@@ -587,13 +587,9 @@ def _write_probe_component_is_safe(
     return info
 
 
-def run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ...]:
+def _run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ...]:
     """Exercise only profile-local file/directory ACL writes with synthetic data."""
-    root = (
-        Path(sk._active_profile_identity())
-        if profile_root is None
-        else Path(profile_root)
-    )
+    root: Path | None = None
     probe_dir: Path | None = None
     sentinel: Path | None = None
     created_probe_dir = False
@@ -601,6 +597,15 @@ def run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ..
     failure: Exception | None = None
     failure_type: str | None = None
     cleanup_failed = False
+
+    try:
+        root = (
+            Path(sk._active_profile_identity())
+            if profile_root is None
+            else Path(profile_root)
+        )
+    except Exception as exc:
+        failure = exc
 
     def component_identity(info: os.stat_result) -> tuple[int, int]:
         return (info.st_dev, info.st_ino)
@@ -617,13 +622,21 @@ def run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ..
             raise sk.KeystoreError("write probe descriptor changed")
         return identity
 
-    if not sk._is_windows():
+    if root is not None and not sk._is_windows():
         root_fd: int | None = None
         probe_fd: int | None = None
         sentinel_fd: int | None = None
         probe_name: str | None = None
         probe_identity: tuple[int, int] | None = None
         sentinel_identity: tuple[int, int] | None = None
+
+        def close_descriptor(fd: int) -> None:
+            nonlocal cleanup_failed
+            try:
+                os.close(fd)
+            except Exception:
+                cleanup_failed = True
+
         try:
             try:
                 root_info = root.lstat()
@@ -678,7 +691,7 @@ def run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ..
             failure = exc
         finally:
             if sentinel_fd is not None:
-                os.close(sentinel_fd)
+                close_descriptor(sentinel_fd)
             if created_probe_dir:
                 try:
                     if root_fd is None or probe_name is None or probe_identity is None:
@@ -705,20 +718,18 @@ def run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ..
                 except Exception:
                     cleanup_failed = True
             if probe_fd is not None:
-                os.close(probe_fd)
+                close_descriptor(probe_fd)
             if root_fd is not None:
-                os.close(root_fd)
-    else:
+                close_descriptor(root_fd)
+    elif root is not None:
         try:
-            from hermes_cli.windows_permissions import run_private_acl_write_probe
+            from hermes_cli.windows_permissions import _run_private_acl_write_probe
 
             directory_name = f"{_WRITE_PROBE_PREFIX}{secrets.token_hex(16)}"
             probe_dir = root / directory_name
-            result = run_private_acl_write_probe(
+            result = _run_private_acl_write_probe(
                 root,
                 directory_name=directory_name,
-                file_name=_WRITE_PROBE_SENTINEL,
-                contents=_WRITE_PROBE_CONTENTS,
             )
             cleanup_failed = result.cleanup_failed
             if result.failure_type is not None:
@@ -748,6 +759,7 @@ def run_write_probe(profile_root: Path | None = None) -> tuple[SecretFinding, ..
         )
     if cleanup_failed:
         artifact = probe_dir if probe_dir is not None else root
+        assert artifact is not None
         findings.append(
             _finding(
                 "WRITE_PROBE_CLEANUP_FAILED",
@@ -1631,7 +1643,7 @@ def _handle_secrets_doctor(args) -> int:
         print(
             "Running explicit synthetic ACL write probe; this creates and removes test files."
         )
-        probe_findings = run_write_probe()
+        probe_findings = _run_write_probe()
         for finding in probe_findings:
             _print_finding(finding)
         findings = findings + probe_findings
@@ -1743,5 +1755,4 @@ __all__ = [
     "diagnose_secrets",
     "plan_secret_repair",
     "register_cli",
-    "run_write_probe",
 ]

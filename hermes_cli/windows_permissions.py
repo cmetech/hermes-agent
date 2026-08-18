@@ -22,7 +22,7 @@ class WindowsAclInspection:
 
 
 @dataclass(frozen=True)
-class WindowsPrivateProbeResult:
+class _WindowsPrivateProbeResult:
     """Outcome of one handle-relative synthetic private-file probe."""
 
     failure_type: str | None
@@ -67,11 +67,14 @@ _FILE_OPEN_REPARSE_POINT = 0x00200000
 _FILE_WRITE_DATA = 0x00000002
 _SYNCHRONIZE = 0x00100000
 _DELETE = 0x00010000
-_FILE_LIST_DIRECTORY = 0x00000001
 _FILE_ADD_FILE = 0x00000002
 _FILE_ADD_SUBDIRECTORY = 0x00000004
+_FILE_TRAVERSE = 0x00000020
 _FILE_DISPOSITION_INFO_CLASS = 4
 _STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+_PROBE_DIRECTORY_RE = re.compile(r"^\.secret-write-probe-[0-9a-f]{32}$")
+_PROBE_FILE_NAME = "sentinel"
+_PROBE_CONTENTS = b"hermes-secret-write-probe\n"
 
 
 @dataclass(frozen=True)
@@ -364,7 +367,7 @@ class _WindowsAclApi:
         directory: bool,
         access: int,
         disposition: int,
-        share_delete: bool,
+        exclusive: bool,
     ) -> int:
         name_buffer = ctypes.create_unicode_buffer(name)
         encoded_length = len(name.encode("utf-16-le"))
@@ -385,9 +388,7 @@ class _WindowsAclApi:
         status = _IO_STATUS_BLOCK()
         options = _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT
         options |= _FILE_DIRECTORY_FILE if directory else _FILE_NON_DIRECTORY_FILE
-        share_access = _FILE_SHARE_READ | _FILE_SHARE_WRITE
-        if share_delete:
-            share_access |= _FILE_SHARE_DELETE
+        share_access = 0 if exclusive else _FILE_SHARE_READ | _FILE_SHARE_WRITE
         result = self.ntdll.NtCreateFile(
             ctypes.byref(handle),
             access,
@@ -412,7 +413,7 @@ class _WindowsAclApi:
             directory=True,
             access=access,
             disposition=_FILE_OPEN,
-            share_delete=False,
+            exclusive=False,
         )
 
     def create_relative_directory(self, parent: int, name: str, *, access: int) -> int:
@@ -422,7 +423,7 @@ class _WindowsAclApi:
             directory=True,
             access=access,
             disposition=_FILE_CREATE,
-            share_delete=False,
+            exclusive=False,
         )
 
     def create_relative(
@@ -434,7 +435,7 @@ class _WindowsAclApi:
             directory=directory,
             access=access,
             disposition=_FILE_CREATE,
-            share_delete=True,
+            exclusive=True,
         )
 
     def write_handle(self, handle: int, data: bytes) -> None:
@@ -730,6 +731,43 @@ def _open_flags(*, directory: bool) -> int:
     return flags
 
 
+def _operate_handle(
+    api: _WindowsAclApi, handle: int, *, directory: bool, apply: bool
+) -> WindowsAclInspection | None:
+    """Apply or inspect the private ACL on one already-held native handle."""
+    initial = api.handle_metadata(handle)
+    _verify_metadata(initial, directory=directory)
+    current_user = api.current_user()
+    security_information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+    before = api.read_acl(handle, current_user, security_information)
+
+    if apply:
+        if not before.owner_matches:
+            raise WindowsAclError("ACL owner does not match the current user")
+        inheritance = "OICI" if directory else ""
+        mask = DIRECTORY_PRIVATE_MASK if directory else FILE_PRIVATE_MASK
+        sddl = f"D:P(A;{inheritance};0x{mask:08x};;;{current_user.text})"
+        api.set_dacl(
+            handle,
+            sddl,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        )
+        after = api.read_acl(handle, current_user, security_information)
+        inspection = _inspection_for_state(after, directory=directory)
+        if not inspection.secure:
+            raise WindowsAclError(
+                inspection.detail or "Windows ACL verification failed"
+            )
+    else:
+        inspection = _inspection_for_state(before, directory=directory)
+
+    final = api.handle_metadata(handle)
+    _verify_metadata(final, directory=directory)
+    if final.identity != initial.identity:
+        raise WindowsAclError("Windows ACL object changed during operation")
+    return None if apply else inspection
+
+
 def _operate(
     path: Path, *, directory: bool, apply: bool
 ) -> WindowsAclInspection | None:
@@ -748,37 +786,7 @@ def _operate(
         handle = api.open_handle(
             path, access=access, flags=_open_flags(directory=directory)
         )
-        initial = api.handle_metadata(handle)
-        _verify_metadata(initial, directory=directory)
-        current_user = api.current_user()
-        security_information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
-        before = api.read_acl(handle, current_user, security_information)
-
-        if apply:
-            if not before.owner_matches:
-                raise WindowsAclError("ACL owner does not match the current user")
-            inheritance = "OICI" if directory else ""
-            mask = DIRECTORY_PRIVATE_MASK if directory else FILE_PRIVATE_MASK
-            sddl = f"D:P(A;{inheritance};0x{mask:08x};;;{current_user.text})"
-            api.set_dacl(
-                handle,
-                sddl,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            )
-            after = api.read_acl(handle, current_user, security_information)
-            inspection = _inspection_for_state(after, directory=directory)
-            if not inspection.secure:
-                raise WindowsAclError(
-                    inspection.detail or "Windows ACL verification failed"
-                )
-        else:
-            inspection = _inspection_for_state(before, directory=directory)
-
-        final = api.handle_metadata(handle)
-        _verify_metadata(final, directory=directory)
-        if final.identity != initial.identity:
-            raise WindowsAclError("Windows ACL object changed during operation")
-        return None if apply else inspection
+        return _operate_handle(api, handle, directory=directory, apply=apply)
     except WindowsAclError:
         primary_failed = True
         raise
@@ -792,35 +800,6 @@ def _operate(
             except Exception:
                 if not primary_failed:
                     raise WindowsAclError("Windows ACL operation failed") from None
-
-
-def _apply_private_acl_handle(
-    api: _WindowsAclApi, handle: int, *, directory: bool
-) -> None:
-    initial = api.handle_metadata(handle)
-    _verify_metadata(initial, directory=directory)
-    current_user = api.current_user()
-    security_information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
-    before = api.read_acl(handle, current_user, security_information)
-    if not before.owner_matches:
-        raise WindowsAclError("ACL owner does not match the current user")
-    inheritance = "OICI" if directory else ""
-    mask = DIRECTORY_PRIVATE_MASK if directory else FILE_PRIVATE_MASK
-    sddl = f"D:P(A;{inheritance};0x{mask:08x};;;{current_user.text})"
-    api.set_dacl(
-        handle,
-        sddl,
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-    )
-    inspection = _inspection_for_state(
-        api.read_acl(handle, current_user, security_information), directory=directory
-    )
-    if not inspection.secure:
-        raise WindowsAclError(inspection.detail or "Windows ACL verification failed")
-    final = api.handle_metadata(handle)
-    _verify_metadata(final, directory=directory)
-    if final.identity != initial.identity:
-        raise WindowsAclError("Windows ACL object changed during operation")
 
 
 def _relative_probe_name(name: str) -> str:
@@ -860,135 +839,130 @@ def _missing_relative_object(exc: Exception) -> bool:
 
 
 def _open_probe_root(
-    api: _WindowsAclApi, root: Path
-) -> tuple[int, list[tuple[int, _FileIdentity]]]:
+    api: _WindowsAclApi,
+    root: Path,
+    held: list[tuple[int, _FileIdentity | None]],
+) -> int:
     """Walk or create one absolute directory from an immutable anchor handle."""
     anchor, components = _probe_root_parts(root)
-    base_access = _FILE_LIST_DIRECTORY | _SYNCHRONIZE
-    held: list[tuple[int, _FileIdentity]] = []
+    base_access = _FILE_TRAVERSE | _SYNCHRONIZE
+    path_handles: list[tuple[int, _FileIdentity]] = []
     component_names: list[str | None] = [None]
     can_create_child: list[bool] = [False]
-    try:
-        anchor_handle = api.open_handle(
-            anchor,
-            access=base_access,
-            flags=_open_flags(directory=True),
-        )
-        anchor_metadata = api.handle_metadata(anchor_handle)
-        _verify_metadata(anchor_metadata, directory=True)
-        held.append((anchor_handle, anchor_metadata.identity))
 
-        for index, component in enumerate(components):
-            final = index == len(components) - 1
-            access = base_access | (_FILE_ADD_SUBDIRECTORY if final else 0)
-            parent_handle = held[-1][0]
-            try:
-                handle = api.open_relative_directory(
-                    parent_handle, component, access=access
-                )
-            except Exception as exc:
-                if not _missing_relative_object(exc):
-                    raise
-                if not can_create_child[-1]:
-                    parent_identity = held[-1][1]
-                    if len(held) == 1:
-                        replacement = api.open_handle(
-                            anchor,
-                            access=base_access | _FILE_ADD_SUBDIRECTORY,
-                            flags=_open_flags(directory=True),
-                        )
-                    else:
-                        parent_name = component_names[-1]
-                        assert parent_name is not None
-                        replacement = api.open_relative_directory(
-                            held[-2][0],
-                            parent_name,
-                            access=base_access | _FILE_ADD_SUBDIRECTORY,
-                        )
-                    replacement_metadata = api.handle_metadata(replacement)
-                    _verify_metadata(replacement_metadata, directory=True)
-                    if replacement_metadata.identity != parent_identity:
-                        api.close_handle(replacement)
-                        raise WindowsAclError(
-                            "Windows probe root component changed while opening"
-                        )
-                    api.close_handle(parent_handle)
-                    held[-1] = (replacement, replacement_metadata.identity)
-                    can_create_child[-1] = True
-                    parent_handle = replacement
-                handle = api.create_relative_directory(
-                    parent_handle,
-                    component,
-                    access=base_access | _FILE_ADD_SUBDIRECTORY,
-                )
-                access |= _FILE_ADD_SUBDIRECTORY
+    def track(handle: int) -> _HandleMetadata:
+        index = len(held)
+        held.append((handle, None))
+        metadata = api.handle_metadata(handle)
+        _verify_metadata(metadata, directory=True)
+        held[index] = (handle, metadata.identity)
+        return metadata
 
-            metadata = api.handle_metadata(handle)
-            _verify_metadata(metadata, directory=True)
-            held.append((handle, metadata.identity))
-            component_names.append(component)
-            can_create_child.append(bool(access & _FILE_ADD_SUBDIRECTORY))
+    anchor_handle = api.open_handle(
+        anchor,
+        access=base_access,
+        flags=_open_flags(directory=True),
+    )
+    anchor_metadata = track(anchor_handle)
+    path_handles.append((anchor_handle, anchor_metadata.identity))
 
-        for handle, identity in held:
-            metadata = api.handle_metadata(handle)
-            _verify_metadata(metadata, directory=True)
-            if metadata.identity != identity:
-                raise WindowsAclError(
-                    "Windows probe root component changed during traversal"
-                )
-        return held[-1][0], held
-    except Exception:
-        for handle, _identity in reversed(held):
-            try:
-                api.close_handle(handle)
-            except Exception:
-                pass
-        raise
+    for index, component in enumerate(components):
+        final = index == len(components) - 1
+        access = base_access | (_FILE_ADD_SUBDIRECTORY if final else 0)
+        parent_handle = path_handles[-1][0]
+        try:
+            handle = api.open_relative_directory(
+                parent_handle, component, access=access
+            )
+        except Exception as exc:
+            if not _missing_relative_object(exc):
+                raise
+            if not can_create_child[-1]:
+                parent_identity = path_handles[-1][1]
+                if len(path_handles) == 1:
+                    replacement = api.open_handle(
+                        anchor,
+                        access=base_access | _FILE_ADD_SUBDIRECTORY,
+                        flags=_open_flags(directory=True),
+                    )
+                else:
+                    parent_name = component_names[-1]
+                    assert parent_name is not None
+                    replacement = api.open_relative_directory(
+                        path_handles[-2][0],
+                        parent_name,
+                        access=base_access | _FILE_ADD_SUBDIRECTORY,
+                    )
+                replacement_metadata = track(replacement)
+                if replacement_metadata.identity != parent_identity:
+                    raise WindowsAclError(
+                        "Windows probe root component changed while opening"
+                    )
+                path_handles[-1] = (replacement, replacement_metadata.identity)
+                can_create_child[-1] = True
+                parent_handle = replacement
+            handle = api.create_relative_directory(
+                parent_handle,
+                component,
+                access=base_access | _FILE_ADD_SUBDIRECTORY,
+            )
+            access |= _FILE_ADD_SUBDIRECTORY
+
+        metadata = track(handle)
+        path_handles.append((handle, metadata.identity))
+        component_names.append(component)
+        can_create_child.append(bool(access & _FILE_ADD_SUBDIRECTORY))
+
+    for handle, identity in held:
+        if identity is None:
+            continue
+        metadata = api.handle_metadata(handle)
+        _verify_metadata(metadata, directory=True)
+        if metadata.identity != identity:
+            raise WindowsAclError(
+                "Windows probe root component changed during traversal"
+            )
+    return path_handles[-1][0]
 
 
-def run_private_acl_write_probe(
-    root: Path, *, directory_name: str, file_name: str, contents: bytes
-) -> WindowsPrivateProbeResult:
+def _run_private_acl_write_probe(
+    root: Path, *, directory_name: str
+) -> _WindowsPrivateProbeResult:
     """Create, ACL-inspect, and delete synthetic artifacts relative to one root handle."""
-    directory_name = _relative_probe_name(directory_name)
-    file_name = _relative_probe_name(file_name)
-    if not isinstance(contents, bytes) or not contents or len(contents) > 4096:
-        raise WindowsAclError("Windows probe contents are invalid")
+    if not isinstance(directory_name, str) or not _PROBE_DIRECTORY_RE.fullmatch(
+        directory_name
+    ):
+        raise WindowsAclError("Windows probe directory name is invalid")
     root = Path(root)
-    root_handle: int | None = None
-    root_handles: list[tuple[int, _FileIdentity]] = []
+    api: _WindowsAclApi | None = None
+    root_handles: list[tuple[int, _FileIdentity | None]] = []
     directory_handle: int | None = None
     file_handle: int | None = None
     failure_type: str | None = None
     cleanup_failed = False
     try:
         api = _native_api()
-        root_handle, root_handles = _open_probe_root(api, root)
+        root_handle = _open_probe_root(api, root, root_handles)
         directory_handle = api.create_relative(
             root_handle,
             directory_name,
             directory=True,
-            access=READ_CONTROL
-            | WRITE_DAC
-            | _DELETE
-            | _SYNCHRONIZE
-            | _FILE_LIST_DIRECTORY
-            | _FILE_ADD_FILE,
+            access=READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_ADD_FILE,
         )
-        _apply_private_acl_handle(api, directory_handle, directory=True)
+        _operate_handle(api, directory_handle, directory=True, apply=True)
         file_handle = api.create_relative(
             directory_handle,
-            file_name,
+            _PROBE_FILE_NAME,
             directory=False,
             access=READ_CONTROL | WRITE_DAC | _DELETE | _SYNCHRONIZE | _FILE_WRITE_DATA,
         )
-        _apply_private_acl_handle(api, file_handle, directory=False)
-        api.write_handle(file_handle, contents)
+        _operate_handle(api, file_handle, directory=False, apply=True)
+        api.write_handle(file_handle, _PROBE_CONTENTS)
         api.flush_handle(file_handle)
     except Exception as exc:
         failure_type = type(exc).__name__
     finally:
-        if file_handle is not None:
+        if api is not None and file_handle is not None:
             try:
                 api.delete_on_close(file_handle)
             except Exception:
@@ -997,7 +971,7 @@ def run_private_acl_write_probe(
                 api.close_handle(file_handle)
             except Exception:
                 cleanup_failed = True
-        if directory_handle is not None:
+        if api is not None and directory_handle is not None:
             try:
                 api.delete_on_close(directory_handle)
             except Exception:
@@ -1006,12 +980,13 @@ def run_private_acl_write_probe(
                 api.close_handle(directory_handle)
             except Exception:
                 cleanup_failed = True
-        for handle, _identity in reversed(root_handles):
-            try:
-                api.close_handle(handle)
-            except Exception:
-                cleanup_failed = True
-    return WindowsPrivateProbeResult(failure_type, cleanup_failed)
+        if api is not None:
+            for handle, _identity in reversed(root_handles):
+                try:
+                    api.close_handle(handle)
+                except Exception:
+                    cleanup_failed = True
+    return _WindowsPrivateProbeResult(failure_type, cleanup_failed)
 
 
 def restrict_file_to_current_user(path: Path) -> None:
@@ -1037,10 +1012,8 @@ def inspect_directory_acl(path: Path) -> WindowsAclInspection:
 __all__ = [
     "WindowsAclError",
     "WindowsAclInspection",
-    "WindowsPrivateProbeResult",
     "inspect_directory_acl",
     "inspect_file_acl",
     "restrict_directory_to_current_user",
     "restrict_file_to_current_user",
-    "run_private_acl_write_probe",
 ]

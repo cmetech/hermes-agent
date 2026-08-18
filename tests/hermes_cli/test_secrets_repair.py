@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -1034,7 +1035,7 @@ def test_plain_doctor_never_invokes_write_probe_or_creates_absent_profile(
         invoked = True
         raise AssertionError("plain doctor must not run the write probe")
 
-    monkeypatch.setattr(repair, "run_write_probe", unexpected_probe, raising=False)
+    monkeypatch.setattr(repair, "_run_write_probe", unexpected_probe)
     args = build_secrets_parser().parse_args(["secrets", "doctor"])
 
     assert args.func(args) == 0
@@ -1046,6 +1047,112 @@ def test_plain_doctor_never_invokes_write_probe_or_creates_absent_profile(
     assert "No secret storage findings." in capsys.readouterr().out
 
 
+def test_task4_write_probe_helper_is_private():
+    from hermes_cli import secrets_repair as repair
+
+    assert "run_write_probe" not in repair.__all__
+    assert not hasattr(repair, "run_write_probe")
+    assert list(inspect.signature(repair._run_write_probe).parameters) == [
+        "profile_root"
+    ]
+
+
+def test_write_probe_handler_redacts_profile_resolution_failure(
+    profile, monkeypatch, capsys
+):
+    from hermes_cli import secrets_repair as repair
+
+    secret = "private-profile-resolution-detail"
+    monkeypatch.setattr(
+        repair,
+        "diagnose_secrets",
+        lambda: repair.DoctorReport("auto", {}, ()),
+    )
+
+    def fail_profile_resolution():
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(repair.sk, "_active_profile_identity", fail_profile_resolution)
+    args = build_secrets_parser().parse_args([
+        "secrets",
+        "doctor",
+        "--write-probe",
+    ])
+
+    assert args.func(args) == 1
+    output = capsys.readouterr().out
+    assert "Running explicit synthetic ACL write probe" in output
+    assert "WRITE_PROBE_FAILED" in output
+    assert "RuntimeError" in output
+    assert secret not in output
+    assert not profile.exists()
+
+
+@pytest.mark.parametrize("failing_close", [1, 2, 3])
+def test_write_probe_attempts_every_posix_close_and_redacts_failures(
+    profile, monkeypatch, failing_close
+):
+    from hermes_cli import secrets_repair as repair
+
+    secret = "private-close-detail"
+    real_close = os.close
+    close_calls = []
+    monkeypatch.setattr(repair.secrets, "token_hex", lambda _bytes: "a" * 32)
+
+    def close_then_fail(fd):
+        close_calls.append(fd)
+        real_close(fd)
+        if len(close_calls) == failing_close:
+            raise OSError(secret)
+
+    monkeypatch.setattr(repair.os, "close", close_then_fail)
+
+    findings = repair._run_write_probe(profile)
+
+    assert [item.code for item in findings] == ["WRITE_PROBE_CLEANUP_FAILED"]
+    assert len(close_calls) == 3
+    assert str(profile / f".secret-write-probe-{'a' * 32}") in findings[0].message
+    assert secret not in findings[0].message
+    assert list(profile.glob(".secret-write-probe-*")) == []
+
+
+def test_write_probe_handler_returns_nonzero_and_notice_on_cleanup_failure(
+    profile, monkeypatch, capsys
+):
+    from hermes_cli import secrets_repair as repair
+
+    secret = "private-handler-cleanup-detail"
+    real_close = os.close
+    close_calls = 0
+    monkeypatch.setattr(
+        repair,
+        "diagnose_secrets",
+        lambda: repair.DoctorReport("auto", {}, ()),
+    )
+
+    def close_once_then_fail(fd):
+        nonlocal close_calls
+        close_calls += 1
+        real_close(fd)
+        if close_calls == 1:
+            raise OSError(secret)
+
+    monkeypatch.setattr(repair.os, "close", close_once_then_fail)
+    args = build_secrets_parser().parse_args([
+        "secrets",
+        "doctor",
+        "--write-probe",
+    ])
+
+    assert args.func(args) == 1
+    output = capsys.readouterr().out
+    assert "Running explicit synthetic ACL write probe" in output
+    assert "WRITE_PROBE_CLEANUP_FAILED" in output
+    assert secret not in output
+    assert close_calls == 3
+    assert list(profile.glob(".secret-write-probe-*")) == []
+
+
 def test_write_probe_creates_only_one_synthetic_artifact_and_cleans_it(
     profile, fake_keyring, monkeypatch
 ):
@@ -1055,13 +1162,13 @@ def test_write_probe_creates_only_one_synthetic_artifact_and_cleans_it(
     monkeypatch.setattr(repair.sk, "_is_windows", lambda: True)
     probe_calls = []
 
-    def successful_probe(root, *, directory_name, file_name, contents):
-        probe_calls.append((root, directory_name, file_name, contents))
+    def successful_probe(root, *, directory_name):
+        probe_calls.append((root, directory_name))
         root.mkdir(parents=True, exist_ok=False)
-        return windows_permissions.WindowsPrivateProbeResult(None, False)
+        return windows_permissions._WindowsPrivateProbeResult(None, False)
 
     monkeypatch.setattr(
-        windows_permissions, "run_private_acl_write_probe", successful_probe
+        windows_permissions, "_run_private_acl_write_probe", successful_probe
     )
 
     def forbidden_secret_store_access(*_args, **_kwargs):
@@ -1081,7 +1188,7 @@ def test_write_probe_creates_only_one_synthetic_artifact_and_cleans_it(
         repair, "_load_authority_registry_readonly", forbidden_secret_store_access
     )
 
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
 
     assert [(item.code, item.severity) for item in findings] == [
         ("WRITE_PROBE_OK", "info")
@@ -1089,11 +1196,10 @@ def test_write_probe_creates_only_one_synthetic_artifact_and_cleans_it(
     assert profile.is_dir()
     assert list(profile.glob(".secret-write-probe-*")) == []
     assert len(probe_calls) == 1
-    root, directory_name, file_name, contents = probe_calls[0]
+    root, directory_name = probe_calls[0]
     assert root == profile
     assert directory_name.startswith(".secret-write-probe-")
-    assert file_name == "sentinel"
-    assert contents == b"hermes-secret-write-probe\n"
+    assert len(directory_name.removeprefix(".secret-write-probe-")) == 32
     assert fake_keyring.set_calls == []
     assert fake_keyring.delete_calls == []
 
@@ -1105,13 +1211,13 @@ def test_write_probe_acl_failure_is_redacted_and_cleaned(profile, monkeypatch):
     monkeypatch.setattr(repair.sk, "_is_windows", lambda: True)
     monkeypatch.setattr(
         windows_permissions,
-        "run_private_acl_write_probe",
-        lambda *_args, **_kwargs: windows_permissions.WindowsPrivateProbeResult(
+        "_run_private_acl_write_probe",
+        lambda *_args, **_kwargs: windows_permissions._WindowsPrivateProbeResult(
             "RuntimeError", False
         ),
     )
 
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
 
     assert [(item.code, item.severity) for item in findings] == [
         ("WRITE_PROBE_FAILED", "error")
@@ -1134,7 +1240,7 @@ def test_write_probe_reports_manual_cleanup_path_without_exception_payload(
         return original_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(repair.os, "unlink", refuse_probe_unlink)
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
     artifact = next(profile.glob(".secret-write-probe-*"))
 
     assert [(item.code, item.severity) for item in findings] == [
@@ -1155,7 +1261,7 @@ def test_write_probe_never_reuses_a_collision(profile, monkeypatch):
     marker = collision / "sentinel"
     marker.write_bytes(b"pre-existing")
 
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
 
     assert [(item.code, item.severity) for item in findings] == [
         ("WRITE_PROBE_FAILED", "error")
@@ -1184,7 +1290,7 @@ def test_write_probe_never_deletes_a_sentinel_collision(profile, monkeypatch):
 
     monkeypatch.setattr(repair.os, "open", collide_sentinel)
 
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
     collision = profile / ".secret-write-probe-collision" / "sentinel"
 
     assert {item.code for item in findings} == {
@@ -1217,7 +1323,7 @@ def test_write_probe_fails_closed_when_probe_directory_is_replaced(
 
     monkeypatch.setattr(repair.os, "fchmod", replace_probe_directory)
 
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
     probe = next(profile.glob(".secret-write-probe-*"))
 
     assert {item.code for item in findings} == {
@@ -1236,7 +1342,7 @@ def test_write_probe_rejects_a_symlink_profile_root(profile, tmp_path):
     profile.parent.mkdir(parents=True)
     profile.symlink_to(target, target_is_directory=True)
 
-    findings = repair.run_write_probe(profile)
+    findings = repair._run_write_probe(profile)
 
     assert [(item.code, item.severity) for item in findings] == [
         ("WRITE_PROBE_FAILED", "error")
