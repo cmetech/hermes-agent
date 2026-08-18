@@ -4,6 +4,8 @@ import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { brandText } from '@/test/brand-text'
+
 import {
   billingDevFixtures,
   loggedOutBillingState,
@@ -86,7 +88,9 @@ describe('BillingSettings', () => {
     expect(screen.getByText('Visa •••• 3206')).toBeTruthy()
     expect(
       screen.getByText(
-        "Remote spending is off for this account — a billing admin can turn it on from the portal's Hermes Agent page."
+        brandText(
+          "Remote spending is off for this account — a billing admin can turn it on from the portal's Hermes Agent page."
+        )
       )
     ).toBeTruthy()
     expect(screen.queryByRole('button', { name: '$100' })).toBeNull()
