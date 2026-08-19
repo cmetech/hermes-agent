@@ -1,18 +1,19 @@
 ---
 id: confluence-tools
 display_name: Ericsson Confluence Tools
-aliases: [Ericsson Confluence, Confluence connector, Confluence page research, Confluence tools]
+aliases: [Ericsson Confluence, Confluence connector, Confluence page research, Confluence tools, "<brand> confluence commands", Ericsson Confluence connector CLI]
 goals:
   - Search Confluence with bounded CQL and navigate visible spaces and direct child pages.
   - Read one page, its Markdown body, or its comments while preserving untrusted-content warnings.
   - Research one explicit page with bounded and attributable page and comment evidence.
   - Preview and perform an explicitly approved page creation, page update, or comment.
+  - Run deterministic `<brand> confluence ...` shell commands without replacing natural-language Confluence conversations.
 maturity: available
 recommendation_eligible: true
 source_flows: []
 implementation:
   skills: []
-  plugins: [plugins/ericsson-confluence]
+  plugins: [plugins/ericsson-confluence, plugins/ericsson-connector-cli]
   mcp_servers: []
   workflows: []
   tools:
@@ -63,6 +64,17 @@ navigation, Markdown page and comment reads, and approval-gated authoring. The
 qualified `ericsson-confluence:page-research` skill researches one page with
 bounded, attributable page and comment evidence while keeping remote content in
 the role of data rather than instructions.
+
+## Direct shell commands
+
+Natural-language Confluence research remains available for evidence synthesis and
+page-guided questions. The always-loaded facade makes
+`<brand> confluence --help` visible before connector enablement and exposes
+deterministic leaves such as `<brand> confluence page get 12345`. The facade is
+not enabled or configured separately; execution requires `ericsson-confluence`
+enabled and configured in the active profile. Direct writes require exactly one
+of `--dry-run` and `--confirm`; never place origins, PATs, or profile selection
+on argv.
 
 ## Try saying
 

@@ -12,6 +12,7 @@
   "capabilities/workflows/sharepoint-document-intake.yml",
   "plugins/ericsson-arm",
   "plugins/ericsson-confluence",
+  "plugins/ericsson-connector-cli",
   "plugins/ericsson-gitlab",
   "plugins/ericsson-jira",
   "plugins/ericsson-sharepoint",

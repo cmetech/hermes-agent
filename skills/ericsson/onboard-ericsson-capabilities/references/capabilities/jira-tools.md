@@ -1,17 +1,18 @@
 ---
 id: jira-tools
 display_name: Ericsson Jira Tools
-aliases: [Jira issue tools, Jira ticket lookup, Jira issue management]
+aliases: [Jira issue tools, Jira ticket lookup, Jira issue management, "<brand> jira commands", Ericsson Jira connector CLI]
 goals:
   - Discover bounded Jira issues, fields, projects, transitions, assignable users, and link types.
   - Read assigned work, explicit searches, issue details, and recent comments.
   - Preview and perform an explicitly approved Jira comment, transition, assignment, field update, label change, issue creation, or issue link.
+  - Run deterministic `<brand> jira ...` shell commands without replacing natural-language Jira conversations.
 maturity: available
 recommendation_eligible: true
 source_flows: [docs/flows/jira-single-ticket-showcase.md]
 implementation:
   skills: [skills/ericsson/jira]
-  plugins: [plugins/ericsson-jira]
+  plugins: [plugins/ericsson-jira, plugins/ericsson-connector-cli]
   mcp_servers: []
   workflows: [workflows/jira-single-ticket-showcase.yml]
   tools:
@@ -58,6 +59,17 @@ reads, and seven approval-gated writes. It can list assigned work, search with a
 explicit bound, read one issue and recent comments, discover fields, project
 metadata, transitions, assignable users, and link types, then preview and perform
 one selected mutation.
+
+## Direct shell commands
+
+Natural-language Jira requests remain the best path for research, explanation,
+and multi-step work. The always-loaded facade also makes `<brand> jira --help`
+visible in every profile and provides deterministic leaf commands such as
+`<brand> jira issue get ERIC-123`. The facade has no Jira credentials and is not
+enabled separately: actual execution requires the standalone `ericsson-jira`
+connector to be enabled and configured. Direct writes require exactly one of
+`--dry-run` and `--confirm`; never put the Jira origin, credentials, or profile
+selection on argv.
 
 ## Try saying
 
