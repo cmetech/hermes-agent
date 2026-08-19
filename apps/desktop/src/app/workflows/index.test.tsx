@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider, TRANSLATIONS } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
@@ -9,6 +9,12 @@ import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/
 import { WorkflowCatalog } from './catalog'
 import { isWorkflowAttemptEvidence, isWorkflowPersistentSessionRecoveryEvidence, RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
+
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  Element.prototype.hasPointerCapture = vi.fn(() => false)
+  Element.prototype.releasePointerCapture = vi.fn()
+})
 
 const getWorkflowRun = vi.fn()
 const getWorkflowEvidence = vi.fn()
@@ -203,7 +209,7 @@ describe('WorkflowsView', () => {
     ['board', 'Active board'],
     ['history', 'History'],
     ['archive', 'Archive']
-  ] as const)('renders the %s view with collapsible lanes and disabled future controls', async (view, label) => {
+  ] as const)('renders the %s view with collapsible lanes and run filtering', async (view, label) => {
     $workflowSelectedRunId.set(null)
     listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -216,7 +222,7 @@ describe('WorkflowsView', () => {
       screen.getByLabelText('Workflows activity board').querySelector('[data-layout="collapsible-lanes"]')
     ).toBeTruthy()
     expect((screen.getByRole('button', { name: 'Run filters coming soon' }) as HTMLButtonElement).disabled).toBe(true)
-    expect((screen.getByRole('textbox', { name: 'Search runs — coming soon' }) as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByRole('textbox', { name: 'Filter workflow runs' }) as HTMLInputElement).disabled).toBe(false)
     expect(listWorkflowRuns).toHaveBeenCalledWith(undefined, view)
 
     const runView = screen.getByRole('main').querySelector('[data-workflow-run-view]')!
@@ -229,6 +235,34 @@ describe('WorkflowsView', () => {
     expect(boardShell.firstElementChild?.className).toContain('h-full')
     expect(boardShell.querySelector('[data-layout="collapsible-lanes"]')?.className).toContain('flex-1')
     expect(boardShell.querySelector('[data-lane-scroll]')?.className).toContain('overflow-y-auto')
+  })
+
+  it('filters the active workflow board across the loaded run details', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowRuns.mockResolvedValue({
+      next_cursor: null,
+      runs: [
+        run(),
+        run({
+          current_nodes: ['publish'],
+          health: 'healthy',
+          run_id: 'release-42',
+          status: 'running',
+          workflow: 'Release smoke test'
+        })
+      ],
+      schema_version: 1
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client)
+
+    const filter = screen.getByRole('textbox', { name: 'Filter workflow runs' })
+    fireEvent.change(filter, { target: { value: 'release-42' } })
+
+    expect(screen.getByRole('button', { name: /Release smoke test/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Laptop diagnostic/ })).toBeNull()
+    expect(screen.getByLabelText('1 loaded workflow run')).toBeTruthy()
   })
 
   it.each([
@@ -257,7 +291,7 @@ describe('WorkflowsView', () => {
 
     await renderView(client, 'workflows')
 
-    expect(screen.queryByRole('textbox', { name: 'Search runs — coming soon' })).toBeNull()
+    expect(screen.queryByRole('textbox', { name: 'Filter workflow runs' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Run filters coming soon' })).toBeNull()
   })
 
@@ -542,6 +576,106 @@ describe('WorkflowsView', () => {
     expect(rows[1]?.textContent).toContain('Project')
     expect(listWorkflowDefinitions).toHaveBeenCalledTimes(1)
     expect(listWorkflowRuns).not.toHaveBeenCalled()
+  })
+
+  it('shows ten catalog rows by default and pages through the remaining workflows', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: Array.from({ length: 12 }, (_, index) =>
+        definition({ name: `Workflow ${String(index + 1).padStart(2, '0')}` })
+      ),
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const table = await screen.findByRole('table', { name: 'Workflow catalog' })
+    expect(within(table).getAllByRole('row')).toHaveLength(11)
+    expect(within(table).getByText('Workflow 01')).toBeTruthy()
+    expect(within(table).queryByText('Workflow 11')).toBeNull()
+    expect(screen.getByText('1–10 of 12 workflows')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Go to workflow page 1' }).getAttribute('aria-current')).toBe('page')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Go to workflow page 2' }))
+
+    expect(within(table).getAllByRole('row')).toHaveLength(3)
+    expect(within(table).getByText('Workflow 11')).toBeTruthy()
+    expect(within(table).queryByText('Workflow 01')).toBeNull()
+    expect(screen.getByText('11–12 of 12 workflows')).toBeTruthy()
+  })
+
+  it('lets the user show 10, 25, or 50 catalog rows per page', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: Array.from({ length: 30 }, (_, index) =>
+        definition({ name: `Workflow ${String(index + 1).padStart(2, '0')}` })
+      ),
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const table = await screen.findByRole('table', { name: 'Workflow catalog' })
+    expect(within(table).getAllByRole('row')).toHaveLength(11)
+
+    fireEvent.pointerDown(screen.getByRole('combobox', { name: 'Rows per page' }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: 'mouse'
+    })
+    fireEvent.click(await screen.findByRole('option', { name: '25' }))
+
+    expect(within(table).getAllByRole('row')).toHaveLength(26)
+    expect(within(table).getByText('Workflow 25')).toBeTruthy()
+    expect(within(table).queryByText('Workflow 26')).toBeNull()
+  })
+
+  it('filters the catalog before pagination and returns to the first page when the query changes', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({
+      items: Array.from({ length: 12 }, (_, index) =>
+        definition({
+          description: index === 1 ? 'Deploys the production release.' : 'Routine workflow.',
+          name: `Workflow ${String(index + 1).padStart(2, '0')}`
+        })
+      ),
+      truncated: false
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const table = await screen.findByRole('table', { name: 'Workflow catalog' })
+    fireEvent.click(screen.getByRole('button', { name: 'Go to next page' }))
+    expect(within(table).getByText('Workflow 11')).toBeTruthy()
+
+    const filter = screen.getByRole('textbox', { name: 'Filter workflows' })
+    fireEvent.change(filter, { target: { value: 'production' } })
+    expect(within(table).getAllByRole('row')).toHaveLength(2)
+    expect(within(table).getByText('Workflow 02')).toBeTruthy()
+    expect(within(table).queryByText('Workflow 11')).toBeNull()
+
+    fireEvent.change(filter, { target: { value: '' } })
+    expect(within(table).getByText('Workflow 01')).toBeTruthy()
+    expect(within(table).queryByText('Workflow 11')).toBeNull()
+  })
+
+  it('distinguishes an unmatched catalog filter from an empty installation', async () => {
+    $workflowSelectedRunId.set(null)
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    const filter = await screen.findByRole('textbox', { name: 'Filter workflows' })
+    fireEvent.change(filter, { target: { value: 'no-such-workflow' } })
+
+    expect(screen.getByText('No workflows match your filter')).toBeTruthy()
+    expect(screen.queryByText('No workflows installed')).toBeNull()
+    expect(screen.queryByRole('table', { name: 'Workflow catalog' })).toBeNull()
+    expect(screen.getByRole('textbox', { name: 'Filter workflows' })).toBeTruthy()
   })
 
   it('passes the exact catalog definition to View and Run callbacks', async () => {
@@ -1107,9 +1241,10 @@ describe('WorkflowsView', () => {
     } as typeof HTMLElement.prototype.matches
 
     try {
-      keyboardStops[0]!.focus()
+      fireEvent.keyDown(globalThis.document, { key: 'Tab' })
+      act(() => keyboardStops[0]!.focus())
       expect(document.activeElement).toBe(view)
-      keyboardStops[1]!.focus()
+      act(() => keyboardStops[1]!.focus())
       expect(document.activeElement).toBe(runExplanation)
       expect((await screen.findByRole('tooltip')).textContent).toContain(
         'Run is unavailable because this workflow uses unsupported input fields.'

@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { useId } from 'react'
+import { useId, useMemo, useState } from 'react'
 
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -7,12 +7,25 @@ import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
+import {
+  getPaginationItems,
+  Pagination,
+  PaginationButton,
+  PaginationContent,
+  PaginationEllipsis,
+  PaginationItem,
+  PaginationNext,
+  PaginationPrevious
+} from '@/components/ui/pagination'
+import { SearchField } from '@/components/ui/search-field'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip } from '@/components/ui/tooltip'
 import { getApiRequestProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
+import { normalize } from '@/lib/text'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
 import {
@@ -25,6 +38,10 @@ import {
 const WORKFLOW_DOCS_URL =
   'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
 
+const DEFAULT_PAGE_SIZE = 10
+const PAGE_SIZE_OPTIONS = [10, 25, 50] as const
+const EMPTY_CATALOG_ITEMS: Array<WorkflowDefinition | WorkflowDefinitionError> = []
+
 export interface WorkflowCatalogProps {
   onRunWorkflow?: (workflow: WorkflowDefinition) => void
   onViewWorkflow?: (workflow: WorkflowDefinition) => void
@@ -32,6 +49,25 @@ export interface WorkflowCatalogProps {
 
 function isCatalogError(item: WorkflowDefinition | WorkflowDefinitionError): item is WorkflowDefinitionError {
   return 'error' in item
+}
+
+function catalogSearchText(item: WorkflowDefinition | WorkflowDefinitionError): string {
+  if (isCatalogError(item)) {
+    return `${item.name} ${item.error}`.toLowerCase()
+  }
+
+  return [
+    item.name,
+    item.description,
+    item.version,
+    item.source,
+    item.trust_state,
+    item.language?.effective_profile,
+    item.compatibility?.level
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
 }
 
 function CatalogErrorRow({ item }: { item: WorkflowDefinitionError }) {
@@ -178,6 +214,10 @@ function CatalogRow({
 
 export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow }: WorkflowCatalogProps) {
   const { t } = useI18n()
+  const pageSizeLabelId = useId()
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [query, setQuery] = useState('')
   const requestProfile = getApiRequestProfile()
   const profile = requestProfile ?? 'default'
 
@@ -185,6 +225,20 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow }: WorkflowCatal
     queryFn: () => listWorkflowDefinitions(requestProfile),
     queryKey: ['workflow-catalog', profile]
   })
+
+  const items = catalog.data?.items ?? EMPTY_CATALOG_ITEMS
+  const normalizedQuery = normalize(query)
+
+  const filteredItems = useMemo(
+    () => (normalizedQuery ? items.filter(item => catalogSearchText(item).includes(normalizedQuery)) : items),
+    [items, normalizedQuery]
+  )
+
+  const pageCount = Math.max(1, Math.ceil(filteredItems.length / pageSize))
+  const currentPage = Math.min(page, pageCount)
+  const visibleItems = filteredItems.slice((currentPage - 1) * pageSize, currentPage * pageSize)
+  const rangeStart = (currentPage - 1) * pageSize + 1
+  const rangeEnd = Math.min(filteredItems.length, currentPage * pageSize)
 
   if (catalog.isLoading) {
     return (
@@ -208,8 +262,6 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow }: WorkflowCatal
       </div>
     )
   }
-
-  const items = catalog.data?.items ?? []
 
   if (items.length === 0) {
     return (
@@ -235,52 +287,124 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow }: WorkflowCatal
           </Alert>
         </div>
       ) : null}
-      <div className="max-w-full overflow-x-auto">
-        <table
-          aria-label={t.operations.workflowCatalog}
-          className="w-full min-w-[52rem] table-fixed text-left text-[length:var(--conversation-caption-font-size)]"
-        >
-          <thead className="border-b border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) text-[0.625rem] uppercase tracking-[0.08em] text-(--ui-text-tertiary)">
-            <tr>
-              <th className="w-[16%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnName}
-              </th>
-              <th className="w-[9%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnVersion}
-              </th>
-              <th className="w-[28%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnDescription}
-              </th>
-              <th className="w-[10%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnTrust}
-              </th>
-              <th className="w-[10%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnInputs}
-              </th>
-              <th className="w-[12%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnSource}
-              </th>
-              <th className="w-[15%] px-2.5 py-1.5 font-medium" scope="col">
-                {t.operations.workflowColumnActions}
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((item, index) =>
-              isCatalogError(item) ? (
-                <CatalogErrorRow item={item} key={`${item.name}-${item.error}-${index}`} />
-              ) : (
-                <CatalogRow
-                  item={item}
-                  key={`${item.name}-${item.source}-${item.version}`}
-                  onRunWorkflow={onRunWorkflow}
-                  onViewWorkflow={onViewWorkflow}
-                />
-              )
-            )}
-          </tbody>
-        </table>
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <SearchField
+          aria-label={t.operations.workflowCatalogFilter}
+          onChange={value => {
+            setQuery(value)
+            setPage(1)
+          }}
+          placeholder={t.operations.workflowCatalogFilter}
+          value={query}
+        />
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="text-[0.6875rem] text-(--ui-text-tertiary)" id={pageSizeLabelId}>
+            {t.operations.workflowCatalogRowsPerPage}
+          </span>
+          <Select
+            onValueChange={value => {
+              setPageSize(Number(value))
+              setPage(1)
+            }}
+            value={String(pageSize)}
+          >
+            <SelectTrigger aria-labelledby={pageSizeLabelId} className="w-20" size="sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {PAGE_SIZE_OPTIONS.map(option => (
+                <SelectItem key={option} value={String(option)}>
+                  {option}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       </div>
+      {filteredItems.length === 0 ? (
+        <EmptyState className="min-h-36" title={t.operations.workflowCatalogNoMatchTitle} />
+      ) : (
+        <>
+          <div className="max-w-full overflow-x-auto">
+            <table
+              aria-label={t.operations.workflowCatalog}
+              className="w-full min-w-[52rem] table-fixed text-left text-[length:var(--conversation-caption-font-size)]"
+            >
+              <thead className="border-b border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) text-[0.625rem] uppercase tracking-[0.08em] text-(--ui-text-tertiary)">
+                <tr>
+                  <th className="w-[16%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnName}
+                  </th>
+                  <th className="w-[9%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnVersion}
+                  </th>
+                  <th className="w-[28%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnDescription}
+                  </th>
+                  <th className="w-[10%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnTrust}
+                  </th>
+                  <th className="w-[10%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnInputs}
+                  </th>
+                  <th className="w-[12%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnSource}
+                  </th>
+                  <th className="w-[15%] px-2.5 py-1.5 font-medium" scope="col">
+                    {t.operations.workflowColumnActions}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleItems.map((item, index) =>
+                  isCatalogError(item) ? (
+                    <CatalogErrorRow item={item} key={`${item.name}-${item.error}-${index}`} />
+                  ) : (
+                    <CatalogRow
+                      item={item}
+                      key={`${item.name}-${item.source}-${item.version}`}
+                      onRunWorkflow={onRunWorkflow}
+                      onViewWorkflow={onViewWorkflow}
+                    />
+                  )
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-2 flex items-center justify-between gap-3">
+            <span className="text-[0.6875rem] text-(--ui-text-tertiary)">
+              {t.operations.workflowCatalogRange(rangeStart, rangeEnd, filteredItems.length)}
+            </span>
+            {pageCount > 1 ? (
+              <Pagination className="mx-0 w-auto justify-end">
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)} />
+                  </PaginationItem>
+                  {getPaginationItems(currentPage, pageCount).map((item, index) => (
+                    <PaginationItem key={`${item}-${index}`}>
+                      {item === 'ellipsis' ? (
+                        <PaginationEllipsis />
+                      ) : (
+                        <PaginationButton
+                          aria-label={t.operations.workflowCatalogGoToPage(item)}
+                          isActive={currentPage === item}
+                          onClick={() => setPage(item)}
+                        >
+                          {item}
+                        </PaginationButton>
+                      )}
+                    </PaginationItem>
+                  ))}
+                  <PaginationItem>
+                    <PaginationNext disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)} />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            ) : null}
+          </div>
+        </>
+      )}
     </div>
   )
 }

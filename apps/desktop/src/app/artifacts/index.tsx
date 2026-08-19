@@ -7,6 +7,7 @@ import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
+  getPaginationItems,
   Pagination,
   PaginationButton,
   PaginationContent,
@@ -62,32 +63,6 @@ function pageRangeLabel(total: number, page: number, pageSize: number, a: Transl
   const end = Math.min(total, page * pageSize)
 
   return a.rangeOf(start, end, total)
-}
-
-function paginationItems(page: number, pageCount: number): Array<number | 'ellipsis'> {
-  if (pageCount <= 7) {
-    return Array.from({ length: pageCount }, (_, index) => index + 1)
-  }
-
-  const pages: Array<number | 'ellipsis'> = [1]
-  const start = Math.max(2, page - 1)
-  const end = Math.min(pageCount - 1, page + 1)
-
-  if (start > 2) {
-    pages.push('ellipsis')
-  }
-
-  for (let nextPage = start; nextPage <= end; nextPage += 1) {
-    pages.push(nextPage)
-  }
-
-  if (end < pageCount - 1) {
-    pages.push('ellipsis')
-  }
-
-  pages.push(pageCount)
-
-  return pages
 }
 
 type CellCtx = {
@@ -403,7 +378,7 @@ function ArtifactsPagination({ className, itemLabel, onPageChange, page, pageSiz
             <PaginationItem>
               <PaginationPrevious disabled={page <= 1} onClick={() => onPageChange(Math.max(1, page - 1))} />
             </PaginationItem>
-            {paginationItems(page, pageCount).map((item, index) => (
+            {getPaginationItems(page, pageCount).map((item, index) => (
               <PaginationItem key={`${item}-${index}`}>
                 {item === 'ellipsis' ? (
                   <PaginationEllipsis />
