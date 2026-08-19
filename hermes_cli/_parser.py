@@ -11,6 +11,8 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 """
 
 import argparse
+import ntpath
+import sys
 
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
@@ -82,6 +84,25 @@ For more help on a command:
 """
 
 
+def _resolve_cli_prog() -> str:
+    """Return the active branded entrypoint name, or the neutral fallback."""
+    candidate = ntpath.basename(str(sys.argv[0]).strip())
+    stem, suffix = ntpath.splitext(candidate)
+    if suffix.casefold() in {".exe", ".cmd", ".bat"}:
+        candidate = stem
+
+    try:
+        from hermes_cli.brand_config import resolve_active_brand
+
+        active_brand = resolve_active_brand().strip()
+    except Exception:
+        return "hermes"
+
+    if candidate and candidate.casefold() == active_brand.casefold():
+        return active_brand
+    return "hermes"
+
+
 def build_top_level_parser():
     """Build the top-level parser, the subparsers action, and the ``chat`` subparser.
 
@@ -90,7 +111,7 @@ def build_top_level_parser():
     other subparsers via ``subparsers.add_parser(...)``.
     """
     parser = argparse.ArgumentParser(
-        prog="hermes",
+        prog=_resolve_cli_prog(),
         description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOGUE,
