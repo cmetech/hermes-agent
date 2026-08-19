@@ -10947,9 +10947,9 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
-        # Help-ish invocations — plugin commands not being listed in
-        # top-level --help is an acceptable trade-off for skipping an
-        # expensive eager import of every bundled plugin module.
+        # The positional ``hermes help`` compatibility path is handled before
+        # argparse. Explicit root ``-h`` / ``--help`` takes the discovery path
+        # so its command inventory is complete.
         "help",
     }
 )
@@ -11025,8 +11025,10 @@ def _plugin_cli_discovery_needed() -> bool:
     """
     first = _first_positional_argv()
     if first is None:
-        # Bare ``hermes`` or only flags → defaults to ``chat``.
-        return False
+        # Explicit root help must enumerate plugin-contributed commands. Bare
+        # ``hermes`` and non-help flag-only launches still default to ``chat``
+        # without paying the plugin discovery cost.
+        return any(arg in {"-h", "--help"} for arg in sys.argv[1:])
     if first in _BUILTIN_SUBCOMMANDS:
         return False
     # Unknown token — could be a plugin subcommand, OR a chat prompt
@@ -12046,8 +12048,9 @@ def main() -> int:
     # own argparse tree.  No hardcoded plugin commands in main.py.
     #
     # Skipped when the invocation is already targeting a known built-in
-    # subcommand — ``hermes --help``, ``hermes version``, ``hermes logs``,
-    # etc.  This avoids eagerly importing every bundled plugin module
+    # subcommand — ``hermes version``, ``hermes logs``, etc. Explicit root
+    # help discovers plugins so it can enumerate their commands. This avoids
+    # eagerly importing every bundled plugin module on normal fast paths
     # (google.cloud.pubsub_v1, aiohttp, grpc, PIL …) which costs
     # 500-650ms on typical installs.
     # =========================================================================

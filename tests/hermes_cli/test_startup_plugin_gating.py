@@ -2,9 +2,10 @@
 
 ``hermes_cli.main`` skips eager plugin discovery at argparse-setup time
 when the invocation is clearly targeting a known built-in subcommand.
-This saves 500-650ms on ``hermes --help``, ``hermes version``,
-``hermes logs``, etc., by not importing ``google.cloud.pubsub_v1``,
-``aiohttp``, ``grpc``, and friends.
+This saves 500-650ms on ``hermes version``, ``hermes logs``, etc., by not
+importing ``google.cloud.pubsub_v1``, ``aiohttp``, ``grpc``, and friends.
+Explicit root help deliberately discovers plugins so its command inventory is
+complete.
 
 Two invariants:
 
@@ -81,16 +82,19 @@ def _live_subcommand_names() -> set[str]:
 @pytest.mark.parametrize(
     "argv",
     [
-        ["hermes", "--help"],
         ["hermes", "logs"],
         ["hermes", "plugins", "list"],
     ],
 )
-def test_help_and_known_builtins_keep_the_plugin_discovery_fast_path(
-    monkeypatch, argv
-):
+def test_known_builtins_keep_the_plugin_discovery_fast_path(monkeypatch, argv):
     monkeypatch.setattr(sys, "argv", argv)
     assert _plugin_cli_discovery_needed() is False
+
+
+@pytest.mark.parametrize("help_flag", ["-h", "--help"])
+def test_explicit_root_help_discovers_plugin_commands(monkeypatch, help_flag):
+    monkeypatch.setattr(sys, "argv", ["hermes", help_flag])
+    assert _plugin_cli_discovery_needed() is True
 
 
 def test_help_surface_with_plugin_discovery_suppressed_matches_builtin_registry():
