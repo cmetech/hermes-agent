@@ -5,7 +5,9 @@
         "Ericsson ARM",
         "Ericsson Artifactory",
         "Artifactory connector",
-        "release artefact research"
+        "release artefact research",
+        "<brand> arm commands",
+        "Ericsson ARM connector CLI"
       ],
       "displayName": "Ericsson Artifactory/ARM Tools",
       "entry": "references/capabilities/artifactory-arm-tools.md",
@@ -14,7 +16,8 @@
         "Search for release artefacts with bounded AQL and preserve truncation warnings.",
         "Trace an artefact through build properties to the GitLab pipeline and commit that produced it.",
         "Preview and perform an explicitly approved checksum-first deployment of one local file.",
-        "Preview and perform an explicitly approved deletion of one Artifactory path."
+        "Preview and perform an explicitly approved deletion of one Artifactory path.",
+        "Run deterministic `<brand> arm ...` shell commands without replacing natural-language Artifactory conversations."
       ],
       "id": "artifactory-arm-tools",
       "maturity": "available",
@@ -42,7 +45,9 @@
         "Ericsson Confluence",
         "Confluence connector",
         "Confluence page research",
-        "Confluence tools"
+        "Confluence tools",
+        "<brand> confluence commands",
+        "Ericsson Confluence connector CLI"
       ],
       "displayName": "Ericsson Confluence Tools",
       "entry": "references/capabilities/confluence-tools.md",
@@ -50,7 +55,8 @@
         "Search Confluence with bounded CQL and navigate visible spaces and direct child pages.",
         "Read one page, its Markdown body, or its comments while preserving untrusted-content warnings.",
         "Research one explicit page with bounded and attributable page and comment evidence.",
-        "Preview and perform an explicitly approved page creation, page update, or comment."
+        "Preview and perform an explicitly approved page creation, page update, or comment.",
+        "Run deterministic `<brand> confluence ...` shell commands without replacing natural-language Confluence conversations."
       ],
       "id": "confluence-tools",
       "maturity": "available",
@@ -60,7 +66,8 @@
       "aliases": [
         "Co-Worker onboarding",
         "Ericsson capability guide",
-        "capability training"
+        "capability training",
+        "Ericsson connector CLI"
       ],
       "displayName": "Ericsson Capability Onboarding",
       "entry": "references/capabilities/ericsson-capability-onboarding.md",
@@ -78,7 +85,9 @@
         "Ericsson GitLab",
         "repository tools",
         "merge request tools",
-        "GitLab CI tools"
+        "GitLab CI tools",
+        "<brand> gitlab commands",
+        "Ericsson GitLab connector CLI"
       ],
       "displayName": "GitLab Tools",
       "entry": "references/capabilities/gitlab-tools.md",
@@ -89,7 +98,8 @@
         "Research a GitLab repository or merge request with bounded evidence.",
         "Inspect GitLab pipelines, job logs, and CI configuration without reading variable values.",
         "Reply to and resolve merge request discussions, inspect approvals, approve, and SHA-pin a merge.",
-        "Preview and perform explicitly approved GitLab repository, review, and CI recovery writes."
+        "Preview and perform explicitly approved GitLab repository, review, and CI recovery writes.",
+        "Run deterministic `<brand> gitlab ...` shell commands without replacing natural-language GitLab conversations."
       ],
       "id": "gitlab-tools",
       "maturity": "available",
@@ -167,14 +177,17 @@
       "aliases": [
         "Jira issue tools",
         "Jira ticket lookup",
-        "Jira issue management"
+        "Jira issue management",
+        "<brand> jira commands",
+        "Ericsson Jira connector CLI"
       ],
       "displayName": "Ericsson Jira Tools",
       "entry": "references/capabilities/jira-tools.md",
       "goals": [
         "Discover bounded Jira issues, fields, projects, transitions, assignable users, and link types.",
         "Read assigned work, explicit searches, issue details, and recent comments.",
-        "Preview and perform an explicitly approved Jira comment, transition, assignment, field update, label change, issue creation, or issue link."
+        "Preview and perform an explicitly approved Jira comment, transition, assignment, field update, label change, issue creation, or issue link.",
+        "Run deterministic `<brand> jira ...` shell commands without replacing natural-language Jira conversations."
       ],
       "id": "jira-tools",
       "maturity": "available",

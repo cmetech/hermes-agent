@@ -1,7 +1,7 @@
 ---
 id: ericsson-capability-onboarding
 display_name: Ericsson Capability Onboarding
-aliases: [Co-Worker onboarding, Ericsson capability guide, capability training]
+aliases: [Co-Worker onboarding, Ericsson capability guide, capability training, Ericsson connector CLI]
 goals:
   - Onboard me to the Co-Worker capabilities.
   - Help me find Ericsson capabilities for my job.
@@ -36,6 +36,7 @@ underlying domain capability.
 - “Please onboard me to the Co-Worker capabilities.”
 - “Which Ericsson capabilities fit my role?”
 - “Resume my onboarding and explain what is left.”
+- “Teach me how to discover the Ericsson connector CLI commands.”
 
 Follow up with a narrower filter, request a preview, choose an output format or
 artifact destination, ask about exclusions or warnings, or ask how to rerun safely.

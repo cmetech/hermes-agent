@@ -1,0 +1,6 @@
+name: ericsson-connector-cli
+version: 1.0.0
+description: "Always-visible Ericsson connector command facade."
+author: Ericsson (cmetech)
+kind: backend
+provides_tools: []

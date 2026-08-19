@@ -1,19 +1,20 @@
 ---
 id: artifactory-arm-tools
 display_name: Ericsson Artifactory/ARM Tools
-aliases: [Ericsson ARM, Ericsson Artifactory, Artifactory connector, release artefact research]
+aliases: [Ericsson ARM, Ericsson Artifactory, Artifactory connector, release artefact research, "<brand> arm commands", Ericsson ARM connector CLI]
 goals:
   - List visible Artifactory repositories and inspect bounded artefact or folder metadata.
   - Search for release artefacts with bounded AQL and preserve truncation warnings.
   - Trace an artefact through build properties to the GitLab pipeline and commit that produced it.
   - Preview and perform an explicitly approved checksum-first deployment of one local file.
   - Preview and perform an explicitly approved deletion of one Artifactory path.
+  - Run deterministic `<brand> arm ...` shell commands without replacing natural-language Artifactory conversations.
 maturity: available
 recommendation_eligible: true
 source_flows: []
 implementation:
   skills: []
-  plugins: [plugins/ericsson-arm]
+  plugins: [plugins/ericsson-arm, plugins/ericsson-connector-cli]
   mcp_servers: []
   workflows: []
   tools:
@@ -77,6 +78,17 @@ repository discovery, artefact and folder metadata, AQL search, and build
 properties. Those properties connect a release artefact to the GitLab pipeline
 and commit that produced it. The plugin also provides approval-gated deployment
 and deletion of one exact target.
+
+## Direct shell commands
+
+Natural-language artifact research remains available for tracing and explanation.
+The always-loaded facade makes `<brand> arm --help` visible before connector
+enablement and exposes deterministic leaves such as
+`<brand> arm artifact info release-local team/app.tgz`. The facade carries no
+ARM configuration and is not enabled separately; execution requires
+`ericsson-arm` enabled and configured in the active profile. Every direct write
+requires exactly one of `--dry-run` and `--confirm`; never put the Artifactory
+origin, token, certificate paths, or profile selection on argv.
 
 ## Try saying
 

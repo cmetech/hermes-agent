@@ -7,8 +7,9 @@ import json
 import math
 from pathlib import Path
 
+from . import application
 from . import tools as jira_tools
-from .models import JiraError, SAFE_ERROR_MESSAGES, safe_remediation
+from .models import JiraError, SAFE_ERROR_MESSAGES
 
 
 _WRITE_TOOLS = frozenset(
@@ -260,8 +261,11 @@ def _interrupt_authority():
 
 def _has_write_admission(admission, tool_name: str) -> bool:
     try:
+        from hermes_cli.plugins import PluginToolAdmission
+
         return (
-            getattr(admission, "approved", None) is True
+            type(admission) is PluginToolAdmission
+            and getattr(admission, "approved", None) is True
             and getattr(admission, "policy", None) == "plugin_approve"
             and getattr(admission, "tool_name", None) == tool_name
         )
@@ -314,48 +318,14 @@ def register(ctx) -> None:
                         },
                     }
                 )
-            try:
-                result = jira_tools.invoke(
+            return _json(
+                application.execute(
                     name,
                     args or {},
                     configuration,
                     cancel_check=_interrupt_authority(),
                 )
-                return _json({"success": True, "result": result})
-            except JiraError as exc:
-                error = {
-                    "category": exc.category,
-                    "message": SAFE_ERROR_MESSAGES[exc.category],
-                }
-                remediation = safe_remediation(getattr(exc, "remediation", None))
-                if remediation:
-                    error["remediation"] = remediation
-                return _json(
-                    {
-                        "success": False,
-                        "error": error,
-                    }
-                )
-            except (KeyError, TypeError, ValueError):
-                return _json(
-                    {
-                        "success": False,
-                        "error": {
-                            "category": "invalid_input",
-                            "message": SAFE_ERROR_MESSAGES["invalid_input"],
-                        },
-                    }
-                )
-            except Exception:
-                return _json(
-                    {
-                        "success": False,
-                        "error": {
-                            "category": "transient",
-                            "message": SAFE_ERROR_MESSAGES["transient"],
-                        },
-                    }
-                )
+            )
 
         return invoke
 
@@ -382,6 +352,86 @@ def register(ctx) -> None:
         }
 
     ctx.register_hook("pre_tool_call", require_write_approval)
+
+    def local_command_handler(invocation):
+        permission_error = {
+            "success": False,
+            "error": {
+                "category": "permission",
+                "message": SAFE_ERROR_MESSAGES["permission"],
+            },
+        }
+        invalid_input = {
+            "success": False,
+            "error": {
+                "category": "invalid_input",
+                "message": SAFE_ERROR_MESSAGES["invalid_input"],
+            },
+        }
+        try:
+            from hermes_cli.plugin_application_commands import (
+                PluginApplicationCommandInvocation,
+                PluginApplicationCommandMode,
+            )
+
+            if (
+                type(invocation) is not PluginApplicationCommandInvocation
+                or not invocation.active
+                or invocation.provider_id != "ericsson-jira"
+                or invocation.caller_id != "ericsson-connector-cli"
+                or invocation.operation not in jira_tools.SCHEMAS
+            ):
+                return permission_error
+            name = invocation.operation
+            arguments = dict(invocation.arguments)
+            mode = invocation.mode
+            if name in _WRITE_TOOLS:
+                if {"dry_run", "confirm"}.intersection(arguments):
+                    return invalid_input
+                properties = jira_tools.SCHEMAS[name]["parameters"]["properties"]
+                if mode is PluginApplicationCommandMode.DRY_RUN:
+                    if "dry_run" not in properties:
+                        return invalid_input
+                    arguments["dry_run"] = True
+                elif mode is PluginApplicationCommandMode.CONFIRM:
+                    if "confirm" in properties:
+                        arguments["confirm"] = True
+                    elif "dry_run" in properties:
+                        arguments["dry_run"] = False
+                    else:
+                        return invalid_input
+                else:
+                    return permission_error
+            elif mode is not PluginApplicationCommandMode.READ:
+                return permission_error
+        except Exception:
+            return permission_error
+
+        try:
+            configuration = ctx.configuration()
+        except Exception:
+            return {
+                "success": False,
+                "error": {
+                    "category": "invalid_configuration",
+                    "message": SAFE_ERROR_MESSAGES["invalid_configuration"],
+                },
+            }
+        return application.execute(
+            name,
+            arguments,
+            configuration,
+            cancel_check=_interrupt_authority(),
+        )
+
+    ctx.register_application_commands(
+        operations={
+            name: "write" if name in _WRITE_TOOLS else "read"
+            for name in jira_tools.SCHEMAS
+        },
+        allowed_callers={"ericsson-connector-cli"},
+        handler=local_command_handler,
+    )
 
     for name, schema in jira_tools.SCHEMAS.items():
         ctx.register_tool(

@@ -262,6 +262,20 @@ SCHEMAS = {
         },
         ["project"],
     ),
+    "gitlab_read_pipeline": _schema(
+        "gitlab_read_pipeline",
+        "Read one bounded normalized GitLab pipeline without exposing jobs, "
+        "variables, users, or raw payload fields.",
+        {
+            "project": _PROJECT,
+            "pipeline_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2147483647,
+            },
+        },
+        ["project", "pipeline_id"],
+    ),
     "gitlab_inspect_ci": _schema(
         "gitlab_inspect_ci",
         "Inspect bounded GitLab pipeline, CI include, and variable metadata "
@@ -349,6 +363,18 @@ SCHEMAS = {
             "dry_run": {"type": "boolean"},
         },
         ["project", "ticket_key", "summary"],
+    ),
+    "gitlab_create_named_branch": _schema(
+        "gitlab_create_named_branch",
+        "Create or reuse one explicit branch at an exact resolved commit after "
+        "host approval.",
+        {
+            "project": _PROJECT,
+            "branch": _REF,
+            "ref": _REF,
+            "dry_run": {"type": "boolean"},
+        },
+        ["project", "branch", "ref"],
     ),
     "gitlab_commit_changes": _schema(
         "gitlab_commit_changes",
@@ -641,6 +667,10 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
             )
         if name == "gitlab_read_merge_request":
             return operations.read_merge_request(values["project"], values["iid"])
+        if name == "gitlab_read_pipeline":
+            return operations.read_pipeline(
+                values["project"], values["pipeline_id"]
+            )
         if name == "gitlab_inspect_ci":
             return operations.inspect_ci(
                 values["project"],
@@ -688,6 +718,13 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
                 ticket_key=values["ticket_key"],
                 summary=values["summary"],
                 source_ref=values.get("source_ref"),
+                dry_run=values.get("dry_run", False),
+            )
+        if name == "gitlab_create_named_branch":
+            return operations.create_named_branch(
+                values["project"],
+                branch=values["branch"],
+                ref=values["ref"],
                 dry_run=values.get("dry_run", False),
             )
         if name == "gitlab_commit_changes":
