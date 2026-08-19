@@ -360,7 +360,11 @@ def test_real_upgraded_profile_deseeds_jira_once_and_retains_configuration(
     staging.seed_baked_capabilities(home)
 
     migrated = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
-    assert migrated["plugins"]["enabled"] == ["workflow", "ericsson-teams"]
+    assert migrated["plugins"]["enabled"] == [
+        "workflow",
+        "ericsson-teams",
+        "ericsson-connector-cli",
+    ]
     assert migrated["plugins"]["disabled"] == []
     assert migrated["plugins"]["lifecycle_migrations_applied"] == [
         JIRA_LIFECYCLE_MIGRATION
@@ -380,6 +384,7 @@ def test_real_upgraded_profile_deseeds_jira_once_and_retains_configuration(
     assert restaged["plugins"]["enabled"] == [
         "workflow",
         "ericsson-teams",
+        "ericsson-connector-cli",
         "ericsson-jira",
     ]
     assert restaged["plugins"]["lifecycle_migrations_applied"] == [
