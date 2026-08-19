@@ -238,6 +238,9 @@ describe('workflow View dialog', () => {
     ).toHaveLength(1)
     expect(openModalOwnsKeyboard()).toBe(true)
     expect(dialog.querySelector('[data-workflow-view-scroll]')).toBeTruthy()
+    expect(dialog.classList.contains('w-[92vw]')).toBe(true)
+    expect(dialog.classList.contains('max-w-5xl')).toBe(true)
+    expect(Array.from(dialog.classList).some(className => className.startsWith('sm:max-w-'))).toBe(false)
   })
 
   it('explains server-authored legacy semantics without inventing a profile', async () => {
