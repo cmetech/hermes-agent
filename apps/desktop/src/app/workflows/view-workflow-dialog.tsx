@@ -188,7 +188,7 @@ export function ViewWorkflowDialog({ onClose, onRun, profile, workflow }: ViewWo
 
   return (
     <Dialog onOpenChange={open => !open && onClose()} open>
-      <DialogContent className="min-w-0 overflow-x-hidden sm:max-w-3xl">
+      <DialogContent className="w-[92vw] min-w-0 max-w-5xl overflow-x-hidden">
         <DialogHeader>
           <DialogTitle icon={Eye}>{copy.workflowViewTitle(workflow.name)}</DialogTitle>
           <DialogDescription>{copy.workflowViewDescription}</DialogDescription>
