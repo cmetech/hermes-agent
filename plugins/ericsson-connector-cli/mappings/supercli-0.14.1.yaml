@@ -1,0 +1,808 @@
+schema_version: ericsson.supercli-migration/v1
+source:
+  product: SuperCLI
+  version: 0.14.1
+  commit: 6645cd0bb56cc54aa4f1d49095490832c9528dbb
+  binary_sha256: 72ce9d9ad14b451b53a7f0f06786d75336a302562a8ed6d0dbafc2cb7657cc6a
+  inventory_sha256: 2c09aab7b8a84a3fc6cff2e98b8cfd40e37290fd6c05ca1ac212584cf548664c
+  evidence:
+    - SUPER-CLI-ARCHITECTURE.md
+    - PLUGIN-GAP-ANALYSIS.md
+    - out/func-strings.txt
+
+_templates:
+  equivalent_read: &equivalent_read
+    disposition: equivalent
+    replacement: null
+    operation: null
+    flag_mapping:
+      - source: Pinned evidence asserts the bare command only.
+        replacement: Use the bounded operands and options shown in the replacement.
+    output_difference: The replacement returns bounded normalized connector data rather than a raw vendor response.
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    earliest_wave: Wave 4B
+    rationale: The bounded replacement provides the same read outcome.
+    evidence_ref: out/func-strings.txt
+  renamed_read: &renamed_read
+    disposition: renamed
+    replacement: null
+    operation: null
+    flag_mapping:
+      - source: Pinned evidence asserts the bare command only.
+        replacement: Use the bounded operands and options shown in the replacement; do not infer source flags.
+    output_difference: The replacement returns bounded normalized connector data rather than a raw vendor response.
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    earliest_wave: Wave 4B
+    rationale: The read outcome is supported under a curated command name.
+    evidence_ref: out/func-strings.txt
+  safer_read: &safer_read
+    disposition: safer-different
+    replacement: null
+    operation: null
+    flag_mapping:
+      - source: Source --url, credential, --raw, and --no-throttle escape hatches, if present in a script.
+        replacement: No argv translation; use active-profile configuration and bounded output.
+    output_difference: The replacement is bounded and normalized and never returns an arbitrary raw vendor payload.
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    earliest_wave: Wave 4B
+    rationale: The user outcome is available with deliberate profile and output safety differences.
+    evidence_ref: SUPER-CLI-ARCHITECTURE.md sections 4, 5, and 7
+  safer_write: &safer_write
+    disposition: safer-different
+    replacement: null
+    operation: null
+    flag_mapping:
+      - source: Source mutation operands evidenced by the command family.
+        replacement: Use the bounded replacement operands and file inputs shown.
+      - source: Source --url, credential, --raw, and --no-throttle escape hatches, if present in a script.
+        replacement: No argv translation; use active-profile configuration and bounded output.
+      - source: Mutation intent.
+        replacement: Supply exactly one of --dry-run and --confirm.
+    output_difference: The replacement returns a bounded normalized preview/result and never an arbitrary raw vendor payload.
+    write_behavior: Every write requires exactly one of --dry-run and --confirm; confirmed ambiguous outcomes return write_ambiguous and are never retried.
+    earliest_wave: Wave 4B
+    rationale: The mutation is supported with stronger input, authority, and ambiguity controls.
+    evidence_ref: SUPER-CLI-ARCHITECTURE.md sections 7.4 and 7.5; PLUGIN-GAP-ANALYSIS.md section 2
+  gap: &gap
+    disposition: not-yet-supported
+    replacement: null
+    operation: null
+    flag_mapping: []
+    output_difference: No Ericsson connector CLI result is available for this source command.
+    write_behavior: No direct execution is exposed; no mutation authority is granted.
+    earliest_wave: Unscheduled
+    rationale: The current bounded connector contract does not expose this operation.
+    evidence_ref: out/func-strings.txt
+  excluded: &excluded
+    disposition: no-equivalent
+    replacement: null
+    operation: null
+    flag_mapping: []
+    output_difference: No Ericsson connector CLI result is available for this deliberately excluded operation.
+    write_behavior: No direct execution is exposed; no mutation authority is granted.
+    earliest_wave: No port planned
+    rationale: The operation is outside the approved bounded connector contract.
+    evidence_ref: out/func-strings.txt
+
+rows:
+  # Jira — 24 exact source commands.
+  - <<: *gap
+    service: jira
+    source_command: super-cli jira board list
+    rationale: Jira Agile board enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:3099; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_read
+    service: jira
+    source_command: super-cli jira component list
+    replacement: '{brand} jira project get <project>'
+    operation: jira_get_project
+    rationale: Project lookup returns bounded issue types, components, and versions together.
+    evidence_ref: out/func-strings.txt:3094; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *equivalent_read
+    service: jira
+    source_command: super-cli jira field list
+    replacement: '{brand} jira field list'
+    operation: jira_list_fields
+    rationale: The bounded field inventory provides the same discovery outcome.
+    evidence_ref: out/func-strings.txt:3110; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue assign
+    replacement: '{brand} jira issue assign <key> <assignee> --dry-run|--confirm'
+    operation: jira_assign_issue
+    rationale: Assignment uses one bounded assignee and genuine one-shot write intent.
+    evidence_ref: out/func-strings.txt:3049; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue comment add
+    replacement: '{brand} jira issue comment <key> --body-file <path> --dry-run|--confirm'
+    operation: jira_add_comment
+    rationale: Comment text comes from a bounded file instead of process arguments and preserves ambiguous-write refusal.
+    evidence_ref: out/func-strings.txt:3038; PLUGIN-GAP-ANALYSIS.md sections 2 and 3
+  - <<: *gap
+    service: jira
+    source_command: super-cli jira issue comment list
+    rationale: Issue lookup includes a bounded comment projection, but there is no standalone paginated comment-list contract.
+    evidence_ref: out/func-strings.txt:3034; PLUGIN-GAP-ANALYSIS.md section 1.1
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue create
+    replacement: '{brand} jira issue create <project> <issue-type> --summary <text> --dry-run|--confirm'
+    operation: jira_create_issue
+    rationale: Creation accepts a bounded issue shape and rejects arbitrary raw Jira field JSON.
+    evidence_ref: out/func-strings.txt:3063; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue edit
+    replacement: '{brand} jira issue update <key> --field <name=value> --dry-run|--confirm'
+    operation: jira_update_fields
+    rationale: Repeatable --field entries are bounded by an allowlist; arbitrary raw JSON mutation is not accepted.
+    evidence_ref: out/func-strings.txt:3066; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue label add
+    replacement: '{brand} jira issue label <key> add <label> --dry-run|--confirm'
+    operation: jira_manage_labels
+    rationale: Label addition is a bounded explicit operation with protected write authority.
+    evidence_ref: out/func-strings.txt:3070; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue label remove
+    replacement: '{brand} jira issue label <key> remove <label> --dry-run|--confirm'
+    operation: jira_manage_labels
+    rationale: Label removal is a bounded explicit operation with protected write authority.
+    evidence_ref: out/func-strings.txt:3074; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue link
+    replacement: '{brand} jira issue link <inward-key> <outward-key> <link-type> --dry-run|--confirm'
+    operation: jira_link_issues
+    rationale: Linking preserves direction and refuses to retry an uncertain mutation.
+    evidence_ref: out/func-strings.txt:3078; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *renamed_read
+    service: jira
+    source_command: super-cli jira issue list
+    replacement: '{brand} jira issue search --jql <jql> --max-results <count>'
+    operation: jira_search_issues
+    rationale: Jira issue listing is exposed as bounded JQL search.
+    evidence_ref: out/func-strings.txt:3025; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *safer_write
+    service: jira
+    source_command: super-cli jira issue transition do
+    replacement: '{brand} jira issue transition <key> <transition-id> --dry-run|--confirm'
+    operation: jira_transition_issue
+    rationale: Transition execution accepts the discovered transition id and explicit intent.
+    evidence_ref: out/func-strings.txt:3045; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *renamed_read
+    service: jira
+    source_command: super-cli jira issue transition list
+    replacement: '{brand} jira transition list <key>'
+    operation: jira_list_transitions
+    rationale: The same discovery outcome is available under the curated transition tree.
+    evidence_ref: out/func-strings.txt:3042; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *renamed_read
+    service: jira
+    source_command: super-cli jira issue view
+    replacement: '{brand} jira issue get <key>'
+    operation: jira_get_issue
+    rationale: A bounded issue projection replaces the source view spelling.
+    evidence_ref: out/func-strings.txt:3030; SUPER-CLI-ARCHITECTURE.md sections 5.3 and 6.3
+  - <<: *safer_read
+    service: jira
+    source_command: super-cli jira issue-type list
+    replacement: '{brand} jira project get <project>'
+    operation: jira_get_project
+    rationale: Project lookup returns bounded issue types together with components and versions.
+    evidence_ref: out/func-strings.txt:3082; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *renamed_read
+    service: jira
+    source_command: super-cli jira link-type list
+    replacement: '{brand} jira link-type list'
+    operation: jira_list_link_types
+    rationale: The connector exposes the same bounded link-type discovery outcome.
+    evidence_ref: out/func-strings.txt:3085; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *gap
+    service: jira
+    source_command: super-cli jira priority list
+    rationale: Standalone priority enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:3091; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *gap
+    service: jira
+    source_command: super-cli jira project list
+    rationale: The connector resolves one project but does not enumerate all visible projects.
+    evidence_ref: out/func-strings.txt:3053; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *renamed_read
+    service: jira
+    source_command: super-cli jira project view
+    replacement: '{brand} jira project get <project>'
+    operation: jira_get_project
+    rationale: The curated get command returns bounded project discovery metadata.
+    evidence_ref: out/func-strings.txt:3113; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *gap
+    service: jira
+    source_command: super-cli jira sprint list
+    rationale: Jira Agile sprint enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:3103; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *gap
+    service: jira
+    source_command: super-cli jira sprint move
+    rationale: Moving issues into sprints has no reviewed connector preview and confirmation path.
+    evidence_ref: out/func-strings.txt:3106; SUPER-CLI-ARCHITECTURE.md section 6.3
+  - <<: *renamed_read
+    service: jira
+    source_command: super-cli jira user search
+    replacement: '{brand} jira user search-assignable <project> --query <text>'
+    operation: jira_search_assignable_users
+    rationale: The connector deliberately limits results to users assignable in one project.
+    evidence_ref: out/func-strings.txt:3088; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_read
+    service: jira
+    source_command: super-cli jira version list
+    replacement: '{brand} jira project get <project>'
+    operation: jira_get_project
+    rationale: Project lookup returns bounded versions together with issue types and components.
+    evidence_ref: out/func-strings.txt:3097; PLUGIN-GAP-ANALYSIS.md section 4
+
+  # GitLab — 46 exact source commands.
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab branch list
+    rationale: Branch enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2943; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *equivalent_read
+    service: gitlab
+    source_command: super-cli gitlab commit list
+    replacement: '{brand} gitlab commit list <project>'
+    operation: gitlab_list_commits
+    rationale: The bounded commit listing provides the same read outcome.
+    evidence_ref: out/func-strings.txt:2959; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab commit view
+    replacement: '{brand} gitlab commit show <project> <sha>'
+    operation: gitlab_read_commit
+    rationale: Commit details are exposed under the curated show spelling.
+    evidence_ref: out/func-strings.txt:2939; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab file list
+    replacement: '{brand} gitlab repository tree <project> --ref <ref> --path <path>'
+    operation: gitlab_list_repository_tree
+    rationale: Repository-tree listing provides the bounded file and directory discovery outcome.
+    evidence_ref: out/func-strings.txt:2965; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab file view
+    replacement: '{brand} gitlab file show <project> <path> --ref <ref>'
+    operation: gitlab_read_file
+    rationale: File content is bounded by --max-bytes and exposed under the show spelling.
+    evidence_ref: out/func-strings.txt:2962; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab group project list
+    replacement: '{brand} gitlab group project-list <group>'
+    operation: gitlab_list_group_projects
+    rationale: Bounded group traversal replaces the source command's spaced project/list path.
+    evidence_ref: out/func-strings.txt:3006; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab job cancel
+    rationale: Job cancellation has no reviewed preview and confirmation path in this release.
+    evidence_ref: out/func-strings.txt:2992; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *equivalent_read
+    service: gitlab
+    source_command: super-cli gitlab job log
+    replacement: '{brand} gitlab job log <project> <job-id>'
+    operation: gitlab_job_log
+    rationale: The connector returns a bounded, truncated-safe job log.
+    evidence_ref: out/func-strings.txt:2935; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab job play
+    replacement: '{brand} gitlab job play <project> <job-id> --dry-run|--confirm'
+    operation: gitlab_play_job
+    rationale: Manual-job execution uses explicit one-shot intent and preserves ambiguous-write refusal.
+    evidence_ref: out/func-strings.txt:2999; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab job retry
+    replacement: '{brand} gitlab job retry <project> <job-id> --dry-run|--confirm'
+    operation: gitlab_retry_job
+    rationale: Retry is authorized once and does not retry an unproved mutation outcome.
+    evidence_ref: out/func-strings.txt:2995; PLUGIN-GAP-ANALYSIS.md sections 2 and 4
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab job view
+    rationale: A standalone normalized job-detail operation is not exposed in this release.
+    evidence_ref: out/func-strings.txt:2932; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab mr approval list
+    replacement: '{brand} gitlab mr approval-show <project> <iid>'
+    operation: gitlab_merge_request_approvals
+    rationale: Approval state is exposed under a curated read-only spelling.
+    evidence_ref: out/func-strings.txt:2893; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr approve
+    replacement: '{brand} gitlab mr approve <project> <iid> --sha <sha> --dry-run|--confirm'
+    operation: gitlab_approve_merge_request
+    rationale: Approval supports an exact SHA precondition and one-shot write authority.
+    evidence_ref: out/func-strings.txt:2897; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab mr commit list
+    replacement: '{brand} gitlab mr commit-list <project> <iid>'
+    operation: gitlab_list_merge_request_commits
+    rationale: The bounded MR commit inventory uses a curated hyphenated leaf.
+    evidence_ref: out/func-strings.txt:2890; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr create
+    replacement: '{brand} gitlab mr create <project> <source-branch> <target-branch> --title <text> --dry-run|--confirm'
+    operation: gitlab_create_merge_request
+    rationale: MR creation uses bounded fields and refuses ambiguous mutation retries.
+    evidence_ref: out/func-strings.txt:2904; PLUGIN-GAP-ANALYSIS.md sections 1.2 and 2
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab mr diff
+    rationale: The connector reads MR metadata but does not expose the source command's per-file diff contract.
+    evidence_ref: out/func-strings.txt:2869; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr discussion resolve
+    replacement: '{brand} gitlab mr discussion-resolve <project> <iid> <discussion-id> --resolved --dry-run|--confirm'
+    operation: gitlab_resolve_discussion
+    rationale: Resolution is explicit, bounded to one discussion, and protected by write intent.
+    evidence_ref: out/func-strings.txt:2882; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr discussion unresolve
+    replacement: '{brand} gitlab mr discussion-resolve <project> <iid> <discussion-id> --no-resolved --dry-run|--confirm'
+    operation: gitlab_resolve_discussion
+    rationale: Unresolve is represented by the same bounded operation with resolved=false.
+    evidence_ref: out/func-strings.txt:2886; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr edit
+    replacement: '{brand} gitlab mr update <project> <iid> --title <text> --dry-run|--confirm'
+    operation: gitlab_update_merge_request
+    rationale: MR updates accept only reviewed bounded fields and explicit intent.
+    evidence_ref: out/func-strings.txt:2907; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *safer_read
+    service: gitlab
+    source_command: super-cli gitlab mr list
+    replacement: '{brand} gitlab mr list <project>'
+    operation: gitlab_list_merge_requests
+    rationale: The replacement requires a project and does not preserve SuperCLI's user-scoped no-project mode.
+    evidence_ref: out/func-strings.txt:2861; post-Wave-3 reconciliation
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr merge
+    replacement: '{brand} gitlab mr merge <project> <iid> --sha <sha> --dry-run|--confirm'
+    operation: gitlab_merge_merge_request
+    rationale: Merge preserves approval, SHA, pipeline, and ambiguous-write protections.
+    evidence_ref: out/func-strings.txt:2901; PLUGIN-GAP-ANALYSIS.md sections 2 and 4
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr note add
+    replacement: '{brand} gitlab mr note <project> <iid> --body-file <path> --dry-run|--confirm'
+    operation: gitlab_create_mr_note
+    rationale: Note content comes from a bounded file and the mutation uses one-shot authority.
+    evidence_ref: out/func-strings.txt:2876; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab mr note list
+    replacement: '{brand} gitlab mr discussion-list <project> <iid>'
+    operation: gitlab_list_merge_request_discussions
+    rationale: The connector returns bounded discussions and notes together.
+    evidence_ref: out/func-strings.txt:2873; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab mr note reply
+    replacement: '{brand} gitlab mr discussion-reply <project> <iid> <discussion-id> --body-file <path> --dry-run|--confirm'
+    operation: gitlab_reply_to_discussion
+    rationale: Replies are bound to one discussion and use bounded file input and explicit intent.
+    evidence_ref: out/func-strings.txt:2879; PLUGIN-GAP-ANALYSIS.md section 4
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab mr pipeline list
+    rationale: MR-specific pipeline enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2984; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab mr rebase
+    rationale: MR rebase has no reviewed non-mutating preview and confirmation path in this release.
+    evidence_ref: out/func-strings.txt:2910; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *renamed_read
+    service: gitlab
+    source_command: super-cli gitlab mr view
+    replacement: '{brand} gitlab mr show <project> <iid>'
+    operation: gitlab_read_merge_request
+    rationale: Bounded MR details are exposed under the show spelling.
+    evidence_ref: out/func-strings.txt:2865; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab pipeline cancel
+    rationale: Pipeline cancellation has no reviewed preview and confirmation path in this release.
+    evidence_ref: out/func-strings.txt:2988; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab pipeline job list
+    rationale: Pipeline-job enumeration is not exposed as a standalone connector operation.
+    evidence_ref: out/func-strings.txt:2928; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *equivalent_read
+    service: gitlab
+    source_command: super-cli gitlab pipeline list
+    replacement: '{brand} gitlab pipeline list <project>'
+    operation: gitlab_list_pipelines
+    rationale: The bounded pipeline inventory provides the same read outcome.
+    evidence_ref: out/func-strings.txt:2914; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *safer_write
+    service: gitlab
+    source_command: super-cli gitlab pipeline retry
+    replacement: '{brand} gitlab pipeline retry <project> <pipeline-id> --dry-run|--confirm'
+    operation: gitlab_retry_pipeline
+    rationale: Retry is one-shot, preserves pipeline reconciliation, and never replays an ambiguous write.
+    evidence_ref: out/func-strings.txt:2924; PLUGIN-GAP-ANALYSIS.md sections 2 and 4
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab pipeline run
+    rationale: Creating a pipeline has no reviewed preview and confirmation path in this release.
+    evidence_ref: out/func-strings.txt:2920; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *safer_read
+    service: gitlab
+    source_command: super-cli gitlab pipeline view
+    replacement: '{brand} gitlab pipeline view <project> <pipeline-id>'
+    operation: gitlab_read_pipeline
+    rationale: The replacement returns only bounded normalized pipeline metadata for the evidenced project and pipeline inputs.
+    evidence_ref: out/func-strings.txt:2917; post-Wave-3 reconciliation
+  - <<: *excluded
+    service: gitlab
+    source_command: super-cli gitlab project create
+    rationale: Project provisioning is a governance operation outside the approved bounded connector contract.
+    evidence_ref: out/func-strings.txt:2981; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *excluded
+    service: gitlab
+    source_command: super-cli gitlab project edit
+    rationale: Broad project-settings mutation is deliberately excluded from the bounded connector contract.
+    evidence_ref: out/func-strings.txt:2978; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab project search
+    rationale: Fuzzy project search is not exposed; the connector resolves one exact project identity.
+    evidence_ref: out/func-strings.txt:2972; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *safer_read
+    service: gitlab
+    source_command: super-cli gitlab project view
+    replacement: '{brand} gitlab project resolve <project>'
+    operation: gitlab_resolve_project
+    rationale: The connector resolves one exact project and returns bounded identity metadata.
+    evidence_ref: out/func-strings.txt:2975; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab release create
+    rationale: GitLab release creation is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:3003; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab release list
+    rationale: GitLab release enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2951; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab release view
+    rationale: GitLab release detail is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2955; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab search code
+    rationale: Repository code search and snippets are not exposed by the bounded connector contract.
+    evidence_ref: out/func-strings.txt:2968; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab tag list
+    rationale: Repository tag enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2947; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab todo done
+    rationale: User to-do mutation is not part of the project-scoped connector contract.
+    evidence_ref: out/func-strings.txt:3019; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *gap
+    service: gitlab
+    source_command: super-cli gitlab todo list
+    rationale: User-scoped to-do enumeration is not part of the project-scoped connector contract.
+    evidence_ref: out/func-strings.txt:3015; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *excluded
+    service: gitlab
+    source_command: super-cli gitlab variable list
+    rationale: CI/CD variable enumeration can expose protected configuration and is deliberately excluded.
+    evidence_ref: out/func-strings.txt:3012; SUPER-CLI-ARCHITECTURE.md section 6.5
+  - <<: *excluded
+    service: gitlab
+    source_command: super-cli gitlab webhook list
+    rationale: Webhook endpoint enumeration is outside the bounded project-content contract.
+    evidence_ref: out/func-strings.txt:3009; SUPER-CLI-ARCHITECTURE.md section 6.5
+
+  # Confluence — 19 exact source commands.
+  - <<: *excluded
+    service: confluence
+    source_command: super-cli confluence page append
+    rationale: Blind append is deliberately excluded because the bounded update path requires an explicit replacement body and version reconciliation.
+    evidence_ref: out/func-strings.txt:2691; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence page attachment list
+    rationale: Attachment enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2674; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *renamed_read
+    service: confluence
+    source_command: super-cli confluence page child list
+    replacement: '{brand} confluence page child-list <content-id>'
+    operation: confluence_list_children
+    rationale: Child-page enumeration is exposed under the curated hyphenated leaf.
+    evidence_ref: out/func-strings.txt:2640; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *safer_write
+    service: confluence
+    source_command: super-cli confluence page comment add
+    replacement: '{brand} confluence page comment <content-id> --body-file <path> --dry-run|--confirm'
+    operation: confluence_add_comment
+    rationale: Comment input is bounded Markdown from a file and is escaped before storage rendering.
+    evidence_ref: out/func-strings.txt:2667; SUPER-CLI-ARCHITECTURE.md sections 6.4 and 7.3
+  - <<: *excluded
+    service: confluence
+    source_command: super-cli confluence page comment delete
+    rationale: Comment deletion is deliberately excluded because no reviewed preview and reconciliation contract exists.
+    evidence_ref: out/func-strings.txt:2670; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *renamed_read
+    service: confluence
+    source_command: super-cli confluence page comment list
+    replacement: '{brand} confluence page comment-list <content-id>'
+    operation: confluence_list_comments
+    rationale: Bounded comments are exposed under the curated hyphenated leaf.
+    evidence_ref: out/func-strings.txt:2664; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *safer_write
+    service: confluence
+    source_command: super-cli confluence page create
+    replacement: '{brand} confluence page create <space-key> --title <text> --body-file <path> --dry-run|--confirm'
+    operation: confluence_create_page
+    rationale: Bounded Markdown is escaped into storage form and returned content remains marked untrusted.
+    evidence_ref: out/func-strings.txt:2684; SUPER-CLI-ARCHITECTURE.md sections 6.4 and 7.3
+  - <<: *excluded
+    service: confluence
+    source_command: super-cli confluence page delete
+    rationale: Page deletion is deliberately excluded from the approved write contract despite source trash recoverability.
+    evidence_ref: out/func-strings.txt:2680; SUPER-CLI-ARCHITECTURE.md sections 6.4 and 7.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence page label add
+    rationale: Label mutation is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2650; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence page label list
+    rationale: Label enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2643; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence page label remove
+    rationale: Label mutation is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2654; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *excluded
+    service: confluence
+    source_command: super-cli confluence page move
+    rationale: Page moves are deliberately excluded because no bounded preview and hierarchy-reconciliation contract exists.
+    evidence_ref: out/func-strings.txt:2677; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *equivalent_read
+    service: confluence
+    source_command: super-cli confluence page search
+    replacement: '{brand} confluence page search --cql <cql>'
+    operation: confluence_search
+    rationale: The bounded CQL search provides the same discovery outcome.
+    evidence_ref: out/func-strings.txt:2632; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *safer_write
+    service: confluence
+    source_command: super-cli confluence page update
+    replacement: '{brand} confluence page update <content-id> --body-file <path> --dry-run|--confirm'
+    operation: confluence_update_page
+    rationale: Markdown is escaped into storage form and optimistic version conflicts remain explicit.
+    evidence_ref: out/func-strings.txt:2687; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence page version list
+    rationale: Page version history is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2658; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence page version view
+    rationale: Historical page-version bodies are not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2661; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *renamed_read
+    service: confluence
+    source_command: super-cli confluence page view
+    replacement: '{brand} confluence page get <content-id>'
+    operation: confluence_get_page
+    rationale: The bounded page projection is exposed under the get spelling with an untrusted-content warning.
+    evidence_ref: out/func-strings.txt:2636; SUPER-CLI-ARCHITECTURE.md sections 6.4 and 7.3
+  - <<: *equivalent_read
+    service: confluence
+    source_command: super-cli confluence space list
+    replacement: '{brand} confluence space list'
+    operation: confluence_list_spaces
+    rationale: The bounded space inventory provides the same read outcome.
+    evidence_ref: out/func-strings.txt:2616; SUPER-CLI-ARCHITECTURE.md section 6.4
+  - <<: *gap
+    service: confluence
+    source_command: super-cli confluence space view
+    rationale: Standalone space-detail lookup is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2621; SUPER-CLI-ARCHITECTURE.md section 6.4
+
+  # ARM — 19 exact source commands.
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm artifact copy
+    rationale: Server-side artifact copy is outside the approved deploy/delete contract and has no reviewed reconciliation path.
+    evidence_ref: out/func-strings.txt:2546; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *safer_write
+    service: arm
+    source_command: super-cli arm artifact delete
+    replacement: '{brand} arm artifact delete <repo> <path> --dry-run|--confirm'
+    operation: arm_delete
+    rationale: Deletion requires exact intent, file-path confinement, and ambiguous-write refusal.
+    evidence_ref: out/func-strings.txt:2542; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *safer_write
+    service: arm
+    source_command: super-cli arm artifact deploy
+    replacement: '{brand} arm artifact deploy <repo> <path> --file <path> --dry-run|--confirm'
+    operation: arm_deploy
+    rationale: Deployment confines the local file, validates certificates, compares checksums first, and falls back to full upload when needed.
+    evidence_ref: out/func-strings.txt:2538; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm artifact download
+    rationale: Binary download has no equivalent; use bounded artifact metadata and checksums to identify content, then use an approved file-transfer path.
+    evidence_ref: out/func-strings.txt:2534; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *equivalent_read
+    service: arm
+    source_command: super-cli arm artifact info
+    replacement: '{brand} arm artifact info <repo> <path>'
+    operation: arm_artifact_info
+    rationale: The connector returns bounded metadata, checksums, and folder children.
+    evidence_ref: out/func-strings.txt:2527; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *safer_read
+    service: arm
+    source_command: super-cli arm artifact list
+    replacement: '{brand} arm artifact info <repo> <path> --max-children <count>'
+    operation: arm_artifact_info
+    rationale: Folder listing is a bounded child projection of artifact metadata rather than an unbounded standalone list.
+    evidence_ref: out/func-strings.txt:2531; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm artifact move
+    rationale: Server-side artifact move is outside the approved deploy/delete contract and has no reviewed reconciliation path.
+    evidence_ref: out/func-strings.txt:2549; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm artifact properties delete
+    rationale: Artifact property mutation is deliberately excluded from the read-only property contract.
+    evidence_ref: out/func-strings.txt:2559; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *renamed_read
+    service: arm
+    source_command: super-cli arm artifact properties get
+    replacement: '{brand} arm artifact properties <repo> <path>'
+    operation: arm_get_properties
+    rationale: Bounded property reads use the curated properties leaf and optional repeatable keys.
+    evidence_ref: out/func-strings.txt:2552; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm artifact properties set
+    rationale: Artifact property mutation is deliberately excluded from the read-only property contract.
+    evidence_ref: out/func-strings.txt:2555; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *gap
+    service: arm
+    source_command: super-cli arm docker tag list
+    rationale: Docker tag enumeration is not exposed by the approved connector contract.
+    evidence_ref: out/func-strings.txt:2563; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm permission list
+    rationale: Permission-target enumeration is an administrative operation outside the bounded artifact contract.
+    evidence_ref: out/func-strings.txt:2582; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm permission view
+    rationale: Permission-target details are administrative data outside the bounded artifact contract.
+    evidence_ref: out/func-strings.txt:2592; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *renamed_read
+    service: arm
+    source_command: super-cli arm repo list
+    replacement: '{brand} arm repository list'
+    operation: arm_list_repositories
+    rationale: Repository enumeration is exposed under the full repository noun with bounded filters.
+    evidence_ref: out/func-strings.txt:2522; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *safer_read
+    service: arm
+    source_command: super-cli arm search aql
+    replacement: '{brand} arm artifact search --query-file <path>'
+    operation: arm_search_artifacts
+    rationale: AQL is bounded, parsed locally from a file or one query option, and constrained to approved include fields and limits.
+    evidence_ref: out/func-strings.txt:2567; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm storage info
+    rationale: Instance-wide storage administration data is outside the bounded artifact contract.
+    evidence_ref: out/func-strings.txt:2571; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm xray scan
+    rationale: Starting Xray scans is outside the approved artifact metadata and deployment contract.
+    evidence_ref: out/func-strings.txt:2607; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm xray summary
+    rationale: Xray vulnerability data is not part of the approved ARM connector contract.
+    evidence_ref: out/func-strings.txt:2600; SUPER-CLI-ARCHITECTURE.md section 6.6
+  - <<: *excluded
+    service: arm
+    source_command: super-cli arm xray violation list
+    rationale: Xray policy violations are not part of the approved ARM connector contract.
+    evidence_ref: out/func-strings.txt:2604; SUPER-CLI-ARCHITECTURE.md section 6.6
+
+new_capabilities:
+  - status: new-capability
+    operation: jira_my_tickets
+    access: read
+    replacement: '{brand} jira issue mine'
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    rationale: The Ericsson connector adds an active-user ticket view without an exact pinned source command.
+    evidence_ref: connector descriptor contract
+  - status: new-capability
+    operation: gitlab_list_commit_comments
+    access: read
+    replacement: '{brand} gitlab commit comment-list <project> <sha>'
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    rationale: The Ericsson connector adds bounded commit-comment discovery without an exact pinned source command.
+    evidence_ref: connector descriptor contract
+  - status: new-capability
+    operation: gitlab_list_commit_discussions
+    access: read
+    replacement: '{brand} gitlab commit discussion-list <project> <sha>'
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    rationale: The Ericsson connector adds bounded commit-discussion discovery without an exact pinned source command.
+    evidence_ref: connector descriptor contract
+  - status: new-capability
+    operation: gitlab_inspect_ci
+    access: read
+    replacement: '{brand} gitlab ci inspect <project>'
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    rationale: The Ericsson connector adds bounded multi-file CI inspection without an exact pinned source command.
+    evidence_ref: connector descriptor contract; post-Wave-3 reconciliation
+  - status: new-capability
+    operation: gitlab_create_named_branch
+    access: write
+    replacement: '{brand} gitlab branch create <project> <branch> <ref> --dry-run|--confirm'
+    write_behavior: Every write requires exactly one of --dry-run and --confirm; confirmed ambiguous outcomes return write_ambiguous and are never retried.
+    rationale: No exact pinned source command exists for explicit named-branch creation; the connector adds exact-ref identity reconciliation.
+    evidence_ref: connector descriptor contract; post-Wave-3 reconciliation
+  - status: new-capability
+    operation: gitlab_create_branch
+    access: write
+    replacement: '{brand} gitlab branch create-ticket <project> <ticket-key> --summary <text> --dry-run|--confirm'
+    write_behavior: Every write requires exactly one of --dry-run and --confirm; confirmed ambiguous outcomes return write_ambiguous and are never retried.
+    rationale: The Ericsson connector adds ticket-derived branch naming without an exact pinned source command.
+    evidence_ref: connector descriptor contract; post-Wave-3 reconciliation
+  - status: new-capability
+    operation: gitlab_commit_changes
+    access: write
+    replacement: '{brand} gitlab commit create <project> <branch> --commit-message <text> --change-file <path> --dry-run|--confirm'
+    write_behavior: Every write requires exactly one of --dry-run and --confirm; confirmed ambiguous outcomes return write_ambiguous and are never retried.
+    rationale: The Ericsson connector adds bounded multi-action commits without an exact pinned source command.
+    evidence_ref: connector descriptor contract
+  - status: new-capability
+    operation: confluence_get_page_body
+    access: read
+    replacement: '{brand} confluence page body <content-id>'
+    write_behavior: Read-only; dry-run, confirmation, and ambiguous-write handling do not apply.
+    rationale: The Ericsson connector adds a bounded body-specific read without an exact pinned source command.
+    evidence_ref: connector descriptor contract

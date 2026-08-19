@@ -18,12 +18,14 @@ provides_tools:
   - gitlab_read_file
   - gitlab_read_merge_request
   - gitlab_list_pipelines
+  - gitlab_read_pipeline
   - gitlab_inspect_ci
   - gitlab_job_log
   - gitlab_retry_job
   - gitlab_play_job
   - gitlab_retry_pipeline
   - gitlab_create_branch
+  - gitlab_create_named_branch
   - gitlab_commit_changes
   - gitlab_create_merge_request
   - gitlab_create_mr_note

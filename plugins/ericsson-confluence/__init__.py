@@ -65,8 +65,9 @@ if not _own_package_loaded():
     __package__ = _direct_package_name()
     __spec__ = sys.modules[__package__].__spec__
 
+from . import application
 from . import tools as confluence_tools
-from .models import ConfluenceError, SAFE_ERROR_MESSAGES, safe_remediation
+from .models import ConfluenceError, SAFE_ERROR_MESSAGES
 
 
 def _arg(args: dict, name: str) -> str:
@@ -96,13 +97,28 @@ WRITE_APPROVALS = {
 def _has_write_admission(admission: object, tool_name: str) -> bool:
     """Accept only the host admission minted for this exact write tool."""
     try:
+        from hermes_cli.plugins import PluginToolAdmission
+
         return (
-            getattr(admission, "approved", None) is True
+            type(admission) is PluginToolAdmission
+            and getattr(admission, "approved", None) is True
             and getattr(admission, "policy", None) == "plugin_approve"
             and getattr(admission, "tool_name", None) == tool_name
         )
     except Exception:
         return False
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _interrupt_authority():
+    try:
+        from tools.interrupt import is_interrupted
+    except ImportError:
+        return lambda: False
+    return is_interrupted
 
 
 def register(ctx: object) -> None:
@@ -147,15 +163,15 @@ def register(ctx: object) -> None:
     if not hasattr(ctx, "register_tool"):
         return
 
-    def json_error(category: str, remediation: object = None) -> str:
-        error = {"category": category, "message": SAFE_ERROR_MESSAGES[category]}
-        safe = safe_remediation(remediation)
-        if safe:
-            error["remediation"] = safe
-        return json.dumps(
-            {"success": False, "error": error},
-            ensure_ascii=False,
-            separators=(",", ":"),
+    def json_error(category: str) -> str:
+        return _json(
+            {
+                "success": False,
+                "error": {
+                    "category": category,
+                    "message": SAFE_ERROR_MESSAGES[category],
+                },
+            }
         )
 
     def available() -> bool:
@@ -174,21 +190,89 @@ def register(ctx: object) -> None:
                 configuration = ctx.configuration()
             except Exception:
                 return json_error("invalid_configuration")
-            try:
-                result = confluence_tools.invoke(name, args or {}, configuration)
-                return json.dumps(
-                    {"success": True, "result": result},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
+            return _json(
+                application.execute(
+                    name,
+                    args or {},
+                    configuration,
+                    cancel_check=_interrupt_authority(),
                 )
-            except ConfluenceError as exc:
-                return json_error(exc.category, exc.remediation)
-            except (KeyError, TypeError, ValueError):
-                return json_error("invalid_input")
-            except Exception:
-                return json_error("transient")
+            )
 
         return invoke
+
+    def local_command_handler(invocation):
+        permission_error = {
+            "success": False,
+            "error": {
+                "category": "permission",
+                "message": SAFE_ERROR_MESSAGES["permission"],
+            },
+        }
+        invalid_input = {
+            "success": False,
+            "error": {
+                "category": "invalid_input",
+                "message": SAFE_ERROR_MESSAGES["invalid_input"],
+            },
+        }
+        try:
+            from hermes_cli.plugin_application_commands import (
+                PluginApplicationCommandInvocation,
+                PluginApplicationCommandMode,
+            )
+
+            if (
+                type(invocation) is not PluginApplicationCommandInvocation
+                or not invocation.active
+                or invocation.provider_id != "ericsson-confluence"
+                or invocation.caller_id != "ericsson-connector-cli"
+                or invocation.operation not in confluence_tools.SCHEMAS
+            ):
+                return permission_error
+            name = invocation.operation
+            arguments = dict(invocation.arguments)
+            mode = invocation.mode
+            if {"dry_run", "confirm"}.intersection(arguments):
+                return invalid_input
+            if name in _WRITE_TOOLS:
+                if mode is PluginApplicationCommandMode.DRY_RUN:
+                    arguments["dry_run"] = True
+                elif mode is PluginApplicationCommandMode.CONFIRM:
+                    arguments["confirm"] = True
+                else:
+                    return permission_error
+            elif mode is not PluginApplicationCommandMode.READ:
+                return permission_error
+        except Exception:
+            return permission_error
+
+        try:
+            configuration = ctx.configuration()
+        except Exception:
+            return {
+                "success": False,
+                "error": {
+                    "category": "invalid_configuration",
+                    "message": SAFE_ERROR_MESSAGES["invalid_configuration"],
+                },
+            }
+        return application.execute(
+            name,
+            arguments,
+            configuration,
+            cancel_check=_interrupt_authority(),
+        )
+
+    if hasattr(ctx, "register_application_commands"):
+        ctx.register_application_commands(
+            operations={
+                name: "write" if name in _WRITE_TOOLS else "read"
+                for name in confluence_tools.SCHEMAS
+            },
+            allowed_callers={"ericsson-connector-cli"},
+            handler=local_command_handler,
+        )
 
     for name, schema in confluence_tools.SCHEMAS.items():
         ctx.register_tool(

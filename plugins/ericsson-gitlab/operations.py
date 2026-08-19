@@ -2636,6 +2636,62 @@ class GitLabOperations:
             "continuation": self._continuation(pages),
         }
 
+    def read_pipeline(
+        self, project: str | int, pipeline_id: int
+    ) -> dict[str, Any]:
+        pipeline_id = _positive_bound(pipeline_id, 2_147_483_647)
+        deadline = self.client.operation_deadline()
+        project_result = self.resolve_project(project, deadline=deadline)
+        endpoint = _project_endpoint(project_result["id"])
+        payload = _as_object(
+            self.client.get_json(
+                f"/api/v4/projects/{endpoint}/pipelines/{pipeline_id}",
+                deadline=deadline,
+            )
+        )
+        if _remote_positive_int(payload.get("id")) != pipeline_id:
+            raise GitLabError("invalid_remote_data")
+        if "project_id" in payload and (
+            _remote_positive_int(payload.get("project_id"))
+            != project_result["id"]
+        ):
+            raise GitLabError("invalid_remote_data")
+
+        def required_string(field: str, maximum: int) -> str:
+            value = payload.get(field)
+            if (
+                field not in payload
+                or not isinstance(value, str)
+                or not value
+                or len(value) > maximum
+                or "\x00" in value
+            ):
+                raise GitLabError("invalid_remote_data")
+            return value
+
+        result: dict[str, Any] = {
+            "project": {
+                "id": project_result["id"],
+                "path": project_result["path_with_namespace"],
+            },
+            "pipeline_id": pipeline_id,
+            "status": required_string("status", 64),
+            "ref": required_string("ref", _MAX_REF),
+            "sha": required_string("sha", 128),
+            "source": required_string("source", 128),
+            "web_url": required_string("web_url", _MAX_PROJECT_REFERENCE),
+        }
+        _same_origin_url(result["web_url"], self.client.auth.origin)
+        for field in ("created_at", "updated_at", "started_at", "finished_at"):
+            if field not in payload:
+                raise GitLabError("invalid_remote_data")
+            value = payload[field]
+            if value is None:
+                result[field] = None
+            else:
+                result[field] = _rfc3339(value, remote=True)[1]
+        return result
+
     def _write_json(
         self,
         method: str,
@@ -2884,6 +2940,125 @@ class GitLabOperations:
             return result
 
         return self._usable_write_result(finish_branch_write)
+
+    def create_named_branch(
+        self,
+        project: str | int,
+        *,
+        branch: str,
+        ref: str,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        branch = _validate_ref(branch)
+        ref = _validate_ref(ref)
+        if not isinstance(dry_run, bool):
+            raise GitLabError("invalid_input")
+
+        deadline = self.client.operation_deadline()
+        project_result = self._write_project(project, deadline=deadline)
+        endpoint = _project_endpoint(project_result["id"])
+        commit_payload = _as_object(
+            self.client.get_json(
+                f"/api/v4/projects/{endpoint}/repository/commits/"
+                f"{quote(ref, safe='')}",
+                deadline=deadline,
+            )
+        )
+        commit_id = _commit_sha(commit_payload.get("id"))
+        if "project_id" in commit_payload and (
+            _remote_positive_int(commit_payload.get("project_id"))
+            != project_result["id"]
+        ):
+            raise GitLabError("invalid_remote_data")
+
+        branch_path = (
+            f"/api/v4/projects/{endpoint}/repository/branches/"
+            f"{quote(branch, safe='')}"
+        )
+
+        def read_target() -> dict[str, Any] | None:
+            try:
+                payload = self.client.get_json(branch_path, deadline=deadline)
+            except GitLabError as exc:
+                if exc.category == "not_found":
+                    return None
+                raise
+            return self._branch_result(
+                payload,
+                project=project,
+                project_result=project_result,
+                branch=branch,
+                source_ref=ref,
+                created=False,
+            )
+
+        existing = read_target()
+        if existing is not None:
+            if existing["commit_id"] != commit_id:
+                raise GitLabError("conflict")
+            if dry_run:
+                existing["dry_run"] = True
+            return existing
+        if dry_run:
+            return {
+                "project": str(project),
+                "branch": branch,
+                "source_ref": ref,
+                "commit_id": commit_id,
+                "created": False,
+                "reused": False,
+                "dry_run": True,
+            }
+
+        status, created_payload = self._write_json(
+            "POST",
+            f"/api/v4/projects/{endpoint}/repository/branches",
+            {"branch": branch, "ref": commit_id},
+            deadline=deadline,
+        )
+        duplicate_race = (
+            status in {400, 409}
+            and "branch already exists"
+            in " ".join(self._remote_messages(created_payload)).lower()
+        )
+        if status >= 400 and not duplicate_race:
+            raise self.client._error_for_status(status)
+        if status < 400 and status != 201:
+            raise GitLabError("write_ambiguous")
+
+        def reconcile_named_branch() -> dict[str, Any]:
+            partial_identity: dict[str, Any] = {}
+            if not duplicate_race:
+                partial_identity = self._validate_partial_branch_identity(
+                    _as_object(created_payload),
+                    project_result=project_result,
+                    branch=branch,
+                )
+            reconciled_payload = self.client.get_json(
+                branch_path, deadline=deadline
+            )
+            result = self._branch_result(
+                reconciled_payload,
+                project=project,
+                project_result=project_result,
+                branch=branch,
+                source_ref=ref,
+                created=not duplicate_race,
+            )
+            if result["commit_id"] != commit_id:
+                raise GitLabError("invalid_remote_data")
+            if partial_identity:
+                reconciled_identity = self._validate_partial_branch_identity(
+                    _as_object(reconciled_payload),
+                    project_result=project_result,
+                    branch=branch,
+                )
+                self._require_reconciled_identity(
+                    partial_identity, reconciled_identity
+                )
+            return result
+
+        return self._usable_write_result(reconcile_named_branch)
 
     @staticmethod
     def _commit_actions(

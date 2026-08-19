@@ -1,7 +1,7 @@
 ---
 id: gitlab-tools
 display_name: GitLab Tools
-aliases: [Ericsson GitLab, repository tools, merge request tools, GitLab CI tools]
+aliases: [Ericsson GitLab, repository tools, merge request tools, GitLab CI tools, "<brand> gitlab commands", Ericsson GitLab connector CLI]
 goals:
   - Explore nested groups, subgroups, and visible projects recursively.
   - Inspect recent commits, commit details, comments, and discussions.
@@ -10,12 +10,13 @@ goals:
   - Inspect GitLab pipelines, job logs, and CI configuration without reading variable values.
   - Reply to and resolve merge request discussions, inspect approvals, approve, and SHA-pin a merge.
   - Preview and perform explicitly approved GitLab repository, review, and CI recovery writes.
+  - Run deterministic `<brand> gitlab ...` shell commands without replacing natural-language GitLab conversations.
 maturity: available
 recommendation_eligible: true
 source_flows: []
 implementation:
   skills: [skills/ericsson/gitlab]
-  plugins: [plugins/ericsson-gitlab]
+  plugins: [plugins/ericsson-gitlab, plugins/ericsson-connector-cli]
   mcp_servers: []
   workflows: []
   tools:
@@ -32,12 +33,14 @@ implementation:
     - gitlab_list_merge_request_commits
     - gitlab_list_merge_request_discussions
     - gitlab_list_pipelines
+    - gitlab_read_pipeline
     - gitlab_inspect_ci
     - gitlab_job_log
     - gitlab_retry_job
     - gitlab_play_job
     - gitlab_retry_pipeline
     - gitlab_create_branch
+    - gitlab_create_named_branch
     - gitlab_commit_changes
     - gitlab_create_merge_request
     - gitlab_create_mr_note
@@ -76,21 +79,33 @@ troubleshooting: [plugin disabled, missing or invalid configuration, permission 
 
 ## What it solves
 
-The standalone Ericsson GitLab plugin provides 28 tools: 16 bounded reads and
+The standalone Ericsson GitLab plugin provides 30 tools: 18 bounded reads and
 12 approval-gated writes. It covers recursive group discovery, repository and
 commit research, actionable merge-request review, and CI diagnosis and recovery.
 
+## Direct shell commands
+
+Natural-language GitLab requests remain available for research, review, and
+cross-system workflows. The always-loaded facade makes `<brand> gitlab --help`
+visible before enablement and exposes deterministic leaves such as
+`<brand> gitlab pipeline view group/project 918`. The facade has no GitLab
+configuration and is not a connector to enable; execution still requires
+`ericsson-gitlab` enabled and configured in the active profile. Every direct
+write requires exactly one of `--dry-run` and `--confirm`, and origins,
+credentials, certificate paths, and profile selection stay off argv.
+
 The read surface resolves projects; lists group projects, repository trees,
 commits, commit comments and discussions, merge requests, merge-request commits
-and discussions, and pipelines; reads files, commits, merge requests, CI job-log
-tails, and merge-request approval state; and inspects CI structure and variable
-metadata without returning variable values.
+and discussions, and pipelines; reads files, commits, merge requests, exact
+pipeline metadata, CI job-log tails, and merge-request approval state; and
+inspects CI structure and variable metadata without returning variable values.
 
-The write surface creates branches, atomic commits, and merge requests; posts
-merge-request notes; replies to and resolves or reopens discussions; approves,
-SHA-pins and merges, or updates merge requests; and retries jobs, starts manual
-jobs, or retries failed and canceled pipeline jobs. Pipeline/job cancellation
-and merge-request rebasing remain deliberately unavailable.
+The write surface creates ticket-derived or explicitly named branches, atomic
+commits, and merge requests; posts merge-request notes; replies to and resolves
+or reopens discussions; approves, SHA-pins and merges, or updates merge requests;
+and retries jobs, starts manual jobs, or retries failed and canceled pipeline
+jobs. Pipeline/job cancellation and merge-request rebasing remain deliberately
+unavailable.
 
 ## Try saying
 
