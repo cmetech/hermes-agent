@@ -1,7 +1,7 @@
 'use client'
 
 import mermaid from 'mermaid'
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { Zoomable } from '@/components/ui/zoomable'
 import { copySvgAsPng } from '@/lib/svg-image'
@@ -41,6 +41,35 @@ function SourcePreview({ code, muted }: { code: string; muted?: boolean }) {
       {code}
     </pre>
   )
+}
+
+function MermaidMarkup({ className, fit, svg }: { className?: string; fit?: boolean; svg: string }) {
+  const container = useRef<HTMLDivElement>(null)
+
+  useLayoutEffect(() => {
+    if (!fit || !container.current) {
+      return
+    }
+
+    const diagram = container.current.querySelector('svg')
+
+    if (!diagram) {
+      return
+    }
+
+    // Mermaid emits an intrinsic `max-width` inline. That is useful in chat,
+    // but it wins over a responsive workflow canvas when Windows display
+    // scaling makes the Electron CSS viewport narrower than the `sm`
+    // breakpoint. Apply the fit contract directly to the generated SVG so
+    // the result is independent of stylesheet order and platform DPI.
+    diagram.setAttribute('preserveAspectRatio', 'xMidYMid meet')
+    diagram.style.setProperty('width', '100%', 'important')
+    diagram.style.setProperty('height', '100%', 'important')
+    diagram.style.setProperty('max-width', 'none', 'important')
+    diagram.style.setProperty('max-height', 'none', 'important')
+  }, [fit, svg])
+
+  return <div className={className} dangerouslySetInnerHTML={{ __html: svg }} ref={container} />
 }
 
 // Lazy chunk (pulls in mermaid). Renders ```mermaid fences as diagrams; shows
@@ -106,20 +135,22 @@ export default function MermaidRenderer({ code, streaming, presentation = 'inlin
       label="Open diagram"
       onCopy={() => copySvgAsPng(svg)}
       overlay={
-        <div
+        <MermaidMarkup
           className="size-full p-6 pb-16 [&_svg]:block [&_svg]:size-full [&_svg]:!max-h-none [&_svg]:!max-w-none"
-          dangerouslySetInnerHTML={{ __html: svg }}
+          fit
+          svg={svg}
         />
       }
     >
-      <div
+      <MermaidMarkup
         className={cn(
           'overflow-hidden p-3 [&_svg]:mx-auto [&_svg]:block [&_svg]:max-w-full',
           workflowPresentation
             ? 'h-[clamp(16rem,50dvh,34rem)] [&_svg]:size-full [&_svg]:!max-h-none [&_svg]:!max-w-none'
             : '[&_svg]:h-auto [&_svg]:max-h-[33dvh]'
         )}
-        dangerouslySetInnerHTML={{ __html: svg }}
+        fit={workflowPresentation}
+        svg={svg}
       />
     </Zoomable>
   )

@@ -18,9 +18,16 @@ import {
   previewWorkflowCleanup
 } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { normalize } from '@/lib/text'
 import { notify } from '@/store/notifications'
 import { ensureGatewayProfile } from '@/store/profile'
-import type { WorkflowDefinition, WorkflowEventPage, WorkflowRunPage, WorkflowRunView } from '@/types/hermes'
+import type {
+  WorkflowDefinition,
+  WorkflowEventPage,
+  WorkflowRunPage,
+  WorkflowRunSnapshot,
+  WorkflowRunView
+} from '@/types/hermes'
 
 import { PAGE_INSET_X } from '../layout-constants'
 
@@ -40,6 +47,24 @@ function isConflict(error: unknown): boolean {
   }
 
   return error instanceof Error && /^409(?:\D|$)/.test(error.message)
+}
+
+function workflowRunSearchText(run: WorkflowRunSnapshot): string {
+  return [
+    run.workflow,
+    run.run_id,
+    run.status,
+    run.health,
+    run.presentation_state,
+    run.trigger,
+    run.provenance?.source,
+    run.provenance?.assurance,
+    ...(run.current_nodes ?? []),
+    ...(run.warnings ?? [])
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
 }
 
 export function loadWorkflowRunPage(view: WorkflowRunView, cursor?: string): Promise<WorkflowRunPage> {
@@ -66,6 +91,7 @@ export function WorkflowsView() {
   const runReturnFocusRef = useRef<HTMLButtonElement | null>(null)
   const [actionPending, setActionPending] = useState(false)
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
+  const [runQuery, setRunQuery] = useState('')
   const [view, setView] = useState<WorkflowRunView>('workflows')
 
   paneVisibleRef.current = paneVisible
@@ -257,18 +283,30 @@ export function WorkflowsView() {
   }
 
   const pages = (runs.data?.pages ?? []) as WorkflowRunPage[]
-  const runItems = pages.flatMap(page => page.runs)
+
+  const runItems = useMemo(
+    () => ((runs.data?.pages ?? []) as WorkflowRunPage[]).flatMap(page => page.runs),
+    [runs.data?.pages]
+  )
+
   const nextCursor = pages.at(-1)?.next_cursor ?? null
+  const normalizedRunQuery = normalize(runQuery)
+
+  const filteredRunItems = useMemo(
+    () =>
+      normalizedRunQuery ? runItems.filter(run => workflowRunSearchText(run).includes(normalizedRunQuery)) : runItems,
+    [normalizedRunQuery, runItems]
+  )
 
   const model = useMemo(
     () =>
-      workflowBoardModel(runItems, {
+      workflowBoardModel(filteredRunItems, {
         nextCursor,
         scheduledLabel: t.operations.workflowScheduled,
         scopeLabel: t.operations.workflows,
         stale: runs.isError
       }),
-    [nextCursor, runItems, runs.isError, t.operations.workflowScheduled, t.operations.workflows]
+    [filteredRunItems, nextCursor, runs.isError, t.operations.workflowScheduled, t.operations.workflows]
   )
 
   const loadedRunCount = model.columns.reduce((total, column) => total + column.cards.length, 0)
@@ -333,7 +371,9 @@ export function WorkflowsView() {
       <WorkflowViewHeader
         headingRef={headingRef}
         loadedRunCount={loadedRunCount}
+        onRunQueryChange={setRunQuery}
         onViewChange={changeView}
+        runQuery={runQuery}
         view={view}
       />
       {view === 'workflows' ? (

@@ -9,13 +9,22 @@ import type { WorkflowRunView } from '@/types/hermes'
 interface WorkflowViewHeaderProps {
   headingRef: RefObject<HTMLHeadingElement | null>
   loadedRunCount: number
+  onRunQueryChange: (query: string) => void
   onViewChange: (view: WorkflowRunView) => void
+  runQuery: string
   view: WorkflowRunView
 }
 
 const VIEWS = ['workflows', 'board', 'history', 'archive'] as const
 
-export function WorkflowViewHeader({ headingRef, loadedRunCount, onViewChange, view }: WorkflowViewHeaderProps) {
+export function WorkflowViewHeader({
+  headingRef,
+  loadedRunCount,
+  onRunQueryChange,
+  onViewChange,
+  runQuery,
+  view
+}: WorkflowViewHeaderProps) {
   const { t } = useI18n()
   const copy = t.operations
 
@@ -59,11 +68,10 @@ export function WorkflowViewHeader({ headingRef, loadedRunCount, onViewChange, v
             <Codicon name="filter" size="0.85rem" />
           </Button>
           <SearchField
-            aria-label={copy.workflowRunSearchComingSoon}
-            disabled
-            onChange={() => undefined}
-            placeholder={copy.workflowRunSearchComingSoon}
-            value=""
+            aria-label={copy.workflowRunFilter}
+            onChange={onRunQueryChange}
+            placeholder={copy.workflowRunFilter}
+            value={runQuery}
           />
         </div>
       )}

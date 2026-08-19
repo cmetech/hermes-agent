@@ -1725,6 +1725,11 @@ export interface Translations {
     workflowCatalogPartialDescription: string
     workflowCatalogCapacityError: string
     workflowCatalogInvalidDefinition: string
+    workflowCatalogFilter: string
+    workflowCatalogGoToPage: (page: number) => string
+    workflowCatalogNoMatchTitle: string
+    workflowCatalogRange: (start: number, end: number, total: number) => string
+    workflowCatalogRowsPerPage: string
     workflowColumnName: string
     workflowColumnVersion: string
     workflowColumnDescription: string
@@ -1823,6 +1828,7 @@ export interface Translations {
     workflowLaneCollapse: (lane: string) => string
     workflowLaneEmpty: string
     workflowRunFiltersComingSoon: string
+    workflowRunFilter: string
     workflowRunSearchComingSoon: string
     workflowRunDetailLoading: string
     workflowRunDetailError: string
