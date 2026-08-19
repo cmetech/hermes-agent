@@ -84,6 +84,11 @@ For more help on a command:
 """
 
 
+def _brand_epilogue(prog: str) -> str:
+    """Brand command examples without rewriting literal Hermes identifiers."""
+    return _EPILOGUE.replace("\n    hermes", f"\n    {prog}")
+
+
 def _resolve_cli_prog() -> str:
     """Return the active branded entrypoint name, or the neutral fallback."""
     candidate = ntpath.basename(str(sys.argv[0]).strip())
@@ -103,6 +108,34 @@ def _resolve_cli_prog() -> str:
     return "hermes"
 
 
+def _resolve_help_product_name(prog: str) -> str:
+    """Return the branded product name used by top-level help."""
+    if prog.casefold() == "hermes":
+        return "Hermes Agent"
+    try:
+        from hermes_cli.brand_config import load_brand, resolve_active_brand
+
+        brand = load_brand(resolve_active_brand())
+        display_name = str(brand.get("displayName") or prog.upper()).strip()
+    except Exception:
+        display_name = prog.upper()
+    return f"{display_name} Coworker"
+
+
+class _BrandedArgumentParser(argparse.ArgumentParser):
+    """Render core product references with the active entrypoint identity."""
+
+    def format_help(self) -> str:
+        help_text = super().format_help()
+        entrypoint = self.prog.split(maxsplit=1)[0]
+        if entrypoint.casefold() == "hermes":
+            return help_text
+        product_name = _resolve_help_product_name(entrypoint)
+        return help_text.replace("Hermes", product_name).replace(
+            "hermes ", f"{entrypoint} "
+        )
+
+
 def build_top_level_parser():
     """Build the top-level parser, the subparsers action, and the ``chat`` subparser.
 
@@ -110,11 +143,15 @@ def build_top_level_parser():
     ``chat_parser.set_defaults(func=cmd_chat)`` and continues registering
     other subparsers via ``subparsers.add_parser(...)``.
     """
-    parser = argparse.ArgumentParser(
-        prog=_resolve_cli_prog(),
-        description="Hermes Agent - AI assistant with tool-calling capabilities",
+    prog = _resolve_cli_prog()
+    parser = _BrandedArgumentParser(
+        prog=prog,
+        description=(
+            f"{_resolve_help_product_name(prog)} - "
+            "AI assistant with tool-calling capabilities"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=_EPILOGUE,
+        epilog=_brand_epilogue(prog),
     )
 
     parser.add_argument(
