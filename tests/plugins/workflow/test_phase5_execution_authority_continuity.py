@@ -596,7 +596,7 @@ def test_phase5_restart_intersects_transport_with_remaining_wall_deadline(
     ).advance(run_id)
     assert first["nodes"]["ask"]["state"] == "paused", first["nodes"]["ask"]
     first_interaction = first["nodes"]["ask"]["pending_interaction"]
-    assert runner.requests[0].wall_timeout_seconds == 1800
+    assert runner.requests[0].wall_timeout_seconds == pytest.approx(1800, abs=1e-9)
     assert first["nodes"]["ask"]["remaining_wall_seconds"] == 900
 
     restarted = RunStore(store.hermes_home)
@@ -615,7 +615,7 @@ def test_phase5_restart_intersects_transport_with_remaining_wall_deadline(
     ).advance(run_id)
     assert second["nodes"]["ask"]["state"] == "paused", second["nodes"]["ask"]
     second_interaction = second["nodes"]["ask"]["pending_interaction"]
-    assert runner.requests[1].wall_timeout_seconds == 900
+    assert runner.requests[1].wall_timeout_seconds == pytest.approx(900, abs=1e-9)
     assert second["nodes"]["ask"]["remaining_wall_seconds"] == 0
 
     restarted.approve_run(
