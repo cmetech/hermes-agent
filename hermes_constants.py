@@ -80,6 +80,17 @@ def version_agent_label() -> str:
     return "Hermes Agent" if identity == "hermes" else "Co-worker Agent"
 
 
+def product_display_name() -> str:
+    """Return the source-stamped product name for user-facing CLI text.
+
+    Brand generation owns the default home-directory literal, making its
+    basename the import-safe source of truth for Hermes, OTTO, and LOOP24
+    builds on both POSIX and Windows.
+    """
+    identity = home_dir_basename().removeprefix(".").lower()
+    return "Hermes" if identity == "hermes" else identity.upper()
+
+
 def _hermes_home_from_env() -> Path:
     """Resolve HERMES_HOME from the process environment only.
 
