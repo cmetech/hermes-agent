@@ -58,14 +58,14 @@ function toolset(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function renderSkills() {
+async function renderSkills(route = '/skills?tab=toolsets') {
   const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
       // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+        <MemoryRouter initialEntries={[route]}>
           <SkillsView />
         </MemoryRouter>
       </QueryClientProvider>
@@ -153,5 +153,28 @@ describe('SkillsView toolset management', () => {
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.
     await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/settings?tab=config:model&aux=vision'))
+  })
+})
+
+describe('SkillsView profile skills', () => {
+  it('labels distribution-owned skills as Profile and keeps them read-only', async () => {
+    getSkills.mockResolvedValue([
+      {
+        category: 'oscar',
+        description: 'OSCAR administration guidance',
+        enabled: true,
+        name: 'oscar-admin-qa',
+        provenance: 'profile',
+        usage: 0
+      }
+    ])
+
+    await renderSkills('/skills?tab=skills')
+
+    expect((await screen.findAllByText('Profile')).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Oscar').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Learned')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Archive' })).toBeNull()
   })
 })

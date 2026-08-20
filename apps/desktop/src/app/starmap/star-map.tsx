@@ -891,6 +891,7 @@ export function StarMap({
       id: node.id,
       kind: node.kind === 'memory' ? 'memory' : 'skill',
       label: node.label,
+      readOnly: imported || Boolean(node.readOnly),
       x: e.clientX,
       y: e.clientY
     })

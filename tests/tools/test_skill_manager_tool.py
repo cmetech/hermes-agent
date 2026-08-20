@@ -335,6 +335,40 @@ class TestRemoveFile:
         assert outside_file.exists()
 
 
+@pytest.mark.parametrize(
+    ("mutation", "args"),
+    [
+        (_edit_skill, (VALID_SKILL_CONTENT_2,)),
+        (_patch_skill, ("Do the thing.", "Do the new thing.")),
+        (_delete_skill, ()),
+        (_write_file, ("references/new.md", "new content")),
+        (_remove_file, ("references/existing.md",)),
+    ],
+)
+def test_profile_distribution_skill_rejects_every_mutation(tmp_path, mutation, args):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    with _skill_dir(skills_dir), patch("tools.skill_usage._skills_dir", return_value=skills_dir):
+        assert _create_skill("my-skill", VALID_SKILL_CONTENT, category="oscar")["success"]
+        supporting = skills_dir / "oscar" / "my-skill" / "references" / "existing.md"
+        supporting.parent.mkdir(parents=True, exist_ok=True)
+        supporting.write_text("existing content", encoding="utf-8")
+        (tmp_path / "distribution.yaml").write_text(
+            "name: oscar\n"
+            "version: 0.2.0\n"
+            "distribution_owned:\n"
+            "  - skills/oscar\n",
+            encoding="utf-8",
+        )
+
+        result = mutation("my-skill", *args)
+
+    assert result["success"] is False
+    assert "profile distribution" in result["error"]
+    assert (skills_dir / "oscar" / "my-skill" / "SKILL.md").exists()
+    assert supporting.exists()
+
+
 # ---------------------------------------------------------------------------
 # skill_manage dispatcher
 # ---------------------------------------------------------------------------
