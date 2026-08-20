@@ -15,6 +15,7 @@ export interface NodeMenuTarget {
   id: string
   kind: 'memory' | 'skill'
   label: string
+  readOnly: boolean
   x: number
   y: number
 }
@@ -119,24 +120,35 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
             style={{ left: target.x, top: target.y }}
           >
             <div className="truncate px-2 py-1 text-[0.68rem] text-muted-foreground">{target.label}</div>
-            <button
-              className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground disabled:opacity-50"
-              disabled={loading}
-              onClick={() => void openEdit()}
-              type="button"
-            >
-              Edit {noun}…
-            </button>
-            <button
-              className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs text-destructive hover:bg-destructive/10"
-              onClick={() => {
-                setDeleting({ id: target.id, kind: target.kind, label: target.label })
-                onClose()
-              }}
-              type="button"
-            >
-              {target.kind === 'skill' ? 'Archive skill' : 'Delete memory'}
-            </button>
+            {target.readOnly ? (
+              <div className="px-2 py-1 text-xs text-muted-foreground">Profile-managed skill</div>
+            ) : (
+              <>
+                <button
+                  className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground disabled:opacity-50"
+                  disabled={loading}
+                  onClick={() => void openEdit()}
+                  type="button"
+                >
+                  Edit {noun}…
+                </button>
+                <button
+                  className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs text-destructive hover:bg-destructive/10"
+                  onClick={() => {
+                    setDeleting({
+                      id: target.id,
+                      kind: target.kind,
+                      label: target.label,
+                      readOnly: false
+                    })
+                    onClose()
+                  }}
+                  type="button"
+                >
+                  {target.kind === 'skill' ? 'Archive skill' : 'Delete memory'}
+                </button>
+              </>
+            )}
           </div>
         </>
       ) : null}

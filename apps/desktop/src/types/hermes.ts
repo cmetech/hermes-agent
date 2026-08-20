@@ -1450,6 +1450,7 @@ export interface StarmapNode {
   state: string
   createdBy: null | string
   pinned: boolean
+  readOnly?: boolean
 }
 
 /** A declared `related_skills` link; both endpoints are guaranteed to be nodes. */

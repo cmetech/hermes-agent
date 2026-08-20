@@ -401,6 +401,7 @@ async def get_skills(profile: Optional[str] = None):
         _read_profile_distribution_skill_names,
         activity_count,
         load_usage,
+        skill_ownership,
     )
     with _profile_scope(profile):
         config = load_config()
@@ -423,11 +424,11 @@ async def get_skills(profile: Optional[str] = None):
     for s in skills:
         s["enabled"] = s["name"] not in disabled
         s["usage"] = activity_count(usage.get(s["name"], {}))
-        s["provenance"] = (
-            "hub" if s["name"] in hub_names
-            else "bundled" if s["name"] in bundled_names
-            else "profile" if s["name"] in profile_names
-            else "agent"
+        s["provenance"] = skill_ownership(
+            s["name"],
+            bundled_names=bundled_names,
+            hub_names=hub_names,
+            profile_names=profile_names,
         )
         display = rename.get(s["name"])
         if display:

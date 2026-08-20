@@ -79,3 +79,34 @@ def test_full_payload_shape_and_edge_integrity(tmp_path):
     assert graph["stats"]["nodes"] == len(skill_nodes)
     assert graph["stats"]["memory_nodes"] == len(graph["memory"])
     assert all("timestamp" in n for n in graph["nodes"])
+
+
+def test_profile_distribution_skill_is_marked_read_only(tmp_path):
+    home = tmp_path / ".hermes"
+    skill_dir = home / "skills" / "oscar" / "oscar-rules"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: oscar-rules\ndescription: OSCAR rules\n---\n\n# Rules\n",
+        encoding="utf-8",
+    )
+    supporting = skill_dir / "references" / "owned.md"
+    supporting.parent.mkdir()
+    supporting.write_text("owned", encoding="utf-8")
+    (home / "skills" / ".usage.json").write_text(
+        '{"oscar-rules": {"use_count": 1}}', encoding="utf-8"
+    )
+    (home / "distribution.yaml").write_text(
+        "name: oscar\n"
+        "version: 0.2.0\n"
+        "distribution_owned:\n"
+        "  - skills/oscar/oscar-rules/references/owned.md\n",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    oscar = next(node for node in graph["nodes"] if node["id"] == "oscar-rules")
+    assert oscar["readOnly"] is True

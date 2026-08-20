@@ -696,6 +696,26 @@ def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
         )
 
 
+def _profile_distribution_write_guard(
+    name: str, skill_path: Path
+) -> Optional[Dict[str, Any]]:
+    """Refuse mutations that an installed profile update would overwrite."""
+    try:
+        from tools.skill_usage import skill_ownership
+
+        if skill_ownership(name, skill_path) == "profile":
+            return {
+                "success": False,
+                "error": (
+                    f"Skill '{name}' belongs to the installed profile distribution; "
+                    "profile-distributed skills are read-only and must be changed upstream."
+                ),
+            }
+    except Exception as exc:
+        logger.debug("profile distribution ownership check failed for %s: %s", name, exc)
+    return None
+
+
 def _org_mirror_write_guard(name: str, skill_path: Path, action: str) -> Optional[Dict[str, Any]]:
     """Org-shared skills are EDITABLE IN PLACE — this only blocks deletion.
 
@@ -987,6 +1007,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    profile_guard = _profile_distribution_write_guard(name, existing["path"])
+    if profile_guard:
+        return profile_guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
     if org_guard:
         return org_guard
@@ -1058,6 +1081,9 @@ def _patch_skill(
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    profile_guard = _profile_distribution_write_guard(name, skill_dir)
+    if profile_guard:
+        return profile_guard
     org_guard = _org_mirror_write_guard(name, skill_dir, "patch")
     if org_guard:
         return org_guard
@@ -1171,6 +1197,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    profile_guard = _profile_distribution_write_guard(name, existing["path"])
+    if profile_guard:
+        return profile_guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
     if org_guard:
         return org_guard
@@ -1291,6 +1320,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    profile_guard = _profile_distribution_write_guard(name, existing["path"])
+    if profile_guard:
+        return profile_guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
     if org_guard:
         return org_guard
@@ -1345,6 +1377,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    profile_guard = _profile_distribution_write_guard(name, skill_dir)
+    if profile_guard:
+        return profile_guard
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
     if guard:
         return guard

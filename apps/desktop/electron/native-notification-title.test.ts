@@ -1,14 +1,15 @@
-import assert from 'node:assert/strict'
-import test from 'node:test'
+import { describe, expect, it } from 'vitest'
 
 import { nativeNotificationTitle } from './native-notification-title'
 
-test('native notification titles replace the upstream name with the active brand', () => {
-  assert.equal(nativeNotificationTitle('Hermes finished', 'LOOP24'), 'LOOP24 finished')
-  assert.equal(nativeNotificationTitle('Hermes', 'OTTO'), 'OTTO')
-})
+describe('nativeNotificationTitle', () => {
+  it('replaces the upstream name with the active brand', () => {
+    expect(nativeNotificationTitle('Hermes finished', 'LOOP24')).toBe('LOOP24 finished')
+    expect(nativeNotificationTitle('Hermes', 'OTTO')).toBe('OTTO')
+  })
 
-test('native notification titles preserve generic copy and fall back to the active brand', () => {
-  assert.equal(nativeNotificationTitle('Approval needed', 'LOOP24'), 'Approval needed')
-  assert.equal(nativeNotificationTitle('', 'LOOP24'), 'LOOP24')
+  it('preserves generic copy and falls back to the active brand', () => {
+    expect(nativeNotificationTitle('Approval needed', 'LOOP24')).toBe('Approval needed')
+    expect(nativeNotificationTitle('', 'LOOP24')).toBe('LOOP24')
+  })
 })
