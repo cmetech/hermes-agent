@@ -11,6 +11,7 @@ mocking git would just test the mock.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -162,12 +163,20 @@ class TestVersionRequires:
         if ok:
             check_hermes_requires(spec, cur)
         else:
-            with pytest.raises(DistributionError, match="requires Hermes"):
+            with pytest.raises(DistributionError, match="requires "):
                 check_hermes_requires(spec, cur)
 
     def test_parse_semver_handles_prerelease(self):
         assert _parse_semver("0.12.0-rc1") == (0, 12, 0)
         assert _parse_semver("v0.12.0+abc") == (0, 12, 0)
+
+    def test_incompatible_distribution_uses_active_product_name(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_constants.home_dir_basename", lambda: ".loop24"
+        )
+
+        with pytest.raises(DistributionError, match=r"requires LOOP24 >=99\.0\.0"):
+            check_hermes_requires(">=99.0.0", "0.1.0")
 
 
 # ===========================================================================
@@ -363,7 +372,7 @@ class TestInstall:
             hermes_requires=">=99.0.0",
         )
         staged = _make_staging_dir(profile_env, "future", manifest=mf)
-        with pytest.raises(DistributionError, match="requires Hermes"):
+        with pytest.raises(DistributionError, match="requires "):
             install_distribution(str(staged), name="future")
 
 
@@ -625,6 +634,27 @@ class TestInstalledAtStamp:
 
 class TestProfileInfoDistribution:
 
+    def test_profile_info_uses_active_product_name(
+        self, profile_env, monkeypatch, capsys
+    ):
+        staged = _make_staging_dir(
+            profile_env,
+            "src",
+            manifest=DistributionManifest(
+                name="telem", version="1.2.3", hermes_requires=">=0.12.0"
+            ),
+        )
+        install_distribution(str(staged), name="telem")
+        monkeypatch.setattr(
+            "hermes_constants.home_dir_basename", lambda: ".loop24"
+        )
+
+        from hermes_cli.main import cmd_profile
+
+        cmd_profile(SimpleNamespace(profile_action="info", profile_name="telem"))
+
+        assert "Requires:     LOOP24 >=0.12.0" in capsys.readouterr().out
+
     def test_installed_distribution_shows_in_list(self, profile_env):
         staged = _make_staging_dir(
             profile_env, "src",
@@ -671,4 +701,3 @@ class TestErrorSurfaces:
         staged = _make_staging_dir(profile_env, "bad", manifest=mf)
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
-

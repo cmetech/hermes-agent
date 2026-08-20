@@ -70,3 +70,15 @@ def test_non_utf8_env_does_not_abort_the_preview(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert any("FOO_TOKEN" in ln for ln in out.splitlines())
+
+
+def test_distribution_preview_uses_active_product_name(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("hermes_constants.home_dir_basename", lambda: ".loop24")
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    plan = _make_plan(profile, [])
+    plan.manifest.hermes_requires = ">=0.12.0"
+
+    _render_distribution_plan(plan)
+
+    assert "Requires: LOOP24 >=0.12.0" in capsys.readouterr().out

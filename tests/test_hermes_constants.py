@@ -18,6 +18,7 @@ from hermes_constants import (
     get_hermes_home,
     get_process_hermes_home,
     heal_hermes_managed_node,
+    home_dir_basename,
     hermes_managed_node_tree_present,
     iter_hermes_node_dirs,
     is_container,
@@ -38,7 +39,7 @@ class TestGetDefaultHermesRoot:
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        assert get_default_hermes_root() == tmp_path / ".hermes"
+        assert get_default_hermes_root() == tmp_path / home_dir_basename()
 
 
 
@@ -62,7 +63,7 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
 
-        assert get_default_hermes_root() == local_appdata / "hermes"
+        assert get_default_hermes_root() == local_appdata / home_dir_basename()
 
 
 
@@ -78,7 +79,7 @@ class TestGetHermesHome:
         monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
-        assert get_hermes_home() == local_appdata / "hermes"
+        assert get_hermes_home() == local_appdata / home_dir_basename()
 
 
 class TestGetProcessHermesHome:
