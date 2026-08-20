@@ -634,6 +634,29 @@ class TestInstalledAtStamp:
 
 class TestProfileInfoDistribution:
 
+    def test_profile_install_success_hint_uses_active_cli_name(
+        self, profile_env, monkeypatch, capsys
+    ):
+        staged = _make_staging_dir(profile_env, "src")
+        monkeypatch.setattr(
+            "hermes_constants.home_dir_basename", lambda: ".loop24"
+        )
+
+        from hermes_cli.main import cmd_profile
+
+        cmd_profile(
+            SimpleNamespace(
+                profile_action="install",
+                source=str(staged),
+                install_name="telem",
+                force=False,
+                alias=False,
+                yes=True,
+            )
+        )
+
+        assert "Use with:      loop24 -p telem chat" in capsys.readouterr().out
+
     def test_profile_info_uses_active_product_name(
         self, profile_env, monkeypatch, capsys
     ):
