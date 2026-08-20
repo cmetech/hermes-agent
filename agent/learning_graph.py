@@ -260,6 +260,30 @@ def build_learning_graph() -> dict[str, Any]:
     - memory chunks as first-class graph nodes connected to those learned skills.
     """
     all_skills = build_skill_nodes(_skill_roots())
+    try:
+        from tools.skill_usage import (
+            _read_bundled_manifest_names,
+            _read_hub_installed_names,
+            _read_profile_distribution_skill_names,
+            skill_ownership,
+        )
+
+        bundled_names = _read_bundled_manifest_names()
+        hub_names = _read_hub_installed_names()
+        profile_names = _read_profile_distribution_skill_names()
+        profile_distribution_skills = {
+            name
+            for name in all_skills
+            if skill_ownership(
+                name,
+                bundled_names=bundled_names,
+                hub_names=hub_names,
+                profile_names=profile_names,
+            )
+            == "profile"
+        }
+    except Exception:
+        profile_distribution_skills = set()
     learned_skills = {
         name: node
         for name, node in all_skills.items()
@@ -287,6 +311,7 @@ def build_learning_graph() -> dict[str, Any]:
             "state": n.state,
             "createdBy": n.created_by,
             "pinned": n.pinned,
+            "readOnly": n.name in profile_distribution_skills,
         }
         for n in learned_skills.values()
     ]
@@ -303,6 +328,7 @@ def build_learning_graph() -> dict[str, Any]:
                 "state": "active",
                 "createdBy": "memory",
                 "pinned": False,
+                "readOnly": False,
             }
         )
 

@@ -1450,6 +1450,7 @@ export interface StarmapNode {
   state: string
   createdBy: null | string
   pinned: boolean
+  readOnly?: boolean
 }
 
 /** A declared `related_skills` link; both endpoints are guaranteed to be nodes. */
@@ -1734,8 +1735,8 @@ export interface SkillInfo {
   displayName?: string
   /** Total observed activity (use + view + patch). Absent on older backends. */
   usage?: number
-  /** 'agent' = learned/local (editable), 'bundled' = ships with Hermes, 'hub' = installed. */
-  provenance?: 'agent' | 'bundled' | 'hub'
+  /** Skill ownership controls its badge and whether Desktop may edit it. */
+  provenance?: 'agent' | 'bundled' | 'hub' | 'profile'
 }
 
 export interface ToolsetInfo {

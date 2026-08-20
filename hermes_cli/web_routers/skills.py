@@ -398,20 +398,22 @@ async def get_skills(profile: Optional[str] = None):
     from tools.skill_usage import (
         _read_bundled_manifest_names,
         _read_hub_installed_names,
+        _read_profile_distribution_skill_names,
         activity_count,
         load_usage,
+        skill_ownership,
     )
     with _profile_scope(profile):
         config = load_config()
         disabled = get_disabled_skills(config)
         skills = _find_all_skills(skip_disabled=True)
         usage = load_usage()
-        # Set-based provenance (same classification as skill_usage.provenance,
-        # without a per-skill manifest read): hub > bundled > agent, where
-        # "agent" covers agent-authored AND local hand-made skills — the ones
-        # the user may edit/delete from the UI.
+        # Set-based provenance for Desktop ownership controls: hub > bundled >
+        # profile distribution > agent/manual. Only the final bucket is
+        # editable and archivable in the UI.
         bundled_names = _read_bundled_manifest_names()
         hub_names = _read_hub_installed_names()
+        profile_names = _read_profile_distribution_skill_names()
     # Brand curation: override the DISPLAY title for renamed skills (identity
     # key `name` is untouched, so toggle/usage/invoke keep working). Fail-open.
     try:
@@ -422,10 +424,11 @@ async def get_skills(profile: Optional[str] = None):
     for s in skills:
         s["enabled"] = s["name"] not in disabled
         s["usage"] = activity_count(usage.get(s["name"], {}))
-        s["provenance"] = (
-            "hub" if s["name"] in hub_names
-            else "bundled" if s["name"] in bundled_names
-            else "agent"
+        s["provenance"] = skill_ownership(
+            s["name"],
+            bundled_names=bundled_names,
+            hub_names=hub_names,
+            profile_names=profile_names,
         )
         display = rename.get(s["name"])
         if display:

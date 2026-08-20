@@ -64,6 +64,96 @@ def _load_cfg(home):
 
 class TestProfileScopedSkills:
 
+    def test_distribution_owned_skill_reports_profile_provenance(
+        self, client, isolated_profiles
+    ):
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "distribution.yaml").write_text(
+            "name: worker-alpha\n"
+            "version: 1.0.0\n"
+            "distribution_owned:\n"
+            "  - skills/\n",
+            encoding="utf-8",
+        )
+
+        resp = client.get("/api/skills", params={"profile": "worker_alpha"})
+
+        assert resp.status_code == 200
+        skills = {row["name"]: row for row in resp.json()}
+        assert skills["worker-skill"]["provenance"] == "profile"
+
+    @pytest.mark.parametrize("higher_owner", ["bundled", "hub"])
+    def test_distribution_provenance_yields_to_higher_owner(
+        self, client, isolated_profiles, higher_owner
+    ):
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "distribution.yaml").write_text(
+            "name: worker-alpha\nversion: 1.0.0\ndistribution_owned:\n  - skills/\n",
+            encoding="utf-8",
+        )
+        if higher_owner == "bundled":
+            (worker_home / "skills" / ".bundled_manifest").write_text(
+                "worker-skill:abc123\n", encoding="utf-8"
+            )
+        else:
+            hub = worker_home / "skills" / ".hub"
+            hub.mkdir()
+            (hub / "lock.json").write_text(
+                '{"installed": {"worker-skill": {}}}', encoding="utf-8"
+            )
+
+        resp = client.get("/api/skills", params={"profile": "worker_alpha"})
+
+        assert resp.status_code == 200
+        skills = {row["name"]: row for row in resp.json()}
+        assert skills["worker-skill"]["provenance"] == higher_owner
+
+    @pytest.mark.parametrize(
+        ("method", "path", "body"),
+        [
+            (
+                "put",
+                "/api/skills/content",
+                {
+                    "name": "worker-skill",
+                    "content": "---\nname: worker-skill\ndescription: changed\n---\n\n# Worker\n",
+                    "profile": "worker_alpha",
+                },
+            ),
+            (
+                "put",
+                "/api/learning/node",
+                {
+                    "id": "worker-skill",
+                    "content": "---\nname: worker-skill\ndescription: changed\n---\n\n# Worker\n",
+                    "profile": "worker_alpha",
+                },
+            ),
+            (
+                "delete",
+                "/api/learning/node",
+                {"id": "worker-skill", "profile": "worker_alpha"},
+            ),
+        ],
+    )
+    def test_distribution_owned_skill_mutations_are_rejected(
+        self, client, isolated_profiles, method, path, body
+    ):
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "distribution.yaml").write_text(
+            "name: worker-alpha\n"
+            "version: 1.0.0\n"
+            "distribution_owned:\n"
+            "  - skills/\n",
+            encoding="utf-8",
+        )
+
+        resp = client.request(method.upper(), path, json=body)
+
+        assert resp.status_code == 400
+        assert "profile distribution" in resp.json()["detail"]
+        assert (worker_home / "skills" / "worker-skill" / "SKILL.md").exists()
+
 
     def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):
         resp = client.put(

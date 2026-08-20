@@ -247,6 +247,114 @@ def _read_hub_installed_names() -> Set[str]:
     return set()
 
 
+def _profile_distribution_owned_roots() -> List[Path]:
+    """Resolved skill-tree paths owned by the active profile distribution."""
+    from hermes_cli.profile_distribution import read_manifest
+
+    base = _skills_dir()
+    if not base.exists():
+        return []
+
+    try:
+        manifest = read_manifest(base.parent)
+    except Exception:
+        return []
+    if manifest is None:
+        return []
+
+    owned_roots: List[Path] = []
+    for raw in manifest.owned_paths():
+        parts = Path(str(raw).strip().strip("/")).parts
+        if parts and parts[0] == "skills":
+            try:
+                owned_roots.append(base.parent.joinpath(*parts).resolve())
+            except OSError:
+                continue
+    return owned_roots
+
+
+def _path_overlaps_profile_owned(
+    skill_path: Path, owned_roots: Optional[List[Path]] = None
+) -> bool:
+    candidate = skill_path.parent if skill_path.name == "SKILL.md" else skill_path
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return False
+
+    for owned in owned_roots if owned_roots is not None else _profile_distribution_owned_roots():
+        try:
+            resolved.relative_to(owned)
+            return True
+        except ValueError:
+            pass
+        try:
+            owned.relative_to(resolved)
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def is_profile_distribution_skill(
+    skill_name: str, skill_path: Optional[Path] = None
+) -> bool:
+    """Whether a skill is part of the active profile's installed distribution.
+
+    Ownership is path-based, not inferred from skill names: a manifest may own
+    the whole ``skills/`` tree or only a nested category/skill/file. Any overlap
+    with a skill directory makes the skill read-only so an update cannot later
+    overwrite an apparently successful local edit.
+    """
+    candidate = skill_path or _find_skill_dir(skill_name)
+    if candidate is None:
+        return False
+    return _path_overlaps_profile_owned(candidate)
+
+
+def skill_ownership(
+    skill_name: str,
+    skill_path: Optional[Path] = None,
+    *,
+    bundled_names: Optional[Set[str]] = None,
+    hub_names: Optional[Set[str]] = None,
+    profile_names: Optional[Set[str]] = None,
+) -> str:
+    """Resolve ownership with the canonical hub > bundled > profile > agent precedence."""
+    hubs = _read_hub_installed_names() if hub_names is None else hub_names
+    if skill_name in hubs:
+        return "hub"
+    bundled = _read_bundled_manifest_names() if bundled_names is None else bundled_names
+    if skill_name in bundled:
+        return "bundled"
+    if profile_names is not None:
+        return "profile" if skill_name in profile_names else "agent"
+    return "profile" if is_profile_distribution_skill(skill_name, skill_path) else "agent"
+
+
+def _profile_distribution_read_only_message(skill_name: str) -> str:
+    return (
+        f"skill '{skill_name}' belongs to the installed profile distribution; "
+        "profile-distributed skills are read-only and must be changed upstream"
+    )
+
+
+def _read_profile_distribution_skill_names() -> Set[str]:
+    """Return local skill names owned by the active profile distribution."""
+    base = _skills_dir()
+    owned_roots = _profile_distribution_owned_roots()
+    if not owned_roots:
+        return set()
+
+    names: Set[str] = set()
+    for skill_md in base.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md) or is_external_skill_path(skill_md):
+            continue
+        if _path_overlaps_profile_owned(skill_md.parent, owned_roots):
+            names.add(_read_skill_name(skill_md, fallback=skill_md.parent.name))
+    return names
+
+
 def _prune_builtins_enabled() -> bool:
     """Whether bundled built-in skills are eligible for curator pruning.
 
@@ -470,10 +578,13 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
         return False
     if is_protected_builtin(skill_name):
         return False
-    if is_hub_installed(skill_name):
+    ownership = skill_ownership(skill_name, skill_path)
+    if ownership == "hub":
         return False
-    if is_bundled(skill_name):
+    if ownership == "bundled":
         return _prune_builtins_enabled()
+    if ownership == "profile":
+        return False
     local_dir = _find_skill_dir(skill_name)
     if local_dir is not None:
         return not is_external_skill_path(local_dir)
@@ -886,6 +997,8 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         return False, _external_read_only_message(skill_name)
 
     if not is_curation_eligible(skill_name, local_skill_dir):
+        if skill_ownership(skill_name, local_skill_dir) == "profile":
+            return False, _profile_distribution_read_only_message(skill_name)
         if is_protected_builtin(skill_name):
             return False, (
                 f"skill '{skill_name}' is a protected built-in; it backs "

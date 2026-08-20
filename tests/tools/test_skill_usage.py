@@ -364,3 +364,79 @@ def test_adopt_rejects_empty_name(skills_home):
 
     assert adopt_skill("")[0] is False
 
+
+def test_profile_distribution_skill_is_read_only_to_curator(skills_home):
+    from tools.skill_usage import (
+        archive_skill,
+        is_curation_eligible,
+        is_profile_distribution_skill,
+    )
+
+    skill_dir = _write_skill(skills_home / "skills", "oscar-rules", category="oscar")
+    (skills_home / "distribution.yaml").write_text(
+        "name: oscar\n"
+        "version: 0.2.0\n"
+        "distribution_owned:\n"
+        "  - skills/oscar\n",
+        encoding="utf-8",
+    )
+
+    assert is_profile_distribution_skill("oscar-rules", skill_dir) is True
+    assert is_curation_eligible("oscar-rules", skill_dir) is False
+    ok, message = archive_skill("oscar-rules")
+    assert ok is False
+    assert "profile distribution" in message
+    assert skill_dir.exists()
+
+
+@pytest.mark.parametrize(("higher_owner", "expected"), [("bundled", "bundled"), ("hub", "hub")])
+def test_profile_distribution_ownership_yields_to_higher_precedence(
+    skills_home, monkeypatch, higher_owner, expected
+):
+    from tools import skill_usage
+
+    skill_dir = _write_skill(skills_home / "skills", "collision", category="oscar")
+    (skills_home / "distribution.yaml").write_text(
+        "name: oscar\nversion: 0.2.0\ndistribution_owned:\n  - skills/\n",
+        encoding="utf-8",
+    )
+    if higher_owner == "bundled":
+        (skills_home / "skills" / ".bundled_manifest").write_text(
+            "collision:abc123\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(skill_usage, "_prune_builtins_enabled", lambda: True)
+    else:
+        hub = skills_home / "skills" / ".hub"
+        hub.mkdir()
+        (hub / "lock.json").write_text(
+            json.dumps({"installed": {"collision": {}}}), encoding="utf-8"
+        )
+
+    assert skill_usage.skill_ownership("collision", skill_dir) == expected
+    assert skill_usage.is_curation_eligible("collision", skill_dir) is (
+        higher_owner == "bundled"
+    )
+
+
+def test_support_file_ownership_marks_containing_skill_as_profile_owned(skills_home):
+    from tools.skill_usage import (
+        _read_profile_distribution_skill_names,
+        is_profile_distribution_skill,
+        skill_ownership,
+    )
+
+    skill_dir = _write_skill(skills_home / "skills", "file-owned", category="oscar")
+    supporting = skill_dir / "references" / "owned.md"
+    supporting.parent.mkdir()
+    supporting.write_text("owned", encoding="utf-8")
+    (skills_home / "distribution.yaml").write_text(
+        "name: oscar\n"
+        "version: 0.2.0\n"
+        "distribution_owned:\n"
+        "  - skills/oscar/file-owned/references/owned.md\n",
+        encoding="utf-8",
+    )
+
+    assert is_profile_distribution_skill("file-owned", skill_dir) is True
+    assert _read_profile_distribution_skill_names() == {"file-owned"}
+    assert skill_ownership("file-owned", skill_dir) == "profile"
