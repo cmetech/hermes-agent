@@ -150,6 +150,7 @@ import {
   resolveOauthRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
+import { nativeNotificationTitle } from './native-notification-title'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -10788,7 +10789,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   const actions = Array.isArray(payload?.actions) ? payload.actions : []
 
   const notification = new Notification({
-    title: payload?.title || 'Hermes',
+    title: nativeNotificationTitle(payload?.title, APP_NAME),
     body: payload?.body || '',
     silent: Boolean(payload?.silent),
     actions: actions.map(action => ({ type: 'button', text: String(action?.text || '') }))
