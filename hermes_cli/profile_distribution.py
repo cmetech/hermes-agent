@@ -72,6 +72,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_constants import product_display_name
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +324,7 @@ def check_hermes_requires(spec: str, current_version: str) -> None:
     }[op]
     if not ok:
         raise DistributionError(
-            f"This distribution requires Hermes {op}{target}, "
+            f"This distribution requires {product_display_name()} {op}{target}, "
             f"but you have {current_version}."
         )
 
