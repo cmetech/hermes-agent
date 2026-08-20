@@ -80,6 +80,11 @@ def version_agent_label() -> str:
     return "Hermes Agent" if identity == "hermes" else "Co-worker Agent"
 
 
+def product_cli_name() -> str:
+    """Return the source-stamped command name for the active product."""
+    return home_dir_basename().removeprefix(".").lower()
+
+
 def product_display_name() -> str:
     """Return the source-stamped product name for user-facing CLI text.
 
@@ -87,7 +92,7 @@ def product_display_name() -> str:
     basename the import-safe source of truth for Hermes, OTTO, and LOOP24
     builds on both POSIX and Windows.
     """
-    identity = home_dir_basename().removeprefix(".").lower()
+    identity = product_cli_name()
     return "Hermes" if identity == "hermes" else identity.upper()
 
 
