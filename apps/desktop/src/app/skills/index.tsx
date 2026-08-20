@@ -124,6 +124,11 @@ function skillSubtitle(skill: SkillInfo): React.ReactNode {
           hub
         </Badge>
       )}
+      {provenance === 'profile' && (
+        <Badge className="shrink-0 normal-case" variant="muted">
+          profile
+        </Badge>
+      )}
     </>
   )
 }

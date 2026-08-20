@@ -247,6 +247,38 @@ def _read_hub_installed_names() -> Set[str]:
     return set()
 
 
+def _read_profile_distribution_skill_names() -> Set[str]:
+    """Return local skill names owned by the active profile distribution."""
+    from hermes_cli.profile_distribution import read_manifest
+
+    base = _skills_dir()
+    if not base.exists():
+        return set()
+
+    try:
+        manifest = read_manifest(base.parent)
+    except Exception:
+        return set()
+    if manifest is None:
+        return set()
+
+    owned_roots = []
+    for raw in manifest.owned_paths():
+        parts = Path(str(raw).strip().strip("/")).parts
+        if parts and parts[0] == "skills":
+            owned_roots.append(base.parent.joinpath(*parts))
+    if not owned_roots:
+        return set()
+
+    names: Set[str] = set()
+    for skill_md in base.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md) or is_external_skill_path(skill_md):
+            continue
+        if any(skill_md.is_relative_to(root) for root in owned_roots):
+            names.add(_read_skill_name(skill_md, fallback=skill_md.parent.name))
+    return names
+
+
 def _prune_builtins_enabled() -> bool:
     """Whether bundled built-in skills are eligible for curator pruning.
 

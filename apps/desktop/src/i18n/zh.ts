@@ -1302,7 +1302,8 @@ export const zh: Translations = {
     provenance: {
       agent: '习得',
       bundled: '内置',
-      hub: '技能中心'
+      hub: '技能中心',
+      profile: '配置文件'
     },
     emptyNoneFound: noun => `未找到${noun}`,
     emptyNothingMatches: query => `没有匹配“${query}”的内容。`,

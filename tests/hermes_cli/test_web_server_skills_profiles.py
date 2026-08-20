@@ -64,6 +64,24 @@ def _load_cfg(home):
 
 class TestProfileScopedSkills:
 
+    def test_distribution_owned_skill_reports_profile_provenance(
+        self, client, isolated_profiles
+    ):
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "distribution.yaml").write_text(
+            "name: worker-alpha\n"
+            "version: 1.0.0\n"
+            "distribution_owned:\n"
+            "  - skills/\n",
+            encoding="utf-8",
+        )
+
+        resp = client.get("/api/skills", params={"profile": "worker_alpha"})
+
+        assert resp.status_code == 200
+        skills = {row["name"]: row for row in resp.json()}
+        assert skills["worker-skill"]["provenance"] == "profile"
+
 
     def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):
         resp = client.put(

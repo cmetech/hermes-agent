@@ -1734,8 +1734,8 @@ export interface SkillInfo {
   displayName?: string
   /** Total observed activity (use + view + patch). Absent on older backends. */
   usage?: number
-  /** 'agent' = learned/local (editable), 'bundled' = ships with Hermes, 'hub' = installed. */
-  provenance?: 'agent' | 'bundled' | 'hub'
+  /** Skill ownership controls its badge and whether Desktop may edit it. */
+  provenance?: 'agent' | 'bundled' | 'hub' | 'profile'
 }
 
 export interface ToolsetInfo {
