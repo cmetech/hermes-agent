@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -1431,8 +1432,10 @@ def test_noninteractive_reset_requires_yes(profile, fake_keyring, monkeypatch, c
 
 def test_real_console_doctor_and_default_repair_are_byte_read_only(tmp_path):
     repo = Path(__file__).resolve().parents[2]
-    hermes = repo / ".venv" / "bin" / "hermes"
-    assert hermes.is_file(), "the real .venv/bin/hermes entrypoint is required"
+    hermes = Path(sys.executable).with_name(
+        "hermes.exe" if os.name == "nt" else "hermes"
+    )
+    assert hermes.is_file(), "the active environment's hermes entrypoint is required"
     profile = tmp_path / "profiles" / "subprocess"
     profile.mkdir(parents=True)
     (profile / "config.yaml").write_text("secret_keystore: file\n", encoding="utf-8")
@@ -1483,7 +1486,9 @@ def test_real_console_doctor_and_default_repair_are_byte_read_only(tmp_path):
 @pytest.mark.parametrize("prefix", ["--app", "--appl"])
 def test_real_console_apply_prefix_cannot_mutate_from_readonly_path(tmp_path, prefix):
     repo = Path(__file__).resolve().parents[2]
-    hermes = repo / ".venv" / "bin" / "hermes"
+    hermes = Path(sys.executable).with_name(
+        "hermes.exe" if os.name == "nt" else "hermes"
+    )
     profile = tmp_path / "profiles" / "prefix"
     temp = profile / "secrets" / ".authority.json.prefix.tmp"
     temp.parent.mkdir(parents=True)
