@@ -53,7 +53,7 @@
     "test:ui": "vitest run --project ui",
     "test:workflow-ui": "vitest run --project ui src/app/workflows/ src/app/kanban/ src/app/routes.test.ts src/components/activity-board/ src/components/assistant-ui/embeds/workflow-topology.test.tsx src/components/assistant-ui/embeds/mermaid-embed.test.tsx",
     "test:desktop:platforms": "vitest run --project electron",
-    "test:electron:node": "tsx --test electron/brand-scope.test.ts electron/release-update.test.ts electron/structured-api-channel.test.ts electron/structured-api-response.test.ts",
+    "test:electron:node": "tsx --test electron/backend-env.test.ts electron/brand-scope.test.ts electron/native-notification-title.test.ts electron/release-update.test.ts electron/structured-api-channel.test.ts electron/structured-api-response.test.ts",
     "test": "vitest run",
     "preview": "node scripts/assert-root-install.mjs && vite preview --host 127.0.0.1 --port 4174",
     "check:test:desktop:platforms": "npm run test:desktop:platforms",

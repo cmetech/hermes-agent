@@ -1,0 +1,65 @@
+schema_version: 1
+feature: environment-runtime
+# Hardened terminal-environment snapshot and remote-shell behavior on shared
+# execution backends.
+upstream_changes:
+- id: authenticated-shell-session-snapshots
+  change_class: execution-security
+  owner: downstream-environment-reliability
+  overlap_policy: any_owned_file
+  files:
+  - tools/environments/base.py
+  - tools/environments/daytona.py
+  - tools/environments/docker.py
+  - tools/environments/local.py
+  - tools/environments/modal.py
+  - tools/environments/singularity.py
+  - tools/environments/ssh.py
+  - tools/terminal_tool.py
+  owned_symbols:
+  - BaseEnvironment.init_session
+  - BaseEnvironment._set_session_mode
+  - BaseEnvironment._snapshot_excluded_passthrough_names
+  - _export_dump_excluding_session_vars
+  tests:
+  - tests/tools/test_base_environment.py
+  - tests/tools/test_approved_command_clean_slate.py
+  - tests/tools/test_daytona_environment.py
+  - tests/tools/test_docker_environment.py
+  - tests/tools/test_environment_bash_launch_contract.py
+  - tests/tools/test_local_env_windows_msys.py
+  - tests/tools/test_modal_snapshot_isolation.py
+  expected_commit_subject: 'fix(environments): harden atomic snapshot publication'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Snapshot bootstrap must be Bash 3 compatible, atomically
+    published, sanitized, authenticated before use, isolated from setup input,
+    and fail closed to a non-snapshot session mode on any guard or trace
+    uncertainty. Preserve real command status under errexit and external stop
+    provenance.
+  removal_condition: >-
+    Remove when upstream supplies an equivalent authenticated, bounded shell
+    snapshot lifecycle with the same fallback and interruption semantics.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: ssh-non-posix-account-shell
+  change_class: execution-compatibility
+  owner: downstream-environment-reliability
+  overlap_policy: any_owned_file
+  files:
+  - tools/environments/ssh.py
+  owned_symbols:
+  - SSHEnvironment._run_bash
+  - SSHEnvironment._detect_remote_home
+  tests:
+  - tests/tools/test_base_environment.py
+  expected_commit_subject: 'fix(ssh): support non-posix account shells'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Remote execution must explicitly invoke Bash and must not
+    assume the SSH account's login shell parses POSIX syntax. Preserve upstream
+    connection, transfer, timeout, and cleanup changes.
+  removal_condition: >-
+    Remove when upstream's SSH backend supports non-POSIX account shells while
+    retaining Bash session semantics.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

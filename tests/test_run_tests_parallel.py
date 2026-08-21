@@ -35,6 +35,9 @@ import pytest
 
 from scripts import run_tests_parallel
 
+# Nested wrapper probes are normal callers, not ledger protocol clients.
+os.environ.pop("WORKFLOW_LEDGER_EXECUTION_ACTIVE", None)
+
 
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name

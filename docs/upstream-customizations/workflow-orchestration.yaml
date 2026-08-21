@@ -5639,3 +5639,93 @@ upstream_changes:
     equality with shared static reference validation, exact canonical scalar typing,
     durable scheduler coverage, and unchanged historical condition behavior.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: desktop-workflow-lane-collapse-and-filter
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/workflow-view-header.tsx
+  - apps/desktop/src/components/activity-board/activity-board.tsx
+  - apps/desktop/src/components/activity-board/lane-collapse.ts
+  owned_symbols:
+  - WorkflowsView
+  - workflowRunSearchText
+  - ActivityBoard
+  - reconcileLaneCollapseState
+  - laneIsCollapsed
+  - toggleLaneCollapse
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/workflow-view-header.test.tsx
+  - apps/desktop/src/components/activity-board/activity-board.test.tsx
+  - apps/desktop/src/components/activity-board/lane-collapse.test.ts
+  expected_commit_subject: 'fix(desktop): collapse empty workflow lanes'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Empty lanes collapse by default, user overrides survive
+    only while the lane's occupied/empty phase is unchanged, and view changes
+    reset scope. Run filtering applies to the loaded board without mutating
+    backend snapshots or hiding the disabled future-filter affordance.
+  removal_condition: >-
+    Remove when upstream supplies equivalent scoped lane-collapse state and
+    workflow-run filtering on the shared activity board.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: desktop-workflow-catalog-pagination-and-filter
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/artifacts/index.tsx
+  - apps/desktop/src/app/workflows/catalog.tsx
+  - apps/desktop/src/app/workflows/index.tsx
+  - apps/desktop/src/app/workflows/workflow-view-header.tsx
+  - apps/desktop/src/components/ui/pagination.tsx
+  owned_symbols:
+  - WorkflowCatalog
+  - catalogSearchText
+  - getPaginationItems
+  - Pagination
+  - PaginationPrevious
+  - PaginationNext
+  tests:
+  - apps/desktop/src/app/workflows/index.test.tsx
+  - apps/desktop/src/app/workflows/workflow-view-header.test.tsx
+  expected_commit_subject: 'feat(desktop): paginate and filter workflows'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Filter before pagination, reset to page one when query or
+    page size changes, keep unmatched-filter and empty-install states distinct,
+    and retain accessible bounded pagination controls and localized range text.
+  removal_condition: >-
+    Remove when upstream provides equivalent catalog and run filtering with
+    accessible bounded pagination and the same state distinctions.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+- id: desktop-workflow-diagram-viewport-fit
+  change_class: desktop-workflow-ui
+  owner: workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/workflows/view-workflow-dialog.tsx
+  - apps/desktop/src/components/assistant-ui/embeds/mermaid-embed.tsx
+  - apps/desktop/src/components/ui/zoomable.tsx
+  owned_symbols:
+  - ViewWorkflowDialog
+  - MermaidMarkup
+  - Zoomable
+  - ZoomPanViewer
+  tests:
+  - apps/desktop/src/app/workflows/view-workflow-dialog.test.tsx
+  - apps/desktop/src/components/assistant-ui/embeds/mermaid-embed.test.tsx
+  - apps/desktop/src/components/ui/zoomable.test.tsx
+  expected_commit_subject: 'fix(desktop): fit workflow diagrams at scaled viewports'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Workflow diagrams get a bounded stage-sized viewport and
+    override Mermaid's intrinsic max-width only in workflow presentation. Full
+    view uses a contain-sized pan/zoom stage; chat diagrams keep their compact
+    natural sizing. Preserve strict Mermaid security and lazy loading.
+  removal_condition: >-
+    Remove when upstream's shared renderer fits workflow diagrams at scaled
+    Electron viewports without regressing chat rendering, zoom, or security.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

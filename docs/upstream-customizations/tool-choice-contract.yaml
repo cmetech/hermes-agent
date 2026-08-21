@@ -1,0 +1,160 @@
+schema_version: 1
+feature: tool-choice-contract
+# Fork-owned explicit tool-selection and native structured-output contracts on
+# shared provider, CLI, gateway, API, and TUI seams.
+upstream_changes:
+- id: one-shot-tool-choice-surfaces
+  change_class: agent-control-contract
+  owner: downstream-agent-reliability
+  overlap_policy: any_owned_file
+  files:
+  - agent/tool_choice_control.py
+  - apps/desktop/src/app/session/hooks/use-prompt-actions/slash.ts
+  - apps/desktop/src/lib/desktop-slash-commands.ts
+  - cli.py
+  - gateway/run.py
+  - gateway/slash_commands.py
+  - hermes_cli/commands.py
+  - tui_gateway/methods_prompt.py
+  - tui_gateway/methods_tools.py
+  - tui_gateway/server.py
+  owned_symbols:
+  - OneShotToolChoice
+  - configure_tool_choice
+  - _consume_gateway_tool_choice
+  - _handle_tool_choice_command
+  - _consume_session_tool_choice
+  - _handle_tool_choice_control
+  tests:
+  - apps/desktop/src/app/session/hooks/use-prompt-actions/index.test.tsx
+  - apps/desktop/src/lib/desktop-slash-commands.test.ts
+  - tests/cli/test_tool_choice_control.py
+  - tests/gateway/test_tool_choice_control.py
+  - tests/tui_gateway/test_tool_choice_control.py
+  expected_commit_subject: 'feat: add one-shot tool choice controls'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Preserve one-shot, per-session consumption across CLI,
+    gateway, and TUI while retaining upstream command-registry and session
+    lifecycle changes. A selected policy applies to one operation only and must
+    not mutate the cached system prompt or leak into another session.
+  removal_condition: >-
+    Remove when upstream exposes an equivalent one-shot explicit tool-choice
+    control on all three surfaces with the same session isolation.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: provider-tool-policy-transport
+  change_class: provider-contract
+  owner: downstream-agent-reliability
+  overlap_policy: any_owned_file
+  files:
+  - agent/bedrock_adapter.py
+  - agent/chat_completion_helpers.py
+  - agent/tool_choice_policy.py
+  - agent/transports/anthropic.py
+  - agent/transports/base.py
+  - agent/transports/bedrock.py
+  - agent/transports/chat_completions.py
+  - agent/transports/codex.py
+  owned_symbols:
+  - ToolChoicePolicy
+  - ToolOperationContext
+  - parse_tool_choice
+  - parse_tool_choice_request
+  - validate_tool_choice_policy
+  - resolve_tool_choice
+  tests:
+  - tests/agent/test_tool_choice_policy.py
+  - tests/agent/test_transports.py
+  - tests/agent/test_chat_completion_helpers.py
+  - tests/agent/test_anthropic_adapter.py
+  - tests/agent/test_bedrock_adapter.py
+  expected_commit_subject: 'feat: map tool policy across provider transports'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Keep one immutable operation context as the authority for
+    provider mappings. Mandatory policies must fail explicitly when a provider
+    cannot honor them; retries reuse the operation context, post-tool calls
+    become auto, and unrelated later requests start clean.
+  removal_condition: >-
+    Remove when upstream owns equivalent cross-provider required, named, none,
+    retry, and post-tool semantics without request-global state.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: api-tool-contract-lifecycle-and-diagnostics
+  change_class: api-contract
+  owner: downstream-agent-reliability
+  overlap_policy: any_owned_file
+  files:
+  - agent/conversation_loop.py
+  - agent/error_classifier.py
+  - agent/otto_tool_contract.py
+  - agent/tool_contract_telemetry.py
+  - gateway/platforms/api_server.py
+  - run_agent.py
+  owned_symbols:
+  - _tool_policy_allows_fallback
+  - build_tool_contract_event
+  - emit_tool_contract_event
+  - _tool_contract_result_error
+  - _parse_api_tool_operation
+  - _effective_agent_tool_names
+  - OttoToolContractError
+  - add_otto_request_headers
+  - verify_response_echo
+  - verify_stream_echo
+  tests:
+  - tests/agent/test_error_classifier.py
+  - tests/agent/test_otto_tool_contract.py
+  - tests/agent/test_tool_choice_lifecycle.py
+  - tests/agent/test_tool_contract_telemetry.py
+  - tests/gateway/test_api_tool_choice_contract.py
+  - tests/gateway/test_api_server_runs.py
+  - tests/gateway/test_api_server.py
+  expected_commit_subject: 'feat: surface tool contract failures without fallback'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Validate policy before dispatch, distinguish contract
+    failures from provider fallback, keep streaming preflight bounded, and emit
+    bounded diagnostic metadata without prompt or secret content. Preserve
+    legacy request compatibility unless the caller opts into the strict
+    contract version.
+  removal_condition: >-
+    Remove when upstream provides equivalent request-scoped admission,
+    lifecycle, explicit failure, streaming preflight, and bounded diagnostics.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: native-structured-output-transports
+  change_class: provider-contract
+  owner: downstream-agent-reliability
+  overlap_policy: any_owned_file
+  files:
+  - agent/anthropic_adapter.py
+  - agent/chat_completion_helpers.py
+  - agent/codex_responses_adapter.py
+  - agent/transports/anthropic.py
+  - agent/transports/chat_completions.py
+  - agent/transports/codex.py
+  owned_symbols:
+  - _build_native_output_config_format
+  - _build_native_response_format
+  - _reserve_structured_response_format
+  - _build_native_text_format
+  - _reserve_structured_text_format
+  - _preflight_codex_api_kwargs
+  tests:
+  - tests/agent/test_anthropic_adapter.py
+  - tests/agent/test_codex_responses_adapter.py
+  - tests/agent/transports/test_chat_completions.py
+  - tests/agent/transports/test_codex_transport.py
+  - tests/agent/transports/test_transport.py
+  expected_commit_subject: 'feat(agent): enforce native structured output transports'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Native structured output must be mapped at the transport
+    boundary and reserved from caller overrides. Non-native strategies and
+    legacy calls must not receive accidental response-format fields.
+  removal_condition: >-
+    Remove when upstream provides equivalent native-schema handling for direct
+    Anthropic, Chat Completions, and Responses transports.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
