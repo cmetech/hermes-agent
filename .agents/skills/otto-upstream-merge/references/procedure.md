@@ -113,6 +113,14 @@ done
 Also run the neutral branding generator gate and the repository-specific
 pre-merge checks in `../CLAUDE.md`.
 
+The preflight checkout is intentionally detached, so identify it explicitly as
+the neutral branch when invoking the branch-gated check:
+
+```bash
+cd "$PREFLIGHT_WT/apps/desktop" || exit 1
+GITHUB_REF_NAME=base npm run check:brand-neutral || exit 1
+```
+
 Remove the preflight worktree after its evidence is captured, then return to
 the live repository without switching its branch:
 
