@@ -7,7 +7,7 @@
   "author": "cmetech",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cmetech/otto.git"
+    "url": "git+https://github.com/NousResearch/hermes-agent.git"
   },
   "type": "module",
   "main": "dist/electron-main.mjs",
