@@ -57,7 +57,7 @@ upstream_changes:
     Remove when upstream provides an equivalent bounded static plugin
     configuration descriptor with side-effect-free discovery, generic field and
     action projection, and the same fail-closed path/schema guarantees.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 
 - id: owner-bound-plugin-application-commands
   change_class: plugin-host-generic
@@ -90,7 +90,7 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream provides an equivalent owner-bound local plugin port
     that cannot widen model authority or cross plugin identity boundaries.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 
 - id: plugin-cli-command-collision-rejection
   change_class: plugin-host-generic
@@ -113,7 +113,7 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream rejects duplicate CLI command ownership with the same
     failed-load isolation.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 
 - id: profile-plugin-configuration-and-setup-actions
   change_class: plugin-host-generic
@@ -173,7 +173,7 @@ upstream_changes:
     Remove when upstream ships equivalent profile-local plugin configuration,
     secret storage, bounded setup-action lifecycle, runtime access, readiness,
     and CLI projection through one connector-neutral service.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 
 - id: desktop-plugin-configuration-projection
   change_class: desktop-capability-generic
@@ -247,7 +247,7 @@ upstream_changes:
     Remove when upstream provides an equivalent Desktop/API surface for generic
     descriptor-backed plugin fields, readiness, enablement, secrets, and setup
     actions with profile isolation and old-runtime compatibility.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 
 - id: optional-plugin-capability-staging-and-vendoring
   change_class: capability-staging-generic
@@ -306,4 +306,4 @@ upstream_changes:
     Remove when upstream supports equivalent structured optional-plugin
     staging and a clean-commit, committed-index, exact-byte atomic vendor with
     authenticated inventory reconciliation for workflows and packages.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101

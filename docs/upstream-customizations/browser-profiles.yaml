@@ -94,7 +94,7 @@ upstream_changes:
     Remove when upstream provides a first-class per-profile or per-origin trust
     model for private-network browser access (for example an allowlist attached
     to a CDP-attached session), making the local seam redundant.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: enrolled-browser-launch-wiring
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -574,7 +574,7 @@ upstream_changes:
     Remove when upstream can drive a user-supplied, already-installed browser
     binary with a persistent user-data-dir as a first-class session backend,
     making the local acquire()/CDP wiring redundant.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: browser-profile-settings-surface
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -609,7 +609,7 @@ upstream_changes:
     Remove alongside browser-profile-ssrf-trust-seam, or when a dedicated browser
     profiles panel replaces these Advanced keys (planned follow-up, deferred until
     the enrolled launcher is verified on a managed corporate machine).
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: enrolled-profile-seeding-and-toggle
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -689,4 +689,4 @@ upstream_changes:
     Remove when the enrolled browser profile is configured through a dedicated
     Settings panel that writes the profile directly, making first-run seeding of
     config.yaml unnecessary.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101

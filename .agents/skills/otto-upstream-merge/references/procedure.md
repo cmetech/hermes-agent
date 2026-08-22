@@ -2,18 +2,28 @@
 
 ## 1. Pin scope and capture evidence
 
-Set the requested release and immutable commit explicitly. For v0.20.5:
+Set the requested release and immutable commit explicitly before running this
+block. Do not give either value a historical default:
 
 ```bash
 REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
 cd "$REPO_ROOT" || exit 1
 test "$(git branch --show-current)" = base || exit 1
 git fetch origin || exit 1
-REQUESTED_VERSION=0.20.5
-UPSTREAM_TARGET=fcbd1076a93841fa88855acce810e342a5b78101
+: "${REQUESTED_VERSION:?set the requested upstream version}"
+: "${UPSTREAM_TARGET:?set the exact 40-hex upstream release commit}"
+printf '%s\n' "$UPSTREAM_TARGET" | grep -Eq '^[0-9a-f]{40}$' || exit 1
 git cat-file -e "$UPSTREAM_TARGET^{commit}" || exit 1
 git show "$UPSTREAM_TARGET:pyproject.toml" |
   grep -Fx "version = \"$REQUESTED_VERSION\"" || exit 1
+RELEASE_SUBJECT="$(git show -s --format=%s "$UPSTREAM_TARGET")" || exit 1
+case "$RELEASE_SUBJECT" in
+  "chore: release v$REQUESTED_VERSION ("*")") ;;
+  *) exit 1 ;;
+esac
+printf '%s\n' "$RELEASE_SUBJECT" |
+  grep -Eq '^chore: release v[^ ]+ \([0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?\)( \(#[0-9]+\))?$' \
+  || exit 1
 git merge-base --is-ancestor "$UPSTREAM_TARGET" origin/main || exit 1
 git rev-list --count "$UPSTREAM_TARGET"..origin/main
 ```
@@ -41,6 +51,7 @@ Unrelated user changes may remain in the live checkout.
 ```bash
 CONTROL_PATHS=(
   .agents/skills/otto-upstream-merge
+  docs/merge-reports
   docs/upstream-customizations
   scripts/check_upstream_customizations.py
   scripts/run_workflow_ledger_invariants.py
@@ -51,9 +62,18 @@ test -z "$(git ls-files --others --exclude-standard -- "${CONTROL_PATHS[@]}")" |
 
 EVIDENCE_ROOT="$(mktemp -d)" || exit 1
 EVIDENCE_DIR="$EVIDENCE_ROOT/evidence"
+EVIDENCE_MARKER="$EVIDENCE_ROOT/.otto-upstream-merge-evidence"
+: > "$EVIDENCE_MARKER" || exit 1
+cleanup_evidence() {
+  test -n "${EVIDENCE_ROOT:-}" || return 0
+  test -f "$EVIDENCE_ROOT/.otto-upstream-merge-evidence" || return 0
+  rm -rf -- "$EVIDENCE_ROOT"
+}
+trap cleanup_evidence EXIT INT TERM
 PREFLIGHT_ROOT="$(mktemp -d)" || exit 1
 PREFLIGHT_WT="$PREFLIGHT_ROOT/base-v${REQUESTED_VERSION}-preflight"
 cleanup_preflight() {
+  keep_evidence="${1:-}"
   case "${PREFLIGHT_WT:-}" in
     "$PREFLIGHT_ROOT"/*)
       git -C "$PREFLIGHT_WT" merge --abort 2>/dev/null || true
@@ -61,6 +81,7 @@ cleanup_preflight() {
       ;;
   esac
   rmdir "$PREFLIGHT_ROOT" 2>/dev/null || true
+  test "$keep_evidence" = keep-evidence || cleanup_evidence
 }
 trap cleanup_preflight EXIT INT TERM
 mkdir -p "$EVIDENCE_DIR" || exit 1
@@ -72,18 +93,36 @@ ln -s "$REPO_ROOT/apps/desktop/node_modules" \
   "$PREFLIGHT_WT/apps/desktop/node_modules" || exit 1
 
 cd "$PREFLIGHT_WT" || exit 1
+BASELINE_FILE="$EVIDENCE_DIR/manifest-baselines.tsv"
+: > "$BASELINE_FILE" || exit 1
 for manifest in docs/upstream-customizations/*.yaml; do
   test -f "$manifest" || exit 1
-  name="$(basename "$manifest" .yaml)"
   baseline="$($PYTHON scripts/check_upstream_customizations.py \
     --manifest "$manifest" --strict --base-ref base \
     --print-verified-upstream)" || exit 1
-  git merge-base --is-ancestor "$baseline" "$UPSTREAM_TARGET" || exit 1
+  printf '%s\t%s\n' "$baseline" "$manifest" >> "$BASELINE_FILE" || exit 1
+done
+test "$(cut -f1 "$BASELINE_FILE" | sort -u | wc -l | tr -d ' ')" = 1 || exit 1
+LAST_COMPLETED_TARGET="$(cut -f1 "$BASELINE_FILE" | head -n 1)"
+LAST_COMPLETED_VERSION="$(git show "$LAST_COMPLETED_TARGET:pyproject.toml" |
+  sed -n 's/^version = "\([^"]*\)"$/\1/p')"
+test -n "$LAST_COMPLETED_VERSION" || exit 1
+POSTMERGE_REPORT="$(find docs/merge-reports -maxdepth 1 -type f \
+  -name "*-upstream-v${LAST_COMPLETED_VERSION}-POSTMERGE.md" -print)"
+test -n "$POSTMERGE_REPORT" || exit 1
+test "$(printf '%s\n' "$POSTMERGE_REPORT" | wc -l | tr -d ' ')" = 1 || exit 1
+grep -F -- "- Upstream target: \`$LAST_COMPLETED_TARGET\`" \
+  "$POSTMERGE_REPORT" >/dev/null || exit 1
+test "$LAST_COMPLETED_TARGET" != "$UPSTREAM_TARGET" || exit 1
+git merge-base --is-ancestor "$LAST_COMPLETED_TARGET" "$UPSTREAM_TARGET" || exit 1
+
+for manifest in docs/upstream-customizations/*.yaml; do
+  name="$(basename "$manifest" .yaml)"
   "$PYTHON" scripts/check_upstream_customizations.py \
     --manifest "$manifest" --strict --base-ref base || exit 1
   if "$PYTHON" scripts/check_upstream_customizations.py \
     --manifest "$manifest" --strict --base-ref base \
-    --upstream-diff "$baseline..$UPSTREAM_TARGET" \
+    --upstream-diff "$LAST_COMPLETED_TARGET..$UPSTREAM_TARGET" \
     --report "$EVIDENCE_DIR/$name-overlap.json"; then
     checker_status=0
   else
@@ -126,8 +165,8 @@ the live repository without switching its branch:
 
 ```bash
 cd "$REPO_ROOT" || exit 1
-cleanup_preflight
-trap - EXIT INT TERM
+cleanup_preflight keep-evidence
+trap cleanup_evidence EXIT INT TERM
 test "$(git branch --show-current)" = base || exit 1
 ```
 
@@ -136,9 +175,10 @@ test "$(git branch --show-current)" = base || exit 1
 The live tree may contain user work. Use a detached worktree:
 
 ```bash
-TRIAL_ROOT="$(mktemp -d)"
+TRIAL_ROOT="$(mktemp -d)" || exit 1
 TRIAL_WT="$TRIAL_ROOT/base-v${REQUESTED_VERSION}-trial"
 cleanup_trial() {
+  keep_evidence="${1:-}"
   case "${TRIAL_WT:-}" in
     "$TRIAL_ROOT"/*)
       git -C "$TRIAL_WT" merge --abort 2>/dev/null || true
@@ -146,9 +186,10 @@ cleanup_trial() {
       ;;
   esac
   rmdir "$TRIAL_ROOT" 2>/dev/null || true
+  test "$keep_evidence" = keep-evidence || cleanup_evidence
 }
 trap cleanup_trial EXIT INT TERM
-git worktree add --detach "$TRIAL_WT" base
+git worktree add --detach "$TRIAL_WT" base || exit 1
 if git -C "$TRIAL_WT" merge --no-commit --no-ff "$UPSTREAM_TARGET"; then
   merge_status=0
 else
@@ -211,10 +252,10 @@ results, new surface, risks, follow-ups, and `GO`, `GO-WITH-FIXES`, or `NO-GO`.
 Abort and remove only the worktree created above:
 
 ```bash
-cleanup_trial
+cleanup_trial keep-evidence
+cleanup_evidence
 trap - EXIT INT TERM
 test "$(git branch --show-current)" = base
-rm -rf "$EVIDENCE_ROOT"
 ```
 
 Stop. A real merge requires explicit user approval after this report.
@@ -237,5 +278,39 @@ release proof. Generated text outputs may be regenerated from the tested base;
 binary art conflicts retain the verified brand overlay. Neither exception
 allows whole-file resolution of shared source code.
 
+Ledger invariants are authoritative on neutral `base`. If they are also run on
+a brand candidate, a neutral-default assertion may be recorded as
+not-applicable only when that exact test passed on the tested base and a
+brand-specific generator or runtime gate covers the branded behavior. Every
+other failure remains a blocker.
+
 Do not publish or create a release unless separately authorized. Whether the
 run succeeds or aborts, finish on `base` and report the exact tested SHAs.
+
+## 6. Seal the completed cycle
+
+Do not advance catalog baselines after rehearsal. Once the real merge and all
+applicable brand and release gates pass, update every manifest to the immutable
+target with the existing text-preserving command:
+
+```bash
+for manifest in docs/upstream-customizations/*.yaml; do
+  "$PYTHON" scripts/check_upstream_customizations.py \
+    --manifest "$manifest" \
+    --set-verified-upstream "$UPSTREAM_TARGET" || exit 1
+  test "$("$PYTHON" scripts/check_upstream_customizations.py \
+    --manifest "$manifest" --print-verified-upstream)" = "$UPSTREAM_TARGET" \
+    || exit 1
+done
+```
+
+Write `docs/merge-reports/<date>-upstream-v<version>-POSTMERGE.md`. Record the
+real merge and final base SHAs, brand SHAs, catalog count, late fixes, test and
+package/launch results, release workflow failures and fixes, run IDs, release
+URLs, remaining risks, and the exact next baseline. Historical decisions stay
+in the report; update manifest guidance only when ongoing ownership changed.
+
+Commit the report and baseline advancement together. Re-run strict validation
+against that exact closure commit before pushing it. A cycle is not sealed
+while manifests still point at the previous upstream release or the only report
+still describes a dry run.

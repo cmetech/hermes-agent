@@ -2548,9 +2548,19 @@ def _set_verified_upstream(path: Path, data: dict[str, Any], repo: Path, sha: st
         raise ValueError("verified upstream is not a local commit")
     if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=repo).returncode:
         raise ValueError("verified upstream is not an ancestor of HEAD")
-    for entry in data["upstream_changes"]:
-        entry["last_verified_upstream"] = sha
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    source = path.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r"^([ \t]*last_verified_upstream:[ \t]*)([0-9a-f]{40})([ \t]*(?:#.*)?)$",
+        re.MULTILINE,
+    )
+    expected = [entry["last_verified_upstream"] for entry in data["upstream_changes"]]
+    matches = list(pattern.finditer(source))
+    if [match.group(2) for match in matches] != expected:
+        raise ValueError("manifest baseline text does not match parsed entries")
+    path.write_text(
+        pattern.sub(lambda match: f"{match.group(1)}{sha}{match.group(3)}", source),
+        encoding="utf-8",
+    )
 
 
 def _write_json_atomically(path: Path, value: Any) -> None:
