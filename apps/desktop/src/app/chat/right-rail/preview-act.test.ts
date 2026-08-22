@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $rightRailActiveTabId } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
-import { applyBrand } from '../../../scripts/brand-transform.mjs'
+import { applyBrand } from '../../../../scripts/brand-transform.mjs'
 
 import { actOnActivePreview } from './preview-act'
 import { registerPreviewInput } from './preview-input'
