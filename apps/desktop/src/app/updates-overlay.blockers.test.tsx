@@ -203,7 +203,7 @@ describe('BlockerView', () => {
       />
     )
 
-    expect(screen.getByText('Close local previews to update Hermes?')).toBeTruthy()
+    expect(screen.getByText(applyBrand('Close local previews to update Hermes?'))).toBeTruthy()
     expect(screen.getByText('Example Preview')).toBeTruthy()
     expect(screen.getByText('Port 8766')).toBeTruthy()
     expect(screen.getByText(/will not modify or delete your files/i)).toBeTruthy()
