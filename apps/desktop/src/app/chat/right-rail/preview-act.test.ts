@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $rightRailActiveTabId } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
+import { applyBrand } from '../../../scripts/brand-transform.mjs'
 
 import { actOnActivePreview } from './preview-act'
 import { registerPreviewInput } from './preview-input'
@@ -270,7 +271,7 @@ describe('actOnActivePreview (drive_preview tool)', () => {
       registerPreviewScriptRunner(tabId, async code =>
         code.includes('var locate = ')
           ? JSON.stringify({ acted: 'looking at button "Save"', point: { x: 12, y: 8 }, success: true })
-          : JSON.stringify({ elements: [], hit: { tag: 'HERMES-WATCH', trusted: true }, success: true })
+          : JSON.stringify({ elements: [], hit: { tag: applyBrand('HERMES-WATCH'), trusted: true }, success: true })
       )
     )
     cleanups.push(registerPreviewInput(tabId, { focus: vi.fn(), send: vi.fn() }))
