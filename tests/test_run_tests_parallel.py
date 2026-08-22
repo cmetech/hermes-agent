@@ -50,6 +50,12 @@ def _handoff_path_for(nonce: str) -> Path:
     return _HANDOFF_DIR / f"grandchild-{nonce}.json"
 
 
+def _wrapper_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["HERMES_PYTHON"] = sys.executable
+    return env
+
+
 def _pid_alive(pid: int) -> bool:
     """POSIX: send signal 0 to probe whether ``pid`` is still alive.
 
@@ -463,7 +469,7 @@ def test_worker_selection_policy(
     probe_dir = _make_probe_dir(tmp_path)
     repo_root = Path(__file__).resolve().parent.parent
     runner = repo_root / "scripts" / "run_tests.sh"
-    env = os.environ.copy()
+    env = _wrapper_env()
     if env_workers is None:
         env.pop("HERMES_TEST_WORKERS", None)
     else:
@@ -514,7 +520,7 @@ def test_canonical_wrapper_preserves_file_retry_environment_override(
         ),
         encoding="utf-8",
     )
-    env = os.environ.copy()
+    env = _wrapper_env()
     env["HERMES_TEST_FILE_RETRIES"] = "0"
 
     proc = subprocess.run(
@@ -539,7 +545,7 @@ def test_ledger_wrapper_mode_rejects_unsealed_or_ambiguous_commands(
     repo_root = Path(__file__).resolve().parent.parent
     wrapper = repo_root / "scripts" / "run_tests.sh"
     relative_probe = "tests/test_run_tests_parallel.py"
-    env = os.environ.copy()
+    env = _wrapper_env()
     env["WORKFLOW_LEDGER_EXECUTION_ACTIVE"] = "1"
     forged_root = tmp_path / "workflow-ledger-pytest-forged"
     forged_basetemp = forged_root / "basetemp"
@@ -618,6 +624,7 @@ def test_canonical_wrapper_help_exits_without_running_tests(
     proc = subprocess.run(
         [str(runner), str(nonexistent), help_flag],
         cwd=repo_root,
+        env=_wrapper_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -991,7 +998,7 @@ def test_runner_default_honors_linux_process_affinity(tmp_path: Path) -> None:
         )
         """
     )
-    env = os.environ.copy()
+    env = _wrapper_env()
     env.pop("HERMES_TEST_WORKERS", None)
 
     proc = subprocess.run(
