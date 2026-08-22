@@ -10,7 +10,10 @@ upstream_changes:
   files:
   - hermes_cli/plugin_configuration.py
   - hermes_cli/plugins.py
+  - hermes_cli/plugins_cmd.py
   - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugin_configuration_api.py
+  - tests/hermes_cli/test_plugins_cmd_list.py
   owned_symbols:
   - FieldStorage
   - ValidationConstraints
@@ -24,13 +27,19 @@ upstream_changes:
   - PluginManifest
   - LoadedPlugin
   - PluginManager.static_plugin_inventory
+  - _read_manifest_info
+  - _parse_manifest_v2_fields
+  - cmd_list
   owned_invariants:
   - plugin configuration metadata is inert bounded JSON loaded without importing plugin code
   - malformed descriptors omit configuration surfaces without preventing plugin discovery
   - field ids, types, defaults, visibility, validation, readiness, platform projection, and setup-action metadata are bounded and fail closed
   - descriptors declare generic host behavior and never grant connector execution authority
+  - a string config_schema remains a file-backed configuration descriptor reference while only a mapping is parsed as the upstream inline v2 schema
   tests:
   - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugin_configuration_api.py
+  - tests/hermes_cli/test_plugins_cmd_list.py
   expected_commit_subject: 'feat(plugins): expose static configuration descriptors'
   upstream_candidate: true
   merge_guidance: >-
@@ -40,12 +49,71 @@ upstream_changes:
     fixed-width regex validation, URL validation, exact structured-plugin
     identity, and platform filtering. Plugin discovery must remain available
     when a descriptor is invalid, but no invalid field or action may project.
+    Preserve the dual config_schema contract: a string names the bounded
+    file-backed connector descriptor, while a mapping is the inline v2 schema;
+    never reject or reinterpret the string as malformed inline schema.
     Do not add connector ids or vendor-specific defaults to this generic seam.
   removal_condition: >-
     Remove when upstream provides an equivalent bounded static plugin
     configuration descriptor with side-effect-free discovery, generic field and
     action projection, and the same fail-closed path/schema guarantees.
-  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: owner-bound-plugin-application-commands
+  change_class: plugin-host-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/plugin_application_commands.py
+  - hermes_cli/plugins.py
+  owned_symbols:
+  - PluginApplicationCommandInvocation
+  - PluginApplicationCommandMode
+  - _register_application_commands
+  - _invoke_application_command
+  - PluginContext.register_application_commands
+  - PluginContext.invoke_application_command
+  owned_invariants:
+  - application commands are immutable owner-bound local invocations and never enter model-tool admission
+  - provider operations modes caller allowlists arguments results invocation ids and failure text are bounded and validated
+  - reload failure removes only providers published by the failed plugin and never unrelated registrations
+  tests:
+  - tests/hermes_cli/test_plugin_application_commands.py
+  - tests/hermes_cli/test_plugins.py
+  expected_commit_subject: 'feat: add owner-bound plugin application command dispatch'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Keep deterministic application commands outside the model
+    tool schema. Preserve canonical plugin identity, caller allowlists,
+    immutable single-use invocation capability, bounded JSON arguments/results,
+    mode enforcement, and rollback of registrations from failed plugin loads.
+  removal_condition: >-
+    Remove when upstream provides an equivalent owner-bound local plugin port
+    that cannot widen model authority or cross plugin identity boundaries.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: plugin-cli-command-collision-rejection
+  change_class: plugin-host-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/plugins.py
+  owned_symbols:
+  - PluginCliCommandCollisionError
+  - PluginContext.register_cli_command
+  tests:
+  - tests/hermes_cli/test_plugin_cli_registration.py
+  - tests/hermes_cli/test_plugins.py
+  expected_commit_subject: 'fix: reject plugin CLI command collisions'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Duplicate plugin CLI command names fail closed before
+    replacing the original owner; partial plugin-load rollback must not remove
+    an unrelated provider's command.
+  removal_condition: >-
+    Remove when upstream rejects duplicate CLI command ownership with the same
+    failed-load isolation.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 
 - id: profile-plugin-configuration-and-setup-actions
   change_class: plugin-host-generic
@@ -105,7 +173,7 @@ upstream_changes:
     Remove when upstream ships equivalent profile-local plugin configuration,
     secret storage, bounded setup-action lifecycle, runtime access, readiness,
     and CLI projection through one connector-neutral service.
-  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 
 - id: desktop-plugin-configuration-projection
   change_class: desktop-capability-generic
@@ -179,7 +247,7 @@ upstream_changes:
     Remove when upstream provides an equivalent Desktop/API surface for generic
     descriptor-backed plugin fields, readiness, enablement, secrets, and setup
     actions with profile isolation and old-runtime compatibility.
-  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 
 - id: optional-plugin-capability-staging-and-vendoring
   change_class: capability-staging-generic
@@ -238,4 +306,4 @@ upstream_changes:
     Remove when upstream supports equivalent structured optional-plugin
     staging and a clean-commit, committed-index, exact-byte atomic vendor with
     authenticated inventory reconciliation for workflows and packages.
-  last_verified_upstream: b7a05b6b6f509d14f708a2fe7b7c1d3559396ef6
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

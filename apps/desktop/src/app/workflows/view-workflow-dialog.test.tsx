@@ -402,11 +402,13 @@ describe('workflow View dialog', () => {
     expect(within(dialog).getByRole('button', { name: 'Run' }).hasAttribute('disabled')).toBe(false)
   })
 
-  it('preserves the shared dialog vertical scroll while clipping horizontal overflow', async () => {
+  it('preserves the shared dialog body scroll while clipping horizontal overflow', async () => {
     renderView()
     const dialog = await openView()
+    const body = dialog.firstElementChild
 
-    expect(dialog.classList.contains('overflow-y-auto')).toBe(true)
+    expect(body?.classList.contains('overflow-y-auto')).toBe(true)
+    expect(dialog.classList.contains('overflow-y-auto')).toBe(false)
     expect(dialog.classList.contains('overflow-x-hidden')).toBe(true)
     expect(dialog.classList.contains('overflow-hidden')).toBe(false)
   })

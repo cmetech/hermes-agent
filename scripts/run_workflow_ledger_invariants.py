@@ -723,6 +723,8 @@ def _provision_external_node_modules(
             sealed_repo,
             deadline,
         )
+        for cache_path in _NODE_DEPENDENCY_CACHE_PATHS:
+            (root.destination / cache_path).mkdir(exist_ok=True)
         try:
             root.view_identity = _file_identity(root.destination)
             root.view_entries = _snapshot_dependency_entries(

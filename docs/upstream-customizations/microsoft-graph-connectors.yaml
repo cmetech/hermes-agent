@@ -59,7 +59,7 @@ upstream_changes:
     provider protocol with explicit app-only and delegated identity selection,
     profile-owned safe cache persistence, silent-versus-interactive separation,
     secret redaction, and unchanged Teams app-only behavior.
-  last_verified_upstream: da59906aaad8f9cb023fb66426c6f60ff5afa04a
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
 
 - id: bounded-microsoft-graph-client-operations
   change_class: capability-generic
@@ -115,4 +115,4 @@ upstream_changes:
     redirects and monitors, atomic file handling, cancellation/deadline-aware
     capped retry waits, validated upload resume offsets, and non-replay of
     ambiguous mutations while preserving the existing Teams client contract.
-  last_verified_upstream: da59906aaad8f9cb023fb66426c6f60ff5afa04a
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

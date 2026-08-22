@@ -68,6 +68,15 @@ merge cleanliness is never proof that the recorded behavior survived. Baselines
 advance only through the controlled upstream-merge workflow after the named
 tests pass.
 
+The human merge report may use the more descriptive disposition
+`retain-downstream-behavior` when upstream is inapplicable, contradicts a
+documented fork invariant, or the downstream behavior is a verified superset.
+Record that as machine decision `adapt`: the upstream commit remains in history
+and only the shared behavior is reconciled. Conflict difficulty, deadline
+pressure, or feature disinterest never justify retaining downstream behavior.
+If applicability or equivalence is unclear, stop the real merge rather than
+inventing a decision.
+
 Two-dot ranges are literal Git revision sets: `A..B` examines commits reachable
 from `B` but not `A`, even when the tips diverge. Triple-dot ranges compare the
 merge base of `A` and `B` to `B`. Symbol overlap always reads the resolved left
@@ -120,13 +129,17 @@ dependency view disappears with the detached worktree on every exit path.
 
 - `agent-browser-probe-cache.yaml` — bounded agent-browser availability caching.
 - `browser-profiles.yaml` — enrolled browser profile trust and launch seams.
+- `credential-storage.yaml` — plugin-secret authority, migration, atomic publication, and ACL boundaries.
 - `desktop-loader.yaml` — non-blocking declarative Desktop loader animation.
 - `desktop-test-infra.yaml` — Desktop test and dependency-view infrastructure.
+- `environment-runtime.yaml` — authenticated shell snapshots and remote-shell compatibility.
+- `fork-runtime.yaml` — shared profile, branding, Desktop, gateway, and service-runtime behavior.
 - `gateway-autostart.yaml` — Desktop gateway automation startup and visibility.
 - `kanban-attachment-access.yaml` — bounded kanban attachment access.
 - `platform-test-skips.yaml` — explicit platform-specific test exclusions.
 - `plugin-configuration.yaml` — generic static plugin descriptors, profile setup actions, Desktop/CLI projection, and capability staging.
 - `python-isolation.yaml` — managed Python environment isolation.
 - `test-harness.yaml` — generic test harness customizations.
+- `tool-choice-contract.yaml` — one-shot controls, provider policy mapping, API lifecycle, and native structured output.
 - `windows-npm-toolchain.yaml` — Windows npm compatibility enforcement.
 - `workflow-orchestration.yaml` — workflow language, admission, execution, and merge invariants.

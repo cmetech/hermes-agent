@@ -208,6 +208,19 @@ class TestRawSentinelFilter:
         assert sentinel not in result["output"]
         assert len(result["output"]) <= max_bytes
 
+    def test_stdin_error_diagnostic_respects_bounded_capture(self, monkeypatch):
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.returncode = 0
+        proc.stdout = iter(["command output"])
+        proc._hermes_stdin_errors = [RuntimeError("write failed")]
+        monkeypatch.setattr("tools.tool_output_limits.get_max_bytes", lambda: 32)
+
+        result = _TestableEnv()._wait_for_process(proc, bounded_capture=True)
+
+        assert result["stdin_error"] == "write failed"
+        assert len(result["output"]) <= 32
+
 
 class TestWrapCommand:
     def test_basic_shape(self):
@@ -980,7 +993,11 @@ class TestInitSessionFailure:
         try:
             result = env.execute("printf 'USER_OUTPUT'")
 
-            assert result == {"output": "USER_OUTPUT", "returncode": 0}
+            assert result == {
+                "output": "USER_OUTPUT",
+                "returncode": 0,
+                "cwd_observed": True,
+            }
             assert token not in result["output"]
             assert env._session_mode == "snapshot"
         finally:
@@ -1227,7 +1244,7 @@ trap __hermes_debug_attack DEBUG
 
             assert result["returncode"] == 0
             assert result["output"].endswith("RECOVERED")
-            assert set(result) == {"output", "returncode"}
+            assert set(result) == {"output", "returncode", "cwd_observed"}
             assert env._session_mode == "degraded_nonlogin"
         finally:
             set_interrupt(False)

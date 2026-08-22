@@ -1,5 +1,4 @@
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -179,7 +178,7 @@ def test_action_failure_never_returns_plugin_exception_secrets(tmp_path, monkeyp
 
 def test_action_deadline_cancels_without_status_polling(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    service, _, _ = _plugin(
+    service, manager, _ = _plugin(
         tmp_path,
         source=(
             "import threading, time\n"
@@ -195,7 +194,7 @@ def test_action_deadline_cancels_without_status_polling(tmp_path, monkeypatch):
     )
 
     started = service.start_action("action-plugin", "auth", timeout_seconds=0.05)
-    module = sys.modules["hermes_plugins.action_plugin"]
+    module = manager._plugins["action-plugin"].module
 
     assert module.cancel_seen.wait(0.5) is True
     assert service.action_status(started["run_id"])["status"] == "timed_out"
@@ -329,7 +328,7 @@ def test_disabled_active_profile_cannot_use_cached_action_registration(
 
 def test_noncooperative_workers_are_capacity_bounded(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    service, _, _ = _plugin(
+    service, manager, _ = _plugin(
         tmp_path,
         source=(
             "import threading\n"
@@ -346,7 +345,7 @@ def test_noncooperative_workers_are_capacity_bounded(tmp_path, monkeypatch):
     with pytest.raises(PluginConfigurationError, match="capacity"):
         service.start_action("action-plugin", "auth", timeout_seconds=1)
 
-    sys.modules["hermes_plugins.action_plugin"].release.set()
+    manager._plugins["action-plugin"].module.release.set()
     for run in started:
         _wait(service, run["run_id"])
 
@@ -394,7 +393,7 @@ def test_action_output_enforces_aggregate_byte_budget_during_projection(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    service, _, _ = _plugin(
+    service, manager, _ = _plugin(
         tmp_path,
         source=(
             "from collections.abc import Mapping\n"
@@ -416,7 +415,7 @@ def test_action_output_enforces_aggregate_byte_budget_during_projection(
     result = _wait(service, service.start_action("action-plugin", "auth")["run_id"])
 
     assert result["status"] == "failed"
-    assert sys.modules["hermes_plugins.action_plugin"].items_seen < 100
+    assert manager._plugins["action-plugin"].module.items_seen < 100
 
 
 def test_near_boundary_mapping_is_rejected_by_traversal_not_final_encoding():
@@ -482,7 +481,7 @@ def test_connector_secret_authority_precedence_is_managed_scope_external_file(
     from hermes_cli.plugin_configuration import _secret_storage_key
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    service, _, _ = _plugin(
+    service, manager, _ = _plugin(
         tmp_path,
         source=(
             "expected = ''\n"
@@ -493,7 +492,7 @@ def test_connector_secret_authority_precedence_is_managed_scope_external_file(
     )
     service.update("action-plugin", secrets={"token": "profile-file-secret"})
     key = _secret_storage_key("action-plugin", "token")
-    module = sys.modules["hermes_plugins.action_plugin"]
+    module = manager._plugins["action-plugin"].module
 
     def assert_authority(value):
         module.expected = value

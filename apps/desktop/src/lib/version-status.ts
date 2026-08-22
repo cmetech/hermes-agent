@@ -39,8 +39,8 @@ export interface VersionStatusInput {
   /** Client only: short commit sha of the running build. */
   sha?: null | string
   target: UpdateTarget
-  /** An update the commit count can't express (pip installs; OTTO
-   *  release-mode client installs, which update by downloading a release). */
+  /** An update the commit count can't express (shallow clones, pip installs,
+   *  or release-mode clients that update by downloading a release). */
   updateAvailable?: boolean
   version?: null | string
 }
@@ -71,9 +71,10 @@ export function resolveVersionStatus({
 }: VersionStatusInput): VersionStatusResult {
   const client = target === 'client'
   const busy = applying || restarting
-  // OTTO: `updateAvailable` counts for the CLIENT too — a release-mode desktop
-  // install knows it's stale but has no commit count, so it takes the same
-  // `(update)` fallback a pip backend does.
+  // updateAvailable covers every "behind but uncountable" shape: shallow
+  // installer clones (behind === null upstream, coalesced to 0 by callers),
+  // SSH-official presence-only checks, pip installs, and release clients. It
+  // applies to BOTH targets so an uncountable client update remains visible.
   const available = behind > 0 || !!updateAvailable
 
   // A client with no version still identifies itself by sha; a backend can't.

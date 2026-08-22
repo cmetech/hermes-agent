@@ -378,7 +378,11 @@ export function WorkflowsView() {
       />
       {view === 'workflows' ? (
         <div className="mt-4 min-h-0 flex-1 overflow-y-auto">
-          <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} />
+          <WorkflowCatalog
+            onRunWorkflow={openReview}
+            onViewWorkflow={openView}
+            requestProfile={requestProfile}
+          />
         </div>
       ) : (
         <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>

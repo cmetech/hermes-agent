@@ -2,6 +2,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as SvgImage from '@/lib/svg-image'
+
 import MermaidRenderer from './mermaid-embed'
 
 const mermaidMock = vi.hoisted(() => ({
@@ -11,7 +13,10 @@ const mermaidMock = vi.hoisted(() => ({
 
 vi.mock('mermaid', () => ({ default: mermaidMock }))
 vi.mock('./use-is-dark', () => ({ useIsDark: () => false }))
-vi.mock('@/lib/svg-image', () => ({ copySvgAsPng: vi.fn() }))
+vi.mock('@/lib/svg-image', async importOriginal => ({
+  ...(await importOriginal<typeof SvgImage>()),
+  copySvgAsPng: vi.fn()
+}))
 
 const INTRINSIC_SVG =
   '<svg height="48" style="max-width: 180px;" viewBox="0 0 180 48" width="100%"><g><rect height="40" width="172" /></g></svg>'

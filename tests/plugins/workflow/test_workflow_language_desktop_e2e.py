@@ -135,6 +135,11 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         web_server.app,
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
     ) as client:
+        assert client.get("/api/plugins/workflow/workflows").status_code == 200
+        assert client.get(
+            "/api/plugins/workflow/workflows/archon-deferred",
+            params={"catalog_source": "project"},
+        ).status_code == 200
         before_home = _tree_snapshot(home)
         before_project = _tree_snapshot(workdir)
         catalog_response = client.get("/api/plugins/workflow/workflows")

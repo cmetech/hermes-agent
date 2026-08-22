@@ -504,6 +504,10 @@ def test_relay_stream_preserves_terminal_route_drift(
         async def run_in_session_async(_session, callback, *args, **kwargs):
             return await callback(*args, **kwargs)
 
+        @staticmethod
+        def acquire_operation_lease():
+            return SimpleNamespace(release=lambda: None)
+
     monkeypatch.setattr(
         relay_runtime,
         "resolve_execution_context",

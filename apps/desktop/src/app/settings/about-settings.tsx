@@ -5,7 +5,7 @@ import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
-import { CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
+import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $desktopVersion,
@@ -25,6 +25,7 @@ import { UninstallSection } from './uninstall-section'
 // lowercased in the path (`hermes-agent`) so the build-time \bHermes\b→OTTO
 // transform can't rewrite it — it must be flipped in source. See CLAUDE.md.
 const RELEASE_NOTES_URL = 'https://github.com/cmetech/otto/releases'
+const INSTALLER_URL = 'https://hermes-agent.nousresearch.com/'
 
 function relativeTime(ms: number | undefined, a: Translations['settings']['about']) {
   if (!ms) {
@@ -70,6 +71,9 @@ export function AboutSettings() {
     : RELEASE_NOTES_URL
 
   const behind = status?.behind ?? 0
+  // behind is null when the exact count is unknowable (shallow clone): the
+  // backend flags that case via updateAvailable instead of a number.
+  const updateAvailable = behind > 0 || Boolean(status?.updateAvailable)
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
   // OTTO release installs (packaged): "Update now" downloads the next release
@@ -94,8 +98,8 @@ export function AboutSettings() {
   } else if (applying) {
     statusLine = a.installing
     statusTone = 'available'
-  } else if (behind > 0) {
-    statusLine = a.updateReady(behind)
+  } else if (updateAvailable) {
+    statusLine = behind > 0 ? a.updateReady(behind) : a.updateReadyUnknown
     statusTone = 'available'
   } else if (status) {
     statusLine = a.onLatest
@@ -113,6 +117,31 @@ export function AboutSettings() {
             {version?.appVersion ? a.version(version.appVersion) : a.versionUnavailable}
           </p>
         </div>
+        {version?.bundleOutOfSync && (
+          <div className="mx-auto w-full max-w-2xl rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-left text-sm">
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div className="min-w-0">
+                <p className="font-medium">{a.bundleOutOfSync}</p>
+                <p className="mt-1 text-xs text-muted-foreground">{a.bundleOutOfSyncDesc}</p>
+                <Button asChild className="mt-2" size="sm" variant="textStrong">
+                  <a
+                    href={INSTALLER_URL}
+                    onClick={event => {
+                      event.preventDefault()
+                      void window.hermesDesktop?.openExternal?.(INSTALLER_URL)
+                    }}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    <ExternalLink className="size-3" />
+                    {a.bundleOutOfSyncAction}
+                  </a>
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="mx-auto mt-4 w-full max-w-2xl">
@@ -152,7 +181,7 @@ export function AboutSettings() {
               {checking ? a.checking : a.checkNow}
             </Button>
 
-            {behind > 0 && supported && !applying && (
+            {updateAvailable && supported && !applying && (
               <>
                 <Button onClick={() => startActiveUpdate()} size="sm">
                   {a.updateNow}

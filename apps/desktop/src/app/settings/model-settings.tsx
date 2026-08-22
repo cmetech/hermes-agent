@@ -6,7 +6,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import {
-  getApiRequestProfile,
   getAuxiliaryModels,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -29,10 +28,11 @@ import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
 import { evaluateModelEligibility, type ModelUsageKind } from '@/lib/model-eligibility'
 import { DEFAULT_REASONING_EFFORT, REASONING_EFFORT_VALUES } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
+import { setMainModelAssignment } from '@/store/cron-model-impact'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualOnboarding, startManualProviderOAuth } from '@/store/onboarding'
 
-import { invalidateHermesConfig, setHermesConfigCache, useHermesConfigRecord } from '../hooks/use-config-record'
+import { hermesConfigCacheWriter, invalidateHermesConfig, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
 import { CONTROL_TEXT } from './constants'
@@ -194,11 +194,15 @@ function StaleAuxWarning({ applying, onReset, slots, taskLabel }: StaleAuxWarnin
 interface ModelSettingsProps {
   /** Notified after the main model is applied, so live UI stores can sync. */
   onMainModelChanged?: (provider: string, model: string) => void
+  /** Shared settings "Applies to" scope: a concrete profile to edit instead of
+   *  the app's active one, or null to follow the active profile (default). */
+  scopeProfile?: null | string
 }
 
-export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
+export function ModelSettings({ onMainModelChanged, scopeProfile = null }: ModelSettingsProps) {
   const { t } = useI18n()
   const m = t.settings.model
+  const requestProfile = scopeProfile ?? undefined
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [mainModel, setMainModel] = useState<{ model: string; provider: string } | null>(null)
@@ -210,9 +214,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const [selectedMoaPreset, setSelectedMoaPreset] = useState('')
   const [newMoaPresetName, setNewMoaPresetName] = useState('')
   // agent.* defaults round-trip through the shared config cache (read → write
-  // back the whole record), so a save here shows in the MCP/config surfaces.
-  const { data: config } = useHermesConfigRecord()
-  const setConfig = setHermesConfigCache
+  // back the whole record), so a save here shows in the MCP/model surfaces.
+  const { data: config } = useHermesConfigRecord(scopeProfile)
+  const setConfig = useMemo(() => hermesConfigCacheWriter(scopeProfile), [scopeProfile])
   const [applying, setApplying] = useState(false)
   const [editingAuxTask, setEditingAuxTask] = useState<null | string>(null)
   const [auxDraft, setAuxDraft] = useState<{ model: string; provider: string }>({ model: '', provider: '' })
@@ -241,59 +245,63 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const moaSaveGeneration = useRef(0)
   const moaSaveTimer = useRef<number | null>(null)
 
-  const refresh = useCallback(async (options?: { preserveDraft?: boolean; refreshCatalog?: boolean; replaceSelection?: boolean }) => {
-    const epoch = profileEpoch.current
-    setLoading(true)
-    setError('')
+  const refresh = useCallback(
+    async ({
+      preserveDraft = false,
+      refreshCatalog = false,
+      replaceSelection = false
+    }: { preserveDraft?: boolean; refreshCatalog?: boolean; replaceSelection?: boolean } = {}) => {
+      const epoch = profileEpoch.current
+      setLoading(true)
+      setError('')
 
-    try {
-      const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
-        getGlobalModelInfo(),
-        getGlobalModelOptions(options?.refreshCatalog ? { refresh: true } : undefined),
-        getAuxiliaryModels(),
-        getMoaModels().catch(() => null)
-      ])
+      try {
+        const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
+          getGlobalModelInfo(requestProfile),
+          getGlobalModelOptions(refreshCatalog ? { refresh: true } : undefined, requestProfile),
+          getAuxiliaryModels(requestProfile),
+          getMoaModels(requestProfile).catch(() => null)
+        ])
 
-      if (profileEpoch.current !== epoch) {
-        return
-      }
+        if (profileEpoch.current !== epoch) {
+          return
+        }
 
-      setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
-      setProviders(modelOptions.providers || [])
+        setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
+        setProviders(modelOptions.providers || [])
 
-      // preserveDraft (OTTO): leave the in-progress selection untouched.
-      // replaceSelection (upstream): hard-set to the saved model.
-      // default: soft-set — fill only when nothing is selected yet.
-      if (!options?.preserveDraft) {
-        if (options?.replaceSelection) {
-          setSelectedProvider(modelInfo.provider)
-          setSelectedModel(modelInfo.model)
-        } else {
-          setSelectedProvider(prev => prev || modelInfo.provider)
-          setSelectedModel(prev => prev || modelInfo.model)
+        if (!preserveDraft) {
+          if (replaceSelection) {
+            setSelectedProvider(modelInfo.provider)
+            setSelectedModel(modelInfo.model)
+          } else {
+            setSelectedProvider(prev => prev || modelInfo.provider)
+            setSelectedModel(prev => prev || modelInfo.model)
+          }
+        }
+
+        setAuxiliary(auxiliaryModels)
+        setMoa(moaModels)
+
+        if (moaModels) {
+          setSelectedMoaPreset(prev => (prev && moaModels.presets[prev] ? prev : moaModels.default_preset))
+        }
+
+        // The config record loads via its own shared query; a model switch can
+        // change it server-side (aux slots), so nudge that cache to refetch.
+        void invalidateHermesConfig(scopeProfile)
+      } catch (err) {
+        if (profileEpoch.current === epoch) {
+          setError(err instanceof Error ? err.message : String(err))
+        }
+      } finally {
+        if (profileEpoch.current === epoch) {
+          setLoading(false)
         }
       }
-
-      setAuxiliary(auxiliaryModels)
-      setMoa(moaModels)
-
-      if (moaModels) {
-        setSelectedMoaPreset(prev => (prev && moaModels.presets[prev] ? prev : moaModels.default_preset))
-      }
-
-      // The config record loads via its own shared query; a model switch can
-      // change it server-side (aux slots), so nudge that cache to refetch.
-      void invalidateHermesConfig()
-    } catch (err) {
-      if (profileEpoch.current === epoch) {
-        setError(err instanceof Error ? err.message : String(err))
-      }
-    } finally {
-      if (profileEpoch.current === epoch) {
-        setLoading(false)
-      }
-    }
-  }, [])
+    },
+    [requestProfile, scopeProfile]
+  )
 
   useEffect(() => {
     void refresh()
@@ -435,43 +443,41 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // edit that completes the slot flushes the whole preset. Every edit bumps
   // the generation so an in-flight response from an older save can never
   // repaint over the user's mid-edit state.
-  const scheduleMoaSave = useCallback((next: MoaConfigResponse) => {
-    if (moaSaveTimer.current !== null) {
-      window.clearTimeout(moaSaveTimer.current)
-      moaSaveTimer.current = null
-    }
+  const scheduleMoaSave = useCallback(
+    (next: MoaConfigResponse) => {
+      if (moaSaveTimer.current !== null) {
+        window.clearTimeout(moaSaveTimer.current)
+        moaSaveTimer.current = null
+      }
 
-    // Hold the save while a slot is half-filled (provider picked, model
-    // pending): bump the generation so any in-flight older save is invalidated,
-    // but leave the last complete config on disk until the slot completes.
-    if (!moaConfigComplete(next)) {
-      moaSaveGeneration.current += 1
+      if (!moaConfigComplete(next)) {
+        moaSaveGeneration.current += 1
 
-      return
-    }
+        return
+      }
 
-    const epoch = profileEpoch.current
-    const generation = ++moaSaveGeneration.current
-    const profile = getApiRequestProfile()
+      const epoch = profileEpoch.current
+      const generation = ++moaSaveGeneration.current
 
-    moaSaveTimer.current = window.setTimeout(() => {
-      moaSaveTimer.current = null
-      void saveMoaModels(next, profile)
-        .then(saved => {
-          if (profileEpoch.current !== epoch || moaSaveGeneration.current !== generation) {
-            return
-          }
-
-          moaRef.current = saved
-          setMoa(saved)
-        })
-        .catch(err => {
-          if (profileEpoch.current === epoch && moaSaveGeneration.current === generation) {
-            setError(err instanceof Error ? err.message : String(err))
-          }
-        })
-    }, 600)
-  }, [])
+      moaSaveTimer.current = window.setTimeout(() => {
+        moaSaveTimer.current = null
+        void saveMoaModels(next, requestProfile)
+          .then(saved => {
+            if (profileEpoch.current !== epoch || moaSaveGeneration.current !== generation) {
+              return
+            }
+            moaRef.current = saved
+            setMoa(saved)
+          })
+          .catch(err => {
+            if (profileEpoch.current === epoch && moaSaveGeneration.current === generation) {
+              setError(err instanceof Error ? err.message : String(err))
+            }
+          })
+      }, 600)
+    },
+    [requestProfile]
+  )
 
   const updateMoaPreset = useCallback(
     (updater: (preset: NonNullable<typeof currentMoaPreset>) => NonNullable<typeof currentMoaPreset>) => {
@@ -510,35 +516,38 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     return next
   }, [])
 
-  const saveMoa = useCallback(async (next: MoaConfigResponse) => {
-    const epoch = profileEpoch.current
+  const saveMoa = useCallback(
+    async (next: MoaConfigResponse) => {
+      const epoch = profileEpoch.current
 
-    // Explicit preset ops (set default / add / delete) supersede any pending
-    // debounced slot autosave — cancel it and invalidate in-flight responses
-    // so the two writers can't race each other's state.
-    if (moaSaveTimer.current) {
-      window.clearTimeout(moaSaveTimer.current)
-      moaSaveTimer.current = null
-    }
-
-    moaSaveGeneration.current += 1
-    setApplying(true)
-    setError('')
-
-    try {
-      const saved = await saveMoaModels(next)
-
-      if (profileEpoch.current !== epoch) {
-        return
+      // Explicit preset ops (set default / add / delete) supersede any pending
+      // debounced slot autosave — cancel it and invalidate in-flight responses
+      // so the two writers can't race each other's state.
+      if (moaSaveTimer.current) {
+        window.clearTimeout(moaSaveTimer.current)
+        moaSaveTimer.current = null
       }
 
-      setMoa(saved)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setApplying(false)
-    }
-  }, [])
+      moaSaveGeneration.current += 1
+      setApplying(true)
+      setError('')
+
+      try {
+        const saved = await saveMoaModels(next, requestProfile)
+
+        if (profileEpoch.current !== epoch) {
+          return
+        }
+
+        setMoa(saved)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setApplying(false)
+      }
+    },
+    [requestProfile]
+  )
 
   const auxiliaryTaskLabel = useCallback((key: string) => m.tasks[key]?.label ?? key, [m.tasks])
 
@@ -677,13 +686,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setConfig(next)
 
       try {
-        await saveHermesConfig(next)
+        await saveHermesConfig(next, scopeProfile ?? undefined)
       } catch (err) {
         setConfig(prev)
         notifyError(err, m.defaultsFailed)
       }
     },
-    [config, m.defaultsFailed, setConfig]
+    [config, m.defaultsFailed, scopeProfile, setConfig]
   )
 
   // Paste an API key for the selected `api_key` provider, persist it, then
@@ -702,7 +711,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setError('')
 
     try {
-      await setEnvVar(keyEnv, apiKeyDraft.trim())
+      await setEnvVar(keyEnv, apiKeyDraft.trim(), requestProfile)
       setApiKeyDraft('')
 
       // Pick a sensible default for the freshly-activated provider (mirrors
@@ -711,13 +720,13 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       let nextModel = ''
 
       try {
-        const rec = await getRecommendedDefaultModel(slug)
+        const rec = await getRecommendedDefaultModel(slug, requestProfile)
         nextModel = rec.model || ''
       } catch {
         nextModel = ''
       }
 
-      const options = await getGlobalModelOptions({ refresh: true })
+      const options = await getGlobalModelOptions({ refresh: true }, requestProfile)
 
       if (profileEpoch.current !== epoch) {
         return
@@ -732,7 +741,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     } finally {
       setActivating(false)
     }
-  }, [apiKeyDraft, selectedProviderRow])
+  }, [apiKeyDraft, requestProfile, selectedProviderRow])
 
   // OAuth / external providers can't be activated with a pasted key — hand off
   // to the shared onboarding flow scoped to this provider's real sign-in. The
@@ -771,12 +780,14 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setSelectionWarning(false)
 
     try {
-      const result = await setModelAssignment({
-        model: selectedModel,
-        provider: selectedProvider,
-        scope: 'main',
-        ...(selectedProviderRow?.api_url ? { base_url: selectedProviderRow.api_url } : {})
-      })
+      const result = await setMainModelAssignment(
+        {
+          model: selectedModel,
+          provider: selectedProvider,
+          ...(selectedProviderRow?.api_url ? { base_url: selectedProviderRow.api_url } : {})
+        },
+        requestProfile
+      )
 
       if (profileEpoch.current !== epoch) {
         return
@@ -787,14 +798,20 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setMainModel({ provider, model })
       setSwitchStaleAux(result.stale_aux ?? [])
       setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
-      onMainModelChanged?.(provider, model)
+
+      // Live UI stores mirror the ACTIVE profile's model; a scoped apply
+      // changed a different profile and must not repaint them.
+      if (scopeProfile == null) {
+        onMainModelChanged?.(provider, model)
+      }
+
       await refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, selectedModel, selectedProvider, selectedProviderRow])
+  }, [onMainModelChanged, refresh, requestProfile, scopeProfile, selectedModel, selectedProvider, selectedProviderRow])
 
   // Sibling of the applyMainModel endpoint passthrough (#65254): auxiliary
   // assignments targeting a user-defined provider must carry that provider's
@@ -823,12 +840,10 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       try {
         // OTTO verified-model selection: "use main" assigns the auto
         // follow-main sentinel rather than pinning the current main model.
-        const result = await setModelAssignment({
-          model: '',
-          provider: 'auto',
-          scope: 'auxiliary',
-          task
-        })
+        const result = await setModelAssignment(
+          { model: '', provider: 'auto', scope: 'auxiliary', task },
+          requestProfile
+        )
 
         setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
         await refresh()
@@ -838,7 +853,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [endpointForProvider, mainModel, refresh]
+    [mainModel, refresh, requestProfile]
   )
 
   const applyAuxiliaryDraft = useCallback(
@@ -852,13 +867,16 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setSelectionWarning(false)
 
       try {
-        const result = await setModelAssignment({
-          model: auxDraft.model,
-          provider: auxDraft.provider,
-          scope: 'auxiliary',
-          task,
-          ...endpointForProvider(auxDraft.provider)
-        })
+        const result = await setModelAssignment(
+          {
+            model: auxDraft.model,
+            provider: auxDraft.provider,
+            scope: 'auxiliary',
+            task,
+            ...endpointForProvider(auxDraft.provider)
+          },
+          requestProfile
+        )
 
         setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
         setEditingAuxTask(null)
@@ -869,7 +887,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [auxDraft, endpointForProvider, refresh]
+    [auxDraft, endpointForProvider, refresh, requestProfile]
   )
 
   const beginAuxiliaryEdit = useCallback(
@@ -896,12 +914,15 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setSelectionWarning(false)
 
     try {
-      const result = await setModelAssignment({
-        model: mainModel.model,
-        provider: mainModel.provider,
-        scope: 'auxiliary',
-        task: '__reset__'
-      })
+      const result = await setModelAssignment(
+        {
+          model: mainModel.model,
+          provider: mainModel.provider,
+          scope: 'auxiliary',
+          task: '__reset__'
+        },
+        requestProfile
+      )
 
       setSwitchStaleAux([])
       setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
@@ -911,7 +932,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     } finally {
       setApplying(false)
     }
-  }, [mainModel, refresh])
+  }, [mainModel, refresh, requestProfile])
 
   if (loading && !mainModel) {
     return <ModelSettingsSkeleton />
