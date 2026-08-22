@@ -5,6 +5,24 @@ support edge capabilities. Each manifest identifies exact files and symbols,
 the independent commit boundary, regression tests, merge guidance, and the
 upstream commit against which the behavior was last verified.
 
+## Starting the next upstream merge
+
+From the Hermes Agent repository, give Codex this prompt:
+
+> Use `$otto-upstream-merge` to assess and rehearse upstream Hermes vX.X.X into
+> `base`. Stop at the approval checkpoint.
+
+The explicit skill name is more reliable than a long explanatory prompt. It
+starts target pinning, catalog analysis, conflict review, isolated rehearsal,
+verification, and the trial report. It does not perform the real merge or
+publish a release without later approval.
+
+After reviewing the trial report, continue with:
+
+> I approve the real merge for the pinned vX.X.X target.
+
+Branded release publication remains a separate request.
+
 `owned_symbols` is reserved for bounded, exact identifiers that the checker
 can locate in a declared file at the committed `HEAD`; dirty checkout bytes and
 comments never satisfy ownership. Python identifiers are resolved through the
