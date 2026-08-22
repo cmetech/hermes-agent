@@ -114,7 +114,7 @@ describe('actOnActivePreview (drive_preview tool)', () => {
 
     cleanups.push(
       registerPreviewScriptRunner(tabId, async code =>
-        code.includes('"kind":"locate"')
+        code.includes('w.__hermesHit = null')
           ? JSON.stringify({ acted: 'looking at button "Save"', point: { x: 120, y: 80 }, success: true })
           : // `hit` is the page's witness that the real pointerdown arrived.
             JSON.stringify({ elements: [], hit: { tag: 'BUTTON', trusted: true }, success: true })
@@ -185,7 +185,7 @@ describe('actOnActivePreview (drive_preview tool)', () => {
 
     cleanups.push(
       registerPreviewScriptRunner(tabId, async code =>
-        code.includes('"kind":"locate"')
+        code.includes('w.__hermesHit = null')
           ? JSON.stringify({ acted: 'looking at textbox "Search"', point: { x: 40, y: 20 }, success: true })
           : JSON.stringify({ elements: [], hit: null, success: true })
       )
@@ -248,7 +248,7 @@ describe('actOnActivePreview (drive_preview tool)', () => {
 
     cleanups.push(
       registerPreviewScriptRunner(tabId, async code =>
-        code.includes('"kind":"locate"')
+        code.includes('w.__hermesHit = null')
           ? JSON.stringify({ acted: 'looking at button "Save"', point: { x: 12, y: 8 }, success: true })
           : JSON.stringify({ elements: [], hit: null, success: true })
       )
@@ -268,7 +268,7 @@ describe('actOnActivePreview (drive_preview tool)', () => {
 
     cleanups.push(
       registerPreviewScriptRunner(tabId, async code =>
-        code.includes('"kind":"locate"')
+        code.includes('w.__hermesHit = null')
           ? JSON.stringify({ acted: 'looking at button "Save"', point: { x: 12, y: 8 }, success: true })
           : JSON.stringify({ elements: [], hit: { tag: 'HERMES-WATCH', trusted: true }, success: true })
       )
