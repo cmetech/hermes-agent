@@ -37,7 +37,7 @@ vi.mock('@/hermes', () => ({
   getMoaModels: () => getMoaModels(),
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
-  saveMoaModels: (body: unknown, profile?: null | string) => saveMoaModels(body, profile),
+  saveMoaModels: (body: unknown, profile?: null | string) => saveMoaModels(body, profile ?? apiRequestProfile),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
   getHermesConfigRecord: () => getHermesConfigRecord(),
   saveHermesConfig: (config: unknown) => saveHermesConfig(config),
@@ -58,6 +58,7 @@ vi.mock('../hooks/use-on-profile-switch', () => ({
 }))
 
 vi.mock('../hooks/use-config-record', () => ({
+  hermesConfigCacheWriter: vi.fn(() => vi.fn()),
   invalidateHermesConfig: vi.fn(),
   setHermesConfigCache: vi.fn(),
   useHermesConfigRecord: () => {
@@ -87,7 +88,7 @@ beforeEach(() => {
     tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
   })
   getMoaModels.mockResolvedValue(null)
-  setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
+  setModelAssignment.mockResolvedValue({ ok: true, provider: 'nous', model: 'hermes-4', gateway_tools: [] })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
   saveMoaModels.mockImplementation(async body => body)
   setEnvVar.mockResolvedValue({ ok: true })
@@ -367,6 +368,7 @@ describe('ModelSettings', () => {
       ]
     })
     setModelAssignment.mockResolvedValueOnce({
+      ok: true,
       provider: 'local-ollama',
       model: 'qwen3:latest',
       gateway_tools: []
@@ -494,6 +496,7 @@ describe('ModelSettings', () => {
 
   it('warns when a main switch leaves auxiliary tasks pinned to another provider', async () => {
     setModelAssignment.mockResolvedValueOnce({
+      ok: true,
       provider: 'openrouter',
       model: 'anthropic/claude-opus-4.7',
       gateway_tools: [],

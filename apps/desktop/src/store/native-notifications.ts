@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
 
+import { type HermesOpenTarget, resolveHermesOpenPath } from '@/lib/hermes-open-target'
 import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
@@ -7,16 +8,12 @@ import { withinNativeNotifyBaseline } from './notify-baseline'
 import { clearApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
+export type { HermesOpenTarget }
+
 // Native OS notifications (Electron `Notification`), separate from the in-app
 // toast feed in `notifications.ts`. Each kind toggles independently.
 export type NativeNotificationKind =
-  | 'approval'
-  | 'backgroundDone'
-  | 'credits'
-  | 'input'
-  | 'plugin'
-  | 'turnDone'
-  | 'turnError'
+  'approval' | 'backgroundDone' | 'credits' | 'input' | 'plugin' | 'turnDone' | 'turnError'
 
 export const NATIVE_NOTIFICATION_KINDS: readonly NativeNotificationKind[] = [
   'approval',
@@ -153,6 +150,8 @@ function shouldFire(kind: NativeNotificationKind, sessionId?: null | string, glo
 export interface NativeNotificationAction {
   id: string
   text: string
+  /** Serializable activate target echoed back on button press (plugin path). */
+  activate?: string
 }
 
 export interface NativeNotificationInput {
@@ -174,61 +173,163 @@ export interface NativeNotificationInput {
    * into one another. Never drives click-to-focus like `sessionId` does.
    */
   tag?: string
+  /** Absolute file path for the OS notification icon (Electron). */
+  icon?: string
+  /**
+   * Resolved hash-router path to open on body click when there is no
+   * `sessionId` (plugins). Same vocabulary as `hermes://index-network/intent/1`.
+   */
+  activate?: string
+  /** Renderer-side handle so click/action can invoke registered callbacks. */
+  notifyId?: string
 }
 
-// Fire-and-forget wrapper. Projection is best-effort: outside Electron the
-// bridge is absent and `projectNativeNotification` rejects, so an uncaught
-// rejection here would surface as a hard error in the browser/dev-server build
-// (and fails a whole vitest run). Callers that need the outcome await
-// `projectNativeNotification` directly and handle the rejection themselves.
-export function dispatchNativeNotification(input: NativeNotificationInput): void {
-  void projectNativeNotification(input).catch(error => {
-    console.debug('[native-notifications] projection failed', error)
-  })
-}
-
-export async function projectNativeNotification(input: NativeNotificationInput): Promise<'projected' | 'suppressed'> {
+function shouldProjectNativeNotification(input: NativeNotificationInput): boolean {
   const prefs = $nativeNotifyPrefs.get()
 
   if (!prefs.enabled || !prefs.kinds[input.kind]) {
-    return 'suppressed'
+    return false
   }
 
   if (withinNativeNotifyBaseline()) {
-    return 'suppressed'
+    return false
   }
 
   if (!shouldFire(input.kind, input.sessionId, input.global)) {
-    return 'suppressed'
+    return false
   }
 
   if (throttled(`${input.kind}:${input.sessionId ?? input.tag ?? (input.global ? 'global' : '')}`, Date.now())) {
-    return 'suppressed'
+    return false
   }
 
-  if (!window.hermesDesktop?.notify) {
-    throw new Error('Electron notification bridge unavailable')
-  }
+  return true
+}
 
-  await window.hermesDesktop.notify({
+function nativeNotificationPayload(input: NativeNotificationInput) {
+  return {
     actions: input.actions,
+    activate: input.activate,
     body: input.body,
+    icon: input.icon,
     kind: input.kind,
+    notifyId: input.notifyId,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     tag: input.tag,
     title: input.title
+  }
+}
+
+/** Returns true when the notification passed every guard and was handed to the
+ * OS bridge. Rejections are contained because this is the fire-and-forget path. */
+export function dispatchNativeNotification(input: NativeNotificationInput): boolean {
+  const notify = window.hermesDesktop?.notify
+
+  if (!shouldProjectNativeNotification(input) || !notify) {
+    return false
+  }
+
+  void notify(nativeNotificationPayload(input)).catch(error => {
+    console.debug('[native-notifications] projection failed', error)
   })
+
+  return true
+}
+
+/** Awaited projection path for durable workflow delivery. Bridge failures stay
+ * observable to the caller so it can retain/retry the pending notification. */
+export async function projectNativeNotification(input: NativeNotificationInput): Promise<'projected' | 'suppressed'> {
+  if (!shouldProjectNativeNotification(input)) {
+    return 'suppressed'
+  }
+
+  const notify = window.hermesDesktop?.notify
+
+  if (!notify) {
+    throw new Error('Electron notification bridge unavailable')
+  }
+
+  await notify(nativeNotificationPayload(input))
 
   return 'projected'
 }
 
 // -- the plugin door (`ctx.os.notify`) ----------------------------------------
 
+export interface PluginNotificationAction {
+  id: string
+  label: string
+  /** Navigate here on button press (path or `hermes://index-network/intent/1`). */
+  activate?: HermesOpenTarget
+  /** Renderer callback — only `id` crosses IPC; this stays in-process. */
+  onAction?: () => void
+}
+
 export interface PluginNativeNotificationInput {
   title: string
   body?: string
   silent?: boolean
+  /** Absolute filesystem path for the notification icon. */
+  icon?: string
+  /**
+   * Where body-click should land. Accepts a plugin deep link
+   * (`hermes://index-network/intent/1`), a hash path (`/index-network/intent/1`),
+   * or `{ path, params }` — all resolve through the same helper as OS deep links.
+   */
+  activate?: HermesOpenTarget
+  /** Extra work on body click (runs in addition to `activate` navigation). */
+  onActivate?: () => void
+  actions?: PluginNotificationAction[]
+}
+
+interface PendingPluginNotify {
+  onActivate?: () => void
+  actions: Map<string, () => void>
+}
+
+const pendingPluginNotify = new Map<string, PendingPluginNotify>()
+
+function mintNotifyId(pluginId: string): string {
+  return `${pluginId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** Invoke body-click callback if one was registered for this notify id. */
+export function invokePluginNotifyActivate(notifyId: string | undefined): void {
+  if (!notifyId) {
+    return
+  }
+
+  const pending = pendingPluginNotify.get(notifyId)
+  pending?.onActivate?.()
+}
+
+/** Invoke an action-button callback. Returns true when a handler ran. */
+export function invokePluginNotifyAction(notifyId: string | undefined, actionId: string | undefined): boolean {
+  if (!notifyId || !actionId) {
+    return false
+  }
+
+  const handler = pendingPluginNotify.get(notifyId)?.actions.get(actionId)
+
+  if (!handler) {
+    return false
+  }
+
+  handler()
+
+  return true
+}
+
+/** Drop pending handlers (tests / after a click consumed the toast). */
+export function clearPluginNotifyHandlers(notifyId?: string): void {
+  if (notifyId) {
+    pendingPluginNotify.delete(notifyId)
+
+    return
+  }
+
+  pendingPluginNotify.clear()
 }
 
 /** Native OS notification on behalf of a plugin. One "Plugin notifications"
@@ -237,7 +338,42 @@ export interface PluginNativeNotificationInput {
  *  user is away from Hermes — the in-app toast (`host.notify`) covers the
  *  foreground case. */
 export function dispatchPluginNativeNotification(pluginId: string, input: PluginNativeNotificationInput): void {
-  dispatchNativeNotification({ ...input, global: true, kind: 'plugin', tag: pluginId })
+  const activate = resolveHermesOpenPath(input.activate) ?? undefined
+  const notifyId = input.onActivate || input.actions?.some(a => a.onAction) ? mintNotifyId(pluginId) : undefined
+
+  const actions: NativeNotificationAction[] | undefined = input.actions?.map(action => ({
+    activate: resolveHermesOpenPath(action.activate) ?? undefined,
+    id: action.id,
+    text: action.label
+  }))
+
+  const fired = dispatchNativeNotification({
+    actions,
+    activate,
+    body: input.body,
+    global: true,
+    icon: input.icon,
+    kind: 'plugin',
+    notifyId,
+    silent: input.silent,
+    tag: pluginId,
+    title: input.title
+  })
+
+  // Register renderer callbacks only for notifications that actually reached
+  // the OS — a throttled/suppressed one can never be clicked, so registering
+  // first would leak the closures for the window's lifetime.
+  if (fired && notifyId) {
+    const handlers = new Map<string, () => void>()
+
+    for (const action of input.actions ?? []) {
+      if (action.onAction) {
+        handlers.set(action.id, action.onAction)
+      }
+    }
+
+    pendingPluginNotify.set(notifyId, { actions: handlers, onActivate: input.onActivate })
+  }
 }
 
 // Resolve a pending approval from a notification button, mirroring the in-app

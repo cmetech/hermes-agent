@@ -14,7 +14,7 @@ import yaml
 
 ROOT = Path(__file__).parents[2]
 GATE = ROOT / "scripts/test_workflow_merge_gate.sh"
-CI = ROOT / ".github/workflows/ci.yml"
+CI = ROOT / ".github/workflows/ci.yaml"
 MANIFEST = ROOT / "docs/upstream-customizations/workflow-orchestration.yaml"
 CUSTOMIZATION_CHECKER = ROOT / "scripts/check_upstream_customizations.py"
 PHASE_1_LANGUAGE_BACKEND_SUITES = (

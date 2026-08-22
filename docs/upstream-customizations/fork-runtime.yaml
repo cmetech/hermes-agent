@@ -1,0 +1,193 @@
+schema_version: 1
+feature: fork-runtime
+# Shared fork behaviors that are neither workflow orchestration nor generated
+# brand overlays, but must survive upstream refactors on common runtime/UI files.
+upstream_changes:
+- id: profile-distribution-skill-ownership
+  change_class: profile-integrity
+  owner: downstream-profile-runtime
+  overlap_policy: any_owned_file
+  files:
+  - agent/learning_graph.py
+  - apps/desktop/src/app/skills/index.tsx
+  - apps/desktop/src/app/starmap/node-context-menu.tsx
+  - apps/desktop/src/app/starmap/star-map.tsx
+  - apps/desktop/src/types/hermes.ts
+  - hermes_cli/web_routers/skills.py
+  - tools/skill_manager_tool.py
+  - tools/skill_usage.py
+  owned_symbols:
+  - _profile_distribution_owned_roots
+  - is_profile_distribution_skill
+  - skill_ownership
+  - _profile_distribution_write_guard
+  - SkillsView
+  - NodeContextMenu
+  - SkillInfo
+  tests:
+  - tests/agent/test_learning_graph.py
+  - tests/hermes_cli/test_web_server_skills_profiles.py
+  - tests/tools/test_skill_manager_tool.py
+  - tests/tools/test_skill_usage.py
+  - apps/desktop/src/app/skills/index.test.tsx
+  - apps/desktop/src/app/starmap/node-context-menu.test.tsx
+  expected_commit_subject: 'fix(skills): enforce profile distribution ownership'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Content installed and owned by a profile distribution is
+    read-only to the agent curator and is labeled consistently by REST,
+    Desktop, the learning graph, and mutation guards. Never infer ownership
+    from name alone or let a profile-owned skill be archived, edited, or
+    absorbed as agent-created content.
+  removal_condition: >-
+    Remove when upstream provides equivalent distribution-owned skill
+    provenance and enforces it on every read and mutation surface.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: gateway-shutdown-diagnostic-watchdog-reaping
+  change_class: runtime-reliability
+  owner: downstream-gateway-reliability
+  overlap_policy: any_owned_file
+  files:
+  - gateway/shutdown_forensics.py
+  owned_symbols:
+  - spawn_async_diagnostic
+  tests:
+  - tests/gateway/test_shutdown_forensics.py
+  expected_commit_subject: 'fix(gateway): reap shutdown diagnostic watchdog'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Detached shutdown diagnostics remain bounded without GNU
+    timeout, and normal completion must terminate and wait for the watchdog and
+    its timer so no sleeper is orphaned.
+  removal_condition: >-
+    Remove when upstream provides an equivalent portable bounded diagnostic
+    subprocess with complete watchdog reaping.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: s6-supervise-permission-finalization
+  change_class: runtime-reliability
+  owner: downstream-gateway-reliability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/service_manager.py
+  owned_symbols:
+  - _seed_supervise_skeleton
+  tests:
+  - tests/hermes_cli/test_service_manager.py
+  expected_commit_subject: 'fix(service-manager): preserve setgid after ownership change'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Apply ownership before final chmod on s6 directories and
+    FIFOs because chown may clear setgid or mode bits required for group access.
+  removal_condition: >-
+    Remove when upstream creates the supervise skeleton with ownership-first,
+    final-mode semantics and equivalent tests.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: branded-cli-and-profile-labels
+  change_class: fork-brand-runtime
+  owner: downstream-brand-runtime
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/_parser.py
+  - hermes_cli/main.py
+  - hermes_cli/profile_distribution.py
+  - hermes_constants.py
+  owned_symbols:
+  - _brand_epilogue
+  - _resolve_cli_prog
+  - _resolve_help_product_name
+  - _BrandedArgumentParser
+  - check_hermes_requires
+  - version_agent_label
+  - product_cli_name
+  - product_display_name
+  tests:
+  - tests/hermes_cli/test_branded_parser_prog.py
+  - tests/hermes_cli/test_profile_distribution.py
+  - tests/hermes_cli/test_profile_install_env_encoding.py
+  - tests/hermes_cli/test_version_product_label.py
+  expected_commit_subject: 'fix(cli): complete branded root help'
+  upstream_candidate: false
+  merge_guidance: >-
+    UNION on merge. Root usage, epilogues, version labels, and profile
+    distribution requirements must derive from the active brand while retaining
+    upstream parser structure and commands. Literal upstream package names may
+    remain only where they identify a compatibility protocol, not the product.
+  removal_condition: >-
+    Remove only if the fork no longer ships branded CLIs or upstream exposes a
+    generic product-identity contract used by every parser/profile label.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: branded-native-notification-title
+  change_class: fork-brand-runtime
+  owner: downstream-brand-runtime
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/electron/main.ts
+  - apps/desktop/electron/native-notification-title.ts
+  owned_symbols:
+  - nativeNotificationTitle
+  tests:
+  - apps/desktop/electron/native-notification-title.test.ts
+  expected_commit_subject: 'fix(desktop): brand native notification titles'
+  upstream_candidate: false
+  merge_guidance: >-
+    UNION on merge. Native notification titles must use the active packaged app
+    name and replace upstream product wording without altering notification
+    routing, body text, or structured payload handling.
+  removal_condition: >-
+    Remove only when upstream notification dispatch accepts the active generic
+    product identity at the same boundary.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: desktop-statusbar-default-and-locked-pills
+  change_class: desktop-ux-contract
+  owner: downstream-desktop-runtime
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/shell/statusbar-controls.tsx
+  - apps/desktop/src/store/statusbar-prefs.ts
+  owned_symbols:
+  - $statusbarVisible
+  - StatusbarControls
+  - StatusbarItemView
+  tests:
+  - apps/desktop/src/app/shell/statusbar-visibility.test.tsx
+  expected_commit_subject: 'feat(desktop): show the statusbar by default'
+  upstream_candidate: true
+  merge_guidance: >-
+    CONVERGENT REVIEW REQUIRED. Upstream commit 120e465c9741d1fbf8f98dcf85ecb9df7cf09a05
+    also makes the statusbar visible by default; if its behavior passes this
+    fork's contract, classify that portion remove-as-upstream-equivalent rather
+    than stacking it. Independently preserve locked version/update pills and
+    flex shrink behavior so optional items cannot clip them off-screen.
+  removal_condition: >-
+    Remove the default override after upstream equivalence is verified. Keep
+    the locked-pill delta until upstream guarantees those items remain visible
+    at narrow widths.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+
+- id: desktop-full-page-session-restore
+  change_class: desktop-session-correctness
+  owner: downstream-desktop-runtime
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/contrib/wiring.tsx
+  - apps/desktop/src/store/session-states.ts
+  owned_symbols:
+  - ContribWiring
+  - focusOpenSession
+  tests:
+  - apps/desktop/src/store/session-states.test.ts
+  expected_commit_subject: 'fix(desktop): restore sessions from full-page routes'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. A cached primary session is considered on-screen only while
+    its session route is visible; resuming it from a full-page route must
+    navigate back instead of treating the cached selection as a completed focus.
+  removal_condition: >-
+    Remove when upstream distinguishes cached selection from visible primary
+    session during resume/focus routing.
+  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482

@@ -4,7 +4,7 @@ import mermaid from 'mermaid'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { Zoomable } from '@/components/ui/zoomable'
-import { copySvgAsPng } from '@/lib/svg-image'
+import { copySvgAsPng, normalizeSvgSize } from '@/lib/svg-image'
 import { cn } from '@/lib/utils'
 
 import type { RichFenceProps } from './types'
@@ -96,7 +96,7 @@ export default function MermaidRenderer({ code, streaming, presentation = 'inlin
         const result = await mermaid.render(id, code)
 
         if (!cancelled) {
-          setSvg(result.svg)
+          setSvg(normalizeSvgSize(result.svg))
         }
       } catch {
         if (!cancelled) {

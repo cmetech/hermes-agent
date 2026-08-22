@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { brandText } from '@/test/brand-text'
 
+import { formatMoney } from './billing-amounts'
 import {
   billingDevFixtures,
   loggedOutBillingState,
@@ -172,7 +173,7 @@ describe('BillingSettings', () => {
       target: { value: '7.50' }
     })
 
-    expect(screen.getByText('Threshold: minimum is $10.')).toBeTruthy()
+    expect(screen.getByText(`Threshold: minimum is ${formatMoney(10)}.`)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -223,7 +224,7 @@ describe('BillingSettings', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Manage' }))
 
     expect(screen.getByRole('spinbutton', { name: 'Auto-refill threshold' })).toBeTruthy()
-    expect(screen.queryByText('Threshold: minimum is $10.')).toBeNull()
+    expect(screen.queryByText(`Threshold: minimum is ${formatMoney(10)}.`)).toBeNull()
     // Save is disabled because the prefilled config is invalid — but no error yet.
     expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true)
   })
@@ -596,7 +597,7 @@ describe('BillingSettings', () => {
       ok: true
     })
 
-    await waitFor(() => expect(screen.getByText('$25 added. Balance is refreshing.')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(`${formatMoney(25)} added. Balance is refreshing.`)).toBeTruthy())
   })
 
   it('renders logged-out as a connect card without normal account rows', async () => {

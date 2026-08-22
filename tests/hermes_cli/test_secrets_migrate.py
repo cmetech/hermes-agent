@@ -3,6 +3,7 @@
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -447,8 +448,10 @@ def test_real_console_dry_run_is_byte_read_only_and_never_touches_keyring(
     tmp_path,
 ):
     repo = Path(__file__).resolve().parents[2]
-    hermes = repo / ".venv" / "bin" / "hermes"
-    assert hermes.is_file(), "the real .venv/bin/hermes entrypoint is required"
+    hermes = Path(sys.executable).with_name(
+        "hermes.exe" if os.name == "nt" else "hermes"
+    )
+    assert hermes.is_file(), "the active environment's hermes entrypoint is required"
 
     hermes_root = tmp_path / "hermes-root"
     profile = hermes_root / "profiles" / "dry-run"

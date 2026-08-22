@@ -354,22 +354,17 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "model": "gpt-test",
         "provider": "openai",
         "toolsets": None,
+        "skills": None,
         "usage_file": "usage.json",
     }
 
 
-def test_termux_fast_cli_launch_version_skips_update_check(monkeypatch, main_mod):
-    captured = []
-
+def test_termux_fast_cli_launch_rejects_removed_version_subcommand(monkeypatch, main_mod):
     monkeypatch.setenv("TERMUX_VERSION", "1")
     monkeypatch.delenv("HERMES_TUI", raising=False)
     monkeypatch.setattr(sys, "argv", ["hermes", "version"])
-    monkeypatch.setattr(
-        main_mod, "_print_version_info", lambda *, check_updates: captured.append(check_updates)
-    )
 
-    assert main_mod._try_termux_fast_cli_launch() is True
-    assert captured == [False]
+    assert main_mod._try_termux_fast_cli_launch() is False
 
 
 def test_termux_ultrafast_version_runs_before_heavy_startup(
@@ -379,7 +374,8 @@ def test_termux_ultrafast_version_runs_before_heavy_startup(
     monkeypatch.delenv("HERMES_TERMUX_DISABLE_FAST_CLI", raising=False)
     monkeypatch.setattr(sys, "argv", ["hermes", "--version"])
     monkeypatch.setattr(
-        "hermes_constants.version_agent_label", lambda: "Co-worker Agent"
+        "hermes_cli.banner.format_banner_version_label",
+        lambda: "Co-worker Agent vtest",
     )
 
     assert main_mod._try_termux_ultrafast_version() is True
@@ -664,7 +660,6 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
 
 
 

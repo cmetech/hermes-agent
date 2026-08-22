@@ -687,7 +687,11 @@ describe('WorkflowsView', () => {
 
     render(
       <QueryClientProvider client={client}>
-        <WorkflowCatalog onRunWorkflow={onRunWorkflow} onViewWorkflow={onViewWorkflow} />
+        <WorkflowCatalog
+          onRunWorkflow={onRunWorkflow}
+          onViewWorkflow={onViewWorkflow}
+          requestProfile={apiRequestState.profile}
+        />
       </QueryClientProvider>
     )
 

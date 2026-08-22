@@ -43,8 +43,15 @@ vi.mock('./panes', () => ({
   useStatusbarContributions: () => []
 }))
 vi.mock('../kanban', () => ({ KanbanView: () => <div data-testid="builtin-kanban" /> }))
-vi.mock('@/store/profile', () => ({ $activeGatewayProfile: atom(null) }))
-vi.mock('@/store/session', () => ({ $freshDraftReady: atom(false), $gatewayState: atom('closed') }))
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  $activeGatewayProfile: atom(null)
+}))
+vi.mock('@/store/session', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  $freshDraftReady: atom(false),
+  $gatewayState: atom('closed')
+}))
 
 // Only the two calls the banner makes; everything else stays real so the
 // surface's own imports resolve normally.

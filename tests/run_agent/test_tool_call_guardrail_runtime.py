@@ -278,6 +278,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
             side_effect=lambda name, args, **kwargs: SimpleNamespace(
                 block_message=observe_plugin(name, args, **kwargs),
                 admission=None,
+                modified_args=None,
             ),
         ),
         patch.object(agent._tool_guardrails, "before_call", side_effect=observe_guardrail),
@@ -337,7 +338,7 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
         patch(
             "hermes_cli.plugins.resolve_pre_tool_admission",
             return_value=SimpleNamespace(
-                block_message="plugin policy", admission=None
+                block_message="plugin policy", admission=None, modified_args=None
             ),
         ),
         patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,

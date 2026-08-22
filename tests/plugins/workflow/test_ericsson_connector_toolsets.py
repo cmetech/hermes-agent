@@ -411,7 +411,8 @@ def test_real_gitlab_write_receives_only_host_minted_current_invocation_admissio
         lambda *args, **kwargs: {"approved": True, "message": None},
     )
 
-    schema = registry._tools["gitlab_create_branch"].schema
+    schema = registry.get_schema("gitlab_create_branch")
+    assert schema is not None
     assert "approved" not in schema["parameters"].get("properties", {})
     result = json.loads(
         handle_function_call(
@@ -437,9 +438,7 @@ def test_real_gitlab_write_receives_only_host_minted_current_invocation_admissio
     # The plugin consumed the host-minted admission before invoking its backend.
     assert captured["kwargs"].keys() == {"cancel_check"}
 
-    for name in tuple(registry.get_all_tool_names()):
-        if name.startswith("gitlab_"):
-            registry.deregister(name)
+    manager.unload("ericsson-gitlab")
 
 
 def test_cli_admission_uses_the_active_connector_capability_snapshot(

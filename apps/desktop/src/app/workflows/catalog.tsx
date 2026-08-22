@@ -20,7 +20,6 @@ import {
 import { SearchField } from '@/components/ui/search-field'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip } from '@/components/ui/tooltip'
-import { getApiRequestProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import { listWorkflowDefinitions } from '@/lib/hermes-api'
@@ -45,6 +44,7 @@ const EMPTY_CATALOG_ITEMS: Array<WorkflowDefinition | WorkflowDefinitionError> =
 export interface WorkflowCatalogProps {
   onRunWorkflow?: (workflow: WorkflowDefinition) => void
   onViewWorkflow?: (workflow: WorkflowDefinition) => void
+  requestProfile: string | null
 }
 
 function isCatalogError(item: WorkflowDefinition | WorkflowDefinitionError): item is WorkflowDefinitionError {
@@ -212,13 +212,12 @@ function CatalogRow({
   )
 }
 
-export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow }: WorkflowCatalogProps) {
+export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile }: WorkflowCatalogProps) {
   const { t } = useI18n()
   const pageSizeLabelId = useId()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
   const [query, setQuery] = useState('')
-  const requestProfile = getApiRequestProfile()
   const profile = requestProfile ?? 'default'
 
   const catalog = useQuery({
