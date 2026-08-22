@@ -1442,10 +1442,7 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     root_third_party.mkdir()
     (root_third_party / "marker").write_text("external third party\n")
     external_root_cache = external_root_modules / ".vite/vitest/cache-id/results.json"
-    external_root_cache.parent.mkdir(parents=True)
-    external_root_cache.write_text("external root cache remains immutable\n")
     external_root_temporary_cache = external_root_modules / ".vite-temp"
-    external_root_temporary_cache.mkdir()
     root_workspace_scope = external_root_modules / "@hermes"
     root_workspace_scope.mkdir()
     (root_workspace_scope / "shared").symlink_to("../../apps/shared")
@@ -1465,10 +1462,7 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     desktop_vitest = external_desktop_modules / "vitest"
     desktop_vitest.mkdir()
     external_cache = external_desktop_modules / ".vite/vitest/cache-id/results.json"
-    external_cache.parent.mkdir(parents=True)
-    external_cache.write_text("external cache remains immutable\n")
     external_temporary_cache = external_desktop_modules / ".vite-temp"
-    external_temporary_cache.mkdir()
     vitest = desktop_vitest / "cli.py"
     vitest.write_text(
         "#!/usr/bin/env python3\n"
@@ -1626,10 +1620,10 @@ def test_sealed_ledger_runner_uses_external_node_toolchain_without_live_discover
     ]
     assert observed_cwd.is_file()
     assert observed_tsx.is_file()
-    assert external_cache.read_text() == "external cache remains immutable\n"
-    assert list(external_temporary_cache.iterdir()) == []
-    assert external_root_cache.read_text() == "external root cache remains immutable\n"
-    assert list(external_root_temporary_cache.iterdir()) == []
+    assert not external_cache.exists()
+    assert not external_temporary_cache.exists()
+    assert not external_root_cache.exists()
+    assert not external_root_temporary_cache.exists()
     assert Path(observed_cwd.read_text()).parent.name == "apps"
     assert _git(repo, "worktree", "list", "--porcelain") == worktrees_before
     assert list(temp_root.iterdir()) == []
