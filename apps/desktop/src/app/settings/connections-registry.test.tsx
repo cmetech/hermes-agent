@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { $connection } from '@/store/session'
+import { applyBrand } from '../../../scripts/brand-transform.mjs'
 
 import {
   ConnectionsRegistrySection,
@@ -112,7 +113,7 @@ describe('ConnectionsRegistrySection', () => {
 
     const localKind = screen.getByRole('button', { name: 'Local' }) as HTMLButtonElement
     expect(localKind.disabled).toBe(true)
-    expect(screen.getByRole('button', { name: 'Hermes Cloud' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: applyBrand('Hermes Cloud') })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Remote gateway' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'SSH' })).toBeTruthy()
   })
