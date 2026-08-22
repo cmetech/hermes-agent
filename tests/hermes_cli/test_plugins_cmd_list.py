@@ -144,3 +144,36 @@ def test_cmd_list_json_exposes_disabled_static_configuration_without_import(
     assert payload[0]["configuration"]["fields"][0]["is_set"] is False
     assert "value" not in payload[0]["configuration"]["fields"][0]
     assert not sentinel.exists()
+
+
+def test_declared_capabilities_for_entrypoint_uses_distribution_metadata(
+    monkeypatch, tmp_path
+):
+    bundled_dir = tmp_path / "bundled"
+    user_dir = tmp_path / "user"
+    bundled_dir.mkdir()
+    user_dir.mkdir()
+    plugin_ep = SimpleNamespace(
+        name="thread-namer",
+        value="thread_namer.plugin:register",
+        group="hermes_agent.plugins",
+        dist=SimpleNamespace(version="1.0", metadata={"Summary": ""}),
+    )
+    capability_ep = SimpleNamespace(
+        name="thread-namer.gateway.platform_actions",
+        value="thread_namer.plugin:register",
+        group="hermes_agent.plugin_capabilities",
+    )
+    monkeypatch.setattr(plugins_cmd, "_plugins_dir", lambda: user_dir)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_bundled_plugins_dir", lambda: bundled_dir
+    )
+    monkeypatch.setattr(
+        plugins_cmd.importlib.metadata,
+        "entry_points",
+        lambda: [plugin_ep, capability_ep],
+    )
+
+    assert plugins_cmd._declared_capabilities_for_key("thread-namer") == [
+        "gateway.platform_actions"
+    ]

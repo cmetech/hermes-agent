@@ -210,6 +210,27 @@ def test_catalog_lists_disabled_descriptor_without_importing_plugin_code(
     assert not sentinel.exists()
 
 
+def test_referenced_descriptor_is_not_parsed_as_inline_v2_schema(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    _write_config(home, enabled=[PLUGIN_ID])
+    _write_plugin(home)
+    empty_bundled = tmp_path / "empty-bundled"
+    empty_bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(empty_bundled))
+    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "0")
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    manifest = manager._plugins[PLUGIN_ID].manifest
+    assert manifest.configuration is not None
+    assert manifest.config_schema == {}
+    assert "config_schema must be a mapping" not in caplog.text
+
+
 def test_detail_update_secret_clear_and_readiness_are_profile_scoped(api):
     client, home, profile, _service_instance, _manager = api
 
@@ -478,7 +499,7 @@ def test_catalog_inventory_and_setup_actions_follow_the_requested_profile(
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(plugins, "get_bundled_plugins_dir", lambda: bundled)
     monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
-    manager = PluginManager()
+    manager = PluginManager(scope_key=str(profile_a))
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     monkeypatch.setattr(
         "hermes_cli.web_routers.plugin_configuration.get_plugin_configuration_service",

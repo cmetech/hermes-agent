@@ -125,6 +125,7 @@ upstream_changes:
   - v5 format-2 admission requires one immutable provider authority while historical v1-v4 tests stay explicitly pinned
   - generated authoring guidance and installed reference assets match the runtime profile mapping
   - catalog detail and Desktop consume backend-authored normalizer and provider capability projections
+  - read-only catalog and detail requests may initialize bounded schema cache state once but repeated warm requests never mutate user configuration or widen authority
   tests:
   - tests/plugins/workflow/test_phase5_language.py
   - tests/plugins/workflow/test_phase3_language.py
@@ -143,7 +144,9 @@ upstream_changes:
     authority and derive LATEST_NORMALIZER_VERSION from it. Preserve legacy at v2,
     explicit and sealed v1-v4 replay, snapshot format 2, fail-closed provider authority,
     config-only tiers and aliases, backend-authored client projections, and the exact
-    Phase 1-4 compatibility contracts inherited by v5.
+    Phase 1-4 compatibility contracts inherited by v5. Treat bounded lazy schema-cache
+    initialization as warm-up in read-only mutation tests, then require repeated warm
+    catalog/detail requests to leave user configuration and authority unchanged.
   removal_condition: Remove when upstream activates an equivalent v5 provider-portable
     Archon contract with the same historical readers, immutable provider authority,
     generated guidance, installed-distribution coverage, and backend-owned client surfaces.
@@ -924,19 +927,25 @@ upstream_changes:
   change_class: desktop-test-generic
   owner: workflow-orchestration
   files:
+  - apps/desktop/src/app/settings/model-settings.tsx
   - apps/desktop/src/app/settings/model-settings.test.tsx
   owned_symbols:
   - local main-model auxiliary inheritance test
   - profile-bound MoA autosave expectations
+  - ModelSettings active-profile request fallback
+  owned_invariants:
+  - a null settings override follows the app's active API profile while an explicit profile remains pinned for every model request and autosave
   tests:
   - apps/desktop/src/app/settings/model-settings.test.tsx
   expected_commit_subject: 'test(desktop): align model settings baseline contracts'
   upstream_candidate: true
   merge_guidance: Preserve the auto follow-main sentinel when an auxiliary slot
     inherits a user-defined local main model; inheriting must not pin the current
-    model or copy its endpoint into the slot. MoA debounced autosaves must assert
-    their captured request profile explicitly, including null for the default
-    profile, and timer-driven state changes must remain inside React act boundaries.
+    model or copy its endpoint into the slot. A null settings override must be
+    omitted at the REST-helper boundary so the helper resolves the active API
+    profile; an explicit override must remain pinned. MoA debounced autosaves
+    must assert that captured effective profile, and timer-driven state changes
+    must remain inside React act boundaries.
   removal_condition: Remove when upstream tests cover the same follow-main and
     profile-captured autosave contracts.
   last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
@@ -1056,7 +1065,7 @@ upstream_changes:
   files:
   - .superpowers/sdd/task-2-report.md
   - .superpowers/sdd/task-6-report.md
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - plugins/workflow/api_admission.py
   - plugins/workflow/catalog_api.py
   - plugins/workflow/cli.py
@@ -1541,6 +1550,8 @@ upstream_changes:
   - TaskMutationPrecondition
   - TaskMutationConflict
   - set_task_status
+  owned_invariants:
+  - expected_run_id is always combined with any caller-supplied mutation precondition so a stale worker cannot mutate a newer run
   tests:
   - tests/hermes_cli/test_kanban_mutation_preconditions.py
   - tests/hermes_cli/test_kanban_db.py
@@ -1550,7 +1561,8 @@ upstream_changes:
   - tests/hermes_cli/test_kanban_stale_run_callers.py
   expected_commit_subject: 'feat(kanban): add mutation preconditions'
   upstream_candidate: true
-  merge_guidance: Preserve same-transaction optional compare-and-set checks, the claim-only
+  merge_guidance: Preserve same-transaction optional compare-and-set checks, always
+    combining expected_run_id with any existing caller precondition. Keep the claim-only
     running transition, dependency gating, exact-run closure, and signal-after-commit
     reclaim behavior while reconciling upstream Kanban lifecycle changes.
   removal_condition: Remove when Hermes upstream provides equivalent generic task
@@ -1931,7 +1943,7 @@ upstream_changes:
   change_class: ci-generic
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   owned_symbols:
   - workflow-portability
   tests:
@@ -2405,7 +2417,9 @@ upstream_changes:
   expected_commit_subject: 'feat(desktop): Task 5 add workflow catalog datagrid'
   upstream_candidate: true
   merge_guidance: Preserve the Workflows-first catalog entry point, explicit-profile
-    request binding paired with its React Query cache key, native tokenized table,
+    request binding paired with its React Query cache key, and pass that profile
+    through reactive component props rather than reading a non-reactive global in
+    a memoized child. Preserve the native tokenized table,
     localized explicit loading/error/empty states, shared semantic warning Alert for
     partial results, semantic Badge variants without call-site color chrome, and typed
     corrupt-entry rows. Keep View enabled for every valid entry, and keep Run fail-closed
@@ -2774,7 +2788,7 @@ upstream_changes:
   change_class: workflow-verification
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - scripts/test_workflow_merge_gate.sh
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   - tests/plugins/workflow/test_laptop_diagnostic_middleware_e2e.py
@@ -3085,7 +3099,7 @@ upstream_changes:
   change_class: workflow-security
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - scripts/test_workflow_merge_gate.sh
   - tests/plugins/workflow/test_workflow_showcase_desktop_e2e.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -3489,7 +3503,10 @@ upstream_changes:
   - agent/chat_completion_helpers.py
   - agent/codex_runtime.py
   - agent/provider_attempts.py
+  - agent/turn_context.py
   - tests/agent/test_provider_attempt_transport.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_retry.py
   owned_symbols:
   - reserve_provider_transport_attempt
   - reservation-time concrete transport route assertion
@@ -3500,6 +3517,7 @@ upstream_changes:
   - chat-completions, Bedrock, MoA, and summary transport reservations
   - create_anthropic_message per-transport before_transport callback
   - Codex Responses and app-server transport reservations
+  - _UNTITLED_PLATFORMS auxiliary-title exclusion
   owned_invariants:
   - every actual provider transport is reserved before launch
   - each retry or stream-to-create fallback receives a distinct reservation
@@ -3509,6 +3527,7 @@ upstream_changes:
   - effective SDK route comparison includes default_query and uses the centralized credential-free endpoint digest
   - Codex app-server preserves reservation-time capability drift identity through worker terminal classification without a partial result
   - sealed Bedrock clients receive the selected endpoint_url while unsealed construction omits it and retains SDK resolution
+  - cron subagent and plugin-agent conversations never launch an auxiliary automatic-title provider request
   tests:
   - tests/agent/test_provider_attempt_transport.py
   - tests/agent/test_bedrock_adapter.py
@@ -3517,6 +3536,8 @@ upstream_changes:
   - tests/run_agent/test_env_credential_turn_refresh.py
   - tests/plugins/workflow/test_ai_executor.py
   - tests/plugins/workflow/test_phase5_provider_options.py
+  - tests/plugins/workflow/test_node_mcp.py
+  - tests/plugins/workflow/test_retry.py
   expected_commit_subject: 'test(workflow): gate provider attempt transport seams'
   upstream_candidate: true
   merge_guidance: Preserve the optional request-local reservation callback at every
@@ -3530,7 +3551,10 @@ upstream_changes:
     For sealed requests, the same seam must verify the concrete SDK client's
     effective endpoint (base URL plus default query) against the selected route
     before accounting. Capability drift is a bounded terminal result and may not
-    enter app-server partial-result recovery, retry, repair, or fallback.
+    enter app-server partial-result recovery, retry, repair, or fallback. Keep
+    cron, subagent, and plugin-agent conversations out of automatic session-title
+    generation so auxiliary title calls cannot consume or bypass sealed workflow
+    provider-attempt authority.
   removal_condition: Remove when upstream provides equivalent request-scoped, pre-transport
     provider-attempt authority across every supported provider path with a release-gated
     regression contract.
@@ -3600,7 +3624,7 @@ upstream_changes:
   change_class: agent-core-generic
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - agent/bedrock_adapter.py
   - agent/model_metadata.py
   - agent/plugin_agent.py
@@ -3655,7 +3679,7 @@ upstream_changes:
   change_class: workflow-verification
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - scripts/test_workflow_merge_gate.sh
   - tests/plugins/workflow/test_ai_extensions_middleware_e2e.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -4016,7 +4040,7 @@ upstream_changes:
   owner: workflow-orchestration
   files:
   - .superpowers/sdd/task-4-report.md
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - plugins/workflow/api_admission.py
   - plugins/workflow/runner_binding.py
   - plugins/workflow/scheduled_revalidation.py
@@ -4089,7 +4113,7 @@ upstream_changes:
   change_class: workflow-testing
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - scripts/test_workflow_merge_gate.sh
   - tests/plugins/workflow/test_scheduling_middleware_e2e.py
   - tests/scripts/test_workflow_merge_gate.py
@@ -5020,7 +5044,7 @@ upstream_changes:
   files:
   - scripts/test_workflow_merge_gate.sh
   - tests/scripts/test_workflow_merge_gate.py
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   owned_symbols:
   - PYTHON_BIN
   owned_invariants:
@@ -5030,6 +5054,7 @@ upstream_changes:
   - provider-attempt transport contract base merge-gate selection
   - relative PYTHON_BIN canonicalization before repository switching
   - canonical per-file test isolation in the base merge gate
+  - simulated native-Windows tests restore the host os.name before any assertion or failure reporting
   - tests/plugins/workflow/test_language.py gate membership
   - tests/plugins/workflow/test_language_snapshot.py gate membership
   - tests/plugins/workflow/test_language_schema.py gate membership
@@ -5058,7 +5083,9 @@ upstream_changes:
     install path. Canonicalize an explicit relative PYTHON_BIN before switching to
     rehearsal repositories, share that exact environment into temporary worktrees,
     and run Python suites through the canonical per-file runner so module globals
-    and background runtime state cannot cross test-file boundaries.
+    and background runtime state cannot cross test-file boundaries. Any POSIX-host
+    Windows simulation must install fallible patches before changing os.name and
+    restore os.name in a finally block so pytest can always report the real result.
   removal_condition: Remove when upstream's base and native portability release gates
     select equivalent language contracts, admission pinning, schema, middleware, and
     Desktop compatibility coverage.
@@ -5154,7 +5181,7 @@ upstream_changes:
   change_class: workflow-testing
   owner: workflow-orchestration
   files:
-  - .github/workflows/ci.yml
+  - .github/workflows/ci.yaml
   - scripts/run_tests.sh
   - plugins/workflow/store.py
   - tests/plugins/workflow/test_admission.py

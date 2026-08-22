@@ -6,7 +6,7 @@
  * dropping the contribution (reserved-path filter) leaves `kanbanContributed`
  * false with no build or type error, and the old board renders forever.
  */
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { MemoryRouter } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -40,8 +40,15 @@ vi.mock('../kanban', () => ({ KanbanView: () => <div data-testid="builtin-kanban
 // The banner needs a QueryClientProvider this route table doesn't set up;
 // the yield contract under test is which board renders, not the banner.
 vi.mock('../kanban/dispatcher-banner', () => ({ DispatcherBanner: () => null }))
-vi.mock('@/store/profile', () => ({ $activeGatewayProfile: atom(null) }))
-vi.mock('@/store/session', () => ({ $freshDraftReady: atom(false), $gatewayState: atom('closed') }))
+vi.mock('@/store/profile', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  $activeGatewayProfile: atom(null)
+}))
+vi.mock('@/store/session', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  $freshDraftReady: atom(false),
+  $gatewayState: atom('closed')
+}))
 
 import { ChatRoutesSurface } from './surfaces'
 
@@ -95,19 +102,23 @@ describe('kanban yield contract at /kanban', () => {
     renderAt(KANBAN_ROUTE)
     expect(await screen.findByTestId('builtin-kanban')).toBeTruthy()
 
-    const dispose = registry.register({
-      id: 'page',
-      area: ROUTES_AREA,
-      source: 'plugin:kanban',
-      data: { path: KANBAN_ROUTE },
-      render: () => <div data-testid="plugin-kanban-page" />
+    let dispose: () => void = () => undefined
+
+    act(() => {
+      dispose = registry.register({
+        id: 'page',
+        area: ROUTES_AREA,
+        source: 'plugin:kanban',
+        data: { path: KANBAN_ROUTE },
+        render: () => <div data-testid="plugin-kanban-page" />
+      })
     })
 
     try {
       expect(await screen.findByTestId('plugin-kanban-page')).toBeTruthy()
       expect(screen.queryByTestId('builtin-kanban')).toBeNull()
     } finally {
-      dispose()
+      act(dispose)
     }
   })
 })

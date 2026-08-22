@@ -15,7 +15,7 @@ const cases = [
     pref: skinPref as unknown as Pref,
     fallback: DEFAULT_SKIN_NAME,
     a: 'ember',
-    b: 'midnight',
+    b: 'catppuccin',
     junk: 'nope'
   },
   // fallback is 'dark', not upstream's 'light': normalizeMode in ./context

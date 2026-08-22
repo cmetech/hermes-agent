@@ -12,6 +12,7 @@ upstream_changes:
   - hermes_cli/plugins.py
   - hermes_cli/plugins_cmd.py
   - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugin_configuration_api.py
   - tests/hermes_cli/test_plugins_cmd_list.py
   owned_symbols:
   - FieldStorage
@@ -27,14 +28,17 @@ upstream_changes:
   - LoadedPlugin
   - PluginManager.static_plugin_inventory
   - _read_manifest_info
+  - _parse_manifest_v2_fields
   - cmd_list
   owned_invariants:
   - plugin configuration metadata is inert bounded JSON loaded without importing plugin code
   - malformed descriptors omit configuration surfaces without preventing plugin discovery
   - field ids, types, defaults, visibility, validation, readiness, platform projection, and setup-action metadata are bounded and fail closed
   - descriptors declare generic host behavior and never grant connector execution authority
+  - a string config_schema remains a file-backed configuration descriptor reference while only a mapping is parsed as the upstream inline v2 schema
   tests:
   - tests/hermes_cli/test_plugin_configuration.py
+  - tests/hermes_cli/test_plugin_configuration_api.py
   - tests/hermes_cli/test_plugins_cmd_list.py
   expected_commit_subject: 'feat(plugins): expose static configuration descriptors'
   upstream_candidate: true
@@ -45,6 +49,9 @@ upstream_changes:
     fixed-width regex validation, URL validation, exact structured-plugin
     identity, and platform filtering. Plugin discovery must remain available
     when a descriptor is invalid, but no invalid field or action may project.
+    Preserve the dual config_schema contract: a string names the bounded
+    file-backed connector descriptor, while a mapping is the inline v2 schema;
+    never reject or reinterpret the string as malformed inline schema.
     Do not add connector ids or vendor-specific defaults to this generic seam.
   removal_condition: >-
     Remove when upstream provides an equivalent bounded static plugin

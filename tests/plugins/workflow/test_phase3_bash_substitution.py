@@ -3085,7 +3085,6 @@ def test_v3_native_windows_inline_executor_keeps_exact_argv_and_containment(
         captured["tree"] = tree
         return tree
 
-    monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr("tools.environments.local._find_bash", lambda: "/bin/sh")
     monkeypatch.setattr(
         ManagedProcessTree,
@@ -3093,11 +3092,15 @@ def test_v3_native_windows_inline_executor_keeps_exact_argv_and_containment(
         staticmethod(capture_spawn),
     )
 
-    result, output = _run_v3_bash(
-        tmp_path,
-        command=command,
-        value=value,
-    )
+    try:
+        monkeypatch.setattr(os, "name", "nt")
+        result, output = _run_v3_bash(
+            tmp_path,
+            command=command,
+            value=value,
+        )
+    finally:
+        monkeypatch.setattr(os, "name", original_name)
 
     assert result.status == "succeeded"
     assert output == b"inline value"

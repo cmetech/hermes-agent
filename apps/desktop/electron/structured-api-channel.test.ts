@@ -21,11 +21,13 @@ test('structured authenticated channel is additive to the legacy API channel', (
   assert.match(preloadSource, /api: request => ipcRenderer\.invoke\('hermes:api', request\)/)
   assert.match(preloadSource, /apiStructured: request => ipcRenderer\.invoke\('hermes:api:structured', request\)/)
 
-  const structuredHandler = between(mainSource, "ipcMain.handle('hermes:api:structured'", "ipcMain.handle('hermes:api'")
+  const sharedHandler = between(mainSource, 'async function handleHermesApiRequest(', "ipcMain.handle('hermes:api'")
+  const ipcHandlers = between(mainSource, "ipcMain.handle('hermes:api'", '// One deduper per cross-window cue')
 
-  assert.match(structuredHandler, /fetchJsonViaOauthSession/)
-  assert.match(structuredHandler, /fetchJson\(url, connection\.token/)
-  assert.equal(structuredHandler.match(/structured: true/g)?.length, 2)
+  assert.match(sharedHandler, /fetchJsonViaOauthSession/)
+  assert.match(sharedHandler, /fetchJson\(url, connection\.token/)
+  assert.match(ipcHandlers, /handleHermesApiRequest\(request\)/)
+  assert.match(ipcHandlers, /handleHermesApiRequest\(request, true\)/)
 })
 
 test('both structured transports share response collection and retain adapter timeout aborts', () => {

@@ -83,11 +83,12 @@ function KanbanCount() {
 const plugin: HermesPlugin = {
   id: 'kanban',
   name: 'Kanban',
+  description: 'Multi-agent task board — board page, sidebar entry, and a live in-flight count in the status bar.',
   // Fork default: ON (upstream ships false). Persisted user choice wins.
   defaultEnabled: true,
   register(ctx) {
     ctx.i18n.register(KANBAN_LOCALES)
-    ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket))
+    ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket, { os: ctx.os, t: ctx.i18n.t }))
 
     // The curated OS door — the drawer reveals a task's attachment (its output
     // file) in the file manager through it. Released on unload like `rest`.

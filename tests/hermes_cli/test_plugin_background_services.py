@@ -656,11 +656,12 @@ def test_successful_reload_rebinds_setup_actions_to_the_discovery_profile(
         )
         context.register_setup_action("connect", lambda _context: {"ok": True})
 
-    monkeypatch.setattr(manager, "static_plugin_inventory", lambda: [manifest])
+    monkeypatch.setattr(manager, "_collect_directory_manifests", lambda: [manifest])
+    monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
     monkeypatch.setattr(
         manager,
         "_load_directory_module",
-        lambda _manifest: SimpleNamespace(register=register),
+        lambda _manifest, **_kwargs: SimpleNamespace(register=register),
     )
 
     replacements = manager.reload_background_services(timeout=1)

@@ -150,6 +150,7 @@ function renderView() {
 
 function KeybindRouteHarness() {
   useKeybinds({
+    archiveSelectedSession: vi.fn(),
     openNewSessionTab: vi.fn(),
     startFreshSession: vi.fn(),
     toggleCommandCenter: vi.fn(),

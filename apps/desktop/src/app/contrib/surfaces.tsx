@@ -11,8 +11,10 @@ import { useStore } from '@nanostores/react'
 import { type ComponentProps, lazy, memo, type ReactNode, Suspense, useMemo } from 'react'
 import { Navigate, Route, Routes, useParams } from 'react-router'
 
-import { ContribBoundary } from '@/contrib/react/boundary'
+import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
+import { $activeConnectionId } from '@/store/connections'
+import { $gateway } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
 
@@ -95,9 +97,12 @@ const StatusbarSurfaceInner = memo(function StatusbarSurfaceInner({
   chatOpen: boolean
   commandCenterOpen: boolean
 }) {
+  const activeConnectionId = useStore($activeConnectionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const gatewayState = useStore($gatewayState)
   const freshDraftReady = useStore($freshDraftReady)
-  const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway)
+  const gatewayScope = `${activeConnectionId ?? ''}\0${activeGatewayProfile}`
+  const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway, gatewayScope)
   const extraLeftItems = useStatusbarContributions('left')
   const extraRightItems = useStatusbarContributions('right')
 
@@ -132,10 +137,9 @@ export function StatusbarSurface(props: ComponentProps<typeof StatusbarSurfaceIn
 }
 
 /** The workspace pane: the real route table (chat + full-page views + plugin
- *  routes). Subscribes to `$gatewayState` and ROUTES_AREA itself; the gateway
- *  instance + voice cap arrive as props so a reconnect/config load re-renders
- *  only this surface. ChatView subscribes to its own session atoms, so
- *  streaming never round-trips through the controller. */
+ *  routes). Subscribes to the gateway instance/state and ROUTES_AREA itself;
+ *  the voice cap arrives as a prop. ChatView subscribes to its own session
+ *  atoms, so streaming never round-trips through the controller. */
 export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   actions,
   maxVoiceRecordingSeconds
@@ -144,23 +148,14 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   maxVoiceRecordingSeconds?: number
 }) {
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const gateway = useStore($gateway)
   const gatewayState = useStore($gatewayState)
-  useContributions(ROUTES_AREA)
-  const routeContributions = contributedRoutes()
+  const routeContributions = contributedRoutes(useContributions(ROUTES_AREA))
   // Upstream's SDK kanban plugin (v0.20.0, opt-in) registers its own richer
   // `/kanban` board page. When it is enabled, the built-in operations board
   // stands down — otherwise this static route shadows the contributed one
   // (same path, earlier in the table) and BOTH nav rows land on the old page.
   const kanbanContributed = routeContributions.some(route => route.path === KANBAN_ROUTE)
-
-  // Recapture the live gateway instance whenever the connection state flips.
-  // getGateway reads a controller ref, so gatewayState is the intentional
-  // re-eval trigger (not a value the computation itself reads).
-  const gateway = useMemo(
-    () => actions.getGateway(),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [actions, gatewayState]
-  )
 
   const modelMenuContent = useMemo(
     () =>
@@ -204,7 +199,14 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
       <Route element={page(<WorkflowsView />)} path="workflows" />
       {!kanbanContributed && (
-        <Route element={page(<KanbanRouteContent><KanbanView /></KanbanRouteContent>)} path="kanban" />
+        <Route
+          element={page(
+            <KanbanRouteContent>
+              <KanbanView />
+            </KanbanRouteContent>
+          )}
+          path="kanban"
+        />
       )}
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />
@@ -217,15 +219,15 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
           workspace pane like any built-in view — behind the same blast wall
           as every other contribution mount. */}
       {routeContributions.map(route => {
-        const content = <ContribBoundary id={route.key}>{route.render()}</ContribBoundary>
+        const content = (
+          <ContribBoundary id={route.key}>
+            <ContribRender render={route.render} />
+          </ContribBoundary>
+        )
 
         return (
           <Route
-            element={page(
-              route.path === KANBAN_ROUTE
-                ? <KanbanRouteContent>{content}</KanbanRouteContent>
-                : content
-            )}
+            element={page(route.path === KANBAN_ROUTE ? <KanbanRouteContent>{content}</KanbanRouteContent> : content)}
             key={route.key}
             path={route.path.slice(1)}
           />
