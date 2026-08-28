@@ -3,14 +3,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 
 pid_file = os.environ.get("WORKFLOW_MCP_PID_FILE")
 if pid_file:
     Path(pid_file).write_text(str(os.getpid()), encoding="utf-8")
 
-server = FastMCP("workflow-echo")
+server = MCPServer("workflow-echo")
 
 
 @server.tool()

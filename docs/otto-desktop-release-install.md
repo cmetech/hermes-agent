@@ -25,9 +25,12 @@ The release flow used for `v1.1.6` and later paired branded releases is:
    `scripts/brand/generate.mjs <brand> --write`, and pass the generator,
    brand, workflow-merge, and build gates.
 4. Push `base`, `otto`, and `loop24` forward-only.
-5. Dispatch each brand's existing `release.yml` in its releases-only repo at
+5. Inspect each releases repo's current `release.yml` and require the Electron
+   Builder command to pass `--publish never`. The workflow's explicit upload
+   step owns publication; Electron Builder must not publish implicitly in CI.
+6. Dispatch each brand's existing `release.yml` in its releases-only repo at
    the same version and prerelease state.
-6. Monitor both runs and verify each release body names the expected source
+7. Monitor both runs and verify each release body names the expected source
    commit and each release contains the full Windows/macOS asset set.
 
 | Brand | Source ref | Releases repo | Stamp branch | Artifact prefix |
@@ -128,6 +131,10 @@ LOOP24_SHA=$(git rev-parse origin/loop24)
 # Use the same version and prerelease state for every brand. The version input
 # has no leading "v"; release.yml creates the v<version> tag. Pass the exact
 # gated source SHA, as the v1.1.6 releases did, never a moving branch name.
+for repo in cmetech/otto cmetech/loop24; do
+  gh workflow view release.yml -R "$repo" --yaml | rg -- '--publish never'
+done
+
 gh workflow run release.yml -R cmetech/otto \
   -f ref="$OTTO_SHA" -f stamp_branch=otto -f version=2.0.0 -f prerelease=false
 gh workflow run release.yml -R cmetech/loop24 \

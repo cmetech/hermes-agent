@@ -82,4 +82,4 @@ upstream_changes:
     Remove when agent-browser exposes a way to validate the CLI without
     executing it (a manifest or a resolvable version marker), making the probe
     cheap enough that memoizing it is pointless.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101

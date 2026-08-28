@@ -48,6 +48,10 @@ verification contracts.
 - An unclear applicability or behavioral relationship is a merge blocker.
 - Every ledger baseline must be an ancestor of the pinned upstream target;
   divergent ranges are invalid evidence.
+- Never advance ledger baselines from rehearsal evidence. After the real merge
+  and every applicable brand/release gate pass, advance every manifest to the
+  immutable upstream target and write a post-merge report that captures any
+  issues discovered after rehearsal.
 - A release is incomplete until the live checkout is back on `base`.
 
 ## Decision rule
@@ -61,8 +65,9 @@ Record importance, applicability, relationship, evidence, tests, residual
 risk, and revisit condition in the durable merge report. Difficulty alone is
 never evidence.
 
-## Current assessed target
+## Target lifecycle
 
-For upstream Hermes v0.20.5, the verified release commit is
-`fcbd1076a93841fa88855acce810e342a5b78101`. Re-verify it at execution time;
-do not substitute the newer `origin/main` tip.
+Set `UPSTREAM_TARGET` from the requested release on every run. Read the last
+completed target from the unanimous manifest baselines and the latest
+`POSTMERGE` report; never reuse a historical target merely because it appears
+in an older trial report.
