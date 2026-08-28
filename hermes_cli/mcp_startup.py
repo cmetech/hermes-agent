@@ -18,7 +18,10 @@ def _has_configured_mcp_servers() -> bool:
 
         raw_config = read_raw_config() or {}
         mcp_servers = raw_config.get("mcp_servers")
-        if isinstance(mcp_servers, dict) and len(mcp_servers) > 0:
+        if isinstance(mcp_servers, dict) and any(
+            not isinstance(server, dict) or server.get("enabled", True) is not False
+            for server in mcp_servers.values()
+        ):
             return True
         from hermes_cli.agent_plugins import has_enabled_agent_plugin_mcp
 
@@ -44,6 +47,11 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             thread = _mcp_discovery_thread
             if thread is not None and thread.is_alive():
                 return
+
+        if not _has_configured_mcp_servers():
+            return
+
+        if _mcp_discovery_started:
             try:
                 from tools.mcp_tool import get_mcp_status
 
@@ -60,8 +68,6 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             _mcp_discovery_thread = None
 
         _mcp_discovery_started = True
-        if not _has_configured_mcp_servers():
-            return
 
         # Capture the caller's context-local HERMES_HOME override (profile
         # scoping in multi-profile processes like the dashboard/desktop
