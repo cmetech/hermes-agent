@@ -30,11 +30,13 @@ let apiRequestProfile: null | string = null
 let profileSwitchHandler: (() => void) | null = null
 
 vi.mock('@/hermes', () => ({
-  getGlobalModelInfo: () => getGlobalModelInfo(),
-  getGlobalModelOptions: (options?: unknown) => getGlobalModelOptions(options),
+  getGlobalModelInfo: (profile?: null | string) => getGlobalModelInfo(profile),
+  getGlobalModelOptions: (options?: unknown, profile?: null | string) =>
+    getGlobalModelOptions(options, profile),
   getApiRequestProfile: () => apiRequestProfile,
-  getAuxiliaryModels: () => getAuxiliaryModels(),
-  getMoaModels: () => getMoaModels(),
+  getAuxiliaryModels: (profile?: null | string) => getAuxiliaryModels(profile),
+  getMoaModels: (profile?: null | string) => getMoaModels(profile),
+  profileScopeKey: (scope?: null | string) => (scope ?? '').trim() || 'default',
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   saveMoaModels: (body: unknown, profile?: null | string) => saveMoaModels(body, profile ?? apiRequestProfile),
@@ -103,7 +105,7 @@ afterEach(() => {
   profileSwitchHandler = null
 })
 
-async function renderModelSettings() {
+async function renderModelSettings(scopeProfile?: string) {
   const { ModelSettings } = await import('./model-settings')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
@@ -112,7 +114,7 @@ async function renderModelSettings() {
     // needs a router context in tests (the app provides HashRouter at root).
     <MemoryRouter>
       <QueryClientProvider client={client}>
-        <ModelSettings />
+        <ModelSettings scopeProfile={scopeProfile} />
       </QueryClientProvider>
     </MemoryRouter>
   )
@@ -234,13 +236,37 @@ function rowComboboxes(title: string): HTMLElement[] {
   return within(row).getAllByRole('combobox')
 }
 
+describe('ModelSettings profile scope', () => {
+  // #90549: the API helpers treat `null` as "deliberately target the
+  // primary/default profile". A page following the active profile must pass
+  // `undefined`, or every read repaints the primary's model and the user's
+  // change looks reverted.
+  it('follows the active profile (undefined, never null) when unscoped', async () => {
+    await renderModelSettings()
+
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledWith(undefined))
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, undefined)
+    expect(getAuxiliaryModels).toHaveBeenCalledWith(undefined)
+    expect(getMoaModels).toHaveBeenCalledWith(undefined)
+  })
+
+  it('reads through the explicit scope override when one is set', async () => {
+    await renderModelSettings('research')
+
+    await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledWith('research'))
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, 'research')
+    expect(getAuxiliaryModels).toHaveBeenCalledWith('research')
+    expect(getMoaModels).toHaveBeenCalledWith('research')
+  })
+})
+
 describe('ModelSettings', () => {
   it('loads the current main model and lists configured providers only', async () => {
     await renderModelSettings()
 
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
-    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined)
+    expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, undefined)
 
     // Open the provider Select — only configured providers should be listed.
     const triggers = await screen.findAllByRole('combobox')
@@ -685,8 +711,8 @@ describe('ModelSettings', () => {
     profileSwitch.callback?.()
 
     expect(await screen.findByText('legacy-model')).toBeTruthy()
-    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, undefined)
-    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, undefined)
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, undefined, undefined)
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, undefined, undefined)
 
     oldOptions.resolve({ providers: [gatewayProvider()] })
     await waitFor(() => expect(screen.queryByText('gateway-good')).toBeNull())
@@ -732,8 +758,8 @@ describe('ModelSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh models' }))
 
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(2))
-    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, undefined)
-    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, { refresh: true })
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(1, undefined, undefined)
+    expect(getGlobalModelOptions).toHaveBeenNthCalledWith(2, { refresh: true }, undefined)
     triggers = screen.getAllByRole('combobox')
     expect(triggers[0].textContent).toContain('Gateway')
     expect(triggers[1].textContent).toContain('auto')

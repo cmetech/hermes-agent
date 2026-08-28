@@ -5,6 +5,12 @@ import { brandText } from '@/test/brand-text'
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
 
+// This test owns the machine-level GatewaySettings contract. The managed SSH
+// update section mounted below the registry has its own focused coverage
+// (store/managed-updates.test.ts); keep its store subscriptions out of this
+// single-purpose test.
+vi.mock('./managed-updates-section', () => ({ ManagedUpdatesSection: () => null }))
+
 const localConnection = {
   cloudOrg: '',
   envOverride: false,

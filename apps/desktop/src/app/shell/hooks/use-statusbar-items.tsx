@@ -15,7 +15,7 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
-import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { runtimeReadinessDisplay, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
@@ -287,6 +287,7 @@ export function useStatusbarItems({
   const gatewayConnecting = gatewayState === 'connecting'
   const inferenceReady = gatewayOpen && inferenceStatus?.ready === true
   const gatewayDegraded = gatewayOpen || gatewayConnecting
+  const readinessDisplay = runtimeReadinessDisplay(inferenceStatus)
   // The third state. The chip fused the websocket and inference legs and left
   // this one out entirely, so with both of those healthy it read "ready" while
   // the messaging gateway -- the process that hosts kanban dispatch and cron --
@@ -299,13 +300,14 @@ export function useStatusbarItems({
   const gatewayHealthy = inferenceReady && !automationStopped
 
   const gatewayDetail = gatewayOpen
-    ? inferenceStatus?.ready
-      ? automationStopped
-        ? `${copy.automation}: ${gatewayAutomationLabel(false, copy)}`
-        : copy.gatewayReady
-      : inferenceStatus
-        ? copy.gatewayNeedsSetup
-        : copy.gatewayChecking
+    ? readinessDisplay === 'ready' && automationStopped
+      ? `${copy.automation}: ${gatewayAutomationLabel(false, copy)}`
+      : {
+        checking: copy.gatewayChecking,
+        needs_setup: copy.gatewayNeedsSetup,
+        ready: copy.gatewayReady,
+        unavailable: copy.gatewayUnavailable
+      }[readinessDisplay]
     : gatewayConnecting
       ? copy.gatewayConnecting
       : copy.gatewayOffline

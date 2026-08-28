@@ -216,6 +216,30 @@ class TestMicrosoftGraphClient:
         assert len(calls) == 1
         assert sleeps and max(sleeps) <= 0.25
 
+    async def test_download_accepts_stream_content_by_default(self, tmp_path: Path):
+        captured_accept: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_accept.append(request.headers["Accept"])
+            return httpx.Response(
+                200,
+                content=b"recording-bytes",
+                headers={"content-type": "video/mp4"},
+            )
+
+        client = MicrosoftGraphClient(
+            _make_provider(),
+            transport=httpx.MockTransport(handler),
+        )
+        destination = tmp_path / "recording.mp4"
+
+        result = await client.download_to_file(
+            "/recordings/recording-1/content", destination
+        )
+
+        assert captured_accept == ["*/*"]
+        assert destination.read_bytes() == b"recording-bytes"
+        assert result["content_type"] == "video/mp4"
 
     async def test_invalid_json_response_raises_client_error(self):
         def handler(request: httpx.Request) -> httpx.Response:
