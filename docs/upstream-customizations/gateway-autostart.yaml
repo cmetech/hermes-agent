@@ -83,7 +83,7 @@ upstream_changes:
     Remove when upstream starts the gateway for desktop installs on its own --
     i.e. when a desktop backend with kanban enabled and no messaging configured
     gets a dispatcher without this hook. Keep the tests.
-  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
+  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
 
 - id: dispatcher-presence-visibility
   change_class: capability-generic
@@ -186,4 +186,4 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream's own kanban surfaces disclose dispatcher absence --
     i.e. when a board with no gateway running says so without this code.
-  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
+  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5

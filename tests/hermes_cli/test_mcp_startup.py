@@ -163,10 +163,52 @@ def test_portable_only_mcp_configuration_opens_startup_gate(monkeypatch):
     assert mcp_startup._has_configured_mcp_servers() is True
 
 
+def test_all_disabled_mcp_configuration_keeps_startup_gate_closed(monkeypatch):
+    calls = {"mcp": 0}
+    warnings = []
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(
+            read_raw_config=lambda: {
+                "mcp_servers": {
+                    "outlook": {"enabled": False},
+                    "glean": {"enabled": False},
+                }
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.agent_plugins",
+        types.SimpleNamespace(
+            has_enabled_agent_plugin_mcp=lambda _config: False,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=lambda: calls.__setitem__("mcp", calls["mcp"] + 1),
+            get_mcp_status=lambda: [],
+        ),
+    )
+    logger = types.SimpleNamespace(
+        debug=lambda *_a, **_k: None,
+        warning=lambda message, *_a, **_k: warnings.append(message),
+    )
 
+    mcp_startup.start_background_mcp_discovery(
+        logger=logger, thread_name="test-disabled-mcp-discovery"
+    )
+    assert mcp_startup.join_mcp_discovery(timeout=1.0) is True
+    mcp_startup.start_background_mcp_discovery(
+        logger=logger, thread_name="test-disabled-mcp-discovery"
+    )
+    assert mcp_startup.join_mcp_discovery(timeout=1.0) is True
 
-
-
+    assert calls["mcp"] == 0
+    assert warnings == []
 
 
 def _retry_logger():
@@ -197,5 +239,3 @@ def _install_retry_stubs(monkeypatch, *, connected: bool, calls: dict):
             get_mcp_status=lambda: [{"connected": connected}],
         ),
     )
-
-
