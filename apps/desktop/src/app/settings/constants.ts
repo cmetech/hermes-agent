@@ -1,6 +1,7 @@
 import {
   Box,
   Brain,
+  Globe,
   type IconComponent,
   Lock,
   MessageCircle,
@@ -428,7 +429,8 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     allowPrivateUrls: 'Browser Private URLs',
     autoLocalForPrivateUrls: 'Local Browser For Private URLs',
     defaultProfile: 'Use Corporate Browser For Internal Sites',
-    'profiles.enrolled.trustedOrigins': 'Trusted Internal Origins'
+    'profiles.enrolled.trustedOrigins': 'Trusted Internal Origins',
+    useRealProfile: 'Use My Real Browser Profile'
   },
   checkpoints: {
     enabled: 'File Checkpoints',
@@ -581,6 +583,8 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     redactSecrets: 'Hide detected secrets from model-visible content when possible.'
   },
   browser: {
+    useRealProfile:
+      "Local browsing uses your real logins. Hermes copies your default browser's profile (cookies, logins, preferences) into a managed snapshot and drives it with its packaged Chromium — your live profile is never opened directly, and the copy is refreshed from it on each run. Also lets the agent open a local real-profile session on request even when a cloud browser backend is configured. Only Chromium browsers (Chrome, Edge, Brave, Chromium) are supported; a non-Chromium default fails with a clear message. Off by default.",
     allowPrivateUrls:
       'Lets the browser reach ANY private or internal address. Prefer Trusted Internal Origins below, which grants access to specific sites only.',
     defaultProfile:
@@ -685,6 +689,12 @@ export const SECTIONS: DesktopConfigSection[] = [
     ]
   },
   {
+    id: 'browser',
+    label: 'Browser',
+    icon: Globe,
+    keys: ['browser.use_real_profile', 'browser.allow_private_urls', 'browser.auto_local_for_private_urls']
+  },
+  {
     id: 'memory',
     label: 'Memory & Context',
     icon: Brain,
@@ -746,7 +756,8 @@ export const SECTIONS: DesktopConfigSection[] = [
       'stt.elevenlabs.tag_audio_events',
       'stt.elevenlabs.diarize',
       'voice.record_key',
-      'voice.max_recording_seconds'
+      'voice.max_recording_seconds',
+      'voice.client_direct'
     ]
   },
   {

@@ -11,6 +11,7 @@ import {
   $updateStatus,
   resetUpdateApplyState
 } from '@/store/updates'
+
 import { applyBrand } from '../../scripts/brand-transform.mjs'
 
 import { BlockerView, formatBlockerCommandLine, UpdatesOverlay } from './updates-overlay'

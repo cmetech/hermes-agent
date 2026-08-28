@@ -1299,7 +1299,7 @@ def test_real_mcp_worker_uses_complete_private_runtime_closure_after_ipc(
 from pathlib import Path
 import os
 import sys
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from helper import VALUE
 
 ORIGINAL_ROOT = Path({str(run)!r})
@@ -1313,7 +1313,7 @@ except ImportError:
     injected_value = 'isolated'
 else:
     injected_value = injected.VALUE
-server = FastMCP('authority-echo')
+server = MCPServer('authority-echo')
 
 @server.tool()
 def echo(text: str) -> str:

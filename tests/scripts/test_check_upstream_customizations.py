@@ -4020,6 +4020,30 @@ def test_cli_set_verified_upstream_still_updates_checkout_manifest(
     assert updated["upstream_changes"][0]["last_verified_upstream"] == verified
 
 
+def test_cli_set_verified_upstream_preserves_manifest_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path)
+    baseline = _git(repo, "rev-parse", "HEAD")
+    manifest = _manifest(repo, baseline)
+    original = "# preserve catalog rationale\n" + manifest.read_text()
+    manifest.write_text(original)
+    _git(repo, "commit", "--allow-empty", "-m", "new verification point")
+    verified = _git(repo, "rev-parse", "HEAD")
+    monkeypatch.chdir(repo)
+
+    assert customization_checker.main(
+        [
+            "--manifest",
+            str(manifest),
+            "--set-verified-upstream",
+            verified,
+        ]
+    ) == 0
+    assert manifest.read_text() == original.replace(baseline, verified)
+
+
 def test_strict_cli_validates_owned_symbols_at_requested_base_ref(
     tmp_path: Path,
     monkeypatch,

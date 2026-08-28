@@ -91,7 +91,7 @@ upstream_changes:
     Remove when Electron (or the backend launcher) gains a first-class way to
     spawn a child with a curated environment instead of inheriting the parent's,
     making an explicit scrub of process.env unnecessary.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: import-safe-runtime-modules
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -122,7 +122,7 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream enforces the same import-purity contract across these
     shared modules.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: installer-managed-python-and-env-scrub
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -189,7 +189,7 @@ upstream_changes:
     Remove when uv defaults to managed-only interpreter selection (making the
     --managed-python wrappers redundant) AND the desktop no longer spawns
     installs from a process that inherits machine-scope environment.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: cli-launcher-env-isolation
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -250,7 +250,7 @@ upstream_changes:
     the invoking shell's environment -- e.g. a native launcher that starts the
     interpreter with a curated environment, or a CPython that ignores PYTHONPATH
     for a venv it did not build.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
 - id: posix-command-launcher-coverage
   change_class: capability-generic
   owner: downstream-edge-capability
@@ -317,4 +317,4 @@ upstream_changes:
     Remove when the POSIX installer puts the venv's bin directory on PATH
     directly (making per-script launchers unnecessary) AND the entry points no
     longer need an environment scrub to start.
-  last_verified_upstream: 36cb5ae5530a75def7df3195e49b7a4aa2add482
+  last_verified_upstream: fcbd1076a93841fa88855acce810e342a5b78101
