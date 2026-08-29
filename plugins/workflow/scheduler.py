@@ -62,6 +62,7 @@ from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
+    LoopGroupChildScope,
     RetryLedgerGrant,
     RetryPolicy,
     RunExecutionLimits,
@@ -94,6 +95,7 @@ from plugins.workflow.output_resolution import (
 from plugins.workflow.resources import (
     ResourceResolver,
     VariableContext,
+    effective_scoped_node_options,
     read_snapshot_provider_authority,
 )
 from plugins.workflow.schema import (
@@ -117,6 +119,7 @@ from plugins.workflow.trust import (
     WorkflowResourceCapacityError,
     WorkflowResourceReadBudget,
 )
+from plugins.workflow.topology import ScopedWorkflowNode, iter_scoped_workflow_nodes
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
 
 
@@ -152,6 +155,21 @@ class _StrictReferenceSnapshot:
             raise WorkflowOutputReferenceError(
                 "output_reference_integrity", node_id, tuple(path)
             ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerWorkItem:
+    """One top-level or loop-group child unit for the existing scheduler."""
+
+    run_id: str
+    node: WorkflowNode
+    loop_group_scope: LoopGroupChildScope | None = None
+
+    @property
+    def semantic_id(self) -> str:
+        if self.loop_group_scope is None:
+            return self.node.id
+        return f"{self.loop_group_scope.group_id}/{self.node.id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -814,9 +832,15 @@ def load_snapshot_format2(
     if dict(runtime_package.sidecar) != dict(identity_package.sidecar):
         mismatch("active root policy expansion changed")
 
-    runtime_by_id = {node.id: node for node in runtime_package.definition.nodes}
+    runtime_by_id = {
+        scoped.semantic_id: scoped.node
+        for scoped in iter_scoped_workflow_nodes(runtime_package.definition)
+        if scoped.node.node_type != "loop_group"
+    }
     expected_by_id = {
-        node.id: node for node in identity_package.definition.nodes
+        scoped.semantic_id: scoped.node
+        for scoped in iter_scoped_workflow_nodes(identity_package.definition)
+        if scoped.node.node_type != "loop_group"
     }
     for binding in manifest.resources:
         if binding.node_id is None:
@@ -1946,6 +1970,312 @@ class RunScheduler:
         )
 
     @staticmethod
+    def _work_item_state(
+        projection: Mapping[str, object], work_item: SchedulerWorkItem
+    ) -> Mapping[str, object]:
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            raise RuntimeError("workflow projection nodes are missing")
+        if work_item.loop_group_scope is None:
+            state = nodes.get(work_item.node.id)
+        else:
+            scope = work_item.loop_group_scope
+            group = nodes.get(scope.group_id)
+            controller = group.get("loop_group") if isinstance(group, Mapping) else None
+            body = controller.get("body") if isinstance(controller, Mapping) else None
+            state = body.get(scope.node_id) if isinstance(body, Mapping) else None
+            if (
+                not isinstance(controller, Mapping)
+                or controller.get("controller_generation")
+                != scope.controller_generation
+                or controller.get("iteration") != scope.iteration
+            ):
+                raise RuntimeError("stale loop group work item")
+        if not isinstance(state, Mapping):
+            raise RuntimeError("workflow work item state is missing")
+        return state
+
+    @staticmethod
+    def _runtime_work_node(
+        package: WorkflowPackage, work_item: SchedulerWorkItem
+    ) -> WorkflowNode:
+        if work_item.loop_group_scope is None:
+            return work_item.node
+        scope = work_item.loop_group_scope
+        group = next(
+            node
+            for node in package.definition.nodes
+            if node.id == scope.group_id and node.node_type == "loop_group"
+        )
+        options = effective_scoped_node_options(
+            package.definition,
+            ScopedWorkflowNode(
+                work_item.node,
+                scope.group_id,
+                work_item.semantic_id,
+                "scheduler",
+                group.options,
+            ),
+        )
+        return replace(
+            work_item.node,
+            id=work_item.semantic_id,
+            depends_on=tuple(dict.fromkeys((*work_item.node.depends_on, *group.depends_on))),
+            options=options,
+        )
+
+    def _ready_work_items(
+        self,
+        run_id: str,
+        package: WorkflowPackage,
+        projection: Mapping[str, object],
+    ) -> list[SchedulerWorkItem]:
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            return []
+        ready: list[SchedulerWorkItem] = []
+        for node in package.definition.nodes:
+            state = nodes.get(node.id)
+            if not isinstance(state, Mapping):
+                continue
+            if node.node_type != "loop_group":
+                if state.get("state") == "ready":
+                    ready.append(SchedulerWorkItem(run_id, node))
+                continue
+            controller = state.get("loop_group")
+            body_state = (
+                controller.get("body") if isinstance(controller, Mapping) else None
+            )
+            body_nodes = node.value.get("nodes") if isinstance(node.value, Mapping) else None
+            if not isinstance(body_state, Mapping) or not isinstance(body_nodes, tuple):
+                continue
+            generation = controller.get("controller_generation")
+            iteration = controller.get("iteration")
+            for child in body_nodes:
+                child_state = body_state.get(child.id)
+                if not isinstance(child_state, Mapping) or child_state.get("state") != "ready":
+                    continue
+                ready.append(
+                    SchedulerWorkItem(
+                        run_id,
+                        child,
+                        LoopGroupChildScope(
+                            run_id,
+                            node.id,
+                            generation,
+                            iteration,
+                            child.id,
+                        ),
+                    )
+                )
+        ready.sort(key=lambda item: item.node.source_index)
+        return ready
+
+    def _resolve_loop_child_output(
+        self,
+        projection: Mapping[str, object],
+        scope: LoopGroupChildScope,
+        node_id: str,
+        *,
+        previous: bool,
+    ) -> ResolvedNodeOutput | None:
+        nodes = projection.get("nodes")
+        group = nodes.get(scope.group_id) if isinstance(nodes, Mapping) else None
+        controller = group.get("loop_group") if isinstance(group, Mapping) else None
+        body = controller.get("body") if isinstance(controller, Mapping) else None
+        if not isinstance(body, Mapping) or node_id not in body:
+            raise WorkflowOutputReferenceError("output_reference_missing", node_id)
+        if previous:
+            outputs = controller.get("previous_outputs")
+            raw_candidate = outputs.get(node_id) if isinstance(outputs, Mapping) else None
+            if raw_candidate is None:
+                return None
+            expected_iteration = scope.iteration - 1
+            artifacts = projection.get("artifacts", ())
+        else:
+            child = body[node_id]
+            raw_candidate = child.get("output") if isinstance(child, Mapping) else None
+            if raw_candidate is None:
+                raise WorkflowOutputReferenceError("output_reference_missing", node_id)
+            expected_iteration = scope.iteration
+            artifacts = child.get("artifacts", ()) if isinstance(child, Mapping) else ()
+        try:
+            candidate = primary_output_candidate_from_identity(raw_candidate)
+        except ArchonOutputIntegrityError as exc:
+            raise WorkflowOutputReferenceError(
+                "output_reference_integrity", node_id
+            ) from exc
+        matches = []
+        for artifact in artifacts if isinstance(artifacts, list | tuple) else ():
+            if not isinstance(artifact, Mapping):
+                continue
+            try:
+                artifact_scope = LoopGroupChildScope.from_durable_record(
+                    artifact.get("loop_group_scope")
+                )
+            except ValueError:
+                continue
+            if (
+                artifact_scope.group_id == scope.group_id
+                and artifact_scope.controller_generation
+                == scope.controller_generation
+                and artifact_scope.iteration == expected_iteration
+                and artifact_scope.node_id == node_id
+                and artifact.get("relative_path")
+                == candidate.attempt_relative_path
+                and artifact.get("media_type") == candidate.media_type
+                and artifact.get("size_bytes") == candidate.size_bytes
+                and artifact.get("sha256") == candidate.sha256
+                and isinstance(artifact.get("attempt_id"), str)
+            ):
+                matches.append((artifact_scope, artifact))
+        if len(matches) != 1:
+            raise WorkflowOutputReferenceError("output_reference_integrity", node_id)
+        artifact_scope, descriptor = matches[0]
+        resolved = resolve_node_output(
+            run_directory=self.store.run_directory(scope.run_id),
+            node_id=artifact_scope.worker_node_id,
+            attempt_id=str(descriptor["attempt_id"]),
+            descriptor=descriptor,
+            candidate=candidate,
+            strict=True,
+        )
+        return replace(resolved, node_id=node_id)
+
+    def _scoped_variables(
+        self,
+        projection: dict[str, object],
+        package: WorkflowPackage,
+        work_item: SchedulerWorkItem,
+        *,
+        sealed_resource_paths: frozenset[str] | None,
+        sealed_resource_bytes: Mapping[str, bytes] | None,
+    ) -> VariableContext:
+        scope = work_item.loop_group_scope
+        if scope is None:
+            raise ValueError("scoped variables require a loop group child")
+        group = next(node for node in package.definition.nodes if node.id == scope.group_id)
+        body_nodes = group.value["nodes"]
+        current = {}
+        for node_id in work_item.node.depends_on:
+            try:
+                current[node_id] = self._resolve_loop_child_output(
+                    projection, scope, node_id, previous=False
+                )
+            except WorkflowOutputReferenceError as exc:
+                current[node_id] = exc
+        outer = self._output_values(
+            projection,
+            self.store.run_directory(scope.run_id),
+            node_ids=group.depends_on,
+        )
+        previous = {
+            node.id: (
+                lambda node_id=node.id: self._resolve_loop_child_output(
+                    projection, scope, node_id, previous=True
+                )
+            )
+            for node in body_nodes
+        }
+        variables = self._variables(
+            projection,
+            self.store.run_directory(scope.run_id),
+            sealed_resource_paths=sealed_resource_paths,
+            sealed_resource_bytes=sealed_resource_bytes,
+            resolved_outputs={},
+        )
+        return replace(
+            variables,
+            node_outputs={**outer, **current},
+            current_body_outputs=current,
+            allowed_outer_outputs=outer,
+            previous_body_outputs=previous,
+        )
+
+    def _scoped_directories(
+        self, work_item: SchedulerWorkItem, attempt_id: str
+    ) -> tuple[Path | None, Path | None]:
+        scope = work_item.loop_group_scope
+        if scope is None:
+            return None, None
+        run_directory = self.store.run_directory(scope.run_id).resolve()
+        attempt = (
+            run_directory
+            / "nodes"
+            / scope.group_id
+            / str(scope.controller_generation)
+            / "iterations"
+            / f"{scope.iteration:04d}"
+            / "nodes"
+            / scope.node_id
+            / attempt_id
+        ).resolve()
+        publication = (
+            run_directory
+            / "artifacts"
+            / "loop-groups"
+            / scope.group_id
+            / "iterations"
+            / f"{scope.iteration:04d}"
+            / scope.node_id
+        ).resolve()
+        if not attempt.is_relative_to(run_directory) or not publication.is_relative_to(
+            run_directory
+        ):
+            raise RuntimeError("loop group execution path escaped its run")
+        return attempt, publication
+
+    @staticmethod
+    def _claim_state(
+        projection: Mapping[str, object], claim: NodeClaim
+    ) -> Mapping[str, object]:
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            raise RuntimeError("workflow projection nodes are missing")
+        if claim.loop_group_scope is None:
+            state = nodes.get(claim.node_id)
+        else:
+            group = nodes.get(claim.loop_group_scope.group_id)
+            controller = group.get("loop_group") if isinstance(group, Mapping) else None
+            body = controller.get("body") if isinstance(controller, Mapping) else None
+            state = body.get(claim.node_id) if isinstance(body, Mapping) else None
+        if not isinstance(state, Mapping):
+            raise RuntimeError("workflow claim state is missing")
+        return state
+
+    def _complete_loop_group_result(
+        self,
+        claim: NodeClaim,
+        *,
+        status: str,
+        artifacts: tuple[ArtifactRef, ...],
+        error_code: str | None,
+        error_message: str | None,
+        metadata: Mapping[str, object],
+    ) -> None:
+        scope = claim.loop_group_scope
+        if scope is None:
+            raise ValueError("loop group completion requires a scoped claim")
+        for _attempt in range(64):
+            projection = self.store.load_run(claim.run_id)
+            try:
+                self.store.complete_loop_group_child(
+                    scope,
+                    claim,
+                    status=status,
+                    expected_state_version=int(projection["state_version"]),
+                    artifacts=artifacts,
+                    error_code=error_code,
+                    error_message=error_message,
+                    metadata=metadata,
+                )
+                return
+            except RuntimeError as exc:
+                if str(exc) != "stale loop group state version":
+                    raise
+        raise RuntimeError("stale loop group state version")
+
+    @staticmethod
     def _predecessor_results(
         projection: Mapping[str, object],
         dependencies: Iterable[str],
@@ -2031,9 +2361,119 @@ class RunScheduler:
         status = projection["status"]
         return status if status in {"cancelled", "abandoned", "interrupted"} else None
 
+    def _advance_loop_group_controllers(
+        self,
+        run_id: str,
+        nodes: tuple[WorkflowNode, ...],
+        projection: Mapping[str, object],
+    ) -> bool:
+        """Advance workerless v6 controllers through Task 4 transitions."""
+        projection_nodes = projection.get("nodes")
+        if not isinstance(projection_nodes, Mapping):
+            return False
+        for group in nodes:
+            if group.node_type != "loop_group" or not isinstance(group.value, Mapping):
+                continue
+            state = projection_nodes.get(group.id)
+            if not isinstance(state, Mapping):
+                continue
+            body_nodes = group.value.get("nodes")
+            if not isinstance(body_nodes, tuple):
+                continue
+            if state.get("state") == "ready" and state.get("loop_group") is None:
+                semantics = group.value
+                language = projection.get("language")
+                if not isinstance(language, Mapping):
+                    raise RuntimeError("loop group language authority is missing")
+                node_semantics = language.get("node_semantics")
+                sealed_group = (
+                    node_semantics.get(group.id)
+                    if isinstance(node_semantics, Mapping)
+                    else None
+                )
+                sealed_loop = (
+                    sealed_group.get("loop_group")
+                    if isinstance(sealed_group, Mapping)
+                    else None
+                )
+                primary_sink = (
+                    sealed_loop.get("primary_sink")
+                    if isinstance(sealed_loop, Mapping)
+                    else None
+                )
+                if not isinstance(primary_sink, str):
+                    raise RuntimeError("loop group sink authority is missing")
+                return self.store.initialize_loop_group(
+                    run_id,
+                    group.id,
+                    body_nodes,
+                    max_iterations=int(semantics["max_iterations"]),
+                    primary_sink=primary_sink,
+                    expected_state_version=int(projection["state_version"]),
+                    execution_fence=self.execution_fence,
+                )
+            controller = state.get("loop_group")
+            body = controller.get("body") if isinstance(controller, Mapping) else None
+            if (
+                state.get("state") != "running"
+                or not isinstance(controller, Mapping)
+                or not isinstance(body, Mapping)
+                or not body_nodes
+            ):
+                continue
+            scope = LoopGroupChildScope(
+                run_id,
+                group.id,
+                int(controller["controller_generation"]),
+                int(controller["iteration"]),
+                body_nodes[0].id,
+            )
+            failed = next(
+                (
+                    child
+                    for child in body.values()
+                    if isinstance(child, Mapping) and child.get("state") == "failed"
+                ),
+                None,
+            )
+            if failed is not None:
+                attempt = next(
+                    (
+                        item
+                        for item in reversed(failed.get("attempts", ()))
+                        if isinstance(item, Mapping) and item.get("state") == "failed"
+                    ),
+                    {},
+                )
+                return self.store.fail_loop_group(
+                    scope,
+                    error_code=str(attempt.get("error_code") or "node_failed"),
+                    error_message=str(
+                        attempt.get("error_message") or "loop group child failed"
+                    ),
+                    expected_state_version=int(projection["state_version"]),
+                    execution_fence=self.execution_fence,
+                )
+            if all(
+                isinstance(child, Mapping)
+                and child.get("state") in {"succeeded", "skipped"}
+                for child in body.values()
+            ) and int(controller["iteration"]) < int(controller["max_iterations"]):
+                return self.store.record_loop_group_iteration(
+                    scope,
+                    expected_state_version=int(projection["state_version"]),
+                    execution_fence=self.execution_fence,
+                )
+        return False
+
     def _resolve_graph(self, run_id: str, nodes: Iterable[WorkflowNode]) -> None:
+        nodes = tuple(nodes)
         while True:
             projection = self.store.load_run(run_id)
+            if self._advance_loop_group_controllers(run_id, nodes, projection):
+                continue
+            if projection.get("status") != "running":
+                return
             run_directory = self.store.run_directory(run_id)
             language_snapshot = read_language_snapshot(projection.get("language"))
             strict_v3 = language_snapshot is not None and supports_phase3_semantics(
@@ -3878,6 +4318,37 @@ class RunScheduler:
         provider_authority=None,
         claimed_deadline_budget: DeadlineBudget | None = None,
     ) -> None:
+        self._execute_work_item(
+            run_id,
+            claim,
+            SchedulerWorkItem(run_id, node),
+            package,
+            projection,
+            strict_reference_snapshot,
+            execution_limits,
+            execution_semantics,
+            sealed_resource_paths,
+            sealed_resource_bytes,
+            provider_authority,
+            claimed_deadline_budget,
+        )
+
+    def _execute_work_item(
+        self,
+        run_id: str,
+        claim: NodeClaim,
+        work_item: SchedulerWorkItem,
+        package,
+        projection: dict[str, object],
+        strict_reference_snapshot: _StrictReferenceSnapshot | None,
+        execution_limits: RunExecutionLimits,
+        execution_semantics: Phase3ExecutionSemantics | None,
+        sealed_resource_paths: frozenset[str] | None,
+        sealed_resource_bytes: Mapping[str, bytes] | None,
+        provider_authority=None,
+        claimed_deadline_budget: DeadlineBudget | None = None,
+    ) -> None:
+        node = self._runtime_work_node(package, work_item)
         with self._activity:
             self._active_executions += 1
         try:
@@ -3915,7 +4386,7 @@ class RunScheduler:
                         ),
                     )
                     return
-                node_state = dict(projection["nodes"][node.id])
+                node_state = dict(self._work_item_state(projection, work_item))
                 consumed_attempts = max(
                     0, int(node_state.get("retry_consumed", 0))
                 )
@@ -4064,26 +4535,36 @@ class RunScheduler:
                             execution_limits,
                             execution_semantics,
                         )
-                    variables = self._variables(
-                        projection,
-                        self.store.run_directory(run_id),
-                        sealed_resource_paths=sealed_resource_paths,
-                        sealed_resource_bytes=sealed_resource_bytes,
-                        output_node_ids=(
-                            node.depends_on
-                            if supports_phase3_semantics(
-                                package.language.effective_profile,
-                                package.language.normalizer_version,
-                            )
-                            else None
-                        ),
-                        resolved_outputs=(
-                            strict_reference_snapshot.outputs
-                            if strict_reference_snapshot is not None
-                            else None
-                        ),
+                    variables = (
+                        self._scoped_variables(
+                            projection,
+                            package,
+                            work_item,
+                            sealed_resource_paths=sealed_resource_paths,
+                            sealed_resource_bytes=sealed_resource_bytes,
+                        )
+                        if work_item.loop_group_scope is not None
+                        else self._variables(
+                            projection,
+                            self.store.run_directory(run_id),
+                            sealed_resource_paths=sealed_resource_paths,
+                            sealed_resource_bytes=sealed_resource_bytes,
+                            output_node_ids=(
+                                node.depends_on
+                                if supports_phase3_semantics(
+                                    package.language.effective_profile,
+                                    package.language.normalizer_version,
+                                )
+                                else None
+                            ),
+                            resolved_outputs=(
+                                strict_reference_snapshot.outputs
+                                if strict_reference_snapshot is not None
+                                else None
+                            ),
+                        )
                     )
-                    loop_input = projection["nodes"][node.id].get(
+                    loop_input = self._work_item_state(projection, work_item).get(
                         "loop_user_input_artifact"
                     )
                     if node.node_type == "loop" and isinstance(loop_input, str):
@@ -4164,7 +4645,17 @@ class RunScheduler:
                     )
                     shared_context_compatibility_digest = (
                         phase5_shared_context_compatibility_digest(
-                            package,
+                            (
+                                replace(
+                                    package,
+                                    definition=replace(
+                                        package.definition,
+                                        nodes=(node,),
+                                    ),
+                                )
+                                if work_item.loop_group_scope is not None
+                                else package
+                            ),
                             sealed_node_authority,
                             node_id=node.id,
                             sealed_closure_digest=sealed_closure_digest,
@@ -4337,6 +4828,12 @@ class RunScheduler:
                                     execution_limits.kill_reap_grace_seconds
                                 ),
                             ),
+                            attempt_directory=self._scoped_directories(
+                                work_item, claim.attempt_id
+                            )[0],
+                            publication_directory=self._scoped_directories(
+                                work_item, claim.attempt_id
+                            )[1],
                         )
                     )
                 except SealedStructuredOutputDecisionError as exc:
@@ -4620,7 +5117,7 @@ class RunScheduler:
         )
         if charge_execution_authority:
             projection = self.store.load_run(claim.run_id)
-            node_state = projection["nodes"][claim.node_id]
+            node_state = self._claim_state(projection, claim)
             consumed_before = int(node_state.get("retry_consumed", 0))
             retry_grant = self._sealed_retry_grant(
                 node,
@@ -4741,43 +5238,63 @@ class RunScheduler:
                         retained_candidate,
                     )
                     try:
-                        self.store.complete_node(
-                            claim,
-                            status=result.status,
-                            artifacts=completion_artifacts,
-                            typed_publication=typed_publication,
-                            error_code=result.error_code,
-                            error_message=result.error_message,
-                            metadata=completion_metadata,
-                            session_registry_update=(
-                                result.session_registry_update
-                            ),
-                            session_registry_authority=(
-                                result.session_registry_authority
-                            ),
-                        )
+                        if claim.loop_group_scope is not None:
+                            self._complete_loop_group_result(
+                                claim,
+                                status=result.status,
+                                artifacts=completion_artifacts,
+                                error_code=result.error_code,
+                                error_message=result.error_message,
+                                metadata=completion_metadata,
+                            )
+                        else:
+                            self.store.complete_node(
+                                claim,
+                                status=result.status,
+                                artifacts=completion_artifacts,
+                                typed_publication=typed_publication,
+                                error_code=result.error_code,
+                                error_message=result.error_message,
+                                metadata=completion_metadata,
+                                session_registry_update=(
+                                    result.session_registry_update
+                                ),
+                                session_registry_authority=(
+                                    result.session_registry_authority
+                                ),
+                            )
                     except BaseException:
                         self._purge_attempt_output_cache(claim)
                         raise
             else:
-                self.store.complete_node(
-                    claim,
-                    status=result.status,
-                    artifacts=result.artifacts,
-                    error_code=result.error_code,
-                    error_message=result.error_message,
-                    metadata=completion_metadata,
-                    session_registry_update=result.session_registry_update,
-                    session_registry_authority=(
-                        result.session_registry_authority
-                    ),
-                )
+                if claim.loop_group_scope is not None:
+                    self._complete_loop_group_result(
+                        claim,
+                        status=result.status,
+                        artifacts=result.artifacts,
+                        error_code=result.error_code,
+                        error_message=result.error_message,
+                        metadata=completion_metadata,
+                    )
+                else:
+                    self.store.complete_node(
+                        claim,
+                        status=result.status,
+                        artifacts=result.artifacts,
+                        error_code=result.error_code,
+                        error_message=result.error_message,
+                        metadata=completion_metadata,
+                        session_registry_update=result.session_registry_update,
+                        session_registry_authority=(
+                            result.session_registry_authority
+                        ),
+                    )
             return
         if execution_semantics is not None:
             if retry_grant is None:
                 if projection is None:
                     projection = self.store.load_run(claim.run_id)
-                node_state = projection["nodes"][claim.node_id]
+                node_state = self._claim_state(projection, claim)
                 retry_grant = self._sealed_retry_grant(
                     node,
                     execution_semantics,
@@ -4789,7 +5306,7 @@ class RunScheduler:
             policy = self._effective_retry_policy(node, execution_limits)
         if projection is None:
             projection = self.store.load_run(claim.run_id)
-        node_state = projection["nodes"][claim.node_id]
+        node_state = self._claim_state(projection, claim)
         consumed_before = int(node_state.get("retry_consumed", 0))
         if retry_charge is not None:
             provider_attempts = retry_charge.additional_provider_attempts
@@ -4860,14 +5377,25 @@ class RunScheduler:
             failure = FailureClass.TRANSIENT
         metadata = {**result.metadata, "retry_consumed": consumed}
         if failure in {FailureClass.RECONCILE, FailureClass.UNKNOWN_OUTCOME}:
-            self.store.complete_node(
-                claim,
-                status="paused",
-                artifacts=result.artifacts,
-                error_code=result.error_code,
-                error_message=result.error_message,
-                metadata={**metadata, "pending_interaction": "reconcile"},
-            )
+            completion_metadata = {**metadata, "pending_interaction": "reconcile"}
+            if claim.loop_group_scope is not None:
+                self._complete_loop_group_result(
+                    claim,
+                    status="paused",
+                    artifacts=result.artifacts,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                    metadata=completion_metadata,
+                )
+            else:
+                self.store.complete_node(
+                    claim,
+                    status="paused",
+                    artifacts=result.artifacts,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                    metadata=completion_metadata,
+                )
         elif failure is FailureClass.TRANSIENT and consumed < policy.max_attempts:
             workflow_attempt = len(node_state["attempts"])
             delay = compute_retry_delay(policy, workflow_attempt, jitter=self._jitter)
@@ -4881,14 +5409,24 @@ class RunScheduler:
                 consumed_attempts=consumed,
             )
         else:
-            self.store.complete_node(
-                claim,
-                status="failed",
-                artifacts=result.artifacts,
-                error_code=result.error_code,
-                error_message=result.error_message,
-                metadata=metadata,
-            )
+            if claim.loop_group_scope is not None:
+                self._complete_loop_group_result(
+                    claim,
+                    status="failed",
+                    artifacts=result.artifacts,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                    metadata=metadata,
+                )
+            else:
+                self.store.complete_node(
+                    claim,
+                    status="failed",
+                    artifacts=result.artifacts,
+                    error_code=result.error_code,
+                    error_message=result.error_message,
+                    metadata=metadata,
+                )
 
     def advance(self, run_id: str, *, max_nodes: int | None = None):
         if self._shutdown.is_set():
@@ -4931,7 +5469,6 @@ class RunScheduler:
             authorization,
         ):
             return self.store.load_run(run_id)
-        by_id = {node.id: node for node in package.definition.nodes}
         foreground_owner_id, foreground_owner_epoch = self._foreground_claim_token(
             self.store.load_run(run_id)
         )
@@ -4980,26 +5517,30 @@ class RunScheduler:
                     "waiting_retry",
                 }:
                     break
-                ready: list[str] = []
+                ready: list[SchedulerWorkItem] = []
                 strict_reference_snapshots: dict[
                     str, _StrictReferenceSnapshot
                 ] = {}
-                for node_id in sorted(projection["nodes"]):
-                    if projection["nodes"][node_id]["state"] != "ready":
-                        continue
-                    preflight = self._preflight_strict_node_references(
-                        run_id,
-                        by_id[node_id],
-                        package,
-                        projection,
-                        sealed_resource_paths=sealed_resource_paths,
-                        sealed_resource_bytes=sealed_resource_bytes,
+                for work_item in self._ready_work_items(
+                    run_id, package, projection
+                ):
+                    preflight = (
+                        True
+                        if work_item.loop_group_scope is not None
+                        else self._preflight_strict_node_references(
+                            run_id,
+                            work_item.node,
+                            package,
+                            projection,
+                            sealed_resource_paths=sealed_resource_paths,
+                            sealed_resource_bytes=sealed_resource_bytes,
+                        )
                     )
                     if not preflight:
                         continue
-                    ready.append(node_id)
+                    ready.append(work_item)
                     if isinstance(preflight, _StrictReferenceSnapshot):
-                        strict_reference_snapshots[node_id] = preflight
+                        strict_reference_snapshots[work_item.semantic_id] = preflight
                 projection = self.store.load_run(run_id)
                 if not self._revalidate_connector_capabilities(
                     run_id,
@@ -5017,23 +5558,23 @@ class RunScheduler:
                     capacity = min(capacity, remaining)
                 claims = []
                 fence_lost = False
-                for node_id in ready[:capacity]:
+                for work_item in ready[:capacity]:
+                    node = self._runtime_work_node(package, work_item)
+                    node_state = self._work_item_state(projection, work_item)
                     claim_now = self._monotonic()
                     claimed_deadline_budget = (
                         self._attempt_deadline_budget(
-                            by_id[node_id],
+                            node,
                             execution_limits,
                             execution_semantics,
                             now=claim_now,
                             remaining_wall_seconds=(
                                 float(
-                                    projection["nodes"][node_id][
-                                        "remaining_wall_seconds"
-                                    ]
+                                    node_state["remaining_wall_seconds"]
                                 )
                                 if execution_semantics is not None
                                 and "remaining_wall_seconds"
-                                in projection["nodes"][node_id]
+                                in node_state
                                 else None
                             ),
                         )
@@ -5049,10 +5590,10 @@ class RunScheduler:
                         )
                     ):
                         retry_consumed_before = int(
-                            projection["nodes"][node_id].get("retry_consumed", 0)
+                            node_state.get("retry_consumed", 0)
                         )
                         authority_grant = self._sealed_retry_grant(
-                            by_id[node_id],
+                            node,
                             execution_semantics,
                             retry_consumed=retry_consumed_before,
                         )
@@ -5061,17 +5602,13 @@ class RunScheduler:
                             "retry_consumed_before": retry_consumed_before,
                             "remaining_attempts": authority_grant.remaining_attempts,
                             "iteration_consumed_before": int(
-                                projection["nodes"][node_id].get(
-                                    "iteration_consumed", 0
-                                )
+                                node_state.get("iteration_consumed", 0)
                             ),
                             "remaining_iterations": max(
                                 0,
                                 90
                                 - int(
-                                    projection["nodes"][node_id].get(
-                                        "iteration_consumed", 0
-                                    )
+                                    node_state.get("iteration_consumed", 0)
                                 ),
                             ),
                             "remaining_wall_seconds": (
@@ -5082,21 +5619,18 @@ class RunScheduler:
                         }
                     session_recovery_reserve = (
                         self._persistent_session_recovery_reserve(
-                            by_id[node_id],
+                            node,
                             package,
                             projection,
                         )
                     )
                     try:
-                        claim = self.store.claim_node(
-                            run_id,
-                            node_id,
-                            self.owner_id,
+                        claim_kwargs = dict(
                             lease_seconds=self.lease_seconds,
                             now=self._utcnow(),
                             monotonic_now=claim_now,
                             journal_reserve_bytes=self._heartbeat_journal_reserve(
-                                by_id[node_id],
+                                node,
                                 execution_limits,
                                 execution_semantics,
                             )
@@ -5104,11 +5638,11 @@ class RunScheduler:
                             terminal_journal_reserve_bytes=(
                                 session_recovery_reserve
                             ),
-                            executor_id=by_id[node_id].node_type,
+                            executor_id=node.node_type,
                             owner_epoch=self.owner_id,
                             effect_classification=self.store.node_effect_classification(
                                 run_id,
-                                node_id,
+                                work_item.semantic_id,
                                 projection=projection,
                             ),
                             execution_fence=self.execution_fence,
@@ -5118,6 +5652,23 @@ class RunScheduler:
                             max_run_workers=execution_limits.max_total_workers,
                             execution_authority=claim_execution_authority,
                         )
+                        if work_item.loop_group_scope is None:
+                            claim = self.store.claim_node(
+                                run_id,
+                                work_item.node.id,
+                                self.owner_id,
+                                **claim_kwargs,
+                            )
+                        else:
+                            current_projection = self.store.load_run(run_id)
+                            claim = self.store.claim_loop_group_child(
+                                work_item.loop_group_scope,
+                                self.owner_id,
+                                expected_state_version=int(
+                                    current_projection["state_version"]
+                                ),
+                                **claim_kwargs,
+                            )
                     except StorageQuotaError as exc:
                         self.store.interrupt_for_host_pressure(run_id, message=str(exc))
                         break
@@ -5129,9 +5680,9 @@ class RunScheduler:
                     if claim is not None:
                         claims.append((
                             claim,
-                            by_id[node_id],
+                            work_item,
                             projection,
-                            strict_reference_snapshots.get(node_id),
+                            strict_reference_snapshots.get(work_item.semantic_id),
                             claimed_deadline_budget,
                         ))
                 if fence_lost:
@@ -5146,10 +5697,10 @@ class RunScheduler:
                 ) as pool:
                     futures = [
                         pool.submit(
-                            self._execute_claim,
+                            self._execute_work_item,
                             run_id,
                             claim,
-                            node,
+                            work_item,
                             package,
                             snapshot,
                             strict_snapshot,
@@ -5160,7 +5711,7 @@ class RunScheduler:
                             provider_authority,
                             budget,
                         )
-                        for claim, node, snapshot, strict_snapshot, budget in claims
+                        for claim, work_item, snapshot, strict_snapshot, budget in claims
                     ]
                     for future in futures:
                         future.result()
@@ -5292,7 +5843,7 @@ class RunScheduler:
                         completed_run_id = futures.pop(future)
                         future.result()
                         self._reconcile_session_registry_update(completed_run_id)
-                candidates: dict[str, list[str]] = {}
+                candidates: dict[str, list[SchedulerWorkItem]] = {}
                 snapshots = {}
                 strict_reference_snapshots: dict[
                     tuple[str, str], _StrictReferenceSnapshot
@@ -5332,26 +5883,28 @@ class RunScheduler:
                     active.append(run_id)
                     snapshots[run_id] = projection
                     candidates[run_id] = []
-                    for node_id in sorted(projection["nodes"]):
-                        if projection["nodes"][node_id]["state"] != "ready":
-                            continue
-                        preflight = self._preflight_strict_node_references(
-                            run_id,
-                            next(
-                                node
-                                for node in packages[run_id].definition.nodes
-                                if node.id == node_id
-                            ),
-                            packages[run_id],
-                            projection,
-                            sealed_resource_paths=sealed_resource_paths[run_id],
-                            sealed_resource_bytes=sealed_resource_bytes[run_id],
+                    for work_item in self._ready_work_items(
+                        run_id, packages[run_id], projection
+                    ):
+                        preflight = (
+                            True
+                            if work_item.loop_group_scope is not None
+                            else self._preflight_strict_node_references(
+                                run_id,
+                                work_item.node,
+                                packages[run_id],
+                                projection,
+                                sealed_resource_paths=sealed_resource_paths[run_id],
+                                sealed_resource_bytes=sealed_resource_bytes[run_id],
+                            )
                         )
                         if not preflight:
                             continue
-                        candidates[run_id].append(node_id)
+                        candidates[run_id].append(work_item)
                         if isinstance(preflight, _StrictReferenceSnapshot):
-                            strict_reference_snapshots[(run_id, node_id)] = preflight
+                            strict_reference_snapshots[
+                                (run_id, work_item.semantic_id)
+                            ] = preflight
                 preclaim_active = []
                 for run_id in active:
                     projection = self.store.load_run(run_id)
@@ -5396,11 +5949,12 @@ class RunScheduler:
                             >= execution_limits[run_id].max_parallel_nodes
                         ):
                             continue
-                        node_id = candidates[run_id].pop(0)
-                        node = next(
-                            node
-                            for node in packages[run_id].definition.nodes
-                            if node.id == node_id
+                        work_item = candidates[run_id].pop(0)
+                        node = self._runtime_work_node(
+                            packages[run_id], work_item
+                        )
+                        node_state = self._work_item_state(
+                            snapshots[run_id], work_item
                         )
                         claim_now = self._monotonic()
                         claimed_deadline_budget = (
@@ -5411,13 +5965,11 @@ class RunScheduler:
                                 now=claim_now,
                                 remaining_wall_seconds=(
                                     float(
-                                        snapshots[run_id]["nodes"][node_id][
-                                            "remaining_wall_seconds"
-                                        ]
+                                        node_state["remaining_wall_seconds"]
                                     )
                                     if execution_semantics[run_id] is not None
                                     and "remaining_wall_seconds"
-                                    in snapshots[run_id]["nodes"][node_id]
+                                    in node_state
                                     else None
                                 ),
                             )
@@ -5434,9 +5986,7 @@ class RunScheduler:
                             )
                         ):
                             retry_consumed_before = int(
-                                snapshots[run_id]["nodes"][node_id].get(
-                                    "retry_consumed", 0
-                                )
+                                node_state.get("retry_consumed", 0)
                             )
                             authority_grant = self._sealed_retry_grant(
                                 node,
@@ -5450,17 +6000,13 @@ class RunScheduler:
                                     authority_grant.remaining_attempts
                                 ),
                                 "iteration_consumed_before": int(
-                                    snapshots[run_id]["nodes"][node_id].get(
-                                        "iteration_consumed", 0
-                                    )
+                                    node_state.get("iteration_consumed", 0)
                                 ),
                                 "remaining_iterations": max(
                                     0,
                                     90
                                     - int(
-                                        snapshots[run_id]["nodes"][node_id].get(
-                                            "iteration_consumed", 0
-                                        )
+                                        node_state.get("iteration_consumed", 0)
                                     ),
                                 ),
                                 "remaining_wall_seconds": (
@@ -5477,10 +6023,7 @@ class RunScheduler:
                             )
                         )
                         try:
-                            claim = self.store.claim_node(
-                                run_id,
-                                node_id,
-                                self.owner_id,
+                            claim_kwargs = dict(
                                 lease_seconds=self.lease_seconds,
                                 now=self._utcnow(),
                                 monotonic_now=claim_now,
@@ -5497,7 +6040,7 @@ class RunScheduler:
                                 owner_epoch=self.owner_id,
                                 effect_classification=self.store.node_effect_classification(
                                     run_id,
-                                    node_id,
+                                    work_item.semantic_id,
                                     projection=snapshots[run_id],
                                 ),
                                 execution_fence=self.execution_fence,
@@ -5509,6 +6052,23 @@ class RunScheduler:
                                 ),
                                 execution_authority=claim_execution_authority,
                             )
+                            if work_item.loop_group_scope is None:
+                                claim = self.store.claim_node(
+                                    run_id,
+                                    work_item.node.id,
+                                    self.owner_id,
+                                    **claim_kwargs,
+                                )
+                            else:
+                                current_projection = self.store.load_run(run_id)
+                                claim = self.store.claim_loop_group_child(
+                                    work_item.loop_group_scope,
+                                    self.owner_id,
+                                    expected_state_version=int(
+                                        current_projection["state_version"]
+                                    ),
+                                    **claim_kwargs,
+                                )
                         except StorageQuotaError as exc:
                             self.store.interrupt_for_host_pressure(
                                 run_id, message=str(exc)
@@ -5525,10 +6085,12 @@ class RunScheduler:
                         claims.append((
                             run_id,
                             claim,
-                            node,
+                            work_item,
                             packages[run_id],
                             snapshots[run_id],
-                            strict_reference_snapshots.get((run_id, node_id)),
+                            strict_reference_snapshots.get(
+                                (run_id, work_item.semantic_id)
+                            ),
                             execution_limits[run_id],
                             execution_semantics[run_id],
                             sealed_resource_paths[run_id],
@@ -5547,7 +6109,7 @@ class RunScheduler:
                         self.store.release_claim_before_execution(work_item[1])
                     break
                 for claim in claims:
-                    future = pool.submit(self._execute_claim, *claim)
+                    future = pool.submit(self._execute_work_item, *claim)
                     futures[future] = claim[0]
                 if not claims:
                     if not futures:

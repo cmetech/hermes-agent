@@ -25,6 +25,7 @@ from plugins.workflow.language_schema import (
 )
 from plugins.workflow.bash_rendering import (
     RenderedBashCommand,
+    bash_loop_previous_reference_spans,
     bash_output_references,
     render_v3_bash,
 )
@@ -64,6 +65,19 @@ _SCALAR_VARIABLE = re.compile(
 _REFERENCE_NODE_CANDIDATE = re.compile(
     r"\$(?P<node>[A-Za-z_][A-Za-z0-9_-]*)"
 )
+_LOOP_PREV_OUTPUT_REFERENCE = re.compile(
+    r"\$LOOP_PREV\.(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output"
+    r"(?:\.(?P<dot>[A-Za-z0-9_.-]+))?"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopedOutputReference:
+    node_id: str
+    path: tuple[str, ...]
+    start: int
+    end: int
+    previous: bool = False
 
 
 def effective_scoped_node_options(
@@ -822,15 +836,53 @@ class VariableContext:
     node_outputs: Mapping[
         str, str | ResolvedNodeOutput | WorkflowOutputReferenceError
     ] = field(default_factory=dict)
+    current_body_outputs: Mapping[
+        str, ResolvedNodeOutput | WorkflowOutputReferenceError
+    ] = field(default_factory=dict)
+    allowed_outer_outputs: Mapping[
+        str, ResolvedNodeOutput | WorkflowOutputReferenceError
+    ] = field(default_factory=dict)
+    previous_body_outputs: Mapping[
+        str,
+        ResolvedNodeOutput
+        | WorkflowOutputReferenceError
+        | Callable[[], ResolvedNodeOutput | None]
+        | None,
+    ] = field(default_factory=dict)
     normalizer_version: int = 2
 
     def output_reference(
         self, node_id: str, path: tuple[str, ...] = ()
     ) -> ResolvedOutputReference:
         """Resolve one Archon v3 output through the canonical strict resolver."""
-        raw = self.node_outputs.get(node_id)
+        raw = self.current_body_outputs.get(node_id)
+        if raw is None:
+            raw = self.allowed_outer_outputs.get(node_id)
+        if raw is None:
+            raw = self.node_outputs.get(node_id)
         if isinstance(raw, WorkflowOutputReferenceError):
             raise WorkflowOutputReferenceError(raw.code, node_id, tuple(path))
+        return resolve_output_reference(
+            raw if isinstance(raw, ResolvedNodeOutput) else None,
+            node_id=node_id,
+            path=path,
+        )
+
+    def previous_output_reference(
+        self, node_id: str, path: tuple[str, ...] = ()
+    ) -> ResolvedOutputReference:
+        """Resolve one authenticated immediately-previous group output."""
+        if node_id not in self.previous_body_outputs:
+            raise WorkflowOutputReferenceError(
+                "output_reference_missing", node_id, tuple(path)
+            )
+        raw = self.previous_body_outputs[node_id]
+        if callable(raw):
+            raw = raw()
+        if isinstance(raw, WorkflowOutputReferenceError):
+            raise WorkflowOutputReferenceError(raw.code, node_id, tuple(path))
+        if raw is None and not path:
+            return ResolvedOutputReference("", "")
         return resolve_output_reference(
             raw if isinstance(raw, ResolvedNodeOutput) else None,
             node_id=node_id,
@@ -968,19 +1020,49 @@ class StrictSubstitutionRenderer:
         resolver = self.output_resolver or self.variables.output_reference
         return resolver(node_id, path).rendered_text
 
+    def _previous_output(self, node_id: str, path: tuple[str, ...]) -> str:
+        return self.variables.previous_output_reference(node_id, path).rendered_text
+
     def _references(self, template: str, *, bash_contexts: bool = False):
+        previous_matches = tuple(_LOOP_PREV_OUTPUT_REFERENCE.finditer(template))
+        previous_spans = (
+            frozenset(bash_loop_previous_reference_spans(template))
+            if bash_contexts
+            else frozenset(match.span() for match in previous_matches)
+        )
+        previous = tuple(
+            _ScopedOutputReference(
+                match.group("node"),
+                tuple(match.group("dot").split("."))
+                if match.group("dot")
+                else (),
+                match.start(),
+                match.end(),
+                True,
+            )
+            for match in previous_matches
+            if match.span() in previous_spans
+        )
+        masked = list(template)
+        for match in previous_matches:
+            masked[match.start() : match.end()] = " " * (
+                match.end() - match.start()
+            )
+        ordinary_template = "".join(masked)
         try:
             if bash_contexts:
-                return bash_output_references(
-                    template,
+                ordinary = bash_output_references(
+                    ordinary_template,
                     normalizer_version=self.variables.normalizer_version,
                 )
-            return tuple(
+            else:
+                ordinary = tuple(
                 iter_output_references(
-                    template,
+                    ordinary_template,
                     normalizer_version=self.variables.normalizer_version,
                 )
             )
+            return tuple(sorted((*ordinary, *previous), key=lambda item: item.start))
         except WorkflowReferenceSyntaxError as exc:
             candidate = (
                 _REFERENCE_NODE_CANDIDATE.match(template, exc.start)
@@ -1004,6 +1086,11 @@ class StrictSubstitutionRenderer:
             for reference in self._references(template):
                 key = (reference.node_id, reference.path)
                 if key in resolved:
+                    continue
+                if getattr(reference, "previous", False):
+                    resolved[key] = self.variables.previous_output_reference(
+                        reference.node_id, reference.path
+                    )
                     continue
                 if reference.node_id not in self.direct_dependencies:
                     raise WorkflowOutputReferenceError(
@@ -1063,7 +1150,9 @@ class StrictSubstitutionRenderer:
             (
                 reference.start,
                 reference.end,
-                self._output(reference.node_id, reference.path),
+                self._previous_output(reference.node_id, reference.path)
+                if getattr(reference, "previous", False)
+                else self._output(reference.node_id, reference.path),
             )
             for reference in references
         ]

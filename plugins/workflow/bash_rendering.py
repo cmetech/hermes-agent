@@ -31,6 +31,10 @@ _BASH_LEXER_MAX_NESTING = 64
 _BASH_SCALAR_REFERENCE = re.compile(
     r"\$(?:(?P<position>[1-9][0-9]*)|(?P<name>[A-Z][A-Z0-9_]*))"
 )
+_LOOP_PREV_OUTPUT_REFERENCE = re.compile(
+    r"\$LOOP_PREV\.(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output"
+    r"(?:\.(?P<path>[A-Za-z0-9_.-]+))?"
+)
 _BASH_SCALAR_NAMES = frozenset({
     "ARGUMENTS",
     "USER_MESSAGE",
@@ -1514,9 +1518,16 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
         iter_output_references_in_spans,
     )
 
+    previous_candidates = tuple(
+        match.span() for match in _LOOP_PREV_OUTPUT_REFERENCE.finditer(template)
+    )
+    masked = list(template)
+    for start, end in previous_candidates:
+        masked[start:end] = " " * (end - start)
+    ordinary_template = "".join(masked)
     output_candidates = tuple(
         iter_output_reference_candidate_spans(
-            template,
+            ordinary_template,
             normalizer_version=normalizer_version,
         )
     )
@@ -1539,7 +1550,9 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
             if start < output_end and end > output_start:
                 continue
         scalar_candidates.append((start, end))
-    candidates = tuple(sorted((*output_candidates, *scalar_candidates)))
+    candidates = tuple(
+        sorted((*output_candidates, *scalar_candidates, *previous_candidates))
+    )
     output_candidate_set = frozenset(output_candidates)
     admitted = tuple(
         (start, end)
@@ -1551,9 +1564,23 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
     )
     return tuple(
         iter_output_references_in_spans(
-            template,
+            ordinary_template,
             admitted,
             normalizer_version=normalizer_version,
+        )
+    )
+
+
+def bash_loop_previous_reference_spans(template: str) -> tuple[tuple[int, int], ...]:
+    """Return lexer-admitted private v6 previous-output spans."""
+    candidates = tuple(
+        match.span() for match in _LOOP_PREV_OUTPUT_REFERENCE.finditer(template)
+    )
+    return tuple(
+        (start, end)
+        for start, end, _quote in classify_bash_reference_spans(
+            template,
+            candidates,
         )
     )
 
