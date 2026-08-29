@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -17,8 +18,9 @@ from plugins.workflow.provider_authority import (
     resolve_workflow_provider_authority,
 )
 from plugins.workflow.schema import parse_workflow_source_bytes
-from plugins.workflow.store import ArtifactRef, RunStore
+from plugins.workflow.store import ArtifactRef, RunStore, workflow_lock
 from plugins.workflow.trust import WorkflowPackageDigest
+from tools.managed_process import ProcessIdentity
 
 
 _EXECUTION_AUTHORITY = {
@@ -197,6 +199,29 @@ def _complete(
         expected_state_version=before["state_version"],
     )
     return candidate
+
+
+def _request_cancellation_cut(store: RunStore, run_id: str) -> dict[str, object]:
+    """Persist the crash cut after cancellation wins but before cleanup."""
+    directory = store.run_directory(run_id)
+    with workflow_lock(store._run_lock_path(run_id)):
+        projection = json.loads((directory / "run.json").read_text())
+        projection["desired_status"] = "cancelled"
+        store._append_locked(directory, projection, "cancel_requested")
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET desired_status='cancelled', updated_at=? "
+                "WHERE run_id=?",
+                (projection["updated_at"], run_id),
+            )
+            store._sync_integrity_index(
+                connection,
+                projection=projection,
+                journal_sha256=hashlib.sha256(
+                    (directory / "events.jsonl").read_bytes()
+                ).hexdigest(),
+            )
+    return projection
 
 
 def test_controller_initializes_once_without_consuming_the_only_worker(
@@ -413,6 +438,42 @@ def test_iteration_commit_carries_only_output_descriptors_and_rejects_stale_scop
     assert store.load_run(run_id)["state_version"] == version
 
 
+def test_cancellation_request_prevents_next_loop_group_iteration(
+    tmp_path, workflow_writer
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    select_scope = _scope(run_id, "select")
+    select_claim = store.claim_loop_group_child(
+        select_scope,
+        "select-worker",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert select_claim is not None
+    _complete(store, select_scope, select_claim, b"selected")
+    ready = store.load_run(run_id)
+    record_scope = _scope(run_id, "record")
+    record_claim = store.claim_loop_group_child(
+        record_scope,
+        "record-worker",
+        expected_state_version=ready["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert record_claim is not None
+    _complete(store, record_scope, record_claim, b"recorded")
+    cancelling = _request_cancellation_cut(store, run_id)
+
+    assert not store.record_loop_group_iteration(
+        record_scope,
+        expected_state_version=cancelling["state_version"],
+    )
+    unchanged = store.load_run(run_id)
+    assert unchanged["desired_status"] == "cancelled"
+    assert unchanged["state_version"] == cancelling["state_version"]
+    assert unchanged["nodes"]["group"]["loop_group"]["iteration"] == 1
+
+
 def test_fail_loop_group_is_generation_and_state_version_fenced(
     tmp_path, workflow_writer
 ) -> None:
@@ -439,6 +500,131 @@ def test_fail_loop_group_is_generation_and_state_version_fenced(
     assert failed["status"] == "failed"
     assert failed["nodes"]["group"]["state"] == "failed"
     assert failed["nodes"]["group"]["loop_group"]["state"] == "failed"
+
+
+def test_cancellation_request_prevents_loop_group_failure(
+    tmp_path, workflow_writer
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    _initialize(store, run_id, group)
+    cancelling = _request_cancellation_cut(store, run_id)
+
+    assert not store.fail_loop_group(
+        _scope(run_id, "select"),
+        error_code="group_failed",
+        error_message="failed",
+        expected_state_version=cancelling["state_version"],
+    )
+    unchanged = store.load_run(run_id)
+    assert unchanged["desired_status"] == "cancelled"
+    assert unchanged["state_version"] == cancelling["state_version"]
+    assert unchanged["nodes"]["group"]["loop_group"]["state"] == "running"
+
+
+def test_loop_group_failure_retains_live_child_until_cleanup_is_corroborated(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = ProcessIdentity(pid=999_997, start_time=12_345, group_id=999_997)
+    assert store.record_process_started(claim, identity)
+    monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    before_failure = store.load_run(run_id)
+
+    assert not store.fail_loop_group(
+        scope,
+        error_code="group_failed",
+        error_message="failed",
+        expected_state_version=before_failure["state_version"],
+    )
+    restarted = RunStore(home)
+    retained = restarted.load_run(run_id)
+    child = retained["nodes"]["group"]["loop_group"]["body"]["select"]
+    assert retained["status"] == "interrupted"
+    assert "claim" not in child
+    assert child["recovery"]["attempt_id"] == claim.attempt_id
+    assert child["recovery"]["observation"] == "still_running"
+    assert child["recovery"]["termination_confirmed"] is False
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+
+    assert restarted.record_process_stopped(claim, identity, cleaned=True)
+    cleaned = restarted.load_run(run_id)
+    child = cleaned["nodes"]["group"]["loop_group"]["body"]["select"]
+    assert cleaned["status"] == "interrupted"
+    assert child["recovery"]["observation"] == "known_stopped"
+    assert child["recovery"]["termination_confirmed"] is True
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
+
+
+def test_loop_group_failure_finalizes_after_active_child_cleanup_is_recorded(
+    tmp_path, workflow_writer
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    identity = ProcessIdentity(pid=999_998, start_time=23_456, group_id=999_998)
+    assert store.record_process_started(claim, identity)
+    assert store.record_process_stopped(claim, identity, cleaned=True)
+    cleaned = store.load_run(run_id)
+
+    assert store.fail_loop_group(
+        scope,
+        error_code="group_failed",
+        error_message="failed",
+        expected_state_version=cleaned["state_version"],
+    )
+    assert store.load_run(run_id)["status"] == "failed"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
+
+
+def test_projection_rejects_terminal_child_with_active_claim(
+    tmp_path, workflow_writer
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    projection = store.load_run(run_id)
+    child = projection["nodes"]["group"]["loop_group"]["body"]["select"]
+    child["state"] = "succeeded"
+    child["attempts"][-1]["state"] = "succeeded"
+
+    assert not store._valid_projection(projection, run_id=run_id)
 
 
 def test_child_heartbeat_and_stale_expiry_use_existing_claim_lifecycle(

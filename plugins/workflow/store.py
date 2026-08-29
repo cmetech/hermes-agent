@@ -490,8 +490,12 @@ def _valid_loop_group_state(
                 or not isinstance(claim.get("lease_expires_at"), str)
                 or not attempts
                 or attempts[-1].get("attempt_id") != claim.get("attempt_id")
+                or child.get("state") not in {"claimed", "running"}
+                or attempts[-1].get("state") != child.get("state")
             ):
                 return False
+        elif attempts and attempts[-1].get("state") in {"claimed", "running"}:
+            return False
         recovery = child.get("recovery")
         if recovery is not None:
             try:
@@ -10545,6 +10549,7 @@ class RunStore:
         self,
         connection: sqlite3.Connection,
         *,
+        attempt_id: str,
         run_id: str,
         node_id: str,
         owner_id: str,
@@ -10563,7 +10568,6 @@ class RunStore:
             ).fetchone()[0]
             if active_run_workers >= max_run_workers:
                 return None
-        attempt_id = uuid.uuid4().hex
         connection.execute(
             "INSERT INTO worker_claims "
             "(attempt_id, run_id, node_id, owner_id, lease_expires_at) "
@@ -10577,6 +10581,216 @@ class RunStore:
             ),
         )
         return attempt_id
+
+    def _claim_ready_node_locked(
+        self,
+        directory: Path,
+        projection: MutableMapping[str, object],
+        node: MutableMapping[str, object],
+        *,
+        run_id: str,
+        worker_node_id: str,
+        claim_node_id: str,
+        attempt_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        now: datetime | None,
+        monotonic_now: float | None,
+        journal_reserve_bytes: int,
+        terminal_journal_reserve_bytes: int,
+        executor_id: str,
+        owner_epoch: str | None,
+        effect_classification: str,
+        evidence_paths: Iterable[str],
+        execution_fence: ExecutionFence | None,
+        foreground_owner_id: str | None,
+        foreground_owner_epoch: int | None,
+        require_execution_authority: bool,
+        max_run_workers: int | None,
+        execution_authority: Mapping[str, object] | None,
+        event_type: str,
+        event_payload: Mapping[str, object],
+        loop_group_scope: LoopGroupChildScope | None = None,
+    ) -> NodeClaim | None:
+        """Persist one already-authorized ready-node claim under both locks."""
+        if _language_has_phase5_semantics(projection.get("language")):
+            execution_authority = _validated_execution_authority(
+                execution_authority
+            )
+        elif execution_authority is not None:
+            execution_authority = _validated_execution_authority(
+                execution_authority
+            )
+        preliminary_reserve = TerminalJournalReserve.for_projection(
+            len(
+                json.dumps(
+                    projection, sort_keys=True, ensure_ascii=False
+                ).encode("utf-8")
+            )
+        )
+        self._ensure_run_capacity(
+            directory,
+            projection,
+            journal_reserve_bytes=(
+                journal_reserve_bytes
+                + preliminary_reserve.terminal_reserve_bytes
+            ),
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            instant = now or datetime.now(timezone.utc)
+            if execution_fence is not None:
+                self.assert_execution_fence(connection, execution_fence)
+            elif require_execution_authority or foreground_owner_id is not None:
+                execution = connection.execute(
+                    "SELECT execution_mode, foreground_owner_id, "
+                    "foreground_epoch, foreground_lease_expires_at, "
+                    "foreground_boot_id, foreground_heartbeat_monotonic, "
+                    "foreground_lease_seconds FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if execution is None or execution["execution_mode"] != "foreground":
+                    connection.rollback()
+                    return None
+                foreground_sample = self._foreground_sample(instant)
+                if monotonic_now is not None:
+                    foreground_sample = LeaseClockSample(
+                        foreground_sample.utc_now,
+                        float(monotonic_now),
+                        foreground_sample.boot_id,
+                    )
+                foreground_lease = self._foreground_lease(execution)
+                if (
+                    foreground_owner_id is None
+                    or execution["foreground_owner_id"] != foreground_owner_id
+                    or execution["foreground_epoch"] != foreground_owner_epoch
+                    or foreground_lease is None
+                    or not lease_is_fresh(foreground_lease, foreground_sample)
+                ):
+                    connection.rollback()
+                    return None
+            monotonic_instant = (
+                float(monotonic_now)
+                if monotonic_now is not None
+                else time.monotonic()
+            )
+            expires = instant + timedelta(seconds=lease_seconds)
+            if self._insert_worker_claim_if_capacity(
+                connection,
+                attempt_id=attempt_id,
+                run_id=run_id,
+                node_id=worker_node_id,
+                owner_id=owner_id,
+                lease_expires_at=expires,
+                max_run_workers=max_run_workers,
+            ) is None:
+                connection.rollback()
+                return None
+            fence_record = (
+                {
+                    "owner_id": execution_fence.owner_id,
+                    "owner_epoch": execution_fence.owner_epoch,
+                }
+                if execution_fence is not None
+                else None
+            )
+            scope_record = (
+                loop_group_scope.durable_record()
+                if loop_group_scope is not None
+                else None
+            )
+            node["state"] = "claimed"
+            node["claim"] = {
+                "owner_id": owner_id,
+                "attempt_id": attempt_id,
+                "lease_expires_at": expires.isoformat(),
+                "heartbeat_at": instant.isoformat(),
+                "heartbeat_monotonic": monotonic_instant,
+                "lease_seconds": float(lease_seconds),
+                "owner_epoch": owner_epoch or owner_id,
+                "executor_id": executor_id,
+                "effect_classification": effect_classification,
+                "execution_fence": fence_record,
+                **(
+                    {"loop_group_scope": scope_record}
+                    if scope_record is not None
+                    else {}
+                ),
+            }
+            node["attempts"].append({
+                "attempt_id": attempt_id,
+                "state": "claimed",
+                "claimed_at": instant.isoformat(),
+                "owner_id": owner_id,
+                "owner_epoch": owner_epoch or owner_id,
+                "executor_id": executor_id,
+                "effect_classification": effect_classification,
+                "execution_fence": fence_record,
+                "evidence_paths": list(evidence_paths),
+                **(
+                    {"loop_group_scope": scope_record}
+                    if scope_record is not None
+                    else {}
+                ),
+                **(
+                    {"execution_authority": dict(execution_authority)}
+                    if execution_authority is not None
+                    else {}
+                ),
+            })
+            reserve = TerminalJournalReserve.for_projection(
+                len(
+                    json.dumps(
+                        projection, sort_keys=True, ensure_ascii=False
+                    ).encode("utf-8")
+                )
+            )
+            self._ensure_run_capacity(
+                directory,
+                projection,
+                journal_reserve_bytes=(
+                    journal_reserve_bytes + reserve.terminal_reserve_bytes
+                ),
+            )
+            connection.execute(
+                "INSERT INTO attempt_journal_reserves ("
+                "attempt_id, run_id, terminal_reserve_bytes, "
+                "projection_limit_bytes, consumed_bytes, created_at) "
+                "VALUES (?, ?, ?, ?, 0, ?)",
+                (
+                    attempt_id,
+                    run_id,
+                    reserve.terminal_reserve_bytes
+                    + terminal_journal_reserve_bytes,
+                    reserve.projection_limit_bytes,
+                    _utc_now(),
+                ),
+            )
+            self._append_locked(
+                directory,
+                projection,
+                event_type,
+                dict(event_payload),
+                node_id=worker_node_id,
+                attempt_id=attempt_id,
+                reserve_connection=connection,
+            )
+            connection.commit()
+            return NodeClaim(
+                run_id,
+                claim_node_id,
+                attempt_id,
+                owner_id,
+                expires,
+                execution_fence,
+                loop_group_scope,
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def claim_loop_group_child(
         self,
@@ -10657,182 +10871,46 @@ class RunStore:
                 )
             ):
                 return None
-            if _language_has_phase5_semantics(projection.get("language")):
-                execution_authority = _validated_execution_authority(
-                    execution_authority
-                )
-            elif execution_authority is not None:
-                execution_authority = _validated_execution_authority(
-                    execution_authority
-                )
-            preliminary_reserve = TerminalJournalReserve.for_projection(
-                len(
-                    json.dumps(
-                        projection, sort_keys=True, ensure_ascii=False
-                    ).encode("utf-8")
-                )
+            attempt_id = uuid.uuid4().hex
+            resolved_evidence_paths = evidence_paths or (
+                f"nodes/{scope.group_id}/{scope.controller_generation}/"
+                f"iterations/{scope.iteration:04d}/nodes/{scope.node_id}/"
+                f"{attempt_id}/stdout.txt",
+                f"nodes/{scope.group_id}/{scope.controller_generation}/"
+                f"iterations/{scope.iteration:04d}/nodes/{scope.node_id}/"
+                f"{attempt_id}/stderr.txt",
             )
-            self._ensure_run_capacity(
+            return self._claim_ready_node_locked(
                 directory,
                 projection,
-                journal_reserve_bytes=(
-                    journal_reserve_bytes + preliminary_reserve.terminal_reserve_bytes
-                ),
+                child,
+                run_id=scope.run_id,
+                worker_node_id=scope.worker_node_id,
+                claim_node_id=scope.node_id,
+                attempt_id=attempt_id,
+                owner_id=owner_id,
+                lease_seconds=lease_seconds,
+                now=now,
+                monotonic_now=monotonic_now,
+                journal_reserve_bytes=journal_reserve_bytes,
+                terminal_journal_reserve_bytes=terminal_journal_reserve_bytes,
+                executor_id=executor_id,
+                owner_epoch=owner_epoch,
+                effect_classification=effect_classification,
+                evidence_paths=resolved_evidence_paths,
+                execution_fence=execution_fence,
+                foreground_owner_id=foreground_owner_id,
+                foreground_owner_epoch=foreground_owner_epoch,
+                require_execution_authority=require_execution_authority,
+                max_run_workers=max_run_workers,
+                execution_authority=execution_authority,
+                event_type="loop_group_child_claimed",
+                event_payload={
+                    "owner_id": owner_id,
+                    "loop_group_scope": scope.durable_record(),
+                },
+                loop_group_scope=scope,
             )
-            connection = self._connect()
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                instant = now or datetime.now(timezone.utc)
-                if execution_fence is not None:
-                    self.assert_execution_fence(connection, execution_fence)
-                elif require_execution_authority or foreground_owner_id is not None:
-                    execution = connection.execute(
-                        "SELECT execution_mode, foreground_owner_id, "
-                        "foreground_epoch, foreground_lease_expires_at, "
-                        "foreground_boot_id, foreground_heartbeat_monotonic, "
-                        "foreground_lease_seconds FROM runs WHERE run_id=?",
-                        (scope.run_id,),
-                    ).fetchone()
-                    if execution is None or execution["execution_mode"] != "foreground":
-                        connection.rollback()
-                        return None
-                    foreground_sample = self._foreground_sample(instant)
-                    if monotonic_now is not None:
-                        foreground_sample = LeaseClockSample(
-                            foreground_sample.utc_now,
-                            float(monotonic_now),
-                            foreground_sample.boot_id,
-                        )
-                    foreground_lease = self._foreground_lease(execution)
-                    if (
-                        foreground_owner_id is None
-                        or execution["foreground_owner_id"] != foreground_owner_id
-                        or execution["foreground_epoch"] != foreground_owner_epoch
-                        or foreground_lease is None
-                        or not lease_is_fresh(foreground_lease, foreground_sample)
-                    ):
-                        connection.rollback()
-                        return None
-                monotonic_instant = (
-                    float(monotonic_now)
-                    if monotonic_now is not None
-                    else time.monotonic()
-                )
-                expires = instant + timedelta(seconds=lease_seconds)
-                attempt_id = self._insert_worker_claim_if_capacity(
-                    connection,
-                    run_id=scope.run_id,
-                    node_id=scope.worker_node_id,
-                    owner_id=owner_id,
-                    lease_expires_at=expires,
-                    max_run_workers=max_run_workers,
-                )
-                if attempt_id is None:
-                    connection.rollback()
-                    return None
-                resolved_evidence_paths = list(
-                    evidence_paths
-                    or (
-                        f"nodes/{scope.group_id}/{scope.controller_generation}/"
-                        f"iterations/{scope.iteration:04d}/nodes/{scope.node_id}/"
-                        f"{attempt_id}/stdout.txt",
-                        f"nodes/{scope.group_id}/{scope.controller_generation}/"
-                        f"iterations/{scope.iteration:04d}/nodes/{scope.node_id}/"
-                        f"{attempt_id}/stderr.txt",
-                    )
-                )
-                scope_record = scope.durable_record()
-                fence_record = (
-                    {
-                        "owner_id": execution_fence.owner_id,
-                        "owner_epoch": execution_fence.owner_epoch,
-                    }
-                    if execution_fence is not None
-                    else None
-                )
-                child["state"] = "claimed"
-                child["claim"] = {
-                    "owner_id": owner_id,
-                    "attempt_id": attempt_id,
-                    "lease_expires_at": expires.isoformat(),
-                    "heartbeat_at": instant.isoformat(),
-                    "heartbeat_monotonic": monotonic_instant,
-                    "lease_seconds": float(lease_seconds),
-                    "owner_epoch": owner_epoch or owner_id,
-                    "executor_id": executor_id,
-                    "effect_classification": effect_classification,
-                    "execution_fence": fence_record,
-                    "loop_group_scope": scope_record,
-                }
-                child["attempts"].append({
-                    "attempt_id": attempt_id,
-                    "state": "claimed",
-                    "claimed_at": instant.isoformat(),
-                    "owner_id": owner_id,
-                    "owner_epoch": owner_epoch or owner_id,
-                    "executor_id": executor_id,
-                    "effect_classification": effect_classification,
-                    "execution_fence": fence_record,
-                    "loop_group_scope": scope_record,
-                    "evidence_paths": resolved_evidence_paths,
-                    **(
-                        {"execution_authority": dict(execution_authority)}
-                        if execution_authority is not None
-                        else {}
-                    ),
-                })
-                reserve = TerminalJournalReserve.for_projection(
-                    len(
-                        json.dumps(
-                            projection, sort_keys=True, ensure_ascii=False
-                        ).encode("utf-8")
-                    )
-                )
-                self._ensure_run_capacity(
-                    directory,
-                    projection,
-                    journal_reserve_bytes=(
-                        journal_reserve_bytes + reserve.terminal_reserve_bytes
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO attempt_journal_reserves ("
-                    "attempt_id, run_id, terminal_reserve_bytes, "
-                    "projection_limit_bytes, consumed_bytes, created_at) "
-                    "VALUES (?, ?, ?, ?, 0, ?)",
-                    (
-                        attempt_id,
-                        scope.run_id,
-                        reserve.terminal_reserve_bytes
-                        + terminal_journal_reserve_bytes,
-                        reserve.projection_limit_bytes,
-                        _utc_now(),
-                    ),
-                )
-                self._append_locked(
-                    directory,
-                    projection,
-                    "loop_group_child_claimed",
-                    {"owner_id": owner_id, "loop_group_scope": scope_record},
-                    node_id=scope.worker_node_id,
-                    attempt_id=attempt_id,
-                    reserve_connection=connection,
-                )
-                connection.commit()
-                return NodeClaim(
-                    scope.run_id,
-                    scope.node_id,
-                    attempt_id,
-                    owner_id,
-                    expires,
-                    execution_fence,
-                    scope,
-                )
-            except BaseException:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
 
     def complete_loop_group_child(
         self,
@@ -11021,7 +11099,9 @@ class RunStore:
             controller = group["loop_group"]
             body = controller["body"]
             if (
-                group.get("state") != "running"
+                projection.get("status") != "running"
+                or projection.get("desired_status") is not None
+                or group.get("state") != "running"
                 or controller.get("state") != "running"
                 or any(child.get("claim") is not None for child in body.values())
                 or any(
@@ -11084,6 +11164,50 @@ class RunStore:
         now: LeaseClockSample | None = None,
     ) -> bool:
         directory = self.run_directory(scope.run_id)
+        cleanup_required = False
+        with workflow_lock(
+            self._run_lock_path(scope.run_id)
+        ), self._execution_fence_transaction(
+            execution_fence, now
+        ):
+            projection = json.loads((directory / "run.json").read_text())
+            if int(projection["state_version"]) != expected_state_version:
+                raise RuntimeError("stale loop group state version")
+            _loop_group_child_state(projection, scope)
+            controller = projection["nodes"][scope.group_id]["loop_group"]
+            if (
+                projection.get("status") != "running"
+                or projection.get("desired_status") is not None
+                or controller.get("state")
+                in {"failed", "cancelled", "succeeded"}
+            ):
+                return False
+            for child in controller["body"].values():
+                raw_claim = child.get("claim")
+                if not isinstance(raw_claim, Mapping):
+                    continue
+                attempt = next(
+                    (
+                        candidate
+                        for candidate in reversed(child.get("attempts", []))
+                        if candidate.get("attempt_id")
+                        == raw_claim.get("attempt_id")
+                    ),
+                    None,
+                )
+                if isinstance(attempt, Mapping) and self._observe_attempt(
+                    attempt
+                ) not in {"still_running", "outcome_uncertain"}:
+                    continue
+                cleanup_required = True
+        if cleanup_required:
+            self.interrupt_active_claims(
+                scope.run_id,
+                reason=error_code,
+                fence=execution_fence,
+                now=now,
+            )
+            return False
         with workflow_lock(self.admission_lock), workflow_lock(
             self._run_lock_path(scope.run_id)
         ), self._execution_fence_transaction(
@@ -11095,13 +11219,59 @@ class RunStore:
             _loop_group_child_state(projection, scope)
             group = projection["nodes"][scope.group_id]
             controller = group["loop_group"]
-            if controller.get("state") in {"failed", "cancelled", "succeeded"}:
+            if (
+                projection.get("status") != "running"
+                or projection.get("desired_status") is not None
+                or controller.get("state")
+                in {"failed", "cancelled", "succeeded"}
+            ):
                 return False
             active_attempts = []
+            for child in controller["body"].values():
+                claim = child.get("claim")
+                if isinstance(claim, Mapping):
+                    attempt = next(
+                        (
+                            candidate
+                            for candidate in reversed(child.get("attempts", []))
+                            if candidate.get("attempt_id")
+                            == claim.get("attempt_id")
+                        ),
+                        None,
+                    )
+                    if not isinstance(attempt, Mapping) or self._observe_attempt(
+                        attempt
+                    ) in {"still_running", "outcome_uncertain"}:
+                        return False
+                recovery = child.get("recovery")
+                if (
+                    isinstance(recovery, Mapping)
+                    and recovery.get("observation")
+                    in {"still_running", "outcome_uncertain"}
+                    and not recovery.get("termination_confirmed")
+                ):
+                    return False
             for child in controller["body"].values():
                 claim = child.pop("claim", None)
                 if isinstance(claim, Mapping):
                     active_attempts.append(str(claim.get("attempt_id")))
+                    attempt = next(
+                        (
+                            candidate
+                            for candidate in reversed(child.get("attempts", []))
+                            if candidate.get("attempt_id")
+                            == claim.get("attempt_id")
+                        ),
+                        None,
+                    )
+                    if isinstance(attempt, MutableMapping):
+                        attempt.update({
+                            "state": "cancelled",
+                            "error_code": error_code,
+                            "error_message": _sanitize_diagnostic(error_message),
+                            "completed_at": _utc_now(),
+                        })
+                child.pop("recovery", None)
                 if child.get("state") not in {"succeeded", "skipped", "failed"}:
                     child["state"] = "cancelled"
             safe_message = _sanitize_diagnostic(error_message)
@@ -11224,182 +11394,38 @@ class RunStore:
                     )
                 ):
                     return None
-                preliminary_reserve = TerminalJournalReserve.for_projection(
-                    len(
-                        json.dumps(
-                            projection, sort_keys=True, ensure_ascii=False
-                        ).encode("utf-8")
-                    )
+                attempt_id = uuid.uuid4().hex
+                resolved_evidence_paths = evidence_paths or (
+                    f"nodes/{node_id}/{attempt_id}/stdout.txt",
+                    f"nodes/{node_id}/{attempt_id}/stderr.txt",
                 )
-                self._ensure_run_capacity(
+                return self._claim_ready_node_locked(
                     directory,
                     projection,
-                    journal_reserve_bytes=(
-                        journal_reserve_bytes
-                        + preliminary_reserve.terminal_reserve_bytes
-                    ),
+                    node,
+                    run_id=run_id,
+                    worker_node_id=node_id,
+                    claim_node_id=node_id,
+                    attempt_id=attempt_id,
+                    owner_id=owner_id,
+                    lease_seconds=lease_seconds,
+                    now=now,
+                    monotonic_now=monotonic_now,
+                    journal_reserve_bytes=journal_reserve_bytes,
+                    terminal_journal_reserve_bytes=terminal_journal_reserve_bytes,
+                    executor_id=executor_id,
+                    owner_epoch=owner_epoch,
+                    effect_classification=effect_classification,
+                    evidence_paths=resolved_evidence_paths,
+                    execution_fence=execution_fence,
+                    foreground_owner_id=foreground_owner_id,
+                    foreground_owner_epoch=foreground_owner_epoch,
+                    require_execution_authority=require_execution_authority,
+                    max_run_workers=max_run_workers,
+                    execution_authority=execution_authority,
+                    event_type="node_claimed",
+                    event_payload={"owner_id": owner_id},
                 )
-                connection = self._connect()
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    instant = now or datetime.now(timezone.utc)
-                    if execution_fence is not None:
-                        self.assert_execution_fence(connection, execution_fence)
-                    elif require_execution_authority or foreground_owner_id is not None:
-                        execution = connection.execute(
-                            "SELECT execution_mode, foreground_owner_id, "
-                            "foreground_epoch, foreground_lease_expires_at, "
-                            "foreground_boot_id, foreground_heartbeat_monotonic, "
-                            "foreground_lease_seconds "
-                            "FROM runs WHERE run_id=?",
-                            (run_id,),
-                        ).fetchone()
-                        if execution is None:
-                            connection.rollback()
-                            return None
-                        if execution["execution_mode"] == "foreground":
-                            foreground_sample = self._foreground_sample(instant)
-                            if monotonic_now is not None:
-                                foreground_sample = LeaseClockSample(
-                                    foreground_sample.utc_now,
-                                    float(monotonic_now),
-                                    foreground_sample.boot_id,
-                                )
-                            foreground_lease = self._foreground_lease(execution)
-                            if (
-                                foreground_owner_id is None
-                                or execution["foreground_owner_id"]
-                                != foreground_owner_id
-                                or execution["foreground_epoch"]
-                                != foreground_owner_epoch
-                                or foreground_lease is None
-                                or not lease_is_fresh(
-                                    foreground_lease, foreground_sample
-                                )
-                            ):
-                                connection.rollback()
-                                return None
-                        else:
-                            connection.rollback()
-                            return None
-                    monotonic_instant = (
-                        float(monotonic_now)
-                        if monotonic_now is not None
-                        else time.monotonic()
-                    )
-                    expires = instant + timedelta(seconds=lease_seconds)
-                    attempt_id = self._insert_worker_claim_if_capacity(
-                        connection,
-                        run_id=run_id,
-                        node_id=node_id,
-                        owner_id=owner_id,
-                        lease_expires_at=expires,
-                        max_run_workers=max_run_workers,
-                    )
-                    if attempt_id is None:
-                        connection.rollback()
-                        return None
-                    resolved_evidence_paths = list(
-                        evidence_paths
-                        or (
-                            f"nodes/{node_id}/{attempt_id}/stdout.txt",
-                            f"nodes/{node_id}/{attempt_id}/stderr.txt",
-                        )
-                    )
-                    node["state"] = "claimed"
-                    node["claim"] = {
-                        "owner_id": owner_id,
-                        "attempt_id": attempt_id,
-                        "lease_expires_at": expires.isoformat(),
-                        "heartbeat_at": instant.isoformat(),
-                        "heartbeat_monotonic": monotonic_instant,
-                        "lease_seconds": float(lease_seconds),
-                        "owner_epoch": owner_epoch or owner_id,
-                        "executor_id": executor_id,
-                        "effect_classification": effect_classification,
-                        "execution_fence": (
-                            {
-                                "owner_id": execution_fence.owner_id,
-                                "owner_epoch": execution_fence.owner_epoch,
-                            }
-                            if execution_fence is not None
-                            else None
-                        ),
-                    }
-                    node["attempts"].append({
-                        "attempt_id": attempt_id,
-                        "state": "claimed",
-                        "claimed_at": instant.isoformat(),
-                        "owner_id": owner_id,
-                        "owner_epoch": owner_epoch or owner_id,
-                        "executor_id": executor_id,
-                        "effect_classification": effect_classification,
-                        "execution_fence": (
-                            {
-                                "owner_id": execution_fence.owner_id,
-                                "owner_epoch": execution_fence.owner_epoch,
-                            }
-                            if execution_fence is not None
-                            else None
-                        ),
-                        "evidence_paths": resolved_evidence_paths,
-                        **(
-                            {"execution_authority": dict(execution_authority)}
-                            if execution_authority is not None
-                            else {}
-                        ),
-                    })
-                    reserve = TerminalJournalReserve.for_projection(
-                        len(
-                            json.dumps(
-                                projection, sort_keys=True, ensure_ascii=False
-                            ).encode("utf-8")
-                        )
-                    )
-                    self._ensure_run_capacity(
-                        directory,
-                        projection,
-                        journal_reserve_bytes=(
-                            journal_reserve_bytes + reserve.terminal_reserve_bytes
-                        ),
-                    )
-                    connection.execute(
-                        "INSERT INTO attempt_journal_reserves ("
-                        "attempt_id, run_id, terminal_reserve_bytes, "
-                        "projection_limit_bytes, consumed_bytes, created_at) "
-                        "VALUES (?, ?, ?, ?, 0, ?)",
-                        (
-                            attempt_id,
-                            run_id,
-                            reserve.terminal_reserve_bytes
-                            + terminal_journal_reserve_bytes,
-                            reserve.projection_limit_bytes,
-                            _utc_now(),
-                        ),
-                    )
-                    self._append_locked(
-                        directory,
-                        projection,
-                        "node_claimed",
-                        {"owner_id": owner_id},
-                        node_id=node_id,
-                        attempt_id=attempt_id,
-                        reserve_connection=connection,
-                    )
-                    connection.commit()
-                    return NodeClaim(
-                        run_id,
-                        node_id,
-                        attempt_id,
-                        owner_id,
-                        expires,
-                        execution_fence,
-                    )
-                except BaseException:
-                    connection.rollback()
-                    raise
-                finally:
-                    connection.close()
 
     def _release_worker_claim(
         self,
