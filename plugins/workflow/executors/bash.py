@@ -48,12 +48,12 @@ class BashExecutor:
                     error_code="timeout",
                     error_message="bash node exceeded its timeout",
                 )
-        attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+        attempt = context.effective_attempt_directory
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
         variable_spill = attempt / ("variables-v3" if secure_v3 else "variables")
-        artifacts_dir = context.run_directory / "artifacts"
+        artifacts_dir = context.effective_publication_directory
         artifacts_dir.mkdir(exist_ok=True)
         command = str(context.node.value)
         try:

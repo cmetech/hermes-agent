@@ -185,11 +185,11 @@ class ScriptExecutor:
                 return NodeExecutionResult(
                     "failed", error_code="validation", error_message=str(exc)
                 )
-        attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+        attempt = context.effective_attempt_directory
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
-        artifacts_dir = context.run_directory / "artifacts"
+        artifacts_dir = context.effective_publication_directory
         artifacts_dir.mkdir(exist_ok=True)
         artifacts_before = _artifact_snapshot(artifacts_dir)
         if execution_plan is None:

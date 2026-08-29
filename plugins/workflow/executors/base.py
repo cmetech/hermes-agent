@@ -106,6 +106,18 @@ class NodeExecutionContext:
     provider_execute_release: Callable[[str], bool] | None = None
     record_loop_decision: (Callable[[Mapping[str, object]], None] | None) = None
     max_model_iterations: int = 90
+    attempt_directory: Path | None = None
+    publication_directory: Path | None = None
+
+    @property
+    def effective_attempt_directory(self) -> Path:
+        return self.attempt_directory or (
+            self.run_directory / "nodes" / self.node.id / self.attempt_id
+        )
+
+    @property
+    def effective_publication_directory(self) -> Path:
+        return self.publication_directory or self.run_directory / "artifacts"
 
 
 @dataclass(frozen=True)

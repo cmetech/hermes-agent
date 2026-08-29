@@ -514,13 +514,19 @@ class AgentNodeExecutor:
         extension = ".json" if is_structured else ".md"
         media_type = "application/json" if is_structured else "text/plain"
         try:
-            output_path = write_archon_output_exclusive(
-                context.run_directory,
-                node_id=node.id,
-                attempt_id=context.attempt_id,
-                filename=f"output{extension}",
-                data=data,
-            )
+            if context.attempt_directory is None:
+                output_path = write_archon_output_exclusive(
+                    context.run_directory,
+                    node_id=node.id,
+                    attempt_id=context.attempt_id,
+                    filename=f"output{extension}",
+                    data=data,
+                )
+            else:
+                attempt = context.effective_attempt_directory
+                attempt.mkdir(parents=True, exist_ok=False)
+                output_path = attempt / f"output{extension}"
+                output_path.write_bytes(data)
         except ArchonOutputIntegrityError:
             metadata["archon_terminal_failure"] = True
             metadata.pop("output", None)
@@ -2425,7 +2431,7 @@ class AgentNodeExecutor:
                 return self._failure("structured_output_invalid", exc.message)
             extension = ".json"
 
-        attempt = context.run_directory / "nodes" / node.id / context.attempt_id
+        attempt = context.effective_attempt_directory
         attempt.mkdir(parents=True, exist_ok=False)
         output_path = attempt / f"output{extension}"
         output_path.write_text(output, encoding="utf-8")
