@@ -54,7 +54,7 @@ class BashExecutor:
         stderr_path = attempt / "stderr.txt"
         variable_spill = attempt / ("variables-v3" if secure_v3 else "variables")
         artifacts_dir = context.effective_publication_directory
-        artifacts_dir.mkdir(exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
         command = str(context.node.value)
         try:
             if context.variable_context is not None:

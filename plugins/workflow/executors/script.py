@@ -190,7 +190,7 @@ class ScriptExecutor:
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
         artifacts_dir = context.effective_publication_directory
-        artifacts_dir.mkdir(exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
         artifacts_before = _artifact_snapshot(artifacts_dir)
         if execution_plan is None:
             try:

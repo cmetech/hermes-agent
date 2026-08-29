@@ -17,12 +17,12 @@ from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freez
 
 
 class FakeAgentRunner:
-    def __init__(self, response: str) -> None:
-        self.response = response
+    def __init__(self, *responses: str) -> None:
+        self.responses = list(responses)
 
     def run(self, request, **_kwargs) -> PluginAgentRunResult:
         return PluginAgentRunResult(
-            final_response=self.response,
+            final_response=self.responses.pop(0),
             session_id="session-1",
             provider=request.provider or "fake-provider",
             model=request.model or "fake-model",
@@ -65,7 +65,9 @@ def _scoped(context: NodeExecutionContext, name: str) -> NodeExecutionContext:
     return replace(
         context,
         attempt_directory=context.run_directory / "scoped" / name / "attempt",
-        publication_directory=context.run_directory / "scoped" / name / "artifacts",
+        publication_directory=(
+            context.run_directory / "publications" / name / "nested" / "artifacts"
+        ),
     )
 
 
@@ -190,5 +192,56 @@ def test_loop_executor_passes_scoped_attempt_to_child(tmp_path: Path) -> None:
     result = LoopExecutor(FakeAgentRunner("done <promise>DONE</promise>")).execute(execution)
 
     assert result.status == "succeeded"
-    assert (execution.effective_attempt_directory / "output.txt").read_text() == "done"
-    assert tmp_path / result.artifacts[0].relative_path == execution.effective_attempt_directory / "output.txt"
+    output = execution.effective_attempt_directory / "iteration-0001" / "output.txt"
+    assert output.read_text() == "done"
+    assert tmp_path / result.artifacts[0].relative_path == output
+
+
+def test_loop_executor_scopes_each_ordinary_iteration(tmp_path: Path) -> None:
+    execution = _scoped(
+        context(
+            tmp_path,
+            node_type="loop",
+            value={"prompt": "Work", "until": "DONE", "max_iterations": 2},
+        ),
+        "loop-multiple",
+    )
+
+    result = LoopExecutor(
+        FakeAgentRunner("first", "done <promise>DONE</promise>")
+    ).execute(execution)
+
+    assert result.status == "succeeded"
+    first = execution.effective_attempt_directory / "iteration-0001" / "output.txt"
+    second = execution.effective_attempt_directory / "iteration-0002" / "output.txt"
+    assert first.read_text() == "first"
+    assert second.read_text() == "done"
+    assert [tmp_path / artifact.relative_path for artifact in result.artifacts] == [
+        first,
+        second,
+    ]
+
+
+def test_loop_executor_scopes_until_bash_check(tmp_path: Path) -> None:
+    execution = _scoped(
+        context(
+            tmp_path,
+            node_type="loop",
+            value={
+                "prompt": "Work",
+                "until": "DONE",
+                "max_iterations": 2,
+                "until_bash": "false",
+            },
+        ),
+        "loop-check",
+    )
+
+    result = LoopExecutor(
+        FakeAgentRunner("first", "done <promise>DONE</promise>")
+    ).execute(execution)
+
+    assert result.status == "succeeded"
+    assert (
+        execution.effective_attempt_directory / "until-0001" / "stdout.txt"
+    ).read_text() == ""

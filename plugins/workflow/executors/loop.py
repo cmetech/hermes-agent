@@ -341,6 +341,17 @@ class LoopExecutor:
                     else {}
                 ),
                 node_state={},
+                attempt_directory=(
+                    context.effective_attempt_directory / f"iteration-{iteration:04d}"
+                    if context.attempt_directory is not None
+                    else None
+                ),
+                publication_directory=(
+                    context.effective_publication_directory
+                    / f"iteration-{iteration:04d}"
+                    if context.publication_directory is not None
+                    else None
+                ),
             )
             result = self._agent.execute(child_context)
             iteration_artifacts = list(result.artifacts)
@@ -502,6 +513,18 @@ class LoopExecutor:
                         output_resolver=loop_output_resolver,
                         predecessor_results={},
                         node_state={},
+                        attempt_directory=(
+                            context.effective_attempt_directory
+                            / f"until-{iteration:04d}"
+                            if context.attempt_directory is not None
+                            else None
+                        ),
+                        publication_directory=(
+                            context.effective_publication_directory
+                            / f"until-{iteration:04d}"
+                            if context.publication_directory is not None
+                            else None
+                        ),
                     )
                 )
                 if check.status == "succeeded":
