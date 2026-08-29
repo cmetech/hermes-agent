@@ -34,8 +34,13 @@ from hermes_cli.workflow_model_resolution import (
     WorkflowModelConfigSnapshot,
     resolve_workflow_model_reference,
 )
-from plugins.workflow.language import supports_phase5_semantics
-from plugins.workflow.models import WorkflowPackage, freeze_value
+from plugins.workflow.language import supports_phase5_semantics, supports_phase6_semantics
+from plugins.workflow.models import (
+    ValidationIssue,
+    WorkflowPackage,
+    WorkflowValidationError,
+    freeze_value,
+)
 from plugins.workflow.resources import effective_scoped_node_options
 from plugins.workflow.sanitize import public_display_identifier, sanitize_text
 from plugins.workflow.topology import iter_scoped_workflow_nodes
@@ -63,6 +68,52 @@ _SUPPORTED_HOOK_OPERATIONS_BY_EVENT = MappingProxyType({
         "additional_context",
     }),
 })
+
+
+def validate_v6_provider_capacity(package: WorkflowPackage) -> None:
+    """Reject sealed structural authority products before route resolution."""
+    if not supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
+        return
+    routes = 0
+    obligations = 0
+    for node in package.definition.nodes:
+        if node.node_type != "loop_group":
+            continue
+        loop_group = package.language.node_semantics.get(node.id, {}).get(
+            "loop_group"
+        )
+        capacity = (
+            loop_group.get("capacity")
+            if isinstance(loop_group, Mapping)
+            else None
+        )
+        if not isinstance(capacity, Mapping):
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=f"nodes[{node.source_index}].loop_group",
+                    code="loop_group_product_limit",
+                    message=f"loop_group {node.id} capacity bound is missing",
+                    source_line=node.source_line,
+                )
+            )
+        routes += int(capacity["provider_routes"])
+        obligations += int(capacity["provider_obligations"])
+        for label, product, ceiling in (
+            ("provider route", routes, _AUTHORITY_MAX_ROUTES),
+            ("provider obligation", obligations, _AUTHORITY_MAX_OBLIGATIONS),
+        ):
+            if product > ceiling:
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=f"nodes[{node.source_index}].loop_group",
+                        code="loop_group_product_limit",
+                        message=f"loop_group {node.id} {label} product "
+                        f"{product} exceeds ceiling {ceiling}",
+                        source_line=node.source_line,
+                    )
+                )
 
 
 def _hook_operations_supported(event: str, operations: object) -> bool:
@@ -898,6 +949,7 @@ def resolve_workflow_provider_authority(
             "normalizer_version",
             "provider authority requires normalizer v5",
         )
+    validate_v6_provider_capacity(package)
     if not isinstance(model_config, WorkflowModelConfigSnapshot):
         raise TypeError("model_config must be an immutable workflow config snapshot")
     if not isinstance(default_runtime, ExecutionRuntimeCapabilities):
@@ -1358,4 +1410,5 @@ __all__ = [
     "public_provider_capability_projection",
     "read_workflow_provider_authority_bytes",
     "resolve_workflow_provider_authority",
+    "validate_v6_provider_capacity",
 ]

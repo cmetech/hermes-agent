@@ -683,6 +683,201 @@ def _loop_group_work_bounds(
     )
 
 
+def _loop_group_capacity_bounds(
+    nodes: tuple[WorkflowNode, ...],
+    max_iterations: int,
+    *,
+    group_id: str,
+    root_options: Mapping[str, object],
+    group_options: Mapping[str, object],
+    structured_output_ids: frozenset[str],
+) -> Mapping[str, int]:
+    """Derive v6 admission products from existing sealed runtime ceilings."""
+    from plugins.workflow.executors.base import NodeExecutionContext
+    from plugins.workflow.models import RunExecutionLimits, TerminalJournalReserve
+
+    output_limit = int(
+        NodeExecutionContext.__dataclass_fields__["max_output_bytes"].default
+    )
+    artifact_limit = int(
+        NodeExecutionContext.__dataclass_fields__["max_artifact_bytes"].default
+    )
+    execution_limits = RunExecutionLimits()
+    journal_unit = TerminalJournalReserve.for_projection(
+        4096
+    ).terminal_reserve_bytes
+
+    provider_routes = 0
+    provider_obligations = 0
+    output_attempts = 0
+    artifact_executions = 0
+    process_executions = 0
+    for node in nodes:
+        multiplier = (
+            int(node.value.get("max_iterations", 1))
+            if node.node_type == "loop" and isinstance(node.value, Mapping)
+            else 1
+        )
+        retry = node.options.get("retry")
+        approval_rework = (
+            node.value.get("on_reject")
+            if node.node_type == "approval" and isinstance(node.value, Mapping)
+            else None
+        )
+        if isinstance(approval_rework, Mapping):
+            retries = int(approval_rework.get("max_attempts", 3))
+        elif isinstance(retry, Mapping):
+            retries = int(retry.get("max_attempts", 0))
+        else:
+            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        executions = _checked_work_product(max_iterations, multiplier)
+        attempts = _checked_work_product(executions, retries + 1)
+        if node.node_type in {"command", "prompt", "loop", "bash", "script"}:
+            output_attempts += attempts
+        if node.node_type in {"bash", "script"}:
+            artifact_executions += executions
+            process_executions += executions
+
+        is_approval_rework = isinstance(approval_rework, Mapping)
+        if node.node_type not in {"command", "prompt", "loop"} and not (
+            is_approval_rework
+        ):
+            continue
+        options = {
+            **root_options,
+            **group_options,
+            **node.options,
+        }
+        agents = options.get("agents")
+        inline_agents = (
+            tuple(
+                raw_agent
+                for raw_agent in agents.values()
+                if isinstance(raw_agent, Mapping)
+            )
+            if isinstance(agents, Mapping)
+            else ()
+        )
+        fallback = options.get("fallbackModel") is not None
+        execution_routes = 1 + int(fallback)
+        node_routes = execution_routes + len(inline_agents)
+        provider_routes += node_routes
+        provider_obligations += sum(
+            field in raw_agent
+            for raw_agent in inline_agents
+            for field in ("tools", "disallowedTools", "skills")
+        )
+        semantic_id = f"{group_id}/{node.id}"
+        if semantic_id in structured_output_ids or (
+            is_approval_rework
+            and any(field in options for field in ("output_format", "output_type"))
+        ):
+            provider_obligations += execution_routes
+        if root_options.get("persist_sessions") is True:
+            provider_obligations += execution_routes
+        if options.get("persist_session") is True:
+            provider_obligations += execution_routes
+        provider_obligations += execution_routes * sum(
+            field in options for field in ("allowed_tools", "denied_tools")
+        )
+        hooks = options.get("hooks")
+        if isinstance(hooks, Mapping):
+            provider_obligations += execution_routes * sum(
+                len(entries) if isinstance(entries, tuple | list) else 0
+                for entries in hooks.values()
+            )
+        provider_obligations += execution_routes * sum(
+            field in options for field in ("mcp", "skills", "agents")
+        )
+        provider_obligations += node_routes * sum(
+            field in options
+            for field in (
+                "modelReasoningEffort",
+                "effort",
+                "thinking",
+                "betas",
+                "service_tier",
+                "maxBudgetUsd",
+            )
+        )
+        if "webSearchMode" in root_options:
+            provider_obligations += node_routes
+        if "sandbox" in root_options:
+            provider_obligations += node_routes
+        if fallback:
+            provider_obligations += 1
+        if "sandbox" in node.options:
+            provider_obligations += node_routes
+
+    artifact_bytes = _checked_work_product(
+        artifact_executions, artifact_limit
+    )
+    child_attempts = _loop_group_work_bounds(nodes, max_iterations)[1]
+    journal_reserve_bytes = _checked_work_product(child_attempts, journal_unit)
+    run_bytes = (
+        _checked_work_product(output_attempts, output_limit)
+        + artifact_bytes
+        + journal_reserve_bytes
+    )
+    return {
+        "provider_routes": provider_routes,
+        "provider_obligations": provider_obligations,
+        "output_attempts": output_attempts,
+        "artifact_executions": artifact_executions,
+        "artifact_bytes": artifact_bytes,
+        "run_bytes": run_bytes,
+        "journal_reserve_bytes": journal_reserve_bytes,
+        "process_executions": process_executions,
+        "process_tree_rss_byte_executions": _checked_work_product(
+            process_executions, execution_limits.process_tree_rss_bytes
+        ),
+        "process_tree_cpu_second_executions": int(
+            process_executions * execution_limits.process_tree_cpu_seconds
+        ),
+        "process_descendant_executions": _checked_work_product(
+            process_executions, execution_limits.max_descendants
+        ),
+    }
+
+
+def validate_v6_storage_capacity(package: WorkflowPackage) -> None:
+    """Compare sealed v6 storage products after structural provider preflight."""
+    from inspect import signature
+
+    from plugins.workflow.store import RunStore
+
+    if not supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
+        return
+    run_ceiling = int(signature(RunStore).parameters["max_run_bytes"].default)
+    journal_ceiling = max(1, run_ceiling // 2)
+    run_bytes = 0
+    journal_reserve_bytes = 0
+    for node in package.definition.nodes:
+        if node.node_type != "loop_group":
+            continue
+        loop_group = package.language.node_semantics[node.id]["loop_group"]
+        capacity = loop_group["capacity"]
+        run_bytes += int(capacity["run_bytes"])
+        journal_reserve_bytes += int(capacity["journal_reserve_bytes"])
+        for label, product, ceiling in (
+            ("run-byte", run_bytes, run_ceiling),
+            (
+                "journal-reserve",
+                journal_reserve_bytes,
+                journal_ceiling,
+            ),
+        ):
+            if product > ceiling:
+                raise _loop_group_failure(
+                    f"nodes[{node.source_index}].loop_group",
+                    "loop_group_product_limit",
+                    f"loop_group {node.id} {label} product {product} "
+                    f"exceeds ceiling {ceiling}",
+                )
+
+
 def _normalize_loop_group(
     node: Mapping[str, Any],
     path: str,

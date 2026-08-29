@@ -1656,6 +1656,47 @@ def seal_workflow_compilation(
             )
         )
     uses = rewritten_uses
+    from plugins.workflow.language import supports_phase6_semantics
+
+    if supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
+        group_ids = tuple(sorted({
+            use.node_id.split("/", 1)[0]
+            for use in uses
+            if use.node_id is not None and "/" in use.node_id
+        }))
+        group_label = ",".join(group_ids) or "unknown"
+        compiled_bytes = sum(len(use.compiled_bytes) for use in uses)
+        if len(uses) > WORKFLOW_RESOURCE_MAX_FILES:
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource file product {len(uses)} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_FILES}",
+            )
+        oversized = next(
+            (
+                len(use.compiled_bytes)
+                for use in uses
+                if len(use.compiled_bytes) > WORKFLOW_RESOURCE_MAX_FILE_BYTES
+            ),
+            None,
+        )
+        if oversized is not None:
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource byte product {oversized} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_FILE_BYTES}",
+            )
+        if compiled_bytes > WORKFLOW_RESOURCE_MAX_TOTAL_BYTES:
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource byte product {compiled_bytes} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_TOTAL_BYTES}",
+            )
     bindings: list[WorkflowResourceBinding] = []
     sealed_files: dict[str, bytes] = {}
     for use in uses:

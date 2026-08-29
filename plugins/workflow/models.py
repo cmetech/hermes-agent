@@ -571,7 +571,7 @@ class WorkflowConnectorCapabilities:
         if (
             type(self.schema_version) is not int
             or self.schema_version != 1
-            or not services
+            or not (services or tools)
             or len(services) > 64
             or len(tools) > 512
             or any(

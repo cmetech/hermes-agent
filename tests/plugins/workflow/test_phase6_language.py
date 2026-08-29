@@ -18,7 +18,12 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowValidationError,
 )
-from plugins.workflow.schema import load_workflow, load_workflow_snapshot
+from plugins.workflow.schema import (
+    _compile_workflow_source_document,
+    load_workflow,
+    load_workflow_snapshot,
+    parse_workflow_source_bytes,
+)
 from plugins.workflow.topology import (
     iter_scoped_workflow_nodes,
     primary_terminal_node,
@@ -49,6 +54,18 @@ def _load_v6(path):
         sidecar_bytes=sidecar.read_bytes(),
         normalizer_version=6,
     )
+
+
+def _normalize_v6_without_admission(path):
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    return _compile_workflow_source_document(source, normalizer_version=6)
 
 
 def _group(body=None, **overrides):
@@ -436,7 +453,10 @@ def test_v6_accepts_exact_4096_child_attempt_product(tmp_path, workflow_writer):
     ]
     path = workflow_writer(tmp_path, nodes=[_group(body, max_iterations=64)])
 
-    assert _load_v6(path).definition.nodes[0].node_type == "loop_group"
+    assert (
+        _normalize_v6_without_admission(path).definition.nodes[0].node_type
+        == "loop_group"
+    )
 
 
 def _semantic_bound_group(group_index, child_count):
@@ -459,7 +479,11 @@ def test_v6_rejects_more_than_1024_scoped_semantic_entries(tmp_path, workflow_wr
         nodes=[_semantic_bound_group(index, 341) for index in range(3)],
     )
 
-    _assert_issue(path, "loop_group_product_limit", "nodes[2].loop_group")
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_without_admission(path)
+    issue = raised.value.issues[0]
+    assert issue.code == "loop_group_product_limit"
+    assert issue.path == "nodes[2].loop_group"
 
 
 def test_v6_snapshot_round_trips_at_1024_scoped_semantic_entries(
@@ -474,7 +498,7 @@ def test_v6_snapshot_round_trips_at_1024_scoped_semantic_entries(
         ],
     )
 
-    package = _load_v6(path)
+    package = _normalize_v6_without_admission(path)
     snapshot = make_language_snapshot(package, "a" * 64).to_dict()
 
     assert len(snapshot["node_semantics"]) == 1024

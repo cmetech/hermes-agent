@@ -932,7 +932,10 @@ def _normalize_v6(
     if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
         return normalized_definition, structured_outputs, node_semantics
 
-    from plugins.workflow.schema import _loop_group_work_bounds
+    from plugins.workflow.schema import (
+        _loop_group_capacity_bounds,
+        _loop_group_work_bounds,
+    )
     from plugins.workflow.topology import primary_terminal_node
 
     outputs = dict(structured_outputs)
@@ -1003,6 +1006,14 @@ def _normalize_v6(
         child_executions, child_attempts = _loop_group_work_bounds(
             normalized_body, int(group.value["max_iterations"])
         )
+        capacity = _loop_group_capacity_bounds(
+            normalized_body,
+            int(group.value["max_iterations"]),
+            group_id=group.id,
+            root_options=normalized_definition.options,
+            group_options=group.options,
+            structured_output_ids=frozenset(outputs),
+        )
         semantics[group.id] = freeze_value({
             "loop_group": {
                 "primary_sink": sink.id,
@@ -1010,6 +1021,7 @@ def _normalize_v6(
                 "signal_completes": signal_completes,
                 "child_executions": child_executions,
                 "child_attempts": child_attempts,
+                "capacity": capacity,
             }
         })
         if len(semantics) > MAX_SNAPSHOTTED_NODE_SEMANTICS:
@@ -1727,6 +1739,27 @@ def _read_node_semantics(
             _read_phase5_provider_portability(portability)
         loop_group = raw.get("loop_group")
         if loop_group is not None:
+            from plugins.workflow.executors.base import NodeExecutionContext
+            from plugins.workflow.models import (
+                RunExecutionLimits,
+                TerminalJournalReserve,
+            )
+
+            capacity = (
+                loop_group.get("capacity")
+                if isinstance(loop_group, Mapping)
+                else None
+            )
+            output_limit = int(
+                NodeExecutionContext.__dataclass_fields__["max_output_bytes"].default
+            )
+            artifact_limit = int(
+                NodeExecutionContext.__dataclass_fields__["max_artifact_bytes"].default
+            )
+            journal_unit = TerminalJournalReserve.for_projection(
+                4096
+            ).terminal_reserve_bytes
+            execution_limits = RunExecutionLimits()
             if (
                 set(raw) != {"loop_group"}
                 or not isinstance(loop_group, Mapping)
@@ -1737,6 +1770,7 @@ def _read_node_semantics(
                     "signal_completes",
                     "child_executions",
                     "child_attempts",
+                    "capacity",
                 }
                 or not isinstance(loop_group["primary_sink"], str)
                 or not loop_group["primary_sink"]
@@ -1749,6 +1783,51 @@ def _read_node_semantics(
                 or not isinstance(loop_group["child_attempts"], int)
                 or not 1 <= loop_group["child_attempts"] <= 4096
                 or loop_group["child_attempts"] < loop_group["child_executions"]
+                or not isinstance(capacity, Mapping)
+                or set(capacity)
+                != {
+                    "provider_routes",
+                    "provider_obligations",
+                    "output_attempts",
+                    "artifact_executions",
+                    "artifact_bytes",
+                    "run_bytes",
+                    "journal_reserve_bytes",
+                    "process_executions",
+                    "process_tree_rss_byte_executions",
+                    "process_tree_cpu_second_executions",
+                    "process_descendant_executions",
+                }
+                or any(
+                    isinstance(item, bool)
+                    or not isinstance(item, int)
+                    or item < 0
+                    for item in capacity.values()
+                )
+                or capacity["output_attempts"] > loop_group["child_attempts"]
+                or capacity["artifact_executions"]
+                > loop_group["child_executions"]
+                or capacity["process_executions"]
+                != capacity["artifact_executions"]
+                or capacity["artifact_bytes"]
+                != capacity["artifact_executions"] * artifact_limit
+                or capacity["journal_reserve_bytes"]
+                != loop_group["child_attempts"] * journal_unit
+                or capacity["run_bytes"]
+                != capacity["output_attempts"] * output_limit
+                + capacity["artifact_bytes"]
+                + capacity["journal_reserve_bytes"]
+                or capacity["process_tree_rss_byte_executions"]
+                != capacity["process_executions"]
+                * execution_limits.process_tree_rss_bytes
+                or capacity["process_tree_cpu_second_executions"]
+                != int(
+                    capacity["process_executions"]
+                    * execution_limits.process_tree_cpu_seconds
+                )
+                or capacity["process_descendant_executions"]
+                != capacity["process_executions"]
+                * execution_limits.max_descendants
                 or (
                     loop_group["signal_completes"] is False
                     and loop_group["effective_interactive"] is False

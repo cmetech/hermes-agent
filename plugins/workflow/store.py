@@ -41,6 +41,7 @@ from plugins.workflow.language import (
     supports_phase3_semantics,
     supports_phase4_semantics,
     supports_phase5_semantics,
+    supports_phase6_semantics,
 )
 from plugins.workflow.input_contract import (
     WorkflowInputContractError,
@@ -5776,7 +5777,24 @@ class RunStore:
             required_services = frozenset(
                 package.definition.options.get("requires", ())
             )
-            if phase5 and required_services:
+            required_tools = frozenset()
+            if phase5:
+                from plugins.workflow.compat import resolve_tool_name
+
+                required_tools = frozenset(
+                    resolve_tool_name(tool)
+                    for scoped in scoped_nodes
+                    for tool in scoped_options[scoped.semantic_id].get(
+                        "allowed_tools", ()
+                    )
+                )
+            phase6 = supports_phase6_semantics(
+                package.language.effective_profile,
+                package.language.normalizer_version,
+            )
+            if phase5 and (
+                required_services or (phase6 and required_tools)
+            ):
                 if connector_capabilities is None:
                     from hermes_cli.plugin_configuration import (
                         connector_capability_snapshot,
@@ -5789,15 +5807,6 @@ class RunStore:
                     )
                     available_tools = frozenset(
                         connector_capabilities.available_tools
-                    )
-                    from plugins.workflow.compat import resolve_tool_name
-
-                    required_tools = frozenset(
-                        resolve_tool_name(tool)
-                        for scoped in scoped_nodes
-                        for tool in scoped_options[scoped.semantic_id].get(
-                            "allowed_tools", ()
-                        )
                     )
                     if (
                         not required_services.issubset(ready_services)
