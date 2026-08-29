@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from plugins.workflow.models import (
     RunExecutionLimits,
     WorkflowConnectorCapabilities,
     WorkflowValidationError,
+    freeze_value,
 )
 from plugins.workflow.provider_authority import ProviderAuthorityEnvironment
 from plugins.workflow.runner_binding import (
@@ -34,7 +36,11 @@ from plugins.workflow.runner_binding import (
     execution_capability_context,
 )
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.resources import iter_output_field_references
+from plugins.workflow.schema import (
+    parse_workflow_source_bytes,
+    validate_v6_storage_capacity,
+)
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowPackageDigest
 
@@ -94,8 +100,16 @@ def _context():
 
 def _body_nodes(*, include_skills: bool = True):
     return [
-        {"id": "command", "command": "nested-command"},
-        {"id": "bash", "bash": "printf nested", "depends_on": ["command"]},
+        {
+            "id": "command",
+            "command": "nested-command",
+            "output_format": _OUTPUT_SCHEMA,
+        },
+        {
+            "id": "bash",
+            "bash": "printf '%s' '$command.output.status'",
+            "depends_on": ["command"],
+        },
         {
             "id": "script",
             "script": "nested-script",
@@ -261,11 +275,11 @@ def test_v6_seals_nested_admission_authority_resources_and_bounds(
         "child_attempts": 36,
         "capacity": {
             "provider_routes": 8,
-            "provider_obligations": 42,
-            "output_attempts": 27,
+            "provider_obligations": 44,
+            "output_attempts": 36,
             "artifact_executions": 6,
             "artifact_bytes": 100_663_296,
-            "run_bytes": 132_513_792,
+            "run_bytes": 141_950_976,
             "journal_reserve_bytes": 3_538_944,
             "process_executions": 6,
             "process_tree_rss_byte_executions": 12_884_901_888,
@@ -276,6 +290,27 @@ def test_v6_seals_nested_admission_authority_resources_and_bounds(
     assert compilation.package.language.structured_outputs["group"] == (
         compilation.package.language.structured_outputs["group/prompt"]
     )
+    command_output = compilation.package.language.structured_outputs[
+        "group/command"
+    ]
+    assert command_output.schema_fingerprint == (
+        compilation.package.language.structured_outputs[
+            "group/prompt"
+        ].schema_fingerprint
+    )
+    bash = compilation.package.definition.nodes[0].value["nodes"][1]
+    assert tuple(
+        iter_output_field_references(
+            bash.value,
+            normalizer_version=compilation.package.language.normalizer_version,
+        )
+    ) == (("command", ("status",)),)
+    language_snapshot = make_language_snapshot(
+        compilation.package, compilation.composite_digest
+    ).to_dict()
+    assert language_snapshot["structured_outputs"]["group/command"][
+        "schema_fingerprint"
+    ] == command_output.schema_fingerprint
     assert (
         compilation.package.language.structured_outputs["group"].schema_fingerprint
         == compilation.package.language.structured_outputs[
@@ -635,14 +670,20 @@ def test_v6_rejects_authenticated_resource_product_before_provider_resolution(
     tmp_path, workflow_writer, monkeypatch
 ):
     observed = []
-    from plugins.workflow import provider_authority
+    from plugins.workflow import dependency_manifest, provider_authority
 
+    read_resource = dependency_manifest._read_source_resource
     resolver = provider_authority.resolve_workflow_model_reference
+
+    def resource_probe(*args, **kwargs):
+        observed.append("resource")
+        return read_resource(*args, **kwargs)
 
     def provider_probe(*args, **kwargs):
         observed.append("provider")
         return resolver(*args, **kwargs)
 
+    monkeypatch.setattr(dependency_manifest, "_read_source_resource", resource_probe)
     monkeypatch.setattr(
         provider_authority, "resolve_workflow_model_reference", provider_probe
     )
@@ -663,6 +704,119 @@ def test_v6_rejects_authenticated_resource_product_before_provider_resolution(
         )
         _context().provider_authority(compilation.package)
     assert observed == []
+
+
+def test_v6_attempt_publication_product_rejects_before_resource_or_provider_work(
+    tmp_path, workflow_writer, monkeypatch
+):
+    observed = []
+    from plugins.workflow import dependency_manifest, provider_authority
+
+    read_resource = dependency_manifest._read_source_resource
+    resolve_provider = provider_authority.resolve_workflow_model_reference
+
+    def resource_probe(*args, **kwargs):
+        observed.append("resource")
+        return read_resource(*args, **kwargs)
+
+    def provider_probe(*args, **kwargs):
+        observed.append("provider")
+        return resolve_provider(*args, **kwargs)
+
+    monkeypatch.setattr(dependency_manifest, "_read_source_resource", resource_probe)
+    monkeypatch.setattr(
+        provider_authority, "resolve_workflow_model_reference", provider_probe
+    )
+
+    with pytest.raises(WorkflowValidationError, match="loop_group.*run-byte"):
+        _compile_v6(
+            tmp_path,
+            workflow_writer,
+            max_iterations=1,
+            body=[
+                {
+                    "id": f"approval{index}",
+                    "approval": {
+                        "message": "Continue?",
+                        "on_reject": {"prompt": "Revise", "max_attempts": 2},
+                    },
+                }
+                for index in range(180)
+            ],
+            include_skills=False,
+        )
+    assert observed == []
+
+
+def test_v6_retried_scripts_seal_artifact_and_process_attempt_products(
+    tmp_path, workflow_writer
+):
+    compilation = _compile_v6(
+        tmp_path,
+        workflow_writer,
+        max_iterations=1,
+        body=[
+            {
+                "id": f"script{index}",
+                "script": "nested-script",
+                "runtime": "uv",
+                "retry": {"max_attempts": 1},
+            }
+            for index in range(2)
+        ],
+        include_skills=False,
+    )
+
+    capacity = compilation.package.language.node_semantics["group"]["loop_group"][
+        "capacity"
+    ]
+    assert capacity["artifact_executions"] == 4
+    assert capacity["artifact_bytes"] == 67_108_864
+    assert capacity["process_executions"] == 4
+    assert capacity["process_tree_rss_byte_executions"] == 8_589_934_592
+    assert capacity["process_tree_cpu_second_executions"] == 3_600
+    assert capacity["process_descendant_executions"] == 128
+
+
+@pytest.mark.parametrize(
+    ("field", "product", "label"),
+    [
+        ("process_executions", 37, "process execution"),
+        (
+            "process_tree_rss_byte_executions",
+            12_884_901_889,
+            "process-tree RSS byte-execution",
+        ),
+        (
+            "process_tree_cpu_second_executions",
+            5_401,
+            "process-tree CPU second-execution",
+        ),
+        ("process_descendant_executions", 193, "process descendant-execution"),
+    ],
+)
+def test_v6_storage_validator_rejects_process_products_above_sealed_caps(
+    tmp_path, workflow_writer, field, product, label
+):
+    package = _compile_v6(tmp_path, workflow_writer).package
+    semantics = dict(package.language.node_semantics)
+    group_semantics = dict(semantics["group"])
+    loop_group = dict(group_semantics["loop_group"])
+    capacity = dict(loop_group["capacity"])
+    capacity[field] = product
+    loop_group["capacity"] = capacity
+    group_semantics["loop_group"] = loop_group
+    semantics["group"] = group_semantics
+    tampered = replace(
+        package,
+        language=replace(
+            package.language,
+            node_semantics=freeze_value(semantics),
+        ),
+    )
+
+    with pytest.raises(WorkflowValidationError, match=label):
+        validate_v6_storage_capacity(tampered)
 
 
 def test_v6_rejects_run_byte_product_before_resource_or_provider_work(

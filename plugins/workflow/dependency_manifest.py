@@ -40,7 +40,7 @@ from plugins.workflow.trust import (
     _validation_error,
     _walk_strings,
 )
-from plugins.workflow.topology import iter_scoped_workflow_nodes
+from plugins.workflow.topology import ScopedWorkflowNode, iter_scoped_workflow_nodes
 
 
 WORKFLOW_DEPENDENCY_MANIFEST_SCHEMA_VERSION = 1
@@ -1265,6 +1265,52 @@ def _rewrite_mcp_local_paths(value: object, paths: Mapping[str, str]) -> object:
     return value
 
 
+def _validate_v6_declared_resource_capacity(
+    package: WorkflowPackage,
+    sources: tuple[WorkflowSourceDocument, ...],
+    scoped_nodes: tuple[ScopedWorkflowNode, ...],
+) -> None:
+    """Reject the declared lower-bound file product before resource reads."""
+    product = sum(
+        1 + int(source.sidecar_bytes is not None)
+        for source in sources
+    )
+    group_ids: set[str] = set()
+    for scoped in scoped_nodes:
+        node = scoped.node
+        if node.node_type == "loop_group":
+            continue
+        if "/" in scoped.semantic_id:
+            group_ids.add(scoped.semantic_id.split("/", 1)[0])
+        if node.node_type == "command" or (
+            node.node_type == "loop"
+            and isinstance(node.value, Mapping)
+            and isinstance(node.value.get("command"), str)
+        ) or (
+            node.node_type == "script"
+            and isinstance(node.value, str)
+            and not is_inline_script(node.value)
+        ):
+            product += 1
+        options = effective_scoped_node_options(package.definition, scoped)
+        mcp = options.get("mcp")
+        product += (
+            1
+            if isinstance(mcp, str)
+            else len(mcp)
+            if isinstance(mcp, tuple | list)
+            else 0
+        )
+        if product > WORKFLOW_RESOURCE_MAX_FILES:
+            group_label = ",".join(sorted(group_ids)) or "unknown"
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource file product {product} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_FILES}",
+            )
+
+
 def _bind_definition_resources(
     definition_bytes: bytes,
     bindings: tuple[WorkflowResourceBinding, ...],
@@ -1342,6 +1388,18 @@ def seal_workflow_compilation(
     sources_by_key = {_source_package_key(source): source for source in sources}
     if len(sources_by_key) != len(sources):
         raise ValueError("workflow closure package keys must be unique")
+    scoped_nodes = tuple(
+        iter_scoped_workflow_nodes(package.definition)
+        if bind_executable_resources
+        else ()
+    )
+    from plugins.workflow.language import supports_phase6_semantics
+
+    phase6 = supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    )
+    if phase6:
+        _validate_v6_declared_resource_capacity(package, sources, scoped_nodes)
     budget = WorkflowResourceReadBudget(
         max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
         max_total_bytes=WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
@@ -1396,11 +1454,6 @@ def seal_workflow_compilation(
             )
         contents_by_package[package_key] = contents
 
-    scoped_nodes = tuple(
-        iter_scoped_workflow_nodes(package.definition)
-        if bind_executable_resources
-        else ()
-    )
     scoped_by_id = {scoped.semantic_id: scoped for scoped in scoped_nodes}
     for scoped in scoped_nodes:
         node = scoped.node
@@ -1656,11 +1709,7 @@ def seal_workflow_compilation(
             )
         )
     uses = rewritten_uses
-    from plugins.workflow.language import supports_phase6_semantics
-
-    if supports_phase6_semantics(
-        package.language.effective_profile, package.language.normalizer_version
-    ):
+    if phase6:
         group_ids = tuple(sorted({
             use.node_id.split("/", 1)[0]
             for use in uses

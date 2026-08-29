@@ -1806,7 +1806,7 @@ def _read_node_semantics(
                 )
                 or capacity["output_attempts"] > loop_group["child_attempts"]
                 or capacity["artifact_executions"]
-                > loop_group["child_executions"]
+                > loop_group["child_attempts"]
                 or capacity["process_executions"]
                 != capacity["artifact_executions"]
                 or capacity["artifact_bytes"]

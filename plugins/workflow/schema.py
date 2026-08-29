@@ -732,13 +732,19 @@ def _loop_group_capacity_bounds(
             retries = 2 if node.node_type in {"command", "prompt"} else 0
         executions = _checked_work_product(max_iterations, multiplier)
         attempts = _checked_work_product(executions, retries + 1)
-        if node.node_type in {"command", "prompt", "loop", "bash", "script"}:
+        is_approval_rework = isinstance(approval_rework, Mapping)
+        if node.node_type in {
+            "command",
+            "prompt",
+            "loop",
+            "bash",
+            "script",
+        } or is_approval_rework:
             output_attempts += attempts
         if node.node_type in {"bash", "script"}:
-            artifact_executions += executions
-            process_executions += executions
+            artifact_executions += attempts
+            process_executions += attempts
 
-        is_approval_rework = isinstance(approval_rework, Mapping)
         if node.node_type not in {"command", "prompt", "loop"} and not (
             is_approval_rework
         ):
@@ -844,6 +850,7 @@ def validate_v6_storage_capacity(package: WorkflowPackage) -> None:
     """Compare sealed v6 storage products after structural provider preflight."""
     from inspect import signature
 
+    from plugins.workflow.models import RunExecutionLimits
     from plugins.workflow.store import RunStore
 
     if not supports_phase6_semantics(
@@ -852,6 +859,7 @@ def validate_v6_storage_capacity(package: WorkflowPackage) -> None:
         return
     run_ceiling = int(signature(RunStore).parameters["max_run_bytes"].default)
     journal_ceiling = max(1, run_ceiling // 2)
+    execution_limits = RunExecutionLimits()
     run_bytes = 0
     journal_reserve_bytes = 0
     for node in package.definition.nodes:
@@ -867,6 +875,40 @@ def validate_v6_storage_capacity(package: WorkflowPackage) -> None:
                 "journal-reserve",
                 journal_reserve_bytes,
                 journal_ceiling,
+            ),
+        ):
+            if product > ceiling:
+                raise _loop_group_failure(
+                    f"nodes[{node.source_index}].loop_group",
+                    "loop_group_product_limit",
+                    f"loop_group {node.id} {label} product {product} "
+                    f"exceeds ceiling {ceiling}",
+                )
+        for label, product, ceiling in (
+            (
+                "process execution",
+                int(capacity["process_executions"]),
+                int(loop_group["child_attempts"]),
+            ),
+            (
+                "process-tree RSS byte-execution",
+                int(capacity["process_tree_rss_byte_executions"]),
+                int(capacity["process_executions"])
+                * execution_limits.process_tree_rss_bytes,
+            ),
+            (
+                "process-tree CPU second-execution",
+                int(capacity["process_tree_cpu_second_executions"]),
+                int(
+                    int(capacity["process_executions"])
+                    * execution_limits.process_tree_cpu_seconds
+                ),
+            ),
+            (
+                "process descendant-execution",
+                int(capacity["process_descendant_executions"]),
+                int(capacity["process_executions"])
+                * execution_limits.max_descendants,
             ),
         ):
             if product > ceiling:
