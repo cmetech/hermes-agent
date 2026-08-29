@@ -16329,9 +16329,9 @@ class RunStore:
         if not isinstance(spawn, Mapping):
             return "not_started"
         if spawn.get("state") in {"intent", "failed"}:
-            if (
-                spawn.get("state") == "intent"
-                and attempt.get("effect_classification") == "outward"
+            if spawn.get("state") == "intent" and (
+                attempt.get("effect_classification") == "outward"
+                or isinstance(attempt.get("loop_group_scope"), Mapping)
             ):
                 return "outcome_uncertain"
             return "not_started"

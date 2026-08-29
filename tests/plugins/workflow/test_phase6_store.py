@@ -573,6 +573,53 @@ def test_loop_group_failure_retains_live_child_until_cleanup_is_corroborated(
         ).fetchone()[0] == 0
 
 
+def test_loop_group_failure_retains_replay_safe_spawn_intent_without_identity(
+    tmp_path, workflow_writer
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        executor_id="bash",
+        effect_classification="replay_safe",
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    assert store.record_spawn_intent(
+        claim, executor_nonce="spawned-before-identity"
+    )
+    before_failure = store.load_run(run_id)
+
+    assert not store.fail_loop_group(
+        scope,
+        error_code="group_failed",
+        error_message="failed",
+        expected_state_version=before_failure["state_version"],
+    )
+    restarted = RunStore(home)
+    retained = restarted.load_run(run_id)
+    child = retained["nodes"]["group"]["loop_group"]["body"]["select"]
+    assert retained["status"] == "paused"
+    assert "claim" not in child
+    assert child["recovery"]["attempt_id"] == claim.attempt_id
+    assert child["recovery"]["observation"] == "outcome_uncertain"
+    assert child["recovery"]["termination_confirmed"] is False
+    spawn = child["attempts"][-1]["spawn"]
+    assert spawn["state"] == "intent"
+    assert spawn["executor_nonce"] == "spawned-before-identity"
+    assert spawn["effect_classification"] == "replay_safe"
+    assert isinstance(spawn["recorded_at"], str)
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+
+
 def test_loop_group_failure_finalizes_after_active_child_cleanup_is_recorded(
     tmp_path, workflow_writer
 ) -> None:
