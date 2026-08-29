@@ -981,7 +981,9 @@ export function useGatewayBoot({
         // round-trip must not hang "Starting Hermes…" forever. Initial boot
         // rides out a full backend cold spawn, so it gets the shared 45s
         // backend-boot budget, not the 20s reconnect budget.
+        const connectionStartedAt = Date.now()
         const connection = desktop.getConnection(windowProfileOverride() ?? undefined)
+        let extendedForCompletionAt: number | null = null
         let conn: HermesConnection
 
         while (true) {
@@ -990,8 +992,24 @@ export function useGatewayBoot({
 
             break
           } catch (error) {
-            if (!isTimeoutError(error) || !(await desktop.getBootstrapState()).active) {
+            if (!isTimeoutError(error)) {
               throw error
+            }
+
+            const bootstrap = await desktop.getBootstrapState()
+
+            const completedThisAttempt =
+              bootstrap.error === null &&
+              bootstrap.completedAt !== null &&
+              bootstrap.completedAt >= connectionStartedAt &&
+              bootstrap.completedAt !== extendedForCompletionAt
+
+            if (!bootstrap.active && !completedThisAttempt) {
+              throw error
+            }
+
+            if (completedThisAttempt) {
+              extendedForCompletionAt = bootstrap.completedAt
             }
           }
         }
