@@ -8,7 +8,12 @@ import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS, RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import {
+  BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  isTimeoutError,
+  RECONNECT_ATTEMPT_TIMEOUT_MS,
+  withTimeout
+} from '@/lib/with-timeout'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -976,11 +981,20 @@ export function useGatewayBoot({
         // round-trip must not hang "Starting Hermes…" forever. Initial boot
         // rides out a full backend cold spawn, so it gets the shared 45s
         // backend-boot budget, not the 20s reconnect budget.
-        const conn = await withTimeout(
-          desktop.getConnection(windowProfileOverride() ?? undefined),
-          BACKEND_BOOT_WAIT_TIMEOUT_MS,
-          'Timed out connecting to Hermes backend'
-        )
+        const connection = desktop.getConnection(windowProfileOverride() ?? undefined)
+        let conn: HermesConnection
+
+        while (true) {
+          try {
+            conn = await withTimeout(connection, BACKEND_BOOT_WAIT_TIMEOUT_MS, 'Timed out connecting to Hermes backend')
+
+            break
+          } catch (error) {
+            if (!isTimeoutError(error) || !(await desktop.getBootstrapState()).active) {
+              throw error
+            }
+          }
+        }
 
         if (cancelled) {
           return
