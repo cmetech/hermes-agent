@@ -275,10 +275,10 @@ describe('SkillsView toolset management', { timeout: 60_000 }, () => {
     const { notify } = await import('@/store/notifications')
     const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
 
-    render(<EmbeddedHubPicker installedNames={new Set(['web-research'])} profile={null} />)
+    const { container } = render(<EmbeddedHubPicker installedNames={new Set(['web-research'])} profile={null} />)
 
     // The picker is expanded by default — the hub iframe is live on mount.
-    expect(document.querySelector('iframe')).toBeTruthy()
+    expect(container.querySelector('iframe')).toBeTruthy()
 
     await act(async () => {
       window.dispatchEvent(
@@ -297,40 +297,23 @@ describe('SkillsView toolset management', { timeout: 60_000 }, () => {
     )
   })
 
-  it('mounts the hub iframe lazily and keeps it (hidden) across tab switches', async () => {
-    // On a non-Skills tab the docs-site iframe must not exist at all — an
-    // eagerly mounted hub is exactly the Capabilities lag bug.
-    await renderSkills() // ?tab=toolsets
-    await screen.findByRole('switch', { name: 'Turn Web Search toolset off' })
-    expect(document.querySelector('iframe')).toBeNull()
-    cleanup()
+  it('never mounts the Skills Hub in the desktop Capabilities surface', async () => {
+    getSkills.mockResolvedValue([
+      {
+        name: 'web-research',
+        description: 'Research the web',
+        category: 'research',
+        enabled: true,
+        usage: 3,
+        provenance: 'bundled'
+      }
+    ])
 
-    // Embedded mode drives tabs through local state (the route hooks are
-    // mocked here), starting on Skills: the picker mounts with the tab.
-    const { SkillsView } = await import('./index')
-    await act(async () => {
-      render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={['/skills']}>
-            <SkillsView embedded />
-          </MemoryRouter>
-        </QueryClientProvider>
-      )
-    })
+    const { container } = await renderSkills('/skills?tab=skills')
+    await screen.findAllByText('web-research')
 
-    const iframe = document.querySelector('iframe')
-    expect(iframe).toBeTruthy()
-    expect(iframe!.closest('section')!.classList.contains('hidden')).toBe(false)
-
-    // Switch to Tools → the iframe STAYS mounted (no docs-site reload on the
-    // next visit) but its section is fully hidden, so nothing from the hub
-    // can paint over the toolsets UI.
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Tools/ }))
-    })
-    const kept = document.querySelector('iframe')
-    expect(kept).toBeTruthy()
-    expect(kept!.closest('section')!.classList.contains('hidden')).toBe(true)
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(screen.queryByText('Skills Hub')).toBeNull()
   })
 
   it('shows a vision explainer that deep-links to Settings → Models', async () => {
