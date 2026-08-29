@@ -70,6 +70,7 @@ from plugins.workflow.provenance import (
     TriggerProvenance,
     legacy_projection_provenance,
 )
+from plugins.workflow.resources import effective_scoped_node_options
 from plugins.workflow.projection_limits import WORKFLOW_DEFINITION_MAX_NODES
 from plugins.workflow.output_resolution import (
     PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY,
@@ -97,6 +98,7 @@ from plugins.workflow.sanitize import (
     workflow_input_name_is_portable,
     workflow_input_names_are_portable,
 )
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 from plugins.workflow.sessions import (
     NodeSessionKey,
     PersistentSessionRecoverySelection,
@@ -5760,6 +5762,17 @@ class RunStore:
                 raise InputSnapshotError(
                     "provider authority is forbidden before normalizer v5"
                 )
+            scoped_nodes = tuple(
+                scoped
+                for scoped in iter_scoped_workflow_nodes(package.definition)
+                if scoped.node.node_type != "loop_group"
+            )
+            scoped_options = {
+                scoped.semantic_id: effective_scoped_node_options(
+                    package.definition, scoped
+                )
+                for scoped in scoped_nodes
+            }
             required_services = frozenset(
                 package.definition.options.get("requires", ())
             )
@@ -5781,8 +5794,10 @@ class RunStore:
 
                     required_tools = frozenset(
                         resolve_tool_name(tool)
-                        for node in package.definition.nodes
-                        for tool in node.options.get("allowed_tools", ())
+                        for scoped in scoped_nodes
+                        for tool in scoped_options[scoped.semantic_id].get(
+                            "allowed_tools", ()
+                        )
                     )
                     if (
                         not required_services.issubset(ready_services)
@@ -5869,8 +5884,10 @@ class RunStore:
                     target.write_bytes(read_package_file(source))
             node_skill_digests: dict[str, str] = {}
             node_agent_skill_digests: dict[str, str] = {}
-            for node in package.definition.nodes:
-                skills = tuple(node.options.get("skills", ()))
+            for scoped in scoped_nodes:
+                node_id = scoped.semantic_id
+                options = scoped_options[node_id]
+                skills = tuple(options.get("skills", ()))
                 if not skills:
                     continue
                 from agent.skill_commands import build_preloaded_skills_prompt
@@ -5880,16 +5897,19 @@ class RunStore:
                 )
                 if missing:
                     raise InputSnapshotError(
-                        f"workflow node {node.id} references missing skills: "
+                        f"workflow node {node_id} references missing skills: "
                         + ", ".join(missing)
                     )
-                target = staging / "node-skills" / f"{node.id}.md"
+                target = staging / "node-skills" / f"{node_id}.md"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(skill_text, encoding="utf-8")
-                node_skill_digests[node.id] = _sha256(skill_text.encode())
+                node_skill_digests[node_id] = _sha256(skill_text.encode())
 
-            for node in package.definition.nodes:
-                for agent_id, definition in node.options.get("agents", {}).items():
+            for scoped in scoped_nodes:
+                node_id = scoped.semantic_id
+                for agent_id, definition in scoped_options[node_id].get(
+                    "agents", {}
+                ).items():
                     skills = tuple(definition.get("skills", ()))
                     if not skills:
                         continue
@@ -5903,10 +5923,12 @@ class RunStore:
                             f"workflow inline agent {agent_id} references missing skills: "
                             + ", ".join(missing)
                         )
-                    target = staging / "node-agent-skills" / node.id / f"{agent_id}.md"
+                    target = (
+                        staging / "node-agent-skills" / node_id / f"{agent_id}.md"
+                    )
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(skill_text, encoding="utf-8")
-                    node_agent_skill_digests[f"{node.id}/{agent_id}"] = _sha256(
+                    node_agent_skill_digests[f"{node_id}/{agent_id}"] = _sha256(
                         skill_text.encode()
                     )
             input_manifest: dict[str, dict[str, object]] = {}

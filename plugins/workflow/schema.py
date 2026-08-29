@@ -79,6 +79,7 @@ from plugins.workflow.models import (
     freeze_value,
 )
 from plugins.workflow.resources import iter_output_field_references
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 
 TRIGGER_RULES = (
     "all_success",
@@ -639,6 +640,49 @@ def _loop_group_failure(
     return WorkflowValidationError(_issue(path, code, message, line=line))
 
 
+_LOOP_GROUP_WORK_LIMIT = 4096
+
+
+def _checked_work_product(left: int, right: int) -> int:
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (left, right)
+    ):
+        raise ValueError("loop-group work factors must be non-negative integers")
+    return left * right
+
+
+def _loop_group_work_bounds(
+    nodes: tuple[WorkflowNode, ...], max_iterations: int
+) -> tuple[int, int]:
+    executions = 0
+    attempts = 0
+    for node in nodes:
+        multiplier = (
+            node.value.get("max_iterations", 1)
+            if node.node_type == "loop" and isinstance(node.value, Mapping)
+            else 1
+        )
+        retry = node.options.get("retry")
+        approval_rework = (
+            node.value.get("on_reject")
+            if node.node_type == "approval" and isinstance(node.value, Mapping)
+            else None
+        )
+        if isinstance(approval_rework, Mapping):
+            retries = approval_rework.get("max_attempts", 3)
+        elif isinstance(retry, Mapping):
+            retries = retry.get("max_attempts", 0)
+        else:
+            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        executions += multiplier
+        attempts += multiplier * (int(retries) + 1)
+    return (
+        _checked_work_product(max_iterations, executions),
+        _checked_work_product(max_iterations, attempts),
+    )
+
+
 def _normalize_loop_group(
     node: Mapping[str, Any],
     path: str,
@@ -781,38 +825,16 @@ def _normalize_loop_group(
             "loop_group_product_limit",
             f"{group_path}.nodes exceeds the 4096-edge limit",
         )
-    child_executions = 0
-    child_attempts = 0
-    for child in normalized:
-        loop_multiplier = (
-            child.value.get("max_iterations", 1)
-            if child.node_type == "loop" and isinstance(child.value, Mapping)
-            else 1
-        )
-        retry = child.options.get("retry")
-        approval_rework = (
-            child.value.get("on_reject")
-            if child.node_type == "approval" and isinstance(child.value, Mapping)
-            else None
-        )
-        if isinstance(approval_rework, Mapping):
-            raw_retries = approval_rework.get("max_attempts", 3)
-        elif isinstance(retry, Mapping):
-            raw_retries = retry.get("max_attempts", 0)
-        else:
-            raw_retries = 2 if child.node_type in {"command", "prompt"} else 0
-        requested_retries = (
-            raw_retries
-            if isinstance(raw_retries, int) and not isinstance(raw_retries, bool)
-            else 0
-        )
-        child_executions += loop_multiplier
-        child_attempts += loop_multiplier * (requested_retries + 1)
-    if iterations * max(child_executions, child_attempts) > 4096:
+    child_executions, child_attempts = _loop_group_work_bounds(
+        tuple(normalized), iterations
+    )
+    if max(child_executions, child_attempts) > _LOOP_GROUP_WORK_LIMIT:
         raise _loop_group_failure(
             group_path,
             "loop_group_product_limit",
-            f"{group_path} worst-case child work exceeds the 4096 limit",
+            f"loop_group {node.get('id')} work bound "
+            f"{max(child_executions, child_attempts)} exceeds ceiling "
+            f"{_LOOP_GROUP_WORK_LIMIT}",
         )
     for child in normalized:
         if any(dependency not in by_id for dependency in child.depends_on):
@@ -1496,12 +1518,33 @@ _LOOP_PREV_REFERENCE = re.compile(
 def _validate_v6_loop_group_references(
     nodes: tuple[WorkflowNode, ...],
     structured_outputs: Mapping[str, object],
+    *,
+    command_bodies: Mapping[str, str] | None = None,
+    named_script_bodies: Mapping[str, str] | None = None,
 ) -> None:
     issues: list[ValidationIssue] = []
     for group in nodes:
         if group.node_type != "loop_group" or not isinstance(group.value, Mapping):
             continue
         body = tuple(group.value["nodes"])
+        scoped_commands = (
+            {
+                child.id: command_bodies[f"{group.id}/{child.id}"]
+                for child in body
+                if f"{group.id}/{child.id}" in command_bodies
+            }
+            if command_bodies is not None
+            else None
+        )
+        scoped_scripts = (
+            {
+                child.id: named_script_bodies[f"{group.id}/{child.id}"]
+                for child in body
+                if f"{group.id}/{child.id}" in named_script_bodies
+            }
+            if named_script_bodies is not None
+            else None
+        )
         body_ids = frozenset(child.id for child in body)
         group_path = f"nodes[{group.source_index}].loop_group.nodes"
         for child in body:
@@ -1509,7 +1552,8 @@ def _validate_v6_loop_group_references(
             logical_prefix = f"nodes[{child.source_index}]"
             for surface_path, template in _interpolated_node_templates(
                 child,
-                command_bodies=None,
+                command_bodies=scoped_commands,
+                named_script_bodies=scoped_scripts,
                 include_phase4_templates=True,
             ):
                 nested_path = child_prefix + surface_path.removeprefix(logical_prefix)
@@ -1850,24 +1894,35 @@ def validate_authenticated_resource_references(
         ):
             rewritten_commands = dict(validated.command_bodies)
             rewritten_scripts = dict(validated.named_script_bodies)
-            for node in package.definition.nodes:
-                command_body = rewritten_commands.get(node.id)
+            for scoped in iter_scoped_workflow_nodes(package.definition):
+                node = scoped.node
+                command_body = rewritten_commands.get(scoped.semantic_id)
                 if command_body is not None:
-                    rewritten_commands[node.id] = _rewrite_authenticated_resource_body(
-                        package,
-                        node,
-                        command_body,
-                        field=(
-                            "loop.command" if node.node_type == "loop" else "command"
-                        ),
+                    rewritten_commands[scoped.semantic_id] = (
+                        command_body
+                        if scoped.group_id is not None
+                        else _rewrite_authenticated_resource_body(
+                            package,
+                            node,
+                            command_body,
+                            field=(
+                                "loop.command"
+                                if node.node_type == "loop"
+                                else "command"
+                            ),
+                        )
                     )
-                script_body = rewritten_scripts.get(node.id)
+                script_body = rewritten_scripts.get(scoped.semantic_id)
                 if script_body is not None:
-                    rewritten_scripts[node.id] = _rewrite_authenticated_resource_body(
-                        package,
-                        node,
-                        script_body,
-                        field="script",
+                    rewritten_scripts[scoped.semantic_id] = (
+                        script_body
+                        if scoped.group_id is not None
+                        else _rewrite_authenticated_resource_body(
+                            package,
+                            node,
+                            script_body,
+                            field="script",
+                        )
                     )
             validated = ValidatedWorkflowResourceBodies(
                 rewritten_commands,
@@ -1887,6 +1942,16 @@ def validate_authenticated_resource_references(
             ),
             normalizer_version=package.language.normalizer_version,
         )
+        if supports_phase6_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            _validate_v6_loop_group_references(
+                package.definition.nodes,
+                package.language.structured_outputs,
+                command_bodies=validated.command_bodies,
+                named_script_bodies=validated.named_script_bodies,
+            )
         if supports_phase4_semantics(
             package.language.effective_profile,
             package.language.normalizer_version,

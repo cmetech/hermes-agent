@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
+import yaml
 
 import plugins.workflow.language as workflow_language
 from plugins.workflow.language import supports_phase6_semantics
@@ -26,6 +27,20 @@ from plugins.workflow.topology import (
 
 
 def _load_v6(path):
+    document = yaml.safe_load(path.read_bytes())
+    pending = list(document.get("nodes", ()))
+    commands = path.parent / "commands"
+    while pending:
+        node = pending.pop()
+        group = node.get("loop_group")
+        if isinstance(group, dict):
+            pending.extend(group.get("nodes", ()))
+        command = node.get("command")
+        if isinstance(command, str):
+            commands.mkdir(exist_ok=True)
+            (commands / f"{command}.md").write_text(
+                f"fixture command: {command}\n", encoding="utf-8"
+            )
     sidecar = path.with_name(f"{path.stem}.hermes.yaml")
     sidecar.write_text("language_compatibility: archon-2026-07\n", encoding="utf-8")
     return load_workflow_snapshot(
@@ -431,7 +446,7 @@ def _semantic_bound_group(group_index, child_count):
             "until": "done",
             "max_iterations": 1,
             "nodes": [
-                {"id": f"child{index}", "command": "run"}
+                {"id": f"child{index}", "prompt": "run"}
                 for index in range(child_count)
             ],
         },

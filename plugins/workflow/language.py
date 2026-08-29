@@ -454,12 +454,14 @@ def bind_v4_loop_command_semantics(
         if command_bindings:
             raise ValueError("loop command bindings require Phase 4 semantics")
         return package
+    from plugins.workflow.topology import iter_scoped_workflow_nodes
+
     command_nodes = {
-        node.id
-        for node in package.definition.nodes
-        if node.node_type == "loop"
-        and isinstance(node.value, Mapping)
-        and "command" in node.value
+        scoped.semantic_id
+        for scoped in iter_scoped_workflow_nodes(package.definition)
+        if scoped.node.node_type == "loop"
+        and isinstance(scoped.node.value, Mapping)
+        and "command" in scoped.node.value
     }
     if set(command_bindings) != command_nodes or any(
         not isinstance(binding, str) or not binding
@@ -930,6 +932,7 @@ def _normalize_v6(
     if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
         return normalized_definition, structured_outputs, node_semantics
 
+    from plugins.workflow.schema import _loop_group_work_bounds
     from plugins.workflow.topology import primary_terminal_node
 
     outputs = dict(structured_outputs)
@@ -997,11 +1000,16 @@ def _normalize_v6(
                 "loop_group_shape_invalid",
                 "signal_completes cannot be false without an effective interactive operator path",
             )
+        child_executions, child_attempts = _loop_group_work_bounds(
+            normalized_body, int(group.value["max_iterations"])
+        )
         semantics[group.id] = freeze_value({
             "loop_group": {
                 "primary_sink": sink.id,
                 "effective_interactive": effective_interactive,
                 "signal_completes": signal_completes,
+                "child_executions": child_executions,
+                "child_attempts": child_attempts,
             }
         })
         if len(semantics) > MAX_SNAPSHOTTED_NODE_SEMANTICS:
@@ -1727,11 +1735,20 @@ def _read_node_semantics(
                     "primary_sink",
                     "effective_interactive",
                     "signal_completes",
+                    "child_executions",
+                    "child_attempts",
                 }
                 or not isinstance(loop_group["primary_sink"], str)
                 or not loop_group["primary_sink"]
                 or not isinstance(loop_group["effective_interactive"], bool)
                 or not isinstance(loop_group["signal_completes"], bool)
+                or isinstance(loop_group["child_executions"], bool)
+                or not isinstance(loop_group["child_executions"], int)
+                or not 1 <= loop_group["child_executions"] <= 4096
+                or isinstance(loop_group["child_attempts"], bool)
+                or not isinstance(loop_group["child_attempts"], int)
+                or not 1 <= loop_group["child_attempts"] <= 4096
+                or loop_group["child_attempts"] < loop_group["child_executions"]
                 or (
                     loop_group["signal_completes"] is False
                     and loop_group["effective_interactive"] is False

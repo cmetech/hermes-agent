@@ -33,6 +33,7 @@ from plugins.workflow.language import (
     supports_phase5_semantics,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.topology import ScopedWorkflowNode
 from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     ResolvedOutputReference,
@@ -63,6 +64,19 @@ _SCALAR_VARIABLE = re.compile(
 _REFERENCE_NODE_CANDIDATE = re.compile(
     r"\$(?P<node>[A-Za-z_][A-Za-z0-9_-]*)"
 )
+
+
+def effective_scoped_node_options(
+    definition, scoped: ScopedWorkflowNode
+) -> Mapping[str, object]:
+    """Return v6 body authority without changing pre-v6 outer-node behavior."""
+    if scoped.group_id is None:
+        return scoped.node.options
+    return MappingProxyType({
+        **definition.options,
+        **dict(scoped.group_options or {}),
+        **scoped.node.options,
+    })
 
 
 def read_snapshot_provider_authority(
