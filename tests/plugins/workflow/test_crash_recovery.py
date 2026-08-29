@@ -31,6 +31,14 @@ from plugins.workflow.store import (
     TypedPublicationCandidate,
 )
 from plugins.workflow.trust import WorkflowPackageDigest
+from tests.plugins.workflow.test_phase6_store import (
+    _EXECUTION_AUTHORITY,
+    _admit_group,
+    _complete,
+    _initialize,
+    _output,
+    _scope,
+)
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -62,6 +70,137 @@ def _run(store, package, *, idempotency_key="crash"):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def test_loop_group_child_state_and_claim_reconcile_across_each_crash_cut(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    select_scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        select_scope,
+        "child-owner",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+
+    store = RunStore(home)
+    assert store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"][
+        "select"
+    ]["claim"]["attempt_id"] == claim.attempt_id
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT node_id FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == select_scope.worker_node_id
+
+    process = ProcessIdentity.capture(os.getpid())
+    assert store.record_process_started(claim, process)
+    store = RunStore(home)
+    attempt = store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"][
+        "select"
+    ]["attempts"][-1]
+    assert attempt["process_identity"]["pid"] == process.pid
+
+    _output(store, select_scope, claim.attempt_id, b"file-alone-is-not-success")
+    store = RunStore(home)
+    child = store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"][
+        "select"
+    ]
+    assert child["state"] == "claimed"
+    assert "output" not in child
+
+    _complete(store, select_scope, claim, b"selected")
+    store = RunStore(home)
+    body = store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"]
+    assert body["select"]["state"] == "succeeded"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
+
+    ready = store.load_run(run_id)
+    record_scope = _scope(run_id, "record")
+    record_claim = store.claim_loop_group_child(
+        record_scope,
+        "record-owner",
+        expected_state_version=ready["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert record_claim is not None
+    _complete(store, record_scope, record_claim, b"recorded")
+    before_commit = store.load_run(run_id)
+    assert store.record_loop_group_iteration(
+        record_scope,
+        expected_state_version=before_commit["state_version"],
+    )
+
+    restarted = RunStore(home)
+    controller = restarted.load_run(run_id)["nodes"]["group"]["loop_group"]
+    assert controller["iteration"] == 2
+    assert set(controller["previous_outputs"]) == {"select", "record"}
+    assert controller["body"]["select"]["state"] == "ready"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["attempt", "output", "generation", "iteration", "worker_key", "process"],
+)
+def test_loop_group_nested_corruption_fails_initialization(
+    tmp_path,
+    workflow_writer,
+    mutation,
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "child-owner",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    assert store.record_process_started(claim, ProcessIdentity.capture(os.getpid()))
+    _complete(store, scope, claim, b"selected")
+    path = store.run_directory(run_id) / "run.json"
+    projection = json.loads(path.read_text())
+    controller = projection["nodes"]["group"]["loop_group"]
+    child = controller["body"]["select"]
+    attempt = child["attempts"][-1]
+    if mutation == "attempt":
+        attempt["attempt_id"] = "tampered-attempt"
+    elif mutation == "output":
+        child["output"]["sha256"] = "0" * 64
+    elif mutation == "generation":
+        controller["controller_generation"] = 2
+    elif mutation == "iteration":
+        controller["iteration"] = 2
+    elif mutation == "worker_key":
+        attempt["loop_group_scope"]["worker_node_id"] = "tampered-worker"
+    else:
+        attempt["process_identity"]["pid"] += 1
+    path.write_text(json.dumps(projection), encoding="utf-8")
+
+    restarted = RunStore(home)
+    assert restarted._active_run_repair_reasons(run_id) == (
+        "run_evidence_uncorroborated",
+    )
+
+    recovered = restarted.load_run(run_id)
+    recovered_controller = recovered["nodes"]["group"]["loop_group"]
+    recovered_child = recovered_controller["body"]["select"]
+    recovered_attempt = recovered_child["attempts"][-1]
+    assert recovered_controller["controller_generation"] == 1
+    assert recovered_controller["iteration"] == 1
+    assert recovered_attempt["attempt_id"] == claim.attempt_id
+    assert recovered_attempt["loop_group_scope"] == scope.durable_record()
+    assert recovered_attempt["process_identity"]["pid"] == os.getpid()
+    assert recovered_child["output"]["sha256"] != "0" * 64
 
 
 def test_restart_never_reconstructs_shared_identity_from_failed_attempt(

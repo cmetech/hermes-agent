@@ -148,6 +148,38 @@ class LoopGroupChildScope:
             f"{self.iteration:04d}/{self.node_id}"
         )
 
+    def durable_record(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "group_id": self.group_id,
+            "controller_generation": self.controller_generation,
+            "iteration": self.iteration,
+            "node_id": self.node_id,
+            "worker_node_id": self.worker_node_id,
+        }
+
+    @classmethod
+    def from_durable_record(cls, value: object) -> "LoopGroupChildScope":
+        if not isinstance(value, Mapping) or set(value) != {
+            "run_id",
+            "group_id",
+            "controller_generation",
+            "iteration",
+            "node_id",
+            "worker_node_id",
+        }:
+            raise ValueError("loop group child scope is malformed")
+        scope = cls(
+            run_id=value["run_id"],
+            group_id=value["group_id"],
+            controller_generation=value["controller_generation"],
+            iteration=value["iteration"],
+            node_id=value["node_id"],
+        )
+        if value["worker_node_id"] != scope.worker_node_id:
+            raise ValueError("loop group child worker identity changed")
+        return scope
+
 
 @dataclass(frozen=True, slots=True)
 class ValidatedWorkflowResourceBodies:
