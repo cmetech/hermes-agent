@@ -208,12 +208,40 @@ upstream_changes:
   merge_guidance: >-
     UNION on merge. Keep upstream's bounded initial getConnection() wait, but
     renew that same promise's 45-second renderer deadline while Electron reports
-    an active first-launch or release-update bootstrap. Never issue another
-    getConnection() to extend the wait: it could duplicate backend startup.
-    Once bootstrap is inactive, a genuinely wedged connection must still fail
-    on the normal deadline.
+    an active first-launch or release-update bootstrap. When bootstrap completes
+    successfully after the connection attempt began, grant one post-bootstrap
+    deadline even if active already flipped false; never grant twice for the
+    same completedAt timestamp. Never issue another getConnection() to extend
+    the wait: it could duplicate backend startup. A genuinely wedged connection
+    must still fail after the bounded completion grace.
   removal_condition: >-
-    Remove when upstream excludes active bootstrap time from its initial
-    renderer connection deadline without weakening the non-bootstrap hang bound,
-    and the focused useGatewayBoot regression passes unchanged.
+    Remove when upstream excludes active and just-completed bootstrap handoff
+    time from its initial renderer connection deadline without weakening the
+    non-bootstrap hang bound, and the focused useGatewayBoot regressions pass
+    unchanged.
+  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+
+- id: desktop-skills-hub-suppression
+  change_class: desktop-product-curation
+  owner: downstream-desktop-runtime
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/skills/index.tsx
+  - apps/desktop/src/app/skills/index.test.tsx
+  owned_symbols:
+  - SkillsView
+  tests:
+  - apps/desktop/src/app/skills/index.test.tsx
+  expected_commit_subject: 'fix(desktop): hide Skills Hub in fork UI'
+  upstream_candidate: false
+  merge_guidance: >-
+    RETAIN DOWNSTREAM BEHAVIOR on merge. SkillsView must expose installed skills,
+    toolsets, and MCP configuration without mounting the Skills Hub picker,
+    iframe, search, or discovery UI. This applies to the primary Capabilities
+    page and every embedded SkillsView consumer, including Bot configuration.
+    Preserve unrelated upstream skill management and detail improvements.
+  removal_condition: >-
+    Remove only if this fork deliberately re-enables Skills Hub in Desktop or
+    upstream provides a generic Desktop product-curation gate that keeps the Hub
+    disabled for every SkillsView consumer by default in this fork.
   last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5

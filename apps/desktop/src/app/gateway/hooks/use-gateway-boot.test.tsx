@@ -1,7 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DesktopConnectionsRegistry } from '@/global'
+import type { DesktopBootstrapState, DesktopConnectionsRegistry } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $desktopBoot } from '@/store/boot'
 import {
@@ -209,7 +209,7 @@ function fakeDesktop() {
       running: true as boolean,
       timestamp: Date.now()
     })),
-    getBootstrapState: vi.fn(async () => ({
+    getBootstrapState: vi.fn(async (): Promise<DesktopBootstrapState> => ({
       active: false,
       completedAt: null,
       error: null,
@@ -1276,6 +1276,53 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
 
     bootstrapActive = false
+    await act(async () => {
+      resolveConnection(primaryConn)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+  })
+
+  it('keeps waiting through the install-complete backend handoff without flashing a timeout', async () => {
+    let resolveConnection: (connection: typeof primaryConn) => void = () => undefined
+    let completedAt: number | null = null
+    const startedAt = Date.now() + 1
+    const desktop = fakeDesktop()
+
+    desktop.getConnection = vi.fn(
+      () =>
+        new Promise(resolve => {
+          resolveConnection = resolve
+        })
+    )
+    desktop.getBootstrapState = vi.fn(async () => ({
+      active: false,
+      completedAt,
+      error: null,
+      log: [],
+      manifest: null,
+      setupChoice: null,
+      stages: {},
+      startedAt,
+      unsupportedPlatform: null
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    // The installer finishes just before the renderer's 45-second deadline,
+    // while Electron is still handing off to the newly installed backend.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(44_000)
+      completedAt = Date.now()
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+
+    expect($desktopBoot.get().error).toBeNull()
+
     await act(async () => {
       resolveConnection(primaryConn)
       await vi.advanceTimersByTimeAsync(0)
