@@ -1092,6 +1092,7 @@ def _widget_for(scope: str, yaml_name: str, shape: str) -> str:
         "nullable_hook_specific",
         "agents",
         "loop_payload",
+        "loop_group_payload",
         "approval_payload",
         "approval_reject",
     }:
@@ -1363,6 +1364,11 @@ def _example_for(yaml_name: str, shape: str) -> object:
             "until": "done",
             "max_iterations": 3,
         },
+        "loop_group_payload": {
+            "nodes": [{"id": "work", "command": "run-work"}],
+            "until": "done",
+            "max_iterations": 3,
+        },
         "approval_payload": {"message": "Continue?"},
         "approval_reject": {"prompt": "Try again."},
     }
@@ -1495,7 +1501,7 @@ _NODE_FIELDS = (
         _field(
             "node",
             node_type,
-            "object" if node_type in {"loop", "approval"} else "string",
+            "object" if node_type in {"loop", "loop_group", "approval"} else "string",
             f"{node_type}_payload",
             node_types=(node_type,),
             required_node_types=(node_type,),
@@ -1943,6 +1949,13 @@ FIELD_INVENTORY = (
 STRUCTURAL_REQUIREMENTS = (
     StructuralRequirement(
         scope="loop",
+        when_field="interactive",
+        equals=True,
+        required_field="gate_message",
+        required_shape="json_truthy",
+    ),
+    StructuralRequirement(
+        scope="loop_group",
         when_field="interactive",
         equals=True,
         required_field="gate_message",

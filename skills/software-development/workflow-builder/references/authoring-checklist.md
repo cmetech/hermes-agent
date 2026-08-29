@@ -76,6 +76,10 @@ Before writing files:
   1..512 nodes, at most 4,096 edges, and `max_iterations` 1..100. Require
   nonblank `until`; use the first terminal body node in definition order as the
   primary sink. Do not add `returns`.
+- Keep the worst-case group work product at or below 4,096: multiply
+  `max_iterations` by the larger of total body executions and total body
+  attempts, including initial attempts, retries, approval rework, and ordinary
+  loop iteration multipliers.
 - Keep body dependencies among siblings. Current `$body.output` requires that
   sibling dependency; `$outer.output` requires a direct dependency of the
   group; `$LOOP_PREV.body.output` addresses only the previous iteration. Field

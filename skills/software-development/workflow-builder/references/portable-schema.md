@@ -199,6 +199,11 @@ and the graph is acyclic. The first terminal body node in definition order is
 the primary sink and supplies the outer group output; there is no `returns`
 selector.
 
+The sealed worst-case work product must also be at most 4,096. Multiply
+`max_iterations` by the larger of total body executions and total body
+attempts. Attempts include the initial attempt plus admitted retries, approval
+rework attempts, and bounded ordinary-loop iteration multipliers.
+
 Body nodes may be `prompt`, `command`, `bash`, `script`, `approval`, `cancel`,
 or an ordinary `loop`. Reject body `include`, nested `loop_group`, runtime
 `workflow`, and group-level `retry`. Group provider/model options are body

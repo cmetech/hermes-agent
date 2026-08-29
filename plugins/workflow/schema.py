@@ -790,11 +790,17 @@ def _normalize_loop_group(
             else 1
         )
         retry = child.options.get("retry")
-        raw_retries = (
-            retry.get("max_attempts", 0)
-            if isinstance(retry, Mapping)
-            else (2 if child.node_type in {"command", "prompt"} else 0)
+        approval_rework = (
+            child.value.get("on_reject")
+            if child.node_type == "approval" and isinstance(child.value, Mapping)
+            else None
         )
+        if isinstance(approval_rework, Mapping):
+            raw_retries = approval_rework.get("max_attempts", 3)
+        elif isinstance(retry, Mapping):
+            raw_retries = retry.get("max_attempts", 0)
+        else:
+            raw_retries = 2 if child.node_type in {"command", "prompt"} else 0
         requested_retries = (
             raw_retries
             if isinstance(raw_retries, int) and not isinstance(raw_retries, bool)
@@ -1619,6 +1625,13 @@ def _interpolated_node_templates(
         )
         if include_phase4_templates and isinstance(command_body, str):
             yield f"{prefix}.loop.command", command_body
+    elif node.node_type == "loop_group" and isinstance(node.value, Mapping):
+        until_bash = node.value.get("until_bash")
+        if isinstance(until_bash, str):
+            yield f"{prefix}.loop_group.until_bash", until_bash
+        gate_message = node.value.get("gate_message")
+        if include_phase4_templates and isinstance(gate_message, str):
+            yield f"{prefix}.loop_group.gate_message", gate_message
     elif node.node_type == "approval" and isinstance(node.value, Mapping):
         message = node.value.get("message")
         if isinstance(message, str):

@@ -42,6 +42,7 @@ LATEST_NORMALIZER_VERSION = max(CURRENT_NORMALIZER_BY_PROFILE.values())
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
+MAX_SNAPSHOTTED_NODE_SEMANTICS = 1024
 # The normalized type-tag document expands the already bounded workflow and
 # structured schemas. This conservative ceiling keeps semantic hashing bounded
 # without constraining any admitted 2 MiB workflow or its 32 schema snapshots.
@@ -1003,6 +1004,13 @@ def _normalize_v6(
                 "signal_completes": signal_completes,
             }
         })
+        if len(semantics) > MAX_SNAPSHOTTED_NODE_SEMANTICS:
+            raise WorkflowSemanticNormalizationError(
+                group.source_index,
+                "loop_group",
+                "loop_group_product_limit",
+                "workflow exceeds the 1024 scoped-semantic entry limit",
+            )
         normalized_nodes.append(
             replace(
                 group,
@@ -1654,7 +1662,7 @@ def _read_node_semantics(
     profile: WorkflowLanguageProfile,
     normalizer_version: int,
 ) -> Mapping[str, Mapping[str, object]]:
-    if not isinstance(value, Mapping) or len(value) > 1024:
+    if not isinstance(value, Mapping) or len(value) > MAX_SNAPSHOTTED_NODE_SEMANTICS:
         raise WorkflowLanguageCompatibilityError(
             "workflow_language_snapshot_invalid",
             "workflow language snapshot node semantics are invalid",

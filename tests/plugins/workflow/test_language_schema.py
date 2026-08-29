@@ -81,6 +81,57 @@ def test_explicit_v6_contract_derives_bounded_loop_group_surface():
             "node_kinds"
         ]
     }
+    group_kind = kinds["loop_group"]
+    payload = next(
+        item
+        for item in group_kind["fields"]
+        if item["field_path"] == "nodes[].loop_group"
+    )
+    definition = _descriptor_definition(contract, payload)
+    assert node_schema["properties"]["loop_group"]["type"] == "object"
+    assert definition["widget"] == "object"
+    assert definition["examples"] == [
+        {
+            "nodes": [{"id": "work", "command": "run-work"}],
+            "until": "done",
+            "max_iterations": 3,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("group_options", "expected"),
+    [
+        pytest.param(
+            {"interactive": True, "gate_message": "Continue?"},
+            True,
+            id="interactive-with-gate",
+        ),
+        pytest.param(
+            {"interactive": True},
+            False,
+            id="interactive-requires-gate",
+        ),
+    ],
+)
+def test_explicit_v6_group_interactivity_has_schema_loader_parity(
+    group_options, expected
+):
+    document = _workflow({
+        "id": "group",
+        "loop_group": {
+            "nodes": [{"id": "child", "command": "run"}],
+            "until": "done",
+            "max_iterations": 1,
+            **group_options,
+        },
+    })
+
+    assert _structural_outcomes(
+        document,
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    ) == (expected, expected)
 
 
 def test_phase4_loop_inventory_remains_explicitly_readable_without_changing_v1_v3_schemas():

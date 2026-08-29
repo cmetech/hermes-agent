@@ -392,6 +392,125 @@ def test_v6_rejects_worst_case_child_attempt_product(tmp_path, workflow_writer):
     )
 
 
+def test_v6_counts_approval_rework_in_child_attempt_product(tmp_path, workflow_writer):
+    body = [
+        {
+            "id": f"approve{index}",
+            "approval": {
+                "message": "Continue?",
+                "on_reject": {"prompt": "Revise", "max_attempts": 10},
+            },
+        }
+        for index in range(5)
+    ]
+    path = workflow_writer(tmp_path, nodes=[_group(body, max_iterations=100)])
+
+    _assert_issue(path, "loop_group_product_limit", "nodes[0].loop_group")
+
+
+def test_v6_accepts_exact_4096_child_attempt_product(tmp_path, workflow_writer):
+    body = [
+        {
+            "id": f"approve{index}",
+            "approval": {
+                "message": "Continue?",
+                "on_reject": {"prompt": "Revise", "max_attempts": 7},
+            },
+        }
+        for index in range(8)
+    ]
+    path = workflow_writer(tmp_path, nodes=[_group(body, max_iterations=64)])
+
+    assert _load_v6(path).definition.nodes[0].node_type == "loop_group"
+
+
+def _semantic_bound_group(group_index, child_count):
+    return {
+        "id": f"group{group_index}",
+        "loop_group": {
+            "until": "done",
+            "max_iterations": 1,
+            "nodes": [
+                {"id": f"child{index}", "command": "run"}
+                for index in range(child_count)
+            ],
+        },
+    }
+
+
+def test_v6_rejects_more_than_1024_scoped_semantic_entries(tmp_path, workflow_writer):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_semantic_bound_group(index, 341) for index in range(3)],
+    )
+
+    _assert_issue(path, "loop_group_product_limit", "nodes[2].loop_group")
+
+
+def test_v6_snapshot_round_trips_at_1024_scoped_semantic_entries(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _semantic_bound_group(0, 340),
+            _semantic_bound_group(1, 340),
+            _semantic_bound_group(2, 341),
+        ],
+    )
+
+    package = _load_v6(path)
+    snapshot = make_language_snapshot(package, "a" * 64).to_dict()
+
+    assert len(snapshot["node_semantics"]) == 1024
+    assert read_language_snapshot(snapshot).to_dict() == snapshot
+
+
+@pytest.mark.parametrize(
+    ("field", "template", "depends_on", "code"),
+    [
+        (
+            "until_bash",
+            "test -n '$missing.output'",
+            (),
+            "output_reference_not_declared_dependency",
+        ),
+        (
+            "gate_message",
+            "Review $outer.output",
+            (),
+            "output_reference_not_declared_dependency",
+        ),
+        (
+            "gate_message",
+            "Review $outer.output.missing",
+            ("outer",),
+            "structured_output_field_impossible",
+        ),
+    ],
+)
+def test_v6_validates_group_control_template_references(
+    tmp_path, workflow_writer, field, template, depends_on, code
+):
+    outer_schema = {
+        "type": "object",
+        "properties": {"status": {"type": "string"}},
+        "required": ["status"],
+        "additionalProperties": False,
+    }
+    group = _group(**{field: template})
+    group["depends_on"] = list(depends_on)
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {"id": "outer", "prompt": "prepare", "output_format": outer_schema},
+            group,
+        ],
+    )
+
+    _assert_issue(path, code, f"nodes[1].loop_group.{field}")
+
+
 @pytest.mark.parametrize(
     ("prompt", "depends_on", "expected_path"),
     [
