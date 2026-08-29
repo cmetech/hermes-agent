@@ -209,6 +209,17 @@ function fakeDesktop() {
       running: true as boolean,
       timestamp: Date.now()
     })),
+    getBootstrapState: vi.fn(async () => ({
+      active: false,
+      completedAt: null,
+      error: null,
+      log: [],
+      manifest: null,
+      setupChoice: null,
+      stages: {},
+      startedAt: null,
+      unsupportedPlatform: null
+    })),
     onBootProgress: vi.fn(callback => {
       bootProgressHandler = callback
 
@@ -1228,6 +1239,50 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     })
 
     expect($desktopBoot.get().error).toBeTruthy()
+  })
+
+  it('does not spend the initial connection deadline while first-launch bootstrap is active', async () => {
+    let resolveConnection: (connection: typeof primaryConn) => void = () => undefined
+    let bootstrapActive = true
+    const desktop = fakeDesktop()
+
+    desktop.getConnection = vi.fn(
+      () =>
+        new Promise(resolve => {
+          resolveConnection = resolve
+        })
+    )
+    desktop.getBootstrapState = vi.fn(async () => ({
+      active: bootstrapActive,
+      completedAt: null,
+      error: null,
+      log: [],
+      manifest: null,
+      setupChoice: null,
+      stages: {},
+      startedAt: null,
+      unsupportedPlatform: null
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(45_000)
+    })
+
+    expect(desktop.getBootstrapState).toHaveBeenCalledTimes(1)
+    expect($desktopBoot.get().error).toBeNull()
+
+    bootstrapActive = false
+    await act(async () => {
+      resolveConnection(primaryConn)
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
   })
 
   it('softSwitch(): a getConnection() that hangs on a connection-apply switch does not latch $gatewaySwitching forever (#93454)', async () => {

@@ -191,3 +191,29 @@ upstream_changes:
     Remove when upstream distinguishes cached selection from visible primary
     session during resume/focus routing.
   last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+
+- id: desktop-bootstrap-aware-connection-deadline
+  change_class: desktop-startup-correctness
+  owner: downstream-desktop-runtime
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+  - apps/desktop/src/app/gateway/hooks/use-gateway-boot.test.tsx
+  owned_symbols:
+  - useGatewayBoot
+  tests:
+  - apps/desktop/src/app/gateway/hooks/use-gateway-boot.test.tsx
+  expected_commit_subject: 'fix(desktop): exclude active bootstrap from connection deadline'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Keep upstream's bounded initial getConnection() wait, but
+    renew that same promise's 45-second renderer deadline while Electron reports
+    an active first-launch or release-update bootstrap. Never issue another
+    getConnection() to extend the wait: it could duplicate backend startup.
+    Once bootstrap is inactive, a genuinely wedged connection must still fail
+    on the normal deadline.
+  removal_condition: >-
+    Remove when upstream excludes active bootstrap time from its initial
+    renderer connection deadline without weakening the non-bootstrap hang bound,
+    and the focused useGatewayBoot regression passes unchanged.
+  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
