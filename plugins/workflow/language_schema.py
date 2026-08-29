@@ -19,6 +19,7 @@ from plugins.workflow.language import (
     supports_phase3_semantics,
     supports_phase4_semantics,
     supports_phase5_semantics,
+    supports_phase6_semantics,
 )
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowLanguageSelection
 
@@ -71,9 +72,7 @@ CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
 ARCHON_V3_NODE_ID_PATTERN = r"[A-Za-z_][A-Za-z0-9_-]*"
-ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN = (
-    r"(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)"
-)
+ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN = r"(?:[A-Za-z_][A-Za-z0-9_-]*|0|[1-9][0-9]*)"
 ARCHON_V3_OUTPUT_REFERENCE_PATTERN = (
     rf"\$(?P<node>{ARCHON_V3_NODE_ID_PATTERN})\.output"
     rf"(?P<path>(?:\.{ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN})*)"
@@ -136,13 +135,9 @@ class WorkflowReferenceSyntaxError(ValueError):
 
 
 _ARCHON_V3_NODE_ID = re.compile(rf"^(?:{ARCHON_V3_NODE_ID_PATTERN})$", re.ASCII)
-_ARCHON_V3_OUTPUT_REFERENCE = re.compile(
-    ARCHON_V3_OUTPUT_REFERENCE_PATTERN, re.ASCII
-)
+_ARCHON_V3_OUTPUT_REFERENCE = re.compile(ARCHON_V3_OUTPUT_REFERENCE_PATTERN, re.ASCII)
 _ARCHON_V3_WHEN_OPERATOR = re.compile(r"(?:==|!=|<=|>=|<|>)", re.ASCII)
-_ARCHON_V3_WHEN_NUMBER = re.compile(
-    ARCHON_V3_DECIMAL_NUMBER_PATTERN, re.ASCII
-)
+_ARCHON_V3_WHEN_NUMBER = re.compile(ARCHON_V3_DECIMAL_NUMBER_PATTERN, re.ASCII)
 _REFERENCE_CANDIDATE_END = frozenset(" \t\r\n'\"(){}<>=!&|,;:")
 
 
@@ -155,9 +150,7 @@ def _require_strict_reference_semantics(normalizer_version: int) -> None:
             normalizer_version,
         )
     ):
-        raise ValueError(
-            "strict output references require inherited Phase 3 semantics"
-        )
+        raise ValueError("strict output references require inherited Phase 3 semantics")
 
 
 def is_reference_safe_node_id(value: str) -> bool:
@@ -261,9 +254,7 @@ def _complete_reference_at(template: str, start: int) -> bool:
     )
 
 
-def _output_reference_at(
-    template: str, start: int
-) -> OutputReferenceToken | None:
+def _output_reference_at(template: str, start: int) -> OutputReferenceToken | None:
     match = _ARCHON_V3_OUTPUT_REFERENCE.match(template, start)
     if match is not None:
         end = match.end()
@@ -466,6 +457,7 @@ class DurableWorkflowCode:
 _ARCHON_V3 = frozenset({WorkflowLanguageProfile.ARCHON_2026_07})
 _NORMALIZER_V3 = frozenset({3})
 _NORMALIZER_V4 = frozenset({4})
+_NORMALIZER_V6 = frozenset({6})
 # The projected Phase 3 code catalog is an authenticated/API-facing bounded
 # summary. 16 KiB covers the approved normalization/reference/condition codes
 # plus the remaining planned Bash and session-recovery entries without making
@@ -962,6 +954,60 @@ def phase4_durable_code_catalog() -> Mapping[str, DurableWorkflowCode]:
     return MappingProxyType(catalog)
 
 
+PHASE6_DURABLE_CODES = tuple(
+    DurableWorkflowCode(
+        code,
+        meaning,
+        area,
+        _ARCHON_V3,
+        _NORMALIZER_V6,
+        False,
+        True,
+        False,
+        fields,
+    )
+    for code, meaning, area, fields in (
+        (
+            "loop_group_version_unsupported",
+            "loop_group requires the sealed normalizer v6 contract",
+            "normalization",
+            ("nodes[].loop_group",),
+        ),
+        (
+            "loop_group_shape_invalid",
+            "loop_group must use the bounded one-level authoring shape",
+            "normalization",
+            ("nodes[].loop_group",),
+        ),
+        (
+            "loop_group_topology_invalid",
+            "loop_group body must be one sealed acyclic sibling graph",
+            "topology",
+            ("nodes[].loop_group.nodes",),
+        ),
+        (
+            "loop_group_scope_invalid",
+            "loop_group references must stay within their declared scope",
+            "references",
+            ("nodes[].loop_group.nodes[].output references",),
+        ),
+        (
+            "loop_group_product_limit",
+            "loop_group body or worst-case work exceeds a durable bound",
+            "normalization",
+            ("nodes[].loop_group.nodes",),
+        ),
+    )
+)
+
+
+def phase6_durable_code_catalog() -> Mapping[str, DurableWorkflowCode]:
+    catalog = {code.code: code for code in PHASE6_DURABLE_CODES}
+    if len(catalog) != len(PHASE6_DURABLE_CODES):
+        raise RuntimeError("Phase 6 durable codes must be unique")
+    return MappingProxyType(catalog)
+
+
 def _compatibility(
     *,
     legacy_status: str = "supported",
@@ -1182,7 +1228,11 @@ def resolve_field_semantics(
     """Resolve an editor semantic id through the same field-inventory authority."""
     selected = _profile(profile)
     spec = next(
-        (item for item in FIELD_INVENTORY if _field_semantics_id(item) == semantics_ref),
+        (
+            item
+            for item in FIELD_INVENTORY
+            if _field_semantics_id(item) == semantics_ref
+        ),
         None,
     )
     return None if spec is None else _field_semantics(spec, selected)
@@ -1200,7 +1250,9 @@ def field_definition_catalog(
     for spec in FIELD_INVENTORY:
         definition_id = _field_semantics_id(spec)
         if definition_id in inventory_ids:
-            raise RuntimeError(f"duplicate workflow field definition id: {definition_id}")
+            raise RuntimeError(
+                f"duplicate workflow field definition id: {definition_id}"
+            )
         inventory_ids.add(definition_id)
         if definition_ids is not None and definition_id not in definition_ids:
             continue
@@ -1267,6 +1319,7 @@ def _example_for(yaml_name: str, shape: str) -> object:
     by_shape: dict[str, object] = {
         "any": True,
         "string": "value",
+        "nonblank_string": "value",
         "nonempty_string": "value",
         "boolean": True,
         "positive_number": 1,
@@ -1378,7 +1431,7 @@ def _field(
     )
 
 
-EXECUTABLE_NODE_TYPES = (
+NODE_TYPES = (
     "command",
     "prompt",
     "bash",
@@ -1387,11 +1440,9 @@ EXECUTABLE_NODE_TYPES = (
     "approval",
     "cancel",
 )
+EXECUTABLE_NODE_TYPES = (*NODE_TYPES, "loop_group")
 COMPILE_DIRECTIVE_TYPES = ("include",)
 SOURCE_NODE_TYPES = (*EXECUTABLE_NODE_TYPES, *COMPILE_DIRECTIVE_TYPES)
-# Backward-compatible public inventory consumed by schedulers and compatibility
-# checks. Compile directives must never enter this executable-kind tuple.
-NODE_TYPES = EXECUTABLE_NODE_TYPES
 _AI_NODE_TYPES = ("command", "prompt")
 _NON_LOOP_NODE_TYPES = tuple(item for item in NODE_TYPES if item != "loop")
 _AI_EXTENSION_NODE_OPTIONS = (
@@ -1449,7 +1500,7 @@ _NODE_FIELDS = (
             node_types=(node_type,),
             required_node_types=(node_type,),
         )
-        for node_type in NODE_TYPES
+        for node_type in EXECUTABLE_NODE_TYPES
     ),
     _field(
         "node",
@@ -1716,6 +1767,39 @@ _LOOP_FIELDS = (
     ),
     _field("loop", "gate_message", "any", "any"),
 )
+LOOP_GROUP_FIELDS = frozenset({
+    "nodes",
+    "until",
+    "max_iterations",
+    "fresh_context",
+    "until_bash",
+    "interactive",
+    "signal_completes",
+    "gate_message",
+})
+_LOOP_GROUP_FIELDS = (
+    _field(
+        "loop_group",
+        "nodes",
+        "array",
+        "loop_group_nodes",
+        required=True,
+        examples=([{"id": "work", "command": "run-work"}],),
+    ),
+    _field("loop_group", "until", "string", "nonblank_string", required=True),
+    _field(
+        "loop_group",
+        "max_iterations",
+        "integer",
+        "loop_iterations",
+        required=True,
+    ),
+    _field("loop_group", "fresh_context", "boolean", "boolean", default_value=False),
+    _field("loop_group", "until_bash", "string", "nonblank_string"),
+    _field("loop_group", "interactive", "boolean", "boolean", default_value=False),
+    _field("loop_group", "signal_completes", "boolean", "boolean"),
+    _field("loop_group", "gate_message", "string", "nonblank_string"),
+)
 _APPROVAL_FIELDS = (
     _field("approval", "message", "string", "nonempty_string", required=True),
     _field("approval", "capture_response", "any", "any"),
@@ -1845,6 +1929,7 @@ FIELD_INVENTORY = (
     *_NODE_FIELDS,
     *_RETRY_FIELDS,
     *_LOOP_FIELDS,
+    *_LOOP_GROUP_FIELDS,
     *_APPROVAL_FIELDS,
     *_APPROVAL_REJECT_FIELDS,
     *_AGENT_FIELDS,
@@ -1894,13 +1979,40 @@ def field_max_length(scope: str, yaml_name: str) -> int | None:
 
 def structural_node_field_names(node_type: str) -> frozenset[str]:
     """Return node fields the loader and JSON Schema accept structurally."""
-    if node_type not in NODE_TYPES:
+    if node_type not in EXECUTABLE_NODE_TYPES:
         raise ValueError(f"unsupported workflow node type: {node_type}")
-    return frozenset(
+    fields = frozenset(
         spec.yaml_name
         for spec in _specs("node")
         if node_type in spec.structural_node_types
     )
+    if node_type == "loop_group":
+        fields |= frozenset({
+            "id",
+            "loop_group",
+            "depends_on",
+            "when",
+            "trigger_rule",
+            "context",
+            "always_run",
+            "output_type",
+            "provider",
+            "model",
+            "allowed_tools",
+            "denied_tools",
+            "hooks",
+            "mcp",
+            "skills",
+            "agents",
+            "effort",
+            "thinking",
+            "maxBudgetUsd",
+            "systemPrompt",
+            "fallbackModel",
+            "betas",
+            "sandbox",
+        })
+    return fields
 
 
 def _node_field_is_structural(
@@ -1908,6 +2020,8 @@ def _node_field_is_structural(
     node_type: str,
     profile: WorkflowLanguageProfile,
 ) -> bool:
+    if node_type == "loop_group":
+        return spec.yaml_name in structural_node_field_names(node_type)
     if node_type not in spec.structural_node_types:
         return False
     if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
@@ -1919,9 +2033,15 @@ def _node_field_is_structural(
     return True
 
 
+def _node_field_is_applicable(spec: WorkflowFieldSpec, node_type: str) -> bool:
+    if node_type == "loop_group":
+        return spec.yaml_name in structural_node_field_names(node_type)
+    return node_type in spec.applicable_node_types
+
+
 def inapplicable_node_fields(node_type: str) -> dict[str, frozenset[str]]:
     """Return structurally valid fields that are not semantically applicable."""
-    if node_type not in NODE_TYPES:
+    if node_type not in EXECUTABLE_NODE_TYPES:
         raise ValueError(f"unsupported workflow node type: {node_type}")
     return {
         spec.yaml_name: spec.applicable_node_types
@@ -1941,6 +2061,10 @@ def retry_field_names() -> frozenset[str]:
 
 def loop_field_names() -> frozenset[str]:
     return _field_names("loop")
+
+
+def loop_group_field_names() -> frozenset[str]:
+    return LOOP_GROUP_FIELDS
 
 
 def approval_field_names() -> frozenset[str]:
@@ -2013,9 +2137,28 @@ def _loop_specs(
             for spec in specs
         )
     return tuple(
-        spec
-        for spec in specs
-        if spec.yaml_name not in {"command", "signal_completes"}
+        spec for spec in specs if spec.yaml_name not in {"command", "signal_completes"}
+    )
+
+
+def _node_specs(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> tuple[WorkflowFieldSpec, ...]:
+    specs = _specs("node")
+    if supports_phase6_semantics(profile, normalizer_version):
+        return specs
+    return tuple(spec for spec in specs if spec.yaml_name != "loop_group")
+
+
+def _executable_node_types(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> tuple[str, ...]:
+    return (
+        EXECUTABLE_NODE_TYPES
+        if supports_phase6_semantics(profile, normalizer_version)
+        else NODE_TYPES
     )
 
 
@@ -2186,9 +2329,7 @@ def _schema_for_shape(
     if shape == "pause_lane_policy":
         return {"type": "string", "enum": ["hold", "release"]}
     if shape == "retry":
-        return _object_schema(
-            "retry", profile, normalizer_version=normalizer_version
-        )
+        return _object_schema("retry", profile, normalizer_version=normalizer_version)
     if shape == "hooks":
         return _object_schema(
             "hook_event", profile, normalizer_version=normalizer_version
@@ -2240,9 +2381,13 @@ def _schema_for_shape(
         }
     if shape == "nodes":
         return _nodes_schema(profile, normalizer_version=normalizer_version)
+    if shape == "loop_group_nodes":
+        return _body_nodes_schema(profile, normalizer_version=normalizer_version)
     if shape == "loop_payload":
+        return _object_schema("loop", profile, normalizer_version=normalizer_version)
+    if shape == "loop_group_payload":
         return _object_schema(
-            "loop", profile, normalizer_version=normalizer_version
+            "loop_group", profile, normalizer_version=normalizer_version
         )
     if shape == "approval_payload":
         return _object_schema(
@@ -2341,15 +2486,10 @@ def _object_schema(
     normalizer_version: int | None = None,
 ) -> dict[str, Any]:
     selected_version = _authoring_normalizer_version(profile, normalizer_version)
-    specs = (
-        _loop_specs(profile, selected_version) if scope == "loop" else _specs(scope)
-    )
-    phase4_loop = (
-        scope == "loop"
-        and supports_phase4_semantics(
-            profile,
-            selected_version,
-        )
+    specs = _loop_specs(profile, selected_version) if scope == "loop" else _specs(scope)
+    phase4_loop = scope == "loop" and supports_phase4_semantics(
+        profile,
+        selected_version,
     )
     result: dict[str, Any] = {
         "type": "object",
@@ -2422,7 +2562,7 @@ def _nodes_schema(
     selected_version = _authoring_normalizer_version(profile, normalizer_version)
     phase4 = supports_phase4_semantics(profile, selected_version)
     specs = (
-        *_specs("node"),
+        *_node_specs(profile, selected_version),
         *(SOURCE_DIRECTIVE_INVENTORY if phase4 else ()),
     )
     union_properties = {
@@ -2434,7 +2574,8 @@ def _nodes_schema(
         for spec in specs
     }
     variants = []
-    for node_type in SOURCE_NODE_TYPES if phase4 else EXECUTABLE_NODE_TYPES:
+    node_types = _executable_node_types(profile, selected_version)
+    for node_type in (*node_types, *COMPILE_DIRECTIVE_TYPES) if phase4 else node_types:
         properties = {
             spec.yaml_name: True
             for spec in specs
@@ -2456,6 +2597,55 @@ def _nodes_schema(
         "items": {
             "type": "object",
             "properties": union_properties,
+            "oneOf": variants,
+            "additionalProperties": False,
+        },
+    }
+
+
+def _body_nodes_schema(
+    profile: WorkflowLanguageProfile,
+    *,
+    normalizer_version: int | None = None,
+) -> dict[str, Any]:
+    selected_version = _authoring_normalizer_version(profile, normalizer_version)
+    specs = tuple(
+        spec
+        for spec in _node_specs(profile, selected_version)
+        if spec.yaml_name != "loop_group"
+    )
+    properties = {
+        spec.yaml_name: _field_schema(
+            spec,
+            profile,
+            normalizer_version=selected_version,
+        )
+        for spec in specs
+    }
+    variants = [
+        {
+            "type": "object",
+            "properties": {
+                spec.yaml_name: True
+                for spec in specs
+                if _node_field_is_structural(spec, node_type, profile)
+            },
+            "required": [
+                spec.yaml_name
+                for spec in specs
+                if node_type in spec.required_node_types
+            ],
+            "additionalProperties": False,
+        }
+        for node_type in NODE_TYPES
+    ]
+    return {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 512,
+        "items": {
+            "type": "object",
+            "properties": properties,
             "oneOf": variants,
             "additionalProperties": False,
         },
@@ -2570,6 +2760,11 @@ def compatibility_code_catalog(
             if supports_phase4_semantics(selected, selected_version)
             else ()
         ),
+        *(
+            PHASE6_DURABLE_CODES
+            if supports_phase6_semantics(selected, selected_version)
+            else ()
+        ),
     )
     for spec in durable_codes:
         if selected not in spec.profiles:
@@ -2618,6 +2813,11 @@ def _nested_specs_for_kind(
         nested.extend(
             (spec, f"nodes[].loop.{spec.yaml_name}")
             for spec in _loop_specs(profile, normalizer_version)
+        )
+    if node_type == "loop_group":
+        nested.extend(
+            (spec, f"nodes[].loop_group.{spec.yaml_name}")
+            for spec in _specs("loop_group")
         )
     if node_type == "approval":
         nested.extend(
@@ -2698,6 +2898,11 @@ def _node_example(node_type: str) -> dict[str, object]:
         },
         "approval": {"message": "Continue?"},
         "cancel": "Cancellation requested.",
+        "loop_group": {
+            "nodes": [{"id": "work", "command": "run-work"}],
+            "until": "DONE",
+            "max_iterations": 3,
+        },
     }
     example: dict[str, object] = {
         "id": f"{node_type}-node",
@@ -2717,8 +2922,10 @@ def node_kind_descriptors(
     selected = _profile(profile)
     selected_version = _authoring_normalizer_version(selected, normalizer_version)
     descriptors: list[dict[str, object]] = []
-    for kind_order, node_type in enumerate(NODE_TYPES, start=1):
-        payload = next(spec for spec in _specs("node") if spec.yaml_name == node_type)
+    node_types = _executable_node_types(selected, selected_version)
+    node_specs = _node_specs(selected, selected_version)
+    for kind_order, node_type in enumerate(node_types, start=1):
+        payload = next(spec for spec in node_specs if spec.yaml_name == node_type)
         fields = [
             _field_descriptor(
                 spec,
@@ -2726,8 +2933,8 @@ def node_kind_descriptors(
                 node_type,
                 f"nodes[].{spec.yaml_name}",
             )
-            for spec in _specs("node")
-            if node_type in spec.applicable_node_types
+            for spec in node_specs
+            if _node_field_is_applicable(spec, node_type)
             and _node_field_is_structural(spec, node_type, selected)
         ]
         fields.extend(
@@ -2745,6 +2952,7 @@ def node_kind_descriptors(
                         "loop": "loop",
                         "approval": "approval",
                         "approval_reject": "approval",
+                        "loop_group": "loop_group",
                         "agent": "agents",
                         "hook_event": "hooks",
                         "hook_entry": "hooks",
@@ -3010,6 +3218,7 @@ def contract_documentation(
         if supports_phase3_semantics(selected, selected_version)
         else []
     )
+    phase6 = supports_phase6_semantics(selected, selected_version)
     phase4_topics = (
         [
             {
@@ -3071,12 +3280,52 @@ def contract_documentation(
                     "later_archon_features": [
                         "runtime_child_workflows",
                         "include.with",
-                        "loop_group",
+                        *([] if phase6 else ["loop_group"]),
                     ],
                 },
             }
         ]
         if supports_phase4_semantics(selected, selected_version)
+        else []
+    )
+    phase6_topics = (
+        [
+            {
+                "id": "durable-loop-groups",
+                "title": "Durable bounded loop groups",
+                "description": "One immutable nested body with bounded iterations.",
+                "field_paths": [
+                    f"nodes[].loop_group.{spec.yaml_name}"
+                    for spec in _specs("loop_group")
+                ],
+                "applicability": applicability,
+                "parameters": {
+                    "body_depth": 1,
+                    "body_nodes": {"minimum": 1, "maximum": 512},
+                    "body_edges": {"maximum": 4_096},
+                    "max_iterations": {"minimum": 1, "maximum": 100},
+                    "primary_sink": "first_terminal_in_definition_order",
+                    "group_fields": sorted(LOOP_GROUP_FIELDS),
+                    "reference_scopes": {
+                        "current_body": "direct_sibling_dependency",
+                        "outer": "direct_group_dependency",
+                        "previous_body": "immediately_previous_iteration",
+                    },
+                    "effective_interactive_requires": [
+                        "workflow.interactive",
+                        "loop_group.interactive",
+                    ],
+                    "rejected": [
+                        "include",
+                        "nested_loop_group",
+                        "runtime_workflow",
+                        "group_retry",
+                        "returns",
+                    ],
+                },
+            }
+        ]
+        if phase6
         else []
     )
     return {
@@ -3130,6 +3379,7 @@ def contract_documentation(
             },
             *phase3_topics,
             *phase4_topics,
+            *phase6_topics,
         ],
         "examples": [
             {

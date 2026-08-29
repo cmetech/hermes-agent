@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import unicodedata
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from plugins.workflow.models import WorkflowDefinition, WorkflowNode
@@ -25,6 +26,15 @@ class TopologyProjection:
     edge_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class ScopedWorkflowNode:
+    node: WorkflowNode
+    group_id: str | None
+    semantic_id: str
+    authored_path: str
+    group_options: Mapping[str, object] | None
+
+
 def sanitize_topology_label(
     value: str, *, limit: int = _LABEL_LIMIT
 ) -> tuple[str, bool]:
@@ -41,22 +51,19 @@ def sanitize_topology_label(
     return f"{safe[: limit - 1]}…", True
 
 
-def _stable_layers(
-    definition: WorkflowDefinition,
+def stable_node_layers(
+    nodes: tuple[WorkflowNode, ...],
 ) -> tuple[tuple[WorkflowNode, ...], ...]:
-    by_id = {node.id: node for node in definition.nodes}
-    indegree = {node.id: len(set(node.depends_on)) for node in definition.nodes}
-    outgoing: dict[str, list[str]] = {node.id: [] for node in definition.nodes}
-    for node in definition.nodes:
+    """Return deterministic topological layers for one already-validated DAG."""
+    by_id = {node.id: node for node in nodes}
+    indegree = {node.id: len(set(node.depends_on)) for node in nodes}
+    outgoing: dict[str, list[str]] = {node.id: [] for node in nodes}
+    for node in nodes:
         for dependency in set(node.depends_on):
             outgoing[dependency].append(node.id)
     for targets in outgoing.values():
         targets.sort(key=lambda node_id: (by_id[node_id].source_index, node_id))
-    ready = [
-        (node.source_index, node.id)
-        for node in definition.nodes
-        if indegree[node.id] == 0
-    ]
+    ready = [(node.source_index, node.id) for node in nodes if indegree[node.id] == 0]
     heapq.heapify(ready)
     layers: list[tuple[WorkflowNode, ...]] = []
     while ready:
@@ -71,6 +78,37 @@ def _stable_layers(
                     heapq.heappush(next_ready, (by_id[target].source_index, target))
         ready = next_ready
     return tuple(layers)
+
+
+def primary_terminal_node(nodes: tuple[WorkflowNode, ...]) -> WorkflowNode:
+    """Select the first terminal node in authored definition order."""
+    depended_on = {dependency for node in nodes for dependency in node.depends_on}
+    try:
+        return next(node for node in nodes if node.id not in depended_on)
+    except StopIteration as exc:
+        raise ValueError("workflow nodes must contain a terminal node") from exc
+
+
+def iter_scoped_workflow_nodes(
+    definition: WorkflowDefinition,
+) -> Iterator[ScopedWorkflowNode]:
+    """Yield the outer graph and its single approved loop-group body level."""
+    for node in definition.nodes:
+        authored_path = f"nodes[{node.source_index}]"
+        yield ScopedWorkflowNode(node, None, node.id, authored_path, None)
+        if node.node_type != "loop_group" or not isinstance(node.value, Mapping):
+            continue
+        body = node.value.get("nodes")
+        if not isinstance(body, tuple):
+            continue
+        for child in body:
+            yield ScopedWorkflowNode(
+                child,
+                node.id,
+                f"{node.id}/{child.id}",
+                f"{authored_path}.loop_group.nodes[{child.source_index}]",
+                node.options,
+            )
 
 
 def _bounded_utf8(value: str, limit: int, suffix: str) -> str:
@@ -88,7 +126,7 @@ def _bounded_utf8(value: str, limit: int, suffix: str) -> str:
 
 
 def project_topology(definition: WorkflowDefinition) -> TopologyProjection:
-    layers = _stable_layers(definition)
+    layers = stable_node_layers(definition.nodes)
     ordered = tuple(node for layer in layers for node in layer)
     aliases = {node.id: f"n{index}" for index, node in enumerate(ordered)}
     edges = tuple(

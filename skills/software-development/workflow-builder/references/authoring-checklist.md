@@ -1,8 +1,9 @@
 # Authoring checklist
 
 Current/default Archon authoring and admission use normalizer v5; current
-legacy uses v2. Explicit and sealed v1-v4 contracts remain compatible and keep
-their pinned semantics.
+legacy uses v2. Explicit and sealed v1-v6 contracts remain compatible and keep
+their pinned semantics; v6 loop groups remain dormant until the activation
+gate changes current Archon admission.
 
 <!-- workflow-language-version-selection -->
 ```json
@@ -11,7 +12,7 @@ their pinned semantics.
     "hermes-legacy": 2,
     "archon-2026-07": 5
   },
-  "supported_normalizer_versions": [1, 2, 3, 4, 5]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5, 6]
 }
 ```
 
@@ -71,6 +72,18 @@ Before writing files:
   true otherwise. Before the final iteration, a confirmation can approve,
   provide-input, or cancel; the final iteration can only approve or cancel.
   Approval must not replay the provider.
+- For an explicitly sealed v6 package, keep each `loop_group` body to one level,
+  1..512 nodes, at most 4,096 edges, and `max_iterations` 1..100. Require
+  nonblank `until`; use the first terminal body node in definition order as the
+  primary sink. Do not add `returns`.
+- Keep body dependencies among siblings. Current `$body.output` requires that
+  sibling dependency; `$outer.output` requires a direct dependency of the
+  group; `$LOOP_PREV.body.output` addresses only the previous iteration. Field
+  traversal requires the producer's declared structured-output schema.
+- Reject group-body `include`, nested `loop_group`, runtime `workflow`, and
+  group-level `retry`. Body nodes may use the existing prompt, command, bash,
+  script, approval, cancel, and ordinary-loop contracts. Group provider/model
+  options are defaults, and explicit body options win.
 - For shared package bytes, establish the oldest backend. Keep the companion
   unversioned while any consumer predates `language_compatibility` support.
 - Translate any legacy `create-workflow` request into `nodes`; do not adopt

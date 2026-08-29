@@ -56,9 +56,7 @@ def test_archon_v5_capabilities_are_cumulative(
     assert supports_phase5_semantics(profile, version) is phase5
 
 
-def test_v5_is_the_current_archon_admission_contract(
-    tmp_path, workflow_writer
-):
+def test_v5_is_the_current_archon_admission_contract(tmp_path, workflow_writer):
     path = workflow_writer(
         tmp_path,
         nodes=[{"id": "ask", "prompt": "hello", "model": "small"}],
@@ -80,7 +78,7 @@ def test_v5_is_the_current_archon_admission_contract(
         ]
         == 5
     )
-    assert workflow_language.SUPPORTED_NORMALIZER_VERSIONS == {1, 2, 3, 4, 5}
+    assert workflow_language.SUPPORTED_NORMALIZER_VERSIONS == {1, 2, 3, 4, 5, 6}
     assert current.language.normalizer_version == 5
     assert explicit.language.normalizer_version == 5
     assert current.language.node_semantics == explicit.language.node_semantics
