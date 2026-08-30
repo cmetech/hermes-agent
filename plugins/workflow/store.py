@@ -5416,6 +5416,31 @@ class RunStore:
                     continue
                 attempt_id = str(claim.get("attempt_id", ""))
                 if attempt_id:
+                    projection_bytes = len(
+                        json.dumps(
+                            projection, sort_keys=True, ensure_ascii=False
+                        ).encode("utf-8")
+                    )
+                    reserve = TerminalJournalReserve.for_projection(
+                        projection_bytes
+                    )
+                    controller = node.get("loop_group")
+                    if (
+                        isinstance(controller, Mapping)
+                        and isinstance(
+                            controller.get("_pending_loop_decision"), Mapping
+                        )
+                    ):
+                        obligation_reserves[attempt_id] = (
+                            row["run_id"],
+                            TerminalJournalReserve(
+                                projection_limit_bytes=reserve.projection_limit_bytes,
+                                terminal_reserve_bytes=(
+                                    2 * reserve.terminal_reserve_bytes
+                                ),
+                            ),
+                        )
+                        continue
                     active[attempt_id] = (
                         row["run_id"],
                         str(node_id),
@@ -5426,14 +5451,7 @@ class RunStore:
                             or _utc_now()
                         ),
                     )
-                    projection_bytes = len(
-                        json.dumps(
-                            projection, sort_keys=True, ensure_ascii=False
-                        ).encode("utf-8")
-                    )
-                    reserves[attempt_id] = TerminalJournalReserve.for_projection(
-                        projection_bytes
-                    )
+                    reserves[attempt_id] = reserve
         with self._connect() as connection:
             repair_attempts = {
                 str(row["attempt_id"])
@@ -11292,6 +11310,10 @@ class RunStore:
         output_schema_fingerprint: str | None = None,
         output_type: str | None = None,
         pending_interaction: Mapping[str, object] | None = None,
+        predicate_sha256: str | None = None,
+        predicate_owner_id: str | None = None,
+        predicate_lease_seconds: float = 30.0,
+        predicate_claim: NodeClaim | None = None,
         execution_fence: ExecutionFence | None = None,
         now: LeaseClockSample | None = None,
     ) -> bool:
@@ -11302,6 +11324,8 @@ class RunStore:
             "signal_confirmation",
             "ordinary_input",
             "hard_limit",
+            "until_bash_pending",
+            "until_bash_failure",
         }:
             raise ValueError("loop group iteration decision is invalid")
         terminal_success = decision in {"signal_success", "until_bash_success"}
@@ -11310,6 +11334,14 @@ class RunStore:
             raise ValueError("loop group terminal decision output is incomplete")
         if paused != isinstance(pending_interaction, Mapping):
             raise ValueError("loop group interaction decision is incomplete")
+        predicate_pending = decision == "until_bash_pending"
+        if predicate_pending != (
+            isinstance(predicate_sha256, str)
+            and len(predicate_sha256) == 64
+            and isinstance(predicate_owner_id, str)
+            and bool(predicate_owner_id)
+        ):
+            raise ValueError("loop group predicate authority is incomplete")
         directory = self.run_directory(scope.run_id)
         with workflow_lock(
             self._run_lock_path(scope.run_id)
@@ -11354,12 +11386,93 @@ class RunStore:
                 return False
             controller["previous_outputs"] = previous_outputs
             controller.pop("loop_user_input_artifact", None)
-            event_payload: dict[str, object] = {
+            primary = body[str(controller["primary_sink"])]
+            primary_attempt_id = str(primary["attempts"][-1]["attempt_id"])
+            transition_scope = LoopGroupChildScope(
+                scope.run_id,
+                scope.group_id,
+                scope.controller_generation,
+                scope.iteration,
+                str(controller["primary_sink"]),
+            )
+            recorded_predicate_decision = None
+            predicate_reserve_attempt_id = None
+            if predicate_claim is not None:
+                active = group.get("claim")
+                pending_decision = controller.get("_pending_loop_decision")
+                if (
+                    not _active_claim_matches(active, predicate_claim)
+                    or active.get("loop_group_scope")
+                    != transition_scope.durable_record()
+                    or not isinstance(pending_decision, Mapping)
+                    or pending_decision.get("kind") != decision
+                ):
+                    raise RuntimeError("stale loop group predicate decision")
+                recorded_predicate_decision = dict(pending_decision)
+                group.pop("claim", None)
+                controller.pop("_pending_loop_decision", None)
+                predicate_attempt = next(
+                    attempt
+                    for attempt in reversed(group["attempts"])
+                    if attempt.get("attempt_id") == predicate_claim.attempt_id
+                )
+                predicate_attempt.update({
+                    "state": "succeeded",
+                    "completed_at": _utc_now(),
+                })
+                predicate_reserve_attempt_id = predicate_claim.attempt_id
+            scoped_payload = {
+                "loop_group_scope": transition_scope.durable_record(),
                 "controller_generation": scope.controller_generation,
                 "iteration": iteration,
                 "decision": decision,
             }
-            if terminal_success or paused:
+            event_payload: dict[str, object] = {
+                **scoped_payload,
+            }
+            if predicate_pending:
+                assert predicate_sha256 is not None
+                assert predicate_owner_id is not None
+                sample = now or self._lease_clock()
+                attempt_id = (
+                    f"loop-group-predicate-{scope.controller_generation}-"
+                    f"{iteration:04d}"
+                )
+                expires_at = sample.utc_now.astimezone(timezone.utc) + timedelta(
+                    seconds=float(predicate_lease_seconds)
+                )
+                authority = {
+                    "attempt_id": attempt_id,
+                    "owner_id": predicate_owner_id,
+                    "owner_epoch": predicate_owner_id,
+                    "lease_expires_at": expires_at.isoformat(),
+                    "heartbeat_at": sample.utc_now.astimezone(timezone.utc).isoformat(),
+                    "heartbeat_monotonic": sample.monotonic_now,
+                    "lease_seconds": float(predicate_lease_seconds),
+                    "executor_id": "bash",
+                    "effect_classification": "replay_safe",
+                    "loop_group_scope": transition_scope.durable_record(),
+                }
+                group["attempts"].append({
+                    **authority,
+                    "state": "running",
+                    "started_at": _utc_now(),
+                })
+                group["claim"] = dict(authority)
+                sink = primary_output_candidate_from_identity(
+                    previous_outputs[str(controller["primary_sink"])]
+                )
+                controller["_pending_loop_decision"] = {
+                    "kind": "until_bash_pending",
+                    "iteration": iteration,
+                    "predicate_sha256": predicate_sha256,
+                    "output_artifact": sink.attempt_relative_path,
+                    "output_size_bytes": sink.size_bytes,
+                    "output_sha256": sink.sha256,
+                    "loop_group_scope": transition_scope.durable_record(),
+                }
+                predicate_reserve_attempt_id = attempt_id
+            elif terminal_success or paused:
                 assert output_bytes is not None
                 attempt_id = (
                     f"loop-group-{scope.controller_generation}-{iteration:04d}"
@@ -11372,7 +11485,6 @@ class RunStore:
                     else "output.txt"
                 )
                 relative = Path("nodes") / scope.group_id / attempt_id / output_name
-                _atomic_bytes(directory / relative, output_bytes)
                 artifact = {
                     "node_id": scope.group_id,
                     "attempt_id": attempt_id,
@@ -11396,6 +11508,7 @@ class RunStore:
                     "state": "paused" if paused else "succeeded",
                     "completed_at": _utc_now(),
                     "metadata": {PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY: candidate},
+                    "loop_group_scope": transition_scope.durable_record(),
                 }
                 group["attempts"].append(attempt)
                 if terminal_success and output_type is not None:
@@ -11420,30 +11533,6 @@ class RunStore:
                         raise ArchonOutputIntegrityError(
                             "loop group typed output conflicts with sealed authority"
                         )
-                    publication = self._publish_typed_bundle_locked(
-                        directory,
-                        projection,
-                        run_id=scope.run_id,
-                        node_id=scope.group_id,
-                        attempt_id=attempt_id,
-                        artifact=ArtifactRef(
-                            relative.as_posix(),
-                            output_media_type,
-                            len(output_bytes),
-                            str(artifact["sha256"]),
-                        ),
-                        candidate=TypedPublicationCandidate(
-                            attempt_relative_path=relative.as_posix(),
-                            output_type=output_type,
-                            media_type=output_media_type,
-                            size_bytes=len(output_bytes),
-                            sha256=str(artifact["sha256"]),
-                            schema_fingerprint=output_schema_fingerprint,
-                            canonicalization_version=1,
-                            session_id=None,
-                        ),
-                    )
-                    artifact.update(_typed_publication_fields(publication))
                 projection["artifacts"].append(artifact)
                 group["output"] = candidate
                 if paused:
@@ -11477,6 +11566,23 @@ class RunStore:
                     "message": f"loop group reached its hard limit of {maximum} iterations",
                     "node_id": scope.group_id,
                 }
+            elif decision == "until_bash_failure":
+                error_code = str(
+                    (recorded_predicate_decision or {}).get("error_code")
+                    or "until_bash_failed"
+                )
+                error_message = str(
+                    (recorded_predicate_decision or {}).get("error_message")
+                    or "loop group predicate failed"
+                )
+                controller["state"] = "failed"
+                group["state"] = "failed"
+                projection["status"] = "failed"
+                projection["last_error"] = {
+                    "code": error_code,
+                    "message": _sanitize_diagnostic(error_message),
+                    "node_id": scope.group_id,
+                }
             else:
                 controller["iteration"] = iteration + 1
                 controller["body"] = {
@@ -11494,18 +11600,381 @@ class RunStore:
                     "next_iteration": controller["iteration"],
                     "output_nodes": list(previous_outputs),
                 })
+            if predicate_pending:
+                projection_bytes = len(
+                    json.dumps(
+                        projection, sort_keys=True, ensure_ascii=False
+                    ).encode("utf-8")
+                )
+                reserve = TerminalJournalReserve.for_projection(projection_bytes)
+                reserve_bytes = 2 * reserve.terminal_reserve_bytes
+                self._ensure_run_capacity(
+                    directory,
+                    projection,
+                    journal_reserve_bytes=reserve_bytes,
+                )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as reserve_connection:
+                    reserve_connection.execute(
+                        "INSERT OR IGNORE INTO obligation_journal_reserves ("
+                        "attempt_id, run_id, terminal_reserve_bytes, "
+                        "projection_limit_bytes, consumed_bytes, created_at) "
+                        "VALUES (?, ?, ?, ?, 0, ?)",
+                        (
+                            predicate_reserve_attempt_id,
+                            scope.run_id,
+                            reserve_bytes,
+                            reserve.projection_limit_bytes,
+                            _utc_now(),
+                        ),
+                    )
+            if terminal_success or paused:
+                projection_bytes = len(
+                    json.dumps(
+                        projection, sort_keys=True, ensure_ascii=False
+                    ).encode("utf-8")
+                )
+                reserve = TerminalJournalReserve.for_projection(projection_bytes)
+                journal_path = directory / "events.jsonl"
+                self._check_journal_reserve(
+                    run_id=scope.run_id,
+                    projection=projection,
+                    journal_bytes=journal_path.stat().st_size,
+                    frame_bytes=(
+                        reserve.terminal_reserve_bytes
+                        + 2 * reserve.projection_limit_bytes
+                        + 8 * 1024
+                        + (
+                            2 * _TYPED_PUBLICATION_METADATA_MAX_BYTES
+                            if terminal_success and output_type is not None
+                            else 0
+                        )
+                    ),
+                    terminal_attempt_id=None,
+                    connection=fence_connection,
+                )
+                _atomic_bytes(directory / relative, output_bytes)
+                if terminal_success and output_type is not None:
+                    publication = self._publish_typed_bundle_locked(
+                        directory,
+                        projection,
+                        run_id=scope.run_id,
+                        node_id=scope.group_id,
+                        attempt_id=attempt_id,
+                        artifact=ArtifactRef(
+                            relative.as_posix(),
+                            output_media_type,
+                            len(output_bytes),
+                            str(artifact["sha256"]),
+                        ),
+                        candidate=TypedPublicationCandidate(
+                            attempt_relative_path=relative.as_posix(),
+                            output_type=output_type,
+                            media_type=output_media_type,
+                            size_bytes=len(output_bytes),
+                            sha256=str(artifact["sha256"]),
+                            schema_fingerprint=output_schema_fingerprint,
+                            canonicalization_version=1,
+                            session_id=None,
+                        ),
+                    )
+                    artifact.update(_typed_publication_fields(publication))
             self._append_locked(
                 directory,
                 projection,
-                (
-                    "loop_group_iteration_committed"
-                    if decision == "continue"
-                    else "loop_group_iteration_decided"
-                ),
-                event_payload,
+                "loop_group_iteration_completed",
+                scoped_payload,
                 node_id=scope.group_id,
+                attempt_id=primary_attempt_id,
                 defer_notification=fence_connection is not None,
+                terminal_reserve_attempt_id=predicate_reserve_attempt_id,
                 reserve_connection=fence_connection,
+            )
+            if predicate_pending:
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_group_predicate_pending",
+                    scoped_payload,
+                    node_id=scope.group_id,
+                    attempt_id=attempt_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=predicate_reserve_attempt_id,
+                    reserve_connection=fence_connection,
+                )
+                return True
+            self._append_locked(
+                directory,
+                projection,
+                "loop_group_decision_recorded",
+                scoped_payload,
+                node_id=scope.group_id,
+                attempt_id=primary_attempt_id,
+                defer_notification=fence_connection is not None,
+                terminal_reserve_attempt_id=predicate_reserve_attempt_id,
+                reserve_connection=fence_connection,
+            )
+            if decision == "continue":
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_group_iteration_committed",
+                    event_payload,
+                    node_id=scope.group_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=predicate_reserve_attempt_id,
+                    reserve_connection=fence_connection,
+                )
+            else:
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_group_iteration_decided",
+                    event_payload,
+                    node_id=scope.group_id,
+                    defer_notification=fence_connection is not None,
+                    terminal_reserve_attempt_id=predicate_reserve_attempt_id,
+                    reserve_connection=fence_connection,
+                )
+            terminal_event = {
+                "signal_success": "loop_group_succeeded",
+                "until_bash_success": "loop_group_succeeded",
+                "signal_confirmation": "loop_group_paused",
+                "ordinary_input": "loop_group_paused",
+                "continue": "loop_group_next_iteration_created",
+                "hard_limit": "loop_group_failed",
+                "until_bash_failure": "loop_group_failed",
+            }[decision]
+            self._append_locked(
+                directory,
+                projection,
+                terminal_event,
+                scoped_payload,
+                node_id=scope.group_id,
+                attempt_id=primary_attempt_id,
+                defer_notification=fence_connection is not None,
+                terminal_reserve_attempt_id=predicate_reserve_attempt_id,
+                reserve_connection=fence_connection,
+            )
+            if predicate_reserve_attempt_id is not None:
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as reserve_connection:
+                    reserve_connection.execute(
+                        "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                        (predicate_reserve_attempt_id,),
+                    )
+            return True
+
+    def claim_recorded_loop_group_predicate(
+        self,
+        scope: LoopGroupChildScope,
+        owner_id: str,
+        *,
+        lease_seconds: float,
+        now: LeaseClockSample | None = None,
+        execution_fence: ExecutionFence | None = None,
+    ) -> NodeClaim | None:
+        """Recover the ordinary-loop predicate authority without a worker slot."""
+        sample = now or self._lease_clock()
+        directory = self.run_directory(scope.run_id)
+        with workflow_lock(
+            self._run_lock_path(scope.run_id)
+        ), self._execution_fence_transaction(execution_fence, sample):
+            projection = json.loads((directory / "run.json").read_text())
+            _loop_group_child_state(projection, scope)
+            group = projection["nodes"][scope.group_id]
+            controller = group["loop_group"]
+            pending = controller.get("_pending_loop_decision")
+            active = group.get("claim")
+            if (
+                not isinstance(pending, Mapping)
+                or pending.get("kind") != "until_bash_pending"
+                or pending.get("loop_group_scope") != scope.durable_record()
+                or not isinstance(active, dict)
+                or active.get("loop_group_scope") != scope.durable_record()
+            ):
+                return None
+            attempt = next(
+                (
+                    candidate
+                    for candidate in reversed(group.get("attempts", []))
+                    if candidate.get("attempt_id") == active.get("attempt_id")
+                ),
+                None,
+            )
+            if (
+                not isinstance(attempt, dict)
+                or attempt.get("loop_group_scope") != scope.durable_record()
+            ):
+                raise JournalRecoveryError("loop group predicate attempt is missing")
+            fresh = self._recorded_loop_claim_is_fresh(active, sample)
+            if active.get("owner_id") != owner_id:
+                if fresh:
+                    return None
+                observation = self._recorded_loop_attempt_stop_observation(attempt)
+                if observation is None:
+                    return None
+                expires_at = sample.utc_now.astimezone(timezone.utc) + timedelta(
+                    seconds=lease_seconds
+                )
+                active.update({
+                    "owner_id": owner_id,
+                    "owner_epoch": owner_id,
+                    "lease_expires_at": expires_at.isoformat(),
+                    "heartbeat_at": sample.utc_now.astimezone(timezone.utc).isoformat(),
+                    "heartbeat_monotonic": sample.monotonic_now,
+                    "lease_seconds": lease_seconds,
+                    "execution_fence": (
+                        {
+                            "owner_id": execution_fence.owner_id,
+                            "owner_epoch": execution_fence.owner_epoch,
+                        }
+                        if execution_fence is not None
+                        else None
+                    ),
+                })
+                attempt.update(active)
+                self._append_locked(
+                    directory,
+                    projection,
+                    "loop_group_predicate_recovery_claimed",
+                    {
+                        "loop_group_scope": scope.durable_record(),
+                        "observation": observation,
+                    },
+                    node_id=scope.group_id,
+                    attempt_id=str(active["attempt_id"]),
+                )
+            elif not fresh:
+                return None
+            return NodeClaim(
+                scope.run_id,
+                scope.group_id,
+                str(active["attempt_id"]),
+                owner_id,
+                datetime.fromisoformat(str(active["lease_expires_at"])),
+                execution_fence,
+            )
+
+    def prepare_recorded_loop_group_predicate(
+        self,
+        scope: LoopGroupChildScope,
+        claim: NodeClaim,
+    ) -> bool:
+        """Require stopped prior process evidence before predicate re-dispatch."""
+        directory = self.run_directory(scope.run_id)
+        with workflow_lock(self._run_lock_path(scope.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            _loop_group_child_state(projection, scope)
+            group = projection["nodes"][scope.group_id]
+            if (
+                not _active_claim_matches(group.get("claim"), claim)
+                or group["claim"].get("loop_group_scope")
+                != scope.durable_record()
+            ):
+                return False
+            attempt = next(
+                candidate
+                for candidate in reversed(group["attempts"])
+                if candidate.get("attempt_id") == claim.attempt_id
+            )
+            if attempt.get("loop_group_scope") != scope.durable_record():
+                raise JournalRecoveryError("loop group predicate attempt scope changed")
+            spawn = attempt.get("spawn")
+            if not isinstance(spawn, Mapping):
+                return True
+            observation = self._recorded_loop_attempt_stop_observation(attempt)
+            if observation is None:
+                raise JournalRecoveryError(
+                    "loop group predicate process outcome is unresolved"
+                )
+            history = attempt.setdefault("loop_predicate_recoveries", [])
+            if not isinstance(history, list) or len(history) >= 8:
+                raise JournalRecoveryError(
+                    "loop group predicate recovery bound is exhausted"
+                )
+            history.append({"observation": observation})
+            for key in ("spawn", "process_identity", "process_started_at", "process_stop"):
+                attempt.pop(key, None)
+                group["claim"].pop(key, None)
+            self._append_locked(
+                directory,
+                projection,
+                "loop_group_predicate_recovery_prepared",
+                {
+                    "loop_group_scope": scope.durable_record(),
+                    "observation": observation,
+                },
+                node_id=scope.group_id,
+                attempt_id=claim.attempt_id,
+                terminal_reserve_attempt_id=claim.attempt_id,
+            )
+            return True
+
+    def record_loop_group_predicate_decision(
+        self,
+        scope: LoopGroupChildScope,
+        claim: NodeClaim,
+        decision: Mapping[str, object],
+    ) -> bool:
+        """CAS-journal one contained predicate outcome before publication."""
+        if decision.get("kind") not in {
+            "until_bash_success",
+            "until_bash_failure",
+            "ordinary_input",
+            "continue",
+            "hard_limit",
+        }:
+            raise ValueError("loop group predicate decision is invalid")
+        kind = str(decision["kind"])
+        durable_decision: dict[str, object] = {"kind": kind}
+        if kind == "until_bash_failure":
+            error_code = str(decision.get("error_code") or "")
+            durable_decision.update({
+                "error_code": (
+                    error_code
+                    if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", error_code)
+                    else "until_bash_failed"
+                ),
+                "error_message": "loop group predicate failed",
+            })
+        directory = self.run_directory(scope.run_id)
+        with workflow_lock(self._run_lock_path(scope.run_id)):
+            projection = json.loads((directory / "run.json").read_text())
+            _loop_group_child_state(projection, scope)
+            group = projection["nodes"][scope.group_id]
+            controller = group["loop_group"]
+            pending = controller.get("_pending_loop_decision")
+            if (
+                not _active_claim_matches(group.get("claim"), claim)
+                or group["claim"].get("loop_group_scope")
+                != scope.durable_record()
+                or not isinstance(pending, Mapping)
+                or pending.get("kind") != "until_bash_pending"
+                or pending.get("loop_group_scope") != scope.durable_record()
+            ):
+                return False
+            controller["_pending_loop_decision"] = {
+                **dict(pending),
+                **durable_decision,
+            }
+            self._append_locked(
+                directory,
+                projection,
+                "loop_group_predicate_decided",
+                {
+                    "loop_group_scope": scope.durable_record(),
+                    "kind": kind,
+                },
+                node_id=scope.group_id,
+                attempt_id=claim.attempt_id,
+                terminal_reserve_attempt_id=claim.attempt_id,
             )
             return True
 
@@ -16480,9 +16949,13 @@ class RunStore:
                 ):
                     continue
                 loop_state = node.get("loop_state")
+                controller = node.get("loop_group")
                 if (
                     isinstance(loop_state, Mapping)
                     and loop_state.get("_pending_loop_decision") is not None
+                ) or (
+                    isinstance(controller, Mapping)
+                    and controller.get("_pending_loop_decision") is not None
                 ):
                     continue
                 attempt_id = claim["attempt_id"]
@@ -17090,6 +17563,15 @@ class RunStore:
                     "interaction_id": f"reconcile-{claim.attempt_id}",
                     "attempt_id": claim.attempt_id,
                     "reason_code": "claim_released_outcome_uncertain",
+                    **(
+                        {
+                            "loop_group_scope": (
+                                claim.loop_group_scope.durable_record()
+                            )
+                        }
+                        if claim.loop_group_scope is not None
+                        else {}
+                    ),
                 }
                 attempt.update({
                     "state": "paused",
@@ -17135,6 +17617,50 @@ class RunStore:
                         claim.attempt_id, connection=connection
                     )
             return True
+
+    def _append_loop_group_cancelled_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+    ) -> None:
+        for group_id, group in projection.get("nodes", {}).items():
+            controller = group.get("loop_group") if isinstance(group, Mapping) else None
+            body = controller.get("body") if isinstance(controller, Mapping) else None
+            if (
+                not isinstance(controller, Mapping)
+                or group.get("state") != "cancelled"
+                or controller.get("state") != "cancelled"
+            ):
+                continue
+            primary_id = (
+                controller.get("primary_sink")
+                if isinstance(controller, Mapping)
+                else None
+            )
+            primary = body.get(primary_id) if isinstance(body, Mapping) else None
+            if not isinstance(primary_id, str) or not isinstance(primary, Mapping):
+                continue
+            scope = LoopGroupChildScope(
+                str(projection["run_id"]),
+                str(group_id),
+                int(controller["controller_generation"]),
+                int(controller["iteration"]),
+                primary_id,
+            )
+            attempts = primary.get("attempts")
+            attempt_id = (
+                str(attempts[-1]["attempt_id"])
+                if isinstance(attempts, list) and attempts
+                else None
+            )
+            self._append_locked(
+                directory,
+                projection,
+                "loop_group_cancelled",
+                {"loop_group_scope": scope.durable_record()},
+                node_id=str(group_id),
+                attempt_id=attempt_id,
+            )
 
     def cancel_run(
         self,
@@ -17408,6 +17934,11 @@ class RunStore:
                     "interaction_id": f"reconcile-{attempt_id}",
                     "attempt_id": attempt_id,
                     "reason_code": "cancelled_outward_outcome_uncertain",
+                    **(
+                        {"loop_group_scope": dict(ownership["loop_group_scope"])}
+                        if isinstance(ownership.get("loop_group_scope"), Mapping)
+                        else {}
+                    ),
                 }
                 attempt.update({
                     "state": "paused",
@@ -17505,6 +18036,17 @@ class RunStore:
                     "cancellation_outcome": "registry_update_pending",
                 }
 
+            predicate_obligations = {
+                str(claim["attempt_id"])
+                for group in projection["nodes"].values()
+                if isinstance(group, Mapping)
+                for controller in (group.get("loop_group"),)
+                if isinstance(controller, Mapping)
+                and isinstance(controller.get("_pending_loop_decision"), Mapping)
+                for claim in (group.get("claim"),)
+                if isinstance(claim, Mapping)
+                and isinstance(claim.get("attempt_id"), str)
+            }
             projection["status"] = "cancelled"
             projection["desired_status"] = None
             for _node_id, node in _iter_projection_node_states(projection):
@@ -17520,6 +18062,7 @@ class RunStore:
                             "state": "cancelled",
                             "error_code": "cancelled",
                         })
+            self._append_loop_group_cancelled_locked(directory, projection)
             self._append_locked(directory, projection, "run_cancelled")
             with self._connect() as connection:
                 self._sync_integrity_index(
@@ -17531,6 +18074,10 @@ class RunStore:
                 )
                 connection.execute(
                     "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
+                )
+                connection.executemany(
+                    "DELETE FROM obligation_journal_reserves WHERE attempt_id=?",
+                    ((attempt_id,) for attempt_id in predicate_obligations),
                 )
                 self._record_coordinator_wake(
                     connection, run_id=run_id, reason_code="run_cancelled"
@@ -17658,6 +18205,8 @@ class RunStore:
         """Authenticate optional nested interaction identity before mutation."""
         raw_scope = pending.get("loop_group_scope")
         if raw_scope is None:
+            if "/" in node_id:
+                raise WorkflowConflict("loop group interaction scope is missing")
             return None
         try:
             scope = LoopGroupChildScope.from_durable_record(raw_scope)
@@ -17693,8 +18242,15 @@ class RunStore:
             or not isinstance(attempts, list)
             or not attempts
             or attempts[-1].get("attempt_id") != attempt_id
+            or attempts[-1].get("loop_group_scope") != scope.durable_record()
         ):
             raise WorkflowConflict("loop group interaction attempt changed")
+        recovery = node.get("recovery")
+        if isinstance(recovery, Mapping) and (
+            recovery.get("attempt_id") != attempt_id
+            or recovery.get("loop_group_scope") != scope.durable_record()
+        ):
+            raise WorkflowConflict("loop group interaction recovery changed")
         result_artifact = pending.get("result_artifact")
         result_sha256 = pending.get("result_sha256")
         if result_artifact is not None or result_sha256 is not None:
@@ -18594,12 +19150,7 @@ class RunStore:
                     node["approval_rework"] = {"reason": safe_response}
                 else:
                     terminal = True
-                    projection["status"] = "cancelled"
-                    projection["desired_status"] = None
-                    for candidate in projection["nodes"].values():
-                        if candidate["state"] not in {"succeeded", "failed", "skipped"}:
-                            candidate.pop("claim", None)
-                            candidate["state"] = "cancelled"
+                    projection["desired_status"] = "cancelled"
 
             self._append_locked(
                 directory,
@@ -18628,11 +19179,11 @@ class RunStore:
                     verified_content,
                 )
             if terminal:
-                self._append_locked(directory, projection, "run_cancelled")
                 with self._connect() as connection:
                     connection.execute(
-                        "UPDATE runs SET status=?, updated_at=? WHERE run_id=?",
-                        (projection["status"], projection["updated_at"], run_id),
+                        "UPDATE runs SET desired_status='cancelled', updated_at=? "
+                        "WHERE run_id=?",
+                        (projection["updated_at"], run_id),
                     )
                     self._sync_integrity_index(
                         connection,
@@ -18640,9 +19191,6 @@ class RunStore:
                         journal_sha256=_sha256(
                             (directory / "events.jsonl").read_bytes()
                         ),
-                    )
-                    connection.execute(
-                        "DELETE FROM worker_claims WHERE run_id=?", (run_id,)
                     )
                     self._record_coordinator_wake(
                         connection,
@@ -18703,7 +19251,7 @@ class RunStore:
                         projection,
                         reason=f"interaction_{decision}",
                     )
-            return ApprovalDecision(
+            result = ApprovalDecision(
                 run_id=run_id,
                 node_id=node_id,
                 decision=decision,
@@ -18711,6 +19259,21 @@ class RunStore:
                 interaction_id=resolved_id,
                 state_version=int(projection["state_version"]),
             )
+        if terminal:
+            cancelled = self.cancel_run(
+                run_id,
+                expected_state_version=result.state_version,
+                operator_scope=operator_scope,
+            )
+            return ApprovalDecision(
+                run_id=result.run_id,
+                node_id=result.node_id,
+                decision=result.decision,
+                outcome=result.outcome,
+                interaction_id=result.interaction_id,
+                state_version=int(cancelled["state_version"]),
+            )
+        return result
 
     def consume_action_grant(
         self, claim: NodeClaim, *, now: LeaseClockSample | None = None

@@ -14,6 +14,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.executors.script import ScriptExecutor
+from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
@@ -39,6 +40,7 @@ from tests.plugins.workflow.test_phase6_store import (
     _output,
     _scope,
 )
+from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit, _compile
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -2747,3 +2749,142 @@ def test_heartbeat_refuses_to_erase_a_suspend_clock_gap(tmp_path, workflow_write
     )
     unchanged = store.load_run(admitted.run_id)["nodes"]["start"]["claim"]
     assert unchanged["heartbeat_at"] == active["heartbeat_at"]
+
+
+def test_loop_group_predicate_restart_reuses_recorded_input_without_child_replay(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-restart",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-restart")
+    prompt = OutputExecutor(lambda _context, _rendered: "not complete")
+    first = RunScheduler(store, max_parallel_nodes=1)
+    first.executors["prompt"] = prompt
+
+    class CrashBeforeSpawn:
+        def execute(self, _context):
+            raise SystemExit("predicate crashed before spawn")
+
+    first.executors["bash"] = CrashBeforeSpawn()
+    with pytest.raises(SystemExit, match="before spawn"):
+        first.advance_all([run_id])
+
+    pending = store.load_run(run_id)["nodes"]["group"]
+    claim = pending["claim"]
+    recovered_at = datetime.fromisoformat(claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    recovered_monotonic = (
+        float(claim["heartbeat_monotonic"])
+        + float(claim["lease_seconds"])
+        + 1
+    )
+    restarted_store = RunStore(home, max_total_workers=1)
+    with restarted_store._connect() as connection:
+        worker_count = connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim["attempt_id"],),
+        ).fetchone()[0]
+        predicate_reserve = connection.execute(
+            "SELECT terminal_reserve_bytes FROM obligation_journal_reserves "
+            "WHERE attempt_id=?",
+            (claim["attempt_id"],),
+        ).fetchone()
+    assert worker_count == 0
+    assert predicate_reserve is not None
+    second = RunScheduler(
+        restarted_store,
+        max_parallel_nodes=1,
+        utcnow=lambda: recovered_at,
+        monotonic=lambda: recovered_monotonic,
+    )
+    second.executors["prompt"] = prompt
+    second.executors["bash"] = type(
+        "SuccessfulPredicate",
+        (),
+        {"execute": lambda self, context: NodeExecutionResult("succeeded")},
+    )()
+
+    result = second.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
+        "sink"
+    ]
+
+
+def test_loop_group_restart_consumes_the_recorded_predicate_result_once(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-result-restart",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-result-restart")
+    prompt = OutputExecutor(lambda _context, _rendered: "not complete")
+    predicate_calls = []
+    first = RunScheduler(store, max_parallel_nodes=1)
+    first.executors["prompt"] = prompt
+    first.executors["bash"] = type(
+        "SuccessfulPredicate",
+        (),
+        {
+            "execute": lambda self, context: (
+                predicate_calls.append(context.attempt_id)
+                or NodeExecutionResult("succeeded")
+            )
+        },
+    )()
+    original = store.record_loop_group_predicate_decision
+
+    def crash_after_result(*args, **kwargs):
+        assert original(*args, **kwargs)
+        raise SystemExit("predicate result committed")
+
+    monkeypatch.setattr(store, "record_loop_group_predicate_decision", crash_after_result)
+    with pytest.raises(SystemExit, match="result committed"):
+        first.advance_all([run_id])
+
+    recorded = store.load_run(run_id)["nodes"]["group"]["loop_group"]
+    assert recorded["_pending_loop_decision"]["kind"] == "until_bash_success"
+    restarted = RunScheduler(RunStore(home, max_total_workers=1), max_parallel_nodes=1)
+    restarted.executors["prompt"] = prompt
+    restarted.executors["bash"] = type(
+        "ReplayForbidden",
+        (),
+        {"execute": lambda self, context: pytest.fail("predicate replayed")},
+    )()
+
+    result = restarted.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert len(predicate_calls) == 1
+    assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
+        "sink"
+    ]

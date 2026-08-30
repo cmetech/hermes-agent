@@ -2563,11 +2563,58 @@ class RunScheduler:
                     semantics
                 )
                 decision = None
+                predicate_claim = None
                 if completed and signal_completes:
                     decision = "signal_success"
                 elif completed:
                     decision = "signal_confirmation"
                 elif isinstance(group.value.get("until_bash"), str):
+                    recorded = controller.get("_pending_loop_decision")
+                    if not isinstance(recorded, Mapping):
+                        return self.store.record_loop_group_iteration(
+                            decision_scope,
+                            expected_state_version=int(projection["state_version"]),
+                            decision="until_bash_pending",
+                            predicate_sha256=hashlib.sha256(
+                                str(group.value["until_bash"]).encode("utf-8")
+                            ).hexdigest(),
+                            predicate_owner_id=self.owner_id,
+                            predicate_lease_seconds=self.lease_seconds,
+                            execution_fence=self.execution_fence,
+                        )
+                    if recorded.get("loop_group_scope") != decision_scope.durable_record():
+                        raise RuntimeError("loop group predicate scope changed")
+                    if recorded.get("kind") != "until_bash_pending":
+                        active = state.get("claim")
+                        if not isinstance(active, Mapping):
+                            raise RuntimeError("loop group predicate claim is missing")
+                        predicate_claim = NodeClaim(
+                            run_id,
+                            group.id,
+                            str(active["attempt_id"]),
+                            str(active["owner_id"]),
+                            datetime.fromisoformat(str(active["lease_expires_at"])),
+                            self.execution_fence,
+                        )
+                        decision = str(recorded["kind"])
+                    else:
+                        predicate_claim = self.store.claim_recorded_loop_group_predicate(
+                            decision_scope,
+                            self.owner_id,
+                            lease_seconds=self.lease_seconds,
+                            now=LeaseClockSample(
+                                self._utcnow(),
+                                self._monotonic(),
+                                self.store._lease_clock().boot_id,
+                            ),
+                            execution_fence=self.execution_fence,
+                        )
+                        if predicate_claim is None:
+                            return False
+                        if not self.store.prepare_recorded_loop_group_predicate(
+                            decision_scope, predicate_claim
+                        ):
+                            return False
                     all_body = replace(
                         next(child for child in body_nodes if child.id == primary_sink),
                         depends_on=tuple(child.id for child in body_nodes),
@@ -2590,8 +2637,9 @@ class RunScheduler:
                         sealed_resource_paths=None,
                         sealed_resource_bytes=None,
                     )
-                    predicate = self.executors["bash"].execute(
-                        NodeExecutionContext(
+                    if decision is None:
+                        predicate = self.executors["bash"].execute(
+                            NodeExecutionContext(
                             run_id=run_id,
                             run_directory=self.store.run_directory(run_id),
                             node=WorkflowNode(
@@ -2603,28 +2651,55 @@ class RunScheduler:
                                 source_line=group.source_line,
                                 options=freeze_value({}),
                             ),
-                            attempt_id=(
-                                f"loop-group-{scope.controller_generation}-"
-                                f"{scope.iteration:04d}-until"
-                            ),
+                            attempt_id=predicate_claim.attempt_id,
                             variable_context=replace(
                                 variables, loop_prev_output=cleaned
                             ),
                             is_cancelled=lambda: self._cancelled(run_id),
                             cancellation_reason=lambda: self._cancellation_reason(run_id),
+                            spawn_intent=lambda nonce: self.store.record_spawn_intent(
+                                predicate_claim, executor_nonce=nonce
+                            ),
+                            spawn_failed=lambda nonce, code: self.store.record_spawn_failed(
+                                predicate_claim,
+                                executor_nonce=nonce,
+                                error_code=code,
+                            ),
+                            process_started=lambda identity: self.store.record_process_started(
+                                predicate_claim, identity
+                            ),
+                            process_stopped=lambda identity, cleaned: (
+                                self.store.record_process_stopped(
+                                    predicate_claim, identity, cleaned=cleaned
+                                )
+                            ),
                             attempt_directory=publication / "attempt",
                             publication_directory=publication,
                         )
-                    )
-                    if predicate.status == "succeeded":
-                        decision = "until_bash_success"
-                    elif predicate.error_code != "process_exit":
-                        return self.store.fail_loop_group(
-                            scope,
-                            error_code=predicate.error_code or "until_bash_failed",
-                            error_message=predicate.error_message or "loop group predicate failed",
-                            expected_state_version=int(projection["state_version"]),
-                            execution_fence=self.execution_fence,
+                        )
+                        if predicate.status == "succeeded":
+                            final = {"kind": "until_bash_success"}
+                        elif predicate.error_code != "process_exit":
+                            final = {
+                                "kind": "until_bash_failure",
+                                "error_code": (
+                                    predicate.error_code or "until_bash_failed"
+                                ),
+                                "error_message": (
+                                    predicate.error_message
+                                    or "loop group predicate failed"
+                                ),
+                            }
+                        elif int(controller["iteration"]) >= int(
+                            controller["max_iterations"]
+                        ):
+                            final = {"kind": "hard_limit"}
+                        elif effective_interactive:
+                            final = {"kind": "ordinary_input"}
+                        else:
+                            final = {"kind": "continue"}
+                        return self.store.record_loop_group_predicate_decision(
+                            decision_scope, predicate_claim, final
                         )
                 iteration = int(controller["iteration"])
                 maximum = int(controller["max_iterations"])
@@ -2641,6 +2716,19 @@ class RunScheduler:
                         result_artifact=relative,
                         result_sha256=hashlib.sha256(cleaned.encode()).hexdigest(),
                     ).to_dict()
+                elif decision == "ordinary_input":
+                    message = str(group.value.get("gate_message", ""))
+                    pending = {
+                        "type": "loop_input",
+                        "interaction_id": hashlib.sha256(
+                            (
+                                f"{run_id}\0{group.id}\0{scope.controller_generation}\0"
+                                f"{iteration}\0{sink_output.sha256}\0{message}"
+                            ).encode()
+                        ).hexdigest(),
+                        "message": message,
+                        "iteration": iteration,
+                    }
                 elif decision is None and iteration < maximum and effective_interactive:
                     message = str(group.value.get("gate_message", ""))
                     pending = {
@@ -2657,26 +2745,34 @@ class RunScheduler:
                     decision = "ordinary_input"
                 elif decision is None:
                     decision = "hard_limit" if iteration >= maximum else "continue"
-                return self.store.record_loop_group_iteration(
-                    decision_scope,
-                    expected_state_version=int(projection["state_version"]),
-                    decision=decision,
-                    output_bytes=(
-                        cleaned.encode()
-                        if decision in {
-                            "signal_success",
-                            "until_bash_success",
-                            "signal_confirmation",
-                            "ordinary_input",
-                        }
-                        else None
-                    ),
-                    output_media_type=sink_output.media_type,
-                    output_schema_fingerprint=sink_output.schema_fingerprint,
-                    output_type=sink_output.output_type,
-                    pending_interaction=pending,
-                    execution_fence=self.execution_fence,
-                )
+                try:
+                    return self.store.record_loop_group_iteration(
+                        decision_scope,
+                        expected_state_version=int(projection["state_version"]),
+                        decision=decision,
+                        output_bytes=(
+                            cleaned.encode()
+                            if decision in {
+                                "signal_success",
+                                "until_bash_success",
+                                "signal_confirmation",
+                                "ordinary_input",
+                            }
+                            else None
+                        ),
+                        output_media_type=sink_output.media_type,
+                        output_schema_fingerprint=sink_output.schema_fingerprint,
+                        output_type=sink_output.output_type,
+                        pending_interaction=pending,
+                        predicate_claim=predicate_claim,
+                        execution_fence=self.execution_fence,
+                    )
+                except RuntimeError as exc:
+                    if "stale loop group state version" not in str(exc) or not self._cancelled(
+                        run_id
+                    ):
+                        raise
+                    return False
         return False
 
     def _resolve_graph(self, run_id: str, nodes: Iterable[WorkflowNode]) -> None:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.store import RunStore
+from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.store import RunStore, WorkflowConflict
 from tests.plugins.workflow.test_phase6_scheduler import (
     _STRUCTURED_OUTPUT,
     OutputExecutor,
@@ -95,6 +97,147 @@ def test_until_bash_completes_only_when_the_sink_has_no_signal(
     assert [event["payload"]["decision"] for event in decisions] == [
         "until_bash_success"
     ]
+
+
+def test_until_bash_records_controller_authority_before_process_dispatch(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-authority",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-authority")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+
+    class PredicateExecutor:
+        def execute(self, context):
+            event_types = {
+                event["event_type"] for event in store.tail_events(run_id)
+            }
+            assert "loop_group_predicate_pending" in event_types
+            assert context.spawn_intent is not None
+            assert context.spawn_failed is not None
+            assert context.process_started is not None
+            assert context.process_stopped is not None
+            with store._connect() as connection:
+                reserve = connection.execute(
+                    "SELECT terminal_reserve_bytes FROM obligation_journal_reserves "
+                    "WHERE attempt_id=?",
+                    (context.attempt_id,),
+                ).fetchone()
+                worker_count = connection.execute(
+                    "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+                    (context.attempt_id,),
+                ).fetchone()[0]
+            assert reserve is not None
+            assert int(reserve["terminal_reserve_bytes"]) > 0
+            assert worker_count == 0
+            return NodeExecutionResult("succeeded")
+
+    scheduler.executors["bash"] = PredicateExecutor()
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert any(
+        event["event_type"] == "loop_group_predicate_decided"
+        for event in store.tail_events(run_id)
+    )
+
+
+def test_failed_until_bash_reuses_scoped_between_iteration_input(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-input",
+        interactive=True,
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "false",
+                "max_iterations": 2,
+                "interactive": True,
+                "gate_message": "continue?",
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-input")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+
+    paused = scheduler.advance_all([run_id])[run_id]
+
+    interaction = paused["nodes"]["group"]["pending_interaction"]
+    assert paused["status"] == "paused"
+    assert interaction["type"] == "loop_input"
+    assert interaction["loop_group_scope"]["iteration"] == 1
+
+
+def test_until_bash_runtime_failure_terminalizes_the_group_once(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-failure",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 2,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-failure")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    scheduler.executors["bash"] = type(
+        "FailedPredicate",
+        (),
+        {
+            "execute": lambda self, context: NodeExecutionResult(
+                "failed",
+                error_code="predicate_timeout",
+                error_message="predicate timed out at /private/operator/secret-command",
+            )
+        },
+    )()
+
+    failed = scheduler.advance_all([run_id])[run_id]
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == "predicate_timeout"
+    assert failed["nodes"]["group"]["loop_group"]["state"] == "failed"
+    evidence = (
+        store.run_directory(run_id) / "events.jsonl"
+    ).read_text(encoding="utf-8")
+    assert "/private/operator/secret-command" not in evidence
 
 
 def test_first_terminal_body_node_in_definition_order_is_the_primary_sink(
@@ -374,6 +517,54 @@ def test_body_approval_resumes_exact_child_without_replaying_succeeded_sibling(
     assert len(completed_body["gate"]["attempts"]) == 1
 
 
+def test_body_approval_rejection_terminalizes_the_nested_controller(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-approval-rejection",
+        nodes=[
+            _group([
+                {"id": "done", "prompt": "done"},
+                {"id": "gate", "approval": {"message": "approve"}},
+                {
+                    "id": "sink",
+                    "prompt": "sink",
+                    "depends_on": ["done", "gate"],
+                },
+            ])
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=2)
+    run_id = _admit(store, compilation, key="phase6-approval-rejection")
+    scheduler = RunScheduler(store, max_parallel_nodes=2)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "done"
+    )
+    paused = scheduler.advance_all([run_id])[run_id]
+    interaction = paused["nodes"]["group"]["loop_group"]["body"]["gate"][
+        "pending_interaction"
+    ]
+
+    store.reject_run(
+        run_id,
+        interaction_id=interaction["interaction_id"],
+        expected_state_version=paused["state_version"],
+    )
+    cancelled = store.load_run(run_id)
+
+    controller = cancelled["nodes"]["group"]["loop_group"]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["nodes"]["group"]["state"] == "cancelled"
+    assert controller["state"] == "cancelled"
+    assert {child["state"] for child in controller["body"].values()} <= {
+        "succeeded",
+        "cancelled",
+        "skipped",
+    }
+
+
 def test_child_events_are_scoped_and_drop_private_execution_content(
     tmp_path, workflow_writer
 ) -> None:
@@ -452,6 +643,69 @@ def test_outward_child_reconciliation_keeps_exact_scope_and_fails_the_group(
     assert failed["status"] == "failed"
     assert failed["nodes"]["group"]["state"] == "failed"
     assert failed["nodes"]["group"]["loop_group"]["state"] == "failed"
+
+
+def test_nested_reconciliation_requires_the_authenticated_scope(
+    tmp_path, workflow_writer
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        executor_id="bash",
+        effect_classification="outward",
+        execution_authority=_EXECUTION_AUTHORITY,
+        lease_seconds=1,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    assert store.record_spawn_intent(claim, executor_nonce="outward-intent")
+    store.expire_stale_claims(
+        run_id,
+        now=claim.lease_expires_at + timedelta(seconds=1),
+    )
+    directory = store.run_directory(run_id)
+    projection = store.load_run(run_id)
+    child = projection["nodes"]["group"]["loop_group"]["body"]["select"]
+    pending = child["pending_interaction"]
+    pending.pop("loop_group_scope")
+    directory.joinpath("run.json").write_text(json.dumps(projection), encoding="utf-8")
+
+    with pytest.raises(WorkflowConflict, match="scope"):
+        store.reconcile_run(
+            run_id,
+            "confirmed-failed",
+            expected_state_version=projection["state_version"],
+            interaction_id=pending["interaction_id"],
+        )
+
+
+def test_group_terminal_events_have_stable_scoped_families(
+    tmp_path, workflow_writer
+) -> None:
+    store, _scheduler, run_id, _result = _run_group(
+        tmp_path,
+        workflow_writer,
+        output="result <promise>DONE</promise>",
+        group=_group([{"id": "sink", "prompt": "private prompt"}]),
+    )
+
+    events = store.tail_events(run_id)
+    by_type = {event["event_type"]: event for event in events}
+    expected = {
+        "loop_group_iteration_completed",
+        "loop_group_decision_recorded",
+        "loop_group_succeeded",
+    }
+    assert expected <= by_type.keys()
+    for event_type in expected:
+        scope = by_type[event_type]["payload"]["loop_group_scope"]
+        assert scope["run_id"] == run_id
+        assert scope["group_id"] == "group"
+        assert scope["node_id"] == "sink"
 
 
 def test_cancellation_terminalizes_nested_children_and_rejects_stale_completion(

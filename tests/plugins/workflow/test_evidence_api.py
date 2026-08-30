@@ -19,6 +19,10 @@ from plugins.workflow.store import (
     RunStore,
     TypedPublicationCandidate,
 )
+from plugins.workflow.sanitize import (
+    public_event_projection,
+    sanitize_loop_group_event_payload,
+)
 
 
 def _admitted_store(tmp_path, workflow_writer, *, name: str):
@@ -959,3 +963,44 @@ def test_persistent_session_recovery_evidence_is_a_closed_bounded_projection() -
         }
     ]
     assert len(page["items"]) <= 200
+
+
+def test_loop_group_event_evidence_keeps_scope_private_and_drops_execution_data() -> None:
+    payload = sanitize_loop_group_event_payload({
+        "loop_group_scope": {
+            "run_id": "run-1",
+            "group_id": "group",
+            "controller_generation": 1,
+            "iteration": 2,
+            "node_id": "sink",
+        },
+        "decision": "continue",
+        "prompt": "private prompt",
+        "command": "private command",
+        "output": "private output",
+        "environment": {"TOKEN": "private credential"},
+        "path": "/private/workflow/path",
+    })
+    private_event = {
+        "sequence": 7,
+        "timestamp": "2026-08-29T12:00:00+00:00",
+        "run_id": "run-1",
+        "node_id": "group",
+        "attempt_id": "attempt-1",
+        "event_type": "loop_group_decision_recorded",
+        "payload": payload,
+    }
+
+    public = public_event_projection(private_event)
+
+    assert public == {
+        "item_type": "timeline_event",
+        "sequence": 7,
+        "timestamp": "2026-08-29T12:00:00+00:00",
+        "run_id": "run-1",
+        "event_type": "loop_group_decision_recorded",
+        "node_id": "group",
+        "attempt_id": "attempt-1",
+        "decision": "continue",
+    }
+    assert "private" not in str(payload).lower()

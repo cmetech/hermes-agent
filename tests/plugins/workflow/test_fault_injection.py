@@ -20,6 +20,7 @@ from plugins.workflow.store import (
 import plugins.workflow.store as store_module
 import plugins.workflow.sessions as sessions_module
 from tools.managed_process import ProcessIdentity
+from tests.plugins.workflow.test_phase6_scheduler import _admit, _compile
 
 
 def _request(prepared, key: str) -> RunAdmissionRequest:
@@ -594,3 +595,147 @@ def test_twenty_simultaneous_approval_decisions_have_one_durable_winner(
         outcomes = list(pool.map(decide, range(20)))
     assert outcomes.count("applied") == 1
     assert store.load_run(run_id)["status"] == "running"
+
+
+def test_loop_group_terminal_reserve_exhaustion_precedes_output_and_publication(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-terminal-preflight",
+        nodes=[{
+            "id": "group",
+            "output_type": "Report",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [
+                    {
+                        "id": "sink",
+                        "bash": "printf 'result <promise>DONE</promise>'",
+                        "output_type": "Report",
+                    }
+                ],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-terminal-preflight")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    advance_controllers = scheduler._advance_loop_group_controllers
+    assert advance_controllers(
+        run_id,
+        compilation.package.definition.nodes,
+        store.load_run(run_id),
+    )
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", lambda *_args: False
+    )
+    scheduler.advance(run_id, max_nodes=1)
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", advance_controllers
+    )
+    original = store._check_journal_reserve
+
+    def exhaust_group_terminal(*args, **kwargs):
+        raise StorageQuotaError("injected group terminal reserve exhaustion")
+
+    monkeypatch.setattr(store, "_check_journal_reserve", exhaust_group_terminal)
+
+    with pytest.raises(StorageQuotaError, match="group terminal reserve"):
+        advance_controllers(
+            run_id,
+            compilation.package.definition.nodes,
+            store.load_run(run_id),
+        )
+
+    directory = store.run_directory(run_id)
+    assert not (
+        directory
+        / "nodes"
+        / "group"
+        / "loop-group-1-0001"
+        / "output.md"
+    ).exists()
+    outer_publications = []
+    for metadata in directory.glob("publications/*/metadata.json"):
+        value = json.loads(metadata.read_text())
+        if value["node_id"] == "group":
+            outer_publications.append(metadata)
+    assert outer_publications == []
+    monkeypatch.setattr(store, "_check_journal_reserve", original)
+    assert store.load_run(run_id)["nodes"]["group"]["attempts"] == []
+
+
+def test_loop_group_restart_reconciles_crash_after_outer_publication(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-terminal-publication-crash",
+        nodes=[{
+            "id": "group",
+            "output_type": "Report",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [
+                    {
+                        "id": "sink",
+                        "bash": "printf 'result <promise>DONE</promise>'",
+                        "output_type": "Report",
+                    }
+                ],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-terminal-publication-crash")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    advance_controllers = scheduler._advance_loop_group_controllers
+    assert advance_controllers(
+        run_id,
+        compilation.package.definition.nodes,
+        store.load_run(run_id),
+    )
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", lambda *_args: False
+    )
+    scheduler.advance(run_id, max_nodes=1)
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", advance_controllers
+    )
+    original_append = store._append_locked
+
+    def crash_after_publication(directory, projection, event_type, *args, **kwargs):
+        if event_type == "loop_group_iteration_completed":
+            raise SystemExit("crash after outer publication")
+        return original_append(directory, projection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_append_locked", crash_after_publication)
+    with pytest.raises(SystemExit, match="after outer publication"):
+        advance_controllers(
+            run_id,
+            compilation.package.definition.nodes,
+            store.load_run(run_id),
+        )
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    restarted = RunStore(home, max_total_workers=1)
+    recovered = RunScheduler(restarted, max_parallel_nodes=1).advance_all([run_id])[
+        run_id
+    ]
+
+    assert recovered["status"] == "succeeded"
+    outer = []
+    for metadata in restarted.run_directory(run_id).glob(
+        "publications/*/metadata.json"
+    ):
+        value = json.loads(metadata.read_text())
+        if value["node_id"] == "group":
+            outer.append(value)
+    assert len(outer) == 1
+    assert outer[0]["sha256"] == hashlib.sha256(b"result").hexdigest()
