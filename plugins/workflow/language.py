@@ -61,6 +61,7 @@ ARCHON_LANGUAGE_FINDING_FIELDS = frozenset({
     "output_format",
     "output_type",
     "maxBudgetUsd",
+    "maxTurns",
     "sandbox",
 })
 WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX = max(
@@ -1306,6 +1307,14 @@ def language_compatibility_findings(
                 "archon_budget_enforcement_unavailable",
                 "Archon budget enforcement is not available in Phase 1",
                 "Remove maxBudgetUsd or wait for Phase 5 budget enforcement.",
+                blocking=True,
+            )
+        if metadata.normalizer_version < 6 and "maxTurns" in options:
+            add(
+                f"{prefix}.maxTurns",
+                "archon_model_turn_cap_unavailable",
+                "Archon per-node model-turn caps require Phase 6",
+                "Remove maxTurns or use normalizer version 6.",
                 blocking=True,
             )
         if "sandbox" in options:

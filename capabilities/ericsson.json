@@ -60,6 +60,7 @@
     "workflows/my-tickets-summary.yml",
     "workflows/inbox-digest.yml",
     "workflows/jira-single-ticket-showcase.yml",
+    "workflows/jira-defect-loop.yml",
     "workflows/jira-to-gitlab.yml",
     "workflows/sharepoint-document-intake.yml"
   ],

@@ -67,7 +67,7 @@ CONTRACT_RESERVED_GROWTH_BYTES = 4_000
 CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
     "definition_schema": 150_000,
     "node_kinds": 72_000,
-    "compatibility_codes": 16_000,
+    "compatibility_codes": 16_500,
 })
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -1325,6 +1325,7 @@ def _example_for(yaml_name: str, shape: str) -> object:
         "boolean": True,
         "positive_number": 1,
         "positive_integer": 1,
+        "model_turns": 2,
         "string_list": ["value"],
         "mapping": {"key": "value"},
         "worktree": {"enabled": True},
@@ -1661,6 +1662,17 @@ _NODE_FIELDS = (
         phase=5,
         archon_status="blocking",
         archon_code="archon_budget_enforcement_unavailable",
+    ),
+    _field(
+        "node",
+        "maxTurns",
+        "integer",
+        "model_turns",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=NODE_TYPES,
+        phase=6,
+        archon_status="blocking",
+        archon_code="archon_model_turn_cap_unavailable",
     ),
     _field(
         "node",
@@ -2268,6 +2280,8 @@ def _schema_for_shape(
         return {"type": "number", "exclusiveMinimum": 0}
     if shape == "positive_integer":
         return {"type": "integer", "minimum": 1}
+    if shape == "model_turns":
+        return {"type": "integer", "minimum": 1, "maximum": 90}
     if shape == "string_list":
         return {"type": "array", "items": {"type": "string", "minLength": 1}}
     if shape == "mapping":

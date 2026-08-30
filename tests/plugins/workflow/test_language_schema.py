@@ -595,7 +595,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
         "section_max_bytes": {
             "definition_schema": 150_000,
             "node_kinds": 72_000,
-            "compatibility_codes": 16_000,
+            "compatibility_codes": 16_500,
         },
     }
     assert contract["x-hermes-provenance"]["field_authority"] == (
@@ -1204,6 +1204,7 @@ _NODE_FIELD_VALUES = {
     "effort": "high",
     "thinking": "adaptive",
     "maxBudgetUsd": 1,
+    "maxTurns": 2,
     "systemPrompt": "be careful",
     "fallbackModel": "fallback",
     "betas": ["feature"],

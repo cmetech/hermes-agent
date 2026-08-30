@@ -65,6 +65,30 @@ def _real_jira_showcase_compilation(tmp_path):
     )
 
 
+def _real_jira_defect_loop_compilation(tmp_path):
+    repo_root = Path(__file__).resolve().parents[3]
+    source_path = repo_root / "capabilities/workflows/jira-defect-loop.yml"
+    sidecar_path = source_path.with_name("jira-defect-loop.hermes.yaml")
+    workflow_root = tmp_path / "real-jira-defect-loop" / "workflows"
+    workflow_root.mkdir(parents=True)
+    copied = workflow_root / source_path.name
+    copied.write_bytes(source_path.read_bytes())
+    copied_sidecar = workflow_root / sidecar_path.name
+    copied_sidecar.write_bytes(sidecar_path.read_bytes())
+    source = parse_workflow_source_bytes(
+        copied,
+        workflow_bytes=copied.read_bytes(),
+        sidecar_bytes=copied_sidecar.read_bytes(),
+        source="ericsson",
+        precedence=1,
+    )
+    return compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=6,
+    )
+
+
 def _real_sharepoint_compilation(tmp_path):
     repo_root = Path(__file__).resolve().parents[3]
     source_path = (
@@ -160,6 +184,37 @@ def test_real_jira_showcase_has_exact_tools_and_ready_unready_admission(tmp_path
     )
     assert blocked.compatibility.runnable is False
     assert admitted.compatibility.runnable is True
+
+
+def test_real_jira_defect_loop_requires_exact_connector_surface(tmp_path):
+    from plugins.workflow.admission_service import assess_workflow_admission
+    from plugins.workflow.topology import iter_scoped_workflow_nodes
+    from tests.plugins.workflow.test_phase5_admission_parity import _context
+
+    compilation = _real_jira_defect_loop_compilation(tmp_path)
+    exact_tools = frozenset(
+        tool
+        for scoped in iter_scoped_workflow_nodes(compilation.package.definition)
+        for tool in scoped.node.options.get("allowed_tools", ())
+    )
+    services = frozenset({"ericsson-jira", "ericsson-gitlab"})
+
+    assert compilation.package.definition.options["requires"] == (
+        "ericsson-jira",
+        "ericsson-gitlab",
+    )
+    assert assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=services,
+        available_tools=exact_tools,
+    ).compatibility.runnable is True
+    assert assess_workflow_admission(
+        compilation,
+        _context(),
+        available_services=services - {"ericsson-gitlab"},
+        available_tools=exact_tools,
+    ).compatibility.runnable is False
 
 
 def test_real_jira_showcase_blocks_before_run_creation_when_unready(

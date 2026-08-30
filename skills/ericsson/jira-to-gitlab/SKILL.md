@@ -30,7 +30,22 @@ The active agent researches bounded evidence, explains the intended changes, and
 </workflow>
 
 <status>
-Return per-ticket status with ticket key, project, branch, commit, merge request, warnings, and attention needed. The legacy multi-ticket loop_group behavior is deferred; process only the explicitly bounded ticket set and never imply hidden aggregation.
+For a batch of assigned defects, use the `jira-defect-loop` workflow. It makes one
+immutable first-occurrence-ordered manifest of at most 25 Jira keys, processes one key
+per durable loop-group iteration, and publishes bounded per-ticket records plus final
+JSON and Markdown aggregates to authenticated Hermes run history. Expected outcomes
+such as `not_found`, `permission`, `needs_info`, `manual_review`,
+`not_a_code_fix`, and `safely_skipped` are successful terminal ticket records so the
+batch can continue.
+
+Every Jira or GitLab write still requires approval for the exact current ticket,
+target, payload, and intent digest. An ambiguous write stops for reconciliation and
+must never be retried blindly. Tickets that appear after the manifest is sealed wait
+for the next run. The other seven assessed legacy iterative flows remain unmigrated;
+do not imply that this workflow provides parity for them.
+
+Return per-ticket status with ticket key, project, branch, commit, merge request,
+warnings, attention needed, and reconciliation status.
 </status>
 
 <success_criteria>

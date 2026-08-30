@@ -4705,6 +4705,9 @@ class RunScheduler:
         claimed_deadline_budget: DeadlineBudget | None = None,
     ) -> None:
         node = self._runtime_work_node(package, work_item)
+        outward_action = work_item.semantic_id in package.sidecar.get(
+            "outward_action_nodes", ()
+        )
         with self._activity:
             self._active_executions += 1
         try:
@@ -4736,10 +4739,7 @@ class RunScheduler:
                         execution_limits,
                         language_profile=package.language.effective_profile,
                         execution_semantics=execution_semantics,
-                        outward_action=(
-                            node.id
-                            in package.sidecar.get("outward_action_nodes", ())
-                        ),
+                        outward_action=outward_action,
                     )
                     return
                 node_state = dict(self._work_item_state(projection, work_item))
@@ -4753,9 +4753,19 @@ class RunScheduler:
                         execution_semantics.normalizer_version,
                     )
                 )
+                model_iteration_limit = (
+                    min(int(node.options.get("maxTurns", 90)), 90)
+                    if execution_semantics is not None
+                    and supports_phase6_semantics(
+                        package.language.effective_profile,
+                        execution_semantics.normalizer_version,
+                    )
+                    else 90
+                )
                 remaining_iterations = max(
                     0,
-                    90 - int(node_state.get("iteration_consumed", 0)),
+                    model_iteration_limit
+                    - int(node_state.get("iteration_consumed", 0)),
                 )
                 if execution_semantics is not None:
                     retry_grant = self._sealed_retry_grant(
@@ -4784,10 +4794,7 @@ class RunScheduler:
                         execution_limits,
                         language_profile=package.language.effective_profile,
                         execution_semantics=execution_semantics,
-                        outward_action=(
-                            node.id
-                            in package.sidecar.get("outward_action_nodes", ())
-                        ),
+                        outward_action=outward_action,
                     )
                     return
                 if phase5_continuity and remaining_iterations <= 0:
@@ -4810,10 +4817,7 @@ class RunScheduler:
                         execution_limits,
                         language_profile=package.language.effective_profile,
                         execution_semantics=execution_semantics,
-                        outward_action=(
-                            node.id
-                            in package.sidecar.get("outward_action_nodes", ())
-                        ),
+                        outward_action=outward_action,
                     )
                     return
                 if (
@@ -4837,10 +4841,7 @@ class RunScheduler:
                         execution_limits,
                         language_profile=package.language.effective_profile,
                         execution_semantics=execution_semantics,
-                        outward_action=(
-                            node.id
-                            in package.sidecar.get("outward_action_nodes", ())
-                        ),
+                        outward_action=outward_action,
                     )
                     return
                 approved_action_digest = self.store.consume_action_grant(claim)
@@ -5183,10 +5184,7 @@ class RunScheduler:
                             ),
                             structured_output=structured_output,
                             structured_output_decision=structured_output_decision,
-                            outward_action=(
-                                node.id
-                                in package.sidecar.get("outward_action_nodes", ())
-                            ),
+                            outward_action=outward_action,
                             monotonic=self._monotonic,
                             termination_policy=TerminationPolicy(
                                 cooperative_grace_seconds=(
@@ -5301,14 +5299,16 @@ class RunScheduler:
                     else:
                         consumed_now = remaining_iterations
                     iteration_consumed = min(
-                        90,
+                        model_iteration_limit,
                         consumed_iterations_before + consumed_now,
                     )
                     result_metadata.update({
                         "model_calls": consumed_now,
                         "model_calls_exact": model_calls_exact,
                         "iteration_consumed": iteration_consumed,
-                        "remaining_iterations": 90 - iteration_consumed,
+                        "remaining_iterations": (
+                            model_iteration_limit - iteration_consumed
+                        ),
                     })
                     if claimed_deadline_budget is not None:
                         result_metadata["remaining_wall_seconds"] = (
@@ -5326,9 +5326,7 @@ class RunScheduler:
                 execution_limits,
                 language_profile=package.language.effective_profile,
                 execution_semantics=execution_semantics,
-                outward_action=(
-                    node.id in package.sidecar.get("outward_action_nodes", ())
-                ),
+                outward_action=outward_action,
             )
         except RuntimeError as exc:
             if "execution fence" in str(exc):

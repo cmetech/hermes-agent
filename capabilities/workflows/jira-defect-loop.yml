@@ -1,0 +1,346 @@
+name: jira-defect-loop
+description: Process one immutable bounded Jira defect manifest through approved GitLab fixes
+tags: [ericsson, jira, gitlab, batch]
+requires: [ericsson-jira, ericsson-gitlab]
+nodes:
+  - id: fetch-ticket-manifest
+    prompt: >
+      Call jira_my_tickets exactly one time with {"max_results": 25}. Do not
+      retry, page, refresh, or make any second manifest call. From that one
+      response, preserve first occurrence order, deduplicate exact Jira keys,
+      and return at most 25 keys. This ordered result is the immutable run
+      manifest: tickets discovered later must wait for the next run. Return an
+      empty manifest when the one successful response contains no tickets;
+      malformed, uncorroborated, or ambiguous results must fail closed.
+    allowed_tools: [jira_my_tickets]
+    maxTurns: 2
+    retry: {max_attempts: 1}
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [status, count, tickets, warnings]
+      properties:
+        status: {type: string, enum: [ready, empty]}
+        count: {type: integer, minimum: 0, maximum: 25}
+        tickets:
+          type: array
+          maxItems: 25
+          uniqueItems: true
+          items:
+            type: object
+            additionalProperties: false
+            required: [key]
+            properties:
+              key: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z][A-Za-z0-9_]*-[0-9]+$'}
+        warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
+
+  - id: process-ticket-manifest
+    depends_on: [fetch-ticket-manifest]
+    when: "$fetch-ticket-manifest.output.count > 0"
+    loop_group:
+      until: BATCH_COMPLETE
+      max_iterations: 25
+      fresh_context: true
+      nodes:
+        - id: prepare-writes
+          prompt: >
+            Select exactly the first not-yet-recorded key from immutable ordered
+            manifest $fetch-ticket-manifest.output using only the immediately
+            previous cumulative JSON $LOOP_PREV.record-cumulative-state.output.
+            Call jira_get_issue once for that exact key, classify it, and only
+            for a corroborated code fix use gitlab_resolve_project,
+            gitlab_list_repository_tree, and gitlab_read_file for bounded
+            read-only research. Prepare, but do not execute, the smallest exact
+            write plan. Preserve first-occurrence order, never refresh or append
+            the manifest, and bind every proposed operation to the exact ticket,
+            project, target, bounded payload, and canonical payload digest. Set
+            each should_* flag to zero unless the exact write is fully
+            corroborated. Triage confidence is never authorization.
+          allowed_tools: [jira_get_issue, gitlab_resolve_project, gitlab_list_repository_tree, gitlab_read_file]
+          retry: {max_attempts: 1}
+          output_format:
+            type: object
+            additionalProperties: false
+            required: [ticket_key, manifest_count, project_id, project_path, source_branch, branch_name, commit_message, actions, merge_request_title, merge_request_description, jira_comment, should_create_branch, should_commit, should_create_merge_request, should_comment_jira, branch_intent_digest, commit_intent_digest, merge_request_intent_digest, jira_comment_intent_digest, terminal_outcome, warnings]
+            properties:
+              ticket_key: {type: string, minLength: 1, maxLength: 128}
+              manifest_count: {type: integer, minimum: 1, maximum: 25}
+              project_id: {type: [integer, "null"], minimum: 1}
+              project_path: {type: [string, "null"], maxLength: 2048}
+              source_branch: {type: [string, "null"], maxLength: 512}
+              branch_name: {type: [string, "null"], maxLength: 512}
+              commit_message: {type: [string, "null"], maxLength: 4096}
+              actions:
+                type: array
+                maxItems: 50
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [action, file_path, content_digest]
+                  properties:
+                    action: {type: string, enum: [create, update, delete]}
+                    file_path: {type: string, minLength: 1, maxLength: 4096}
+                    content_digest: {type: string, minLength: 1, maxLength: 256}
+              merge_request_title: {type: [string, "null"], maxLength: 255}
+              merge_request_description: {type: [string, "null"], maxLength: 16384}
+              jira_comment: {type: [string, "null"], maxLength: 16384}
+              should_create_branch: {type: integer, enum: [0, 1]}
+              should_commit: {type: integer, enum: [0, 1]}
+              should_create_merge_request: {type: integer, enum: [0, 1]}
+              should_comment_jira: {type: integer, enum: [0, 1]}
+              branch_intent_digest: {type: [string, "null"], maxLength: 256}
+              commit_intent_digest: {type: [string, "null"], maxLength: 256}
+              merge_request_intent_digest: {type: [string, "null"], maxLength: 256}
+              jira_comment_intent_digest: {type: [string, "null"], maxLength: 256}
+              terminal_outcome: {type: string, enum: [fixed, not_found, permission, needs_info, manual_review, not_a_code_fix, safely_skipped]}
+              warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
+
+        - id: approve-branch
+          depends_on: [prepare-writes]
+          when: "$prepare-writes.output.should_create_branch == 1"
+          approval:
+            message: >
+              Approve this current exact branch creation only: ticket
+              $prepare-writes.output.ticket_key; project
+              $prepare-writes.output.project_id; source
+              $prepare-writes.output.source_branch; branch
+              $prepare-writes.output.branch_name; intent digest
+              $prepare-writes.output.branch_intent_digest; this approval binds
+              only this run, iteration, operation, current attempt, and payload.
+            capture_response: true
+
+        - id: create-branch
+          depends_on: [approve-branch, prepare-writes]
+          when: "$prepare-writes.output.should_create_branch == 1"
+          prompt: >
+            Reconcile the current approved intent and digest
+            $prepare-writes.output.branch_intent_digest, then call
+            gitlab_create_branch once for the exact approved project, source,
+            and branch. Request the connector host's current-action approval.
+            If the result is ambiguous, stop in read-only reconciliation and
+            return failed; never retry or duplicate the mutation.
+          allowed_tools: [gitlab_create_branch]
+          retry: {max_attempts: 1}
+          output_format: &write_result
+            type: object
+            additionalProperties: false
+            required: [ticket_key, operation, status, object_id, web_url, warnings, attention_needed, reconciliation_status]
+            properties:
+              ticket_key: {type: string, minLength: 1, maxLength: 128}
+              operation: {type: string, enum: [create_branch, commit_changes, create_merge_request, add_jira_comment]}
+              status: {type: string, enum: [success, failed, permission, safely_skipped]}
+              object_id: {type: [string, "null"], maxLength: 512}
+              web_url: {type: [string, "null"], maxLength: 4096}
+              warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
+              attention_needed: {type: boolean}
+              reconciliation_status: {type: string, enum: [not_required, confirmed, failed_closed]}
+
+        - id: approve-commit
+          depends_on: [create-branch, prepare-writes]
+          when: "$prepare-writes.output.should_commit == 1"
+          approval:
+            message: >
+              Approve this current exact commit only: ticket
+              $prepare-writes.output.ticket_key; project
+              $prepare-writes.output.project_id; branch
+              $prepare-writes.output.branch_name; message
+              $prepare-writes.output.commit_message; bounded actions
+              $prepare-writes.output.actions; intent digest
+              $prepare-writes.output.commit_intent_digest; this approval binds
+              only this run, iteration, operation, current attempt, and payload.
+            capture_response: true
+
+        - id: commit-changes
+          depends_on: [approve-commit, prepare-writes, create-branch]
+          when: "$prepare-writes.output.should_commit == 1"
+          prompt: >
+            Reconcile the current approved intent and digest
+            $prepare-writes.output.commit_intent_digest, dry-run the exact
+            bounded actions, then call gitlab_commit_changes once. Request the
+            connector host's current-action approval. An ambiguous result must
+            stop in read-only reconciliation and return failed; never retry or
+            duplicate the mutation.
+          allowed_tools: [gitlab_commit_changes]
+          retry: {max_attempts: 1}
+          output_format: *write_result
+
+        - id: approve-merge-request
+          depends_on: [commit-changes, prepare-writes]
+          when: "$prepare-writes.output.should_create_merge_request == 1"
+          approval:
+            message: >
+              Approve this current exact merge request only: ticket
+              $prepare-writes.output.ticket_key; project
+              $prepare-writes.output.project_id; source
+              $prepare-writes.output.branch_name; target
+              $prepare-writes.output.source_branch; title
+              $prepare-writes.output.merge_request_title; description
+              $prepare-writes.output.merge_request_description; intent digest
+              $prepare-writes.output.merge_request_intent_digest; this approval
+              binds only this run, iteration, operation, current attempt, and payload.
+            capture_response: true
+
+        - id: create-merge-request
+          depends_on: [approve-merge-request, prepare-writes, commit-changes]
+          when: "$prepare-writes.output.should_create_merge_request == 1"
+          prompt: >
+            Reconcile the exact current approved merge-request intent and digest
+            $prepare-writes.output.merge_request_intent_digest, then call
+            gitlab_create_merge_request once. Request the connector host's
+            current-action approval. On an ambiguous result, stop and use only
+            read-only reconciliation; never retry or create a duplicate.
+          allowed_tools: [gitlab_create_merge_request]
+          retry: {max_attempts: 1}
+          output_format: *write_result
+
+        - id: review-merge-request
+          depends_on: [create-merge-request, prepare-writes]
+          prompt: >
+            When a merge request was successfully created, call
+            gitlab_read_merge_request once to corroborate its exact identity.
+            Otherwise call no tool and return safely_skipped. This is read-only
+            reconciliation and must never create another merge request.
+          allowed_tools: [gitlab_read_merge_request]
+          retry: {max_attempts: 1}
+          output_format:
+            type: object
+            additionalProperties: false
+            required: [ticket_key, status, merge_request_id, merge_request_url, warnings]
+            properties:
+              ticket_key: {type: string, minLength: 1, maxLength: 128}
+              status: {type: string, enum: [success, failed, permission, safely_skipped]}
+              merge_request_id: {type: [string, "null"], maxLength: 512}
+              merge_request_url: {type: [string, "null"], maxLength: 4096}
+              warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
+
+        - id: approve-jira-comment
+          depends_on: [review-merge-request, prepare-writes]
+          when: "$prepare-writes.output.should_comment_jira == 1"
+          approval:
+            message: >
+              Approve this current exact Jira comment only: ticket
+              $prepare-writes.output.ticket_key; comment
+              $prepare-writes.output.jira_comment; intent digest
+              $prepare-writes.output.jira_comment_intent_digest; this approval
+              binds only this run, iteration, operation, current attempt, and payload.
+            capture_response: true
+
+        - id: update-jira
+          depends_on: [approve-jira-comment, prepare-writes, review-merge-request]
+          when: "$prepare-writes.output.should_comment_jira == 1"
+          prompt: >
+            Reconcile the exact current approved Jira comment intent and digest
+            $prepare-writes.output.jira_comment_intent_digest, then call
+            jira_add_comment once for the exact ticket and comment. Request the
+            connector host's current-action approval. If the result is
+            ambiguous, stop in read-only reconciliation and return failed;
+            never retry or duplicate the comment.
+          allowed_tools: [jira_add_comment]
+          retry: {max_attempts: 1}
+          output_format: *write_result
+
+        - id: publish-ticket-record
+          depends_on: [create-branch, commit-changes, review-merge-request, update-jira, prepare-writes]
+          prompt: >
+            Publish exactly one successful terminal record for manifest ticket
+            $prepare-writes.output.ticket_key; expected non-error outcomes are
+            not_found, permission, needs_info, manual_review, not_a_code_fix,
+            and safely_skipped. Use fixed only when every created identity is
+            corroborated. Preserve bounded warnings and make reconciliation
+            failure visible; never turn it into another write attempt.
+          allowed_tools: []
+          retry: {max_attempts: 1}
+          output_type: JiraDefectTicketRecord
+          output_format:
+            type: object
+            additionalProperties: false
+            required: [ticket_key, outcome, status, project_path, branch_name, commit_id, merge_request_url, jira_comment_id, warnings, attention_needed, reconciliation_status]
+            properties:
+              ticket_key: {type: string, minLength: 1, maxLength: 128}
+              outcome: {type: string, enum: [fixed, not_found, permission, needs_info, manual_review, not_a_code_fix, safely_skipped]}
+              status: {type: string, const: terminal}
+              project_path: {type: [string, "null"], maxLength: 2048}
+              branch_name: {type: [string, "null"], maxLength: 512}
+              commit_id: {type: [string, "null"], maxLength: 512}
+              merge_request_url: {type: [string, "null"], maxLength: 4096}
+              jira_comment_id: {type: [string, "null"], maxLength: 512}
+              warnings: {type: array, maxItems: 50, items: {type: string, maxLength: 1024}}
+              attention_needed: {type: boolean}
+              reconciliation_status: {type: string, enum: [not_required, confirmed, failed_closed]}
+
+        - id: record-cumulative-state
+          depends_on: [publish-ticket-record, prepare-writes]
+          prompt: >
+            Append $publish-ticket-record.output exactly once to the ordered
+            bounded records in $LOOP_PREV.record-cumulative-state.output, or
+            start an empty cumulative object on iteration one. Preserve
+            immutable manifest order, reject duplicate keys, and emit compact
+            valid JSON with manifest_count, completed_count, records, and
+            bounded outcome counts. Append
+            <promise>BATCH_COMPLETE</promise> only after completed_count equals
+            $prepare-writes.output.manifest_count; the text before that marker
+            must remain valid JSON after marker stripping.
+          allowed_tools: []
+          retry: {max_attempts: 1}
+
+  - id: publish-empty-json
+    depends_on: [fetch-ticket-manifest]
+    when: "$fetch-ticket-manifest.output.count == 0"
+    prompt: >
+      Publish the empty ordered Jira defect aggregate as bounded JSON with zero
+      manifest and completed counts, empty records, empty counts, and no warnings.
+    allowed_tools: []
+    output_type: JiraDefectAggregateJson
+    output_format: &aggregate_json
+      type: object
+      additionalProperties: false
+      required: [manifest_count, completed_count, records, counts, warnings]
+      properties:
+        manifest_count: {type: integer, minimum: 0, maximum: 25}
+        completed_count: {type: integer, minimum: 0, maximum: 25}
+        records:
+          type: array
+          maxItems: 25
+          items:
+            type: object
+            additionalProperties: false
+            required: [ticket_key, outcome]
+            properties:
+              ticket_key: {type: string, minLength: 1, maxLength: 128}
+              outcome: {type: string, enum: [fixed, not_found, permission, needs_info, manual_review, not_a_code_fix, safely_skipped]}
+        counts:
+          type: object
+          maxProperties: 7
+          additionalProperties: {type: integer, minimum: 0, maximum: 25}
+        warnings: {type: array, maxItems: 50, items: {type: string, maxLength: 1024}}
+
+  - id: publish-empty-markdown
+    depends_on: [fetch-ticket-manifest]
+    when: "$fetch-ticket-manifest.output.count == 0"
+    prompt: >
+      Publish a bounded Markdown summary stating that the immutable Jira defect
+      manifest was empty and no ticket writes were attempted.
+    allowed_tools: []
+    output_type: JiraDefectAggregateMarkdown
+
+  - id: publish-aggregate-json
+    depends_on: [process-ticket-manifest, fetch-ticket-manifest]
+    when: "$fetch-ticket-manifest.output.count > 0"
+    prompt: >
+      Parse the marker-stripped valid cumulative JSON
+      $process-ticket-manifest.output and publish the same records in immutable
+      manifest order as bounded aggregate JSON. Do not add or reorder tickets.
+    allowed_tools: []
+    output_type: JiraDefectAggregateJson
+    output_format: *aggregate_json
+
+  - id: publish-aggregate-markdown
+    depends_on: [process-ticket-manifest, fetch-ticket-manifest]
+    when: "$fetch-ticket-manifest.output.count > 0"
+    prompt: >
+      Render bounded human-readable Markdown from ordered cumulative JSON
+      $process-ticket-manifest.output; include each exact ticket outcome,
+      attention flag, warnings, and corroborated Jira/GitLab links. Do not
+      perform writes or introduce tickets outside the immutable manifest.
+    allowed_tools: []
+    output_type: JiraDefectAggregateMarkdown

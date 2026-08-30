@@ -501,6 +501,14 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
         _validate_thinking(node["thinking"], f"{path}.thinking")
     if "maxBudgetUsd" in node:
         _positive_number(node["maxBudgetUsd"], f"{path}.maxBudgetUsd")
+    if "maxTurns" in node:
+        turns = node["maxTurns"]
+        if isinstance(turns, bool) or not isinstance(turns, int) or not 1 <= turns <= 90:
+            _fail(
+                f"{path}.maxTurns",
+                "invalid_max_turns",
+                f"{path}.maxTurns must be an integer between 1 and 90",
+            )
     if "sandbox" in node:
         _mapping(node["sandbox"], f"{path}.sandbox")
     if "mcp" in node:
@@ -2327,9 +2335,12 @@ def _validate_sidecar_node_references(
 
 def _expand_root_sidecar_node_references(
     sidecar: Mapping[str, Any],
-    nodes: tuple[WorkflowNode, ...],
+    definition: WorkflowDefinition,
+    *,
+    allow_scoped: bool = False,
 ) -> Mapping[str, Any]:
     """Resolve only root-authored executable and include IDs into final nodes."""
+    nodes = definition.nodes
     root_node_ids = {
         node.id
         for node in nodes
@@ -2344,8 +2355,20 @@ def _expand_root_sidecar_node_references(
             [],
         ).append(node.id)
     expanded: list[str] = []
+    scoped_ids = (
+        frozenset(
+            scoped.semantic_id
+            for scoped in iter_scoped_workflow_nodes(definition)
+            if scoped.group_id is not None
+        )
+        if allow_scoped
+        else frozenset()
+    )
     for authored_id in sidecar.get("outward_action_nodes", ()):
         if authored_id in root_node_ids:
+            expanded.append(authored_id)
+            continue
+        if authored_id in scoped_ids:
             expanded.append(authored_id)
             continue
         instance_nodes = include_instances.get(authored_id)
@@ -2734,8 +2757,23 @@ def _compile_workflow_source_document(
         selection.effective_profile,
         selected_normalizer_version,
     ):
-        sidecar = _expand_root_sidecar_node_references(sidecar, nodes)
-    node_ids = frozenset(node.id for node in nodes)
+        sidecar = _expand_root_sidecar_node_references(
+            sidecar,
+            definition,
+            allow_scoped=supports_phase6_semantics(
+                selection.effective_profile,
+                selected_normalizer_version,
+            ),
+        )
+    node_ids = frozenset(
+        scoped.semantic_id
+        for scoped in iter_scoped_workflow_nodes(definition)
+        if scoped.group_id is None
+        or supports_phase6_semantics(
+            selection.effective_profile,
+            selected_normalizer_version,
+        )
+    )
     _validate_sidecar_node_references(sidecar, node_ids)
     try:
         normalized = normalize_workflow(

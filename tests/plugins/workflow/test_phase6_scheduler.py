@@ -791,6 +791,38 @@ def test_persistent_ai_child_reuses_scoped_session_across_iterations(
     assert store.pending_session_registry_update(run_id) is None
 
 
+def test_v6_ai_child_max_turns_reaches_real_runner_and_accounting(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-turn-cap",
+        nodes=[
+            _group(
+                [{"id": "ask", "prompt": "continue", "maxTurns": 2}],
+                maximum=1,
+                provider="openrouter",
+                model="openai/gpt-5.4",
+            )
+        ],
+        provider="openrouter",
+        model="openai/gpt-5.4",
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-turn-cap")
+    runner = PersistentRunner()
+
+    result = RunScheduler(
+        store, agent_runner=runner, max_parallel_nodes=1
+    ).advance_all([run_id])[run_id]
+
+    assert [request.max_iterations for request in runner.requests] == [2]
+    state = result["nodes"]["group"]["loop_group"]["body"]["ask"]
+    assert state["iteration_consumed"] == 1
+    assert state["remaining_iterations"] == 1
+
+
 def test_current_outer_and_previous_outputs_stay_in_their_scopes(
     tmp_path, workflow_writer
 ) -> None:

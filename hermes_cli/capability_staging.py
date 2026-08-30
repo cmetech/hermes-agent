@@ -623,7 +623,20 @@ def _verified_workflow_package(
     catalog = WorkflowCatalogSnapshot.capture(sources)
     verified: list[tuple[str, str, object, object | None]] = []
     for source in sources:
-        compilation = compile_workflow(source, catalog)
+        normalizer_version = (
+            6
+            if any(node.node_type == "loop_group" for node in source.nodes)
+            else None
+        )
+        compilation = compile_workflow(
+            source,
+            catalog,
+            **(
+                {"normalizer_version": normalizer_version}
+                if normalizer_version is not None
+                else {}
+            ),
+        )
         package = compilation.package
         expected = packages.get(package.definition.name)
         phase4 = supports_phase4_semantics(
