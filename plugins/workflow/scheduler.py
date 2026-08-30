@@ -2500,6 +2500,73 @@ class RunScheduler:
                 int(controller["iteration"]),
                 body_nodes[0].id,
             )
+            for child_node in body_nodes:
+                child_state = body.get(child_node.id)
+                if (
+                    not isinstance(child_state, Mapping)
+                    or child_state.get("state") != "ready"
+                ):
+                    continue
+                child_scope = replace(scope, node_id=child_node.id)
+                dependency_states = [
+                    str(body[dependency].get("state"))
+                    for dependency in child_node.depends_on
+                ]
+                triggered = evaluate_trigger_rule(
+                    str(child_node.options.get("trigger_rule", "all_success")),
+                    dependency_states,
+                )
+                if triggered is False:
+                    return self.store.transition_loop_group_child_graph(
+                        child_scope,
+                        state="skipped",
+                        code="trigger_rule_not_satisfied",
+                        message="trigger rule evaluated false",
+                        expected_state_version=int(projection["state_version"]),
+                        execution_fence=self.execution_fence,
+                    )
+                condition = child_node.options.get("when")
+                if not isinstance(condition, str):
+                    continue
+
+                def resolve_scoped_condition_output(node_id: str) -> object:
+                    if node_id in body:
+                        return self._resolve_loop_child_output(
+                            projection,
+                            child_scope,
+                            node_id,
+                            previous=False,
+                        )
+                    if node_id in group.depends_on:
+                        return self._output_values(
+                            projection,
+                            self.store.run_directory(run_id),
+                            node_ids=(node_id,),
+                        ).get(node_id)
+                    return None
+
+                try:
+                    matches = evaluate_v3_condition(
+                        condition, resolve_scoped_condition_output
+                    )
+                except (WorkflowConditionError, WorkflowOutputReferenceError) as exc:
+                    return self.store.transition_loop_group_child_graph(
+                        child_scope,
+                        state="failed",
+                        code=exc.code,
+                        message=str(exc),
+                        expected_state_version=int(projection["state_version"]),
+                        execution_fence=self.execution_fence,
+                    )
+                if not matches:
+                    return self.store.transition_loop_group_child_graph(
+                        child_scope,
+                        state="skipped",
+                        code="condition_false",
+                        message="condition evaluated false",
+                        expected_state_version=int(projection["state_version"]),
+                        execution_fence=self.execution_fence,
+                    )
             failed = next(
                 (
                     child
@@ -4961,15 +5028,16 @@ class RunScheduler:
                         self.store.release_claim_before_execution(claim)
                         return
                     structured_output = package.language.structured_outputs.get(
-                        node.id
+                        work_item.semantic_id
                     )
                     structured_output_decision = (
                         _sealed_structured_output_decision(
                             projection,
-                            node.id,
+                            work_item.semantic_id,
                             structured_output.schema_fingerprint,
                         )
                         if structured_output is not None
+                        and node.node_type in {"command", "prompt", "loop"}
                         else None
                     )
                     runtime_node = node

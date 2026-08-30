@@ -15,7 +15,7 @@ nodes:
       name: jira_my_tickets
       arguments: {max_results: 25}
       result:
-        items_path: items
+        items_path: result.items
         select: [key]
         output_items_path: tickets
         output_count_path: count
@@ -166,6 +166,7 @@ nodes:
 
         - id: approve-branch
           depends_on: [prepare-writes]
+          when: "$prepare-writes.output.should_create_branch == 1"
           approval:
             message: >
               Approve only this current branch operation. Enabled flag:
@@ -177,6 +178,7 @@ nodes:
 
         - id: create-branch
           depends_on: [approve-branch, prepare-writes]
+          when: "$prepare-writes.output.should_create_branch == 1"
           prompt: >
             The approved exact payload is $prepare-writes.output.branch_args
             with intent digest $prepare-writes.output.branch_intent_digest; if
@@ -194,7 +196,7 @@ nodes:
             properties:
               ticket_key: {type: string, minLength: 1, maxLength: 128}
               operation: {type: string, enum: [create_branch, commit_changes, create_merge_request, add_jira_comment]}
-              status: {type: string, enum: [success, failed, permission, safely_skipped]}
+              status: {type: string, const: success}
               object_id: {type: [string, "null"], maxLength: 512}
               web_url: {type: [string, "null"], maxLength: 4096}
               warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
@@ -203,6 +205,7 @@ nodes:
 
         - id: approve-commit
           depends_on: [create-branch, prepare-writes]
+          when: "$prepare-writes.output.should_commit == 1 && $create-branch.output.status == 'success'"
           approval:
             message: >
               Approve only this current commit operation. Enabled flag:
@@ -215,6 +218,7 @@ nodes:
 
         - id: commit-changes
           depends_on: [approve-commit, prepare-writes, create-branch]
+          when: "$prepare-writes.output.should_commit == 1 && $create-branch.output.status == 'success'"
           prompt: >
             The approved exact payload is $prepare-writes.output.commit_args
             with intent digest $prepare-writes.output.commit_intent_digest; if
@@ -229,6 +233,7 @@ nodes:
 
         - id: approve-merge-request
           depends_on: [commit-changes, prepare-writes]
+          when: "$prepare-writes.output.should_create_merge_request == 1 && $commit-changes.output.status == 'success'"
           approval:
             message: >
               Approve only this current merge-request operation. Enabled flag:
@@ -241,6 +246,7 @@ nodes:
 
         - id: create-merge-request
           depends_on: [approve-merge-request, prepare-writes, commit-changes]
+          when: "$prepare-writes.output.should_create_merge_request == 1 && $commit-changes.output.status == 'success'"
           prompt: >
             The approved exact payload is
             $prepare-writes.output.merge_request_args with intent digest
@@ -256,6 +262,7 @@ nodes:
 
         - id: review-merge-request
           depends_on: [create-merge-request, prepare-writes]
+          when: "$prepare-writes.output.should_create_merge_request == 1 && $create-merge-request.output.status == 'success'"
           prompt: >
             If merge-request creation succeeded, call
             gitlab_read_merge_request once to corroborate its exact identity.
@@ -268,13 +275,14 @@ nodes:
             required: [ticket_key, status, merge_request_id, merge_request_url, warnings]
             properties:
               ticket_key: {type: string, minLength: 1, maxLength: 128}
-              status: {type: string, enum: [success, failed, permission, safely_skipped]}
+              status: {type: string, const: success}
               merge_request_id: {type: [string, "null"], maxLength: 512}
               merge_request_url: {type: [string, "null"], maxLength: 4096}
               warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
 
         - id: approve-jira-comment
           depends_on: [review-merge-request, prepare-writes]
+          when: "$prepare-writes.output.should_comment_jira == 1 && $review-merge-request.output.status == 'success'"
           approval:
             message: >
               Approve only this current Jira comment operation. Enabled flag:
@@ -286,6 +294,7 @@ nodes:
 
         - id: update-jira
           depends_on: [approve-jira-comment, prepare-writes, review-merge-request]
+          when: "$prepare-writes.output.should_comment_jira == 1 && $review-merge-request.output.status == 'success'"
           prompt: >
             The approved exact payload is
             $prepare-writes.output.jira_comment_args with intent digest
@@ -301,26 +310,12 @@ nodes:
 
         - id: publish-ticket-record
           depends_on: [create-branch, commit-changes, review-merge-request, update-jira, prepare-writes]
+          trigger_rule: none_failed_min_one_success
           script: |
             const plan = $prepare-writes.output;
-            const branch = $create-branch.output;
-            const commit = $commit-changes.output;
-            const review = $review-merge-request.output;
-            const jira = $update-jira.output;
-            const writes = [branch, commit, jira];
-            if ([branch, commit, review, jira].some((row) => row.ticket_key !== plan.ticket_key)) throw new Error("write result ticket mismatch");
-            const warnings = [...plan.warnings, ...branch.warnings, ...commit.warnings, ...review.warnings, ...jira.warnings].slice(0, 50);
-            const failedClosed = writes.some((row) => row.reconciliation_status === "failed_closed");
-            const permission = [...writes, review].some((row) => row.status === "permission");
-            const failed = [...writes, review].some((row) => row.status === "failed");
             const enabled = [plan.should_create_branch, plan.should_commit, plan.should_create_merge_request, plan.should_comment_jira];
-            const results = [branch, commit, {status: review.status}, jira];
-            const fixed = enabled.every((flag, index) => flag === 0 || results[index].status === "success");
-            let outcome = plan.terminal_outcome;
-            if (failedClosed || failed) outcome = "manual_review";
-            else if (permission) outcome = "permission";
-            else if (outcome === "fixed" && !fixed) outcome = "manual_review";
-            console.log(JSON.stringify({ticket_key: plan.ticket_key, outcome, status: "terminal", project_path: plan.project_path, branch_name: plan.branch_name, commit_id: commit.object_id, merge_request_url: review.merge_request_url, jira_comment_id: jira.object_id, warnings, attention_needed: failedClosed || failed || permission || outcome === "manual_review", reconciliation_status: failedClosed ? "failed_closed" : (enabled.some(Boolean) ? "confirmed" : "not_required")}));
+            const attention = plan.terminal_outcome === "permission" || plan.terminal_outcome === "manual_review";
+            console.log(JSON.stringify({ticket_key: plan.ticket_key, outcome: plan.terminal_outcome, status: "terminal", project_path: plan.project_path, branch_name: plan.branch_name, commit_id: null, merge_request_url: null, jira_comment_id: null, warnings: plan.warnings.slice(0, 50), attention_needed: attention, reconciliation_status: enabled.some(Boolean) ? "confirmed" : "not_required"}));
           runtime: bun
           artifacts: false
           output_type: JiraDefectTicketRecord
@@ -353,11 +348,38 @@ nodes:
             const records = [...prior.records, current];
             const counts = {...prior.counts, [current.outcome]: prior.counts[current.outcome] + 1};
             if (Object.values(counts).reduce((sum, count) => sum + count, 0) !== records.length) throw new Error("terminal aggregate mismatch");
-            const state = {manifest_count: selected.manifest_count, completed_count: records.length, records, counts, warnings: records.flatMap((row) => row.warnings).slice(0, 50)};
-            const marker = records.length === selected.manifest_count ? "\n<promise>BATCH_COMPLETE</promise>" : "";
-            console.log(JSON.stringify(state) + marker);
+            const completion_marker = records.length === selected.manifest_count ? "<promise>BATCH_COMPLETE</promise>" : "";
+            console.log(JSON.stringify({manifest_count: selected.manifest_count, completed_count: records.length, records, counts, warnings: records.flatMap((row) => row.warnings).slice(0, 50), completion_marker}));
           runtime: bun
           artifacts: false
+          output_type: JiraDefectAggregateJson
+          output_format:
+            type: object
+            additionalProperties: false
+            required: [manifest_count, completed_count, records, counts, warnings, completion_marker]
+            properties:
+              manifest_count: {type: integer, minimum: 1, maximum: 25}
+              completed_count: {type: integer, minimum: 1, maximum: 25}
+              records:
+                type: array
+                minItems: 1
+                maxItems: 25
+                uniqueItems: true
+                items: *ticket_record
+              counts: &outcome_counts
+                type: object
+                additionalProperties: false
+                required: [fixed, not_found, permission, needs_info, manual_review, not_a_code_fix, safely_skipped]
+                properties:
+                  fixed: {type: integer, minimum: 0, maximum: 25}
+                  not_found: {type: integer, minimum: 0, maximum: 25}
+                  permission: {type: integer, minimum: 0, maximum: 25}
+                  needs_info: {type: integer, minimum: 0, maximum: 25}
+                  manual_review: {type: integer, minimum: 0, maximum: 25}
+                  not_a_code_fix: {type: integer, minimum: 0, maximum: 25}
+                  safely_skipped: {type: integer, minimum: 0, maximum: 25}
+              warnings: {type: array, maxItems: 50, items: {type: string, maxLength: 1024}}
+              completion_marker: {type: string, enum: ["", "<promise>BATCH_COMPLETE</promise>"]}
 
   - id: publish-empty-json
     depends_on: [fetch-ticket-manifest]
@@ -379,18 +401,7 @@ nodes:
           maxItems: 25
           uniqueItems: true
           items: *ticket_record
-        counts:
-          type: object
-          additionalProperties: false
-          required: [fixed, not_found, permission, needs_info, manual_review, not_a_code_fix, safely_skipped]
-          properties:
-            fixed: {type: integer, minimum: 0, maximum: 25}
-            not_found: {type: integer, minimum: 0, maximum: 25}
-            permission: {type: integer, minimum: 0, maximum: 25}
-            needs_info: {type: integer, minimum: 0, maximum: 25}
-            manual_review: {type: integer, minimum: 0, maximum: 25}
-            not_a_code_fix: {type: integer, minimum: 0, maximum: 25}
-            safely_skipped: {type: integer, minimum: 0, maximum: 25}
+        counts: *outcome_counts
         warnings: {type: array, maxItems: 50, items: {type: string, maxLength: 1024}}
 
   - id: publish-empty-markdown
@@ -408,12 +419,13 @@ nodes:
     script: |
       const manifest = $fetch-ticket-manifest.output;
       const state = $process-ticket-manifest.output;
+      const {completion_marker, ...published} = state;
       const keys = manifest.tickets.map((ticket) => ticket.key);
       const recordKeys = state.records.map((record) => record.ticket_key);
-      if (manifest.count !== keys.length || state.manifest_count !== keys.length || state.completed_count !== keys.length || JSON.stringify(keys) !== JSON.stringify(recordKeys) || new Set(recordKeys).size !== recordKeys.length) throw new Error("final aggregate does not match immutable manifest");
+      if (completion_marker !== "" || manifest.count !== keys.length || state.manifest_count !== keys.length || state.completed_count !== keys.length || JSON.stringify(keys) !== JSON.stringify(recordKeys) || new Set(recordKeys).size !== recordKeys.length) throw new Error("final aggregate does not match immutable manifest");
       const countTotal = Object.values(state.counts).reduce((sum, count) => sum + count, 0);
       if (countTotal !== state.completed_count) throw new Error("final outcome counts do not reconcile");
-      console.log(JSON.stringify(state));
+      console.log(JSON.stringify(published));
     runtime: bun
     artifacts: false
     output_type: JiraDefectAggregateJson

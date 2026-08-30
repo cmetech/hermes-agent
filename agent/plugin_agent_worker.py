@@ -1352,7 +1352,13 @@ class _ToolCallAudit:
         source = _json_value(result)
         if not isinstance(source, dict):
             raise ValueError("tool_call_contract_violation: result is not an object")
-        items = source.get(str(projection["items_path"]))
+        items: object = source
+        for component in str(projection["items_path"]).split("."):
+            if not isinstance(items, dict) or component not in items:
+                raise ValueError(
+                    "tool_call_contract_violation: result items path is invalid"
+                )
+            items = items[component]
         maximum = int(projection["max_items"])
         selected = tuple(str(field) for field in projection["select"])
         if not isinstance(items, list) or len(items) > maximum:

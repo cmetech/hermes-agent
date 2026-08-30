@@ -555,8 +555,19 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
                 "invalid_tool_call_contract",
                 f"{contract_path}.result has an invalid projection shape",
             )
+        items_path = _string(
+            result["items_path"], f"{contract_path}.result.items_path"
+        )
+        components = items_path.split(".")
+        if len(components) > 8 or any(
+            not _SAFE_NAME.fullmatch(component) for component in components
+        ):
+            _fail(
+                f"{contract_path}.result.items_path",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result.items_path must be a portable dotted field path",
+            )
         for field in (
-            "items_path",
             "output_items_path",
             "output_count_path",
             "output_status_path",

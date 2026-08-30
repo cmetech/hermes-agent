@@ -7,13 +7,19 @@ import shutil
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from agent.structured_output import normalize_schema
 from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.loop import LoopExecutor
 from plugins.workflow.executors.script import ScriptExecutor
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowNode, freeze_value
+from plugins.workflow.models import (
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    WorkflowStructuredOutput,
+    freeze_value,
+)
 
 
 class FakeAgentRunner:
@@ -71,6 +77,21 @@ def _scoped(context: NodeExecutionContext, name: str) -> NodeExecutionContext:
     )
 
 
+def _structured(
+    execution: NodeExecutionContext, schema: dict[str, object]
+) -> NodeExecutionContext:
+    normalized = normalize_schema(schema)
+    return replace(
+        execution,
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+        structured_output=WorkflowStructuredOutput(
+            canonical_schema=normalized.canonical_schema,
+            schema_fingerprint=normalized.schema_fingerprint,
+        ),
+    )
+
+
 def test_context_preserves_top_level_paths_and_accepts_scoped_paths(tmp_path):
     base = context(tmp_path, node_id="n", attempt_id="a")
     assert base.effective_attempt_directory == tmp_path / "nodes" / "n" / "a"
@@ -103,6 +124,83 @@ def test_bash_executor_writes_scoped_attempt_and_publication_files(tmp_path: Pat
     assert tmp_path / result.artifacts[0].relative_path == execution.effective_attempt_directory / "stdout.txt"
 
 
+def test_v6_bash_rejects_output_that_violates_its_sealed_schema(tmp_path: Path) -> None:
+    execution = _structured(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="bash",
+                value="printf '{\"count\":2}'",
+                options={"output_type": "AggregateJson"},
+            ),
+            "structured-bash-invalid",
+        ),
+        {
+            "type": "object",
+            "properties": {"count": {"type": "integer", "maximum": 1}},
+            "required": ["count"],
+            "additionalProperties": False,
+        },
+    )
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_invalid"
+
+
+def test_v6_bash_rejects_empty_output_for_nonempty_schema(tmp_path: Path) -> None:
+    execution = _structured(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="bash",
+                value=":",
+                options={"output_type": "AggregateJson"},
+            ),
+            "structured-bash-empty",
+        ),
+        {"type": "object", "minProperties": 1},
+    )
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_invalid"
+
+
+def test_v6_bash_rejects_tampered_structured_output_identity(tmp_path: Path) -> None:
+    execution = _structured(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="bash",
+                value="printf '{\"count\":1}'",
+                options={"output_type": "AggregateJson"},
+            ),
+            "structured-bash-tamper",
+        ),
+        {
+            "type": "object",
+            "properties": {"count": {"const": 1}},
+            "required": ["count"],
+            "additionalProperties": False,
+        },
+    )
+    execution = replace(
+        execution,
+        structured_output=replace(
+            execution.structured_output,
+            schema_fingerprint="0" * 64,
+        ),
+    )
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_integrity"
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
 def test_script_executor_writes_scoped_attempt_and_publication_files(tmp_path: Path) -> None:
     execution = _scoped(
@@ -125,6 +223,106 @@ def test_script_executor_writes_scoped_attempt_and_publication_files(tmp_path: P
     assert (execution.effective_attempt_directory / "stdout.txt").read_text() == "script"
     assert (execution.effective_publication_directory / "script.txt").read_text() == "publication"
     assert tmp_path / result.artifacts[0].relative_path == execution.effective_attempt_directory / "stdout.txt"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_v6_script_validates_canonicalizes_and_authenticates_structured_output(
+    tmp_path: Path,
+) -> None:
+    execution = _structured(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="script",
+                value="console.log('{\"name\":\"ticket\", \"count\":1}')",
+                options={
+                    "runtime": "bun",
+                    "deps": (),
+                    "output_type": "AggregateJson",
+                },
+            ),
+            "structured-script-valid",
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "minimum": 1, "maximum": 1},
+                "name": {"const": "ticket"},
+            },
+            "required": ["count", "name"],
+            "additionalProperties": False,
+        },
+    )
+
+    result = ScriptExecutor().execute(execution)
+
+    assert result.status == "succeeded"
+    assert result.primary_output is not None
+    assert result.primary_output.schema_fingerprint == (
+        execution.structured_output.schema_fingerprint
+    )
+    assert result.primary_output.structured_value == freeze_value(
+        {"count": 1, "name": "ticket"}
+    )
+    output = tmp_path / result.primary_output.attempt_relative_path
+    assert output.name == "output.json"
+    assert output.read_bytes() == b'{"count":1,"name":"ticket"}'
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+@pytest.mark.parametrize(
+    "rendered",
+    [
+        '{"records":[],"completion_marker":"WRONG"}',
+        '{"records":[{"key":"A"},{"key":"A"}],"completion_marker":""}',
+        '{}',
+    ],
+)
+def test_v6_script_rejects_adversarial_aggregate_output(
+    tmp_path: Path, rendered: str
+) -> None:
+    execution = _structured(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="script",
+                value=f"console.log({rendered!r})",
+                options={
+                    "runtime": "bun",
+                    "deps": (),
+                    "output_type": "AggregateJson",
+                },
+            ),
+            f"structured-script-invalid-{abs(hash(rendered))}",
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "records": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 25,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "object",
+                        "properties": {"key": {"type": "string"}},
+                        "required": ["key"],
+                        "additionalProperties": False,
+                    },
+                },
+                "completion_marker": {
+                    "enum": ["", "<promise>BATCH_COMPLETE</promise>"]
+                },
+            },
+            "required": ["records", "completion_marker"],
+            "additionalProperties": False,
+        },
+    )
+
+    result = ScriptExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_invalid"
 
 
 def test_artifact_free_bash_rejects_even_an_empty_generated_artifact(

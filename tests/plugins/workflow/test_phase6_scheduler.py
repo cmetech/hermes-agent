@@ -604,6 +604,125 @@ def test_artifact_free_scoped_script_receives_zero_runtime_ceiling(
     assert executor.contexts[0].max_artifact_bytes == 0
 
 
+def test_scoped_script_receives_its_semantic_structured_output_contract(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-structured-script",
+        nodes=[
+            _group([
+                {
+                    "id": "reduce",
+                    "script": "console.log(JSON.stringify({present: 'yes'}))",
+                    "runtime": "bun",
+                    "output_format": {
+                        "type": "object",
+                        "properties": {"present": {"type": "string"}},
+                        "required": ["present"],
+                        "additionalProperties": False,
+                    },
+                }
+            ])
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-structured-script")
+    executor = SucceedingExecutor()
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["script"] = executor
+
+    scheduler.advance_all([run_id])
+
+    assert len(executor.contexts) == 1
+    assert executor.contexts[0].structured_output == (
+        compilation.package.language.structured_outputs["group/reduce"]
+    )
+    assert executor.contexts[0].structured_output_decision is None
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_zero_write_flag_skips_approval_and_tool_node_but_runs_terminal_reducer(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="conditional-write-skip",
+        nodes=[
+            _group([
+                {
+                    "id": "prepare",
+                    "script": "console.log(JSON.stringify({should_write: 0}))",
+                    "runtime": "bun",
+                    "artifacts": False,
+                    "output_format": {
+                        "type": "object",
+                        "properties": {"should_write": {"const": 0}},
+                        "required": ["should_write"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "id": "approve",
+                    "depends_on": ["prepare"],
+                    "when": "$prepare.output.should_write == 1",
+                    "approval": {"message": "must not pause"},
+                },
+                {
+                    "id": "write",
+                    "depends_on": ["prepare", "approve"],
+                    "when": "$prepare.output.should_write == 1",
+                    "prompt": "must not execute",
+                },
+                {
+                    "id": "finish",
+                    "depends_on": ["prepare", "approve", "write"],
+                    "trigger_rule": "none_failed_min_one_success",
+                    "script": (
+                        "const plan = $prepare.output; "
+                        "console.log(JSON.stringify({should_write: plan.should_write, "
+                        "completion: '<promise>DONE</promise>'}))"
+                    ),
+                    "runtime": "bun",
+                    "artifacts": False,
+                    "output_format": {
+                        "type": "object",
+                        "properties": {
+                            "should_write": {"const": 0},
+                            "completion": {
+                                "enum": ["", "<promise>DONE</promise>"]
+                            },
+                        },
+                        "required": ["should_write", "completion"],
+                        "additionalProperties": False,
+                    },
+                },
+            ])
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="conditional-write-skip")
+
+    class ForbiddenExecutor:
+        def execute(self, _context):
+            raise AssertionError("a guarded approval/write node executed")
+
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["approval"] = ForbiddenExecutor()
+    scheduler.executors["prompt"] = ForbiddenExecutor()
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    body = result["nodes"]["group"]["loop_group"]["body"]
+    assert body["prepare"]["state"] == "succeeded"
+    assert body["approve"]["state"] == "skipped"
+    assert body["write"]["state"] == "skipped"
+    assert body["finish"]["state"] == "succeeded"
+    assert result["nodes"]["group"]["state"] == "succeeded"
+
+
 def test_scoped_shared_context_uses_only_original_body_predecessor_evidence(
     tmp_path, workflow_writer
 ) -> None:

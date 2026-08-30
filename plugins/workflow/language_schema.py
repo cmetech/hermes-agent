@@ -2323,6 +2323,11 @@ def _schema_for_shape(
         return {"type": "integer", "minimum": 1, "maximum": 90}
     if shape == "tool_call_contract":
         text = {"type": "string", "minLength": 1, "pattern": r"^[A-Za-z0-9_-]+$"}
+        dotted_path = {
+            "type": "string",
+            "minLength": 1,
+            "pattern": r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,7}$",
+        }
         return {
             "type": "object",
             "properties": {
@@ -2331,7 +2336,7 @@ def _schema_for_shape(
                 "result": {
                     "type": "object",
                     "properties": {
-                        "items_path": text,
+                        "items_path": dotted_path,
                         "select": {
                             "type": "array",
                             "minItems": 1,

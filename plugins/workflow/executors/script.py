@@ -13,13 +13,20 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from agent.structured_output import (
+    StructuredOutputError,
+    StructuredOutputValidatorUnavailable,
+)
 from plugins.workflow.executors.base import (
     BoundedProcessOutput,
     NodeExecutionContext,
     NodeExecutionResult,
+    StructuredProcessOutputIntegrityError,
     process_tree_active,
+    validate_structured_process_output,
 )
 from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.output_resolution import PrimaryOutputCandidate
 from plugins.workflow.resources import (
     ResourceResolver,
     VariableContext,
@@ -438,7 +445,58 @@ class ScriptExecutor:
                 f"script node exited with status {returncode}",
                 metadata,
             )
-        return NodeExecutionResult("succeeded", tuple(artifacts), metadata=metadata)
+        try:
+            structured = validate_structured_process_output(context, output_text)
+        except StructuredOutputValidatorUnavailable as exc:
+            return NodeExecutionResult(
+                "failed",
+                tuple(artifacts),
+                "structured_output_unavailable",
+                str(exc),
+                metadata,
+            )
+        except StructuredProcessOutputIntegrityError as exc:
+            return NodeExecutionResult(
+                "failed",
+                tuple(artifacts),
+                "structured_output_integrity",
+                str(exc),
+                metadata,
+            )
+        except StructuredOutputError as exc:
+            return NodeExecutionResult(
+                "failed",
+                tuple(artifacts),
+                "structured_output_invalid",
+                str(exc),
+                metadata,
+            )
+        candidate = None
+        if structured is not None:
+            stdout_path.write_bytes(structured.canonical_bytes)
+            artifacts[0] = _artifact(
+                stdout_path, context.run_directory, structured.media_type
+            )
+            candidate = PrimaryOutputCandidate(
+                attempt_relative_path=artifacts[0].relative_path,
+                media_type=artifacts[0].media_type,
+                size_bytes=artifacts[0].size_bytes,
+                sha256=artifacts[0].sha256,
+                structured_value=structured.value,
+                schema_fingerprint=context.structured_output.schema_fingerprint,
+                canonicalization_version=structured.canonicalization_version,
+                output_type=(
+                    str(context.node.options["output_type"])
+                    if context.node.options.get("output_type") is not None
+                    else None
+                ),
+            )
+        return NodeExecutionResult(
+            "succeeded",
+            tuple(artifacts),
+            metadata=metadata,
+            primary_output=candidate,
+        )
 
 
 __all__ = ["ScriptExecutor"]

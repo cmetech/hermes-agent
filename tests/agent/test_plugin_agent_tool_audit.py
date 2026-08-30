@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 
 import pytest
@@ -11,7 +12,7 @@ CONTRACT = {
     "name": "jira_my_tickets",
     "arguments": {"max_results": 25},
     "result": {
-        "items_path": "items",
+        "items_path": "result.items",
         "select": ["key"],
         "output_items_path": "tickets",
         "output_count_path": "count",
@@ -27,22 +28,44 @@ def _completed(audit: _ToolCallAudit, call_id: str, args: dict, result: object) 
     audit.complete(call_id, "jira_my_tickets", args, json.dumps(result))
 
 
-def test_exact_tool_call_contract_derives_first_occurrence_manifest() -> None:
+@pytest.mark.parametrize(
+    ("items", "expected_status", "expected_tickets"),
+    [
+        (
+            [{"key": "ERIC-2"}, {"key": "ERIC-1"}, {"key": "ERIC-2"}],
+            "ready",
+            [{"key": "ERIC-2"}, {"key": "ERIC-1"}],
+        ),
+        ([], "empty", []),
+    ],
+)
+def test_real_jira_application_envelope_derives_manifest_without_network(
+    monkeypatch, items, expected_status, expected_tickets
+) -> None:
+    application = importlib.import_module("plugins.ericsson-jira.application")
+    configuration = object()
+
+    def invoke(name, arguments, observed_configuration, **_kwargs):
+        assert name == "jira_my_tickets"
+        assert arguments == {"max_results": 25}
+        assert observed_configuration is configuration
+        return {"items": items, "private": "transient secret"}
+
+    monkeypatch.setattr(application.jira_tools, "invoke", invoke)
+    envelope = application.execute(
+        "jira_my_tickets", {"max_results": 25}, configuration
+    )
     audit = _ToolCallAudit(CONTRACT, outward_action=False)
     args = {"max_results": 25}
     audit.start("one", "jira_my_tickets", args)
-    _completed(
-        audit,
-        "one",
-        args,
-        {
-            "items": [{"key": "ERIC-2"}, {"key": "ERIC-1"}, {"key": "ERIC-2"}],
-            "private": "transient secret",
-        },
-    )
+    _completed(audit, "one", args, envelope)
 
     evidence = audit.finalize(
-        {"status": "ready", "count": 2, "tickets": [{"key": "ERIC-2"}, {"key": "ERIC-1"}]}
+        {
+            "status": expected_status,
+            "count": len(expected_tickets),
+            "tickets": expected_tickets,
+        }
     )
 
     assert evidence == {
@@ -60,7 +83,7 @@ def test_exact_tool_call_contract_bounds_projected_untrusted_values() -> None:
         audit,
         "one",
         args,
-        {"items": [{"key": "X" * 4097}]},
+        {"success": True, "result": {"items": [{"key": "X" * 4097}]}},
     )
 
     with pytest.raises(ValueError, match="tool_call_contract_violation"):
@@ -82,12 +105,27 @@ def test_exact_tool_call_contract_rejects_every_non_exact_trace(mode: str) -> No
         audit.start("one", "jira_my_tickets", args)
         if mode == "parallel":
             audit.start("two", "jira_my_tickets", exact)
-        _completed(audit, "one", args, {"items": [{"key": "ERIC-1"}]})
+        _completed(
+            audit,
+            "one",
+            args,
+            {"success": True, "result": {"items": [{"key": "ERIC-1"}]}},
+        )
         if mode == "duplicate":
             audit.start("two", "jira_my_tickets", exact)
-            _completed(audit, "two", exact, {"items": [{"key": "ERIC-1"}]})
+            _completed(
+                audit,
+                "two",
+                exact,
+                {"success": True, "result": {"items": [{"key": "ERIC-1"}]}},
+            )
         elif mode == "parallel":
-            _completed(audit, "two", exact, {"items": [{"key": "ERIC-2"}]})
+            _completed(
+                audit,
+                "two",
+                exact,
+                {"success": True, "result": {"items": [{"key": "ERIC-2"}]}},
+            )
 
     with pytest.raises(ValueError, match="tool_call_contract_violation"):
         audit.finalize(
@@ -108,7 +146,12 @@ def test_exact_tool_call_contract_rejects_schema_valid_manifest_lies(output: dic
     audit = _ToolCallAudit(CONTRACT, outward_action=False)
     args = {"max_results": 25}
     audit.start("one", "jira_my_tickets", args)
-    _completed(audit, "one", args, {"items": [{"key": "ERIC-1"}]})
+    _completed(
+        audit,
+        "one",
+        args,
+        {"success": True, "result": {"items": [{"key": "ERIC-1"}]}},
+    )
 
     with pytest.raises(ValueError, match="tool_call_contract_violation"):
         audit.finalize(output)

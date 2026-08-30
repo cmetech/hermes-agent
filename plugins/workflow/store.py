@@ -11370,6 +11370,76 @@ class RunStore:
             now=now,
         )
 
+    def transition_loop_group_child_graph(
+        self,
+        scope: LoopGroupChildScope,
+        *,
+        state: str,
+        code: str,
+        message: str,
+        expected_state_version: int,
+        execution_fence: ExecutionFence | None = None,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """CAS one unclaimed v6 body child after trigger/condition evaluation."""
+        if state not in {"skipped", "failed"}:
+            raise ValueError("loop group graph state must be skipped or failed")
+        safe_message = _sanitize_v3_condition_diagnostic(message)
+        directory = self.run_directory(scope.run_id)
+        with workflow_lock(
+            self._run_lock_path(scope.run_id)
+        ), self._execution_fence_transaction(
+            execution_fence, now
+        ) as fence_connection:
+            projection = json.loads((directory / "run.json").read_text())
+            if int(projection["state_version"]) != expected_state_version:
+                raise RuntimeError("stale loop group state version")
+            child = _loop_group_child_state(projection, scope)
+            group = projection["nodes"][scope.group_id]
+            controller = group["loop_group"]
+            if (
+                projection.get("status") != "running"
+                or projection.get("desired_status") is not None
+                or group.get("state") != "running"
+                or controller.get("state") != "running"
+                or child.get("state") != "ready"
+            ):
+                return False
+            if child.get("attempts") or child.get("claim") is not None:
+                raise RuntimeError("loop group graph child already consumed an attempt")
+            child["state"] = state
+            child["retry_consumed"] = 0
+            payload: dict[str, object]
+            if state == "skipped":
+                child["skip_reason"] = code
+                payload = {"reason": code}
+                if code not in projection["warnings"]:
+                    projection["warnings"].append(code)
+            else:
+                projection["last_error"] = {
+                    "code": code,
+                    "message": safe_message,
+                    "node_id": scope.worker_node_id,
+                }
+                payload = {"error_code": code, "error_message": safe_message}
+            body = controller["body"]
+            for candidate in body.values():
+                if candidate.get("state") == "pending" and all(
+                    body[dependency].get("state") in {"succeeded", "skipped"}
+                    for dependency in candidate.get("depends_on", [])
+                ):
+                    candidate["state"] = "ready"
+            self._append_locked(
+                directory,
+                projection,
+                f"loop_group_child_{state}",
+                {**payload, "loop_group_scope": scope.durable_record()},
+                node_id=scope.worker_node_id,
+                defer_notification=fence_connection is not None,
+                reserve_connection=fence_connection,
+            )
+            return True
+
     def _drain_loop_group_transition_locked(
         self,
         directory: Path,

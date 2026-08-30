@@ -7,6 +7,14 @@ from pathlib import Path
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
+from agent.structured_output import (
+    StructuredOutputError,
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    StructuredOutputValue,
+    normalize_schema,
+    parse_validate_canonicalize,
+)
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.models import (
@@ -131,6 +139,60 @@ class NodeExecutionResult:
     session_registry_update: SessionRegistryUpdateCandidate | None = None
     session_registry_authority: SessionRegistryUpdateCandidate | None = None
     session_recovery_outcome: str | None = None
+
+
+class StructuredProcessOutputIntegrityError(ValueError):
+    """A sealed deterministic output declaration changed after admission."""
+
+
+def validate_structured_process_output(
+    context: NodeExecutionContext,
+    response: str,
+) -> StructuredOutputValue | None:
+    """Validate one v6 script/bash stdout value against its sealed schema."""
+    if (
+        context.language_profile is not WorkflowLanguageProfile.ARCHON_2026_07
+        or context.normalizer_version < 6
+    ):
+        return None
+    declared = context.structured_output
+    if declared is None:
+        if context.node.options.get("output_format") is not None:
+            raise StructuredProcessOutputIntegrityError(
+                "admitted structured-output schema is missing"
+            )
+        return None
+
+    def thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key): thaw(item) for key, item in value.items()}
+        if isinstance(value, tuple | list):
+            return [thaw(item) for item in value]
+        return value
+
+    try:
+        normalized = normalize_schema(thaw(declared.canonical_schema))
+    except StructuredOutputError as exc:
+        raise StructuredProcessOutputIntegrityError(
+            "admitted structured-output schema is invalid"
+        ) from exc
+    if (
+        normalized.schema_fingerprint != declared.schema_fingerprint
+        or declared.canonicalization_version != 1
+    ):
+        raise StructuredProcessOutputIntegrityError(
+            "admitted structured-output identity is contradictory"
+        )
+    return parse_validate_canonicalize(
+        response,
+        StructuredOutputRequest(
+            schema=normalized,
+            strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            adapter_version=1,
+            output_bytes_limit=context.max_output_bytes,
+            canonicalization_version=declared.canonicalization_version,
+        ),
+    )
 
 
 def pretransport_zero_metadata(

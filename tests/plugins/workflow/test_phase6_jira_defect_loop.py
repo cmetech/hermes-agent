@@ -16,6 +16,7 @@ from agent.structured_output import (
     parse_validate_canonicalize,
 )
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.conditions import evaluate_v3_condition
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.loop import clean_loop_completion
 from plugins.workflow.executors.script import ScriptExecutor
@@ -27,6 +28,7 @@ from plugins.workflow.language import (
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import ResolvedNodeOutput
 from plugins.workflow.resources import VariableContext
+from plugins.workflow.scheduler import evaluate_trigger_rule
 from plugins.workflow.schema import parse_workflow_source_bytes
 from plugins.workflow.topology import iter_scoped_workflow_nodes, primary_terminal_node
 
@@ -114,7 +116,7 @@ nodes:
       name: jira_my_tickets
       arguments: {max_results: 25}
       result:
-        items_path: items
+        items_path: result.items
         select: [key]
         output_items_path: tickets
         output_count_path: count
@@ -133,7 +135,7 @@ nodes:
         "name": "jira_my_tickets",
         "arguments": {"max_results": 25},
         "result": {
-            "items_path": "items",
+            "items_path": "result.items",
             "select": ["key"],
             "output_items_path": "tickets",
             "output_count_path": "count",
@@ -161,6 +163,43 @@ nodes:
         )
 
 
+@pytest.mark.parametrize(
+    "items_path",
+    [
+        "result..items",
+        ".result.items",
+        "result/items",
+        "a.b.c.d.e.f.g.h.i",
+    ],
+)
+def test_v6_rejects_unbounded_or_nonportable_result_paths(
+    tmp_path: Path, items_path: str
+) -> None:
+    with pytest.raises(Exception, match="tool_call_contract"):
+        _compile_inline(
+            tmp_path,
+            f"""name: invalid-result-path
+description: Invalid result path
+nodes:
+  - id: fetch
+    prompt: Fetch once
+    tool_call_contract:
+      name: jira_my_tickets
+      arguments: {{max_results: 25}}
+      result:
+        items_path: {items_path}
+        select: [key]
+        output_items_path: tickets
+        output_count_path: count
+        output_status_path: status
+        empty_status: empty
+        nonempty_status: ready
+        max_items: 25
+""",
+            "language_compatibility: archon-2026-07\n",
+        )
+
+
 def test_v6_ai_contract_fields_change_fingerprint_and_reject_snapshot_tamper(
     tmp_path,
 ) -> None:
@@ -178,7 +217,7 @@ nodes:
       name: jira_my_tickets
       arguments: {{max_results: {max_results}}}
       result:
-        items_path: items
+        items_path: result.items
         select: [key]
         output_items_path: tickets
         output_count_path: count
@@ -323,6 +362,7 @@ def _resolved(node_id: str, value: object) -> ResolvedNodeOutput:
         node_id=node_id,
         attempt_id=f"{node_id}-attempt",
         publication_id="a" * 32,
+        schema_fingerprint="f" * 64,
     )
 
 
@@ -334,6 +374,13 @@ def _run_script(
     previous: dict[str, object | None] | None = None,
     extra_dependencies: tuple[str, ...] = (),
 ):
+    compilation = _compile()
+    structured_id = (
+        f"process-ticket-manifest/{node.id}"
+        if f"process-ticket-manifest/{node.id}"
+        in compilation.package.language.structured_outputs
+        else node.id
+    )
     current = {key: _resolved(key, value) for key, value in outputs.items()}
     prior = {
         key: (_resolved(key, value) if value is not None else None)
@@ -361,6 +408,9 @@ def _run_script(
             output_resolver=variables.output_reference,
             language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
             normalizer_version=6,
+            structured_output=compilation.package.language.structured_outputs.get(
+                structured_id
+            ),
             max_artifact_bytes=0,
         )
     )
@@ -386,7 +436,7 @@ def test_distributed_v6_workflow_seals_one_immutable_bounded_manifest() -> None:
         "name": "jira_my_tickets",
         "arguments": {"max_results": 25},
         "result": {
-            "items_path": "items",
+            "items_path": "result.items",
             "select": ["key"],
             "output_items_path": "tickets",
             "output_count_path": "count",
@@ -517,6 +567,134 @@ def test_each_outward_write_has_its_exact_current_approval_and_closed_failure_sc
             _validate(request, {"status": "ambiguous"})
 
 
+def test_each_approval_and_write_is_conditioned_on_its_exact_plan_flag() -> None:
+    compilation = _compile()
+    scoped = {
+        item.semantic_id: item.node
+        for item in iter_scoped_workflow_nodes(compilation.package.definition)
+    }
+    expected = {
+        "approve-branch": "$prepare-writes.output.should_create_branch == 1",
+        "create-branch": "$prepare-writes.output.should_create_branch == 1",
+        "approve-commit": (
+            "$prepare-writes.output.should_commit == 1 && "
+            "$create-branch.output.status == 'success'"
+        ),
+        "commit-changes": (
+            "$prepare-writes.output.should_commit == 1 && "
+            "$create-branch.output.status == 'success'"
+        ),
+        "approve-merge-request": (
+            "$prepare-writes.output.should_create_merge_request == 1 && "
+            "$commit-changes.output.status == 'success'"
+        ),
+        "create-merge-request": (
+            "$prepare-writes.output.should_create_merge_request == 1 && "
+            "$commit-changes.output.status == 'success'"
+        ),
+        "review-merge-request": (
+            "$prepare-writes.output.should_create_merge_request == 1 && "
+            "$create-merge-request.output.status == 'success'"
+        ),
+        "approve-jira-comment": (
+            "$prepare-writes.output.should_comment_jira == 1 && "
+            "$review-merge-request.output.status == 'success'"
+        ),
+        "update-jira": (
+            "$prepare-writes.output.should_comment_jira == 1 && "
+            "$review-merge-request.output.status == 'success'"
+        ),
+    }
+
+    for node_id, condition in expected.items():
+        assert scoped[f"process-ticket-manifest/{node_id}"].options["when"] == condition
+    terminal = scoped["process-ticket-manifest/publish-ticket-record"]
+    assert terminal.options["trigger_rule"] == "none_failed_min_one_success"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+@pytest.mark.parametrize("outcome", EXPECTED_OUTCOMES)
+def test_nonwrite_outcomes_finish_without_approvals_or_write_outputs(
+    tmp_path: Path, outcome: str
+) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    body = {node.id: node for node in group.value["nodes"]}
+    plan = {
+        "ticket_key": "ERIC-1",
+        "manifest_count": 1,
+        "project_path": None,
+        "branch_name": None,
+        "branch_args": {
+            "project": "unused",
+            "prefix": "unused",
+            "ticket_key": "ERIC-1",
+            "summary": "unused",
+            "source_ref": "unused",
+            "dry_run": False,
+        },
+        "commit_args": {
+            "project": "unused",
+            "branch": "unused",
+            "commit_message": "unused",
+            "actions": [
+                {"action": "create", "file_path": "unused", "content": ""}
+            ],
+            "dry_run": False,
+        },
+        "merge_request_args": {
+            "project": "unused",
+            "source_branch": "unused",
+            "target_branch": "unused",
+            "title": "unused",
+            "description": "",
+            "remove_source_branch": False,
+            "squash": False,
+            "dry_run": False,
+        },
+        "jira_comment_args": {
+            "key": "ERIC-1",
+            "body": "unused",
+            "dry_run": False,
+        },
+        "should_create_branch": 0,
+        "should_commit": 0,
+        "should_create_merge_request": 0,
+        "should_comment_jira": 0,
+        "branch_intent_digest": "a" * 64,
+        "commit_intent_digest": "b" * 64,
+        "merge_request_intent_digest": "c" * 64,
+        "jira_comment_intent_digest": "d" * 64,
+        "terminal_outcome": outcome,
+        "warnings": [],
+    }
+    approval_condition = body["approve-branch"].options["when"]
+    assert not evaluate_v3_condition(
+        approval_condition, {"prepare-writes": _resolved("prepare-writes", plan)}
+    )
+    assert evaluate_trigger_rule(
+        "none_failed_min_one_success",
+        ["succeeded", *("skipped" for _ in range(4))],
+    )
+
+    result, text = _run_script(
+        tmp_path,
+        body["publish-ticket-record"],
+        outputs={"prepare-writes": plan},
+    )
+
+    assert result.status == "succeeded"
+    record = json.loads(text)
+    assert record["outcome"] == outcome
+    assert record["status"] == "terminal"
+    assert record["commit_id"] is None
+    assert record["merge_request_url"] is None
+
+
 def test_write_plan_preserves_exact_connector_arguments_and_prompts_use_them() -> None:
     compilation = _compile()
     scoped = {
@@ -560,6 +738,9 @@ def test_terminal_and_aggregate_schemas_retain_full_records_and_close_counts() -
     aggregate_schema = compilation.package.language.structured_outputs[
         "publish-aggregate-json"
     ].canonical_schema
+    cumulative_schema = compilation.package.language.structured_outputs[
+        "process-ticket-manifest/record-cumulative-state"
+    ].canonical_schema
 
     assert set(record_schema["required"]) == set(
         aggregate_schema["properties"]["records"]["items"]["required"]
@@ -568,6 +749,25 @@ def test_terminal_and_aggregate_schemas_retain_full_records_and_close_counts() -
     assert set(aggregate_schema["properties"]["counts"]["required"]) == {
         "fixed",
         *EXPECTED_OUTCOMES,
+    }
+    assert set(cumulative_schema["required"]) == {
+        "manifest_count",
+        "completed_count",
+        "records",
+        "counts",
+        "warnings",
+        "completion_marker",
+    }
+    cumulative_records = cumulative_schema["properties"]["records"]
+    assert cumulative_records["minItems"] == 1
+    assert cumulative_records["maxItems"] == 25
+    assert cumulative_records["uniqueItems"] is True
+    assert set(cumulative_records["items"]["required"]) == set(
+        record_schema["required"]
+    )
+    assert set(cumulative_schema["properties"]["completion_marker"]["enum"]) == {
+        "",
+        "<promise>BATCH_COMPLETE</promise>",
     }
 
 
@@ -731,6 +931,104 @@ def test_real_reducers_reject_schema_valid_order_and_count_mismatches(
     )
     assert wrong_key.status == "failed"
     assert wrong_key.error_code == "process_exit"
+
+    wrong_count, _text = _run_script(
+        tmp_path,
+        body["record-cumulative-state"],
+        outputs={
+            "select-ticket": {
+                "ticket_key": "ERIC-2",
+                "manifest_count": 2,
+                "index": 1,
+            },
+            "publish-ticket-record": records[1],
+        },
+        previous={
+            "record-cumulative-state": {
+                "manifest_count": 2,
+                "completed_count": 1,
+                "records": [records[0]],
+                "counts": {
+                    "fixed": 0,
+                    "not_found": 0,
+                    "permission": 0,
+                    "needs_info": 0,
+                    "manual_review": 0,
+                    "not_a_code_fix": 0,
+                    "safely_skipped": 0,
+                },
+                "warnings": [],
+                "completion_marker": "",
+            }
+        },
+    )
+    assert wrong_count.status == "failed"
+    assert wrong_count.error_code == "process_exit"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_cumulative_sink_schema_rejects_adversarial_full_record_and_marker_outputs(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    sink = next(node for node in group.value["nodes"] if node.id == "record-cumulative-state")
+    record = {
+        "ticket_key": "ERIC-1",
+        "outcome": "safely_skipped",
+        "status": "terminal",
+        "project_path": None,
+        "branch_name": None,
+        "commit_id": None,
+        "merge_request_url": None,
+        "jira_comment_id": None,
+        "warnings": [],
+        "attention_needed": False,
+        "reconciliation_status": "not_required",
+    }
+    counts = {
+        "fixed": 0,
+        "not_found": 0,
+        "permission": 0,
+        "needs_info": 0,
+        "manual_review": 0,
+        "not_a_code_fix": 0,
+        "safely_skipped": 1,
+    }
+    valid = {
+        "manifest_count": 1,
+        "completed_count": 1,
+        "records": [record],
+        "counts": counts,
+        "warnings": [],
+        "completion_marker": "",
+    }
+    missing_full_field = json.loads(json.dumps(valid))
+    del missing_full_field["records"][0]["status"]
+    duplicate = json.loads(json.dumps(valid))
+    duplicate["manifest_count"] = 2
+    duplicate["completed_count"] = 2
+    duplicate["records"] = [record, record]
+    duplicate["counts"]["safely_skipped"] = 2
+    invalid_marker = {**valid, "completion_marker": "BATCH_COMPLETE"}
+
+    for index, payload in enumerate(
+        (missing_full_field, duplicate, invalid_marker, {})
+    ):
+        rendered = json.dumps(payload, separators=(",", ":"))
+        adversarial = replace(
+            sink,
+            value=f"console.log({json.dumps(rendered)})",
+            depends_on=(),
+        )
+        result, _text = _run_script(tmp_path, adversarial, outputs={})
+
+        assert result.status == "failed", index
+        assert result.error_code == "structured_output_invalid", index
 
 
 def test_workflow_declares_only_existing_jira_gitlab_tools_and_typed_history() -> None:
