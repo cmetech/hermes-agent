@@ -55,6 +55,7 @@ from plugins.workflow.language import (
     supports_phase3_semantics,
     supports_phase4_semantics,
     supports_phase5_semantics,
+    supports_phase6_semantics,
     verify_language_snapshot,
 )
 from plugins.workflow.language_schema import iter_output_references
@@ -2068,7 +2069,16 @@ class RunScheduler:
                         ),
                     )
                 )
-        ready.sort(key=lambda item: item.node.source_index)
+        ready.sort(
+            key=(
+                (lambda item: item.node.source_index)
+                if supports_phase6_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                )
+                else (lambda item: item.node.id)
+            )
+        )
         return ready
 
     def _resolve_loop_child_output(
@@ -2148,6 +2158,7 @@ class RunScheduler:
         package: WorkflowPackage,
         work_item: SchedulerWorkItem,
         *,
+        publication_directory: Path,
         sealed_resource_paths: frozenset[str] | None,
         sealed_resource_bytes: Mapping[str, bytes] | None,
     ) -> VariableContext:
@@ -2186,6 +2197,7 @@ class RunScheduler:
         )
         return replace(
             variables,
+            artifacts_dir=publication_directory,
             node_outputs={**outer, **current},
             current_body_outputs=current,
             allowed_outer_outputs=outer,
@@ -2249,9 +2261,12 @@ class RunScheduler:
         *,
         status: str,
         artifacts: tuple[ArtifactRef, ...],
+        typed_publication: TypedPublicationCandidate | None = None,
         error_code: str | None,
         error_message: str | None,
         metadata: Mapping[str, object],
+        session_registry_update=None,
+        session_registry_authority=None,
     ) -> None:
         scope = claim.loop_group_scope
         if scope is None:
@@ -2265,9 +2280,12 @@ class RunScheduler:
                     status=status,
                     expected_state_version=int(projection["state_version"]),
                     artifacts=artifacts,
+                    typed_publication=typed_publication,
                     error_code=error_code,
                     error_message=error_message,
                     metadata=metadata,
+                    session_registry_update=session_registry_update,
+                    session_registry_authority=session_registry_authority,
                 )
                 return
             except RuntimeError as exc:
@@ -4535,11 +4553,15 @@ class RunScheduler:
                             execution_limits,
                             execution_semantics,
                         )
+                    attempt_directory, publication_directory = (
+                        self._scoped_directories(work_item, claim.attempt_id)
+                    )
                     variables = (
                         self._scoped_variables(
                             projection,
                             package,
                             work_item,
+                            publication_directory=publication_directory,
                             sealed_resource_paths=sealed_resource_paths,
                             sealed_resource_bytes=sealed_resource_bytes,
                         )
@@ -4685,8 +4707,20 @@ class RunScheduler:
                                 else None
                             ),
                             predecessor_results=self._predecessor_results(
-                                projection,
-                                node.depends_on,
+                                (
+                                    {
+                                        "nodes": projection["nodes"][
+                                            work_item.loop_group_scope.group_id
+                                        ]["loop_group"]["body"]
+                                    }
+                                    if work_item.loop_group_scope is not None
+                                    else projection
+                                ),
+                                (
+                                    work_item.node.depends_on
+                                    if work_item.loop_group_scope is not None
+                                    else node.depends_on
+                                ),
                                 variables.node_outputs,
                             ),
                             node_state=node_state,
@@ -4828,12 +4862,8 @@ class RunScheduler:
                                     execution_limits.kill_reap_grace_seconds
                                 ),
                             ),
-                            attempt_directory=self._scoped_directories(
-                                work_item, claim.attempt_id
-                            )[0],
-                            publication_directory=self._scoped_directories(
-                                work_item, claim.attempt_id
-                            )[1],
+                            attempt_directory=attempt_directory,
+                            publication_directory=publication_directory,
                         )
                     )
                 except SealedStructuredOutputDecisionError as exc:
@@ -5243,9 +5273,16 @@ class RunScheduler:
                                 claim,
                                 status=result.status,
                                 artifacts=completion_artifacts,
+                                typed_publication=typed_publication,
                                 error_code=result.error_code,
                                 error_message=result.error_message,
                                 metadata=completion_metadata,
+                                session_registry_update=(
+                                    result.session_registry_update
+                                ),
+                                session_registry_authority=(
+                                    result.session_registry_authority
+                                ),
                             )
                         else:
                             self.store.complete_node(
@@ -5275,6 +5312,10 @@ class RunScheduler:
                         error_code=result.error_code,
                         error_message=result.error_message,
                         metadata=completion_metadata,
+                        session_registry_update=result.session_registry_update,
+                        session_registry_authority=(
+                            result.session_registry_authority
+                        ),
                     )
                 else:
                     self.store.complete_node(
@@ -5697,6 +5738,22 @@ class RunScheduler:
                 ) as pool:
                     futures = [
                         pool.submit(
+                            self._execute_claim,
+                            run_id,
+                            claim,
+                            work_item.node,
+                            package,
+                            snapshot,
+                            strict_snapshot,
+                            execution_limits,
+                            execution_semantics,
+                            sealed_resource_paths,
+                            sealed_resource_bytes,
+                            provider_authority,
+                            budget,
+                        )
+                        if work_item.loop_group_scope is None
+                        else pool.submit(
                             self._execute_work_item,
                             run_id,
                             claim,
@@ -6109,7 +6166,16 @@ class RunScheduler:
                         self.store.release_claim_before_execution(work_item[1])
                     break
                 for claim in claims:
-                    future = pool.submit(self._execute_work_item, *claim)
+                    if claim[2].loop_group_scope is None:
+                        future = pool.submit(
+                            self._execute_claim,
+                            claim[0],
+                            claim[1],
+                            claim[2].node,
+                            *claim[3:],
+                        )
+                    else:
+                        future = pool.submit(self._execute_work_item, *claim)
                     futures[future] = claim[0]
                 if not claims:
                     if not futures:

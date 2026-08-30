@@ -206,15 +206,15 @@ class ScriptExecutor:
             if key
             in {"PATH", "HOME", "TMPDIR", "TEMP", "SystemRoot", "ComSpec", "PATHEXT"}
         }
+        variables = context.variable_context
+        if isinstance(variables, VariableContext):
+            allowed_env.update(variables.environment())
         allowed_env.update({
             "HERMES_WORKFLOW_RUN_ID": context.run_id,
             "HERMES_WORKFLOW_RUN_DIR": str(context.run_directory),
             "HERMES_WORKFLOW_NODE_ID": context.node.id,
             "ARTIFACTS_DIR": str(artifacts_dir),
         })
-        variables = context.variable_context
-        if isinstance(variables, VariableContext):
-            allowed_env.update(variables.environment())
         output = BoundedProcessOutput(
             stdout_path, stderr_path, limit=context.max_output_bytes
         )

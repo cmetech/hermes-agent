@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
 import hashlib
+import json
 from pathlib import Path
+import shutil
 import threading
 
 import pytest
 
+from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.runtime_provider import classify_execution_runtime
 from hermes_cli.workflow_model_resolution import parse_workflow_model_config
 from plugins.workflow.admission import RunAdmissionRequest
@@ -25,6 +28,7 @@ from plugins.workflow.runner_binding import (
 )
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.sessions import NodeSessionKey
 from plugins.workflow.store import ArtifactRef, RunStore
 from plugins.workflow.trust import WorkflowPackageDigest
 
@@ -73,11 +77,28 @@ def _execution_context():
     )
 
 
-def _compile(tmp_path: Path, workflow_writer, *, name: str, nodes, **options):
+def _compile(
+    tmp_path: Path,
+    workflow_writer,
+    *,
+    name: str,
+    nodes,
+    normalizer_version: int = 6,
+    **options,
+):
     root = tmp_path / name
     commands = root / "commands"
     commands.mkdir(parents=True)
     (commands / "nested-command.md").write_text("nested command", encoding="utf-8")
+    scripts = root / "scripts"
+    scripts.mkdir()
+    (scripts / "nested-script.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['ARTIFACTS_DIR']).joinpath('script-child.txt').write_text('script')\n"
+        "print('script')\n",
+        encoding="utf-8",
+    )
     workflow = workflow_writer(
         root / "workflows",
         name=name,
@@ -97,7 +118,7 @@ def _compile(tmp_path: Path, workflow_writer, *, name: str, nodes, **options):
     return compile_workflow(
         source,
         WorkflowCatalogSnapshot.capture((source,)),
-        normalizer_version=6,
+        normalizer_version=normalizer_version,
     )
 
 
@@ -130,7 +151,14 @@ def _admit(store: RunStore, compilation, *, key: str) -> str:
     return admitted.run_id
 
 
-def _group(body, *, maximum: int = 1, depends_on=(), **options):
+def _group(
+    body,
+    *,
+    maximum: int = 1,
+    depends_on=(),
+    fresh_context: bool = False,
+    **options,
+):
     return {
         "id": "group",
         "depends_on": list(depends_on),
@@ -138,6 +166,7 @@ def _group(body, *, maximum: int = 1, depends_on=(), **options):
             "until": "DONE",
             "max_iterations": maximum,
             "nodes": body,
+            "fresh_context": fresh_context,
         },
         **options,
     }
@@ -209,6 +238,56 @@ class OutputExecutor:
                 output_type=None,
             ),
         )
+
+
+class PersistentRunner:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def run(self, request, **_kwargs):
+        self.requests.append(request)
+        return PluginAgentRunResult(
+            final_response=f"iteration-{len(self.requests)}",
+            session_id=f"session-{len(self.requests)}",
+            provider=request.provider or "openrouter",
+            model=request.model or "openai/gpt-5.4",
+            status="completed",
+            pending_interaction=None,
+            usage={},
+            audit={
+                "provider_attempts": 1,
+                "model_calls": 1,
+                "intended_authority_digest": request.intended_authority_digest,
+                "model_visible_prefix_digest": "9" * 64,
+            },
+        )
+
+
+def test_pre_v6_top_level_ready_nodes_keep_lexical_id_order(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="legacy-order",
+        nodes=[
+            {"id": "z-first", "bash": "true"},
+            {"id": "a-second", "bash": "true"},
+        ],
+        normalizer_version=5,
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="legacy-order")
+    executor = SucceedingExecutor()
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["bash"] = executor
+
+    scheduler.advance_all([run_id])
+
+    assert [context.node.id for context in executor.contexts] == [
+        "a-second",
+        "z-first",
+    ]
 
 
 def test_one_worker_uses_one_pool_and_body_source_order(
@@ -449,6 +528,199 @@ def test_existing_executors_receive_scoped_paths_and_semantic_authority(
         assert context.effective_attempt_directory.resolve().is_relative_to(
             run_directory.resolve()
         )
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+def test_real_bash_and_named_script_publish_only_under_scoped_artifact_roots(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-publications",
+        nodes=[
+            _group([
+                {
+                    "id": "bash",
+                    "bash": (
+                        'printf bash > "$ARTIFACTS_DIR/bash-child.txt"; '
+                        "printf bash"
+                    ),
+                },
+                {
+                    "id": "script",
+                    "script": "nested-script",
+                    "runtime": "uv",
+                },
+            ])
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=2)
+    run_id = _admit(store, compilation, key="scoped-publications")
+
+    result = RunScheduler(store, max_parallel_nodes=2).advance_all([run_id])[run_id]
+
+    run_directory = store.run_directory(run_id)
+    publication_root = (
+        run_directory / "artifacts" / "loop-groups" / "group" / "iterations" / "0001"
+    )
+    assert {
+        child["state"]
+        for child in result["nodes"]["group"]["loop_group"]["body"].values()
+    } == {"succeeded"}
+    assert (publication_root / "bash" / "bash-child.txt").read_text() == "bash"
+    assert (publication_root / "script" / "script-child.txt").read_text() == "script"
+    assert not (run_directory / "artifacts" / "bash-child.txt").exists()
+    assert not (run_directory / "artifacts" / "script-child.txt").exists()
+
+
+def test_scoped_shared_context_uses_only_original_body_predecessor_evidence(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-predecessor",
+        nodes=[
+            {"id": "outer", "prompt": "outer"},
+            _group(
+                [
+                    {"id": "producer", "prompt": "producer"},
+                    {
+                        "id": "consumer",
+                        "prompt": "consumer",
+                        "depends_on": ["producer"],
+                        "context": "shared",
+                    },
+                ],
+                depends_on=("outer",),
+            ),
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-predecessor")
+    observed = []
+
+    class EvidenceExecutor:
+        def execute(self, context):
+            node_id = _body_id(context)
+            identity = {
+                "intended_authority_digest": "a" * 64,
+                "model_visible_prefix_digest": "b" * 64,
+                "shared_context_compatibility_digest": "c" * 64,
+            }
+            if node_id == "consumer":
+                observed.append(context.predecessor_results)
+                return NodeExecutionResult("succeeded")
+            return NodeExecutionResult(
+                "succeeded",
+                metadata={
+                    "session_id": f"{node_id}-session",
+                    "cache_fingerprint": "d" * 64,
+                    **identity,
+                },
+            )
+
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = EvidenceExecutor()
+
+    scheduler.advance_all([run_id])
+
+    assert len(observed) == 1
+    assert set(observed[0]) == {"producer"}
+    assert observed[0]["producer"]["session_id"] == "producer-session"
+
+
+def test_scoped_typed_publication_is_canonical_and_recovers(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-typed-publication",
+        nodes=[
+            _group([
+                {
+                    "id": "typed",
+                    "bash": "printf durable-report",
+                    "output_type": "Report",
+                }
+            ])
+        ],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-typed-publication")
+
+    result = RunScheduler(store, max_parallel_nodes=1).advance_all([run_id])[run_id]
+
+    [publication] = [
+        artifact for artifact in result["artifacts"] if "publication_id" in artifact
+    ]
+    bundle = store.run_directory(run_id) / "publications" / publication["publication_id"]
+    metadata = json.loads((bundle / "metadata.json").read_text())
+    assert (bundle / "content.md").read_text() == "durable-report"
+    assert publication["node_id"] == "group/typed"
+    assert metadata["node_id"] == "group/typed"
+    assert metadata["output_type"] == "Report"
+    recovered = RunStore(home).load_run(run_id)
+    assert next(
+        artifact["publication_id"]
+        for artifact in recovered["artifacts"]
+        if "publication_id" in artifact
+    ) == publication["publication_id"]
+
+
+def test_persistent_ai_child_reuses_scoped_session_across_iterations(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-persistent-session",
+        nodes=[
+            _group(
+                [
+                    {
+                        "id": "ask",
+                        "prompt": "continue",
+                        "persist_session": True,
+                    }
+                ],
+                maximum=2,
+                fresh_context=False,
+                provider="openrouter",
+                model="openai/gpt-5.4",
+            )
+        ],
+        persist_sessions=True,
+        provider="openrouter",
+        model="openai/gpt-5.4",
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-persistent-session")
+    runner = PersistentRunner()
+    scheduler = RunScheduler(store, agent_runner=runner, max_parallel_nodes=1)
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    assert result["nodes"]["group"]["loop_group"]["iteration"] == 2
+    assert [request.context_mode for request in runner.requests] == ["fresh", "shared"]
+    assert runner.requests[1].session_id == "session-1"
+    record = scheduler.session_registry.get(
+        NodeSessionKey(
+            "scoped-persistent-session",
+            "group/ask",
+            "local",
+            "openrouter",
+            "default",
+        )
+    )
+    assert record is not None
+    assert record.session_id == "session-2"
+    assert record.generation == 2
+    assert store.pending_session_registry_update(run_id) is None
 
 
 def test_current_outer_and_previous_outputs_stay_in_their_scopes(

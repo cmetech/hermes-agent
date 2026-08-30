@@ -1518,8 +1518,10 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
         iter_output_references_in_spans,
     )
 
-    previous_candidates = tuple(
-        match.span() for match in _LOOP_PREV_OUTPUT_REFERENCE.finditer(template)
+    previous_candidates = (
+        tuple(match.span() for match in _LOOP_PREV_OUTPUT_REFERENCE.finditer(template))
+        if normalizer_version >= 6
+        else ()
     )
     masked = list(template)
     for start, end in previous_candidates:

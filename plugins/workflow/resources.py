@@ -1024,7 +1024,11 @@ class StrictSubstitutionRenderer:
         return self.variables.previous_output_reference(node_id, path).rendered_text
 
     def _references(self, template: str, *, bash_contexts: bool = False):
-        previous_matches = tuple(_LOOP_PREV_OUTPUT_REFERENCE.finditer(template))
+        previous_matches = (
+            tuple(_LOOP_PREV_OUTPUT_REFERENCE.finditer(template))
+            if self.variables.normalizer_version >= 6
+            else ()
+        )
         previous_spans = (
             frozenset(bash_loop_previous_reference_spans(template))
             if bash_contexts
