@@ -317,12 +317,18 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
     }
 
     assert module.WorkflowCatalogLanguageStatus.model_validate(list_status)
+    assert module.WorkflowCatalogLanguageStatus.model_validate(
+        {**list_status, "normalizer_version": 6}
+    )
     assert module.WorkflowDetailLanguageStatus.model_validate(detail_status)
     assert module.WorkflowDetailLanguageStatus.model_validate(
         {**detail_status, "normalizer_version": 2}
     )
     assert module.WorkflowDetailLanguageStatus.model_validate(
         {**detail_status, "normalizer_version": 3}
+    )
+    assert module.WorkflowDetailLanguageStatus.model_validate(
+        {**detail_status, "normalizer_version": 6}
     )
 
     invalid_list = [
@@ -331,6 +337,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
         {**list_status, "effective_profile": "future-profile"},
         {**list_status, "legacy": 1},
         {**list_status, "legacy": False},
+        {**list_status, "normalizer_version": 7},
     ]
     invalid_detail = [
         {**detail_status, "extra": "escape"},
@@ -339,7 +346,7 @@ def test_workflow_language_response_models_reject_non_contract_shapes() -> None:
         {**detail_status, "effective_profile": "hermes-legacy"},
         {**detail_status, "legacy": 0},
         {**detail_status, "normalizer_version": True},
-        {**detail_status, "normalizer_version": 6},
+        {**detail_status, "normalizer_version": 7},
         {**detail_status, "normalized_definition_digest": "A" * 64},
         {**detail_status, "normalized_definition_digest": "a" * 63},
     ]
@@ -1422,7 +1429,7 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     assert row["language"] == {
         "effective_profile": "archon-2026-07",
         "legacy": False,
-        "normalizer_version": 5,
+        "normalizer_version": 6,
     }
     assert row["compatibility"] == {
         "level": "portable",
@@ -1436,7 +1443,7 @@ def test_workflow_catalog_projects_archon_language_and_bounded_compatibility(
     assert set(row["compatibility"]) == {"level", "runnable"}
 
 
-def test_current_v5_composite_trust_is_consistent_between_catalog_and_detail(
+def test_current_v6_composite_trust_is_consistent_between_catalog_and_detail(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:
     home = tmp_path / "home"

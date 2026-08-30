@@ -36,7 +36,7 @@ from plugins.workflow.models import (
 WORKFLOW_NORMALIZER_VERSION = 2
 CURRENT_NORMALIZER_BY_PROFILE = MappingProxyType({
     WorkflowLanguageProfile.HERMES_LEGACY: 2,
-    WorkflowLanguageProfile.ARCHON_2026_07: 5,
+    WorkflowLanguageProfile.ARCHON_2026_07: 6,
 })
 LATEST_NORMALIZER_VERSION = max(CURRENT_NORMALIZER_BY_PROFILE.values())
 SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})

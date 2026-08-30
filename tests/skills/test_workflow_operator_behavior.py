@@ -180,18 +180,26 @@ def test_operator_current_guidance_keeps_v4_backend_actions_authoritative() -> N
     }
     topics = {item["id"]: item for item in phase4["documentation"]["topics"]}
     parameters = topics["ordinary-loops-and-includes"]["parameters"]
+    current_parameters = current_topics["ordinary-loops-and-includes"]["parameters"]
 
-    assert current["normalizer_version"] == 5
+    assert current["normalizer_version"] == 6
     assert phase4["normalizer_version"] == 4
-    assert current_topics["ordinary-loops-and-includes"] == topics[
-        "ordinary-loops-and-includes"
-    ]
     assert parameters["signal_confirmation_actions"] == {
         "before_final_iteration": ["approve", "provide-input", "cancel"],
         "final_iteration": ["approve", "cancel"],
     }
     assert parameters["wire_actions_reused"] is True
     assert parameters["approval_reexecutes_provider"] is False
+    for key in (
+        "signal_confirmation_actions",
+        "wire_actions_reused",
+        "approval_reexecutes_provider",
+    ):
+        assert current_parameters[key] == parameters[key]
+    assert current_parameters["later_archon_features"] == [
+        "runtime_child_workflows",
+        "include.with",
+    ]
 
 
 def test_operator_skills_are_structured_and_defer_syntax_to_runtime() -> None:

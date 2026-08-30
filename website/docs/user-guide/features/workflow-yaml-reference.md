@@ -1,7 +1,7 @@
 ---
 sidebar_position: 14
 title: "Workflow YAML reference"
-description: "Author profile-aware portable workflows with current Phase 5 provider semantics"
+description: "Author profile-aware portable workflows with current Phase 6 loop-group semantics"
 ---
 
 # Workflow YAML reference
@@ -10,11 +10,11 @@ Hermes reads a portable workflow definition and an optional Hermes companion
 file. The portable file describes the DAG. The companion selects the language
 profile and adds Hermes admission and execution policy.
 
-This page documents the active normalizer v5 contract for provider portability.
-New Archon admissions select v5. V5 inherits Phase 4 ordinary
-loops and immutable compile-time includes plus the Phase 3 timeout, retry,
-structured-output, and reference semantics. Older sealed language versions
-remain compatibility inputs.
+This page documents the active normalizer v6 contract for durable loop groups.
+New Archon admissions select v6. V6 inherits Phase 5 provider portability,
+Phase 4 ordinary loops and immutable compile-time includes, and the Phase 3
+timeout, retry, structured-output, and reference semantics. Older sealed
+language versions remain compatibility inputs.
 
 ## Authoritative schema
 
@@ -84,8 +84,8 @@ doctor, and the normal digest-bound trust review again.
 
 ### Current normalizer selection
 
-New and default `archon-2026-07` contracts and admissions select normalizer v5.
-Current `hermes-legacy` contracts select v2. Explicit and sealed v1 through v4
+New and default `archon-2026-07` contracts and admissions select normalizer v6.
+Current `hermes-legacy` contracts select v2. Explicit and sealed v1 through v5
 remain readable with their original meanings; resume uses the version pinned in
 the immutable run snapshot rather than the moving profile default.
 
@@ -94,9 +94,9 @@ the immutable run snapshot rather than the moving profile default.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 5
+    "archon-2026-07": 6
   },
-  "supported_normalizer_versions": [1, 2, 3, 4, 5]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5, 6]
 }
 ```
 
@@ -113,10 +113,10 @@ contract = workflow_authoring_contract(
 )
 ```
 
-The default call without `normalizer_version` is the authoritative current v5
+The default call without `normalizer_version` is the authoritative current v6
 syntax and diagnostic inventory. Any explicit version must remain pinned
 through compilation, validation, trust, admission, and the immutable run
-snapshot; explicit v1-v4 selection is compatibility behavior. Explicit version
+snapshot; explicit v1-v5 selection is compatibility behavior. Explicit version
 selection is not a way to change the current profile default.
 
 ## Phase 5 provider portability
@@ -412,7 +412,8 @@ dependencies, and references are validated as one acyclic graph.
 | `prompt` | `prompt: nonempty string`; inline prompt text. | AI fields below. | Mapped to an isolated Hermes agent worker |
 | `bash` | `bash: nonempty string`. | Optional millisecond `timeout` and `retry`. | Enforced through the contained process runner |
 | `script` | `script: nonempty string` and `runtime: uv | bun`. | `deps` string array; optional millisecond `timeout` and `retry`. Named scripts resolve below `scripts/`. | Enforced when the runtime and resource exist |
-| `loop` | `loop` object below. | Common fields except node `retry`. | Current v5 inherits v4's sealed prompt/command source and confirmed-signal semantics; sealed v3-v4 behavior is preserved |
+| `loop` | `loop` object below. | Common fields except node `retry`. | Current v6 inherits v4's sealed prompt/command source and confirmed-signal semantics; sealed v3-v5 behavior is preserved |
+| `loop_group` | One-level bounded body DAG with `until` and `max_iterations`. | Group defaults plus the existing body node fields. | Enforced in current v6; nested groups, includes, runtime workflows, and group retry are rejected |
 | `approval` | `approval` object below. | Common fields; node retry is not supported in Archon v3-v5. | Enforced durable compare-and-set user gate |
 | `cancel` | `cancel: nonempty string` reason. | Common fields; node retry is not supported in Archon v3-v5. | Enforced durable cancellation; it never publishes because it cannot complete successfully |
 
@@ -451,8 +452,8 @@ mapping. An unknown capitalized alias or an unavailable mapped tool blocks
 before a model call.
 
 MCP and skills are options on `command` and `prompt`; they are not node kinds.
-The seven node kinds are `command`, `prompt`, `bash`, `script`, `loop`,
-`approval`, and `cancel`. Script execution with `uv` or `bun` is existing
+The eight node kinds are `command`, `prompt`, `bash`, `script`, `loop`,
+`loop_group`, `approval`, and `cancel`. Script execution with `uv` or `bun` is existing
 workflow behavior, not a structured-output node variant.
 
 ## Phase 3 references, conditions, Bash, and sessions
@@ -891,8 +892,9 @@ Archon node `timeout` field.
 Phase 4 does not add an executable node kind: `include` is compile-only, and
 the existing `loop` node receives the sealed prompt/command and signal contract
 described above. Phase 5 adds provider portability without a new node kind.
-MCP and skills remain options on AI nodes. Runtime child workflows,
-`include.with`, and `loop_group` remain out of scope. Provider-native sandbox
+Phase 6 adds one-level bounded `loop_group` nodes. MCP and skills remain options
+on AI nodes. Runtime child workflows, `include.with`, nested groups, and
+group-level retry remain out of scope. Provider-native sandbox
 requests and providers without authoritative cost settlement remain explicit
 blocking compatibility findings.
 

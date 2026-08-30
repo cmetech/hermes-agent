@@ -63,12 +63,12 @@ ARCHON_V3_CONDITION_TYPED_OPERAND_MODES = MappingProxyType({
 })
 CONTRACT_READER_VERSION = 2
 EDITOR_PROJECTION_VERSION = 2
-CONTRACT_MAX_BYTES = 256_000
+CONTRACT_MAX_BYTES = 288_000
 CONTRACT_RESERVED_GROWTH_BYTES = 4_000
 CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
-    "definition_schema": 150_000,
+    "definition_schema": 160_000,
     "node_kinds": 72_000,
-    "compatibility_codes": 18_000,
+    "compatibility_codes": 19_000,
 })
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -2732,11 +2732,9 @@ def _body_nodes_schema(
         if spec.yaml_name != "loop_group"
     )
     properties = {
-        spec.yaml_name: _field_schema(
-            spec,
-            profile,
-            normalizer_version=selected_version,
-        )
+        spec.yaml_name: {
+            "$ref": f"#/properties/nodes/items/properties/{spec.yaml_name}"
+        }
         for spec in specs
     }
     variants = [
@@ -3515,6 +3513,21 @@ def _contract_digest(envelope: dict[str, object]) -> str:
     return f"sha256:{sha256(canonical).hexdigest()}"
 
 
+def _require_contract_bounds(contract: Mapping[str, object]) -> None:
+    total_bytes = len(canonical_contract_json(contract).encode())
+    usable_bytes = CONTRACT_MAX_BYTES - CONTRACT_RESERVED_GROWTH_BYTES
+    if total_bytes > usable_bytes:
+        raise ValueError(
+            f"workflow authoring contract exceeds {usable_bytes} bytes"
+        )
+    for section, maximum in CONTRACT_SECTION_MAX_BYTES.items():
+        section_bytes = len(canonical_contract_json(contract[section]).encode())
+        if section_bytes > maximum:
+            raise ValueError(
+                f"workflow authoring contract {section} exceeds {maximum} bytes"
+            )
+
+
 def _canonical_float(value: float) -> str:
     if not math.isfinite(value):
         raise ValueError("canonical contract JSON requires finite numbers")
@@ -3651,4 +3664,6 @@ def workflow_authoring_contract(
             "companion_optional": True,
         },
     }
-    return {**envelope, "contract_digest": _contract_digest(envelope)}
+    contract = {**envelope, "contract_digest": _contract_digest(envelope)}
+    _require_contract_bounds(contract)
+    return contract

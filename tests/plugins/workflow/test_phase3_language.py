@@ -49,14 +49,14 @@ def test_new_packages_select_the_current_normalizer_for_their_profile(
     legacy = load_workflow(legacy_path)
     archon = load_workflow(archon_path)
 
-    assert workflow_language.LATEST_NORMALIZER_VERSION == 5
+    assert workflow_language.LATEST_NORMALIZER_VERSION == 6
     assert workflow_language.CURRENT_NORMALIZER_BY_PROFILE == {
         WorkflowLanguageProfile.HERMES_LEGACY: 2,
-        WorkflowLanguageProfile.ARCHON_2026_07: 5,
+        WorkflowLanguageProfile.ARCHON_2026_07: 6,
     }
     assert unversioned.language.normalizer_version == 2
     assert legacy.language.normalizer_version == 2
-    assert archon.language.normalizer_version == 5
+    assert archon.language.normalizer_version == 6
 
 
 def test_legacy_default_normalization_is_identical_to_explicit_v2(
@@ -364,12 +364,13 @@ def test_archon_v3_rejects_invalid_requested_semantics(
     assert exc.value.issues[0].code == code
 
 
-def test_trust_risk_identity_changes_for_current_v5_and_sealed_v2_v4(
+def test_trust_risk_identity_changes_for_current_v6_and_sealed_v2_v5(
     tmp_path, workflow_writer
 ) -> None:
     archon_path = workflow_writer(tmp_path / "archon")
     _sidecar(archon_path, "archon-2026-07")
-    archon_v5 = load_workflow(archon_path)
+    archon_v6 = load_workflow(archon_path)
+    archon_v5 = _load_archon_version(archon_path, 5)
     archon_v4 = _load_archon_version(archon_path, 4)
     archon_v3 = _load_archon_version(archon_path, 3)
     archon_v2 = _load_archon_version(archon_path, 2)
@@ -382,6 +383,9 @@ def test_trust_risk_identity_changes_for_current_v5_and_sealed_v2_v4(
         normalizer_version=2,
     )
 
+    archon_v6_risk = build_risk_summary(
+        archon_v6, assess_compatibility(archon_v6)
+    )
     archon_v5_risk = build_risk_summary(
         archon_v5, assess_compatibility(archon_v5)
     )
@@ -401,12 +405,15 @@ def test_trust_risk_identity_changes_for_current_v5_and_sealed_v2_v4(
         legacy_explicit, assess_compatibility(legacy_explicit)
     )
 
+    assert archon_v6.language.normalizer_version == 6
     assert archon_v5.language.normalizer_version == 5
     assert archon_v4.language.normalizer_version == 4
     assert archon_v3.language.normalizer_version == 3
+    assert compute_package_digest(archon_v6) == compute_package_digest(archon_v5)
     assert compute_package_digest(archon_v5) == compute_package_digest(archon_v4)
     assert compute_package_digest(archon_v4) == compute_package_digest(archon_v3)
     assert compute_package_digest(archon_v3) == compute_package_digest(archon_v2)
+    assert archon_v6_risk.risk_digest != archon_v5_risk.risk_digest
     assert archon_v5_risk.risk_digest != archon_v4_risk.risk_digest
     assert archon_v4_risk.risk_digest != archon_v3_risk.risk_digest
     assert archon_v3_risk.risk_digest != archon_v2_risk.risk_digest

@@ -46,8 +46,8 @@ because older strict companion parsers reject the new field. An explicit
 
 ### Current normalizer selection
 
-New and default `archon-2026-07` contracts and admissions use normalizer v5.
-Current `hermes-legacy` contracts use v2. Explicit and sealed v1 through v4
+New and default `archon-2026-07` contracts and admissions use normalizer v6.
+Current `hermes-legacy` contracts use v2. Explicit and sealed v1 through v5
 remain supported compatibility inputs, and resume preserves their pinned
 semantics.
 
@@ -56,9 +56,9 @@ semantics.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 5
+    "archon-2026-07": 6
   },
-  "supported_normalizer_versions": [1, 2, 3, 4, 5]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5, 6]
 }
 ```
 
@@ -111,9 +111,9 @@ reporting validation failures; do not collapse them to a generic parse error.
 
 ### Normalizer v4
 
-Normal authoring contracts and new Archon admissions select normalizer v4. An
-installed integration or contract test retrieves its authoritative inventory
-with the ordinary default call:
+Explicit historical v4 contracts retain their sealed include and ordinary-loop
+semantics. An installed integration or contract test retrieves that inventory
+with an explicit version selection:
 
 ```python
 from plugins.workflow.language_schema import workflow_authoring_contract
@@ -121,12 +121,12 @@ from plugins.workflow.models import WorkflowLanguageProfile
 
 contract = workflow_authoring_contract(
     WorkflowLanguageProfile.ARCHON_2026_07,
+    normalizer_version=4,
 )
 ```
 
 Compile, validate, trust, and admit that exact contract, and pin v4 in the
-immutable run snapshot. Pass `normalizer_version=1`, `2`, or `3` only to read or
-operate an explicit historical contract; those selections retain compatibility
+immutable run snapshot. Explicit historical selections retain compatibility
 and do not change the current Archon default.
 
 V4 adds `include` as a compile-only source directive. It is not executable and
@@ -172,9 +172,8 @@ Runtime child workflows and `include.with` remain deliberate omissions. Do not
 synthesize them from v4. Portable `maxBudgetUsd` and sandbox guarantees also
 remain blocked.
 
-Normalizer v6 defines one dormant, explicit `loop_group` authoring contract.
-Current Archon admission remains v5 until the runtime activation gate changes
-it. A v6 group has exactly this one-level shape:
+Normalizer v6 defines the current `loop_group` authoring contract. A v6 group
+has exactly this one-level shape:
 
 ```yaml
 - id: process-items

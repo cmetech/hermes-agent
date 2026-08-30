@@ -147,7 +147,7 @@ def test_checked_in_sharepoint_bundle_is_disabled_complete_and_profiled() -> Non
     assert workflow.with_name("sharepoint-document-intake.hermes.yaml").is_file()
 
 
-def test_fresh_profile_stages_authenticated_v5_and_v6_jira_workflows(
+def test_fresh_profile_stages_authenticated_v6_jira_workflows(
     tmp_path, monkeypatch
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
@@ -197,6 +197,7 @@ def test_fresh_profile_stages_authenticated_v5_and_v6_jira_workflows(
         "jira-to-gitlab",
         "jira-defect-loop",
     ):
+        assert discovered[name].language.normalizer_version == 6
         assert "ericsson-jira" in discovered[name].definition.options["requires"]
     assert "ericsson-gitlab" in discovered["jira-defect-loop"].definition.options[
         "requires"

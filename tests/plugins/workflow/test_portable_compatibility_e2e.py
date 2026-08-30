@@ -337,11 +337,11 @@ def test_mcp_and_skills_stay_ai_node_options_in_the_archon_contract(
     assert {"mcp", "skills"}.isdisjoint(NODE_TYPES)
 
 
-def test_current_v5_include_loop_inherits_the_explicit_v4_contract(
+def test_current_v6_include_loop_inherits_the_explicit_v4_contract(
     tmp_path,
     workflow_writer,
 ) -> None:
-    """Exercise current v5 inheritance and explicit-v4 compatibility together."""
+    """Exercise current v6 inheritance and explicit-v4 compatibility together."""
     from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
     from plugins.workflow.schema import parse_workflow_source_bytes
 
@@ -401,7 +401,7 @@ def test_current_v5_include_loop_inherits_the_explicit_v4_contract(
         normalizer_version=4,
     )
 
-    assert default_contract["normalizer_version"] == 5
+    assert default_contract["normalizer_version"] == 6
     assert explicit_contract["normalizer_version"] == 4
     assert {
         item["id"] for item in default_contract["documentation"]["topics"]

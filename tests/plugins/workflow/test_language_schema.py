@@ -54,12 +54,15 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
 
     assert contract["schema_version"] == 1
     assert contract["profile"] == "archon-2026-07"
-    assert contract["normalizer_version"] == 5
+    assert contract["normalizer_version"] == 6
     assert (
         contract["definition_schema"]["$schema"]
         == "https://json-schema.org/draft/2020-12/schema"
     )
-    assert len(language_schema.canonical_contract_json(contract).encode()) < 256_000
+    assert len(language_schema.canonical_contract_json(contract).encode()) <= (
+        language_schema.CONTRACT_MAX_BYTES
+        - language_schema.CONTRACT_RESERVED_GROWTH_BYTES
+    )
 
 
 def test_explicit_v6_contract_derives_bounded_loop_group_surface():
@@ -74,6 +77,9 @@ def test_explicit_v6_contract_derives_bounded_loop_group_surface():
     assert set(group_schema["properties"]) == set(loop_group_field_names())
     assert group_schema["required"] == ["nodes", "until", "max_iterations"]
     assert group_schema["properties"]["nodes"]["maxItems"] == 512
+    assert group_schema["properties"]["nodes"]["items"]["properties"]["command"] == {
+        "$ref": "#/properties/nodes/items/properties/command"
+    }
     assert set(phase6_durable_code_catalog()) <= set(codes)
     assert "loop_group" not in {
         item["id"]
@@ -362,6 +368,54 @@ def test_archon_contract_reserves_growth_headroom_and_section_budgets():
         )
 
 
+def _padded_contract_value(value, target_bytes):
+    baseline = len(language_schema.canonical_contract_json(value).encode())
+    with_empty_padding = {**value, "x-task9-padding": ""}
+    overhead = (
+        len(language_schema.canonical_contract_json(with_empty_padding).encode())
+        - baseline
+    )
+    return {**value, "x-task9-padding": "x" * (target_bytes - baseline - overhead)}
+
+
+def test_contract_total_bound_accepts_the_exact_boundary_and_rejects_overflow():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    boundary = _padded_contract_value(
+        contract,
+        language_schema.CONTRACT_MAX_BYTES
+        - language_schema.CONTRACT_RESERVED_GROWTH_BYTES,
+    )
+
+    language_schema._require_contract_bounds(boundary)
+    with pytest.raises(ValueError, match="contract exceeds"):
+        language_schema._require_contract_bounds({
+            **boundary,
+            "x-task9-padding": f"{boundary['x-task9-padding']}x",
+        })
+
+
+@pytest.mark.parametrize(
+    "section",
+    tuple(language_schema.CONTRACT_SECTION_MAX_BYTES),
+)
+def test_contract_section_bounds_accept_exact_boundaries_and_reject_overflow(section):
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    boundary_section = _padded_contract_value(
+        {}, language_schema.CONTRACT_SECTION_MAX_BYTES[section]
+    )
+    boundary = {**contract, section: boundary_section}
+
+    language_schema._require_contract_bounds(boundary)
+    with pytest.raises(ValueError, match=f"{section} exceeds"):
+        language_schema._require_contract_bounds({
+            **boundary,
+            section: {
+                **boundary_section,
+                "x-task9-padding": f"{boundary_section['x-task9-padding']}x",
+            },
+        })
+
+
 def test_serialized_editor_contract_resolves_every_field_definition_without_python():
     wire = json.loads(
         json.dumps(workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07))
@@ -590,12 +644,12 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
     assert contract["contract_digest"] == f"sha256:{expected_digest}"
     assert contract["limits"] == {
         "max_document_bytes": 2 * 1024 * 1024,
-        "max_contract_bytes": 256_000,
+        "max_contract_bytes": 288_000,
         "reserved_growth_bytes": 4_000,
         "section_max_bytes": {
-            "definition_schema": 150_000,
+            "definition_schema": 160_000,
             "node_kinds": 72_000,
-                "compatibility_codes": 18_000,
+            "compatibility_codes": 19_000,
         },
     }
     assert contract["x-hermes-provenance"]["field_authority"] == (
@@ -642,7 +696,12 @@ def test_node_kind_descriptors_cover_each_applicable_node_field_once(profile):
     contract = workflow_authoring_contract(profile)
     descriptors = {item["id"]: item for item in contract["node_kinds"]}
 
-    assert set(descriptors) == set(NODE_TYPES)
+    expected_node_types = (
+        set(language_schema.EXECUTABLE_NODE_TYPES)
+        if profile is WorkflowLanguageProfile.ARCHON_2026_07
+        else set(NODE_TYPES)
+    )
+    assert set(descriptors) == expected_node_types
     for node_type, descriptor in descriptors.items():
         assert descriptor["field_path"] == f"nodes[].{node_type}"
         assert descriptor["status"] == "supported"
@@ -854,7 +913,10 @@ def test_archon_condition_contract_projects_runtime_bounds_and_typed_rules():
         "ordered_rhs": ["unquoted_decimal", "quoted_decimal"],
         "structured_strings_coerce_to_number": False,
     }
-    assert len(language_schema.canonical_contract_json(contract).encode()) < 256_000
+    assert len(language_schema.canonical_contract_json(contract).encode()) <= (
+        language_schema.CONTRACT_MAX_BYTES
+        - language_schema.CONTRACT_RESERVED_GROWTH_BYTES
+    )
 
 
 @pytest.mark.parametrize(
@@ -1059,15 +1121,20 @@ def test_schema_publishes_loader_defaults_and_identifier_pattern():
 def test_every_published_schema_example_validates_against_its_field(profile):
     contract = workflow_authoring_contract(profile)
 
-    def validate_examples(value):
-        if isinstance(value, dict):
-            for example in value.get("examples", []):
-                Draft202012Validator(value).validate(example)
-            for child in value.values():
-                validate_examples(child)
-        elif isinstance(value, list):
-            for child in value:
-                validate_examples(child)
+    def validate_examples(root):
+        validator = Draft202012Validator(root)
+
+        def visit(value):
+            if isinstance(value, dict):
+                for example in value.get("examples", []):
+                    validator.evolve(schema=value).validate(example)
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(root)
 
     validate_examples(contract["definition_schema"])
     validate_examples(contract["sidecar_schema"])

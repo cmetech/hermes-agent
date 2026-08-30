@@ -1120,6 +1120,7 @@ def test_phase5_duplicate_succeeded_persistence_fails_closed_without_mutation(
         "attempt_id": attempt["attempt_id"],
         "owner_id": attempt["owner_id"],
         "execution_fence": None,
+        "loop_group_scope": None,
     })()
 
     try:

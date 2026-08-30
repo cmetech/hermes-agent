@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "packages": {
     "inbox-digest": "b959fcfc7b0b9d360c14c19047c9f7371981883271d1333daf12e21d3732ade4",
-    "jira-single-ticket-showcase": "f5cc950888423faf8b1a3eb0688aa934f0b4d4d2b77591d573f1507c572cc9f7",
+    "jira-single-ticket-showcase": "7b68553cdde8a88495ff9a5986fd4f14e2824cb673e541568facdb6e6d74e202",
     "jira-defect-loop": "a6e147fd406436703e7eaf0dedfb6c3915838cf4fbab3938e1b19b7769d25d5a",
-    "jira-to-gitlab": "31fe86858108283e2f4aed8cb22e7291d7d6c1df02646a24156b02523893166c",
-    "my-tickets-summary": "6a002d7c292098a92fadbeca8f5d686fcd5c40c84f7a81695ea939181e581e7e",
-    "sharepoint-document-intake": "2099cbd65c9675ffd9bfe2a5be7fbdfeed008133f2ac3bbd6dec3fde7ab4028c"
+    "jira-to-gitlab": "dd5c5e67549df15b537803bc1bf9ba8ea901933ed57be3414adaede1e5112d98",
+    "my-tickets-summary": "849d70a6716b07dd3966cf38be5ff3a1389558a8855c1827e344bd47f28a72a2",
+    "sharepoint-document-intake": "bb4a258bdd00f0aedccc2075100dcaffb1a8829116c22722305cb4ecc72358e7"
   }
 }

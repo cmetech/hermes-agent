@@ -125,6 +125,9 @@ def test_show_adds_redacted_operational_metadata_and_cron_join(
 def test_catalog_show_projects_dormant_v6_group_as_one_outer_node(
     workflow_writer, tmp_path
 ):
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    commands.joinpath("secret-body.md").write_text("SECRET\n", encoding="utf-8")
     path = workflow_writer(
         tmp_path,
         nodes=[

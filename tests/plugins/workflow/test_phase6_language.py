@@ -227,23 +227,35 @@ def test_v6_promotes_primary_sink_output_and_scopes_body_semantics(
         assert raised.value.code == "workflow_language_snapshot_mismatch"
 
 
-def test_v5_rejects_loop_group_without_changing_current_admission(
+def test_current_v6_admits_loop_group_while_recorded_v5_rejects_it(
     tmp_path, workflow_writer
 ):
-    path = workflow_writer(tmp_path, nodes=[_group()])
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group(
+            [
+                {"id": "read", "bash": "printf item"},
+                {"id": "record", "depends_on": ["read"], "bash": "printf done"},
+            ],
+            max_iterations=1,
+        )],
+    )
     sidecar = path.with_name(f"{path.stem}.hermes.yaml")
     sidecar.write_text("language_compatibility: archon-2026-07\n", encoding="utf-8")
 
     with pytest.raises(WorkflowValidationError) as raised:
-        load_workflow(path)
+        load_workflow_snapshot(
+            path,
+            workflow_bytes=path.read_bytes(),
+            sidecar_bytes=sidecar.read_bytes(),
+            normalizer_version=5,
+        )
+
+    current = load_workflow(path)
 
     assert raised.value.issues[0].code == "loop_group_version_unsupported"
-    assert (
-        workflow_language.CURRENT_NORMALIZER_BY_PROFILE[
-            WorkflowLanguageProfile.ARCHON_2026_07
-        ]
-        == 5
-    )
+    assert current.language.normalizer_version == 6
+    assert current.definition.nodes[0].node_type == "loop_group"
 
 
 @pytest.mark.parametrize("node_type", ("bash", "script"))
@@ -258,10 +270,16 @@ def test_artifact_free_process_mode_is_v6_only(
     sidecar.write_text("language_compatibility: archon-2026-07\n", encoding="utf-8")
 
     with pytest.raises(WorkflowValidationError) as raised:
-        load_workflow(path)
+        load_workflow_snapshot(
+            path,
+            workflow_bytes=path.read_bytes(),
+            sidecar_bytes=sidecar.read_bytes(),
+            normalizer_version=5,
+        )
 
     assert raised.value.issues[0].code == "artifacts_version_unsupported"
     assert raised.value.issues[0].path == "nodes[0].artifacts"
+    assert load_workflow(path).language.normalizer_version == 6
 
 
 @pytest.mark.parametrize("value", (None, 0, 1, "false", [], {}))
@@ -671,11 +689,11 @@ def test_loop_group_child_scope_is_validated_and_deterministic():
             LoopGroupChildScope(**values)
 
 
-def test_phase6_reader_is_supported_but_dormant():
+def test_phase6_reader_is_supported_and_current_for_archon():
     profile = WorkflowLanguageProfile.ARCHON_2026_07
 
     assert workflow_language.SUPPORTED_NORMALIZER_VERSIONS == {1, 2, 3, 4, 5, 6}
-    assert workflow_language.LATEST_NORMALIZER_VERSION == 5
-    assert workflow_language.CURRENT_NORMALIZER_BY_PROFILE[profile] == 5
+    assert workflow_language.LATEST_NORMALIZER_VERSION == 6
+    assert workflow_language.CURRENT_NORMALIZER_BY_PROFILE[profile] == 6
     assert supports_phase6_semantics(profile, 5) is False
     assert supports_phase6_semantics(profile, 6) is True
