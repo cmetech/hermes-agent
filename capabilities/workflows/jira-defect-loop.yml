@@ -312,7 +312,7 @@ nodes:
           output_format: *write_result
 
         - id: publish-ticket-record
-          depends_on: [create-branch, commit-changes, review-merge-request, update-jira, prepare-writes]
+          depends_on: [create-branch, commit-changes, create-merge-request, review-merge-request, update-jira, prepare-writes]
           trigger_rule: none_failed_min_one_success
           script: |
             const plan = $prepare-writes.output;
@@ -329,13 +329,16 @@ nodes:
             };
             const branch = result("create-branch", plan.should_create_branch, "create_branch");
             const commit = result("commit-changes", plan.should_commit, "commit_changes");
+            const mergeRequest = result("create-merge-request", plan.should_create_merge_request, "create_merge_request");
             const review = result("review-merge-request", plan.should_create_merge_request, "review_merge_request");
             const jira = result("update-jira", plan.should_comment_jira, "add_jira_comment");
             if (branch && (!branch.object_id || branch.object_id !== plan.branch_name)) throw new Error("branch identity mismatch");
             if (commit && !commit.object_id) throw new Error("commit identity missing");
-            if (review && (!review.merge_request_id || !review.merge_request_url)) throw new Error("merge request identity missing");
+            if (mergeRequest && (!mergeRequest.object_id || !mergeRequest.web_url)) throw new Error("merge request write identity missing");
+            if (review && (!review.merge_request_id || !review.merge_request_url)) throw new Error("merge request review identity missing");
+            if (mergeRequest && review && (mergeRequest.object_id !== review.merge_request_id || mergeRequest.web_url !== review.merge_request_url)) throw new Error("merge request evidence mismatch");
             if (jira && !jira.object_id) throw new Error("Jira comment identity missing");
-            const present = [branch, commit, review, jira].filter(Boolean);
+            const present = [branch, commit, mergeRequest, review, jira].filter(Boolean);
             const warnings = [plan, ...present].flatMap((value) => value.warnings || []).slice(0, 50);
             const attention = plan.terminal_outcome === "permission" || plan.terminal_outcome === "manual_review" || present.some((value) => value.attention_needed);
             const reconciliation = present.some((value) => value.reconciliation_status === "confirmed") ? "confirmed" : "not_required";

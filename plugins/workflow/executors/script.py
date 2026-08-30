@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from agent.structured_output import (
     StructuredOutputError,
@@ -27,6 +28,7 @@ from plugins.workflow.executors.base import (
     validate_structured_process_output,
 )
 from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.language_schema import WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import PrimaryOutputCandidate
 from plugins.workflow.resources import (
@@ -37,6 +39,142 @@ from plugins.workflow.resources import (
 from plugins.workflow.schema import is_inline_script
 from plugins.workflow.store import ArtifactRef
 from tools.managed_process import ManagedProcessTree
+
+
+_PREDECESSOR_STATES = frozenset({
+    "succeeded",
+    "failed",
+    "skipped",
+    "cancelled",
+    "interrupted",
+})
+_PREDECESSOR_FIELDS = frozenset({
+    "state",
+    "session_id",
+    "cache_fingerprint",
+    "intended_authority_digest",
+    "model_visible_prefix_digest",
+    "shared_context_compatibility_digest",
+    "output_evidence",
+    "output",
+})
+_OUTPUT_EVIDENCE_FIELDS = frozenset({
+    "node_id",
+    "attempt_id",
+    "publication_id",
+    "sha256",
+    "size_bytes",
+    "media_type",
+    "schema_fingerprint",
+    "canonicalization_version",
+    "output_type",
+})
+
+
+def _sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_predecessor_output(
+    dependency: str,
+    entry: Mapping[str, object],
+    *,
+    max_output_bytes: int,
+) -> None:
+    state = entry.get("state")
+    if state not in _PREDECESSOR_STATES or not set(entry) <= _PREDECESSOR_FIELDS:
+        raise ValueError("predecessor state is invalid")
+    has_output = "output" in entry
+    has_evidence = "output_evidence" in entry
+    evidence = entry.get("output_evidence")
+    if not has_output:
+        if has_evidence:
+            raise ValueError("predecessor output evidence has no output")
+        return
+    if state != "succeeded" or not has_evidence or not isinstance(evidence, Mapping):
+        raise ValueError("predecessor output is not succeeded")
+    if set(evidence) != _OUTPUT_EVIDENCE_FIELDS:
+        raise ValueError("predecessor output evidence is incomplete")
+    size_bytes = evidence.get("size_bytes")
+    schema_fingerprint = evidence.get("schema_fingerprint")
+    if (
+        evidence.get("node_id") != dependency
+        or not isinstance(evidence.get("attempt_id"), str)
+        or not evidence["attempt_id"]
+        or (
+            evidence.get("publication_id") is not None
+            and not isinstance(evidence["publication_id"], str)
+        )
+        or not _sha256(evidence.get("sha256"))
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or not 0 <= size_bytes <= max_output_bytes
+        or not isinstance(evidence.get("media_type"), str)
+        or not evidence["media_type"]
+        or (schema_fingerprint is not None and not _sha256(schema_fingerprint))
+        or evidence.get("canonicalization_version") != 1
+        or not isinstance(evidence.get("output_type"), str)
+        or not evidence["output_type"]
+    ):
+        raise ValueError("predecessor output evidence is invalid")
+    if schema_fingerprint is None:
+        output = entry["output"]
+        if not isinstance(output, str):
+            raise ValueError("unstructured predecessor output is invalid")
+        encoded = output.encode("utf-8")
+    else:
+        if evidence["media_type"] != "application/json":
+            raise ValueError("structured predecessor output media type is invalid")
+        encoded = canonical_json_bytes(
+            entry["output"],
+            max_bytes=max_output_bytes,
+        )
+    if len(encoded) != size_bytes or not hmac.compare_digest(
+        hashlib.sha256(encoded).hexdigest(), evidence["sha256"]
+    ):
+        raise ValueError("predecessor output evidence does not match")
+
+
+def _predecessor_json_parts(
+    context: NodeExecutionContext,
+) -> tuple[bytes, ...] | None:
+    dependencies = tuple(context.node.depends_on)
+    if not dependencies and not context.predecessor_results:
+        return None
+    if (
+        len(dependencies) != len(set(dependencies))
+        or set(context.predecessor_results) != set(dependencies)
+    ):
+        raise ValueError("predecessor outputs are not the direct dependencies")
+    max_bytes = min(
+        WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
+        context.resource_limits.max_rss_bytes,
+    )
+    parts: list[bytes] = [b"{"]
+    used = 2
+    for index, dependency in enumerate(sorted(dependencies)):
+        entry = context.predecessor_results[dependency]
+        if not isinstance(entry, Mapping):
+            raise ValueError("predecessor entry is invalid")
+        _validate_predecessor_output(
+            dependency,
+            entry,
+            max_output_bytes=context.max_output_bytes,
+        )
+        key = canonical_json_bytes(dependency, max_bytes=context.max_output_bytes)
+        punctuation = (b"," if index else b"") + key + b":"
+        remaining = max_bytes - used - len(punctuation)
+        if remaining <= 0:
+            raise ValueError("predecessor outputs exceed process input limit")
+        encoded = canonical_json_bytes(entry, max_bytes=remaining)
+        used += len(punctuation) + len(encoded)
+        parts.extend((punctuation, encoded))
+    parts.append(b"}")
+    return tuple(parts)
 
 
 def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
@@ -186,18 +324,15 @@ class ScriptExecutor:
                 context.language_profile, context.variable_context.normalizer_version
             )
         )
-        predecessor_bytes = None
+        predecessor_parts = None
         if (
             context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
             and context.normalizer_version >= 6
-            and context.predecessor_results
+            and (context.node.depends_on or context.predecessor_results)
         ):
             try:
-                predecessor_bytes = canonical_json_bytes(
-                    context.predecessor_results,
-                    max_bytes=context.max_output_bytes,
-                )
-            except (TypeError, ValueError, UnicodeError) as exc:
+                predecessor_parts = _predecessor_json_parts(context)
+            except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
                 return NodeExecutionResult(
                     "failed",
                     error_code="validation",
@@ -284,7 +419,7 @@ class ScriptExecutor:
                     error_code="timeout",
                     error_message="script node exceeded its timeout",
                 )
-            if predecessor_bytes is not None:
+            if predecessor_parts is not None:
                 predecessor_path = attempt / "predecessors.json"
                 descriptor = os.open(
                     predecessor_path,
@@ -292,7 +427,8 @@ class ScriptExecutor:
                     0o600,
                 )
                 with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(predecessor_bytes)
+                    for part in predecessor_parts:
+                        stream.write(part)
                 allowed_env["HERMES_WORKFLOW_PREDECESSORS_FILE"] = str(
                     predecessor_path
                 )

@@ -24,6 +24,7 @@ from plugins.workflow.language import (
     read_language_snapshot,
     WorkflowLanguageCompatibilityError,
 )
+from plugins.workflow.language_schema import WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
 from plugins.workflow.models import (
     RunExecutionLimits,
     WorkflowConnectorCapabilities,
@@ -279,7 +280,7 @@ def test_v6_seals_nested_admission_authority_resources_and_bounds(
             "output_attempts": 36,
             "artifact_executions": 6,
             "artifact_bytes": 100_663_296,
-            "run_bytes": 141_950_976,
+            "run_bytes": 149_950_976,
             "journal_reserve_bytes": 3_538_944,
             "process_executions": 6,
             "process_tree_rss_byte_executions": 12_884_901_888,
@@ -804,6 +805,12 @@ def test_v6_artifact_free_scripts_charge_process_but_no_generated_artifact_bytes
     assert capacity["artifact_bytes"] == 0
     assert capacity["process_executions"] == 4
     assert capacity["output_attempts"] == 4
+    assert capacity["run_bytes"] == (
+        capacity["output_attempts"] * 1024 * 1024
+        + capacity["journal_reserve_bytes"]
+        + min(capacity["process_executions"], RunExecutionLimits().max_parallel_nodes)
+        * WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
+    )
 
 
 def test_v6_artifact_free_capacity_tampering_fails_closed(

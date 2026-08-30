@@ -26,7 +26,10 @@ from plugins.workflow.language import (
     verify_language_snapshot,
 )
 from plugins.workflow.models import WorkflowLanguageProfile
-from plugins.workflow.output_resolution import ResolvedNodeOutput
+from plugins.workflow.output_resolution import (
+    ResolvedNodeOutput,
+    resolved_output_publication_identity,
+)
 from plugins.workflow.resources import VariableContext
 from plugins.workflow.scheduler import RunScheduler, evaluate_trigger_rule
 from plugins.workflow.schema import parse_workflow_source_bytes
@@ -397,6 +400,18 @@ def _run_script(
         node,
         depends_on=tuple(dict.fromkeys((*node.depends_on, *extra_dependencies))),
     )
+    if predecessor_results is None:
+        predecessor_results = {}
+        for dependency in runtime_node.depends_on:
+            output = current.get(dependency)
+            if output is None:
+                predecessor_results[dependency] = {"state": "skipped"}
+                continue
+            predecessor_results[dependency] = {
+                "state": "succeeded",
+                "output_evidence": resolved_output_publication_identity(output),
+                "output": output.value,
+            }
     run_directory = tmp_path / f"run-{node.id}-{len(list(tmp_path.iterdir()))}"
     run_directory.mkdir()
     result = ScriptExecutor().execute(
@@ -406,7 +421,7 @@ def _run_script(
             node=runtime_node,
             attempt_id="attempt",
             variable_context=variables,
-            predecessor_results=predecessor_results or {},
+            predecessor_results=predecessor_results,
             output_resolver=variables.output_reference,
             language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
             normalizer_version=6,
@@ -449,6 +464,7 @@ def _terminal_predecessors(
     *,
     create_branch: dict[str, object] | None = None,
     commit_changes: dict[str, object] | None = None,
+    create_merge_request: dict[str, object] | None = None,
     review_merge_request: dict[str, object] | None = None,
     update_jira: dict[str, object] | None = None,
 ) -> dict[str, dict[str, object]]:
@@ -456,15 +472,36 @@ def _terminal_predecessors(
         "prepare-writes": plan,
         "create-branch": create_branch,
         "commit-changes": commit_changes,
+        "create-merge-request": create_merge_request,
         "review-merge-request": review_merge_request,
         "update-jira": update_jira,
     }
-    return {
-        node_id: {
-            "state": "succeeded" if output is not None else "skipped",
-            **({"output": output} if output is not None else {}),
+    predecessors = {}
+    for node_id, output in values.items():
+        if output is None:
+            predecessors[node_id] = {"state": "skipped"}
+            continue
+        resolved = _resolved(node_id, output)
+        predecessors[node_id] = {
+            "state": "succeeded",
+            "output_evidence": resolved_output_publication_identity(resolved),
+            "output": output,
         }
-        for node_id, output in values.items()
+    return predecessors
+
+
+def _set_terminal_predecessor(
+    predecessors: dict[str, dict[str, object]],
+    node_id: str,
+    output: dict[str, object],
+    *,
+    state: str = "succeeded",
+) -> None:
+    resolved = _resolved(node_id, output)
+    predecessors[node_id] = {
+        "state": state,
+        "output_evidence": resolved_output_publication_identity(resolved),
+        "output": output,
     }
 
 
@@ -717,6 +754,14 @@ def test_each_approval_and_write_is_conditioned_on_its_exact_plan_flag() -> None
         assert scoped[f"process-ticket-manifest/{node_id}"].options["when"] == condition
     terminal = scoped["process-ticket-manifest/publish-ticket-record"]
     assert terminal.options["trigger_rule"] == "none_failed_min_one_success"
+    assert set(terminal.depends_on) == {
+        "prepare-writes",
+        "create-branch",
+        "commit-changes",
+        "create-merge-request",
+        "review-merge-request",
+        "update-jira",
+    }
 
 
 @pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
@@ -823,12 +868,20 @@ def test_terminal_reducer_publishes_corroborated_write_identities_and_warnings(
     commit = _write_evidence(
         "ERIC-1", "commit_changes", object_id="deadbeef", warnings=["commit warning"]
     )
+    merge_request_url = "https://gitlab.example/team/service/-/merge_requests/17"
+    merge_request = _write_evidence(
+        "ERIC-1",
+        "create_merge_request",
+        object_id="17",
+        web_url=merge_request_url,
+        warnings=["merge request warning"],
+    )
     review = {
         "ticket_key": "ERIC-1",
         "operation": "review_merge_request",
         "status": "success",
         "merge_request_id": "17",
-        "merge_request_url": "https://gitlab.example/team/service/-/merge_requests/17",
+        "merge_request_url": merge_request_url,
         "warnings": ["review warning"],
         "attention_needed": True,
         "reconciliation_status": "confirmed",
@@ -848,6 +901,7 @@ def test_terminal_reducer_publishes_corroborated_write_identities_and_warnings(
             plan,
             create_branch=branch,
             commit_changes=commit,
+            create_merge_request=merge_request,
             review_merge_request=review,
             update_jira=jira,
         ),
@@ -861,18 +915,133 @@ def test_terminal_reducer_publishes_corroborated_write_identities_and_warnings(
         "project_path": "team/service",
         "branch_name": "fix/ERIC-1",
         "commit_id": "deadbeef",
-        "merge_request_url": "https://gitlab.example/team/service/-/merge_requests/17",
+        "merge_request_url": merge_request_url,
         "jira_comment_id": "10001",
         "warnings": [
             "plan warning",
             "branch warning",
             "commit warning",
+            "merge request warning",
             "review warning",
             "jira warning",
         ],
         "attention_needed": True,
         "reconciliation_status": "confirmed",
     }
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_write",
+        "failed_write_state",
+        "failed_write_status",
+        "ambiguous_write",
+        "wrong_write_ticket",
+        "wrong_write_operation",
+        "missing_write_identity",
+        "identity_mismatch",
+        "url_mismatch",
+        "missing_review",
+    ),
+)
+def test_terminal_reducer_fails_closed_without_agreeing_merge_request_evidence(
+    tmp_path: Path, case: str
+) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    terminal = next(
+        node for node in group.value["nodes"] if node.id == "publish-ticket-record"
+    )
+    plan = _terminal_plan(jira=0)
+    url = "https://gitlab.example/team/service/-/merge_requests/17"
+    write = _write_evidence(
+        "ERIC-1", "create_merge_request", object_id="17", web_url=url
+    )
+    review = {
+        "ticket_key": "ERIC-1",
+        "operation": "review_merge_request",
+        "status": "success",
+        "merge_request_id": "17",
+        "merge_request_url": url,
+        "warnings": [],
+        "attention_needed": False,
+        "reconciliation_status": "confirmed",
+    }
+    predecessors = _terminal_predecessors(
+        plan,
+        create_branch=_write_evidence(
+            "ERIC-1", "create_branch", object_id="fix/ERIC-1"
+        ),
+        commit_changes=_write_evidence(
+            "ERIC-1", "commit_changes", object_id="deadbeef"
+        ),
+        create_merge_request=write,
+        review_merge_request=review,
+    )
+    if case == "missing_write":
+        predecessors["create-merge-request"] = {"state": "skipped"}
+    elif case == "failed_write_state":
+        predecessors["create-merge-request"] = {"state": "failed"}
+    elif case == "failed_write_status":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "status": "failed"},
+        )
+    elif case == "ambiguous_write":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "reconciliation_status": "failed_closed"},
+        )
+    elif case == "wrong_write_ticket":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "ticket_key": "ERIC-2"},
+        )
+    elif case == "wrong_write_operation":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "operation": "commit_changes"},
+        )
+    elif case == "missing_write_identity":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "object_id": None},
+        )
+    elif case == "identity_mismatch":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "object_id": "18"},
+        )
+    elif case == "url_mismatch":
+        _set_terminal_predecessor(
+            predecessors,
+            "create-merge-request",
+            {**write, "web_url": f"{url}-other"},
+        )
+    else:
+        predecessors["review-merge-request"] = {"state": "skipped"}
+
+    result, _text = _run_script(
+        tmp_path,
+        terminal,
+        outputs={"prepare-writes": plan},
+        predecessor_results=predecessors,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "process_exit"
 
 
 def test_v6_script_predecessors_receive_authenticated_state_and_typed_output() -> None:
@@ -894,6 +1063,9 @@ def test_v6_script_predecessors_receive_authenticated_state_and_typed_output() -
     )
 
     assert results["create-branch"]["state"] == "succeeded"
+    assert results["create-branch"]["output_evidence"] == (
+        resolved_output_publication_identity(succeeded)
+    )
     assert results["create-branch"]["output"] == succeeded.value
     assert results["commit-changes"] == {"state": "skipped"}
 
@@ -978,26 +1150,37 @@ def test_terminal_reducer_fails_closed_on_uncorroborated_write_evidence(
     elif case == "partial_write_chain":
         pass
     elif case == "failed_state":
-        predecessors["create-branch"] = {"state": "failed", "output": branch}
+        predecessors["create-branch"] = {"state": "failed"}
     elif case == "permission_status":
-        predecessors["create-branch"]["output"] = {**branch, "status": "permission"}
+        _set_terminal_predecessor(
+            predecessors,
+            "create-branch",
+            {**branch, "status": "permission"},
+        )
     elif case == "failed_status":
-        predecessors["create-branch"]["output"] = {**branch, "status": "failed"}
+        _set_terminal_predecessor(
+            predecessors,
+            "create-branch",
+            {**branch, "status": "failed"},
+        )
     elif case == "wrong_ticket":
-        predecessors["create-branch"]["output"] = {
-            **branch,
-            "ticket_key": "ERIC-2",
-        }
+        _set_terminal_predecessor(
+            predecessors,
+            "create-branch",
+            {**branch, "ticket_key": "ERIC-2"},
+        )
     elif case == "wrong_operation":
-        predecessors["create-branch"]["output"] = {
-            **branch,
-            "operation": "commit_changes",
-        }
+        _set_terminal_predecessor(
+            predecessors,
+            "create-branch",
+            {**branch, "operation": "commit_changes"},
+        )
     else:
-        predecessors["create-branch"]["output"] = {
-            **branch,
-            "reconciliation_status": "failed_closed",
-        }
+        _set_terminal_predecessor(
+            predecessors,
+            "create-branch",
+            {**branch, "reconciliation_status": "failed_closed"},
+        )
 
     result, _text = _run_script(
         tmp_path,

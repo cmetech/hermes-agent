@@ -2378,16 +2378,20 @@ class RunScheduler:
                         })
             output = outputs.get(dependency)
             if isinstance(output, ResolvedNodeOutput):
-                evidence["output_evidence"] = MappingProxyType({
-                    "media_type": output.media_type,
-                    "size_bytes": len(output.canonical_bytes),
-                    "sha256": output.sha256,
-                    "node_id": output.node_id,
-                    "attempt_id": output.attempt_id,
-                    "publication_id": output.publication_id,
-                })
                 if include_output_values:
+                    evidence["output_evidence"] = MappingProxyType(
+                        resolved_output_publication_identity(output)
+                    )
                     evidence["output"] = output.value
+                else:
+                    evidence["output_evidence"] = MappingProxyType({
+                        "media_type": output.media_type,
+                        "size_bytes": len(output.canonical_bytes),
+                        "sha256": output.sha256,
+                        "node_id": output.node_id,
+                        "attempt_id": output.attempt_id,
+                        "publication_id": output.publication_id,
+                    })
             results[dependency] = evidence
         return results
 

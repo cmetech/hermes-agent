@@ -1758,6 +1758,9 @@ def _read_node_semantics(
         loop_group = raw.get("loop_group")
         if loop_group is not None:
             from plugins.workflow.executors.base import NodeExecutionContext
+            from plugins.workflow.language_schema import (
+                WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
+            )
             from plugins.workflow.models import (
                 RunExecutionLimits,
                 TerminalJournalReserve,
@@ -1837,6 +1840,11 @@ def _read_node_semantics(
                 != capacity["output_attempts"] * output_limit
                 + capacity["artifact_bytes"]
                 + capacity["journal_reserve_bytes"]
+                + min(
+                    capacity["process_executions"],
+                    execution_limits.max_parallel_nodes,
+                )
+                * WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
                 or capacity["process_tree_rss_byte_executions"]
                 != capacity["process_executions"]
                 * execution_limits.process_tree_rss_bytes

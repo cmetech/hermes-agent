@@ -44,6 +44,7 @@ from plugins.workflow.language_schema import (
     SOURCE_NODE_TYPES,
     WHEN_EXPRESSION_PATTERN,
     WHEN_REFERENCE_PATTERN,
+    WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
     agent_field_names,
     approval_field_names,
     approval_reject_field_names,
@@ -916,10 +917,19 @@ def _loop_group_capacity_bounds(
     )
     child_attempts = _loop_group_work_bounds(nodes, max_iterations)[1]
     journal_reserve_bytes = _checked_work_product(child_attempts, journal_unit)
+    # Script predecessor inputs are attempt-local and transient, so charge their
+    # maximum concurrent storage peak rather than every sequential execution.
+    # Counting every process attempt (including Bash) keeps the bound conservative
+    # without adding another authoring or snapshot field.
+    process_input_peak_bytes = _checked_work_product(
+        min(process_executions, execution_limits.max_parallel_nodes),
+        WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
+    )
     run_bytes = (
         _checked_work_product(output_attempts, output_limit)
         + artifact_bytes
         + journal_reserve_bytes
+        + process_input_peak_bytes
     )
     return {
         "provider_routes": provider_routes,
