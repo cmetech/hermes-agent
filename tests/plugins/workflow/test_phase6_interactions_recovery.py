@@ -487,6 +487,11 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
                         "prompt": "flaky",
                         "depends_on": ["completed"],
                     },
+                    {
+                        "id": "downstream",
+                        "prompt": "downstream",
+                        "depends_on": ["flaky"],
+                    },
                 ],
                 maximum=2,
             )
@@ -494,13 +499,17 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
     )
     store = RunStore(tmp_path / "home", max_total_workers=1)
     run_id = _admit(store, compilation, key=f"phase6-operator-{operator_action}")
-    calls = {"completed": 0, "flaky": 0}
+    calls = {"completed": 0, "flaky": 0, "downstream": 0}
 
     def output(context, _rendered):
         child_id = context.node.id.rsplit("/", 1)[-1]
         calls[child_id] += 1
         if child_id == "completed":
             return "completed"
+        if child_id == "downstream":
+            if "iterations/0002" in context.effective_attempt_directory.as_posix():
+                return "finished <promise>DONE</promise>"
+            return "continue"
         if "iterations/0002" in context.effective_attempt_directory.as_posix():
             if calls[child_id] == 2:
                 return NodeExecutionResult(
@@ -529,6 +538,8 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
     assert failed_controller["iteration"] == 2
     assert failed_controller["body"]["completed"]["state"] == "succeeded"
     assert failed_controller["body"]["flaky"]["state"] == "failed"
+    assert failed_controller["body"]["downstream"]["state"] == "cancelled"
+    assert failed_controller["body"]["downstream"]["attempts"] == []
 
     if operator_action == "resume":
         resumed = store.resume_run(run_id, always_run_nodes=set())
@@ -546,13 +557,15 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
         "attempt_id"
     ] == completed_attempt
     assert resumed_controller["body"]["flaky"]["state"] == "ready"
+    assert resumed_controller["body"]["downstream"]["state"] == "pending"
 
     completed = scheduler.advance_all([run_id])[run_id]
     completed_body = completed["nodes"]["group"]["loop_group"]["body"]
     assert completed["status"] == "succeeded"
-    assert calls == {"completed": 2, "flaky": 3}
+    assert calls == {"completed": 2, "flaky": 3, "downstream": 2}
     assert len(completed_body["completed"]["attempts"]) == 1
     assert len(completed_body["flaky"]["attempts"]) == 2
+    assert len(completed_body["downstream"]["attempts"]) == 1
 
 
 def test_body_approval_resumes_exact_child_without_replaying_succeeded_sibling(

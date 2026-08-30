@@ -655,7 +655,7 @@ def test_loop_group_failure_finalizes_after_active_child_cleanup_is_recorded(
 
 @pytest.mark.parametrize("observation", ("still_running", "outcome_uncertain"))
 @pytest.mark.parametrize("operator_action", ("resume", "retry", "abandon"))
-def test_operator_refuses_unproven_nested_execution_without_releasing_authority(
+def test_operator_preserves_unproven_nested_execution_authority(
     tmp_path,
     workflow_writer,
     monkeypatch,
@@ -709,17 +709,23 @@ def test_operator_refuses_unproven_nested_execution_without_releasing_authority(
         )
     assert len(authority_before) == 2
 
-    expected_error = ValueError if operator_action == "retry" else RuntimeError
-    expected_message = (
-        "replay-safe" if operator_action == "retry" else "cannot .* while"
-    )
-    with pytest.raises(expected_error, match=expected_message):
-        if operator_action == "resume":
-            store.resume_run(run_id, always_run_nodes=set())
-        elif operator_action == "retry":
-            store.retry_run(run_id, node_id="group/select")
-        else:
-            store.abandon_run(run_id)
+    if operator_action == "resume" and retained["status"] not in {
+        "failed",
+        "interrupted",
+    }:
+        assert store.resume_run(run_id, always_run_nodes=set()) == retained
+    else:
+        expected_error = ValueError if operator_action == "retry" else RuntimeError
+        expected_message = (
+            "replay-safe" if operator_action == "retry" else "cannot .* while"
+        )
+        with pytest.raises(expected_error, match=expected_message):
+            if operator_action == "resume":
+                store.resume_run(run_id, always_run_nodes=set())
+            elif operator_action == "retry":
+                store.retry_run(run_id, node_id="group/select")
+            else:
+                store.abandon_run(run_id)
 
     assert store.load_run(run_id) == retained
     with store._connect() as connection:

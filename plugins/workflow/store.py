@@ -502,6 +502,35 @@ def _reset_loop_group_child_for_operator(
         )
         else "pending"
     )
+    affected = {child_id}
+    restored = True
+    while restored:
+        restored = False
+        for candidate_id, candidate in body.items():
+            if (
+                candidate_id in affected
+                or not isinstance(candidate, MutableMapping)
+                or candidate.get("state") != "cancelled"
+                or candidate.get("attempts")
+                or any(
+                    candidate.get(field) is not None
+                    for field in ("claim", "recovery", "pending_interaction")
+                )
+            ):
+                continue
+            dependencies = candidate.get("depends_on", ())
+            if not any(dependency in affected for dependency in dependencies):
+                continue
+            candidate["state"] = (
+                "ready"
+                if all(
+                    body[dependency].get("state") in {"succeeded", "skipped"}
+                    for dependency in dependencies
+                )
+                else "pending"
+            )
+            affected.add(candidate_id)
+            restored = True
     group["state"] = "running"
     controller["state"] = "running"
 
@@ -18620,7 +18649,6 @@ class RunStore:
                 int(projection["state_version"]) != expected_state_version
             ):
                 raise WorkflowConflict("stale resume decision")
-            _assert_operator_transition_has_no_live_execution(projection, "resume")
             if projection["status"] == "recovery_pending":
                 pending_registry_payloads = _pending_session_registry_payloads(
                     projection
@@ -18666,6 +18694,7 @@ class RunStore:
                         "foreground owner conflict: expired owner requires adoption"
                     )
                 return projection
+            _assert_operator_transition_has_no_live_execution(projection, "resume")
             for node_id, node in projection["nodes"].items():
                 controller = node.get("loop_group")
                 if isinstance(controller, MutableMapping):

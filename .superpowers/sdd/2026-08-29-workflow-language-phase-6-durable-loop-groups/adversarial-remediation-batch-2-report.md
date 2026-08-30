@@ -30,18 +30,39 @@ Result: 0 passed, 9 failed. The failures reproduced all three findings:
 
 The same focused command passed 9 tests after the production changes.
 
+The scoped review follow-up added its regressions before follow-up production
+edits and ran:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_interactions_recovery.py \
+  tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
+  -k 'operator_restarts_only_the_failed_current_iteration_child or phase5_redundant_resume_keeps_a_running_claim_unchanged' \
+  -q
+```
+
+Result: 0 passed, 3 failed. The resume and explicit nested-retry cases left an
+attempt-free downstream child `cancelled` after restarting its failed
+predecessor. The v5 case showed that a redundant resume of a running run raised
+on its active claim instead of returning the existing projection unchanged.
+
 ## Root-cause changes
 
 - Routed resume, retry, and abandon safety checks through the existing nested
   projection-state iterator. Live claims and unproven `still_running` or
-  `outcome_uncertain` recovery now refuse the operator transition before any
-  projection, claim, or reserve mutation. Existing top-level resume/retry error
-  contracts remain intact.
+  `outcome_uncertain` recovery now refuse an eligible operator transition before
+  any projection, claim, or reserve mutation. Ineligible resume statuses retain
+  their historical no-op/foreground-owner behavior, including v1-v5 running
+  runs and `recovery_pending` registry retries. Existing top-level resume/retry
+  error contracts remain intact.
 - Made resume and explicit retry authenticate the current `group/child` body
   state, reset only failed/interrupted children with replay-safe stopped-process
-  evidence, and restore the existing outer/controller state to `running`.
-  Succeeded/skipped siblings, controller generation, current iteration, and
-  attempt history remain unchanged. The outer group is not a retry candidate.
+  evidence, and restore the existing outer/controller state to `running`. Only
+  attempt-free cancelled descendants reachable through current-body dependency
+  edges are restored to pending/ready; executed, claimed, recovery-bound, or
+  interaction-bound cancelled children remain terminal. Succeeded/skipped
+  siblings, controller generation, current iteration, and attempt history remain
+  unchanged. The outer group is not a retry candidate.
 - Preserved the one durable predicate claim, execution fence, callbacks, and
   obligation-journal reserve while assigning every authorized Bash dispatch a
   fresh physical attempt ID and contained directory beneath the iteration's
@@ -61,11 +82,12 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_phase6_interactions_recovery.py \
   tests/plugins/workflow/test_phase6_store.py \
   tests/plugins/workflow/test_crash_recovery.py \
-  -k 'operator_restarts_only_the_failed_current_iteration_child or operator_refuses_unproven_nested_execution_without_releasing_authority or predicate_redispatch_uses_a_fresh_physical_attempt' \
+  tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
+  -k 'operator_restarts_only_the_failed_current_iteration_child or operator_preserves_unproven_nested_execution_authority or predicate_redispatch_uses_a_fresh_physical_attempt or phase5_redundant_resume_keeps_a_running_claim_unchanged' \
   -q
 ```
 
-Result: 3 files, 9 tests passed, 0 failed.
+Result after the scoped review follow-up: 4 files, 10 tests passed, 0 failed.
 
 Required Phase 6 recovery gate:
 
@@ -93,7 +115,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_shutdown_recovery.py -q
 ```
 
-Result: 6 files, 230 tests passed, 0 failed.
+Result after the scoped review follow-up: 6 files, 231 tests passed, 0 failed.
 
 Static gates:
 
@@ -102,6 +124,7 @@ Static gates:
   plugins/workflow/scheduler.py \
   plugins/workflow/store.py \
   tests/plugins/workflow/test_crash_recovery.py \
+  tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
   tests/plugins/workflow/test_phase6_interactions_recovery.py \
   tests/plugins/workflow/test_phase6_store.py
 git diff --check
@@ -115,16 +138,20 @@ errors.
 - `plugins/workflow/scheduler.py`
 - `plugins/workflow/store.py`
 - `tests/plugins/workflow/test_crash_recovery.py`
+- `tests/plugins/workflow/test_phase5_execution_authority_continuity.py`
 - `tests/plugins/workflow/test_phase6_interactions_recovery.py`
 - `tests/plugins/workflow/test_phase6_store.py`
 - `.superpowers/sdd/2026-08-29-workflow-language-phase-6-durable-loop-groups/adversarial-remediation-batch-2-report.md`
 
 ## Commit
 
-`fix(workflow): preserve nested recovery coherence` — the atomic commit
-containing the implementation, regressions, compatibility assertion updates,
-and this report. Its final SHA is returned in the task handoff because a commit
-cannot embed its own SHA.
+`ef809667ad` (`fix(workflow): preserve nested recovery coherence`) — the
+initial atomic implementation commit.
+
+`fix(workflow): restore loop group downstream recovery` — the atomic scoped
+review follow-up containing the downstream-fallout reset, resume ordering fix,
+regressions, and this report update. Its final SHA is returned in the task
+handoff because a commit cannot embed its own SHA.
 
 ## Concerns
 
