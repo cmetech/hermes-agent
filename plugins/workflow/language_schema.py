@@ -67,7 +67,7 @@ CONTRACT_RESERVED_GROWTH_BYTES = 4_000
 CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
     "definition_schema": 150_000,
     "node_kinds": 72_000,
-    "compatibility_codes": 16_500,
+    "compatibility_codes": 18_000,
 })
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -1313,6 +1313,7 @@ def _example_for(yaml_name: str, shape: str) -> object:
         "systemPrompt": "Follow the workflow instructions.",
         "until": "done",
         "gate_message": "Approve the next iteration.",
+        "artifacts": False,
         "hookEventName": "PreToolUse",
     }
     if yaml_name in named:
@@ -1326,6 +1327,20 @@ def _example_for(yaml_name: str, shape: str) -> object:
         "positive_number": 1,
         "positive_integer": 1,
         "model_turns": 2,
+        "tool_call_contract": {
+            "name": "fetch_items",
+            "arguments": {"max_results": 25},
+            "result": {
+                "items_path": "items",
+                "select": ["key"],
+                "output_items_path": "tickets",
+                "output_count_path": "count",
+                "output_status_path": "status",
+                "empty_status": "empty",
+                "nonempty_status": "ready",
+                "max_items": 25,
+            },
+        },
         "string_list": ["value"],
         "mapping": {"key": "value"},
         "worktree": {"enabled": True},
@@ -1587,7 +1602,7 @@ _NODE_FIELDS = (
         "output_format",
         "object",
         "mapping",
-        node_types=_AI_NODE_TYPES,
+        node_types=(*_AI_NODE_TYPES, "bash", "script"),
         structural_node_types=NODE_TYPES,
         phase=2,
         legacy_status="warning",
@@ -1669,10 +1684,21 @@ _NODE_FIELDS = (
         "integer",
         "model_turns",
         node_types=_AI_NODE_TYPES,
-        structural_node_types=NODE_TYPES,
+        structural_node_types=_AI_NODE_TYPES,
         phase=6,
         archon_status="blocking",
         archon_code="archon_model_turn_cap_unavailable",
+    ),
+    _field(
+        "node",
+        "tool_call_contract",
+        "object",
+        "tool_call_contract",
+        node_types=_AI_NODE_TYPES,
+        structural_node_types=_AI_NODE_TYPES,
+        phase=6,
+        archon_status="blocking",
+        archon_code="archon_tool_call_contract_unavailable",
     ),
     _field(
         "node",
@@ -1718,6 +1744,14 @@ _NODE_FIELDS = (
         required_node_types=("script",),
     ),
     _field("node", "deps", "array", "string_list", node_types=("script",)),
+    _field(
+        "node",
+        "artifacts",
+        "boolean",
+        "boolean",
+        node_types=("bash", "script"),
+        phase=6,
+    ),
     _field(
         "node",
         "timeout",
@@ -2173,7 +2207,12 @@ def _node_specs(
     specs = _specs("node")
     if supports_phase6_semantics(profile, normalizer_version):
         return specs
-    return tuple(spec for spec in specs if spec.yaml_name != "loop_group")
+    return tuple(
+        spec
+        for spec in specs
+        if spec.yaml_name
+        not in {"loop_group", "maxTurns", "tool_call_contract", "artifacts"}
+    )
 
 
 def _executable_node_types(
@@ -2282,6 +2321,51 @@ def _schema_for_shape(
         return {"type": "integer", "minimum": 1}
     if shape == "model_turns":
         return {"type": "integer", "minimum": 1, "maximum": 90}
+    if shape == "tool_call_contract":
+        text = {"type": "string", "minLength": 1, "pattern": r"^[A-Za-z0-9_-]+$"}
+        return {
+            "type": "object",
+            "properties": {
+                "name": text,
+                "arguments": {"type": "object", "maxProperties": 32},
+                "result": {
+                    "type": "object",
+                    "properties": {
+                        "items_path": text,
+                        "select": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 16,
+                            "uniqueItems": True,
+                            "items": text,
+                        },
+                        "output_items_path": text,
+                        "output_count_path": text,
+                        "output_status_path": text,
+                        "empty_status": text,
+                        "nonempty_status": text,
+                        "max_items": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                        },
+                    },
+                    "required": [
+                        "items_path",
+                        "select",
+                        "output_items_path",
+                        "output_count_path",
+                        "output_status_path",
+                        "empty_status",
+                        "nonempty_status",
+                        "max_items",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["name", "arguments", "result"],
+            "additionalProperties": False,
+        }
     if shape == "string_list":
         return {"type": "array", "items": {"type": "string", "minLength": 1}}
     if shape == "mapping":

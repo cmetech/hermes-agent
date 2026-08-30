@@ -1264,6 +1264,175 @@ def _sanitize(value: Any, limit: int = 2000) -> str:
         return text
 
 
+def _json_value(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value
+
+
+def _contains_write_ambiguous(
+    value: object, *, depth: int = 0, budget: list[int] | None = None
+) -> bool:
+    if budget is None:
+        budget = [512]
+    if depth > 8 or budget[0] <= 0:
+        return False
+    budget[0] -= 1
+    value = _json_value(value)
+    if isinstance(value, dict):
+        for key, item in list(value.items())[:128]:
+            if str(key).lower() in {"category", "failure_kind", "status"} and str(
+                item
+            ).lower() in {"write_ambiguous", "outcome_unknown"}:
+                return True
+            if _contains_write_ambiguous(item, depth=depth + 1, budget=budget):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(
+            _contains_write_ambiguous(item, depth=depth + 1, budget=budget)
+            for item in value[:128]
+        )
+    return False
+
+
+class _ToolCallAudit:
+    """Bounded, result-redacting evidence for exact calls and outward ambiguity."""
+
+    def __init__(self, contract: object, *, outward_action: bool) -> None:
+        self.contract = dict(contract) if isinstance(contract, dict) else None
+        self.outward_action = outward_action
+        self._lock = threading.Lock()
+        self._starts: list[tuple[str, bool]] = []
+        self._start_count = 0
+        self._active: set[str] = set()
+        self._parallel = False
+        self._results: dict[str, list[dict[str, object]]] = {}
+        self._invalid_results: set[str] = set()
+        self._write_ambiguous = False
+
+    def start(self, call_id: str, name: str, arguments: object) -> None:
+        with self._lock:
+            call_id = str(call_id)
+            if self.contract is not None:
+                self._start_count += 1
+                if len(self._starts) < 2:
+                    self._starts.append((
+                        call_id,
+                        str(name) == self.contract.get("name")
+                        and arguments == self.contract.get("arguments"),
+                    ))
+                if len(self._active) < 2:
+                    self._active.add(call_id)
+            self._parallel = self._parallel or len(self._active) > 1
+
+    def complete(
+        self, call_id: str, name: str, arguments: object, result: object
+    ) -> None:
+        del name, arguments
+        parsed = _json_value(result)
+        with self._lock:
+            self._active.discard(str(call_id))
+            if self.contract is not None and len(self._results) < 2:
+                try:
+                    self._results[str(call_id)] = self._project(
+                        self.contract, parsed
+                    )
+                except (TypeError, ValueError):
+                    self._invalid_results.add(str(call_id))
+            if self.outward_action and _contains_write_ambiguous(parsed):
+                self._write_ambiguous = True
+
+    @staticmethod
+    def _project(contract: dict[str, object], result: object) -> list[dict[str, object]]:
+        projection = contract["result"]
+        assert isinstance(projection, dict)
+        source = _json_value(result)
+        if not isinstance(source, dict):
+            raise ValueError("tool_call_contract_violation: result is not an object")
+        items = source.get(str(projection["items_path"]))
+        maximum = int(projection["max_items"])
+        selected = tuple(str(field) for field in projection["select"])
+        if not isinstance(items, list) or len(items) > maximum:
+            raise ValueError("tool_call_contract_violation: result items are invalid")
+        seen: set[str] = set()
+        projected: list[dict[str, object]] = []
+        for item in items:
+            if not isinstance(item, dict) or any(field not in item for field in selected):
+                raise ValueError(
+                    "tool_call_contract_violation: projected item is invalid"
+                )
+            row = {field: item[field] for field in selected}
+            identity = json.dumps(
+                row, allow_nan=False, sort_keys=True, separators=(",", ":")
+            )
+            if len(identity.encode("utf-8")) > 4096:
+                raise ValueError(
+                    "tool_call_contract_violation: projected item exceeds limit"
+                )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            projected.append(row)
+        return projected
+
+    def finalize(self, output: object) -> dict[str, object]:
+        evidence = self.uncertain_evidence()
+        with self._lock:
+            starts = list(self._starts)
+            start_count = self._start_count
+            results = dict(self._results)
+            invalid_results = set(self._invalid_results)
+            parallel = self._parallel
+        if self.contract is None:
+            return evidence
+        if (
+            parallel
+            or start_count != 1
+            or len(starts) != 1
+            or starts[0][1] is not True
+            or set(results) != {starts[0][0]}
+            or invalid_results
+        ):
+            raise ValueError("tool_call_contract_violation: exact trace mismatch")
+        projected = results[starts[0][0]]
+        projection = self.contract["result"]
+        assert isinstance(projection, dict)
+        if not isinstance(output, dict):
+            raise ValueError("tool_call_contract_violation: output is not an object")
+        items_field = str(projection["output_items_path"])
+        count_field = str(projection["output_count_path"])
+        status_field = str(projection["output_status_path"])
+        expected_status = projection[
+            "empty_status" if not projected else "nonempty_status"
+        ]
+        if (
+            output.get(items_field) != projected
+            or output.get(count_field) != len(projected)
+            or output.get(status_field) != expected_status
+        ):
+            raise ValueError(
+                "tool_call_contract_violation: output is not corroborated by result"
+            )
+        evidence.update({
+            "tool_call_contract_satisfied": True,
+            "tool_call_count": 1,
+        })
+        return evidence
+
+    def uncertain_evidence(self) -> dict[str, object]:
+        with self._lock:
+            if not self._write_ambiguous:
+                return {}
+            return {
+                "write_ambiguous": True,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+            }
+
+
 def _interaction_descriptor(kind: str, payload: dict[str, Any]) -> dict[str, str]:
     safe = {key: _sanitize(value, 1000) for key, value in payload.items()}
     digest = hashlib.sha256(
@@ -1776,6 +1945,10 @@ def _run(
 
         pending: list[dict[str, str]] = []
         approved_action_consumed = False
+        tool_audit = _ToolCallAudit(
+            request.tool_call_contract,
+            outward_action=True,
+        )
 
         def pause(descriptor: dict[str, str]) -> None:
             pending.append(descriptor)
@@ -2034,7 +2207,10 @@ def _run(
                 session_id=request.session_id,
                 session_db=session_db,
                 clarify_callback=clarify,
+                tool_start_callback=tool_audit.start,
+                tool_complete_callback=tool_audit.complete,
             )
+            agent.strict_iteration_limit = request.strict_iteration_limit
             if request._cost_budget_authority is not None:
                 from agent.usage_pricing import authoritative_cost_fact
 
@@ -2281,6 +2457,7 @@ def _run(
                     approved_action_digest=None,
                     workdir=request.workdir,
                     max_iterations=request.max_iterations,
+                    strict_iteration_limit=request.strict_iteration_limit,
                     max_api_attempts=request.max_api_attempts,
                     sealed_provider_attempt_grant=(
                         request.sealed_provider_attempt_grant
@@ -2462,6 +2639,41 @@ def _run(
                     "structured_output": None,
                 }
             except Exception as exc:
+                if request.tool_call_contract is not None:
+                    model_calls = max(
+                        0, int(getattr(agent, "_api_call_count", 0) or 0)
+                    )
+                    shared_attempts, shared_exhausted = provider_attempt_state()
+                    provider_attempt_grant_exhausted[0] = shared_exhausted
+                    return {
+                        "final_response": "",
+                        "session_id": str(agent.session_id or ""),
+                        "provider": str(agent.provider or ""),
+                        "model": str(agent.model or ""),
+                        "status": "failed",
+                        "pending_interaction": None,
+                        "usage": {},
+                        "audit": {
+                            "plugin_id": plugin_id,
+                            "failure_kind": "tool_call_contract_violation",
+                            "provider_attempts": shared_attempts,
+                            "model_calls": model_calls,
+                            **tool_audit.uncertain_evidence(),
+                            **(
+                                {
+                                    "intended_authority_digest": (
+                                        request.intended_authority_digest
+                                    ),
+                                    "model_visible_prefix_digest": (
+                                        model_visible_prefix_digest
+                                    ),
+                                }
+                                if model_visible_prefix_digest is not None
+                                else {}
+                            ),
+                        },
+                        "structured_output": None,
+                    }
                 if request.sealed_fallback_route is not None:
                     fallback_result = run_sealed_fallback({
                         "input_tokens": int(
@@ -2578,6 +2790,23 @@ def _run(
             shared_attempts, shared_exhausted = provider_attempt_state()
             provider_attempt_grant_exhausted[0] = shared_exhausted
             failed = bool(response.get("failed")) or shared_exhausted
+            contract_failure = None
+            try:
+                contract_output = (
+                    json.loads(str(response.get("final_response", "")))
+                    if request.tool_call_contract is not None
+                    else {}
+                )
+                tool_audit_evidence = tool_audit.finalize(contract_output)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                tool_audit_evidence = {}
+                contract_failure = str(exc)
+                failed = True
+            if request.tool_call_contract is not None and failed:
+                tool_audit_evidence = tool_audit.uncertain_evidence()
+                contract_failure = (
+                    contract_failure or "tool-call contract execution failed"
+                )
             model_calls = max(0, int(response.get("api_calls", 0) or 0))
             provider_attempts = (
                 shared_attempts
@@ -2588,6 +2817,7 @@ def _run(
                 failed
                 and not shared_exhausted
                 and not pending
+                and request.tool_call_contract is None
                 and request.sealed_fallback_route is not None
             ):
                 fallback_result = run_sealed_fallback(usage)
@@ -2609,6 +2839,7 @@ def _run(
                 "model_calls": model_calls,
                 "hook_events": hook_events,
                 "sandbox_policy_declared": request.sandbox_policy is not None,
+                **tool_audit_evidence,
                 **(
                     {"api_mode": _sanitize(runtime.get("api_mode"), 64)}
                     if structured_evidence is not None
@@ -2630,7 +2861,9 @@ def _run(
                     ),
                     "model_visible_prefix_digest": model_visible_prefix_digest,
                 })
-            if provider_attempt_grant_exhausted[0]:
+            if contract_failure is not None:
+                audit["failure_kind"] = "tool_call_contract_violation"
+            elif provider_attempt_grant_exhausted[0]:
                 audit["failure_kind"] = (
                     _ProviderAttemptGrantExhausted.failure_kind
                 )

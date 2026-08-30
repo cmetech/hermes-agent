@@ -479,6 +479,12 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
     for field in ("always_run", "persist_session"):
         if field in node:
             _boolean(node[field], f"{path}.{field}")
+    if "artifacts" in node and not isinstance(node["artifacts"], bool):
+        _fail(
+            f"{path}.artifacts",
+            "invalid_artifacts",
+            f"{path}.artifacts must be a boolean",
+        )
     if "output_type" in node:
         _string(
             node["output_type"],
@@ -508,6 +514,76 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
                 f"{path}.maxTurns",
                 "invalid_max_turns",
                 f"{path}.maxTurns must be an integer between 1 and 90",
+            )
+    if "tool_call_contract" in node:
+        contract_path = f"{path}.tool_call_contract"
+        contract = _mapping(node["tool_call_contract"], contract_path)
+        if set(contract) != {"name", "arguments", "result"}:
+            _fail(
+                contract_path,
+                "invalid_tool_call_contract",
+                f"{contract_path} must define exactly name, arguments, and result",
+            )
+        name = _string(contract["name"], f"{contract_path}.name")
+        if not _SAFE_NAME.fullmatch(name):
+            _fail(
+                f"{contract_path}.name",
+                "invalid_tool_call_contract",
+                f"{contract_path}.name must be a portable tool name",
+            )
+        arguments = _mapping(contract["arguments"], f"{contract_path}.arguments")
+        if len(arguments) > 32:
+            _fail(
+                f"{contract_path}.arguments",
+                "invalid_tool_call_contract",
+                f"{contract_path}.arguments exceeds 32 fields",
+            )
+        result = _mapping(contract["result"], f"{contract_path}.result")
+        required = {
+            "items_path",
+            "select",
+            "output_items_path",
+            "output_count_path",
+            "output_status_path",
+            "empty_status",
+            "nonempty_status",
+            "max_items",
+        }
+        if set(result) != required:
+            _fail(
+                f"{contract_path}.result",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result has an invalid projection shape",
+            )
+        for field in (
+            "items_path",
+            "output_items_path",
+            "output_count_path",
+            "output_status_path",
+            "empty_status",
+            "nonempty_status",
+        ):
+            value = _string(result[field], f"{contract_path}.result.{field}")
+            if not _SAFE_NAME.fullmatch(value):
+                _fail(
+                    f"{contract_path}.result.{field}",
+                    "invalid_tool_call_contract",
+                    f"{contract_path}.result.{field} must be a portable field name",
+                )
+        selected = result["select"]
+        _string_list(selected, f"{contract_path}.result.select")
+        if not selected or len(selected) > 16 or len(set(selected)) != len(selected):
+            _fail(
+                f"{contract_path}.result.select",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result.select must contain 1 to 16 unique fields",
+            )
+        maximum = result["max_items"]
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= 100:
+            _fail(
+                f"{contract_path}.result.max_items",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result.max_items must be an integer between 1 and 100",
             )
     if "sandbox" in node:
         _mapping(node["sandbox"], f"{path}.sandbox")
@@ -750,7 +826,8 @@ def _loop_group_capacity_bounds(
         } or is_approval_rework:
             output_attempts += attempts
         if node.node_type in {"bash", "script"}:
-            artifact_executions += attempts
+            if node.options.get("artifacts", True) is not False:
+                artifact_executions += attempts
             process_executions += attempts
 
         if node.node_type not in {"command", "prompt", "loop"} and not (
@@ -1160,6 +1237,24 @@ def _normalize_node(
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
     phase6 = supports_phase6_semantics(profile, normalizer_version)
+    for field in ("maxTurns", "tool_call_contract", "artifacts"):
+        if field in node and not phase6:
+            _fail(
+                f"{path}.{field}",
+                f"{field}_version_unsupported",
+                f"{field} requires Phase 6",
+            )
+    for field, allowed_types in (
+        ("maxTurns", {"command", "prompt"}),
+        ("tool_call_contract", {"command", "prompt"}),
+        ("artifacts", {"bash", "script"}),
+    ):
+        if field in node and node_type not in allowed_types:
+            _fail(
+                f"{path}.{field}",
+                "field_not_applicable",
+                f"{field} is not supported on {node_type} nodes",
+            )
     if node_type == "loop_group" and not phase6:
         _fail(
             f"{path}.loop_group",

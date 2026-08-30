@@ -161,7 +161,17 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
-    if continuation_budget_exhausted:
+    if (
+        final_response is None
+        and budget_fallback_eligible
+        and getattr(agent, "strict_iteration_limit", False) is True
+    ):
+        failed = True
+        final_response = ""
+        _turn_exit_reason = (
+            f"strict_max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        )
+    elif continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
         # one. Preserve that exact answer instead of replacing it with another

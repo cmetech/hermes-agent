@@ -246,6 +246,65 @@ def test_v5_rejects_loop_group_without_changing_current_admission(
     )
 
 
+@pytest.mark.parametrize("node_type", ("bash", "script"))
+def test_artifact_free_process_mode_is_v6_only(
+    tmp_path, workflow_writer, node_type
+):
+    node = {"id": "reduce", node_type: "printf ok", "artifacts": False}
+    if node_type == "script":
+        node.update(script="print('ok')", runtime="uv")
+    path = workflow_writer(tmp_path, nodes=[node])
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text("language_compatibility: archon-2026-07\n", encoding="utf-8")
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        load_workflow(path)
+
+    assert raised.value.issues[0].code == "artifacts_version_unsupported"
+    assert raised.value.issues[0].path == "nodes[0].artifacts"
+
+
+@pytest.mark.parametrize("value", (None, 0, 1, "false", [], {}))
+def test_v6_artifact_free_process_mode_requires_boolean(
+    tmp_path, workflow_writer, value
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[{"id": "reduce", "bash": "printf ok", "artifacts": value}],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _load_v6(path)
+
+    assert raised.value.issues[0].code == "invalid_artifacts"
+    assert raised.value.issues[0].path == "nodes[0].artifacts"
+
+
+def test_v6_artifact_free_process_mode_is_sealed_in_normalized_identity(
+    tmp_path, workflow_writer
+):
+    enabled_path = workflow_writer(
+        tmp_path / "enabled",
+        name="artifact-mode",
+        nodes=[{"id": "reduce", "bash": "printf ok", "artifacts": True}],
+    )
+    disabled_path = workflow_writer(
+        tmp_path / "disabled",
+        name="artifact-mode",
+        nodes=[{"id": "reduce", "bash": "printf ok", "artifacts": False}],
+    )
+
+    enabled = _normalize_v6_without_admission(enabled_path)
+    disabled = _normalize_v6_without_admission(disabled_path)
+
+    assert enabled.definition.nodes[0].options["artifacts"] is True
+    assert disabled.definition.nodes[0].options["artifacts"] is False
+    assert (
+        enabled.language.normalized_definition_digest
+        != disabled.language.normalized_definition_digest
+    )
+
+
 def test_v6_reuses_effective_interactivity_invariant(tmp_path, workflow_writer):
     path = workflow_writer(
         tmp_path,

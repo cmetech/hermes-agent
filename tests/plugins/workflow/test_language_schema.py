@@ -595,7 +595,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
         "section_max_bytes": {
             "definition_schema": 150_000,
             "node_kinds": 72_000,
-            "compatibility_codes": 16_500,
+                "compatibility_codes": 18_000,
         },
     }
     assert contract["x-hermes-provenance"]["field_authority"] == (
@@ -654,6 +654,7 @@ def test_node_kind_descriptors_cover_each_applicable_node_field_once(profile):
             for spec in FIELD_INVENTORY
             if spec.scope == "node"
             and node_type in spec.applicable_node_types
+            and spec.enforcement_phase <= contract["normalizer_version"]
             and not (
                 profile is WorkflowLanguageProfile.ARCHON_2026_07
                 and (
@@ -1205,6 +1206,21 @@ _NODE_FIELD_VALUES = {
     "thinking": "adaptive",
     "maxBudgetUsd": 1,
     "maxTurns": 2,
+    "tool_call_contract": {
+        "name": "fetch_items",
+        "arguments": {"max_results": 25},
+        "result": {
+            "items_path": "items",
+            "select": ["key"],
+            "output_items_path": "tickets",
+            "output_count_path": "count",
+            "output_status_path": "status",
+            "empty_status": "empty",
+            "nonempty_status": "ready",
+            "max_items": 25,
+        },
+    },
+    "artifacts": False,
     "systemPrompt": "be careful",
     "fallbackModel": "fallback",
     "betas": ["feature"],
@@ -1289,7 +1305,6 @@ def test_node_field_structural_and_compatibility_sets_are_distinct_and_exact():
         "persist_session",
         "provider",
         "model",
-        "output_format",
         "allowed_tools",
         "denied_tools",
         "hooks",
@@ -1318,6 +1333,15 @@ def test_node_field_structural_and_compatibility_sets_are_distinct_and_exact():
         spec = _NODE_FIELD_SPECS[field]
         assert spec.structural_node_types == set(NODE_TYPES)
         assert spec.applicable_node_types == {"command", "prompt"}
+    assert _NODE_FIELD_SPECS["output_format"].structural_node_types == set(
+        NODE_TYPES
+    )
+    assert _NODE_FIELD_SPECS["output_format"].applicable_node_types == {
+        "command",
+        "prompt",
+        "bash",
+        "script",
+    }
 
 
 def test_compatibility_applicability_consumes_the_live_field_inventory(monkeypatch):

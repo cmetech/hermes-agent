@@ -574,6 +574,36 @@ def test_real_bash_and_named_script_publish_only_under_scoped_artifact_roots(
     assert not (run_directory / "artifacts" / "script-child.txt").exists()
 
 
+def test_artifact_free_scoped_script_receives_zero_runtime_ceiling(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="artifact-free-context",
+        nodes=[
+            _group([
+                {
+                    "id": "reduce",
+                    "script": "nested-script",
+                    "runtime": "uv",
+                    "artifacts": False,
+                }
+            ])
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="artifact-free-context")
+    executor = SucceedingExecutor()
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["script"] = executor
+
+    scheduler.advance_all([run_id])
+
+    assert len(executor.contexts) == 1
+    assert executor.contexts[0].max_artifact_bytes == 0
+
+
 def test_scoped_shared_context_uses_only_original_body_predecessor_evidence(
     tmp_path, workflow_writer
 ) -> None:
@@ -818,6 +848,7 @@ def test_v6_ai_child_max_turns_reaches_real_runner_and_accounting(
     ).advance_all([run_id])[run_id]
 
     assert [request.max_iterations for request in runner.requests] == [2]
+    assert [request.strict_iteration_limit for request in runner.requests] == [True]
     state = result["nodes"]["group"]["loop_group"]["body"]["ask"]
     assert state["iteration_consumed"] == 1
     assert state["remaining_iterations"] == 1

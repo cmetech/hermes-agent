@@ -62,6 +62,7 @@ ARCHON_LANGUAGE_FINDING_FIELDS = frozenset({
     "output_type",
     "maxBudgetUsd",
     "maxTurns",
+    "tool_call_contract",
     "sandbox",
 })
 WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX = max(
@@ -1317,6 +1318,14 @@ def language_compatibility_findings(
                 "Remove maxTurns or use normalizer version 6.",
                 blocking=True,
             )
+        if metadata.normalizer_version < 6 and "tool_call_contract" in options:
+            add(
+                f"{prefix}.tool_call_contract",
+                "archon_tool_call_contract_unavailable",
+                "Archon exact tool-call contracts require Phase 6",
+                "Remove tool_call_contract or use normalizer version 6.",
+                blocking=True,
+            )
         if "sandbox" in options:
             add(
                 f"{prefix}.sandbox",
@@ -1817,7 +1826,9 @@ def _read_node_semantics(
                 or capacity["artifact_executions"]
                 > loop_group["child_attempts"]
                 or capacity["process_executions"]
-                != capacity["artifact_executions"]
+                > loop_group["child_attempts"]
+                or capacity["process_executions"]
+                < capacity["artifact_executions"]
                 or capacity["artifact_bytes"]
                 != capacity["artifact_executions"] * artifact_limit
                 or capacity["journal_reserve_bytes"]

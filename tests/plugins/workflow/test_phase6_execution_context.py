@@ -127,6 +127,103 @@ def test_script_executor_writes_scoped_attempt_and_publication_files(tmp_path: P
     assert tmp_path / result.artifacts[0].relative_path == execution.effective_attempt_directory / "stdout.txt"
 
 
+def test_artifact_free_bash_rejects_even_an_empty_generated_artifact(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="bash",
+                value=': > "$ARTIFACTS_DIR/forbidden.txt"; printf ok',
+                options={"artifacts": False},
+            ),
+            "artifact-free-bash",
+        ),
+        max_artifact_bytes=0,
+    )
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "artifact_limit"
+
+
+def test_artifact_free_bash_rejects_an_empty_generated_directory(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="bash",
+                value='mkdir "$ARTIFACTS_DIR/forbidden"; printf ok',
+                options={"artifacts": False},
+            ),
+            "artifact-free-bash-directory",
+        ),
+        max_artifact_bytes=0,
+    )
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "artifact_limit"
+
+
+def test_artifact_free_bash_fails_closed_on_a_same_content_retry_artifact(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="bash",
+                value='printf unchanged > "$ARTIFACTS_DIR/forbidden.txt"; printf ok',
+                options={"artifacts": False},
+            ),
+            "artifact-free-bash-retry",
+        ),
+        max_artifact_bytes=0,
+    )
+    execution.effective_publication_directory.mkdir(parents=True)
+    (execution.effective_publication_directory / "forbidden.txt").write_text(
+        "unchanged", encoding="utf-8"
+    )
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "artifact_limit"
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+def test_artifact_free_script_rejects_even_an_empty_generated_artifact(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        _scoped(
+            context(
+                tmp_path,
+                node_type="script",
+                value=(
+                    "import os; from pathlib import Path; "
+                    "Path(os.environ['ARTIFACTS_DIR']).joinpath('forbidden.txt').touch(); "
+                    "print('ok')"
+                ),
+                options={"runtime": "uv", "deps": (), "artifacts": False},
+            ),
+            "artifact-free-script",
+        ),
+        max_artifact_bytes=0,
+    )
+
+    result = ScriptExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "artifact_limit"
+
+
 def test_agent_executor_writes_scoped_attempt_file(tmp_path: Path) -> None:
     execution = _scoped(context(tmp_path), "agent")
 

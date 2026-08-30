@@ -55,6 +55,12 @@ class BashExecutor:
         variable_spill = attempt / ("variables-v3" if secure_v3 else "variables")
         artifacts_dir = context.effective_publication_directory
         artifacts_dir.mkdir(parents=True, exist_ok=True)
+        if context.max_artifact_bytes == 0 and any(artifacts_dir.rglob("*")):
+            return NodeExecutionResult(
+                "failed",
+                error_code="artifact_limit",
+                error_message="bash artifacts are disabled for this node",
+            )
         command = str(context.node.value)
         try:
             if context.variable_context is not None:
@@ -326,6 +332,14 @@ class BashExecutor:
             if stderr_path.stat().st_size:
                 artifacts.append(
                     _artifact(stderr_path, context.run_directory, "text/plain")
+                )
+            if context.max_artifact_bytes == 0 and any(artifacts_dir.rglob("*")):
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "artifact_limit",
+                    "bash artifacts are disabled for this node",
+                    bash_metadata,
                 )
             if spill_integrity_failed:
                 return NodeExecutionResult(

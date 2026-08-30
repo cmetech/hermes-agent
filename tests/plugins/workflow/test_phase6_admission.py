@@ -778,6 +778,98 @@ def test_v6_retried_scripts_seal_artifact_and_process_attempt_products(
     assert capacity["process_descendant_executions"] == 128
 
 
+def test_v6_artifact_free_scripts_charge_process_but_no_generated_artifact_bytes(
+    tmp_path, workflow_writer
+):
+    compilation = _compile_v6(
+        tmp_path,
+        workflow_writer,
+        max_iterations=2,
+        body=[
+            {
+                "id": "reduce",
+                "script": "nested-script",
+                "runtime": "uv",
+                "artifacts": False,
+                "retry": {"max_attempts": 1},
+            }
+        ],
+        include_skills=False,
+    )
+
+    capacity = compilation.package.language.node_semantics["group"]["loop_group"][
+        "capacity"
+    ]
+    assert capacity["artifact_executions"] == 0
+    assert capacity["artifact_bytes"] == 0
+    assert capacity["process_executions"] == 4
+    assert capacity["output_attempts"] == 4
+
+
+def test_v6_artifact_free_capacity_tampering_fails_closed(
+    tmp_path, workflow_writer
+):
+    compilation = _compile_v6(
+        tmp_path,
+        workflow_writer,
+        max_iterations=1,
+        body=[
+            {
+                "id": "reduce",
+                "bash": "printf ok",
+                "artifacts": False,
+            }
+        ],
+        include_skills=False,
+    )
+    snapshot = make_language_snapshot(compilation.package, "a" * 64).to_dict()
+    capacity = snapshot["node_semantics"]["group"]["loop_group"]["capacity"]
+    assert capacity["artifact_executions"] == 0
+    assert capacity["artifact_bytes"] == 0
+    capacity["artifact_bytes"] = 1
+
+    with pytest.raises(WorkflowLanguageCompatibilityError):
+        read_language_snapshot(snapshot)
+
+
+def test_v6_artifact_free_snapshot_rejects_coherent_extra_process_charge(
+    tmp_path, workflow_writer
+):
+    compilation = _compile_v6(
+        tmp_path,
+        workflow_writer,
+        max_iterations=1,
+        body=[
+            {
+                "id": "reduce",
+                "bash": "printf ok",
+                "artifacts": False,
+            }
+        ],
+        include_skills=False,
+    )
+    snapshot = make_language_snapshot(compilation.package, "a" * 64).to_dict()
+    loop_group = snapshot["node_semantics"]["group"]["loop_group"]
+    capacity = loop_group["capacity"]
+    process_executions = loop_group["child_attempts"] + 1
+    limits = RunExecutionLimits()
+    capacity.update({
+        "process_executions": process_executions,
+        "process_tree_rss_byte_executions": (
+            process_executions * limits.process_tree_rss_bytes
+        ),
+        "process_tree_cpu_second_executions": int(
+            process_executions * limits.process_tree_cpu_seconds
+        ),
+        "process_descendant_executions": (
+            process_executions * limits.max_descendants
+        ),
+    })
+
+    with pytest.raises(WorkflowLanguageCompatibilityError):
+        read_language_snapshot(snapshot)
+
+
 @pytest.mark.parametrize(
     ("field", "product", "label"),
     [

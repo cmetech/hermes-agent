@@ -191,6 +191,12 @@ class ScriptExecutor:
         stderr_path = attempt / "stderr.txt"
         artifacts_dir = context.effective_publication_directory
         artifacts_dir.mkdir(parents=True, exist_ok=True)
+        if context.max_artifact_bytes == 0 and any(artifacts_dir.rglob("*")):
+            return NodeExecutionResult(
+                "failed",
+                error_code="artifact_limit",
+                error_message="script artifacts are disabled for this node",
+            )
         artifacts_before = _artifact_snapshot(artifacts_dir)
         if execution_plan is None:
             try:
@@ -345,6 +351,13 @@ class ScriptExecutor:
         if stderr_path.stat().st_size:
             artifacts.append(
                 _artifact(stderr_path, context.run_directory, "text/plain")
+            )
+        if context.max_artifact_bytes == 0 and any(artifacts_dir.rglob("*")):
+            return NodeExecutionResult(
+                "failed",
+                tuple(artifacts),
+                "artifact_limit",
+                "script artifacts are disabled for this node",
             )
         generated_bytes = 0
         for path in sorted(artifacts_dir.rglob("*")):

@@ -908,6 +908,7 @@ def test_phase5_structured_repair_inherits_exact_authority_and_limits(tmp_path):
         approved_action_digest="1" * 64,
         workdir=tmp_path,
         max_iterations=90,
+        strict_iteration_limit=True,
         max_api_attempts=4,
         sealed_provider_attempt_grant=True,
         _provider_attempt_authority=provider_attempt_authority,
@@ -969,6 +970,7 @@ def test_phase5_structured_repair_inherits_exact_authority_and_limits(tmp_path):
     assert repair.kill_reap_grace_seconds == initial.kill_reap_grace_seconds
     assert repair.sandbox_policy == initial.sandbox_policy
     assert repair.max_iterations == 1
+    assert repair.strict_iteration_limit is True
     assert repair.max_api_attempts == 2
     assert repair.wall_timeout_seconds == 19
     assert repair.idle_timeout_seconds == 19
@@ -1162,6 +1164,99 @@ def test_prompt_adapter_skips_repair_when_safety_or_attempt_allowance_is_gone(
     assert result.error_code == "structured_output_invalid"
     assert result.metadata["repair_disposition"] == expected_disposition
     assert len(runner.requests) == 1
+
+
+def test_schema_valid_outward_result_cannot_swallow_write_ambiguous_audit(tmp_path):
+    runner = FakeAgentRunner(
+        '{"status":"success"}',
+        audit_rows=({"write_ambiguous": True},),
+    )
+    node = _node(
+        "ambiguous-write",
+        "write",
+        output_format={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["status"],
+            "properties": {"status": {"type": "string", "const": "success"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path, node, outward_action=True)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "outcome_unknown"
+    assert result.metadata["reconciliation_required"] is True
+    assert len(runner.requests) == 1
+
+
+def test_tool_call_contract_violation_is_terminal_without_claiming_no_effect(
+    tmp_path,
+):
+    class ContractFailureRunner:
+        def __init__(self):
+            self.requests = []
+
+        def run(self, request, **_kwargs):
+            self.requests.append(request)
+            return PluginAgentRunResult(
+                final_response="",
+                session_id="session-contract-failure",
+                provider=request.provider or "fake-provider",
+                model=request.model or "fake-model",
+                status="failed",
+                pending_interaction=None,
+                usage={},
+                audit={
+                    "failure_kind": "tool_call_contract_violation",
+                    "provider_attempts": 1,
+                    "model_calls": 1,
+                },
+            )
+
+    contract = {
+        "name": "jira_my_tickets",
+        "arguments": {"max_results": 25},
+        "result": {
+            "items_path": "items",
+            "select": ("key",),
+            "output_items_path": "tickets",
+            "output_count_path": "count",
+            "output_status_path": "status",
+            "empty_status": "empty",
+            "nonempty_status": "ready",
+            "max_items": 25,
+        },
+    }
+    runner = ContractFailureRunner()
+    node = _node(
+        "contract-failure",
+        "fetch once",
+        allowed_tools=("jira_my_tickets",),
+        tool_call_contract=contract,
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_text_context(tmp_path, node)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "tool_call_contract_violation"
+    assert result.metadata["archon_terminal_failure"] is True
+    assert "known_no_effect" not in result.metadata
+    assert runner.requests[0].tool_call_contract is not None
+
+
+def test_legacy_agent_request_keeps_iteration_summary_behavior(tmp_path):
+    runner = FakeAgentRunner("done")
+    node = _node("legacy-cap", "work")
+
+    result = AgentNodeExecutor(runner).execute(_context(tmp_path, node))
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].strict_iteration_limit is False
 
 
 def test_prompt_adapter_skips_repair_when_cancelled_after_initial_provider_call(

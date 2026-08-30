@@ -4615,6 +4615,19 @@ class RunScheduler:
             retry_consumed=retry_consumed,
         )
 
+    @staticmethod
+    def _model_iteration_limit(
+        node: WorkflowNode,
+        profile: WorkflowLanguageProfile,
+        execution_semantics: Phase3ExecutionSemantics | None,
+    ) -> int:
+        if execution_semantics is not None and supports_phase6_semantics(
+            profile,
+            execution_semantics.normalizer_version,
+        ):
+            return min(int(node.options.get("maxTurns", 90)), 90)
+        return 90
+
     def _heartbeat_journal_reserve(
         self,
         node: WorkflowNode,
@@ -4753,14 +4766,10 @@ class RunScheduler:
                         execution_semantics.normalizer_version,
                     )
                 )
-                model_iteration_limit = (
-                    min(int(node.options.get("maxTurns", 90)), 90)
-                    if execution_semantics is not None
-                    and supports_phase6_semantics(
-                        package.language.effective_profile,
-                        execution_semantics.normalizer_version,
-                    )
-                    else 90
+                model_iteration_limit = self._model_iteration_limit(
+                    node,
+                    package.language.effective_profile,
+                    execution_semantics,
                 )
                 remaining_iterations = max(
                     0,
@@ -5031,6 +5040,12 @@ class RunScheduler:
                             node=runtime_node,
                             attempt_id=claim.attempt_id,
                             timeout_seconds=timeout,
+                            **(
+                                {"max_artifact_bytes": 0}
+                                if runtime_node.node_type in {"bash", "script"}
+                                and runtime_node.options.get("artifacts") is False
+                                else {}
+                            ),
                             is_cancelled=lambda: self._cancelled(run_id),
                             workflow_name=package.definition.name,
                             workflow_options=package.definition.options,
@@ -5983,10 +5998,12 @@ class RunScheduler:
                             ),
                             "remaining_iterations": max(
                                 0,
-                                90
-                                - int(
-                                    node_state.get("iteration_consumed", 0)
-                                ),
+                                self._model_iteration_limit(
+                                    node,
+                                    package.language.effective_profile,
+                                    execution_semantics,
+                                )
+                                - int(node_state.get("iteration_consumed", 0)),
                             ),
                             "remaining_wall_seconds": (
                                 claimed_deadline_budget.remaining_wall(claim_now)
@@ -6397,10 +6414,12 @@ class RunScheduler:
                                 ),
                                 "remaining_iterations": max(
                                     0,
-                                    90
-                                    - int(
-                                        node_state.get("iteration_consumed", 0)
-                                    ),
+                                    self._model_iteration_limit(
+                                        node,
+                                        packages[run_id].language.effective_profile,
+                                        node_semantics,
+                                    )
+                                    - int(node_state.get("iteration_consumed", 0)),
                                 ),
                                 "remaining_wall_seconds": (
                                     claimed_deadline_budget.remaining_wall(claim_now)
