@@ -2613,14 +2613,36 @@ class RunScheduler:
                         active = state.get("claim")
                         if not isinstance(active, Mapping):
                             raise RuntimeError("loop group predicate claim is missing")
-                        predicate_claim = NodeClaim(
-                            run_id,
-                            group.id,
-                            str(active["attempt_id"]),
-                            str(active["owner_id"]),
-                            datetime.fromisoformat(str(active["lease_expires_at"])),
-                            self.execution_fence,
+                        predicate_claim = (
+                            self.store.claim_recorded_loop_group_predicate(
+                                decision_scope,
+                                self.owner_id,
+                                lease_seconds=self.lease_seconds,
+                                now=LeaseClockSample(
+                                    self._utcnow(),
+                                    self._monotonic(),
+                                    self.store._lease_clock().boot_id,
+                                ),
+                                execution_fence=self.execution_fence,
+                            )
                         )
+                        if predicate_claim is None:
+                            return False
+                        if (
+                            active.get("owner_id") != predicate_claim.owner_id
+                            or active.get("lease_expires_at")
+                            != predicate_claim.lease_expires_at.isoformat()
+                            or active.get("execution_fence")
+                            != (
+                                {
+                                    "owner_id": self.execution_fence.owner_id,
+                                    "owner_epoch": self.execution_fence.owner_epoch,
+                                }
+                                if self.execution_fence is not None
+                                else None
+                            )
+                        ):
+                            return True
                         decision = str(recorded["kind"])
                     else:
                         predicate_claim = self.store.claim_recorded_loop_group_predicate(

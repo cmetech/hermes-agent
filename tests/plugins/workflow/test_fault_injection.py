@@ -741,53 +741,77 @@ def test_loop_group_restart_reconciles_crash_after_outer_publication(
     assert outer[0]["sha256"] == hashlib.sha256(b"result").hexdigest()
 
 
-@pytest.mark.parametrize(
-    ("crash_event", "max_iterations", "expected_status", "expected_terminal"),
-    [
-        ("loop_group_decision_recorded", 1, "succeeded", "loop_group_succeeded"),
-        ("loop_group_succeeded", 1, "succeeded", "loop_group_succeeded"),
+_GROUP_EVENT_FAULT_CASES = tuple(
+    (scenario, event_type, side)
+    for scenario, event_types in (
         (
-            "loop_group_next_iteration_created",
-            2,
-            "succeeded",
-            "loop_group_succeeded",
+            "success",
+            (
+                "loop_group_iteration_completed",
+                "loop_group_decision_recorded",
+                "loop_group_iteration_decided",
+                "loop_group_succeeded",
+            ),
         ),
-        ("loop_group_failed", 1, "failed", "loop_group_failed"),
-    ],
+        (
+            "continue",
+            (
+                "loop_group_iteration_committed",
+                "loop_group_next_iteration_created",
+            ),
+        ),
+        ("pause", ("loop_group_paused",)),
+        ("failure", ("loop_group_failed",)),
+    )
+    for event_type in event_types
+    for side in ("before", "after")
+)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "crash_event", "crash_side"),
+    _GROUP_EVENT_FAULT_CASES,
 )
 def test_loop_group_restart_completes_each_staged_event_family_after_crash(
     tmp_path,
     workflow_writer,
     monkeypatch,
+    scenario,
     crash_event,
-    max_iterations,
-    expected_status,
-    expected_terminal,
+    crash_side,
 ) -> None:
+    max_iterations = 2 if scenario == "continue" else 1
     compilation = _compile(
         tmp_path,
         workflow_writer,
-        name=f"phase6-staged-{crash_event}",
+        name=f"phase6-staged-{scenario}-{crash_event}-{crash_side}",
         nodes=[{
             "id": "group",
             "loop_group": {
                 "until": "DONE",
                 "max_iterations": max_iterations,
-                "signal_completes": True,
+                "interactive": scenario == "pause",
+                "signal_completes": scenario != "pause",
+                **({"gate_message": "confirm"} if scenario == "pause" else {}),
                 "nodes": [{"id": "sink", "prompt": "produce"}],
             },
         }],
+        interactive=scenario == "pause",
     )
     home = tmp_path / "home"
     store = RunStore(home, max_total_workers=1)
-    run_id = _admit(store, compilation, key=f"phase6-staged-{crash_event}")
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"phase6-staged-{scenario}-{crash_event}-{crash_side}",
+    )
 
     executions = []
 
     def output(_context, _rendered):
         executions.append(len(executions) + 1)
-        if expected_status == "failed" or (
-            max_iterations > 1 and len(executions) == 1
+        if scenario == "failure" or (
+            scenario == "continue" and len(executions) == 1
         ):
             return "not complete"
         return "done <promise>DONE</promise>"
@@ -801,8 +825,13 @@ def test_loop_group_restart_completes_each_staged_event_family_after_crash(
         nonlocal crashed
         if not crashed and event_type == crash_event:
             crashed = True
-            raise SystemExit(f"crash before {crash_event}")
-        return original_append(directory, projection, event_type, *args, **kwargs)
+            if crash_side == "before":
+                raise SystemExit(f"crash before {crash_event}")
+            original_append(directory, projection, event_type, *args, **kwargs)
+            raise SystemExit(f"crash after {crash_event}")
+        return original_append(
+            directory, projection, event_type, *args, **kwargs
+        )
 
     monkeypatch.setattr(store, "_append_locked", crash_at_boundary)
     with pytest.raises(SystemExit, match=crash_event):
@@ -824,26 +853,67 @@ def test_loop_group_restart_completes_each_staged_event_family_after_crash(
             "loop_group_iteration_decided",
             "loop_group_next_iteration_created",
             "loop_group_succeeded",
+            "loop_group_paused",
             "loop_group_failed",
         }
     ]
 
+    expected = {
+        "success": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_succeeded",
+        ],
+        "continue": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_committed",
+            "loop_group_next_iteration_created",
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_succeeded",
+        ],
+        "pause": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_paused",
+        ],
+        "failure": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_failed",
+        ],
+    }[scenario]
+    expected_status = {
+        "success": "succeeded",
+        "continue": "succeeded",
+        "pause": "paused",
+        "failure": "failed",
+    }[scenario]
     assert recovered["status"] == expected_status
-    assert lifecycle.count("loop_group_iteration_completed") == max_iterations
-    assert lifecycle.count("loop_group_decision_recorded") == max_iterations
-    assert lifecycle.count(expected_terminal) == 1
-    if max_iterations == 2:
-        assert lifecycle.index("loop_group_decision_recorded") < lifecycle.index(
-            "loop_group_next_iteration_created"
-        ) < lifecycle.index("loop_group_succeeded")
-    else:
-        assert lifecycle.index("loop_group_decision_recorded") < lifecycle.index(
-            expected_terminal
-        )
+    assert lifecycle == expected
 
 
-def test_loop_group_cancellation_restart_completes_run_event_once(
-    tmp_path, workflow_writer, monkeypatch
+@pytest.mark.parametrize(
+    ("crash_event", "crash_side", "reserve_on_restart"),
+    [
+        ("loop_group_cancelled", "before", 1),
+        ("loop_group_cancelled", "after", 1),
+        ("run_cancelled", "before", 1),
+        ("run_cancelled", "after", 0),
+    ],
+)
+def test_loop_group_cancellation_restart_completes_run_event_once_and_retains_reserve(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    crash_event,
+    crash_side,
+    reserve_on_restart,
 ) -> None:
     compilation = _compile(
         tmp_path,
@@ -853,6 +923,7 @@ def test_loop_group_cancellation_restart_completes_run_event_once(
             "id": "group",
             "loop_group": {
                 "until": "DONE",
+                "until_bash": "true",
                 "max_iterations": 1,
                 "nodes": [{"id": "sink", "prompt": "produce"}],
             },
@@ -862,26 +933,53 @@ def test_loop_group_cancellation_restart_completes_run_event_once(
     store = RunStore(home, max_total_workers=1)
     run_id = _admit(store, compilation, key="phase6-staged-cancel")
     scheduler = RunScheduler(store, max_parallel_nodes=1)
-    assert scheduler._advance_loop_group_controllers(
-        run_id,
-        compilation.package.definition.nodes,
-        store.load_run(run_id),
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
     )
+    scheduler.executors["bash"] = type(
+        "CrashBeforePredicateSpawn",
+        (),
+        {
+            "execute": lambda self, context: (_ for _ in ()).throw(
+                SystemExit("predicate stopped before spawn")
+            )
+        },
+    )()
+    with pytest.raises(SystemExit, match="before spawn"):
+        scheduler.advance_all([run_id])
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 1
     original_append = store._append_locked
+    crashed = False
 
-    def crash_before_run_cancelled(
+    def crash_at_cancel_boundary(
         directory, projection, event_type, *args, **kwargs
     ):
-        if event_type == "run_cancelled":
-            raise SystemExit("crash before run_cancelled")
-        return original_append(directory, projection, event_type, *args, **kwargs)
+        nonlocal crashed
+        if not crashed and event_type == crash_event:
+            crashed = True
+            if crash_side == "before":
+                raise SystemExit(f"crash before {crash_event}")
+            original_append(directory, projection, event_type, *args, **kwargs)
+            raise SystemExit(f"crash after {crash_event}")
+        return original_append(
+            directory, projection, event_type, *args, **kwargs
+        )
 
-    monkeypatch.setattr(store, "_append_locked", crash_before_run_cancelled)
-    with pytest.raises(SystemExit, match="run_cancelled"):
+    monkeypatch.setattr(store, "_append_locked", crash_at_cancel_boundary)
+    with pytest.raises(SystemExit, match=crash_event):
         store.cancel_run(run_id)
     monkeypatch.setattr(store, "_append_locked", original_append)
 
     restarted = RunStore(home, max_total_workers=1)
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == reserve_on_restart
     recovered = restarted.cancel_run(run_id)
     lifecycle = [
         event["event_type"]
@@ -891,3 +989,8 @@ def test_loop_group_cancellation_restart_completes_run_event_once(
 
     assert recovered["status"] == "cancelled"
     assert lifecycle == ["loop_group_cancelled", "run_cancelled"]
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0

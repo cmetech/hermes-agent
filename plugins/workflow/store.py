@@ -5449,6 +5449,31 @@ class RunStore:
                             ),
                         ),
                     )
+            cancelled_predicate_obligations = projection.get(
+                "_cancelled_predicate_obligations", ()
+            )
+            if isinstance(cancelled_predicate_obligations, list):
+                projection_bytes = len(
+                    json.dumps(
+                        projection,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                )
+                reserve = TerminalJournalReserve.for_projection(projection_bytes)
+                for attempt_id in cancelled_predicate_obligations:
+                    if isinstance(attempt_id, str) and attempt_id:
+                        obligation_reserves[attempt_id] = (
+                            row["run_id"],
+                            TerminalJournalReserve(
+                                projection_limit_bytes=(
+                                    reserve.projection_limit_bytes
+                                ),
+                                terminal_reserve_bytes=(
+                                    2 * reserve.terminal_reserve_bytes
+                                ),
+                            ),
+                        )
             for node_id, node in _iter_projection_node_states(projection):
                 claim = node.get("claim") if isinstance(node, dict) else None
                 if not isinstance(claim, dict) and isinstance(node, dict):
@@ -12037,11 +12062,33 @@ class RunStore:
             group = projection["nodes"][scope.group_id]
             controller = group["loop_group"]
             pending = controller.get("_pending_loop_decision")
+            transition = controller.get("_pending_group_transition")
             active = group.get("claim")
+            pending_kind = (
+                pending.get("kind") if isinstance(pending, Mapping) else None
+            )
+            expected_stage = (
+                "predicate_pending"
+                if pending_kind == "until_bash_pending"
+                else "predicate_decided"
+            )
             if (
                 not isinstance(pending, Mapping)
-                or pending.get("kind") != "until_bash_pending"
+                or pending_kind
+                not in {
+                    "until_bash_pending",
+                    "until_bash_success",
+                    "until_bash_failure",
+                    "ordinary_input",
+                    "continue",
+                    "hard_limit",
+                }
                 or pending.get("loop_group_scope") != scope.durable_record()
+                or not isinstance(transition, Mapping)
+                or transition.get("stage") != expected_stage
+                or transition.get("decision") != pending_kind
+                or transition.get("loop_group_scope")
+                != scope.durable_record()
                 or not isinstance(active, dict)
                 or active.get("loop_group_scope") != scope.durable_record()
             ):
@@ -12072,12 +12119,17 @@ class RunStore:
                 active.get("owner_id") == owner_id
                 and active.get("execution_fence") == requested_fence
             )
-            if exact_authority and fresh:
+            recorded_result = pending_kind != "until_bash_pending"
+            if (
+                fresh
+                and active.get("execution_fence") == requested_fence
+                and (exact_authority or recorded_result)
+            ):
                 return NodeClaim(
                     scope.run_id,
                     scope.group_id,
                     str(active["attempt_id"]),
-                    owner_id,
+                    str(active["owner_id"]),
                     datetime.fromisoformat(str(active["lease_expires_at"])),
                     execution_fence,
                 )

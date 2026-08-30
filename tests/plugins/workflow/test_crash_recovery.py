@@ -2891,6 +2891,137 @@ def test_loop_group_restart_consumes_the_recorded_predicate_result_once(
     ]
 
 
+def test_loop_group_restart_adopts_recorded_result_after_coordinator_turnover(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    started_at = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 100.0, "boot-a"))
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-recorded-result-fence-turnover",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1, lease_clock=clock)
+    run_id = _admit(store, compilation, key="phase6-recorded-result-turnover")
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="same-coordinator",
+        host_kind="gateway",
+        host_instance_id="same-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    first = coordinator.try_acquire(identity, now=started_at, lease_seconds=1)
+    assert first.is_leader
+    fence_a = ExecutionFence(identity.owner_id, first.lease.epoch)
+    predicate_calls = []
+    first_scheduler = RunScheduler(
+        store,
+        owner_id="same-predicate-owner",
+        execution_fence=fence_a,
+        max_parallel_nodes=1,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    first_scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    first_scheduler.executors["bash"] = type(
+        "SuccessfulPredicate",
+        (),
+        {
+            "execute": lambda self, context: (
+                predicate_calls.append(context.attempt_id)
+                or NodeExecutionResult("succeeded")
+            )
+        },
+    )()
+    original = store.record_loop_group_predicate_decision
+
+    def crash_after_result(*args, **kwargs):
+        assert original(*args, **kwargs)
+        raise SystemExit("predicate result committed under fence A")
+
+    monkeypatch.setattr(store, "record_loop_group_predicate_decision", crash_after_result)
+    with pytest.raises(SystemExit, match="fence A"):
+        first_scheduler.advance_all([run_id])
+    monkeypatch.setattr(store, "record_loop_group_predicate_decision", original)
+
+    pending = store.load_run(run_id)
+    controller = pending["nodes"]["group"]["loop_group"]
+    scope_record = controller["_pending_loop_decision"]["loop_group_scope"]
+    scope = _scope(run_id, scope_record["node_id"])
+    raw = pending["nodes"]["group"]["claim"]
+    stale_claim = NodeClaim(
+        run_id,
+        "group",
+        raw["attempt_id"],
+        raw["owner_id"],
+        datetime.fromisoformat(raw["lease_expires_at"]),
+        fence_a,
+    )
+
+    turnover_at = started_at + timedelta(seconds=2)
+    clock.sample = LeaseClockSample(turnover_at, 102.0, "boot-a")
+    second = coordinator.try_acquire(identity, now=turnover_at, lease_seconds=30)
+    assert second.is_leader
+    fence_b = ExecutionFence(identity.owner_id, second.lease.epoch)
+    before = store.load_run(run_id)
+    before_events = store.tail_events(run_id)
+    assert not store.record_loop_group_predicate_decision(
+        scope, stale_claim, {"kind": "until_bash_success"}
+    )
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == before_events
+
+    restarted_store = RunStore(home, max_total_workers=1, lease_clock=clock)
+    restarted = RunScheduler(
+        restarted_store,
+        owner_id="same-predicate-owner",
+        execution_fence=fence_b,
+        max_parallel_nodes=1,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    restarted.executors["prompt"] = first_scheduler.executors["prompt"]
+    restarted.executors["bash"] = type(
+        "ReplayForbidden",
+        (),
+        {"execute": lambda self, context: pytest.fail("predicate replayed")},
+    )()
+
+    result = restarted.advance_all([run_id])[run_id]
+    predicate_attempt = next(
+        attempt
+        for attempt in result["nodes"]["group"]["attempts"]
+        if attempt["attempt_id"] == raw["attempt_id"]
+    )
+    recovery_events = [
+        event
+        for event in restarted_store.tail_events(run_id)
+        if event["event_type"] == "loop_group_predicate_recovery_claimed"
+    ]
+
+    assert result["status"] == "succeeded"
+    assert predicate_calls == [raw["attempt_id"]]
+    assert predicate_attempt["execution_fence"] == {
+        "owner_id": fence_b.owner_id,
+        "owner_epoch": fence_b.owner_epoch,
+    }
+    assert len(recovery_events) == 1
+
+
 def test_loop_group_predicate_rejects_superseded_same_owner_fence(
     tmp_path, workflow_writer
 ) -> None:
