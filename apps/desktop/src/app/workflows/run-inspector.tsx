@@ -281,7 +281,7 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                         {copy.currentNode}
                       </th>
                       <th className="py-1 pr-3 font-medium" scope="col">
-                        {copy.artifactOutputType}
+                        {copy.workflowLoopNodeType}
                       </th>
                       <th className="py-1 pr-3 font-medium" scope="col">
                         {copy.status}
@@ -290,7 +290,7 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                         {copy.attempts}
                       </th>
                       <th className="py-1 pr-3 font-medium" scope="col">
-                        {copy.completionEstimate}
+                        {copy.workflowLoopDuration}
                       </th>
                       <th className="py-1 font-medium" scope="col">
                         {copy.failureCause}

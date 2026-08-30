@@ -162,6 +162,62 @@ def test_runtime_loop_group_completed_iterations_come_from_current_body_state(
     assert public["nodes"]["group"]["loop_group"]["completed_iterations"] == expected
 
 
+def _boundary_controller(*states: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "controller_generation": 2,
+        "iteration": 7,
+        "max_iterations": 25,
+        "state": "running",
+        "primary_sink": f"body-{len(states) - 1:03d}",
+        "body": {
+            f"body-{index:03d}": {
+                "id": f"body-{index:03d}",
+                "type": "bash",
+                "state": state,
+                "attempts": [],
+            }
+            for index, state in enumerate(states)
+        },
+    }
+
+
+def test_exactly_512_terminal_body_nodes_complete_the_current_iteration() -> None:
+    public = public_run_projection(
+        _run(_boundary_controller(*(["succeeded"] * 512)))
+    )
+    group = public["nodes"]["group"]["loop_group"]
+
+    assert len(group["body"]) == 512
+    assert group["completed_iterations"] == 7
+
+
+@pytest.mark.parametrize("hidden_state", ["pending", "failed"])
+def test_hidden_513th_body_node_cannot_complete_the_current_iteration(
+    hidden_state: str,
+) -> None:
+    public = public_run_projection(
+        _run(_boundary_controller(*(["succeeded"] * 512), hidden_state))
+    )
+    group = public["nodes"]["group"]["loop_group"]
+
+    assert len(group["body"]) == 512
+    assert group["completed_iterations"] == 6
+
+
+@pytest.mark.parametrize("malformed_index", [511, 512])
+def test_malformed_body_entries_fail_closed_even_beyond_the_public_cap(
+    malformed_index: int,
+) -> None:
+    controller = _boundary_controller(*(["succeeded"] * 513))
+    controller["body"][f"body-{malformed_index:03d}"]["attempts"] = "malformed"
+
+    public = public_run_projection(_run(controller))
+
+    assert "loop_group" not in public["nodes"]["group"]
+    _api_module().WorkflowRunProjection.model_validate(public)
+
+
 def test_loop_group_duration_rejects_sub_millisecond_timestamp_reversal() -> None:
     controller = _controller()
     controller["body"]["body-000"].update(

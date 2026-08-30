@@ -2230,6 +2230,8 @@ export const ja = defineLocale({
     origin: '起点',
     assurance: '本人確認レベル',
     coordinator: 'コーディネーター',
+    workflowLoopNodeType: '種類',
+    workflowLoopDuration: '所要時間',
     currentNode: '現在のノード',
     previousNode: '前のノード',
     lastProgress: '最後の有意な進捗',

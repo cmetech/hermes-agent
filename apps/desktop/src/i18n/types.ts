@@ -2181,6 +2181,8 @@ export interface Translations {
     origin: string
     assurance: string
     coordinator: string
+    workflowLoopNodeType: string
+    workflowLoopDuration: string
     currentNode: string
     previousNode: string
     lastProgress: string

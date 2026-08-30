@@ -13,6 +13,8 @@ Status: COMPLETE
 - Preserved valid exact scope on generic nested interaction/reconciliation events and interaction evidence, independent of event-name prefixes.
 - Bound Desktop mutations to their origin profile, run ID, state version, and interaction ID; late success/error callbacks update or invalidate only origin-scoped query keys.
 - Shared the existing active-group selector with the inspector so a concurrent ordinary node cannot hide the parent group summary. Table columns use localized copy and semantic column headers.
+- Validated the entire authenticated controller body before truncating the public body to 512. Hidden/unprojected work can hold completion back but can never increase the completed count, and malformed entries fail closed even beyond the public cap.
+- Added the smallest workflow-inspector copy surface for exact `Type` and `Duration` headers, with translations for all five shipped locales and retained semantic `<th scope="col">` markup.
 
 ## RED Evidence
 
@@ -20,11 +22,13 @@ Status: COMPLETE
 - The first exact Desktop RED attempt could not initialize Vitest because the shared workspace lacked the lockfile-declared `@rolldown/plugin-babel`. The parent installed root dependencies with `npm ci --ignore-scripts` without changing manifests. This environment interruption was reported immediately. Desktop tests had already been authored before production changes; after setup, the exact suite exercised the new codec/render/profile boundaries.
 - Fix round 1 Python RED used the exact prescribed five-file gate and reported `209 passed, 8 failed, 1 skipped`. The eight intended failures proved terminal/paused/hard-limit undercounting, sub-millisecond timestamp reversal acceptance, generic event scope loss, and interaction-evidence scope loss.
 - Fix round 1 Desktop RED used the exact prescribed four-file command and reported `93 passed, 3 failed`. The intended failures proved strict interaction-evidence scope rejection, ordinary-first/group-second inspector omission, and late Profile A mutation settlement missing Profile A because the callback targeted the latest render.
+- Fix round 2 Python RED used the exact five-file gate and reported `220 passed, 3 failed, 1 skipped`. The exact-512 and visible-malformed controls passed; the intended failures proved that pending/failed 513th nodes falsely completed the iteration and a malformed hidden 513th entry escaped fail-closed validation.
+- Fix round 2 Desktop RED used the exact four-file command and reported `95 passed, 1 failed`. The inspector exposed the inaccurate `Output type` / `Completion estimate` headers instead of semantic `Type` / `Duration` copy.
 
 ## GREEN Evidence
 
-- Prescribed Python gate after fix round 1: `218 passed, 0 failed, 1 skipped in 69.8s`.
-- Prescribed Desktop gate after fix round 1: `96 passed, 0 failed` across the four required files.
+- Prescribed Python gate after fix round 2: `223 passed, 0 failed, 1 skipped in 70.3s`.
+- Prescribed Desktop gate after fix round 2: `96 passed, 0 failed` across the four required files.
 - Prescribed Desktop typecheck: passed all three TypeScript projects.
 - Ruff check on all changed Python files: `All checks passed!`.
 - Prettier on the changed Desktop files: passed/normalized only Task 7 files.
@@ -47,6 +51,7 @@ Status: COMPLETE
 - Prompt, command/script, tool, feedback, output, credential, environment, path, attempt metadata, and previous-output canaries do not survive the public projection.
 - Scope exposes only group ID, controller generation, iteration, and optional body node ID. It cannot carry raw attempt/output material.
 - Runtime-shaped controllers without a synthetic completion field cover running, paused-after-decision, succeeded, and hard-limit states. Current body state is the only completion authority.
+- Boundary coverage proves exactly 512 terminal body nodes complete the current iteration; a hidden 513th pending/failed node leaves it incomplete; and malformed visible or hidden entries omit only the nested group summary while preserving the enclosing run DTO.
 - Durations reject a completed timestamp that precedes its start before millisecond truncation, including sub-millisecond reversals.
 
 ## Exact Tests

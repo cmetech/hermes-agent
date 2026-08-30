@@ -2157,6 +2157,8 @@ export const zhHant = defineLocale({
     origin: '來源',
     assurance: '身分可信度',
     coordinator: '協調器',
+    workflowLoopNodeType: '類型',
+    workflowLoopDuration: '持續時間',
     currentNode: '目前節點',
     previousNode: '上一節點',
     lastProgress: '最近有效進度',

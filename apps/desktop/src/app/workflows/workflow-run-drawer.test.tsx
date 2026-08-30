@@ -163,8 +163,8 @@ describe('WorkflowRunDrawer', () => {
     const table = screen.getByRole('table', { name: 'Current node' })
 
     expect(table).toBeTruthy()
-    expect(screen.getByRole('columnheader', { name: 'Output type' }).getAttribute('scope')).toBe('col')
-    expect(screen.getByRole('columnheader', { name: 'Completion estimate' }).getAttribute('scope')).toBe('col')
+    expect(screen.getByRole('columnheader', { name: 'Type' }).getAttribute('scope')).toBe('col')
+    expect(screen.getByRole('columnheader', { name: 'Duration' }).getAttribute('scope')).toBe('col')
     expect(screen.getByText('fetch')).toBeTruthy()
     expect(screen.getByText('provider_failed')).toBeTruthy()
     expect(globalThis.document.body.textContent).not.toContain('prompt')

@@ -446,14 +446,16 @@ def _public_loop_group_projection(value: object) -> dict[str, object] | None:
     ):
         return None
     projected_body: list[dict[str, object]] = []
-    for child_id, child in list(body.items())[:512]:
+    current_iteration_completed = True
+    for index, (child_id, child) in enumerate(body.items()):
         item = _public_loop_group_body(child)
         if item is None or item["id"] != child_id:
             return None
-        projected_body.append(item)
-    completed = iteration if all(
-        item["state"] in {"succeeded", "skipped"} for item in projected_body
-    ) else iteration - 1
+        if index < 512:
+            projected_body.append(item)
+        if item["state"] not in {"succeeded", "skipped"}:
+            current_iteration_completed = False
+    completed = iteration if current_iteration_completed else iteration - 1
     projected_iterations: list[dict[str, object]] = []
     for summary in history[-25:]:
         item = _public_loop_group_iteration(summary)

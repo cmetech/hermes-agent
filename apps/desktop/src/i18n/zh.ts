@@ -2730,6 +2730,8 @@ export const zh: Translations = {
     origin: '来源',
     assurance: '身份可信度',
     coordinator: '协调器',
+    workflowLoopNodeType: '类型',
+    workflowLoopDuration: '持续时间',
     currentNode: '当前节点',
     previousNode: '上一节点',
     lastProgress: '最近有效进展',
