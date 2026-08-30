@@ -1080,18 +1080,19 @@ class StrictSubstitutionRenderer:
 
     def resolve_outputs(
         self, *templates: str
-    ) -> Mapping[tuple[str, tuple[str, ...]], ResolvedOutputReference]:
+    ) -> Mapping[tuple[bool, str, tuple[str, ...]], ResolvedOutputReference]:
         """Resolve each canonical output facet once without rendering text."""
         resolved: dict[
-            tuple[str, tuple[str, ...]], ResolvedOutputReference
+            tuple[bool, str, tuple[str, ...]], ResolvedOutputReference
         ] = {}
         resolver = self.output_resolver or self.variables.output_reference
         for template in templates:
             for reference in self._references(template):
-                key = (reference.node_id, reference.path)
+                previous = bool(getattr(reference, "previous", False))
+                key = (previous, reference.node_id, reference.path)
                 if key in resolved:
                     continue
-                if getattr(reference, "previous", False):
+                if previous:
                     resolved[key] = self.variables.previous_output_reference(
                         reference.node_id, reference.path
                     )

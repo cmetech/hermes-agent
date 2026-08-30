@@ -1045,6 +1045,100 @@ def test_current_outer_and_previous_outputs_stay_in_their_scopes(
     ]
 
 
+def test_previous_output_body_conditions_replay_from_authenticated_recovery_state(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="previous-condition-recovery",
+        nodes=[
+            _group(
+                [
+                    {"id": "producer", "prompt": "producer"},
+                    {
+                        "id": "first-only",
+                        "depends_on": ["producer"],
+                        "when": "$LOOP_PREV.producer.output == ''",
+                        "prompt": "first-only",
+                    },
+                    {
+                        "id": "later-only",
+                        "depends_on": ["producer"],
+                        "when": "$LOOP_PREV.producer.output == 'producer-1'",
+                        "prompt": "later-only",
+                    },
+                    {
+                        "id": "finish",
+                        "depends_on": ["producer", "first-only", "later-only"],
+                        "trigger_rule": "none_failed_min_one_success",
+                        "prompt": "finish",
+                    },
+                ],
+                maximum=2,
+            )
+        ],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="previous-condition-recovery")
+
+    def first_output(context, _rendered):
+        node_id = _body_id(context)
+        if node_id == "producer":
+            return "producer-1"
+        if node_id == "finish":
+            return "continue"
+        return node_id
+
+    first_executor = OutputExecutor(first_output)
+    first_scheduler = RunScheduler(store, max_parallel_nodes=1)
+    first_scheduler.executors["prompt"] = first_executor
+
+    before_restart = first_scheduler.advance(run_id, max_nodes=3)
+
+    assert before_restart["nodes"]["group"]["loop_group"]["iteration"] == 2
+    assert [node_id for node_id, _ in first_executor.rendered] == [
+        "producer",
+        "first-only",
+        "finish",
+    ]
+
+    reopened = RunStore(home, max_total_workers=1)
+
+    def recovered_output(context, _rendered):
+        node_id = _body_id(context)
+        if node_id == "producer":
+            return "producer-2"
+        if node_id == "finish":
+            return "done <promise>DONE</promise>"
+        return node_id
+
+    recovered_executor = OutputExecutor(recovered_output)
+    recovered_scheduler = RunScheduler(reopened, max_parallel_nodes=1)
+    recovered_scheduler.executors["prompt"] = recovered_executor
+
+    result = recovered_scheduler.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert [node_id for node_id, _ in recovered_executor.rendered] == [
+        "producer",
+        "later-only",
+        "finish",
+    ]
+    events = [
+        json.loads(line)
+        for line in (reopened.run_directory(run_id) / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert any(
+        event["event_type"] == "loop_group_iteration_committed"
+        and event["payload"]["completed_iteration"] == 1
+        for event in events
+    )
+
+
 def test_previous_structured_field_fails_before_child_execution(
     tmp_path, workflow_writer
 ) -> None:

@@ -395,6 +395,31 @@ def test_artifact_free_bash_fails_closed_on_a_same_content_retry_artifact(
     assert result.error_code == "artifact_limit"
 
 
+def test_artifact_free_bash_allows_unchanged_preexisting_publications(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        context(
+            tmp_path,
+            node_type="bash",
+            value="printf ok",
+            options={"artifacts": False},
+        ),
+        max_artifact_bytes=0,
+    )
+    existing = (
+        execution.effective_publication_directory
+        / "loop-groups/group/iterations/0001/record/output.json"
+    )
+    existing.parent.mkdir(parents=True)
+    existing.write_text('{"ticket":"ERIC-1"}', encoding="utf-8")
+
+    result = BashExecutor().execute(execution)
+
+    assert result.status == "succeeded"
+    assert existing.read_text(encoding="utf-8") == '{"ticket":"ERIC-1"}'
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
 def test_artifact_free_script_rejects_even_an_empty_generated_artifact(
     tmp_path: Path,
@@ -415,6 +440,33 @@ def test_artifact_free_script_rejects_even_an_empty_generated_artifact(
         ),
         max_artifact_bytes=0,
     )
+
+    result = ScriptExecutor().execute(execution)
+
+    assert result.status == "failed"
+    assert result.error_code == "artifact_limit"
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+def test_artifact_free_script_rejects_modifying_preexisting_publication(
+    tmp_path: Path,
+) -> None:
+    execution = replace(
+        context(
+            tmp_path,
+            node_type="script",
+            value=(
+                "import os; from pathlib import Path; "
+                "Path(os.environ['ARTIFACTS_DIR']).joinpath('existing.txt').write_text('unchanged'); "
+                "print('ok')"
+            ),
+            options={"runtime": "uv", "deps": (), "artifacts": False},
+        ),
+        max_artifact_bytes=0,
+    )
+    execution.effective_publication_directory.mkdir(parents=True)
+    existing = execution.effective_publication_directory / "existing.txt"
+    existing.write_text("unchanged", encoding="utf-8")
 
     result = ScriptExecutor().execute(execution)
 

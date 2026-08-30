@@ -660,6 +660,103 @@ def test_v6_rejects_invalid_body_reference_scopes(
     _assert_issue(path, "loop_group_scope_invalid", expected_path)
 
 
+def test_v6_admits_previous_iteration_reference_in_body_condition(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group([
+                {"id": "produce", "prompt": "produce"},
+                {
+                    "id": "consume",
+                    "depends_on": ["produce"],
+                    "when": "$LOOP_PREV.produce.output == ''",
+                    "prompt": "consume",
+                },
+            ])
+        ],
+    )
+
+    package = _load_v6(path)
+
+    group = package.definition.nodes[0]
+    assert group.value["nodes"][1].options["when"] == (
+        "$LOOP_PREV.produce.output == ''"
+    )
+
+
+@pytest.mark.parametrize(
+    ("nodes", "expected_code", "expected_path"),
+    [
+        (
+            [
+                {"id": "outer", "prompt": "outer"},
+                {
+                    **_group([
+                        {
+                            "id": "consume",
+                            "when": "$LOOP_PREV.outer.output == ''",
+                            "prompt": "consume",
+                        }
+                    ]),
+                    "depends_on": ["outer"],
+                },
+            ],
+            "loop_group_scope_invalid",
+            "nodes[1].loop_group.nodes[0].when",
+        ),
+        (
+            [
+                _group([
+                    {
+                        "id": "consume",
+                        "when": "$later.output == 'ready'",
+                        "prompt": "consume",
+                    },
+                    {"id": "later", "prompt": "later"},
+                ])
+            ],
+            "loop_group_scope_invalid",
+            "nodes[0].loop_group.nodes[0].when",
+        ),
+    ],
+    ids=("previous-outer", "current-forward"),
+)
+def test_v6_rejects_invalid_previous_condition_scopes(
+    tmp_path,
+    workflow_writer,
+    nodes,
+    expected_code,
+    expected_path,
+) -> None:
+    path = workflow_writer(tmp_path, nodes=nodes)
+
+    _assert_issue(path, expected_code, expected_path)
+
+
+def test_v6_top_level_condition_does_not_gain_previous_iteration_scope(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {"id": "produce", "prompt": "produce"},
+            {
+                "id": "consume",
+                "depends_on": ["produce"],
+                "when": "$LOOP_PREV.produce.output == ''",
+                "prompt": "consume",
+            },
+        ],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _load_v6(path)
+
+    assert raised.value.issues[0].path == "nodes[1].when"
+
+
 def test_loop_group_child_scope_is_validated_and_deterministic():
     scope = LoopGroupChildScope(
         run_id="a" * 32,

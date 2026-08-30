@@ -209,7 +209,7 @@ class LoopExecutor:
             )
 
             def frozen_output_resolver(node_id, path):
-                return reference_snapshot[(node_id, tuple(path))]
+                return reference_snapshot[(False, node_id, tuple(path))]
 
             loop_output_resolver = frozen_output_resolver
         previous_output = ""

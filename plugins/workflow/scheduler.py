@@ -30,6 +30,7 @@ from plugins.workflow.bash_rendering import bash_output_references
 from plugins.workflow.conditions import (
     WorkflowConditionError,
     evaluate_v3_condition,
+    evaluate_v6_condition,
 )
 from plugins.workflow.entitlement import AIEntitlementResolution, derive_ai_entitlement
 from plugins.workflow.execution_semantics import (
@@ -2555,9 +2556,19 @@ class RunScheduler:
                         ).get(node_id)
                     return None
 
+                def resolve_previous_condition_output(node_id: str) -> object:
+                    return self._resolve_loop_child_output(
+                        projection,
+                        child_scope,
+                        node_id,
+                        previous=True,
+                    )
+
                 try:
-                    matches = evaluate_v3_condition(
-                        condition, resolve_scoped_condition_output
+                    matches = evaluate_v6_condition(
+                        condition,
+                        resolve_scoped_condition_output,
+                        resolve_previous_condition_output,
                     )
                 except (WorkflowConditionError, WorkflowOutputReferenceError) as exc:
                     return self.store.transition_loop_group_child_graph(

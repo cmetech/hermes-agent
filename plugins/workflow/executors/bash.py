@@ -22,6 +22,7 @@ from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
     StructuredProcessOutputIntegrityError,
+    publication_tree_snapshot,
     process_tree_active,
     validate_structured_process_output,
 )
@@ -62,12 +63,16 @@ class BashExecutor:
         variable_spill = attempt / ("variables-v3" if secure_v3 else "variables")
         artifacts_dir = context.effective_publication_directory
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        if context.max_artifact_bytes == 0 and any(artifacts_dir.rglob("*")):
-            return NodeExecutionResult(
-                "failed",
-                error_code="artifact_limit",
-                error_message="bash artifacts are disabled for this node",
-            )
+        artifact_free_before = None
+        if context.max_artifact_bytes == 0:
+            try:
+                artifact_free_before = publication_tree_snapshot(artifacts_dir)
+            except (OSError, ValueError):
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="artifact_limit",
+                    error_message="bash artifacts are disabled for this node",
+                )
         command = str(context.node.value)
         try:
             if context.variable_context is not None:
@@ -114,6 +119,7 @@ class BashExecutor:
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 artifacts_dir=artifacts_dir,
+                artifact_free_before=artifact_free_before,
             )
         finally:
             # Ownership begins as soon as rendering returns. This guard covers
@@ -130,6 +136,7 @@ class BashExecutor:
         stdout_path: Path,
         stderr_path: Path,
         artifacts_dir: Path,
+        artifact_free_before: dict[str, tuple[object, ...]] | None,
     ) -> NodeExecutionResult:
         bash_metadata = {"bash": rendered_command.evidence()} if secure_v3 else {}
         if os.name == "nt":  # pragma: no cover - Windows CI path
@@ -340,14 +347,19 @@ class BashExecutor:
                 artifacts.append(
                     _artifact(stderr_path, context.run_directory, "text/plain")
                 )
-            if context.max_artifact_bytes == 0 and any(artifacts_dir.rglob("*")):
-                return NodeExecutionResult(
-                    "failed",
-                    tuple(artifacts),
-                    "artifact_limit",
-                    "bash artifacts are disabled for this node",
-                    bash_metadata,
-                )
+            if artifact_free_before is not None:
+                try:
+                    artifact_free_after = publication_tree_snapshot(artifacts_dir)
+                except (OSError, ValueError):
+                    artifact_free_after = None
+                if artifact_free_after != artifact_free_before:
+                    return NodeExecutionResult(
+                        "failed",
+                        tuple(artifacts),
+                        "artifact_limit",
+                        "bash artifacts are disabled for this node",
+                        bash_metadata,
+                    )
             if spill_integrity_failed:
                 return NodeExecutionResult(
                     "failed",

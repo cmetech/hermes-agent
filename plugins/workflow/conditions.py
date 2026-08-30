@@ -60,10 +60,18 @@ class _Literal:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreviousOutputReference:
+    node_id: str
+    path: tuple[str, ...]
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
 class _Clause:
-    reference: OutputReferenceToken
+    reference: OutputReferenceToken | _PreviousOutputReference
     operator: str
-    right: _Literal | OutputReferenceToken
+    right: _Literal | OutputReferenceToken | _PreviousOutputReference
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,18 +79,23 @@ class _Expression:
     or_groups: tuple[tuple[_Clause, ...], ...]
 
     @property
-    def references(self) -> tuple[OutputReferenceToken, ...]:
-        references: list[OutputReferenceToken] = []
+    def references(
+        self,
+    ) -> tuple[OutputReferenceToken | _PreviousOutputReference, ...]:
+        references: list[OutputReferenceToken | _PreviousOutputReference] = []
         for group in self.or_groups:
             for clause in group:
                 references.append(clause.reference)
-                if isinstance(clause.right, OutputReferenceToken):
+                if isinstance(
+                    clause.right,
+                    OutputReferenceToken | _PreviousOutputReference,
+                ):
                     references.append(clause.right)
         return tuple(references)
 
 
 class _Parser:
-    def __init__(self, expression: str) -> None:
+    def __init__(self, expression: str, *, allow_previous: bool = False) -> None:
         if not isinstance(expression, str):
             raise WorkflowConditionError("condition_runtime_syntax_invalid")
         try:
@@ -97,6 +110,7 @@ class _Parser:
         self.position = 0
         self.token_count = 0
         self.nesting = 0
+        self.allow_previous = allow_previous
 
     def parse(self) -> _Expression:
         self._enter()
@@ -148,7 +162,11 @@ class _Parser:
             ] == "$":
                 if operator not in ARCHON_V3_CONDITION_EQUALITY_OPERATORS:
                     self._syntax_error()
-                right: _Literal | OutputReferenceToken = self._parse_reference()
+                right: (
+                    _Literal
+                    | OutputReferenceToken
+                    | _PreviousOutputReference
+                ) = self._parse_reference()
             else:
                 right = self._parse_literal()
             self._skip_whitespace()
@@ -156,7 +174,41 @@ class _Parser:
         finally:
             self._leave()
 
-    def _parse_reference(self) -> OutputReferenceToken:
+    def _parse_reference(
+        self,
+    ) -> OutputReferenceToken | _PreviousOutputReference:
+        previous_prefix = "$LOOP_PREV."
+        if self.allow_previous and self.expression.startswith(
+            previous_prefix, self.position
+        ):
+            suffix = "$" + self.expression[
+                self.position + len(previous_prefix) :
+            ]
+            try:
+                reference = next(
+                    iter_output_references(suffix, normalizer_version=6),
+                    None,
+                )
+            except WorkflowReferenceSyntaxError as exc:
+                raise WorkflowConditionError(
+                    "condition_runtime_syntax_invalid"
+                ) from exc
+            if reference is None or reference.start != 0:
+                self._syntax_error()
+            absolute = _PreviousOutputReference(
+                node_id=reference.node_id,
+                path=reference.path,
+                start=self.position,
+                end=(
+                    self.position
+                    + len(previous_prefix)
+                    - 1
+                    + reference.end
+                ),
+            )
+            self.position = absolute.end
+            self._count_token()
+            return absolute
         suffix = self.expression[self.position :]
         try:
             reference = next(
@@ -231,8 +283,8 @@ class _Parser:
         raise WorkflowConditionError("condition_runtime_syntax_invalid")
 
 
-def _parse(expression: str) -> _Expression:
-    return _Parser(expression).parse()
+def _parse(expression: str, *, allow_previous: bool = False) -> _Expression:
+    return _Parser(expression, allow_previous=allow_previous).parse()
 
 
 def validate_v3_condition_syntax(
@@ -240,6 +292,13 @@ def validate_v3_condition_syntax(
 ) -> tuple[OutputReferenceToken, ...]:
     """Validate one v3 condition without evaluating it."""
     return _parse(expression).references
+
+
+def validate_v6_condition_syntax(
+    expression: str,
+) -> tuple[OutputReferenceToken | _PreviousOutputReference, ...]:
+    """Validate a v6 loop-group body condition with previous scope."""
+    return _parse(expression, allow_previous=True).references
 
 
 def _decimal_text(value: str) -> Decimal:
@@ -270,12 +329,21 @@ def _numeric_left(value: object, *, schemaless_text: bool) -> Decimal:
 
 
 def _resolve_reference(
-    reference: OutputReferenceToken,
+    reference: OutputReferenceToken | _PreviousOutputReference,
     output_for: Callable[[str], object],
+    previous_output_for: Callable[[str], object] | None = None,
 ) -> tuple[object, bool]:
-    raw_output = output_for(reference.node_id)
+    previous = isinstance(reference, _PreviousOutputReference)
+    if previous:
+        if previous_output_for is None:
+            raise WorkflowConditionError("condition_runtime_syntax_invalid")
+        raw_output = previous_output_for(reference.node_id)
+    else:
+        raw_output = output_for(reference.node_id)
     if isinstance(raw_output, WorkflowOutputReferenceError):
         raise raw_output
+    if previous and raw_output is None and not reference.path:
+        return "", True
     if raw_output is not None and not isinstance(raw_output, ResolvedNodeOutput):
         raise WorkflowConditionError("condition_operand_type")
     if (
@@ -321,11 +389,23 @@ def _canonical_scalar(value: object) -> tuple[str, object]:
 def _evaluate_clause(
     clause: _Clause,
     output_for: Callable[[str], object],
+    previous_output_for: Callable[[str], object] | None = None,
 ) -> bool:
-    left, schemaless_text = _resolve_reference(clause.reference, output_for)
+    left, schemaless_text = _resolve_reference(
+        clause.reference,
+        output_for,
+        previous_output_for,
+    )
 
-    if isinstance(clause.right, OutputReferenceToken):
-        right, _ = _resolve_reference(clause.right, output_for)
+    if isinstance(
+        clause.right,
+        OutputReferenceToken | _PreviousOutputReference,
+    ):
+        right, _ = _resolve_reference(
+            clause.right,
+            output_for,
+            previous_output_for,
+        )
         equal = _canonical_scalar(left) == _canonical_scalar(right)
         return equal if clause.operator == "==" else not equal
 
@@ -375,8 +455,34 @@ def evaluate_v3_condition(
     return False
 
 
+def evaluate_v6_condition(
+    expression: str,
+    outputs: Mapping[str, object] | Callable[[str], object],
+    previous_outputs: Mapping[str, object] | Callable[[str], object],
+) -> bool:
+    """Evaluate one v6 body condition against current and previous outputs."""
+    parsed = _parse(expression, allow_previous=True)
+    output_for = outputs.get if isinstance(outputs, Mapping) else outputs
+    previous_output_for = (
+        previous_outputs.get
+        if isinstance(previous_outputs, Mapping)
+        else previous_outputs
+    )
+    for group in parsed.or_groups:
+        group_matches = True
+        for clause in group:
+            if not _evaluate_clause(clause, output_for, previous_output_for):
+                group_matches = False
+                break
+        if group_matches:
+            return True
+    return False
+
+
 __all__ = [
     "WorkflowConditionError",
     "evaluate_v3_condition",
+    "evaluate_v6_condition",
     "validate_v3_condition_syntax",
+    "validate_v6_condition_syntax",
 ]

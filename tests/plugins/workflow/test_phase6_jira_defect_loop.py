@@ -377,6 +377,7 @@ def _run_script(
     previous: dict[str, object | None] | None = None,
     extra_dependencies: tuple[str, ...] = (),
     predecessor_results: dict[str, dict[str, object]] | None = None,
+    preexisting_artifacts: dict[str, str] | None = None,
 ):
     compilation = _compile()
     structured_id = (
@@ -414,6 +415,10 @@ def _run_script(
             }
     run_directory = tmp_path / f"run-{node.id}-{len(list(tmp_path.iterdir()))}"
     run_directory.mkdir()
+    for relative_path, content in (preexisting_artifacts or {}).items():
+        artifact = run_directory / "artifacts" / relative_path
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(content, encoding="utf-8")
     result = ScriptExecutor().execute(
         NodeExecutionContext(
             run_id="reducer-test",
@@ -1310,6 +1315,71 @@ def test_final_json_and_markdown_preserve_full_terminal_write_evidence(
         "review warning",
     ):
         assert value in markdown
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_top_level_artifact_free_aggregate_ignores_unchanged_group_artifacts(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile()
+    nodes = {node.id: node for node in compilation.package.definition.nodes}
+    manifest = {
+        "status": "ready",
+        "count": 1,
+        "tickets": [{"key": "ERIC-1"}],
+        "warnings": [],
+    }
+    record = {
+        "ticket_key": "ERIC-1",
+        "outcome": "needs_info",
+        "status": "terminal",
+        "project_path": None,
+        "branch_name": None,
+        "commit_id": None,
+        "merge_request_url": None,
+        "jira_comment_id": None,
+        "warnings": [],
+        "attention_needed": False,
+        "reconciliation_status": "not_required",
+    }
+    aggregate = {
+        "manifest_count": 1,
+        "completed_count": 1,
+        "records": [record],
+        "counts": {
+            "fixed": 0,
+            "not_found": 0,
+            "permission": 0,
+            "needs_info": 1,
+            "manual_review": 0,
+            "not_a_code_fix": 0,
+            "safely_skipped": 0,
+        },
+        "warnings": [],
+        "completion_marker": "",
+    }
+    relative = (
+        "loop-groups/process-ticket-manifest/iterations/0001/"
+        "record-cumulative-state/output.json"
+    )
+    group_output = json.dumps(aggregate, sort_keys=True)
+
+    result, text = _run_script(
+        tmp_path,
+        nodes["publish-aggregate-json"],
+        outputs={
+            "fetch-ticket-manifest": manifest,
+            "process-ticket-manifest": aggregate,
+        },
+        preexisting_artifacts={relative: group_output},
+    )
+
+    assert result.status == "succeeded"
+    assert json.loads(text)["records"] == [record]
+    run_directory = next(tmp_path.glob("run-publish-aggregate-json-*"))
+    assert (run_directory / "artifacts" / relative).read_text(
+        encoding="utf-8"
+    ) == group_output
 
 
 def test_write_plan_preserves_exact_connector_arguments_and_prompts_use_them() -> None:

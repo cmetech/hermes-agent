@@ -162,6 +162,22 @@ def _artifact_text(context: NodeExecutionContext, result, index: int = -1) -> st
     )
 
 
+def _scoped_output(node_id: str, value: str, marker: str) -> ResolvedNodeOutput:
+    data = value.encode("utf-8")
+    return ResolvedNodeOutput(
+        canonical_bytes=data,
+        value=value,
+        text=value,
+        media_type="text/plain",
+        sha256=hashlib.sha256(data).hexdigest(),
+        node_id=node_id,
+        attempt_id=f"attempt-{marker}",
+        publication_id=marker * 32,
+        schema_fingerprint=None,
+        canonicalization_version=1,
+    )
+
+
 def test_loop_completes_on_case_insensitive_promise_and_strips_signal(
     tmp_path: Path,
 ) -> None:
@@ -411,6 +427,128 @@ def test_v3_loop_prompt_renders_authored_tokens_once_without_rescanning_output(
     assert result.status == "succeeded"
     assert len(runner.requests) == 1
     assert runner.requests[0].prompt == f"Previous=<> data=<{literal_output}>"
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        (
+            "$producer.output|$LOOP_PREV.producer.output",
+            "current|previous",
+        ),
+        (
+            "$LOOP_PREV.producer.output|$producer.output",
+            "previous|current",
+        ),
+    ],
+    ids=("current-first", "previous-first"),
+)
+def test_v6_group_scoped_current_and_previous_prompt_references_keep_identity(
+    tmp_path: Path,
+    template: str,
+    expected: str,
+) -> None:
+    runner = FakeAgentRunner("done <promise>DONE</promise>")
+    current = _scoped_output("producer", "current", "a")
+    previous = _scoped_output("producer", "previous", "b")
+    execution = replace(
+        _context(
+            tmp_path,
+            {
+                "prompt": template,
+                "until": "DONE",
+                "max_iterations": 1,
+            },
+            variable_context=VariableContext(
+                current_body_outputs={"producer": current},
+                previous_body_outputs={"producer": previous},
+                normalizer_version=6,
+            ),
+            depends_on=("producer",),
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+    execution = replace(
+        execution,
+        node=replace(
+            execution.node,
+            options=freeze_value({
+                "_sealed_loop_semantics": {
+                    "prompt_source": "inline",
+                    "command_binding": None,
+                    "effective_interactive": False,
+                    "signal_completes": True,
+                }
+            }),
+        ),
+    )
+
+    result = LoopExecutor(runner).execute(execution)
+
+    assert result.status == "succeeded"
+    assert runner.requests[0].prompt == expected
+
+
+@pytest.mark.parametrize(
+    "until_bash",
+    [
+        (
+            "test $producer.output = current && "
+            "test $LOOP_PREV.producer.output = previous"
+        ),
+        (
+            "test $LOOP_PREV.producer.output = previous && "
+            "test $producer.output = current"
+        ),
+    ],
+    ids=("current-first", "previous-first"),
+)
+def test_v6_group_scoped_current_and_previous_until_bash_references_keep_identity(
+    tmp_path: Path,
+    until_bash: str,
+) -> None:
+    runner = FakeAgentRunner("keep going")
+    current = _scoped_output("producer", "current", "a")
+    previous = _scoped_output("producer", "previous", "b")
+    execution = replace(
+        _context(
+            tmp_path,
+            {
+                "prompt": "work",
+                "until": "DONE",
+                "until_bash": until_bash,
+                "max_iterations": 1,
+            },
+            variable_context=VariableContext(
+                current_body_outputs={"producer": current},
+                previous_body_outputs={"producer": previous},
+                normalizer_version=6,
+            ),
+            depends_on=("producer",),
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=4,
+    )
+    execution = replace(
+        execution,
+        node=replace(
+            execution.node,
+            options=freeze_value({
+                "_sealed_loop_semantics": {
+                    "prompt_source": "inline",
+                    "command_binding": None,
+                    "effective_interactive": False,
+                    "signal_completes": True,
+                }
+            }),
+        ),
+    )
+
+    result = LoopExecutor(runner).execute(execution)
+
+    assert result.status == "succeeded"
+    assert result.metadata["loop_state"]["completed_by"] == "until_bash"
 
 
 def test_v3_until_bash_reference_failure_precedes_spill_side_effect(tmp_path) -> None:

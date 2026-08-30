@@ -20,6 +20,7 @@ from plugins.workflow.bash_rendering import (
 from plugins.workflow.conditions import (
     WorkflowConditionError,
     validate_v3_condition_syntax,
+    validate_v6_condition_syntax,
 )
 from plugins.workflow.language import (
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
@@ -1141,6 +1142,7 @@ def _normalize_loop_group(
                     normalizer_version=normalizer_version,
                     origin=origin,
                     path=child_path,
+                    loop_group_body=True,
                 )
             )
         except WorkflowValidationError as exc:
@@ -1223,6 +1225,7 @@ def _normalize_node(
     normalizer_version: int,
     origin: WorkflowNodeOrigin | None = None,
     path: str | None = None,
+    loop_group_body: bool = False,
 ) -> WorkflowNode:
     path = path or f"nodes[{index}]"
     node = _mapping(raw, path)
@@ -1366,7 +1369,10 @@ def _normalize_node(
         when = _string(node["when"], f"{path}.when")
         if archon_v3:
             try:
-                validate_v3_condition_syntax(when)
+                if phase6 and loop_group_body:
+                    validate_v6_condition_syntax(when)
+                else:
+                    validate_v3_condition_syntax(when)
             except WorkflowConditionError as exc:
                 if isinstance(exc.__cause__, WorkflowReferenceSyntaxError):
                     _fail(f"{path}.when", exc.__cause__.code, str(exc.__cause__))

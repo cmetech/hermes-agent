@@ -660,6 +660,8 @@ class AgentNodeExecutor:
             is not StructuredOutputStrategy.PROMPT_JSON_SCHEMA
         ):
             return failed("ineligible_native_strategy")
+        if initial_request.tool_call_contract is not None:
+            return failed("ineligible_tool_call_contract")
         if context.outward_action:
             return failed("ineligible_outward_action")
         if self._uncertain_effects(initial_result.audit):

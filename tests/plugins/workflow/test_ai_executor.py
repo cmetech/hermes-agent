@@ -832,6 +832,7 @@ def test_prompt_adapter_repairs_once_in_a_fresh_action_free_request(tmp_path):
     assert repair.sandbox_policy is None
     assert repair.max_budget_usd is None
     assert repair.approved_action_digest is None
+    assert repair.tool_call_contract is None
     repair_payload = json.loads(repair.prompt)
     assert set(repair_payload) == {
         "canonical_schema",
@@ -1247,6 +1248,71 @@ def test_tool_call_contract_violation_is_terminal_without_claiming_no_effect(
     assert result.metadata["archon_terminal_failure"] is True
     assert "known_no_effect" not in result.metadata
     assert runner.requests[0].tool_call_contract is not None
+
+
+def test_schema_invalid_tool_correlated_output_cannot_enter_generic_repair(
+    tmp_path,
+) -> None:
+    contract = {
+        "name": "jira_my_tickets",
+        "arguments": {"max_results": 25},
+        "result": {
+            "items_path": "result.items",
+            "select": ("key",),
+            "output_items_path": "tickets",
+            "output_count_path": "count",
+            "output_status_path": "status",
+            "empty_status": "empty",
+            "nonempty_status": "ready",
+            "max_items": 25,
+        },
+    }
+    initial_manifest = '{"status":"ready","count":1,"tickets":[{"key":"ERIC-1"}]}'
+    replacement_manifest = (
+        '{"status":"ready","count":1,"tickets":[{"key":"ERIC-2"}],'
+        '"warnings":[]}'
+    )
+    runner = FakeAgentRunner(
+        initial_manifest,
+        replacement_manifest,
+        audit_rows=({
+            "tool_call_contract_satisfied": True,
+            "tool_call_name": "jira_my_tickets",
+            "tool_call_result_sha256": "a" * 64,
+        }, {}),
+    )
+    node = _node(
+        "manifest",
+        "Fetch the immutable manifest once",
+        allowed_tools=("jira_my_tickets",),
+        tool_call_contract=contract,
+        output_format={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["status", "count", "tickets", "warnings"],
+            "properties": {
+                "status": {"type": "string", "enum": ["ready", "empty"]},
+                "count": {"type": "integer", "minimum": 0, "maximum": 25},
+                "tickets": {"type": "array", "maxItems": 25},
+                "warnings": {"type": "array", "maxItems": 25},
+            },
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(
+        _archon_context(tmp_path, node, max_provider_attempts=3)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "structured_output_invalid"
+    assert result.metadata["repair_disposition"] == "ineligible_tool_call_contract"
+    assert result.metadata["audit"]["tool_call_contract_satisfied"] is True
+    assert result.metadata["invalid_output_sha256"] == hashlib.sha256(
+        initial_manifest.encode("utf-8")
+    ).hexdigest()
+    assert len(runner.requests) == 1
+    assert runner.requests[0].tool_call_contract is not None
+    assert not (tmp_path / "run" / "nodes").exists()
 
 
 def test_legacy_agent_request_keeps_iteration_summary_behavior(tmp_path):

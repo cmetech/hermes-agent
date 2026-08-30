@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
+import os
 from pathlib import Path
+import stat
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
@@ -139,6 +142,67 @@ class NodeExecutionResult:
     session_registry_update: SessionRegistryUpdateCandidate | None = None
     session_registry_authority: SessionRegistryUpdateCandidate | None = None
     session_recovery_outcome: str | None = None
+
+
+def publication_tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
+    """Capture one no-follow publication identity, including empty directories."""
+
+    def identity(observed: os.stat_result) -> tuple[int, ...]:
+        return (
+            observed.st_mode,
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_nlink,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+
+    root_before = root.lstat()
+    if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(root_before.st_mode):
+        raise ValueError("publication root is not a regular directory")
+    snapshot: dict[str, tuple[object, ...]] = {
+        ".": ("directory", *identity(root_before))
+    }
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise ValueError("publication tree contains a symlink")
+        if stat.S_ISDIR(before.st_mode):
+            after = path.lstat()
+            if identity(before) != identity(after):
+                raise ValueError("publication directory changed during snapshot")
+            snapshot[relative] = ("directory", *identity(after))
+            continue
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("publication tree contains an unsafe entry")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ValueError("publication file is not regular")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            opened_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after = path.lstat()
+        if not (
+            identity(before) == identity(opened) == identity(opened_after) == identity(after)
+        ):
+            raise ValueError("publication file changed during snapshot")
+        snapshot[relative] = ("file", *identity(after), digest.hexdigest())
+    root_after = root.lstat()
+    if identity(root_before) != identity(root_after):
+        raise ValueError("publication root changed during snapshot")
+    return snapshot
 
 
 class StructuredProcessOutputIntegrityError(ValueError):
