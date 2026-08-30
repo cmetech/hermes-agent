@@ -653,6 +653,92 @@ def test_loop_group_failure_finalizes_after_active_child_cleanup_is_recorded(
         ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("observation", ("still_running", "outcome_uncertain"))
+@pytest.mark.parametrize("operator_action", ("resume", "retry", "abandon"))
+def test_operator_refuses_unproven_nested_execution_without_releasing_authority(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    observation,
+    operator_action,
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        executor_id="bash",
+        effect_classification="replay_safe",
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+    if observation == "still_running":
+        identity = ProcessIdentity(pid=999_996, start_time=34_567, group_id=999_996)
+        assert store.record_process_started(claim, identity)
+        monkeypatch.setattr(ProcessIdentity, "is_current", lambda self: True)
+    else:
+        assert store.record_spawn_intent(claim, executor_nonce="uncertain-spawn")
+    before_failure = store.load_run(run_id)
+    assert not store.fail_loop_group(
+        scope,
+        error_code="group_failed",
+        error_message="failed",
+        expected_state_version=before_failure["state_version"],
+    )
+    retained = store.load_run(run_id)
+    child = retained["nodes"]["group"]["loop_group"]["body"]["select"]
+    assert child["recovery"]["observation"] == observation
+    assert child["recovery"]["termination_confirmed"] is False
+
+    with store._connect() as connection:
+        authority_before = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT attempt_id, run_id, node_id, owner_id, lease_expires_at "
+                "FROM worker_claims WHERE attempt_id=? "
+                "UNION ALL "
+                "SELECT attempt_id, run_id, 'journal-reserve', "
+                "CAST(terminal_reserve_bytes AS TEXT), "
+                "CAST(projection_limit_bytes AS TEXT) "
+                "FROM attempt_journal_reserves WHERE attempt_id=?",
+                (claim.attempt_id, claim.attempt_id),
+            ).fetchall()
+        )
+    assert len(authority_before) == 2
+
+    expected_error = ValueError if operator_action == "retry" else RuntimeError
+    expected_message = (
+        "replay-safe" if operator_action == "retry" else "cannot .* while"
+    )
+    with pytest.raises(expected_error, match=expected_message):
+        if operator_action == "resume":
+            store.resume_run(run_id, always_run_nodes=set())
+        elif operator_action == "retry":
+            store.retry_run(run_id, node_id="group/select")
+        else:
+            store.abandon_run(run_id)
+
+    assert store.load_run(run_id) == retained
+    with store._connect() as connection:
+        authority_after = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT attempt_id, run_id, node_id, owner_id, lease_expires_at "
+                "FROM worker_claims WHERE attempt_id=? "
+                "UNION ALL "
+                "SELECT attempt_id, run_id, 'journal-reserve', "
+                "CAST(terminal_reserve_bytes AS TEXT), "
+                "CAST(projection_limit_bytes AS TEXT) "
+                "FROM attempt_journal_reserves WHERE attempt_id=?",
+                (claim.attempt_id, claim.attempt_id),
+            ).fetchall()
+        )
+    assert authority_after == authority_before
+
+
 def test_projection_rejects_terminal_child_with_active_claim(
     tmp_path, workflow_writer
 ) -> None:

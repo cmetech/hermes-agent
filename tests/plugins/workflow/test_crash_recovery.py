@@ -13,6 +13,7 @@ from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.lease_clock import LeaseClockSample
@@ -2828,6 +2829,128 @@ def test_loop_group_predicate_restart_reuses_recorded_input_without_child_replay
     ]
 
 
+def test_loop_group_predicate_redispatch_uses_a_fresh_physical_attempt(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-physical-attempt",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-physical-attempt")
+    prompt = OutputExecutor(lambda _context, _rendered: "not complete")
+    predicate_attempts = []
+
+    class RecordingBash:
+        def __init__(self, active_store):
+            self.active_store = active_store
+
+        def execute(self, context):
+            with self.active_store._connect() as connection:
+                worker_count = connection.execute(
+                    "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0]
+            predicate_attempts.append(
+                (context.attempt_id, context.effective_attempt_directory, worker_count)
+            )
+            return BashExecutor().execute(context)
+
+    first = RunScheduler(
+        store, max_parallel_nodes=1, heartbeat_seconds=0.1, lease_seconds=1
+    )
+    first.executors["prompt"] = prompt
+    first.executors["bash"] = RecordingBash(store)
+
+    def crash_before_decision(*_args, **_kwargs):
+        raise SystemExit("predicate crashed before decision CAS")
+
+    monkeypatch.setattr(
+        store, "record_loop_group_predicate_decision", crash_before_decision
+    )
+    with pytest.raises(SystemExit, match="before decision CAS"):
+        first.advance_all([run_id])
+
+    pending = store.load_run(run_id)
+    controller = pending["nodes"]["group"]["loop_group"]
+    durable_attempt_id = pending["nodes"]["group"]["claim"]["attempt_id"]
+    assert controller["_pending_loop_decision"]["kind"] == "until_bash_pending"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (durable_attempt_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE attempt_id=?",
+            (durable_attempt_id,),
+        ).fetchone()[0] == 1
+
+    raw_claim = pending["nodes"]["group"]["claim"]
+    recovered_at = datetime.fromisoformat(raw_claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    recovered_monotonic = (
+        float(raw_claim["heartbeat_monotonic"])
+        + float(raw_claim["lease_seconds"])
+        + 1
+    )
+    restarted_store = RunStore(home, max_total_workers=1)
+    restarted = RunScheduler(
+        restarted_store,
+        max_parallel_nodes=1,
+        heartbeat_seconds=0.1,
+        lease_seconds=1,
+        utcnow=lambda: recovered_at,
+        monotonic=lambda: recovered_monotonic,
+    )
+    restarted.executors["prompt"] = prompt
+    restarted.executors["bash"] = RecordingBash(restarted_store)
+
+    result = restarted.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
+        "sink"
+    ]
+    assert len(predicate_attempts) == 2
+    assert len({attempt_id for attempt_id, _path, _workers in predicate_attempts}) == 2
+    assert len({path for _attempt_id, path, _workers in predicate_attempts}) == 2
+    assert all(workers == 0 for _attempt_id, _path, workers in predicate_attempts)
+    assert all(path.is_dir() for _attempt_id, path, _workers in predicate_attempts)
+    decision_root = (
+        restarted_store.run_directory(run_id)
+        / "artifacts"
+        / "loop-groups"
+        / "group"
+        / "iterations"
+        / "0001"
+        / "decision"
+    ).resolve()
+    assert all(
+        path.resolve().is_relative_to(decision_root)
+        for _attempt_id, path, _workers in predicate_attempts
+    )
+    with restarted_store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE attempt_id=?",
+            (durable_attempt_id,),
+        ).fetchone()[0] == 0
+
+
 def test_loop_group_restart_consumes_the_recorded_predicate_result_once(
     tmp_path, workflow_writer, monkeypatch
 ) -> None:
@@ -3014,7 +3137,10 @@ def test_loop_group_restart_adopts_recorded_result_after_coordinator_turnover(
     ]
 
     assert result["status"] == "succeeded"
-    assert predicate_calls == [raw["attempt_id"]]
+    assert len(predicate_calls) == 1
+    assert predicate_calls[0].startswith(
+        f"{raw['attempt_id']}/until-recovery-0001-"
+    )
     assert predicate_attempt["execution_fence"] == {
         "owner_id": fence_b.owner_id,
         "owner_epoch": fence_b.owner_epoch,

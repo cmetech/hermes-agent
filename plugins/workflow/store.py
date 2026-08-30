@@ -443,6 +443,69 @@ def _iter_interaction_node_states(
                     yield f"{node_id}/{child_id}", child
 
 
+def _assert_operator_transition_has_no_live_execution(
+    projection: Mapping[str, object], action: str
+) -> None:
+    for _node_id, node in _iter_projection_node_states(projection):
+        recovery = node.get("recovery")
+        if (
+            isinstance(recovery, Mapping)
+            and recovery.get("observation")
+            in {"still_running", "outcome_uncertain"}
+            and not recovery.get("termination_confirmed")
+        ):
+            if action == "resume":
+                raise RuntimeError(
+                    "cannot resume while the prior executor is still running "
+                    "or its identity is uncertain"
+                )
+            if action == "retry":
+                raise ValueError(
+                    "retry requires exactly one replay-safe failed or interrupted node"
+                )
+            raise RuntimeError(f"cannot {action} while executor termination is unproven")
+        if isinstance(node.get("claim"), Mapping):
+            if action == "retry":
+                raise ValueError(
+                    "retry requires exactly one replay-safe failed or interrupted node"
+                )
+            raise RuntimeError(f"cannot {action} while a live executor claim exists")
+
+
+def _reset_loop_group_child_for_operator(
+    projection: Mapping[str, object],
+    semantic_id: str,
+    child: MutableMapping[str, object],
+) -> None:
+    group_id, child_id = semantic_id.split("/", 1)
+    nodes = projection.get("nodes")
+    group = nodes.get(group_id) if isinstance(nodes, Mapping) else None
+    controller = group.get("loop_group") if isinstance(group, MutableMapping) else None
+    body = controller.get("body") if isinstance(controller, MutableMapping) else None
+    if not isinstance(body, Mapping) or body.get(child_id) is not child:
+        raise RuntimeError("loop group retry scope changed")
+    recovery = child.get("recovery")
+    if isinstance(recovery, Mapping):
+        if (
+            recovery.get("effect_classification") != "replay_safe"
+            or not recovery.get("termination_confirmed")
+        ):
+            raise RuntimeError("cannot retry an unproven loop group child")
+        child.pop("recovery", None)
+    child.pop("claim", None)
+    child.pop("next_attempt_at", None)
+    child["state"] = (
+        "ready"
+        if all(
+            body[dependency].get("state") in {"succeeded", "skipped"}
+            for dependency in child.get("depends_on", ())
+        )
+        else "pending"
+    )
+    group["state"] = "running"
+    controller["state"] = "running"
+
+
 def _projection_node_state(
     projection: Mapping[str, object], node_id: str
 ) -> MutableMapping[str, object] | None:
@@ -18557,6 +18620,7 @@ class RunStore:
                 int(projection["state_version"]) != expected_state_version
             ):
                 raise WorkflowConflict("stale resume decision")
+            _assert_operator_transition_has_no_live_execution(projection, "resume")
             if projection["status"] == "recovery_pending":
                 pending_registry_payloads = _pending_session_registry_payloads(
                     projection
@@ -18602,19 +18666,21 @@ class RunStore:
                         "foreground owner conflict: expired owner requires adoption"
                     )
                 return projection
-            for node in projection["nodes"].values():
-                recovery = node.get("recovery")
-                if (
-                    isinstance(recovery, Mapping)
-                    and recovery.get("observation")
-                    in {"still_running", "outcome_uncertain"}
-                    and not recovery.get("termination_confirmed")
-                ):
-                    raise RuntimeError(
-                        "cannot resume while the prior executor is still running "
-                        "or its identity is uncertain"
-                    )
             for node_id, node in projection["nodes"].items():
+                controller = node.get("loop_group")
+                if isinstance(controller, MutableMapping):
+                    body = controller.get("body")
+                    if isinstance(body, Mapping):
+                        for child_id, child in body.items():
+                            if isinstance(child, MutableMapping) and child.get(
+                                "state"
+                            ) in {"failed", "interrupted"}:
+                                _reset_loop_group_child_for_operator(
+                                    projection,
+                                    f"{node_id}/{child_id}",
+                                    child,
+                                )
+                    continue
                 if node["state"] == "succeeded" and node_id not in always_run:
                     continue
                 node.pop("claim", None)
@@ -19925,34 +19991,35 @@ class RunStore:
                 int(projection["state_version"]) != expected_state_version
             ):
                 raise WorkflowConflict("stale retry decision")
+            _assert_operator_transition_has_no_live_execution(projection, "retry")
             candidates = [
                 (candidate_id, node)
-                for candidate_id, node in projection["nodes"].items()
+                for candidate_id, node in _iter_interaction_node_states(projection)
                 if (node_id is None or candidate_id == node_id)
                 and node.get("state") in {"failed", "interrupted"}
+                and not isinstance(node.get("loop_group"), Mapping)
                 and not isinstance(node.get("pending_interaction"), Mapping)
-                and not (
-                    isinstance(node.get("recovery"), Mapping)
-                    and node["recovery"].get("observation")
-                    in {"still_running", "outcome_uncertain"}
-                    and not node["recovery"].get("termination_confirmed")
-                )
             ]
             if len(candidates) != 1:
                 raise ValueError(
                     "retry requires exactly one replay-safe failed or interrupted node"
                 )
             selected_id, node = candidates[0]
-            node.pop("claim", None)
-            node.pop("next_attempt_at", None)
-            node["state"] = (
-                "ready"
-                if all(
-                    projection["nodes"][dependency]["state"] == "succeeded"
-                    for dependency in node["depends_on"]
+            if "/" in selected_id:
+                _reset_loop_group_child_for_operator(
+                    projection, selected_id, node
                 )
-                else "pending"
-            )
+            else:
+                node.pop("claim", None)
+                node.pop("next_attempt_at", None)
+                node["state"] = (
+                    "ready"
+                    if all(
+                        projection["nodes"][dependency]["state"] == "succeeded"
+                        for dependency in node["depends_on"]
+                    )
+                    else "pending"
+                )
             projection["last_error"] = None
             self._append_locked(
                 directory,
@@ -20254,21 +20321,7 @@ class RunStore:
                 raise ValueError(
                     "only interrupted, failed, or paused runs may be abandoned"
                 )
-            if any(
-                isinstance(node.get("recovery"), Mapping)
-                and node["recovery"].get("observation")
-                in {"still_running", "outcome_uncertain"}
-                and not node["recovery"].get("termination_confirmed")
-                for node in projection["nodes"].values()
-            ):
-                raise RuntimeError(
-                    "cannot abandon while executor termination is unproven"
-                )
-            if any(
-                isinstance(node.get("claim"), Mapping)
-                for node in projection["nodes"].values()
-            ):
-                raise RuntimeError("cannot abandon while a live executor claim exists")
+            _assert_operator_transition_has_no_live_execution(projection, "abandon")
             if projection["status"] in {"succeeded", "cancelled", "abandoned"}:
                 if target == "cancelled":
                     return {**projection, "cancellation_outcome": "already_terminal"}

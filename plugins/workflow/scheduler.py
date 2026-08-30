@@ -2777,6 +2777,10 @@ class RunScheduler:
                         predicate_dependencies = tuple(
                             dict.fromkeys((*all_body.depends_on, *group.depends_on))
                         )
+                        physical_attempt_id = (
+                            f"{predicate_claim.attempt_id}/until-recovery-"
+                            f"{scope.iteration:04d}-{uuid.uuid4().hex}"
+                        )
                         predicate = self.executors["bash"].execute(
                             NodeExecutionContext(
                             run_id=run_id,
@@ -2790,7 +2794,7 @@ class RunScheduler:
                                 source_line=group.source_line,
                                 options=freeze_value({}),
                             ),
-                            attempt_id=predicate_claim.attempt_id,
+                            attempt_id=physical_attempt_id,
                             variable_context=replace(
                                 variables, loop_prev_output=cleaned
                             ),
@@ -2814,7 +2818,7 @@ class RunScheduler:
                                     predicate_claim, identity, cleaned=cleaned
                                 )
                             ),
-                            attempt_directory=publication / "attempt",
+                            attempt_directory=publication / physical_attempt_id,
                             publication_directory=publication,
                         )
                         )

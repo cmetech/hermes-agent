@@ -133,15 +133,19 @@ def test_until_bash_records_controller_authority_before_process_dispatch(
             assert context.spawn_failed is not None
             assert context.process_started is not None
             assert context.process_stopped is not None
+            durable_attempt_id = context.attempt_id.split("/", 1)[0]
+            assert context.attempt_id.startswith(
+                f"{durable_attempt_id}/until-recovery-0001-"
+            )
             with store._connect() as connection:
                 reserve = connection.execute(
                     "SELECT terminal_reserve_bytes FROM obligation_journal_reserves "
                     "WHERE attempt_id=?",
-                    (context.attempt_id,),
+                    (durable_attempt_id,),
                 ).fetchone()
                 worker_count = connection.execute(
-                    "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
-                    (context.attempt_id,),
+                    "SELECT COUNT(*) FROM worker_claims WHERE attempt_id IN (?, ?)",
+                    (durable_attempt_id, context.attempt_id),
                 ).fetchone()[0]
             assert reserve is not None
             assert int(reserve["terminal_reserve_bytes"]) > 0
@@ -464,6 +468,91 @@ def test_hard_maximum_fails_without_a_dead_interaction(
     assert result["status"] == "failed", result["nodes"]["group"]
     assert result["last_error"]["code"] == "loop_group_max_iterations"
     assert result["nodes"]["group"].get("pending_interaction") is None
+
+
+@pytest.mark.parametrize("operator_action", ("resume", "retry"))
+def test_operator_restarts_only_the_failed_current_iteration_child(
+    tmp_path, workflow_writer, operator_action
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"phase6-operator-{operator_action}",
+        nodes=[
+            _group(
+                [
+                    {"id": "completed", "prompt": "completed"},
+                    {
+                        "id": "flaky",
+                        "prompt": "flaky",
+                        "depends_on": ["completed"],
+                    },
+                ],
+                maximum=2,
+            )
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key=f"phase6-operator-{operator_action}")
+    calls = {"completed": 0, "flaky": 0}
+
+    def output(context, _rendered):
+        child_id = context.node.id.rsplit("/", 1)[-1]
+        calls[child_id] += 1
+        if child_id == "completed":
+            return "completed"
+        if "iterations/0002" in context.effective_attempt_directory.as_posix():
+            if calls[child_id] == 2:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="validation",
+                    error_message="retry this child",
+                    metadata={
+                        "archon_terminal_failure": True,
+                        "known_no_effect": True,
+                        "provider_attempts": 0,
+                        "provider_attempts_exact": True,
+                    },
+                )
+            return "finished <promise>DONE</promise>"
+        return "continue"
+
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(output)
+    failed = scheduler.advance_all([run_id])[run_id]
+    failed_controller = failed["nodes"]["group"]["loop_group"]
+    completed_attempt = failed_controller["body"]["completed"]["attempts"][0][
+        "attempt_id"
+    ]
+
+    assert failed["status"] == "failed"
+    assert failed_controller["iteration"] == 2
+    assert failed_controller["body"]["completed"]["state"] == "succeeded"
+    assert failed_controller["body"]["flaky"]["state"] == "failed"
+
+    if operator_action == "resume":
+        resumed = store.resume_run(run_id, always_run_nodes=set())
+    else:
+        resumed = store.retry_run(run_id, node_id="group/flaky")
+
+    resumed_controller = resumed["nodes"]["group"]["loop_group"]
+    assert resumed["status"] == "running"
+    assert resumed["nodes"]["group"]["state"] == "running"
+    assert resumed_controller["state"] == "running"
+    assert resumed_controller["controller_generation"] == 1
+    assert resumed_controller["iteration"] == 2
+    assert resumed_controller["body"]["completed"]["state"] == "succeeded"
+    assert resumed_controller["body"]["completed"]["attempts"][0][
+        "attempt_id"
+    ] == completed_attempt
+    assert resumed_controller["body"]["flaky"]["state"] == "ready"
+
+    completed = scheduler.advance_all([run_id])[run_id]
+    completed_body = completed["nodes"]["group"]["loop_group"]["body"]
+    assert completed["status"] == "succeeded"
+    assert calls == {"completed": 2, "flaky": 3}
+    assert len(completed_body["completed"]["attempts"]) == 1
+    assert len(completed_body["flaky"]["attempts"]) == 2
 
 
 def test_body_approval_resumes_exact_child_without_replaying_succeeded_sibling(
