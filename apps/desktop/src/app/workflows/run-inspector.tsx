@@ -176,6 +176,7 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   ]
 
   const currentNode = run.current_nodes?.[0]
+  const currentLoopGroup = currentNode ? run.nodes?.[currentNode]?.loop_group : null
   const provenance = run.provenance
   const coordinator = run.coordinator
   const signalConfirmation = isLoopSignalConfirmation(run.pending_interaction)
@@ -211,64 +212,96 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
 
       <section aria-live="polite" className="mt-3" role="tabpanel">
         {tab === 'overview' ? (
-          <dl className="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-1 text-sm">
-            <dt>{copy.status}</dt>
-            <dd>{scheduled ? copy.workflowScheduled : run.status}</dd>
-            {scheduledAt ? (
-              <>
-                <dt>{copy.workflowScheduledAt}</dt>
-                <dd className="grid gap-0.5">
-                  <span>
-                    {copy.workflowScheduledLocal}: <span>{new Date(scheduledAt).toLocaleString(locale)}</span>
-                  </span>
-                  <span className="font-mono text-xs">
-                    {copy.workflowScheduledCanonical}: <span>{scheduledAt}</span>
-                  </span>
-                </dd>
-              </>
+          <div className="space-y-4">
+            <dl className="grid grid-cols-[minmax(8rem,auto)_1fr] gap-x-4 gap-y-1 text-sm">
+              <dt>{copy.status}</dt>
+              <dd>{scheduled ? copy.workflowScheduled : run.status}</dd>
+              {scheduledAt ? (
+                <>
+                  <dt>{copy.workflowScheduledAt}</dt>
+                  <dd className="grid gap-0.5">
+                    <span>
+                      {copy.workflowScheduledLocal}: <span>{new Date(scheduledAt).toLocaleString(locale)}</span>
+                    </span>
+                    <span className="font-mono text-xs">
+                      {copy.workflowScheduledCanonical}: <span>{scheduledAt}</span>
+                    </span>
+                  </dd>
+                </>
+              ) : null}
+              <dt>{copy.health}</dt>
+              <dd>{run.health}</dd>
+              <dt>{copy.origin}</dt>
+              <dd>{asDisplay(provenance?.source ?? run.trigger, copy.estimateUnavailable)}</dd>
+              <dt>{copy.assurance}</dt>
+              <dd>{asDisplay(provenance?.assurance, copy.estimateUnavailable)}</dd>
+              <dt>{copy.currentNode}</dt>
+              <dd>{asDisplay(currentNode, copy.estimateUnavailable)}</dd>
+              <dt>{copy.previousNode}</dt>
+              <dd>{asDisplay(run.previous_node, copy.estimateUnavailable)}</dd>
+              <dt>{copy.lastProgress}</dt>
+              <dd>{asDisplay(run.last_semantic_progress_at, copy.estimateUnavailable)}</dd>
+              <dt>{copy.failureCause}</dt>
+              <dd>{asDisplay(run.blocking_reason ?? run.last_error, copy.estimateUnavailable)}</dd>
+              <dt>{copy.coordinator}</dt>
+              <dd>
+                {asDisplay(coordinator?.status, copy.estimateUnavailable)}
+                {coordinator?.reason_code ? ` · ${coordinator.reason_code}` : ''}
+              </dd>
+              <dt>{copy.graphProgress}</dt>
+              <dd>
+                {run.progress.completed_nodes}/{run.progress.total_nodes}
+              </dd>
+              <dt>{copy.completionEstimate}</dt>
+              <dd>{copy.estimateUnavailable}</dd>
+              <dt>{copy.waitingFor}</dt>
+              <dd>
+                {run.pending_interaction
+                  ? asDisplay(run.pending_interaction.type, copy.estimateUnavailable)
+                  : copy.estimateUnavailable}
+              </dd>
+              <dt>{copy.retryAt}</dt>
+              <dd>{asDisplay(run.next_retry_at, copy.estimateUnavailable)}</dd>
+              <dt>{copy.definition}</dt>
+              <dd className="break-all">{asDisplay(run.definition_digest, copy.estimateUnavailable)}</dd>
+              {run.provider_resolution_sha256 ? (
+                <>
+                  <dt>{copy.workflowProviderAuthorityDigest}</dt>
+                  <dd className="break-all font-mono">{run.provider_resolution_sha256}</dd>
+                </>
+              ) : null}
+            </dl>
+            {currentLoopGroup ? (
+              <div className="overflow-x-auto">
+                <table aria-label={copy.currentNode} className="w-full text-left text-xs">
+                  <thead className="text-(--ui-text-secondary)">
+                    <tr>
+                      <th className="py-1 pr-3 font-medium">{copy.currentNode}</th>
+                      <th className="py-1 pr-3 font-medium">{copy.trigger}</th>
+                      <th className="py-1 pr-3 font-medium">{copy.status}</th>
+                      <th className="py-1 pr-3 font-medium">{copy.attempts}</th>
+                      <th className="py-1 pr-3 font-medium">{copy.lastProgress}</th>
+                      <th className="py-1 font-medium">{copy.failureCause}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentLoopGroup.body.map(node => (
+                      <tr className="border-t border-(--ui-border)" key={node.id}>
+                        <td className="py-1 pr-3 font-mono">{node.id}</td>
+                        <td className="py-1 pr-3">{node.node_type}</td>
+                        <td className="py-1 pr-3">{node.state}</td>
+                        <td className="py-1 pr-3">{node.attempt_count}</td>
+                        <td className="py-1 pr-3">
+                          {node.duration_ms == null ? copy.estimateUnavailable : `${node.duration_ms} ms`}
+                        </td>
+                        <td className="py-1">{node.failure_code ?? copy.estimateUnavailable}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             ) : null}
-            <dt>{copy.health}</dt>
-            <dd>{run.health}</dd>
-            <dt>{copy.origin}</dt>
-            <dd>{asDisplay(provenance?.source ?? run.trigger, copy.estimateUnavailable)}</dd>
-            <dt>{copy.assurance}</dt>
-            <dd>{asDisplay(provenance?.assurance, copy.estimateUnavailable)}</dd>
-            <dt>{copy.currentNode}</dt>
-            <dd>{asDisplay(currentNode, copy.estimateUnavailable)}</dd>
-            <dt>{copy.previousNode}</dt>
-            <dd>{asDisplay(run.previous_node, copy.estimateUnavailable)}</dd>
-            <dt>{copy.lastProgress}</dt>
-            <dd>{asDisplay(run.last_semantic_progress_at, copy.estimateUnavailable)}</dd>
-            <dt>{copy.failureCause}</dt>
-            <dd>{asDisplay(run.blocking_reason ?? run.last_error, copy.estimateUnavailable)}</dd>
-            <dt>{copy.coordinator}</dt>
-            <dd>
-              {asDisplay(coordinator?.status, copy.estimateUnavailable)}
-              {coordinator?.reason_code ? ` · ${coordinator.reason_code}` : ''}
-            </dd>
-            <dt>{copy.graphProgress}</dt>
-            <dd>
-              {run.progress.completed_nodes}/{run.progress.total_nodes}
-            </dd>
-            <dt>{copy.completionEstimate}</dt>
-            <dd>{copy.estimateUnavailable}</dd>
-            <dt>{copy.waitingFor}</dt>
-            <dd>
-              {run.pending_interaction
-                ? asDisplay(run.pending_interaction.type, copy.estimateUnavailable)
-                : copy.estimateUnavailable}
-            </dd>
-            <dt>{copy.retryAt}</dt>
-            <dd>{asDisplay(run.next_retry_at, copy.estimateUnavailable)}</dd>
-            <dt>{copy.definition}</dt>
-            <dd className="break-all">{asDisplay(run.definition_digest, copy.estimateUnavailable)}</dd>
-            {run.provider_resolution_sha256 ? (
-              <>
-                <dt>{copy.workflowProviderAuthorityDigest}</dt>
-                <dd className="break-all font-mono">{run.provider_resolution_sha256}</dd>
-              </>
-            ) : null}
-          </dl>
+          </div>
         ) : tab === 'timeline' ? (
           <EvidenceItems emptyLabel={copy.noEvidence} items={events} />
         ) : tab === 'artifacts' && typedArtifacts.length > 0 ? (

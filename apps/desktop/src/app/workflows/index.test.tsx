@@ -1311,6 +1311,96 @@ describe('WorkflowsView', () => {
     expect(screen.queryByText('Profile B workflow')).toBeNull()
   })
 
+  it('keeps late Profile A run, detail, and event responses out of Profile B', async () => {
+    setVisibility('visible')
+    const listA = deferred<{ next_cursor: null; runs: WorkflowRunSnapshot[]; schema_version: 1 }>()
+    const listB = deferred<{ next_cursor: null; runs: WorkflowRunSnapshot[]; schema_version: 1 }>()
+    const detailA = deferred<WorkflowRunSnapshot>()
+    const detailB = deferred<WorkflowRunSnapshot>()
+    const eventsA = deferred<{ cursor_reset: false; events: never[]; next_cursor: number; schema_version: 1 }>()
+
+    const eventsB = deferred<{
+      cursor_reset: false
+      events: Array<{
+        event_type: string
+        item_type: 'timeline_event'
+        run_id: string
+        sequence: number
+        timestamp: string
+      }>
+      next_cursor: number
+      schema_version: 1
+    }>()
+
+    listWorkflowRuns.mockImplementation(() => (apiRequestState.profile === 'profile-a' ? listA.promise : listB.promise))
+    getWorkflowRun.mockImplementation(() =>
+      apiRequestState.profile === 'profile-a' ? detailA.promise : detailB.promise
+    )
+    listWorkflowEvents.mockImplementation(() =>
+      apiRequestState.profile === 'profile-a' ? eventsA.promise : eventsB.promise
+    )
+    apiRequestState.profile = 'profile-a'
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { WorkflowsView } = await import('./index')
+
+    const view = render(
+      <QueryClientProvider client={client}>
+        <WorkflowsView />
+      </QueryClientProvider>
+    )
+
+    const boardTab = await screen.findByRole('tab', { name: 'Active board' })
+
+    if (boardTab.getAttribute('aria-selected') !== 'true') {
+      fireEvent.click(boardTab)
+      $workflowSelectedRunId.set('run-1')
+    }
+
+    await waitFor(() => expect(getWorkflowRun).toHaveBeenCalled())
+    await waitFor(() => expect(listWorkflowEvents).toHaveBeenCalled())
+
+    apiRequestState.profile = 'profile-b'
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <WorkflowsView />
+      </QueryClientProvider>
+    )
+    await waitFor(() => expect(getWorkflowRun).toHaveBeenCalledTimes(2))
+    act(() => {
+      listB.resolve({ next_cursor: null, runs: [run({ workflow: 'Profile B run' })], schema_version: 1 })
+      detailB.resolve(run({ workflow: 'Profile B run' }))
+      eventsB.resolve({
+        cursor_reset: false,
+        events: [
+          {
+            event_type: 'profile_b_event',
+            item_type: 'timeline_event',
+            run_id: 'run-1',
+            sequence: 1,
+            timestamp: '2026-08-29T12:00:00Z'
+          }
+        ],
+        next_cursor: 1,
+        schema_version: 1
+      })
+    })
+
+    expect((await screen.findAllByText('Profile B run')).length).toBeGreaterThan(0)
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: 'Timeline events' }), { button: 0, ctrlKey: false })
+    expect(await screen.findByText(/profile_b_event/)).toBeTruthy()
+
+    act(() => {
+      listA.resolve({ next_cursor: null, runs: [run({ workflow: 'Profile A run' })], schema_version: 1 })
+      detailA.resolve(run({ workflow: 'Profile A run' }))
+      eventsA.resolve({ cursor_reset: false, events: [], next_cursor: 0, schema_version: 1 })
+    })
+
+    await waitFor(() => expect(screen.queryByText('Profile A run')).toBeNull())
+    expect(screen.getAllByText('Profile B run').length).toBeGreaterThan(0)
+    expect(screen.getByText(/profile_b_event/)).toBeTruthy()
+    expect(client.getQueryData(['workflow-run', 'profile-b', 'run-1'])).toMatchObject({ workflow: 'Profile B run' })
+  })
+
   it('renders localized catalog copy without leaking i18n keys', async () => {
     $workflowSelectedRunId.set(null)
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -1432,6 +1522,38 @@ describe('WorkflowsView', () => {
     const cancel = await screen.findByRole('button', { name: 'Cancel' })
     expect((cancel as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
+  })
+
+  it('does not retry a Profile B not-found mutation or alter Profile A state', async () => {
+    apiRequestState.profile = 'profile-b'
+    $workflowSelectedRunId.set('profile-a-run')
+
+    const profileARun = run({
+      next_actions: ['cancel'],
+      pending_interaction: null,
+      run_id: 'profile-a-run',
+      state_version: 7,
+      workflow: 'Profile A run'
+    })
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    client.setQueryData(['workflow-run', 'profile-a', 'profile-a-run'], profileARun)
+    getWorkflowRun.mockResolvedValue(profileARun)
+    mutateWorkflowRun.mockRejectedValue(Object.assign(new Error('404: run not found'), { statusCode: 404 }))
+
+    await renderView(client)
+    const cancel = await screen.findByRole('button', { name: 'Cancel' })
+
+    fireEvent.click(cancel)
+    await waitFor(() => expect(mutateWorkflowRun).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect((cancel as HTMLButtonElement).disabled).toBe(false))
+
+    expect(mutateWorkflowRun).toHaveBeenCalledWith('profile-a-run', 'cancel', {
+      expected_version: 7,
+      interaction_id: undefined
+    })
+    expect(client.getQueryData(['workflow-run', 'profile-a', 'profile-a-run'])).toEqual(profileARun)
   })
 
   it('catches signal confirmations rendered with generic labels or submit-ready empty feedback', () => {

@@ -3188,6 +3188,40 @@ def test_runs_are_bounded_cursor_paginated_and_scope_authorized(
     assert detail.status_code == 404
 
 
+def test_profile_b_cannot_list_detail_event_or_mutate_profile_a_run(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    package = load_workflow(workflow_writer(tmp_path / "package", name="profiles"))
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    store_a = RunStore(home_a)
+    run_a = _start(store_a, package, "profile-a")
+    run_b = _start(RunStore(home_b), package, "profile-b")
+    version_a = store_a.load_run(run_a.run_id)["state_version"]
+    module = _module()
+    client = TestClient(_app(module.router))
+
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    listed_b = client.get("/api/plugins/workflow/runs")
+    detail_a = client.get(f"/api/plugins/workflow/runs/{run_a.run_id}")
+    events_a = client.get(f"/api/plugins/workflow/runs/{run_a.run_id}/events")
+    mutation_a = client.post(
+        f"/api/plugins/workflow/runs/{run_a.run_id}/cancel",
+        json={"expected_version": version_a},
+    )
+
+    assert [item["run_id"] for item in listed_b.json()["runs"]] == [run_b.run_id]
+    for response in (detail_a, events_a, mutation_a):
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "run_not_found"
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    restored_a = client.get(f"/api/plugins/workflow/runs/{run_a.run_id}")
+    assert restored_a.status_code == 200
+    assert restored_a.json()["state_version"] == version_a
+    assert "cancel" in restored_a.json()["next_actions"]
+
+
 def test_runs_pagination_traverses_more_than_200_filtered_rows_without_gaps(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:

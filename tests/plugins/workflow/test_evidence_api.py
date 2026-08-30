@@ -965,7 +965,7 @@ def test_persistent_session_recovery_evidence_is_a_closed_bounded_projection() -
     assert len(page["items"]) <= 200
 
 
-def test_loop_group_event_evidence_keeps_scope_private_and_drops_execution_data() -> None:
+def test_loop_group_event_evidence_exposes_only_closed_scope_and_drops_execution_data() -> None:
     payload = sanitize_loop_group_event_payload({
         "loop_group_scope": {
             "run_id": "run-1",
@@ -1002,5 +1002,11 @@ def test_loop_group_event_evidence_keeps_scope_private_and_drops_execution_data(
         "node_id": "group",
         "attempt_id": "attempt-1",
         "decision": "continue",
+        "loop_group_scope": {
+            "group_id": "group",
+            "controller_generation": 1,
+            "iteration": 2,
+            "body_node_id": "sink",
+        },
     }
     assert "private" not in str(payload).lower()

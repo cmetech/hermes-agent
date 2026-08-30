@@ -402,6 +402,40 @@ export interface WorkflowRetryProjection {
   retry_consumed: number
 }
 
+export interface WorkflowLoopGroupBodyProjection {
+  attempt_count: number
+  duration_ms?: null | number
+  failure_code?: null | string
+  id: string
+  node_type: string
+  state: string
+}
+
+export interface WorkflowLoopGroupIterationProjection {
+  completed_nodes: number
+  duration_ms?: null | number
+  failure_code?: null | string
+  iteration: number
+  state: string
+  total_nodes: number
+}
+
+export interface WorkflowLoopGroupProjection {
+  body: WorkflowLoopGroupBodyProjection[]
+  completed_iterations: number
+  iteration: number
+  iterations: WorkflowLoopGroupIterationProjection[]
+  max_iterations: number
+  primary_sink: string
+}
+
+export interface WorkflowLoopGroupScopeProjection {
+  body_node_id?: null | string
+  controller_generation: number
+  group_id: string
+  iteration: number
+}
+
 export interface WorkflowNodeProjection {
   approval_rework_attempts?: null | number
   attempt_count: number
@@ -410,6 +444,7 @@ export interface WorkflowNodeProjection {
   depends_on: string[]
   error?: null | WorkflowPublicError
   id: string
+  loop_group?: null | WorkflowLoopGroupProjection
   next_attempt_at?: null | string
   pending_interaction?: null | WorkflowPendingInteraction
   retry_consumed?: null | number
@@ -709,6 +744,7 @@ export interface WorkflowTimelineEvent {
   event_type: string
   interaction_id?: string
   item_type: 'timeline_event'
+  loop_group_scope?: null | WorkflowLoopGroupScopeProjection
   node_id?: string
   outcome?: string
   payload_truncated?: boolean

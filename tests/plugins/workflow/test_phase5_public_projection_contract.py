@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 from fastapi import FastAPI
@@ -410,3 +411,18 @@ def test_notification_admin_scope_is_a_bounded_logical_identifier(tmp_path) -> N
     )
     with pytest.raises(ValueError, match="logical identifier"):
         outbox._authority_scope(f"operator supplied feedback {_CANARY}")
+
+
+def test_phase6_loop_group_dtos_are_closed_without_bumping_run_schema() -> None:
+    module = _notification_api_module()
+    assert module.WorkflowRunProjection.model_fields["schema_version"].annotation == Literal[1]
+    scope = {
+        "group_id": "group",
+        "controller_generation": 1,
+        "iteration": 1,
+        "body_node_id": "child",
+    }
+
+    module.WorkflowLoopGroupScopeProjection.model_validate(scope)
+    with pytest.raises(ValidationError):
+        module.WorkflowLoopGroupScopeProjection.model_validate({**scope, "output": _CANARY})

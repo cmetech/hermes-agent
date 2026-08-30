@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
@@ -8,12 +10,6 @@ import { ESCAPE_PRIORITY, pushEscapeLayer } from '@/lib/escape-layers'
 import type { WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowRunDrawer } from './workflow-run-drawer'
-
-vi.mock('./run-inspector', () => ({
-  RunInspector: ({ run }: { run: WorkflowRunSnapshot }) => (
-    <aside aria-label={`${run.workflow} run inspector`}>Inspector {run.run_id}</aside>
-  )
-}))
 
 const run: WorkflowRunSnapshot = {
   definition_digest: 'a'.repeat(64),
@@ -38,6 +34,18 @@ const base = {
   selectedRunId: 'run-1'
 }
 
+function renderDrawer(props: Partial<ComponentProps<typeof WorkflowRunDrawer>> = {}) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+  return render(
+    <QueryClientProvider client={client}>
+      <I18nProvider configClient={null} initialLocale="en">
+        <WorkflowRunDrawer {...base} {...props} />
+      </I18nProvider>
+    </QueryClientProvider>
+  )
+}
+
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
@@ -45,11 +53,7 @@ afterEach(() => {
 
 describe('WorkflowRunDrawer', () => {
   it('renders distinct run-details and run-inspector complementary regions', () => {
-    render(
-      <I18nProvider configClient={null} initialLocale="en">
-        <WorkflowRunDrawer {...base} />
-      </I18nProvider>
-    )
+    renderDrawer()
 
     const drawer = screen.getByRole('complementary', { name: 'Laptop diagnostic run details' })
     const classTokens = (element: Element) => element.className.split(/\s+/)
@@ -68,39 +72,24 @@ describe('WorkflowRunDrawer', () => {
   })
 
   it('renders bounded loading and error states', () => {
-    const view = render(
-      <I18nProvider configClient={null} initialLocale="en">
-        <WorkflowRunDrawer {...base} loading run={null} />
-      </I18nProvider>
-    )
+    const view = renderDrawer({ loading: true, run: null })
 
     expect(screen.getByLabelText('Loading run details')).toBeTruthy()
-    view.rerender(
-      <I18nProvider configClient={null} initialLocale="en">
-        <WorkflowRunDrawer {...base} error={new Error('detail failed')} run={null} />
-      </I18nProvider>
-    )
+    view.unmount()
+    renderDrawer({ error: new Error('detail failed'), run: null })
     expect(screen.getByText('Could not load run details')).toBeTruthy()
   })
 
   it('closes once from the close button or an unhandled Escape', () => {
     const onClose = vi.fn()
 
-    const view = render(
-      <I18nProvider configClient={null} initialLocale="en">
-        <WorkflowRunDrawer {...base} onClose={onClose} />
-      </I18nProvider>
-    )
+    const view = renderDrawer({ onClose })
 
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(onClose).toHaveBeenCalledTimes(1)
     view.unmount()
 
-    render(
-      <I18nProvider configClient={null} initialLocale="en">
-        <WorkflowRunDrawer {...base} onClose={onClose} />
-      </I18nProvider>
-    )
+    renderDrawer({ onClose })
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(2)
   })
@@ -110,11 +99,7 @@ describe('WorkflowRunDrawer', () => {
     const releaseOverlay = pushEscapeLayer(ESCAPE_PRIORITY.overlay)
 
     try {
-      render(
-        <I18nProvider configClient={null} initialLocale="en">
-          <WorkflowRunDrawer {...base} onClose={onClose} />
-        </I18nProvider>
-      )
+      renderDrawer({ onClose })
       fireEvent.keyDown(window, { key: 'Escape' })
 
       expect(onClose).not.toHaveBeenCalled()
@@ -128,13 +113,51 @@ describe('WorkflowRunDrawer', () => {
 
     render(
       <PaneVisibleContext.Provider value={false}>
-        <I18nProvider configClient={null} initialLocale="en">
-          <WorkflowRunDrawer {...base} onClose={onClose} />
-        </I18nProvider>
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <I18nProvider configClient={null} initialLocale="en">
+            <WorkflowRunDrawer {...base} onClose={onClose} />
+          </I18nProvider>
+        </QueryClientProvider>
       </PaneVisibleContext.Provider>
     )
     fireEvent.keyDown(window, { key: 'Escape' })
 
     expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('renders a bounded parent loop summary without private execution values', () => {
+    renderDrawer({
+      run: {
+        ...run,
+        current_nodes: ['group'],
+        nodes: {
+          group: {
+            attempt_count: 0,
+            attempts: [],
+            depends_on: [],
+            id: 'group',
+            loop_group: {
+              body: [
+                { attempt_count: 1, duration_ms: 125, id: 'fetch', node_type: 'bash', state: 'succeeded' },
+                { attempt_count: 2, failure_code: 'provider_failed', id: 'publish', node_type: 'tool', state: 'failed' }
+              ],
+              completed_iterations: 6,
+              iteration: 7,
+              iterations: [],
+              max_iterations: 25,
+              primary_sink: 'publish'
+            },
+            state: 'running'
+          }
+        }
+      }
+    })
+
+    expect(screen.getByRole('table', { name: 'Current node' })).toBeTruthy()
+    expect(screen.getByText('fetch')).toBeTruthy()
+    expect(screen.getByText('provider_failed')).toBeTruthy()
+    expect(globalThis.document.body.textContent).not.toContain('prompt')
+    expect(globalThis.document.body.textContent).not.toContain('command')
+    expect(globalThis.document.body.textContent).not.toContain('output')
   })
 })

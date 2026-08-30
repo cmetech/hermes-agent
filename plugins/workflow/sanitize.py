@@ -328,6 +328,173 @@ def _bounded_code(value: object, *, fallback: str | None = None) -> str | None:
     return projected if not projected.startswith("redacted:") else fallback
 
 
+def _strict_bounded_integer(
+    value: object, *, minimum: int, maximum: int
+) -> int | None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        return None
+    return value
+
+
+def _strict_identifier(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        return None
+    return value if public_display_identifier(value) == value else None
+
+
+def _duration_ms(value: Mapping[str, object]) -> int | None:
+    started_at = _bounded_timestamp(value.get("started_at"))
+    completed_at = _bounded_timestamp(value.get("completed_at"))
+    if started_at is None or completed_at is None:
+        return None
+    started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+    duration = int((completed - started).total_seconds() * 1000)
+    return duration if 0 <= duration <= 1_000_000_000 else None
+
+
+def _public_loop_group_body(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    node_id = _strict_identifier(value.get("id"), maximum=128)
+    node_type = _strict_identifier(value.get("type"), maximum=32)
+    state = _strict_identifier(value.get("state"), maximum=32)
+    attempts = value.get("attempts")
+    if (
+        node_id is None
+        or node_type is None
+        or state is None
+        or state not in _PUBLIC_NODE_STATES
+        or not isinstance(attempts, list)
+    ):
+        return None
+    projected: dict[str, object] = {
+        "id": node_id,
+        "node_type": node_type,
+        "state": state,
+        "attempt_count": len(attempts),
+    }
+    duration = _duration_ms(value)
+    if duration is not None:
+        projected["duration_ms"] = duration
+    failure = _bounded_code(value.get("error_code"))
+    if failure is not None:
+        projected["failure_code"] = failure
+    return projected
+
+
+def _public_loop_group_iteration(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    iteration = _strict_bounded_integer(
+        value.get("iteration"), minimum=1, maximum=100
+    )
+    completed = _strict_bounded_integer(
+        value.get("completed_nodes"), minimum=0, maximum=512
+    )
+    total = _strict_bounded_integer(
+        value.get("total_nodes"), minimum=1, maximum=512
+    )
+    state = _strict_identifier(value.get("state"), maximum=32)
+    if (
+        iteration is None
+        or completed is None
+        or total is None
+        or completed > total
+        or state is None
+    ):
+        return None
+    projected: dict[str, object] = {
+        "iteration": iteration,
+        "state": state,
+        "completed_nodes": completed,
+        "total_nodes": total,
+    }
+    duration = _duration_ms(value)
+    if duration is not None:
+        projected["duration_ms"] = duration
+    failure = _bounded_code(value.get("failure_code") or value.get("error_code"))
+    if failure is not None:
+        projected["failure_code"] = failure
+    return projected
+
+
+def _public_loop_group_projection(value: object) -> dict[str, object] | None:
+    """Return the one closed parent summary, or omit malformed nested state."""
+    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+        return None
+    iteration = _strict_bounded_integer(
+        value.get("iteration"), minimum=1, maximum=100
+    )
+    maximum = _strict_bounded_integer(
+        value.get("max_iterations"), minimum=1, maximum=100
+    )
+    completed = value.get("completed_iterations")
+    if completed is None and iteration is not None:
+        completed = iteration - 1
+    completed = _strict_bounded_integer(completed, minimum=0, maximum=100)
+    primary_sink = _strict_identifier(value.get("primary_sink"), maximum=128)
+    body = value.get("body")
+    history = value.get("iterations", [])
+    if (
+        iteration is None
+        or maximum is None
+        or iteration > maximum
+        or completed is None
+        or completed > iteration
+        or primary_sink is None
+        or not isinstance(body, Mapping)
+        or not body
+        or not isinstance(history, list)
+    ):
+        return None
+    projected_body: list[dict[str, object]] = []
+    for child_id, child in list(body.items())[:512]:
+        item = _public_loop_group_body(child)
+        if item is None or item["id"] != child_id:
+            return None
+        projected_body.append(item)
+    projected_iterations: list[dict[str, object]] = []
+    for summary in history[-25:]:
+        item = _public_loop_group_iteration(summary)
+        if item is None:
+            return None
+        projected_iterations.append(item)
+    return {
+        "iteration": iteration,
+        "max_iterations": maximum,
+        "completed_iterations": completed,
+        "primary_sink": primary_sink,
+        "body": projected_body,
+        "iterations": projected_iterations,
+    }
+
+
+def _public_loop_group_scope(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    group_id = _strict_identifier(value.get("group_id"), maximum=128)
+    generation = _strict_bounded_integer(
+        value.get("controller_generation"), minimum=1, maximum=1_000_000
+    )
+    iteration = _strict_bounded_integer(
+        value.get("iteration"), minimum=1, maximum=100
+    )
+    body_node_id = value.get("body_node_id", value.get("node_id"))
+    if body_node_id is not None:
+        body_node_id = _strict_identifier(body_node_id, maximum=128)
+        if body_node_id is None:
+            return None
+    if group_id is None or generation is None or iteration is None:
+        return None
+    return {
+        "group_id": group_id,
+        "controller_generation": generation,
+        "iteration": iteration,
+        **({"body_node_id": body_node_id} if body_node_id is not None else {}),
+    }
+
+
 def _public_actions(value: object) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
@@ -508,6 +675,9 @@ def _public_node_projection(
             projected[field] = timestamp
     if node.get("error_code") is not None or node.get("error_message") is not None:
         projected["error"] = dict(_PUBLIC_ERROR)
+    loop_group = _public_loop_group_projection(node.get("loop_group"))
+    if loop_group is not None:
+        projected["loop_group"] = loop_group
     return projected
 
 
@@ -539,6 +709,10 @@ def public_event_projection(value: Mapping[str, object]) -> dict[str, object]:
                 identifier = payload.get(field)
                 if isinstance(identifier, str):
                     projected[field] = public_display_identifier(identifier)
+        if str(event_type).startswith("loop_group_"):
+            scope = _public_loop_group_scope(payload.get("loop_group_scope"))
+            if scope is not None:
+                projected["loop_group_scope"] = scope
     if value.get("payload_truncated") is True:
         projected["payload_truncated"] = True
     return projected
