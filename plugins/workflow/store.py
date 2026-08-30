@@ -503,10 +503,20 @@ def _reset_loop_group_child_for_operator(
         else "pending"
     )
     for candidate in body.values():
+        attempts = candidate.get("attempts") if isinstance(candidate, Mapping) else None
+        replay_safe_attempt = bool(
+            isinstance(attempts, list)
+            and attempts
+            and isinstance(attempts[-1], Mapping)
+            and attempts[-1].get("state") == "cancelled"
+            and attempts[-1].get("effect_classification") == "replay_safe"
+            and RunStore._observe_attempt(attempts[-1])
+            in {"not_started", "known_stopped"}
+        )
         if (
             not isinstance(candidate, MutableMapping)
             or candidate.get("state") != "cancelled"
-            or candidate.get("attempts")
+            or (attempts and not replay_safe_attempt)
             or any(
                 candidate.get(field) is not None
                 for field in ("claim", "recovery", "pending_interaction")

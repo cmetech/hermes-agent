@@ -59,6 +59,18 @@ Result: 0 passed, 2 failed. Both resume and explicit nested retry restored the
 failed child and its dependency descendant but left the independent,
 attempt-free cancellation stranded, reproducing the running controller wedge.
 
+The final re-review added claimed-but-not-started sibling cases and ran:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_interactions_recovery.py \
+  -k 'operator_reopens_only_safe_unstarted_attempted_siblings' -q
+```
+
+Result: 2 passed, 2 failed. Outward negative cases remained cancelled, while
+resume and explicit retry both failed to reopen the exact replay-safe sibling
+whose cancelled attempt was corroborated as not started.
+
 ## Root-cause changes
 
 - Routed resume, retry, and abandon safety checks through the existing nested
@@ -74,9 +86,13 @@ attempt-free cancellation stranded, reproducing the running controller wedge.
   attempt-free cancelled child in that current body is restored from its own
   dependency state, covering both dependency descendants and independent work
   cancelled as failure fallout. Executed, claimed, recovery-bound, or
-  interaction-bound cancelled children remain terminal. Succeeded/skipped
-  siblings, controller generation, current iteration, and attempt history
-  remain unchanged. The outer group is not a retry candidate.
+  interaction-bound cancelled children remain terminal, except that an exact
+  last cancelled attempt may reopen when it is replay-safe and the existing
+  attempt observer corroborates `not_started` or `known_stopped`. Outward,
+  malformed, still-running, and outcome-uncertain evidence remains terminal or
+  refused. Attempt history is preserved. Succeeded/skipped siblings, controller
+  generation, and current iteration remain unchanged. The outer group is not a
+  retry candidate.
 - Preserved the one durable predicate claim, execution fence, callbacks, and
   obligation-journal reserve while assigning every authorized Bash dispatch a
   fresh physical attempt ID and contained directory beneath the iteration's
@@ -97,11 +113,11 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_phase6_store.py \
   tests/plugins/workflow/test_crash_recovery.py \
   tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
-  -k 'operator_restarts_only_the_failed_current_iteration_child or operator_preserves_unproven_nested_execution_authority or predicate_redispatch_uses_a_fresh_physical_attempt or phase5_redundant_resume_keeps_a_running_claim_unchanged' \
+  -k 'operator_restarts_only_the_failed_current_iteration_child or operator_reopens_only_safe_unstarted_attempted_siblings or operator_preserves_unproven_nested_execution_authority or predicate_redispatch_uses_a_fresh_physical_attempt or phase5_redundant_resume_keeps_a_running_claim_unchanged' \
   -q
 ```
 
-Result after the second scoped re-review: 4 files, 12 tests passed, 0 failed.
+Result after the final re-review: 4 files, 16 tests passed, 0 failed.
 
 Required Phase 6 recovery gate:
 
@@ -115,7 +131,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_cancel_node.py -q
 ```
 
-Result after the second scoped re-review: 6 files, 214 tests passed, 0 failed.
+Result after the final re-review: 6 files, 218 tests passed, 0 failed.
 
 Required historical compatibility gate:
 
@@ -166,10 +182,14 @@ initial atomic implementation commit.
 first atomic scoped-review follow-up containing the descendant-fallout reset,
 resume ordering fix, and regressions.
 
-`fix(workflow): restore parallel loop group fallout` — the atomic second
-re-review follow-up containing the independent-fallout fix, explicit parameter
-rows, and this report update. Its final SHA is returned in the task handoff
-because a commit cannot embed its own SHA.
+`ba43ae89c3` (`fix(workflow): restore parallel loop group fallout`) — the
+atomic second re-review follow-up containing the independent-fallout fix and
+explicit parameter rows.
+
+`fix(workflow): reopen safe attempted loop siblings` — the atomic final
+re-review follow-up containing the observed-attempt classifier fix, positive
+and negative regressions, and this report update. Its final SHA is returned in
+the task handoff because a commit cannot embed its own SHA.
 
 ## Concerns
 

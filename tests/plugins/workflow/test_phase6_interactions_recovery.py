@@ -594,6 +594,108 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
         assert len(completed_body["independent"]["attempts"]) == 1
 
 
+@pytest.mark.parametrize("operator_action", ("resume", "retry"))
+@pytest.mark.parametrize("sibling_effect", ("replay_safe", "outward"))
+def test_operator_reopens_only_safe_unstarted_attempted_siblings(
+    tmp_path, workflow_writer, operator_action, sibling_effect
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"phase6-attempted-sibling-{operator_action}-{sibling_effect}",
+        nodes=[
+            _group(
+                [
+                    {"id": "flaky", "prompt": "flaky"},
+                    {"id": "independent", "prompt": "independent"},
+                    {
+                        "id": "sink",
+                        "prompt": "sink",
+                        "depends_on": ["flaky", "independent"],
+                    },
+                ]
+            )
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=2)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"phase6-attempted-sibling-{operator_action}-{sibling_effect}",
+    )
+    group = compilation.package.definition.nodes[0]
+    before = store.load_run(run_id)
+    assert store.initialize_loop_group(
+        run_id,
+        group.id,
+        group.value["nodes"],
+        max_iterations=1,
+        primary_sink="sink",
+        expected_state_version=before["state_version"],
+    )
+    initialized = store.load_run(run_id)
+    sibling_claim = store.claim_loop_group_child(
+        _scope(run_id, "independent"),
+        "independent-owner",
+        expected_state_version=initialized["state_version"],
+        executor_id="prompt",
+        effect_classification=sibling_effect,
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert sibling_claim is not None
+    calls = {"flaky": 0, "independent": 0, "sink": 0}
+
+    def output(context, _rendered):
+        child_id = context.node.id.rsplit("/", 1)[-1]
+        calls[child_id] += 1
+        if child_id == "flaky" and calls[child_id] == 1:
+            return NodeExecutionResult(
+                "failed",
+                error_code="validation",
+                error_message="retry flaky",
+                metadata={
+                    "archon_terminal_failure": True,
+                    "known_no_effect": True,
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": True,
+                },
+            )
+        if child_id == "sink":
+            return "finished <promise>DONE</promise>"
+        return child_id
+
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(output)
+    failed = scheduler.advance_all([run_id])[run_id]
+    sibling = failed["nodes"]["group"]["loop_group"]["body"]["independent"]
+    assert failed["status"] == "failed"
+    assert sibling["state"] == "cancelled"
+    assert sibling["attempts"][-1]["attempt_id"] == sibling_claim.attempt_id
+    assert sibling["attempts"][-1]["effect_classification"] == sibling_effect
+    assert "claim" not in sibling
+    assert "recovery" not in sibling
+
+    if operator_action == "resume":
+        resumed = store.resume_run(run_id, always_run_nodes=set())
+    else:
+        resumed = store.retry_run(run_id, node_id="group/flaky")
+    resumed_sibling = resumed["nodes"]["group"]["loop_group"]["body"][
+        "independent"
+    ]
+
+    if sibling_effect == "outward":
+        assert resumed_sibling["state"] == "cancelled"
+        assert len(resumed_sibling["attempts"]) == 1
+        return
+
+    assert resumed_sibling["state"] == "ready"
+    completed = scheduler.advance_all([run_id])[run_id]
+    completed_body = completed["nodes"]["group"]["loop_group"]["body"]
+    assert completed["status"] == "succeeded"
+    assert calls == {"flaky": 2, "independent": 1, "sink": 1}
+    assert len(completed_body["independent"]["attempts"]) == 2
+
+
 def test_body_approval_resumes_exact_child_without_replaying_succeeded_sibling(
     tmp_path, workflow_writer
 ) -> None:
