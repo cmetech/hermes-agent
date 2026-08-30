@@ -46,6 +46,7 @@ class _LimitAgent:
         self.persisted_messages = None
         self._handle_max_iterations_called = False
         self._completion_explainer = completion_explainer
+        self.strict_iteration_limit = False
 
     def _handle_max_iterations(self, messages, api_call_count):
         self._handle_max_iterations_called = True
@@ -194,6 +195,23 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_strict_iteration_limit_never_makes_the_extra_summary_call(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=2)
+    agent.strict_iteration_limit = True
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="budget_exhausted",
+        api_call_count=2,
+    )
+
+    assert agent._handle_max_iterations_called is False
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "strict_max_iterations_reached(2/2)"
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
@@ -371,5 +389,4 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
-
 

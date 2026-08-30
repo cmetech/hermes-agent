@@ -17,19 +17,19 @@ backend; keep workflow directories shared with older runtimes unversioned until
 every consumer recognizes the declaration.
 
 See the [Workflow YAML reference](./workflow-yaml-reference) for the generated
-schema commands, complete field inventory, current Phase 5 status, sealed
+schema commands, complete field inventory, current Phase 6 status, sealed
 compatibility guidance, and migration steps.
 
-The portable graph has seven node kinds: `command`, `prompt`, `bash`, `script`,
-`loop`, `approval`, and `cancel`. MCP and skills are existing per-node options
+The portable graph has eight node kinds: `command`, `prompt`, `bash`, `script`,
+`loop`, `loop_group`, `approval`, and `cancel`. MCP and skills are existing per-node options
 on `command` and `prompt`, not extra node kinds. Script nodes already support
 the documented `uv` and `bun` runtimes; structured data does not add another
 script or extension node type.
 
-### Phase 5 operation
+### Phase 6 operation
 
-New and default `archon-2026-07` admissions use normalizer v5. Current
-`hermes-legacy` admissions use v2. Explicit and already sealed v1 through v4
+New and default `archon-2026-07` admissions use normalizer v6. Current
+`hermes-legacy` admissions use v2. Explicit and already sealed v1 through v5
 packages remain supported compatibility inputs with their recorded behavior.
 
 <!-- workflow-language-version-selection -->
@@ -37,9 +37,9 @@ packages remain supported compatibility inputs with their recorded behavior.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 5
+    "archon-2026-07": 6
   },
-  "supported_normalizer_versions": [1, 2, 3, 4, 5]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5, 6]
 }
 ```
 
@@ -80,7 +80,7 @@ authoritative billed-cost settlement. Retries, repair, fallback, and children
 share the same budget; exhaustion is terminal. One already-started call can
 settle above the remaining amount. Estimated-only providers block instead of
 claiming hard enforcement. No current provider proves provider-native sandbox
-enforcement, so Archon v5 `sandbox` blocks with
+enforcement, so Archon v6 `sandbox` blocks with
 `provider_native_sandbox_unavailable`. Use the companion policy
 `execution_environment: isolated_backend_required` when appropriate; process
 resource limits are not a sandbox or security boundary.
@@ -98,8 +98,9 @@ Resume verifies the pinned normalizer, composite dependency manifest, and
 sealed resource origins before execution. The original root and child source
 trees may be unavailable after admission without changing the run; any missing
 or changed snapshot byte fails closed. Diagnose include failures by their
-stable generated codes and bounded logical paths. The v5 contract still does not
-provide live child workflows, include parameters, or loop groups.
+stable generated codes and bounded logical paths. The v6 contract adds one-level
+bounded `loop_group` nodes; it does not provide live child workflows, include
+parameters, nested groups, or group-level retry.
 
 ## Browse the catalog
 

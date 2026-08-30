@@ -16,6 +16,7 @@ const SCRIPT = fileURLToPath(new URL('../vendor-ericsson.mjs', import.meta.url))
 const TRANSACTION_MARKER = '.ericsson-vendor-owned.json'
 const VENDOR_LOCK = '.ericsson-vendor-lock'
 const VENDOR_LOCK_MARKER = 'owner.json'
+const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url))
 
 function transactionName(id) {
   return `.ericsson-vendor-txn-${id}`
@@ -130,6 +131,41 @@ function treeHash(target) {
   visit(target)
   return sha256(records.join(''))
 }
+
+test('checked-in Ericsson inventory distributes the Jira defect loop pair', () => {
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(REPO_ROOT, 'capabilities/ericsson.json'),
+    'utf8',
+  ))
+  const inventory = JSON.parse(fs.readFileSync(
+    path.join(REPO_ROOT, 'capabilities/ericsson-vendored-paths.json'),
+    'utf8',
+  ))
+  const workflow = path.join(REPO_ROOT, 'capabilities/workflows/jira-defect-loop.yml')
+  const sidecar = path.join(
+    REPO_ROOT,
+    'capabilities/workflows/jira-defect-loop.hermes.yaml',
+  )
+
+  assert.ok(manifest.workflows.includes('workflows/jira-defect-loop.yml'))
+  assert.ok(manifest.workflows.includes('workflows/jira-to-gitlab.yml'))
+  assert.ok(inventory.includes('capabilities/workflows/jira-defect-loop.yml'))
+  assert.ok(inventory.includes('capabilities/workflows/jira-defect-loop.hermes.yaml'))
+  assert.deepEqual(
+    fs.readFileSync(workflow),
+    fs.readFileSync(path.join(
+      REPO_ROOT,
+      'capabilities/workflow-packages/ericsson/workflows/jira-defect-loop.yaml',
+    )),
+  )
+  assert.deepEqual(
+    fs.readFileSync(sidecar),
+    fs.readFileSync(path.join(
+      REPO_ROOT,
+      'capabilities/workflow-packages/ericsson/workflows/jira-defect-loop.hermes.yaml',
+    )),
+  )
+})
 
 function initGitSource(src) {
   execFileSync('git', ['init', '-q'], { cwd: src })

@@ -34,9 +34,16 @@ from hermes_cli.workflow_model_resolution import (
     WorkflowModelConfigSnapshot,
     resolve_workflow_model_reference,
 )
-from plugins.workflow.language import supports_phase5_semantics
-from plugins.workflow.models import WorkflowPackage, freeze_value
+from plugins.workflow.language import supports_phase5_semantics, supports_phase6_semantics
+from plugins.workflow.models import (
+    ValidationIssue,
+    WorkflowPackage,
+    WorkflowValidationError,
+    freeze_value,
+)
+from plugins.workflow.resources import effective_scoped_node_options
 from plugins.workflow.sanitize import public_display_identifier, sanitize_text
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 
 
 _AUTHORITY_SCHEMA_VERSION = 2
@@ -61,6 +68,52 @@ _SUPPORTED_HOOK_OPERATIONS_BY_EVENT = MappingProxyType({
         "additional_context",
     }),
 })
+
+
+def validate_v6_provider_capacity(package: WorkflowPackage) -> None:
+    """Reject sealed structural authority products before route resolution."""
+    if not supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
+        return
+    routes = 0
+    obligations = 0
+    for node in package.definition.nodes:
+        if node.node_type != "loop_group":
+            continue
+        loop_group = package.language.node_semantics.get(node.id, {}).get(
+            "loop_group"
+        )
+        capacity = (
+            loop_group.get("capacity")
+            if isinstance(loop_group, Mapping)
+            else None
+        )
+        if not isinstance(capacity, Mapping):
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=f"nodes[{node.source_index}].loop_group",
+                    code="loop_group_product_limit",
+                    message=f"loop_group {node.id} capacity bound is missing",
+                    source_line=node.source_line,
+                )
+            )
+        routes += int(capacity["provider_routes"])
+        obligations += int(capacity["provider_obligations"])
+        for label, product, ceiling in (
+            ("provider route", routes, _AUTHORITY_MAX_ROUTES),
+            ("provider obligation", obligations, _AUTHORITY_MAX_OBLIGATIONS),
+        ):
+            if product > ceiling:
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=f"nodes[{node.source_index}].loop_group",
+                        code="loop_group_product_limit",
+                        message=f"loop_group {node.id} {label} product "
+                        f"{product} exceeds ceiling {ceiling}",
+                        source_line=node.source_line,
+                    )
+                )
 
 
 def _hook_operations_supported(event: str, operations: object) -> bool:
@@ -780,7 +833,7 @@ def _resolved_route(
     default_runtime: ExecutionRuntimeCapabilities,
     node: object,
     node_id: str,
-    node_index: int,
+    node_path: str,
     role: str,
     inline_agent_id: str | None,
     reference: object,
@@ -795,7 +848,7 @@ def _resolved_route(
     if not isinstance(reference, str) or not reference.strip():
         raise WorkflowProviderAuthorityError(
             "model_reference_missing",
-            f"nodes[{node_index}].model",
+            f"{node_path}.model",
             "AI workflow route has no concrete model reference",
         )
     workflow_provider = package.definition.options.get("provider")
@@ -815,7 +868,7 @@ def _resolved_route(
     except ModelResolutionError as exc:
         raise WorkflowProviderAuthorityError(
             exc.code,
-            f"nodes[{node_index}].model",
+            f"{node_path}.model",
             str(exc),
         ) from exc
     route_id = f"{node_id}:{role}"
@@ -839,9 +892,9 @@ def _resolved_route(
         base_url_trust_class=resolved.base_url_trust_class,
     )
     warning_path = (
-        f"nodes[{node_index}].agents.{inline_agent_id}.model"
+        f"{node_path}.agents.{inline_agent_id}.model"
         if inline_agent_id is not None
-        else f"nodes[{node_index}].model"
+        else f"{node_path}.model"
     )
     warnings = tuple(
         ProviderAuthorityWarning(
@@ -896,6 +949,7 @@ def resolve_workflow_provider_authority(
             "normalizer_version",
             "provider authority requires normalizer v5",
         )
+    validate_v6_provider_capacity(package)
     if not isinstance(model_config, WorkflowModelConfigSnapshot):
         raise TypeError("model_config must be an immutable workflow config snapshot")
     if not isinstance(default_runtime, ExecutionRuntimeCapabilities):
@@ -936,7 +990,10 @@ def resolve_workflow_provider_authority(
         )
 
     root = package.definition.options
-    for index, node in enumerate(package.definition.nodes):
+    for scoped in iter_scoped_workflow_nodes(package.definition):
+        node = scoped.node
+        node_id = scoped.semantic_id
+        prefix = scoped.authored_path
         approval_rework = (
             node.node_type == "approval"
             and isinstance(node.value, Mapping)
@@ -944,15 +1001,15 @@ def resolve_workflow_provider_authority(
         )
         if node.node_type not in {"command", "prompt", "loop"} and not approval_rework:
             continue
-        node_options = node.options
+        node_options = effective_scoped_node_options(package.definition, scoped)
         primary_reference = node_options.get("model", root.get("model"))
         primary, primary_runtime, route_warnings = _resolved_route(
             package=package,
             model_config=model_config,
             default_runtime=default_runtime,
             node=node,
-            node_id=node.id,
-            node_index=index,
+            node_id=node_id,
+            node_path=prefix,
             role="primary",
             inline_agent_id=None,
             reference=primary_reference,
@@ -971,8 +1028,8 @@ def resolve_workflow_provider_authority(
                 model_config=model_config,
                 default_runtime=default_runtime,
                 node=node,
-                node_id=node.id,
-                node_index=index,
+                node_id=node_id,
+                node_path=prefix,
                 role="fallback",
                 inline_agent_id=None,
                 reference=fallback_reference,
@@ -992,8 +1049,8 @@ def resolve_workflow_provider_authority(
                     model_config=model_config,
                     default_runtime=default_runtime,
                     node=node,
-                    node_id=node.id,
-                    node_index=index,
+                    node_id=node_id,
+                    node_path=prefix,
                     role=f"inline_agent:{agent_id}",
                     inline_agent_id=agent_id,
                     reference=raw_agent.get("model", primary_reference),
@@ -1005,7 +1062,7 @@ def resolve_workflow_provider_authority(
                 for field_name in ("tools", "disallowedTools"):
                     if field_name in raw_agent:
                         add(
-                            f"nodes[{index}].agents.{agent_id}.{field_name}",
+                            f"{prefix}.agents.{agent_id}.{field_name}",
                             inline.route_id,
                             WorkflowProviderFeature.TOOL_RESTRICTIONS,
                             option=field_name,
@@ -1018,7 +1075,7 @@ def resolve_workflow_provider_authority(
                         )
                 if "skills" in raw_agent:
                     add(
-                        f"nodes[{index}].agents.{agent_id}.skills",
+                        f"{prefix}.agents.{agent_id}.skills",
                         inline.route_id,
                         WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
                         option="skills",
@@ -1032,18 +1089,18 @@ def resolve_workflow_provider_authority(
         node_route_ids = tuple(
             route_id
             for route_id, route in routes.items()
-            if route.node_id == node.id
+            if route.node_id == node_id
         )
         execution_route_ids = tuple(
             route_id
             for route_id in node_route_ids
             if routes[route_id].role in {"primary", "fallback"}
         )
-        output = package.language.structured_outputs.get(node.id)
+        output = package.language.structured_outputs.get(node_id)
         if output is not None:
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].output_format",
+                    f"{prefix}.output_format",
                     route_id,
                     WorkflowProviderFeature.STRUCTURED_OUTPUT,
                     option="json_schema",
@@ -1058,7 +1115,7 @@ def resolve_workflow_provider_authority(
         ):
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].output_format",
+                    f"{prefix}.output_format",
                     route_id,
                     WorkflowProviderFeature.STRUCTURED_OUTPUT,
                     option="json_schema",
@@ -1082,7 +1139,7 @@ def resolve_workflow_provider_authority(
         if node_options.get("persist_session") is True:
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].persist_session",
+                    f"{prefix}.persist_session",
                     route_id,
                     WorkflowProviderFeature.SESSION_RESUMPTION,
                     requested={
@@ -1098,7 +1155,7 @@ def resolve_workflow_provider_authority(
             if field_name in node_options:
                 for route_id in execution_route_ids:
                     add(
-                        f"nodes[{index}].{field_name}",
+                        f"{prefix}.{field_name}",
                         route_id,
                         WorkflowProviderFeature.TOOL_RESTRICTIONS,
                         option=field_name,
@@ -1108,14 +1165,14 @@ def resolve_workflow_provider_authority(
                             "hermes_dispatch": True,
                         },
                     )
-        portability = package.language.node_semantics.get(node.id, {}).get(
+        portability = package.language.node_semantics.get(node_id, {}).get(
             "provider_portability"
         )
         hooks = portability.get("hooks", ()) if isinstance(portability, Mapping) else ()
         if approval_rework and "hooks" in node_options and not hooks:
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].hooks",
+                    f"{prefix}.hooks",
                     route_id,
                     WorkflowProviderFeature.HOOKS,
                     option="approval_rework",
@@ -1133,7 +1190,7 @@ def resolve_workflow_provider_authority(
             event = str(hook.get("event", ""))
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].hooks.{event}[{hook_index}]",
+                    f"{prefix}.hooks.{event}[{hook_index}]",
                     route_id,
                     WorkflowProviderFeature.HOOKS,
                     option=event,
@@ -1149,11 +1206,11 @@ def resolve_workflow_provider_authority(
         if "mcp" in node_options:
             mcp_precondition = (
                 mcp_execution_preconditions is None
-                or mcp_execution_preconditions.get(node.id) is True
+                or mcp_execution_preconditions.get(node_id) is True
             )
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].mcp",
+                    f"{prefix}.mcp",
                     route_id,
                     WorkflowProviderFeature.MCP,
                     option="stdio",
@@ -1174,7 +1231,7 @@ def resolve_workflow_provider_authority(
         if "skills" in node_options:
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].skills",
+                    f"{prefix}.skills",
                     route_id,
                     WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
                     option="skills",
@@ -1186,7 +1243,7 @@ def resolve_workflow_provider_authority(
         if "agents" in node_options:
             for route_id in execution_route_ids:
                 add(
-                    f"nodes[{index}].agents",
+                    f"{prefix}.agents",
                     route_id,
                     WorkflowProviderFeature.SKILLS_INLINE_AGENTS,
                     option="inline_agents",
@@ -1209,7 +1266,7 @@ def resolve_workflow_provider_authority(
                 if option_name not in effective_options:
                     continue
                 if option_name in node_options:
-                    option_path = f"nodes[{index}].{option_name}"
+                    option_path = f"{prefix}.{option_name}"
                 elif option_name == "effort" and "modelReasoningEffort" in root:
                     option_path = "modelReasoningEffort"
                 else:
@@ -1265,7 +1322,7 @@ def resolve_workflow_provider_authority(
             available = environment.authoritative_cost_available
             for route_id in node_route_ids:
                 add(
-                    f"nodes[{index}].maxBudgetUsd",
+                    f"{prefix}.maxBudgetUsd",
                     route_id,
                     WorkflowProviderFeature.COST_BUDGETS,
                     option="maxBudgetUsd",
@@ -1288,7 +1345,7 @@ def resolve_workflow_provider_authority(
         if fallback_reference is not None:
             add(
                 (
-                    f"nodes[{index}].fallbackModel"
+                    f"{prefix}.fallbackModel"
                     if "fallbackModel" in node_options
                     else "fallbackModel"
                 ),
@@ -1303,7 +1360,7 @@ def resolve_workflow_provider_authority(
         if "sandbox" in node_options:
             for route_id in node_route_ids:
                 add(
-                    f"nodes[{index}].sandbox",
+                    f"{prefix}.sandbox",
                     route_id,
                     WorkflowProviderFeature.PROVIDER_NATIVE_SANDBOX,
                     option="sandbox",
@@ -1353,4 +1410,5 @@ __all__ = [
     "public_provider_capability_projection",
     "read_workflow_provider_authority_bytes",
     "resolve_workflow_provider_authority",
+    "validate_v6_provider_capacity",
 ]

@@ -155,6 +155,14 @@ function finiteInt(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
+function boundedInt(value: unknown, minimum: number, maximum: number): value is number {
+  return finiteInt(value) && value >= minimum && value <= maximum
+}
+
+function boundedString(value: unknown, maximum: number): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= maximum
+}
+
 export function isWorkflowStructuredOutputCapabilitySummary(
   value: unknown
 ): value is WorkflowStructuredOutputCapabilitySummary {
@@ -173,7 +181,7 @@ export function isWorkflowStructuredOutputCapabilitySummary(
     return false
   }
 
-  if (value.mixed !== (value.summary_count > 1)) {
+  if (value.mixed !== value.summary_count > 1) {
     return false
   }
 
@@ -383,6 +391,7 @@ function event(value: unknown): value is WorkflowTimelineEvent {
         'event_type',
         'interaction_id',
         'item_type',
+        'loop_group_scope',
         'node_id',
         'outcome',
         'payload_truncated',
@@ -403,9 +412,72 @@ function event(value: unknown): value is WorkflowTimelineEvent {
     typeof value.run_id === 'string' &&
     typeof value.event_type === 'string' &&
     optionalBoolean(value.payload_truncated) &&
+    (value.loop_group_scope === undefined ||
+      value.loop_group_scope === null ||
+      loopGroupScope(value.loop_group_scope)) &&
     ['actor', 'attempt_id', 'channel', 'decision', 'interaction_id', 'node_id', 'outcome', 'reason_code'].every(key =>
       optionalString(value[key])
     )
+  )
+}
+
+function loopGroupScope(value: unknown): boolean {
+  return (
+    record(value) &&
+    exact(value, new Set(['body_node_id', 'controller_generation', 'group_id', 'iteration'])) &&
+    boundedString(value.group_id, 128) &&
+    boundedInt(value.controller_generation, 1, 1_000_000) &&
+    boundedInt(value.iteration, 1, 100) &&
+    (value.body_node_id === undefined || value.body_node_id === null || boundedString(value.body_node_id, 128))
+  )
+}
+
+function loopGroupBody(value: unknown): boolean {
+  return (
+    record(value) &&
+    exact(value, new Set(['attempt_count', 'duration_ms', 'failure_code', 'id', 'node_type', 'state'])) &&
+    boundedString(value.id, 128) &&
+    boundedString(value.node_type, 32) &&
+    boundedString(value.state, 32) &&
+    finiteInt(value.attempt_count) &&
+    (value.duration_ms === undefined || value.duration_ms === null || finiteInt(value.duration_ms)) &&
+    (value.failure_code === undefined || value.failure_code === null || boundedString(value.failure_code, 128))
+  )
+}
+
+function loopGroupIteration(value: unknown): boolean {
+  return (
+    record(value) &&
+    exact(value, new Set(['completed_nodes', 'duration_ms', 'failure_code', 'iteration', 'state', 'total_nodes'])) &&
+    boundedInt(value.iteration, 1, 100) &&
+    boundedString(value.state, 32) &&
+    boundedInt(value.completed_nodes, 0, 512) &&
+    boundedInt(value.total_nodes, 1, 512) &&
+    value.completed_nodes <= value.total_nodes &&
+    (value.duration_ms === undefined || value.duration_ms === null || finiteInt(value.duration_ms)) &&
+    (value.failure_code === undefined || value.failure_code === null || boundedString(value.failure_code, 128))
+  )
+}
+
+function loopGroup(value: unknown): boolean {
+  return (
+    record(value) &&
+    exact(
+      value,
+      new Set(['body', 'completed_iterations', 'iteration', 'iterations', 'max_iterations', 'primary_sink'])
+    ) &&
+    boundedInt(value.iteration, 1, 100) &&
+    boundedInt(value.max_iterations, 1, 100) &&
+    value.iteration <= value.max_iterations &&
+    boundedInt(value.completed_iterations, 0, 100) &&
+    value.completed_iterations <= value.iteration &&
+    boundedString(value.primary_sink, 128) &&
+    Array.isArray(value.body) &&
+    value.body.length <= 512 &&
+    value.body.every(loopGroupBody) &&
+    Array.isArray(value.iterations) &&
+    value.iterations.length <= 25 &&
+    value.iterations.every(loopGroupIteration)
   )
 }
 
@@ -437,6 +509,7 @@ function evidenceItem(value: unknown): value is WorkflowEvidenceItem {
       'interaction_id',
       'item_type',
       'iteration',
+      'loop_group_scope',
       'max_iterations',
       'next_actions',
       'node_id',
@@ -488,6 +561,9 @@ function evidenceItem(value: unknown): value is WorkflowEvidenceItem {
           optionalString(value[key])
         ) &&
         optionalFiniteInt(value.iteration) &&
+        (value.loop_group_scope === undefined ||
+          value.loop_group_scope === null ||
+          loopGroupScope(value.loop_group_scope)) &&
         optionalFiniteInt(value.max_iterations) &&
         optionalFiniteInt(value.sequence) &&
         optionalFiniteInt(value.state_version) &&
@@ -550,6 +626,7 @@ function node(value: unknown): boolean {
         'depends_on',
         'error',
         'id',
+        'loop_group',
         'next_attempt_at',
         'pending_interaction',
         'retry_consumed',
@@ -563,6 +640,7 @@ function node(value: unknown): boolean {
     finiteInt(value.attempt_count) &&
     Array.isArray(value.attempts) &&
     value.attempts.every(attempt) &&
+    (value.loop_group === undefined || value.loop_group === null || loopGroup(value.loop_group)) &&
     (value.pending_interaction === undefined ||
       value.pending_interaction === null ||
       pendingInteraction(value.pending_interaction)) &&

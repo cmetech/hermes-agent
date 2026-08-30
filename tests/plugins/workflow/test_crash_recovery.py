@@ -13,7 +13,9 @@ from agent.plugin_agent import PluginAgentRunResult
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.script import ScriptExecutor
+from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import ExecutionFence
 from plugins.workflow.scheduler import RunScheduler
@@ -26,11 +28,21 @@ from plugins.workflow.sessions import (
 from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
+    NodeClaim,
     RunStore,
     StorageQuotaError,
     TypedPublicationCandidate,
 )
 from plugins.workflow.trust import WorkflowPackageDigest
+from tests.plugins.workflow.test_phase6_store import (
+    _EXECUTION_AUTHORITY,
+    _admit_group,
+    _complete,
+    _initialize,
+    _output,
+    _scope,
+)
+from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit, _compile
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
@@ -62,6 +74,137 @@ def _run(store, package, *, idempotency_key="crash"):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def test_loop_group_child_state_and_claim_reconcile_across_each_crash_cut(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    select_scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        select_scope,
+        "child-owner",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+
+    store = RunStore(home)
+    assert store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"][
+        "select"
+    ]["claim"]["attempt_id"] == claim.attempt_id
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT node_id FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == select_scope.worker_node_id
+
+    process = ProcessIdentity.capture(os.getpid())
+    assert store.record_process_started(claim, process)
+    store = RunStore(home)
+    attempt = store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"][
+        "select"
+    ]["attempts"][-1]
+    assert attempt["process_identity"]["pid"] == process.pid
+
+    _output(store, select_scope, claim.attempt_id, b"file-alone-is-not-success")
+    store = RunStore(home)
+    child = store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"][
+        "select"
+    ]
+    assert child["state"] == "claimed"
+    assert "output" not in child
+
+    _complete(store, select_scope, claim, b"selected")
+    store = RunStore(home)
+    body = store.load_run(run_id)["nodes"]["group"]["loop_group"]["body"]
+    assert body["select"]["state"] == "succeeded"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 0
+
+    ready = store.load_run(run_id)
+    record_scope = _scope(run_id, "record")
+    record_claim = store.claim_loop_group_child(
+        record_scope,
+        "record-owner",
+        expected_state_version=ready["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert record_claim is not None
+    _complete(store, record_scope, record_claim, b"recorded")
+    before_commit = store.load_run(run_id)
+    assert store.record_loop_group_iteration(
+        record_scope,
+        expected_state_version=before_commit["state_version"],
+    )
+
+    restarted = RunStore(home)
+    controller = restarted.load_run(run_id)["nodes"]["group"]["loop_group"]
+    assert controller["iteration"] == 2
+    assert set(controller["previous_outputs"]) == {"select", "record"}
+    assert controller["body"]["select"]["state"] == "ready"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["attempt", "output", "generation", "iteration", "worker_key", "process"],
+)
+def test_loop_group_nested_corruption_fails_initialization(
+    tmp_path,
+    workflow_writer,
+    mutation,
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "child-owner",
+        expected_state_version=initialized["state_version"],
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    assert store.record_process_started(claim, ProcessIdentity.capture(os.getpid()))
+    _complete(store, scope, claim, b"selected")
+    path = store.run_directory(run_id) / "run.json"
+    projection = json.loads(path.read_text())
+    controller = projection["nodes"]["group"]["loop_group"]
+    child = controller["body"]["select"]
+    attempt = child["attempts"][-1]
+    if mutation == "attempt":
+        attempt["attempt_id"] = "tampered-attempt"
+    elif mutation == "output":
+        child["output"]["sha256"] = "0" * 64
+    elif mutation == "generation":
+        controller["controller_generation"] = 2
+    elif mutation == "iteration":
+        controller["iteration"] = 2
+    elif mutation == "worker_key":
+        attempt["loop_group_scope"]["worker_node_id"] = "tampered-worker"
+    else:
+        attempt["process_identity"]["pid"] += 1
+    path.write_text(json.dumps(projection), encoding="utf-8")
+
+    restarted = RunStore(home)
+    assert restarted._active_run_repair_reasons(run_id) == (
+        "run_evidence_uncorroborated",
+    )
+
+    recovered = restarted.load_run(run_id)
+    recovered_controller = recovered["nodes"]["group"]["loop_group"]
+    recovered_child = recovered_controller["body"]["select"]
+    recovered_attempt = recovered_child["attempts"][-1]
+    assert recovered_controller["controller_generation"] == 1
+    assert recovered_controller["iteration"] == 1
+    assert recovered_attempt["attempt_id"] == claim.attempt_id
+    assert recovered_attempt["loop_group_scope"] == scope.durable_record()
+    assert recovered_attempt["process_identity"]["pid"] == os.getpid()
+    assert recovered_child["output"]["sha256"] != "0" * 64
 
 
 def test_restart_never_reconstructs_shared_identity_from_failed_attempt(
@@ -2608,3 +2751,503 @@ def test_heartbeat_refuses_to_erase_a_suspend_clock_gap(tmp_path, workflow_write
     )
     unchanged = store.load_run(admitted.run_id)["nodes"]["start"]["claim"]
     assert unchanged["heartbeat_at"] == active["heartbeat_at"]
+
+
+def test_loop_group_predicate_restart_reuses_recorded_input_without_child_replay(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-restart",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-restart")
+    prompt = OutputExecutor(lambda _context, _rendered: "not complete")
+    first = RunScheduler(store, max_parallel_nodes=1)
+    first.executors["prompt"] = prompt
+
+    class CrashBeforeSpawn:
+        def execute(self, _context):
+            raise SystemExit("predicate crashed before spawn")
+
+    first.executors["bash"] = CrashBeforeSpawn()
+    with pytest.raises(SystemExit, match="before spawn"):
+        first.advance_all([run_id])
+
+    pending = store.load_run(run_id)["nodes"]["group"]
+    claim = pending["claim"]
+    recovered_at = datetime.fromisoformat(claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    recovered_monotonic = (
+        float(claim["heartbeat_monotonic"])
+        + float(claim["lease_seconds"])
+        + 1
+    )
+    restarted_store = RunStore(home, max_total_workers=1)
+    with restarted_store._connect() as connection:
+        worker_count = connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim["attempt_id"],),
+        ).fetchone()[0]
+        predicate_reserve = connection.execute(
+            "SELECT terminal_reserve_bytes FROM obligation_journal_reserves "
+            "WHERE attempt_id=?",
+            (claim["attempt_id"],),
+        ).fetchone()
+    assert worker_count == 0
+    assert predicate_reserve is not None
+    second = RunScheduler(
+        restarted_store,
+        max_parallel_nodes=1,
+        utcnow=lambda: recovered_at,
+        monotonic=lambda: recovered_monotonic,
+    )
+    second.executors["prompt"] = prompt
+    second.executors["bash"] = type(
+        "SuccessfulPredicate",
+        (),
+        {"execute": lambda self, context: NodeExecutionResult("succeeded")},
+    )()
+
+    result = second.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
+        "sink"
+    ]
+
+
+def test_loop_group_predicate_redispatch_uses_a_fresh_physical_attempt(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-physical-attempt",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-physical-attempt")
+    prompt = OutputExecutor(lambda _context, _rendered: "not complete")
+    predicate_attempts = []
+
+    class RecordingBash:
+        def __init__(self, active_store):
+            self.active_store = active_store
+
+        def execute(self, context):
+            with self.active_store._connect() as connection:
+                worker_count = connection.execute(
+                    "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0]
+            predicate_attempts.append(
+                (context.attempt_id, context.effective_attempt_directory, worker_count)
+            )
+            return BashExecutor().execute(context)
+
+    first = RunScheduler(
+        store, max_parallel_nodes=1, heartbeat_seconds=0.1, lease_seconds=1
+    )
+    first.executors["prompt"] = prompt
+    first.executors["bash"] = RecordingBash(store)
+
+    def crash_before_decision(*_args, **_kwargs):
+        raise SystemExit("predicate crashed before decision CAS")
+
+    monkeypatch.setattr(
+        store, "record_loop_group_predicate_decision", crash_before_decision
+    )
+    with pytest.raises(SystemExit, match="before decision CAS"):
+        first.advance_all([run_id])
+
+    pending = store.load_run(run_id)
+    controller = pending["nodes"]["group"]["loop_group"]
+    durable_attempt_id = pending["nodes"]["group"]["claim"]["attempt_id"]
+    assert controller["_pending_loop_decision"]["kind"] == "until_bash_pending"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (durable_attempt_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE attempt_id=?",
+            (durable_attempt_id,),
+        ).fetchone()[0] == 1
+
+    raw_claim = pending["nodes"]["group"]["claim"]
+    recovered_at = datetime.fromisoformat(raw_claim["lease_expires_at"]) + timedelta(
+        seconds=1
+    )
+    recovered_monotonic = (
+        float(raw_claim["heartbeat_monotonic"])
+        + float(raw_claim["lease_seconds"])
+        + 1
+    )
+    restarted_store = RunStore(home, max_total_workers=1)
+    restarted = RunScheduler(
+        restarted_store,
+        max_parallel_nodes=1,
+        heartbeat_seconds=0.1,
+        lease_seconds=1,
+        utcnow=lambda: recovered_at,
+        monotonic=lambda: recovered_monotonic,
+    )
+    restarted.executors["prompt"] = prompt
+    restarted.executors["bash"] = RecordingBash(restarted_store)
+
+    result = restarted.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
+        "sink"
+    ]
+    assert len(predicate_attempts) == 2
+    assert len({attempt_id for attempt_id, _path, _workers in predicate_attempts}) == 2
+    assert len({path for _attempt_id, path, _workers in predicate_attempts}) == 2
+    assert all(workers == 0 for _attempt_id, _path, workers in predicate_attempts)
+    assert all(path.is_dir() for _attempt_id, path, _workers in predicate_attempts)
+    decision_root = (
+        restarted_store.run_directory(run_id)
+        / "artifacts"
+        / "loop-groups"
+        / "group"
+        / "iterations"
+        / "0001"
+        / "decision"
+    ).resolve()
+    assert all(
+        path.resolve().is_relative_to(decision_root)
+        for _attempt_id, path, _workers in predicate_attempts
+    )
+    with restarted_store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?", (run_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE attempt_id=?",
+            (durable_attempt_id,),
+        ).fetchone()[0] == 0
+
+
+def test_loop_group_restart_consumes_the_recorded_predicate_result_once(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-result-restart",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-result-restart")
+    prompt = OutputExecutor(lambda _context, _rendered: "not complete")
+    predicate_calls = []
+    first = RunScheduler(store, max_parallel_nodes=1)
+    first.executors["prompt"] = prompt
+    first.executors["bash"] = type(
+        "SuccessfulPredicate",
+        (),
+        {
+            "execute": lambda self, context: (
+                predicate_calls.append(context.attempt_id)
+                or NodeExecutionResult("succeeded")
+            )
+        },
+    )()
+    original = store.record_loop_group_predicate_decision
+
+    def crash_after_result(*args, **kwargs):
+        assert original(*args, **kwargs)
+        raise SystemExit("predicate result committed")
+
+    monkeypatch.setattr(store, "record_loop_group_predicate_decision", crash_after_result)
+    with pytest.raises(SystemExit, match="result committed"):
+        first.advance_all([run_id])
+
+    recorded = store.load_run(run_id)["nodes"]["group"]["loop_group"]
+    assert recorded["_pending_loop_decision"]["kind"] == "until_bash_success"
+    restarted = RunScheduler(RunStore(home, max_total_workers=1), max_parallel_nodes=1)
+    restarted.executors["prompt"] = prompt
+    restarted.executors["bash"] = type(
+        "ReplayForbidden",
+        (),
+        {"execute": lambda self, context: pytest.fail("predicate replayed")},
+    )()
+
+    result = restarted.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert len(predicate_calls) == 1
+    assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
+        "sink"
+    ]
+
+
+def test_loop_group_restart_adopts_recorded_result_after_coordinator_turnover(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    started_at = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 100.0, "boot-a"))
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-recorded-result-fence-turnover",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1, lease_clock=clock)
+    run_id = _admit(store, compilation, key="phase6-recorded-result-turnover")
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="same-coordinator",
+        host_kind="gateway",
+        host_instance_id="same-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    first = coordinator.try_acquire(identity, now=started_at, lease_seconds=1)
+    assert first.is_leader
+    fence_a = ExecutionFence(identity.owner_id, first.lease.epoch)
+    predicate_calls = []
+    first_scheduler = RunScheduler(
+        store,
+        owner_id="same-predicate-owner",
+        execution_fence=fence_a,
+        max_parallel_nodes=1,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    first_scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    first_scheduler.executors["bash"] = type(
+        "SuccessfulPredicate",
+        (),
+        {
+            "execute": lambda self, context: (
+                predicate_calls.append(context.attempt_id)
+                or NodeExecutionResult("succeeded")
+            )
+        },
+    )()
+    original = store.record_loop_group_predicate_decision
+
+    def crash_after_result(*args, **kwargs):
+        assert original(*args, **kwargs)
+        raise SystemExit("predicate result committed under fence A")
+
+    monkeypatch.setattr(store, "record_loop_group_predicate_decision", crash_after_result)
+    with pytest.raises(SystemExit, match="fence A"):
+        first_scheduler.advance_all([run_id])
+    monkeypatch.setattr(store, "record_loop_group_predicate_decision", original)
+
+    pending = store.load_run(run_id)
+    controller = pending["nodes"]["group"]["loop_group"]
+    scope_record = controller["_pending_loop_decision"]["loop_group_scope"]
+    scope = _scope(run_id, scope_record["node_id"])
+    raw = pending["nodes"]["group"]["claim"]
+    stale_claim = NodeClaim(
+        run_id,
+        "group",
+        raw["attempt_id"],
+        raw["owner_id"],
+        datetime.fromisoformat(raw["lease_expires_at"]),
+        fence_a,
+    )
+
+    turnover_at = started_at + timedelta(seconds=2)
+    clock.sample = LeaseClockSample(turnover_at, 102.0, "boot-a")
+    second = coordinator.try_acquire(identity, now=turnover_at, lease_seconds=30)
+    assert second.is_leader
+    fence_b = ExecutionFence(identity.owner_id, second.lease.epoch)
+    before = store.load_run(run_id)
+    before_events = store.tail_events(run_id)
+    assert not store.record_loop_group_predicate_decision(
+        scope, stale_claim, {"kind": "until_bash_success"}
+    )
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == before_events
+
+    restarted_store = RunStore(home, max_total_workers=1, lease_clock=clock)
+    restarted = RunScheduler(
+        restarted_store,
+        owner_id="same-predicate-owner",
+        execution_fence=fence_b,
+        max_parallel_nodes=1,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    restarted.executors["prompt"] = first_scheduler.executors["prompt"]
+    restarted.executors["bash"] = type(
+        "ReplayForbidden",
+        (),
+        {"execute": lambda self, context: pytest.fail("predicate replayed")},
+    )()
+
+    result = restarted.advance_all([run_id])[run_id]
+    predicate_attempt = next(
+        attempt
+        for attempt in result["nodes"]["group"]["attempts"]
+        if attempt["attempt_id"] == raw["attempt_id"]
+    )
+    recovery_events = [
+        event
+        for event in restarted_store.tail_events(run_id)
+        if event["event_type"] == "loop_group_predicate_recovery_claimed"
+    ]
+
+    assert result["status"] == "succeeded"
+    assert len(predicate_calls) == 1
+    assert predicate_calls[0].startswith(
+        f"{raw['attempt_id']}/until-recovery-0001-"
+    )
+    assert predicate_attempt["execution_fence"] == {
+        "owner_id": fence_b.owner_id,
+        "owner_epoch": fence_b.owner_epoch,
+    }
+    assert len(recovery_events) == 1
+
+
+def test_loop_group_predicate_rejects_superseded_same_owner_fence(
+    tmp_path, workflow_writer
+) -> None:
+    started_at = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 100.0, "boot-a"))
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-fence-turnover",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1, lease_clock=clock)
+    run_id = _admit(store, compilation, key="phase6-predicate-fence-turnover")
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="same-coordinator",
+        host_kind="gateway",
+        host_instance_id="same-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    first = coordinator.try_acquire(identity, now=started_at, lease_seconds=1)
+    assert first.is_leader
+    fence_a = ExecutionFence(identity.owner_id, first.lease.epoch)
+    scheduler = RunScheduler(
+        store,
+        owner_id="same-predicate-owner",
+        execution_fence=fence_a,
+        max_parallel_nodes=1,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    scheduler.executors["bash"] = type(
+        "CrashBeforePredicateSpawn",
+        (),
+        {
+            "execute": lambda self, context: (_ for _ in ()).throw(
+                SystemExit("predicate stopped before spawn")
+            )
+        },
+    )()
+    with pytest.raises(SystemExit, match="before spawn"):
+        scheduler.advance_all([run_id])
+
+    pending = store.load_run(run_id)
+    controller = pending["nodes"]["group"]["loop_group"]
+    scope_record = controller["_pending_loop_decision"]["loop_group_scope"]
+    scope = _scope(run_id, scope_record["node_id"])
+    raw = pending["nodes"]["group"]["claim"]
+    assert raw["execution_fence"] == {
+        "owner_id": fence_a.owner_id,
+        "owner_epoch": fence_a.owner_epoch,
+    }
+    stale_claim = NodeClaim(
+        run_id,
+        "group",
+        raw["attempt_id"],
+        raw["owner_id"],
+        datetime.fromisoformat(raw["lease_expires_at"]),
+        fence_a,
+    )
+    before = store.load_run(run_id)
+    before_events = store.tail_events(run_id)
+
+    turnover_at = started_at + timedelta(seconds=2)
+    clock.sample = LeaseClockSample(turnover_at, 102.0, "boot-a")
+    second = coordinator.try_acquire(identity, now=turnover_at, lease_seconds=30)
+    assert second.is_leader
+    fence_b = ExecutionFence(identity.owner_id, second.lease.epoch)
+    stale_prepare = store.prepare_recorded_loop_group_predicate(scope, stale_claim)
+    stale_result = store.record_loop_group_predicate_decision(
+        scope, stale_claim, {"kind": "until_bash_success"}
+    )
+
+    assert not stale_prepare
+    assert not stale_result
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == before_events
+    winner = store.claim_recorded_loop_group_predicate(
+        scope,
+        "same-predicate-owner",
+        lease_seconds=30,
+        now=clock.sample,
+        execution_fence=fence_b,
+    )
+    assert winner is not None
+    assert store.prepare_recorded_loop_group_predicate(scope, winner)
+    assert store.record_loop_group_predicate_decision(
+        scope, winner, {"kind": "until_bash_success"}
+    )

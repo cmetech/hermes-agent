@@ -8,6 +8,8 @@ from plugins.workflow.bash_rendering import bash_output_references
 from plugins.workflow.includes import rewrite_reference_tokens
 from plugins.workflow.language_schema import iter_output_references
 from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.output_resolution import WorkflowOutputReferenceError
+from plugins.workflow.resources import VariableContext, substitution_renderer
 from plugins.workflow.schema import parse_workflow_source_bytes
 
 
@@ -55,6 +57,37 @@ def test_v4_bash_rewrite_uses_lexer_admitted_reference_spans() -> None:
     assert rewritten == (
         "printf '%s %s' '$checks__producer.output.value' '$$HOME'"
     )
+
+
+@pytest.mark.parametrize("normalizer_version", (3, 4, 5))
+def test_pre_v6_bash_rejects_private_loop_previous_reference(
+    tmp_path: Path,
+    normalizer_version: int,
+) -> None:
+    """Catch private v6 masking making an unsupported v3-v5 path executable."""
+    template = 'printf %s "$LOOP_PREV.producer.output"'
+
+    with pytest.raises(WorkflowOutputReferenceError) as exc_info:
+        substitution_renderer(
+            VariableContext(normalizer_version=normalizer_version),
+            direct_dependencies=(),
+        ).render_bash(template, spill_directory=tmp_path / "spill")
+
+    assert exc_info.value.code == "output_reference_path_unsupported"
+
+
+@pytest.mark.parametrize("normalizer_version", (3, 4, 5))
+def test_pre_v6_prompt_rejects_private_loop_previous_reference(
+    normalizer_version: int,
+) -> None:
+    """Catch private v6 rendering consuming an unsupported legacy path."""
+    with pytest.raises(WorkflowOutputReferenceError) as exc_info:
+        substitution_renderer(
+            VariableContext(normalizer_version=normalizer_version),
+            direct_dependencies=(),
+        ).render_prompt("$LOOP_PREV.producer.output")
+
+    assert exc_info.value.code == "output_reference_path_unsupported"
 
 
 @pytest.mark.parametrize(

@@ -529,7 +529,7 @@ class ApprovalExecutor:
                 error_message="isolated approval rework failed",
                 metadata=metadata,
             )
-        attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+        attempt = context.effective_attempt_directory
         attempt.mkdir(parents=True, exist_ok=False)
         output = attempt / "rework-output.txt"
         output.write_text(result.final_response, encoding="utf-8")

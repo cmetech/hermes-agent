@@ -20,6 +20,7 @@ from plugins.workflow.store import (
 import plugins.workflow.store as store_module
 import plugins.workflow.sessions as sessions_module
 from tools.managed_process import ProcessIdentity
+from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit, _compile
 
 
 def _request(prepared, key: str) -> RunAdmissionRequest:
@@ -594,3 +595,402 @@ def test_twenty_simultaneous_approval_decisions_have_one_durable_winner(
         outcomes = list(pool.map(decide, range(20)))
     assert outcomes.count("applied") == 1
     assert store.load_run(run_id)["status"] == "running"
+
+
+def test_loop_group_terminal_reserve_exhaustion_precedes_output_and_publication(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-terminal-preflight",
+        nodes=[{
+            "id": "group",
+            "output_type": "Report",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [
+                    {
+                        "id": "sink",
+                        "bash": "printf 'result <promise>DONE</promise>'",
+                        "output_type": "Report",
+                    }
+                ],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-terminal-preflight")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    advance_controllers = scheduler._advance_loop_group_controllers
+    assert advance_controllers(
+        run_id,
+        compilation.package.definition.nodes,
+        store.load_run(run_id),
+    )
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", lambda *_args: False
+    )
+    scheduler.advance(run_id, max_nodes=1)
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", advance_controllers
+    )
+    original = store._check_journal_reserve
+
+    def exhaust_group_terminal(*args, **kwargs):
+        raise StorageQuotaError("injected group terminal reserve exhaustion")
+
+    monkeypatch.setattr(store, "_check_journal_reserve", exhaust_group_terminal)
+
+    with pytest.raises(StorageQuotaError, match="group terminal reserve"):
+        advance_controllers(
+            run_id,
+            compilation.package.definition.nodes,
+            store.load_run(run_id),
+        )
+
+    directory = store.run_directory(run_id)
+    assert not (
+        directory
+        / "nodes"
+        / "group"
+        / "loop-group-1-0001"
+        / "output.md"
+    ).exists()
+    outer_publications = []
+    for metadata in directory.glob("publications/*/metadata.json"):
+        value = json.loads(metadata.read_text())
+        if value["node_id"] == "group":
+            outer_publications.append(metadata)
+    assert outer_publications == []
+    monkeypatch.setattr(store, "_check_journal_reserve", original)
+    assert store.load_run(run_id)["nodes"]["group"]["attempts"] == []
+
+
+def test_loop_group_restart_reconciles_crash_after_outer_publication(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-terminal-publication-crash",
+        nodes=[{
+            "id": "group",
+            "output_type": "Report",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [
+                    {
+                        "id": "sink",
+                        "bash": "printf 'result <promise>DONE</promise>'",
+                        "output_type": "Report",
+                    }
+                ],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-terminal-publication-crash")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    advance_controllers = scheduler._advance_loop_group_controllers
+    assert advance_controllers(
+        run_id,
+        compilation.package.definition.nodes,
+        store.load_run(run_id),
+    )
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", lambda *_args: False
+    )
+    scheduler.advance(run_id, max_nodes=1)
+    monkeypatch.setattr(
+        scheduler, "_advance_loop_group_controllers", advance_controllers
+    )
+    original_append = store._append_locked
+
+    def crash_after_publication(directory, projection, event_type, *args, **kwargs):
+        if event_type == "loop_group_iteration_completed":
+            raise SystemExit("crash after outer publication")
+        return original_append(directory, projection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_append_locked", crash_after_publication)
+    with pytest.raises(SystemExit, match="after outer publication"):
+        advance_controllers(
+            run_id,
+            compilation.package.definition.nodes,
+            store.load_run(run_id),
+        )
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    restarted = RunStore(home, max_total_workers=1)
+    recovered = RunScheduler(restarted, max_parallel_nodes=1).advance_all([run_id])[
+        run_id
+    ]
+
+    assert recovered["status"] == "succeeded"
+    outer = []
+    for metadata in restarted.run_directory(run_id).glob(
+        "publications/*/metadata.json"
+    ):
+        value = json.loads(metadata.read_text())
+        if value["node_id"] == "group":
+            outer.append(value)
+    assert len(outer) == 1
+    assert outer[0]["sha256"] == hashlib.sha256(b"result").hexdigest()
+
+
+_GROUP_EVENT_FAULT_CASES = tuple(
+    (scenario, event_type, side)
+    for scenario, event_types in (
+        (
+            "success",
+            (
+                "loop_group_iteration_completed",
+                "loop_group_decision_recorded",
+                "loop_group_iteration_decided",
+                "loop_group_succeeded",
+            ),
+        ),
+        (
+            "continue",
+            (
+                "loop_group_iteration_committed",
+                "loop_group_next_iteration_created",
+            ),
+        ),
+        ("pause", ("loop_group_paused",)),
+        ("failure", ("loop_group_failed",)),
+    )
+    for event_type in event_types
+    for side in ("before", "after")
+)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "crash_event", "crash_side"),
+    _GROUP_EVENT_FAULT_CASES,
+)
+def test_loop_group_restart_completes_each_staged_event_family_after_crash(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    scenario,
+    crash_event,
+    crash_side,
+) -> None:
+    max_iterations = 2 if scenario == "continue" else 1
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"phase6-staged-{scenario}-{crash_event}-{crash_side}",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": max_iterations,
+                "interactive": scenario == "pause",
+                "signal_completes": scenario != "pause",
+                **({"gate_message": "confirm"} if scenario == "pause" else {}),
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+        interactive=scenario == "pause",
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"phase6-staged-{scenario}-{crash_event}-{crash_side}",
+    )
+
+    executions = []
+
+    def output(_context, _rendered):
+        executions.append(len(executions) + 1)
+        if scenario == "failure" or (
+            scenario == "continue" and len(executions) == 1
+        ):
+            return "not complete"
+        return "done <promise>DONE</promise>"
+
+    first = RunScheduler(store, max_parallel_nodes=1)
+    first.executors["prompt"] = OutputExecutor(output)
+    original_append = store._append_locked
+    crashed = False
+
+    def crash_at_boundary(directory, projection, event_type, *args, **kwargs):
+        nonlocal crashed
+        if not crashed and event_type == crash_event:
+            crashed = True
+            if crash_side == "before":
+                raise SystemExit(f"crash before {crash_event}")
+            original_append(directory, projection, event_type, *args, **kwargs)
+            raise SystemExit(f"crash after {crash_event}")
+        return original_append(
+            directory, projection, event_type, *args, **kwargs
+        )
+
+    monkeypatch.setattr(store, "_append_locked", crash_at_boundary)
+    with pytest.raises(SystemExit, match=crash_event):
+        first.advance_all([run_id])
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    restarted = RunStore(home, max_total_workers=1)
+    second = RunScheduler(restarted, max_parallel_nodes=1)
+    second.executors["prompt"] = OutputExecutor(output)
+    recovered = second.advance_all([run_id])[run_id]
+    lifecycle = [
+        event["event_type"]
+        for event in restarted.tail_events(run_id)
+        if event["event_type"]
+        in {
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_committed",
+            "loop_group_iteration_decided",
+            "loop_group_next_iteration_created",
+            "loop_group_succeeded",
+            "loop_group_paused",
+            "loop_group_failed",
+        }
+    ]
+
+    expected = {
+        "success": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_succeeded",
+        ],
+        "continue": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_committed",
+            "loop_group_next_iteration_created",
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_succeeded",
+        ],
+        "pause": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_paused",
+        ],
+        "failure": [
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_decided",
+            "loop_group_failed",
+        ],
+    }[scenario]
+    expected_status = {
+        "success": "succeeded",
+        "continue": "succeeded",
+        "pause": "paused",
+        "failure": "failed",
+    }[scenario]
+    assert recovered["status"] == expected_status
+    assert lifecycle == expected
+
+
+@pytest.mark.parametrize(
+    ("crash_event", "crash_side", "reserve_on_restart"),
+    [
+        ("loop_group_cancelled", "before", 1),
+        ("loop_group_cancelled", "after", 1),
+        ("run_cancelled", "before", 1),
+        ("run_cancelled", "after", 0),
+    ],
+)
+def test_loop_group_cancellation_restart_completes_run_event_once_and_retains_reserve(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    crash_event,
+    crash_side,
+    reserve_on_restart,
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-staged-cancel",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-staged-cancel")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    scheduler.executors["bash"] = type(
+        "CrashBeforePredicateSpawn",
+        (),
+        {
+            "execute": lambda self, context: (_ for _ in ()).throw(
+                SystemExit("predicate stopped before spawn")
+            )
+        },
+    )()
+    with pytest.raises(SystemExit, match="before spawn"):
+        scheduler.advance_all([run_id])
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 1
+    original_append = store._append_locked
+    crashed = False
+
+    def crash_at_cancel_boundary(
+        directory, projection, event_type, *args, **kwargs
+    ):
+        nonlocal crashed
+        if not crashed and event_type == crash_event:
+            crashed = True
+            if crash_side == "before":
+                raise SystemExit(f"crash before {crash_event}")
+            original_append(directory, projection, event_type, *args, **kwargs)
+            raise SystemExit(f"crash after {crash_event}")
+        return original_append(
+            directory, projection, event_type, *args, **kwargs
+        )
+
+    monkeypatch.setattr(store, "_append_locked", crash_at_cancel_boundary)
+    with pytest.raises(SystemExit, match=crash_event):
+        store.cancel_run(run_id)
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    restarted = RunStore(home, max_total_workers=1)
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == reserve_on_restart
+    recovered = restarted.cancel_run(run_id)
+    lifecycle = [
+        event["event_type"]
+        for event in restarted.tail_events(run_id)
+        if event["event_type"] in {"loop_group_cancelled", "run_cancelled"}
+    ]
+
+    assert recovered["status"] == "cancelled"
+    assert lifecycle == ["loop_group_cancelled", "run_cancelled"]
+    with restarted._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0] == 0

@@ -856,7 +856,7 @@ print(json.dumps({
     timeout_schema = installed_contract["definition_schema"]["properties"]["nodes"][
         "items"
     ]["properties"]["timeout"]
-    assert installed_contract["normalizer_version"] == 5
+    assert installed_contract["normalizer_version"] == 6
     assert timeout_schema["x-hermes-unit"] == "milliseconds"
     assert timeout_schema["x-hermes-semantics"]["omitted"] == 120_000
     assert bash_schema["x-hermes-semantics"] == {
@@ -1127,7 +1127,7 @@ print(json.dumps({
         assert _version_selection_from_guidance(
             installed_references / reference_name
         ) == installed_version_selection
-    assert phase4_result["default_normalizer"] == 5
+    assert phase4_result["default_normalizer"] == 6
     assert phase4_result["explicit_normalizer"] == 4
     assert {
         "include_not_found",

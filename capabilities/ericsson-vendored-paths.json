@@ -4,6 +4,8 @@
   "capabilities/workflows/inbox-digest.yml",
   "capabilities/workflows/jira-single-ticket-showcase.hermes.yaml",
   "capabilities/workflows/jira-single-ticket-showcase.yml",
+  "capabilities/workflows/jira-defect-loop.hermes.yaml",
+  "capabilities/workflows/jira-defect-loop.yml",
   "capabilities/workflows/jira-to-gitlab.hermes.yaml",
   "capabilities/workflows/jira-to-gitlab.yml",
   "capabilities/workflows/my-tickets-summary.hermes.yaml",

@@ -130,7 +130,7 @@ def test_fresh_windows_checkout_seeds_workflow_and_mcp_defaults(
             "-c",
             "core.autocrlf=true",
             "clone",
-            "--no-hardlinks",
+            "--no-local",
             "-q",
             str(source),
             str(checkout),

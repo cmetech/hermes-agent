@@ -24,11 +24,15 @@ from plugins.workflow.models import (
     WorkflowPackage,
     WorkflowValidationError,
 )
-from plugins.workflow.resources import parse_command_resource
+from plugins.workflow.resources import (
+    effective_scoped_node_options,
+    parse_command_resource,
+)
 from plugins.workflow.schema import (
     is_inline_script,
     validate_authenticated_resource_references,
 )
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 
 _LOCK_TIMEOUT_SECONDS = 5.0
 _ISOLATION_CAPABILITIES = (
@@ -466,14 +470,16 @@ def compute_package_digest(
     )
     if package.sidecar_path is not None or expected_sidecar.exists():
         add(package.sidecar_path or expected_sidecar)
-    for node in package.definition.nodes:
+    for scoped in iter_scoped_workflow_nodes(package.definition):
+        node = scoped.node
+        node_id = scoped.semantic_id
         if node.node_type == "command":
             relative, data = add(
                 _command_path(package, str(node.value), read_budget)
             )
             if strict_v3_resources:
                 try:
-                    command_bodies[node.id] = parse_command_resource(
+                    command_bodies[node_id] = parse_command_resource(
                         root / relative,
                         data.decode("utf-8"),
                     ).body
@@ -494,10 +500,14 @@ def compute_package_digest(
                     )
                 )
                 if strict_v3_resources:
-                    named_script_bodies[node.id] = data.decode(
+                    named_script_bodies[node_id] = data.decode(
                         "utf-8", errors="surrogateescape"
                     )
-        mcp_value = node.options.get("mcp")
+        if node.node_type == "loop_group":
+            continue
+        mcp_value = effective_scoped_node_options(
+            package.definition, scoped
+        ).get("mcp")
         references = (
             (mcp_value,)
             if isinstance(mcp_value, str)
@@ -582,34 +592,41 @@ def build_risk_summary(
         package_digest = compute_package_digest(
             package, read_budget=read_budget
         ).sha256
+    scoped_nodes = tuple(iter_scoped_workflow_nodes(package.definition))
+    scoped_options = {
+        scoped.semantic_id: effective_scoped_node_options(
+            package.definition, scoped
+        )
+        for scoped in scoped_nodes
+    }
     shell_nodes = tuple(
-        node.id
-        for node in package.definition.nodes
-        if node.node_type in {"bash", "script"}
+        scoped.semantic_id
+        for scoped in scoped_nodes
+        if scoped.node.node_type in {"bash", "script"}
     )
     requested_tools = tuple(
         sorted({
             ARCHON_TOOL_ALIASES.get(str(tool), str(tool))
-            for node in package.definition.nodes
+            for scoped in scoped_nodes
             for field in ("allowed_tools", "denied_tools")
-            for tool in node.options.get(field, ())
+            for tool in scoped_options[scoped.semantic_id].get(field, ())
         })
     )
     requested_skills = tuple(
         sorted({
             str(skill)
-            for node in package.definition.nodes
-            for skill in node.options.get("skills", ())
+            for scoped in scoped_nodes
+            for skill in scoped_options[scoped.semantic_id].get("skills", ())
         })
     )
     local_mcp = tuple(
         sorted({
             str(reference)
-            for node in package.definition.nodes
+            for scoped in scoped_nodes
             for reference in (
-                (node.options.get("mcp"),)
-                if isinstance(node.options.get("mcp"), str)
-                else node.options.get("mcp", ())
+                (scoped_options[scoped.semantic_id].get("mcp"),)
+                if isinstance(scoped_options[scoped.semantic_id].get("mcp"), str)
+                else scoped_options[scoped.semantic_id].get("mcp", ())
             )
             if isinstance(reference, str)
         })
@@ -620,7 +637,10 @@ def build_risk_summary(
             str(provider)
             for provider in [
                 workflow_provider,
-                *(node.options.get("provider") for node in package.definition.nodes),
+                *(
+                    scoped_options[scoped.semantic_id].get("provider")
+                    for scoped in scoped_nodes
+                ),
             ]
             if isinstance(provider, str) and provider
         })
@@ -639,49 +659,50 @@ def build_risk_summary(
         outward_set = frozenset(outward)
         package_keys = tuple(
             dict.fromkeys(
-                node.origin.package_key
-                for node in package.definition.nodes
-                if node.origin is not None
+                scoped.node.origin.package_key
+                for scoped in scoped_nodes
+                if scoped.node.origin is not None
             )
         )
         projected: list[WorkflowOriginRisk] = []
         for package_key in sorted(package_keys):
             nodes = tuple(
-                node
-                for node in package.definition.nodes
-                if node.origin is not None and node.origin.package_key == package_key
+                scoped
+                for scoped in scoped_nodes
+                if scoped.node.origin is not None
+                and scoped.node.origin.package_key == package_key
             )
             projected.append(
                 WorkflowOriginRisk(
                     package_key=package_key,
                     shell_or_script_nodes=tuple(
-                        node.id
-                        for node in nodes
-                        if node.node_type in {"bash", "script"}
+                        scoped.semantic_id
+                        for scoped in nodes
+                        if scoped.node.node_type in {"bash", "script"}
                     ),
                     requested_tools=tuple(
                         sorted({
                             ARCHON_TOOL_ALIASES.get(str(tool), str(tool))
-                            for node in nodes
+                            for scoped in nodes
                             for field in ("allowed_tools", "denied_tools")
-                            for tool in node.options.get(field, ())
+                            for tool in scoped_options[scoped.semantic_id].get(field, ())
                         })
                     ),
                     requested_skills=tuple(
                         sorted({
                             str(skill)
-                            for node in nodes
-                            for skill in node.options.get("skills", ())
+                            for scoped in nodes
+                            for skill in scoped_options[scoped.semantic_id].get("skills", ())
                         })
                     ),
                     local_mcp_servers=tuple(
                         sorted({
                             str(reference)
-                            for node in nodes
+                            for scoped in nodes
                             for reference in (
-                                (node.options.get("mcp"),)
-                                if isinstance(node.options.get("mcp"), str)
-                                else node.options.get("mcp", ())
+                                (scoped_options[scoped.semantic_id].get("mcp"),)
+                                if isinstance(scoped_options[scoped.semantic_id].get("mcp"), str)
+                                else scoped_options[scoped.semantic_id].get("mcp", ())
                             )
                             if isinstance(reference, str)
                         })
@@ -691,13 +712,18 @@ def build_risk_summary(
                             str(provider)
                             for provider in (
                                 package.definition.options.get("provider"),
-                                *(node.options.get("provider") for node in nodes),
+                                *(
+                                    scoped_options[scoped.semantic_id].get("provider")
+                                    for scoped in nodes
+                                ),
                             )
                             if isinstance(provider, str) and provider
                         })
                     ),
                     outward_action_nodes=tuple(
-                        node.id for node in nodes if node.id in outward_set
+                        scoped.semantic_id
+                        for scoped in nodes
+                        if scoped.semantic_id in outward_set
                     ),
                 )
             )

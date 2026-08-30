@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from plugins.workflow.cli import build_catalog, show_package
-from plugins.workflow.schema import load_workflow
+from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 
 
 def _catalog_package(workflow_writer, root):
@@ -120,3 +120,35 @@ def test_show_adds_redacted_operational_metadata_and_cron_join(
         "SECRET_CRON_BODY",
     ):
         assert secret not in serialized
+
+
+def test_catalog_show_projects_dormant_v6_group_as_one_outer_node(
+    workflow_writer, tmp_path
+):
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    commands.joinpath("secret-body.md").write_text("SECRET\n", encoding="utf-8")
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "nodes": [{"id": "child", "command": "secret-body"}],
+                    "until": "DONE",
+                    "max_iterations": 2,
+                },
+            }
+        ],
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+        normalizer_version=6,
+    )
+
+    detail = show_package(package)
+
+    assert detail["node_type_counts"] == {"loop_group": 1}
+    assert detail["topology_text"] == "group"

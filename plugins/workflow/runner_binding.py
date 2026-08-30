@@ -29,6 +29,8 @@ from plugins.workflow.entitlement import (
     AIEntitlementResolution,
     entitled_agent_runner,
 )
+from plugins.workflow.resources import effective_scoped_node_options
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 
 if TYPE_CHECKING:
     from plugins.workflow.compilation import WorkflowCompilation
@@ -144,11 +146,27 @@ class ExecutionCapabilityContext:
         node_id: str,
     ) -> tuple[ExecutionRuntimeCapabilities, ConfiguredExecutionRoute | None]:
         """Classify the provider route the executor will use for one node."""
-        node = next(node for node in package.definition.nodes if node.id == node_id)
+        scoped = next(
+            scoped
+            for scoped in iter_scoped_workflow_nodes(package.definition)
+            if scoped.semantic_id == node_id
+        )
+        node = scoped.node
+        if node.node_type == "loop_group":
+            loop_group = package.language.node_semantics.get(node.id, {}).get(
+                "loop_group"
+            )
+            if isinstance(loop_group, Mapping):
+                sink = loop_group.get("primary_sink")
+                if isinstance(sink, str):
+                    return self._runtime_capabilities_for_node(
+                        package, f"{node.id}/{sink}"
+                    )
+        options = effective_scoped_node_options(package.definition, scoped)
         workflow_provider = package.definition.options.get("provider")
-        node_provider = node.options.get("provider")
+        node_provider = options.get("provider")
         configured_provider = node_provider or workflow_provider
-        configured_model = node.options.get("model") or package.definition.options.get(
+        configured_model = options.get("model") or package.definition.options.get(
             "model"
         )
         if not isinstance(configured_provider, str) or not configured_provider.strip():

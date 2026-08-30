@@ -37,7 +37,11 @@ from plugins.workflow.entitlement import (
     entitled_agent_runner,
 )
 from plugins.workflow.execution_semantics import phase5_session_cache_fingerprint
-from plugins.workflow.language import supports_phase3_semantics, supports_phase5_semantics
+from plugins.workflow.language import (
+    supports_phase3_semantics,
+    supports_phase5_semantics,
+    supports_phase6_semantics,
+)
 from plugins.workflow.executors.base import (
     NodeExecutionContext,
     NodeExecutionResult,
@@ -351,6 +355,7 @@ class AgentNodeExecutor:
         failure_kind = str(audit.get("failure_kind", "")).lower()
         return bool(
             audit.get("unknown_side_effect") is True
+            or audit.get("write_ambiguous") is True
             or audit.get("outcome_unknown") is True
             or audit.get("reconciliation_required") is True
             or "unknown_side_effect" in failure_kind
@@ -447,7 +452,9 @@ class AgentNodeExecutor:
             sealed_fallback_route=None,
             ephemeral_system_prompt=None,
             approved_action_digest=None,
+            tool_call_contract=None,
             max_iterations=1,
+            strict_iteration_limit=initial_request.strict_iteration_limit,
             max_api_attempts=remaining_provider_attempts,
             idle_timeout_seconds=min(
                 initial_request.idle_timeout_seconds,
@@ -514,13 +521,19 @@ class AgentNodeExecutor:
         extension = ".json" if is_structured else ".md"
         media_type = "application/json" if is_structured else "text/plain"
         try:
-            output_path = write_archon_output_exclusive(
-                context.run_directory,
-                node_id=node.id,
-                attempt_id=context.attempt_id,
-                filename=f"output{extension}",
-                data=data,
-            )
+            if context.attempt_directory is None:
+                output_path = write_archon_output_exclusive(
+                    context.run_directory,
+                    node_id=node.id,
+                    attempt_id=context.attempt_id,
+                    filename=f"output{extension}",
+                    data=data,
+                )
+            else:
+                attempt = context.effective_attempt_directory
+                attempt.mkdir(parents=True, exist_ok=False)
+                output_path = attempt / f"output{extension}"
+                output_path.write_bytes(data)
         except ArchonOutputIntegrityError:
             metadata["archon_terminal_failure"] = True
             metadata.pop("output", None)
@@ -647,6 +660,8 @@ class AgentNodeExecutor:
             is not StructuredOutputStrategy.PROMPT_JSON_SCHEMA
         ):
             return failed("ineligible_native_strategy")
+        if initial_request.tool_call_contract is not None:
+            return failed("ineligible_tool_call_contract")
         if context.outward_action:
             return failed("ineligible_outward_action")
         if self._uncertain_effects(initial_result.audit):
@@ -1722,6 +1737,11 @@ class AgentNodeExecutor:
                 ephemeral_system_prompt=node.options.get("systemPrompt"),
                 request_overrides=request_overrides,
                 structured_output=structured_request,
+                tool_call_contract=(
+                    _thaw(node.options["tool_call_contract"])
+                    if "tool_call_contract" in node.options
+                    else None
+                ),
                 max_budget_usd=node.options.get(
                     "maxBudgetUsd", context.workflow_options.get("maxBudgetUsd")
                 ),
@@ -1735,6 +1755,13 @@ class AgentNodeExecutor:
                 ),
                 workdir=context.run_directory,
                 max_iterations=context.max_model_iterations,
+                strict_iteration_limit=(
+                    "maxTurns" in node.options
+                    and supports_phase6_semantics(
+                        context.language_profile,
+                        context.normalizer_version,
+                    )
+                ),
                 max_api_attempts=granted_provider_attempts,
                 sealed_provider_attempt_grant=strict_v3,
                 idle_timeout_seconds=idle_timeout,
@@ -2053,6 +2080,23 @@ class AgentNodeExecutor:
             "cache_fingerprint": fingerprint,
             "warnings": warnings,
         }
+        if context.outward_action and self._uncertain_effects(result.audit):
+            metadata.update({
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "archon_terminal_failure": True,
+            })
+            return with_recovery_failure(
+                NodeExecutionResult(
+                    "failed",
+                    error_code="outcome_unknown",
+                    error_message=(
+                        "outward action outcome is ambiguous; read-only "
+                        "reconciliation is required"
+                    ),
+                    metadata=metadata,
+                )
+            )
         if phase5:
             observed_intended = result.audit.get("intended_authority_digest")
             observed_prefix = result.audit.get("model_visible_prefix_digest")
@@ -2250,6 +2294,9 @@ class AgentNodeExecutor:
             elif failure_kind == "provider_attempt_grant_exhausted":
                 error_code = "provider_attempt_grant_exhausted"
                 metadata["known_no_effect"] = True
+            elif failure_kind == "tool_call_contract_violation":
+                error_code = "tool_call_contract_violation"
+                metadata["archon_terminal_failure"] = True
             elif phase5 and failure_kind == "budget_exhausted":
                 error_code = "budget_exhausted"
                 metadata["archon_terminal_failure"] = True
@@ -2425,7 +2472,7 @@ class AgentNodeExecutor:
                 return self._failure("structured_output_invalid", exc.message)
             extension = ".json"
 
-        attempt = context.run_directory / "nodes" / node.id / context.attempt_id
+        attempt = context.effective_attempt_directory
         attempt.mkdir(parents=True, exist_ok=False)
         output_path = attempt / f"output{extension}"
         output_path.write_text(output, encoding="utf-8")

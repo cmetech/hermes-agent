@@ -193,6 +193,19 @@ def test_model_resolution_failure_is_a_blocking_admission_result(
     } >= {("nodes[0].model", "model_alias_unconfigured")}
 
 
+def test_v5_admission_execution_identity_remains_stable_for_same_inputs(
+    tmp_path, workflow_writer
+):
+    compilation = _compilation(tmp_path, workflow_writer)
+    context = _context()
+
+    first = assess_workflow_admission(compilation, context)
+    second = assess_workflow_admission(compilation, context)
+
+    assert first.execution_identity == second.execution_identity
+    assert first.risk.risk_digest == second.risk.risk_digest
+
+
 def test_cli_show_and_validate_consume_the_common_phase5_assessment(
     tmp_path, workflow_writer, monkeypatch
 ):

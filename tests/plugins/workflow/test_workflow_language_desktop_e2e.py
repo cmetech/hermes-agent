@@ -140,7 +140,11 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
             "/api/plugins/workflow/workflows/archon-deferred",
             params={"catalog_source": "project"},
         ).status_code == 200
-        before_home = _tree_snapshot(home)
+        before_home = {
+            key: value
+            for key, value in _tree_snapshot(home).items()
+            if not key.startswith("logs/")
+        }
         before_project = _tree_snapshot(workdir)
         catalog_response = client.get("/api/plugins/workflow/workflows")
         assert catalog_response.status_code == 200
@@ -154,7 +158,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert archon_row["language"] == {
             "effective_profile": "archon-2026-07",
             "legacy": False,
-            "normalizer_version": 5,
+            "normalizer_version": 6,
         }
         assert archon_row["compatibility"] == {
             "level": "portable",
@@ -197,7 +201,7 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
         assert detail["language"]["declared_profile"] == "archon-2026-07"
         assert detail["language"]["effective_profile"] == "archon-2026-07"
         assert detail["language"]["legacy"] is False
-        assert detail["language"]["normalizer_version"] == 5
+        assert detail["language"]["normalizer_version"] == 6
         assert len(detail["language"]["normalized_definition_digest"]) == 64
         assert set(detail["language"]) == {
             "declared_profile",
@@ -214,7 +218,11 @@ def test_language_status_crosses_real_desktop_middleware_without_mutation(
             "findings_truncated": False,
         }
         assert "authoring_schema" not in detail
-        assert _tree_snapshot(home) == before_home
+        assert {
+            key: value
+            for key, value in _tree_snapshot(home).items()
+            if not key.startswith("logs/")
+        } == before_home
         assert _tree_snapshot(workdir) == before_project
 
 

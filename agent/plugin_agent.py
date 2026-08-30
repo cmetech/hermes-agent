@@ -543,6 +543,7 @@ class PluginAgentRunRequest:
     ephemeral_system_prompt: str | None = None
     request_overrides: Mapping[str, Any] = field(default_factory=dict)
     structured_output: StructuredOutputRequest | None = None
+    tool_call_contract: Mapping[str, Any] | None = None
     max_budget_usd: float | None = None
     _cost_budget_authority: Mapping[str, Any] | None = field(
         default=None, repr=False, compare=False
@@ -554,6 +555,7 @@ class PluginAgentRunRequest:
     approved_action_digest: str | None = None
     workdir: Path | None = None
     max_iterations: int = 90
+    strict_iteration_limit: bool = False
     max_api_attempts: int = 3
     sealed_provider_attempt_grant: bool = False
     _provider_attempt_authority: Mapping[str, Any] | None = field(
@@ -612,11 +614,13 @@ class PluginAgentRunRequest:
                 if self.structured_output is not None
                 else None
             ),
+            "tool_call_contract": _wire_json(self.tool_call_contract),
             "max_budget_usd": self.max_budget_usd,
             "sandbox_policy": _wire_json(self.sandbox_policy),
             "approved_action_digest": self.approved_action_digest,
             "workdir": str(self.workdir) if self.workdir is not None else None,
             "max_iterations": self.max_iterations,
+            "strict_iteration_limit": self.strict_iteration_limit,
             "max_api_attempts": self.max_api_attempts,
             "sealed_provider_attempt_grant": self.sealed_provider_attempt_grant,
             "idle_timeout_seconds": self.idle_timeout_seconds,
@@ -678,11 +682,13 @@ class PluginAgentRunRequest:
             "ephemeral_system_prompt",
             "request_overrides",
             "structured_output",
+            "tool_call_contract",
             "max_budget_usd",
             "sandbox_policy",
             "approved_action_digest",
             "workdir",
             "max_iterations",
+            "strict_iteration_limit",
             "max_api_attempts",
             "sealed_provider_attempt_grant",
             "_provider_attempt_authority",
@@ -1040,6 +1046,26 @@ def _correlate_structured_result(
         raise RuntimeError("structured output evidence does not match request")
 
 
+def _correlate_tool_call_contract_result(
+    request: PluginAgentRunRequest, result: PluginAgentRunResult
+) -> None:
+    if request.tool_call_contract is None:
+        return
+    if result.status == "completed":
+        if (
+            result.audit.get("tool_call_contract_satisfied") is not True
+            or result.audit.get("tool_call_count") != 1
+            or result.audit.get("failure_kind") is not None
+        ):
+            raise RuntimeError("tool-call contract evidence is missing")
+        return
+    if (
+        result.status != "failed"
+        or result.audit.get("failure_kind") != "tool_call_contract_violation"
+    ):
+        raise RuntimeError("tool-call contract failure evidence is invalid")
+
+
 def _correlate_persistent_session_result(
     plugin_id: str,
     request: PluginAgentRunRequest,
@@ -1113,6 +1139,25 @@ def _validate_request(request: PluginAgentRunRequest) -> None:
         raise ValueError("shared context requires session_id")
     if not isinstance(request.sealed_runtime_authority_required, bool):
         raise TypeError("sealed_runtime_authority_required must be boolean")
+    if not isinstance(request.strict_iteration_limit, bool):
+        raise TypeError("strict_iteration_limit must be boolean")
+    if request.strict_iteration_limit and request.max_iterations > 90:
+        raise ValueError("strict_iteration_limit exceeds the workflow ceiling")
+    if request.tool_call_contract is not None:
+        contract = request.tool_call_contract
+        if not isinstance(contract, Mapping):
+            raise ValueError("tool_call_contract must be an object")
+        try:
+            encoded_contract = json.dumps(
+                contract,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("tool_call_contract must be JSON") from exc
+        if len(encoded_contract) > 64_000:
+            raise ValueError("tool_call_contract exceeds the size limit")
     if request.sealed_runtime_authority_required and (
         request.intended_authority_digest is None
         or request.expected_runtime_identity is None
@@ -2030,6 +2075,7 @@ class PluginAgentRunner:
                     self.plugin_id, request, parsed_result
                 ):
                     _correlate_structured_result(request, parsed_result)
+                    _correlate_tool_call_contract_result(request, parsed_result)
             except (TypeError, ValueError, RuntimeError) as exc:
                 raise PluginAgentResultProtocolError(str(exc)) from exc
             return parsed_result

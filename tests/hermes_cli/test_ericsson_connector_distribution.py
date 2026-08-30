@@ -10,7 +10,8 @@ import sys
 import yaml
 
 from hermes_cli import capability_staging as staging
-from plugins.workflow.discovery import discover_workflows
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.schema import parse_workflow_source_bytes
 from tests.ericsson_connector_source import resolve_ericsson_connector_source
 
 
@@ -146,7 +147,7 @@ def test_checked_in_sharepoint_bundle_is_disabled_complete_and_profiled() -> Non
     assert workflow.with_name("sharepoint-document-intake.hermes.yaml").is_file()
 
 
-def test_fresh_profile_discovers_every_distributed_jira_workflow(
+def test_fresh_profile_stages_authenticated_v6_jira_workflows(
     tmp_path, monkeypatch
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
@@ -160,22 +161,47 @@ def test_fresh_profile_discovers_every_distributed_jira_workflow(
     )
 
     staging.seed_baked_capabilities(home)
-    discovered = {
-        package.definition.name: package
-        for package in discover_workflows(home, home, home)
-    }
+    workflow_root = home / "workflows/ericsson/workflows"
+    discovered = {}
+    for filename, normalizer in (
+        ("my-tickets-summary.yaml", None),
+        ("jira-single-ticket-showcase.yaml", None),
+        ("jira-to-gitlab.yaml", None),
+        ("jira-defect-loop.yaml", 6),
+    ):
+        path = workflow_root / filename
+        sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+        source = parse_workflow_source_bytes(
+            path,
+            workflow_bytes=path.read_bytes(),
+            sidecar_bytes=sidecar.read_bytes() if sidecar.is_file() else None,
+            source="staged",
+            precedence=1,
+        )
+        compilation = compile_workflow(
+            source,
+            WorkflowCatalogSnapshot.capture((source,)),
+            **({"normalizer_version": normalizer} if normalizer else {}),
+        )
+        discovered[compilation.package.definition.name] = compilation.package
 
     assert {
         "my-tickets-summary",
         "jira-single-ticket-showcase",
         "jira-to-gitlab",
+        "jira-defect-loop",
     } <= set(discovered)
     for name in (
         "my-tickets-summary",
         "jira-single-ticket-showcase",
         "jira-to-gitlab",
+        "jira-defect-loop",
     ):
+        assert discovered[name].language.normalizer_version == 6
         assert "ericsson-jira" in discovered[name].definition.options["requires"]
+    assert "ericsson-gitlab" in discovered["jira-defect-loop"].definition.options[
+        "requires"
+    ]
 
 
 def test_baked_distribution_exposes_but_does_not_enable_standalone_plugins(

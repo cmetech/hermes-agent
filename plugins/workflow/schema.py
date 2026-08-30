@@ -15,11 +15,13 @@ import yaml
 from agent.structured_output import parse_exact_decimal_integer
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
+    bash_loop_previous_output_references,
     bash_output_references,
 )
 from plugins.workflow.conditions import (
     WorkflowConditionError,
     validate_v3_condition_syntax,
+    validate_v6_condition_syntax,
 )
 from plugins.workflow.language import (
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
@@ -35,13 +37,16 @@ from plugins.workflow.language import (
     supports_phase3_semantics,
     supports_phase4_semantics,
     supports_phase5_semantics,
+    supports_phase6_semantics,
 )
 from plugins.workflow.language_schema import (
+    EXECUTABLE_NODE_TYPES,
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
     SOURCE_NODE_TYPES,
     WHEN_EXPRESSION_PATTERN,
     WHEN_REFERENCE_PATTERN,
+    WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
     agent_field_names,
     approval_field_names,
     approval_reject_field_names,
@@ -54,8 +59,10 @@ from plugins.workflow.language_schema import (
     hook_specific_field_names,
     contains_output_reference,
     is_reference_safe_node_id,
+    iter_loop_previous_output_references,
     iter_output_references,
     loop_field_names,
+    loop_group_field_names,
     retry_field_names,
     sidecar_field_names,
     structural_node_field_names,
@@ -76,6 +83,7 @@ from plugins.workflow.models import (
     freeze_value,
 )
 from plugins.workflow.resources import iter_output_field_references
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 
 TRIGGER_RULES = (
     "all_success",
@@ -136,6 +144,7 @@ HOOK_RESPONSE_FIELDS = hook_response_field_names()
 HOOK_SPECIFIC_FIELDS = hook_specific_field_names()
 RETRY_FIELDS = retry_field_names()
 LOOP_FIELDS = loop_field_names()
+LOOP_GROUP_FIELDS = loop_group_field_names()
 APPROVAL_FIELDS = approval_field_names()
 APPROVAL_REJECT_FIELDS = approval_reject_field_names()
 AGENT_FIELDS = agent_field_names()
@@ -474,6 +483,12 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
     for field in ("always_run", "persist_session"):
         if field in node:
             _boolean(node[field], f"{path}.{field}")
+    if "artifacts" in node and not isinstance(node["artifacts"], bool):
+        _fail(
+            f"{path}.artifacts",
+            "invalid_artifacts",
+            f"{path}.artifacts must be a boolean",
+        )
     if "output_type" in node:
         _string(
             node["output_type"],
@@ -496,6 +511,95 @@ def _validate_declared_options(node: Mapping[str, Any], path: str) -> None:
         _validate_thinking(node["thinking"], f"{path}.thinking")
     if "maxBudgetUsd" in node:
         _positive_number(node["maxBudgetUsd"], f"{path}.maxBudgetUsd")
+    if "maxTurns" in node:
+        turns = node["maxTurns"]
+        if isinstance(turns, bool) or not isinstance(turns, int) or not 1 <= turns <= 90:
+            _fail(
+                f"{path}.maxTurns",
+                "invalid_max_turns",
+                f"{path}.maxTurns must be an integer between 1 and 90",
+            )
+    if "tool_call_contract" in node:
+        contract_path = f"{path}.tool_call_contract"
+        contract = _mapping(node["tool_call_contract"], contract_path)
+        if set(contract) != {"name", "arguments", "result"}:
+            _fail(
+                contract_path,
+                "invalid_tool_call_contract",
+                f"{contract_path} must define exactly name, arguments, and result",
+            )
+        name = _string(contract["name"], f"{contract_path}.name")
+        if not _SAFE_NAME.fullmatch(name):
+            _fail(
+                f"{contract_path}.name",
+                "invalid_tool_call_contract",
+                f"{contract_path}.name must be a portable tool name",
+            )
+        arguments = _mapping(contract["arguments"], f"{contract_path}.arguments")
+        if len(arguments) > 32:
+            _fail(
+                f"{contract_path}.arguments",
+                "invalid_tool_call_contract",
+                f"{contract_path}.arguments exceeds 32 fields",
+            )
+        result = _mapping(contract["result"], f"{contract_path}.result")
+        required = {
+            "items_path",
+            "select",
+            "output_items_path",
+            "output_count_path",
+            "output_status_path",
+            "empty_status",
+            "nonempty_status",
+            "max_items",
+        }
+        if set(result) != required:
+            _fail(
+                f"{contract_path}.result",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result has an invalid projection shape",
+            )
+        items_path = _string(
+            result["items_path"], f"{contract_path}.result.items_path"
+        )
+        components = items_path.split(".")
+        if len(components) > 8 or any(
+            not _SAFE_NAME.fullmatch(component) for component in components
+        ):
+            _fail(
+                f"{contract_path}.result.items_path",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result.items_path must be a portable dotted field path",
+            )
+        for field in (
+            "output_items_path",
+            "output_count_path",
+            "output_status_path",
+            "empty_status",
+            "nonempty_status",
+        ):
+            value = _string(result[field], f"{contract_path}.result.{field}")
+            if not _SAFE_NAME.fullmatch(value):
+                _fail(
+                    f"{contract_path}.result.{field}",
+                    "invalid_tool_call_contract",
+                    f"{contract_path}.result.{field} must be a portable field name",
+                )
+        selected = result["select"]
+        _string_list(selected, f"{contract_path}.result.select")
+        if not selected or len(selected) > 16 or len(set(selected)) != len(selected):
+            _fail(
+                f"{contract_path}.result.select",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result.select must contain 1 to 16 unique fields",
+            )
+        maximum = result["max_items"]
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or not 1 <= maximum <= 100:
+            _fail(
+                f"{contract_path}.result.max_items",
+                "invalid_tool_call_contract",
+                f"{contract_path}.result.max_items must be an integer between 1 and 100",
+            )
     if "sandbox" in node:
         _mapping(node["sandbox"], f"{path}.sandbox")
     if "mcp" in node:
@@ -629,6 +733,491 @@ def _validate_node_type(
                 )
 
 
+def _loop_group_failure(
+    path: str, code: str, message: str, *, line: int | None = None
+) -> WorkflowValidationError:
+    return WorkflowValidationError(_issue(path, code, message, line=line))
+
+
+_LOOP_GROUP_WORK_LIMIT = 4096
+
+
+def _checked_work_product(left: int, right: int) -> int:
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (left, right)
+    ):
+        raise ValueError("loop-group work factors must be non-negative integers")
+    return left * right
+
+
+def _loop_group_work_bounds(
+    nodes: tuple[WorkflowNode, ...], max_iterations: int
+) -> tuple[int, int]:
+    executions = 0
+    attempts = 0
+    for node in nodes:
+        multiplier = (
+            node.value.get("max_iterations", 1)
+            if node.node_type == "loop" and isinstance(node.value, Mapping)
+            else 1
+        )
+        retry = node.options.get("retry")
+        approval_rework = (
+            node.value.get("on_reject")
+            if node.node_type == "approval" and isinstance(node.value, Mapping)
+            else None
+        )
+        if isinstance(approval_rework, Mapping):
+            retries = approval_rework.get("max_attempts", 3)
+        elif isinstance(retry, Mapping):
+            retries = retry.get("max_attempts", 0)
+        else:
+            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        executions += multiplier
+        attempts += multiplier * (int(retries) + 1)
+    return (
+        _checked_work_product(max_iterations, executions),
+        _checked_work_product(max_iterations, attempts),
+    )
+
+
+def _loop_group_capacity_bounds(
+    nodes: tuple[WorkflowNode, ...],
+    max_iterations: int,
+    *,
+    group_id: str,
+    root_options: Mapping[str, object],
+    group_options: Mapping[str, object],
+    structured_output_ids: frozenset[str],
+) -> Mapping[str, int]:
+    """Derive v6 admission products from existing sealed runtime ceilings."""
+    from plugins.workflow.executors.base import NodeExecutionContext
+    from plugins.workflow.models import RunExecutionLimits, TerminalJournalReserve
+
+    output_limit = int(
+        NodeExecutionContext.__dataclass_fields__["max_output_bytes"].default
+    )
+    artifact_limit = int(
+        NodeExecutionContext.__dataclass_fields__["max_artifact_bytes"].default
+    )
+    execution_limits = RunExecutionLimits()
+    journal_unit = TerminalJournalReserve.for_projection(
+        4096
+    ).terminal_reserve_bytes
+
+    provider_routes = 0
+    provider_obligations = 0
+    output_attempts = 0
+    artifact_executions = 0
+    process_executions = 0
+    for node in nodes:
+        multiplier = (
+            int(node.value.get("max_iterations", 1))
+            if node.node_type == "loop" and isinstance(node.value, Mapping)
+            else 1
+        )
+        retry = node.options.get("retry")
+        approval_rework = (
+            node.value.get("on_reject")
+            if node.node_type == "approval" and isinstance(node.value, Mapping)
+            else None
+        )
+        if isinstance(approval_rework, Mapping):
+            retries = int(approval_rework.get("max_attempts", 3))
+        elif isinstance(retry, Mapping):
+            retries = int(retry.get("max_attempts", 0))
+        else:
+            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        executions = _checked_work_product(max_iterations, multiplier)
+        attempts = _checked_work_product(executions, retries + 1)
+        is_approval_rework = isinstance(approval_rework, Mapping)
+        if node.node_type in {
+            "command",
+            "prompt",
+            "loop",
+            "bash",
+            "script",
+        } or is_approval_rework:
+            output_attempts += attempts
+        if node.node_type in {"bash", "script"}:
+            if node.options.get("artifacts", True) is not False:
+                artifact_executions += attempts
+            process_executions += attempts
+
+        if node.node_type not in {"command", "prompt", "loop"} and not (
+            is_approval_rework
+        ):
+            continue
+        options = {
+            **root_options,
+            **group_options,
+            **node.options,
+        }
+        agents = options.get("agents")
+        inline_agents = (
+            tuple(
+                raw_agent
+                for raw_agent in agents.values()
+                if isinstance(raw_agent, Mapping)
+            )
+            if isinstance(agents, Mapping)
+            else ()
+        )
+        fallback = options.get("fallbackModel") is not None
+        execution_routes = 1 + int(fallback)
+        node_routes = execution_routes + len(inline_agents)
+        provider_routes += node_routes
+        provider_obligations += sum(
+            field in raw_agent
+            for raw_agent in inline_agents
+            for field in ("tools", "disallowedTools", "skills")
+        )
+        semantic_id = f"{group_id}/{node.id}"
+        if semantic_id in structured_output_ids or (
+            is_approval_rework
+            and any(field in options for field in ("output_format", "output_type"))
+        ):
+            provider_obligations += execution_routes
+        if root_options.get("persist_sessions") is True:
+            provider_obligations += execution_routes
+        if options.get("persist_session") is True:
+            provider_obligations += execution_routes
+        provider_obligations += execution_routes * sum(
+            field in options for field in ("allowed_tools", "denied_tools")
+        )
+        hooks = options.get("hooks")
+        if isinstance(hooks, Mapping):
+            provider_obligations += execution_routes * sum(
+                len(entries) if isinstance(entries, tuple | list) else 0
+                for entries in hooks.values()
+            )
+        provider_obligations += execution_routes * sum(
+            field in options for field in ("mcp", "skills", "agents")
+        )
+        provider_obligations += node_routes * sum(
+            field in options
+            for field in (
+                "modelReasoningEffort",
+                "effort",
+                "thinking",
+                "betas",
+                "service_tier",
+                "maxBudgetUsd",
+            )
+        )
+        if "webSearchMode" in root_options:
+            provider_obligations += node_routes
+        if "sandbox" in root_options:
+            provider_obligations += node_routes
+        if fallback:
+            provider_obligations += 1
+        if "sandbox" in node.options:
+            provider_obligations += node_routes
+
+    artifact_bytes = _checked_work_product(
+        artifact_executions, artifact_limit
+    )
+    child_attempts = _loop_group_work_bounds(nodes, max_iterations)[1]
+    journal_reserve_bytes = _checked_work_product(child_attempts, journal_unit)
+    # Script predecessor inputs are attempt-local and transient, so charge their
+    # maximum concurrent storage peak rather than every sequential execution.
+    # Counting every process attempt (including Bash) keeps the bound conservative
+    # without adding another authoring or snapshot field.
+    process_input_peak_bytes = _checked_work_product(
+        min(process_executions, execution_limits.max_parallel_nodes),
+        WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
+    )
+    run_bytes = (
+        _checked_work_product(output_attempts, output_limit)
+        + artifact_bytes
+        + journal_reserve_bytes
+        + process_input_peak_bytes
+    )
+    return {
+        "provider_routes": provider_routes,
+        "provider_obligations": provider_obligations,
+        "output_attempts": output_attempts,
+        "artifact_executions": artifact_executions,
+        "artifact_bytes": artifact_bytes,
+        "run_bytes": run_bytes,
+        "journal_reserve_bytes": journal_reserve_bytes,
+        "process_executions": process_executions,
+        "process_tree_rss_byte_executions": _checked_work_product(
+            process_executions, execution_limits.process_tree_rss_bytes
+        ),
+        "process_tree_cpu_second_executions": int(
+            process_executions * execution_limits.process_tree_cpu_seconds
+        ),
+        "process_descendant_executions": _checked_work_product(
+            process_executions, execution_limits.max_descendants
+        ),
+    }
+
+
+def validate_v6_storage_capacity(package: WorkflowPackage) -> None:
+    """Compare sealed v6 storage products after structural provider preflight."""
+    from inspect import signature
+
+    from plugins.workflow.models import RunExecutionLimits
+    from plugins.workflow.store import RunStore
+
+    if not supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    ):
+        return
+    run_ceiling = int(signature(RunStore).parameters["max_run_bytes"].default)
+    journal_ceiling = max(1, run_ceiling // 2)
+    execution_limits = RunExecutionLimits()
+    run_bytes = 0
+    journal_reserve_bytes = 0
+    for node in package.definition.nodes:
+        if node.node_type != "loop_group":
+            continue
+        loop_group = package.language.node_semantics[node.id]["loop_group"]
+        capacity = loop_group["capacity"]
+        run_bytes += int(capacity["run_bytes"])
+        journal_reserve_bytes += int(capacity["journal_reserve_bytes"])
+        for label, product, ceiling in (
+            ("run-byte", run_bytes, run_ceiling),
+            (
+                "journal-reserve",
+                journal_reserve_bytes,
+                journal_ceiling,
+            ),
+        ):
+            if product > ceiling:
+                raise _loop_group_failure(
+                    f"nodes[{node.source_index}].loop_group",
+                    "loop_group_product_limit",
+                    f"loop_group {node.id} {label} product {product} "
+                    f"exceeds ceiling {ceiling}",
+                )
+        for label, product, ceiling in (
+            (
+                "process execution",
+                int(capacity["process_executions"]),
+                int(loop_group["child_attempts"]),
+            ),
+            (
+                "process-tree RSS byte-execution",
+                int(capacity["process_tree_rss_byte_executions"]),
+                int(capacity["process_executions"])
+                * execution_limits.process_tree_rss_bytes,
+            ),
+            (
+                "process-tree CPU second-execution",
+                int(capacity["process_tree_cpu_second_executions"]),
+                int(
+                    int(capacity["process_executions"])
+                    * execution_limits.process_tree_cpu_seconds
+                ),
+            ),
+            (
+                "process descendant-execution",
+                int(capacity["process_descendant_executions"]),
+                int(capacity["process_executions"])
+                * execution_limits.max_descendants,
+            ),
+        ):
+            if product > ceiling:
+                raise _loop_group_failure(
+                    f"nodes[{node.source_index}].loop_group",
+                    "loop_group_product_limit",
+                    f"loop_group {node.id} {label} product {product} "
+                    f"exceeds ceiling {ceiling}",
+                )
+
+
+def _normalize_loop_group(
+    node: Mapping[str, Any],
+    path: str,
+    *,
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+    origin: WorkflowNodeOrigin | None,
+) -> Mapping[str, object]:
+    group_path = f"{path}.loop_group"
+    value = node["loop_group"]
+    if not isinstance(value, Mapping):
+        raise _loop_group_failure(
+            group_path,
+            "loop_group_shape_invalid",
+            f"{group_path} must be a mapping",
+        )
+    unknown = sorted(set(value) - LOOP_GROUP_FIELDS)
+    if unknown:
+        field = unknown[0]
+        raise _loop_group_failure(
+            f"{group_path}.{field}",
+            "loop_group_shape_invalid",
+            f"{group_path}.{field} is not supported",
+        )
+    until = value.get("until")
+    if not isinstance(until, str) or not until.strip():
+        raise _loop_group_failure(
+            f"{group_path}.until",
+            "loop_group_shape_invalid",
+            f"{group_path}.until must be a nonblank string",
+        )
+    iterations = value.get("max_iterations")
+    if (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, int)
+        or not 1 <= iterations <= 100
+    ):
+        raise _loop_group_failure(
+            f"{group_path}.max_iterations",
+            "loop_group_shape_invalid",
+            f"{group_path}.max_iterations must be between 1 and 100",
+        )
+    for field in ("fresh_context", "interactive", "signal_completes"):
+        if field in value and not isinstance(value[field], bool):
+            raise _loop_group_failure(
+                f"{group_path}.{field}",
+                "loop_group_shape_invalid",
+                f"{group_path}.{field} must be a boolean",
+            )
+    for field in ("until_bash", "gate_message"):
+        if field in value and (
+            not isinstance(value[field], str) or not value[field].strip()
+        ):
+            raise _loop_group_failure(
+                f"{group_path}.{field}",
+                "loop_group_shape_invalid",
+                f"{group_path}.{field} must be a nonblank string",
+            )
+    if value.get("interactive") is True and "gate_message" not in value:
+        raise _loop_group_failure(
+            f"{group_path}.gate_message",
+            "loop_group_shape_invalid",
+            f"{group_path}.gate_message is required when interactive",
+        )
+    body = value.get("nodes")
+    if not isinstance(body, list) or not body:
+        raise _loop_group_failure(
+            f"{group_path}.nodes",
+            "loop_group_shape_invalid",
+            f"{group_path}.nodes must be a non-empty list",
+        )
+    if len(body) > 512:
+        raise _loop_group_failure(
+            f"{group_path}.nodes",
+            "loop_group_product_limit",
+            f"{group_path}.nodes exceeds the 512-node limit",
+        )
+
+    normalized: list[WorkflowNode] = []
+    for index, raw_child in enumerate(body):
+        child_path = f"{group_path}.nodes[{index}]"
+        if not isinstance(raw_child, Mapping):
+            raise _loop_group_failure(
+                child_path,
+                "loop_group_shape_invalid",
+                f"{child_path} must be a mapping",
+            )
+        forbidden = next(
+            (
+                field
+                for field in ("include", "workflow", "loop_group")
+                if field in raw_child
+            ),
+            None,
+        )
+        if forbidden is not None:
+            forbidden_path = (
+                child_path if forbidden == "loop_group" else f"{child_path}.{forbidden}"
+            )
+            raise _loop_group_failure(
+                forbidden_path,
+                "loop_group_shape_invalid",
+                f"{child_path} cannot contain {forbidden}",
+            )
+        child = dict(raw_child)
+        try:
+            normalized.append(
+                _normalize_node(
+                    child,
+                    index,
+                    {},
+                    profile=profile,
+                    normalizer_version=normalizer_version,
+                    origin=origin,
+                    path=child_path,
+                    loop_group_body=True,
+                )
+            )
+        except WorkflowValidationError as exc:
+            issue = exc.issues[0]
+            raise _loop_group_failure(
+                issue.path,
+                "loop_group_shape_invalid",
+                issue.message,
+                line=issue.source_line,
+            ) from exc
+
+    by_id: dict[str, WorkflowNode] = {}
+    for child in normalized:
+        if child.id in by_id:
+            raise _loop_group_failure(
+                f"{group_path}.nodes[{child.source_index}].id",
+                "loop_group_topology_invalid",
+                f"duplicate loop-group body id: {child.id}",
+            )
+        by_id[child.id] = child
+    edge_count = sum(len(set(child.depends_on)) for child in normalized)
+    if edge_count > 4096:
+        raise _loop_group_failure(
+            f"{group_path}.nodes",
+            "loop_group_product_limit",
+            f"{group_path}.nodes exceeds the 4096-edge limit",
+        )
+    child_executions, child_attempts = _loop_group_work_bounds(
+        tuple(normalized), iterations
+    )
+    if max(child_executions, child_attempts) > _LOOP_GROUP_WORK_LIMIT:
+        raise _loop_group_failure(
+            group_path,
+            "loop_group_product_limit",
+            f"loop_group {node.get('id')} work bound "
+            f"{max(child_executions, child_attempts)} exceeds ceiling "
+            f"{_LOOP_GROUP_WORK_LIMIT}",
+        )
+    for child in normalized:
+        if any(dependency not in by_id for dependency in child.depends_on):
+            raise _loop_group_failure(
+                f"{group_path}.nodes[{child.source_index}].depends_on",
+                "loop_group_scope_invalid",
+                "loop-group body dependencies must name sibling body nodes",
+            )
+    indegree = {child.id: len(set(child.depends_on)) for child in normalized}
+    outgoing: dict[str, list[str]] = {child.id: [] for child in normalized}
+    for child in normalized:
+        for dependency in set(child.depends_on):
+            outgoing[dependency].append(child.id)
+    ready = deque(node_id for node_id, degree in indegree.items() if degree == 0)
+    visited = 0
+    while ready:
+        node_id = ready.popleft()
+        visited += 1
+        for target in outgoing[node_id]:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                ready.append(target)
+    if visited != len(normalized):
+        raise _loop_group_failure(
+            f"{group_path}.nodes",
+            "loop_group_topology_invalid",
+            "loop-group body dependency graph contains a cycle",
+        )
+    return freeze_value({
+        **dict(value),
+        "nodes": tuple(normalized),
+        "fresh_context": value.get("fresh_context", False),
+        "interactive": value.get("interactive", False),
+    })
+
+
 def _normalize_node(
     raw: Any,
     index: int,
@@ -637,8 +1226,10 @@ def _normalize_node(
     profile: WorkflowLanguageProfile,
     normalizer_version: int,
     origin: WorkflowNodeOrigin | None = None,
+    path: str | None = None,
+    loop_group_body: bool = False,
 ) -> WorkflowNode:
-    path = f"nodes[{index}]"
+    path = path or f"nodes[{index}]"
     node = _mapping(raw, path)
     if "kind" in node:
         legacy_kind = node.get("kind")
@@ -667,10 +1258,41 @@ def _normalize_node(
     node_id = _validate_identifier(
         node.get("id"), f"{path}.id", max_length=expanded_id_limit
     )
-    present_types = [field for field in NODE_TYPES if field in node]
+    present_types = [field for field in EXECUTABLE_NODE_TYPES if field in node]
     if len(present_types) != 1:
         _fail(path, "node_type_one_of", f"{path} must define exactly one node type")
     node_type = present_types[0]
+    phase6 = supports_phase6_semantics(profile, normalizer_version)
+    for field in ("maxTurns", "tool_call_contract", "artifacts"):
+        if field in node and not phase6:
+            _fail(
+                f"{path}.{field}",
+                f"{field}_version_unsupported",
+                f"{field} requires Phase 6",
+            )
+    for field, allowed_types in (
+        ("maxTurns", {"command", "prompt"}),
+        ("tool_call_contract", {"command", "prompt"}),
+        ("artifacts", {"bash", "script"}),
+    ):
+        if field in node and node_type not in allowed_types:
+            _fail(
+                f"{path}.{field}",
+                "field_not_applicable",
+                f"{field} is not supported on {node_type} nodes",
+            )
+    if node_type == "loop_group" and not phase6:
+        _fail(
+            f"{path}.loop_group",
+            "loop_group_version_unsupported",
+            "loop_group requires normalizer version 6",
+        )
+    if node_type == "loop_group" and "retry" in node:
+        _fail(
+            f"{path}.retry",
+            "loop_group_shape_invalid",
+            "retry is not supported on durable loop groups",
+        )
     structural_fields = set(structural_node_field_names(node_type))
     archon_v3 = supports_phase3_semantics(profile, normalizer_version)
     if archon_v3 and not is_reference_safe_node_id(node_id):
@@ -691,6 +1313,17 @@ def _normalize_node(
             f"{path}.{field} is not structurally valid for {node_type} nodes",
             line=lines.get(field),
         )
+    normalized_value = (
+        _normalize_loop_group(
+            node,
+            path,
+            profile=profile,
+            normalizer_version=normalizer_version,
+            origin=origin,
+        )
+        if node_type == "loop_group"
+        else freeze_value(node[node_type])
+    )
     _validate_node_type(
         node,
         node_type,
@@ -732,15 +1365,16 @@ def _normalize_node(
         _validate_hook_fields(
             node["hooks"],
             f"{path}.hooks",
-            phase5_semantics=supports_phase5_semantics(
-                profile, normalizer_version
-            ),
+            phase5_semantics=supports_phase5_semantics(profile, normalizer_version),
         )
     if "when" in node:
         when = _string(node["when"], f"{path}.when")
         if archon_v3:
             try:
-                validate_v3_condition_syntax(when)
+                if phase6 and loop_group_body:
+                    validate_v6_condition_syntax(when)
+                else:
+                    validate_v3_condition_syntax(when)
             except WorkflowConditionError as exc:
                 if isinstance(exc.__cause__, WorkflowReferenceSyntaxError):
                     _fail(f"{path}.when", exc.__cause__.code, str(exc.__cause__))
@@ -763,7 +1397,7 @@ def _normalize_node(
     return WorkflowNode(
         id=node_id,
         node_type=node_type,
-        value=freeze_value(node[node_type]),
+        value=normalized_value,
         depends_on=tuple(depends),
         source_index=index,
         source_line=lines.get("id"),
@@ -935,9 +1569,7 @@ def _schema_has_unaddressable_dotted_key(
         )
         array_capable = not (
             isinstance(schema_type, str) and schema_type != "array"
-        ) and not (
-            isinstance(schema_type, tuple | list) and "array" not in schema_type
-        )
+        ) and not (isinstance(schema_type, tuple | list) and "array" not in schema_type)
         if object_capable:
             properties = current.get("properties")
             if isinstance(properties, Mapping):
@@ -1098,9 +1730,7 @@ def _v3_object_path_impossible(
         child = properties[property_name]
         if not remaining:
             return child is False
-        return _v3_schema_path_impossible(
-            child, tuple(remaining), root, resolving
-        )
+        return _v3_schema_path_impossible(child, tuple(remaining), root, resolving)
     patterns = schema.get("patternProperties")
     if isinstance(patterns, Mapping) and patterns:
         return False
@@ -1108,9 +1738,7 @@ def _v3_object_path_impossible(
     if additional is False:
         return True
     if isinstance(additional, Mapping) and remaining:
-        return _v3_schema_path_impossible(
-            additional, tuple(remaining), root, resolving
-        )
+        return _v3_schema_path_impossible(additional, tuple(remaining), root, resolving)
     return False
 
 
@@ -1142,9 +1770,7 @@ def _v3_array_path_impossible(
     return _v3_schema_path_impossible(child, remaining, root, resolving)
 
 
-def _resolve_v3_local_ref(
-    root: Mapping[str, object], reference: str
-) -> object | None:
+def _resolve_v3_local_ref(root: Mapping[str, object], reference: str) -> object | None:
     if not reference.startswith("#/"):
         return None
     current: object = root
@@ -1185,6 +1811,12 @@ def _validate_v3_static_output_references(
             named_script_bodies=named_script_bodies,
             include_phase4_templates=phase4_templates,
         ):
+            if (
+                normalizer_version >= 6
+                and node.node_type == "loop_group"
+                and surface_path.endswith(".loop_group.until_bash")
+            ):
+                continue
             try:
                 if surface_path.endswith(".when"):
                     references = validate_v3_condition_syntax(template)
@@ -1233,9 +1865,7 @@ def _validate_v3_static_output_references(
                 if _v3_output_path_impossible(schema, reference.path):
                     if _schema_has_unaddressable_dotted_key(schema, reference.path):
                         code = "output_reference_path_unsupported"
-                        message = (
-                            "output reference cannot address a mapping key containing a dot"
-                        )
+                        message = "output reference cannot address a mapping key containing a dot"
                     else:
                         code = "structured_output_field_impossible"
                         message = (
@@ -1250,6 +1880,175 @@ def _validate_v3_static_output_references(
                             line=node.source_line,
                         )
                     )
+    if issues:
+        raise WorkflowValidationError(tuple(issues))
+
+
+def _validate_v6_loop_group_references(
+    nodes: tuple[WorkflowNode, ...],
+    structured_outputs: Mapping[str, object],
+    *,
+    command_bodies: Mapping[str, str] | None = None,
+    named_script_bodies: Mapping[str, str] | None = None,
+) -> None:
+    issues: list[ValidationIssue] = []
+    for group in nodes:
+        if group.node_type != "loop_group" or not isinstance(group.value, Mapping):
+            continue
+        body = tuple(group.value["nodes"])
+        scoped_commands = (
+            {
+                child.id: command_bodies[f"{group.id}/{child.id}"]
+                for child in body
+                if f"{group.id}/{child.id}" in command_bodies
+            }
+            if command_bodies is not None
+            else None
+        )
+        scoped_scripts = (
+            {
+                child.id: named_script_bodies[f"{group.id}/{child.id}"]
+                for child in body
+                if f"{group.id}/{child.id}" in named_script_bodies
+            }
+            if named_script_bodies is not None
+            else None
+        )
+        body_ids = frozenset(child.id for child in body)
+        group_path = f"nodes[{group.source_index}].loop_group.nodes"
+
+        def validate_template(
+            nested_path: str,
+            template: str,
+            *,
+            current_dependencies: frozenset[str],
+            line: int,
+            bash_context: bool = False,
+            group_predicate: bool = False,
+        ) -> None:
+            try:
+                previous = tuple(
+                    bash_loop_previous_output_references(template)
+                    if bash_context
+                    else iter_loop_previous_output_references(
+                        template, normalizer_version=6
+                    )
+                )
+                masked = list(template)
+                for reference in previous:
+                    masked[reference.start : reference.end] = " " * (
+                        reference.end - reference.start
+                    )
+                ordinary_template = "".join(masked)
+                references = (
+                    bash_output_references(ordinary_template, normalizer_version=6)
+                    if bash_context
+                    else tuple(
+                        iter_output_references(
+                            ordinary_template,
+                            normalizer_version=6,
+                        )
+                    )
+                )
+            except (BashRenderingError, WorkflowReferenceSyntaxError) as exc:
+                issues.append(
+                    _issue(
+                        nested_path,
+                        "loop_group_scope_invalid",
+                        str(exc),
+                        line=line,
+                    )
+                )
+                return
+            for reference in previous:
+                producer_id = reference.node_id
+                if producer_id not in body_ids:
+                    issues.append(
+                        _issue(
+                            nested_path,
+                            "loop_group_scope_invalid",
+                            f"unknown previous-iteration body node: {producer_id}",
+                            line=line,
+                        )
+                    )
+                    continue
+                if reference.path:
+                    output = structured_outputs.get(f"{group.id}/{producer_id}")
+                    schema = getattr(output, "canonical_schema", None)
+                    if not isinstance(schema, Mapping) or _v3_output_path_impossible(
+                        schema, reference.path
+                    ):
+                        issues.append(
+                            _issue(
+                                nested_path,
+                                "loop_group_scope_invalid",
+                                "previous-iteration field requires a compatible structured output",
+                                line=line,
+                            )
+                        )
+            for reference in references:
+                if reference.node_id in body_ids:
+                    allowed = reference.node_id in current_dependencies
+                    output_id = f"{group.id}/{reference.node_id}"
+                else:
+                    allowed = reference.node_id in group.depends_on
+                    output_id = reference.node_id
+                if not allowed:
+                    issues.append(
+                        _issue(
+                            nested_path,
+                            (
+                                "output_reference_not_declared_dependency"
+                                if group_predicate
+                                else "loop_group_scope_invalid"
+                            ),
+                            f"output reference {reference.node_id} is outside the loop-group scope",
+                            line=line,
+                        )
+                    )
+                    continue
+                if reference.path:
+                    output = structured_outputs.get(output_id)
+                    schema = getattr(output, "canonical_schema", None)
+                    if not isinstance(schema, Mapping) or _v3_output_path_impossible(
+                        schema, reference.path
+                    ):
+                        issues.append(
+                            _issue(
+                                nested_path,
+                                "loop_group_scope_invalid",
+                                "loop-group field reference is incompatible with its structured output",
+                                line=line,
+                            )
+                        )
+
+        for child in body:
+            child_prefix = f"{group_path}[{child.source_index}]"
+            logical_prefix = f"nodes[{child.source_index}]"
+            for surface_path, template in _interpolated_node_templates(
+                child,
+                command_bodies=scoped_commands,
+                named_script_bodies=scoped_scripts,
+                include_phase4_templates=True,
+            ):
+                nested_path = child_prefix + surface_path.removeprefix(logical_prefix)
+                validate_template(
+                    nested_path,
+                    template,
+                    current_dependencies=frozenset(child.depends_on),
+                    line=child.source_line,
+                    bash_context=surface_path.endswith((".bash", ".until_bash")),
+                )
+        until_bash = group.value.get("until_bash")
+        if isinstance(until_bash, str):
+            validate_template(
+                f"nodes[{group.source_index}].loop_group.until_bash",
+                until_bash,
+                current_dependencies=body_ids,
+                line=group.source_line,
+                bash_context=True,
+                group_predicate=True,
+            )
     if issues:
         raise WorkflowValidationError(tuple(issues))
 
@@ -1283,12 +2082,17 @@ def _interpolated_node_templates(
         if include_phase4_templates and isinstance(gate_message, str):
             yield f"{prefix}.loop.gate_message", gate_message
         command_body = (
-            command_bodies.get(node.id)
-            if command_bodies is not None
-            else None
+            command_bodies.get(node.id) if command_bodies is not None else None
         )
         if include_phase4_templates and isinstance(command_body, str):
             yield f"{prefix}.loop.command", command_body
+    elif node.node_type == "loop_group" and isinstance(node.value, Mapping):
+        until_bash = node.value.get("until_bash")
+        if isinstance(until_bash, str):
+            yield f"{prefix}.loop_group.until_bash", until_bash
+        gate_message = node.value.get("gate_message")
+        if include_phase4_templates and isinstance(gate_message, str):
+            yield f"{prefix}.loop_group.gate_message", gate_message
     elif node.node_type == "approval" and isinstance(node.value, Mapping):
         message = node.value.get("message")
         if isinstance(message, str):
@@ -1429,9 +2233,7 @@ def _rewrite_authenticated_resource_body(
             if dependency in instance_ids
         }
         sinks = tuple(
-            candidate.id
-            for candidate in instance_nodes
-            if candidate.id not in consumed
+            candidate.id for candidate in instance_nodes if candidate.id not in consumed
         )
         if sinks:
             aliases[alias_id] = sinks[0]
@@ -1509,11 +2311,14 @@ def validate_authenticated_resource_references(
         ):
             rewritten_commands = dict(validated.command_bodies)
             rewritten_scripts = dict(validated.named_script_bodies)
-            for node in package.definition.nodes:
-                command_body = rewritten_commands.get(node.id)
+            for scoped in iter_scoped_workflow_nodes(package.definition):
+                node = scoped.node
+                command_body = rewritten_commands.get(scoped.semantic_id)
                 if command_body is not None:
-                    rewritten_commands[node.id] = (
-                        _rewrite_authenticated_resource_body(
+                    rewritten_commands[scoped.semantic_id] = (
+                        command_body
+                        if scoped.group_id is not None
+                        else _rewrite_authenticated_resource_body(
                             package,
                             node,
                             command_body,
@@ -1524,10 +2329,12 @@ def validate_authenticated_resource_references(
                             ),
                         )
                     )
-                script_body = rewritten_scripts.get(node.id)
+                script_body = rewritten_scripts.get(scoped.semantic_id)
                 if script_body is not None:
-                    rewritten_scripts[node.id] = (
-                        _rewrite_authenticated_resource_body(
+                    rewritten_scripts[scoped.semantic_id] = (
+                        script_body
+                        if scoped.group_id is not None
+                        else _rewrite_authenticated_resource_body(
                             package,
                             node,
                             script_body,
@@ -1552,6 +2359,16 @@ def validate_authenticated_resource_references(
             ),
             normalizer_version=package.language.normalizer_version,
         )
+        if supports_phase6_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        ):
+            _validate_v6_loop_group_references(
+                package.definition.nodes,
+                package.language.structured_outputs,
+                command_bodies=validated.command_bodies,
+                named_script_bodies=validated.named_script_bodies,
+            )
         if supports_phase4_semantics(
             package.language.effective_profile,
             package.language.normalizer_version,
@@ -1690,9 +2507,12 @@ def _validate_sidecar_node_references(
 
 def _expand_root_sidecar_node_references(
     sidecar: Mapping[str, Any],
-    nodes: tuple[WorkflowNode, ...],
+    definition: WorkflowDefinition,
+    *,
+    allow_scoped: bool = False,
 ) -> Mapping[str, Any]:
     """Resolve only root-authored executable and include IDs into final nodes."""
+    nodes = definition.nodes
     root_node_ids = {
         node.id
         for node in nodes
@@ -1707,8 +2527,20 @@ def _expand_root_sidecar_node_references(
             [],
         ).append(node.id)
     expanded: list[str] = []
+    scoped_ids = (
+        frozenset(
+            scoped.semantic_id
+            for scoped in iter_scoped_workflow_nodes(definition)
+            if scoped.group_id is not None
+        )
+        if allow_scoped
+        else frozenset()
+    )
     for authored_id in sidecar.get("outward_action_nodes", ()):
         if authored_id in root_node_ids:
+            expanded.append(authored_id)
+            continue
+        if authored_id in scoped_ids:
             expanded.append(authored_id)
             continue
         instance_nodes = include_instances.get(authored_id)
@@ -2097,8 +2929,23 @@ def _compile_workflow_source_document(
         selection.effective_profile,
         selected_normalizer_version,
     ):
-        sidecar = _expand_root_sidecar_node_references(sidecar, nodes)
-    node_ids = frozenset(node.id for node in nodes)
+        sidecar = _expand_root_sidecar_node_references(
+            sidecar,
+            definition,
+            allow_scoped=supports_phase6_semantics(
+                selection.effective_profile,
+                selected_normalizer_version,
+            ),
+        )
+    node_ids = frozenset(
+        scoped.semantic_id
+        for scoped in iter_scoped_workflow_nodes(definition)
+        if scoped.group_id is None
+        or supports_phase6_semantics(
+            selection.effective_profile,
+            selected_normalizer_version,
+        )
+    )
     _validate_sidecar_node_references(sidecar, node_ids)
     try:
         normalized = normalize_workflow(
@@ -2124,6 +2971,13 @@ def _compile_workflow_source_document(
             normalized.metadata.structured_outputs,
             normalizer_version=selected_normalizer_version,
         )
+        if supports_phase6_semantics(
+            selection.effective_profile, selected_normalizer_version
+        ):
+            _validate_v6_loop_group_references(
+                normalized.definition.nodes,
+                normalized.metadata.structured_outputs,
+            )
     else:
         _validate_structured_output_field_references(
             normalized.definition.nodes, normalized.metadata.structured_outputs

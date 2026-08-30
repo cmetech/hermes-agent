@@ -46,8 +46,8 @@ because older strict companion parsers reject the new field. An explicit
 
 ### Current normalizer selection
 
-New and default `archon-2026-07` contracts and admissions use normalizer v5.
-Current `hermes-legacy` contracts use v2. Explicit and sealed v1 through v4
+New and default `archon-2026-07` contracts and admissions use normalizer v6.
+Current `hermes-legacy` contracts use v2. Explicit and sealed v1 through v5
 remain supported compatibility inputs, and resume preserves their pinned
 semantics.
 
@@ -56,9 +56,9 @@ semantics.
 {
   "current_normalizer_by_profile": {
     "hermes-legacy": 2,
-    "archon-2026-07": 5
+    "archon-2026-07": 6
   },
-  "supported_normalizer_versions": [1, 2, 3, 4, 5]
+  "supported_normalizer_versions": [1, 2, 3, 4, 5, 6]
 }
 ```
 
@@ -111,9 +111,9 @@ reporting validation failures; do not collapse them to a generic parse error.
 
 ### Normalizer v4
 
-Normal authoring contracts and new Archon admissions select normalizer v4. An
-installed integration or contract test retrieves its authoritative inventory
-with the ordinary default call:
+Explicit historical v4 contracts retain their sealed include and ordinary-loop
+semantics. An installed integration or contract test retrieves that inventory
+with an explicit version selection:
 
 ```python
 from plugins.workflow.language_schema import workflow_authoring_contract
@@ -121,12 +121,12 @@ from plugins.workflow.models import WorkflowLanguageProfile
 
 contract = workflow_authoring_contract(
     WorkflowLanguageProfile.ARCHON_2026_07,
+    normalizer_version=4,
 )
 ```
 
 Compile, validate, trust, and admit that exact contract, and pin v4 in the
-immutable run snapshot. Pass `normalizer_version=1`, `2`, or `3` only to read or
-operate an explicit historical contract; those selections retain compatibility
+immutable run snapshot. Explicit historical selections retain compatibility
 and do not change the current Archon default.
 
 V4 adds `include` as a compile-only source directive. It is not executable and
@@ -168,16 +168,62 @@ iteration removes provide-input and offers approve or cancel. Approval accepts
 the sealed result without re-running the provider; feedback permits the next
 bounded iteration.
 
-Runtime child workflows, `include.with`, and `loop_group` are deliberate later
-Archon omissions. Do not synthesize them from v4. Portable `maxBudgetUsd` and
-sandbox guarantees also remain blocked.
+Runtime child workflows and `include.with` remain deliberate omissions. Do not
+synthesize them from v4. Portable `maxBudgetUsd` and sandbox guarantees also
+remain blocked.
+
+Normalizer v6 defines the current `loop_group` authoring contract. A v6 group
+has exactly this one-level shape:
+
+```yaml
+- id: process-items
+  depends_on: [prepare-items]
+  loop_group:
+    nodes:
+      - id: read
+        command: read-item
+      - id: record
+        depends_on: [read]
+        command: record-item
+    until: <promise>DONE</promise>
+    max_iterations: 25
+```
+
+The only group fields are `nodes`, required nonblank `until`, required integer
+`max_iterations` from 1 through 100, boolean `fresh_context`, optional
+`until_bash`, boolean `interactive`, boolean `signal_completes`, and nonblank
+`gate_message`. The body is nonempty, immutable, and bounded to 512 sibling
+nodes and 4,096 edges. Body IDs are unique, dependencies name body siblings,
+and the graph is acyclic. The first terminal body node in definition order is
+the primary sink and supplies the outer group output; there is no `returns`
+selector.
+
+The sealed worst-case work product must also be at most 4,096. Multiply
+`max_iterations` by the larger of total body executions and total body
+attempts. Attempts include the initial attempt plus admitted retries, approval
+rework attempts, and bounded ordinary-loop iteration multipliers.
+
+Body nodes may be `prompt`, `command`, `bash`, `script`, `approval`, `cancel`,
+or an ordinary `loop`. Reject body `include`, nested `loop_group`, runtime
+`workflow`, and group-level `retry`. Group provider/model options are body
+defaults; an explicit body option wins. Effective interactivity requires both
+root and group `interactive`, using the existing `signal_completes` and
+`gate_message` rules.
+
+Inside a body, `$body.output` names a direct sibling dependency for the current
+iteration. `$outer.output` names a direct dependency of the outer group.
+`$LOOP_PREV.body.output` names the immediately previous iteration; a known
+whole-output reference is empty on iteration one, while field traversal still
+requires the body's declared structured-output schema. Older iterations are
+not addressable.
 
 ## Portable YAML shape
 
 Required top-level fields are `name`, `description`, and a nonempty `nodes`
 array. Each node has `id`, exactly one node-type payload, and optional
 `depends_on`. Node types are `command`, `prompt`, `bash`, `script`, `loop`,
-`approval`, and `cancel`. Graph and `$node.output` references must be upstream.
+`approval`, and `cancel`; explicit v6 also admits `loop_group`. Graph and
+`$node.output` references must be upstream.
 
 Common fields include `when`, `trigger_rule`, `context`, `idle_timeout`,
 `always_run`, `output_type`, and supported `retry`. AI nodes may use
@@ -296,11 +342,11 @@ warning/fresh behavior. Use `workflow doctor`, generated
 `compatibility_codes`, and Run Inspector recovery evidence as the operator
 authority.
 
-MCP and skills remain options, not node kinds. V4 adds compile-only
-includes and the sealed ordinary-loop contract above; it adds no executable
-node kind. Do not synthesize runtime child workflows, include parameters,
-`loop_group`, Phase 5 `maxBudgetUsd`, sandbox, or provider-portability
-guarantees.
+MCP and skills remain options, not node kinds. V4 adds compile-only includes
+and the sealed ordinary-loop contract above; explicit v6 adds only the bounded
+one-level `loop_group` contract. Do not synthesize runtime child workflows,
+include parameters, nested groups, Phase 5 `maxBudgetUsd`, sandbox, or
+provider-portability guarantees.
 
 Script nodes require `runtime: uv` or `runtime: bun`; named scripts resolve
 below `scripts/`. Named command templates resolve below `commands/`. MCP names

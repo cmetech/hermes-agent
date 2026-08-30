@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -8,6 +9,7 @@ import time
 
 import pytest
 
+from agent.structured_output import canonical_json_bytes
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionContext
@@ -27,6 +29,42 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from tools.managed_process import ProcessResourceLimits, TerminationPolicy
+
+
+def _v6_predecessor(node_id: str, payload: str) -> dict[str, object]:
+    value = {"payload": payload}
+    encoded = canonical_json_bytes(value, max_bytes=2 * 1024 * 1024)
+    return {
+        "state": "succeeded",
+        "output_evidence": {
+            "node_id": node_id,
+            "attempt_id": f"{node_id}-attempt",
+            "publication_id": "a" * 32,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "size_bytes": len(encoded),
+            "media_type": "application/json",
+            "schema_fingerprint": "b" * 64,
+            "canonicalization_version": 1,
+            "output_type": "LargePayload",
+        },
+        "output": value,
+    }
+
+
+def _predecessor_reader_runtime(tmp_path: Path) -> Path:
+    wrapper = tmp_path / "predecessor-reader"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os\n"
+        "path=os.environ['HERMES_WORKFLOW_PREDECESSORS_FILE']\n"
+        "with open(path, encoding='utf-8') as stream: values=json.load(stream)\n"
+        "print(json.dumps({'input_bytes': os.path.getsize(path), "
+        "'lengths': {key: len(item['output']['payload']) "
+        "for key,item in values.items()}}))\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    return wrapper
 
 
 def test_node_execution_context_preserves_pre_sealed_resource_positional_order(
@@ -781,3 +819,135 @@ def test_scheduler_executes_snapshotted_named_script(
     )
     assert artifact["media_type"] == "application/json"
     assert (bundle / "content.json").read_bytes() == output.read_bytes()
+
+
+def test_v6_script_receives_two_individually_bounded_large_predecessors(
+    tmp_path: Path,
+) -> None:
+    dependencies = ("left", "right")
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('unused')\n",
+            depends_on=dependencies,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+        predecessor_results={
+            dependency: _v6_predecessor(dependency, dependency[0] * 600_000)
+            for dependency in dependencies
+        },
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(_predecessor_reader_runtime(tmp_path))
+    ).execute(context)
+
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    observed = json.loads(output.read_text())
+    assert observed["lengths"] == {"left": 600_000, "right": 600_000}
+    assert observed["input_bytes"] > context.max_output_bytes
+    assert not (context.effective_attempt_directory / "predecessors.json").exists()
+
+
+def test_v6_script_accepts_three_large_predecessors_below_shared_transport_bound(
+    tmp_path: Path,
+) -> None:
+    dependencies = ("first", "second", "third")
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('unused')\n",
+            depends_on=dependencies,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+        predecessor_results={
+            dependency: _v6_predecessor(dependency, "x" * 600_000)
+            for dependency in dependencies
+        },
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(_predecessor_reader_runtime(tmp_path))
+    ).execute(context)
+
+    assert result.status == "succeeded"
+    output = context.run_directory / result.artifacts[0].relative_path
+    assert json.loads(output.read_text())["lengths"] == {
+        dependency: 600_000 for dependency in dependencies
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_evidence",
+        "wrong_size",
+        "wrong_digest",
+        "wrong_node",
+        "oversized_output",
+        "null_evidence",
+        "missing_all",
+        "undeclared_output",
+        "aggregate_limit",
+        "process_limit",
+    ),
+)
+def test_v6_script_predecessor_transport_fails_closed(
+    tmp_path: Path, case: str
+) -> None:
+    dependencies = ("left", "right")
+    predecessors = {
+        dependency: _v6_predecessor(dependency, "x" * 600_000)
+        for dependency in dependencies
+    }
+    resource_limits = ProcessResourceLimits()
+    if case == "missing_evidence":
+        predecessors["left"].pop("output_evidence")
+    elif case == "wrong_size":
+        predecessors["left"]["output_evidence"]["size_bytes"] += 1
+    elif case == "wrong_digest":
+        predecessors["left"]["output_evidence"]["sha256"] = "0" * 64
+    elif case == "wrong_node":
+        predecessors["left"]["output_evidence"]["node_id"] = "other"
+    elif case == "oversized_output":
+        predecessors["left"] = _v6_predecessor("left", "x" * (1024 * 1024))
+    elif case == "null_evidence":
+        predecessors["left"].pop("output")
+        predecessors["left"]["output_evidence"] = None
+    elif case == "missing_all":
+        predecessors = {}
+    elif case == "undeclared_output":
+        predecessors["extra"] = _v6_predecessor("extra", "small")
+    elif case == "aggregate_limit":
+        dependencies = ("first", "second", "third", "fourth")
+        predecessors = {
+            dependency: _v6_predecessor(dependency, "x" * 600_000)
+            for dependency in dependencies
+        }
+    else:
+        resource_limits = replace(resource_limits, max_rss_bytes=1_100_000)
+    context = replace(
+        _context(
+            tmp_path,
+            runtime="uv",
+            script="print('unused')\n",
+            depends_on=dependencies,
+        ),
+        language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+        predecessor_results=predecessors,
+        resource_limits=resource_limits,
+    )
+
+    result = ScriptExecutor(
+        runtime_locator=lambda _runtime: str(_predecessor_reader_runtime(tmp_path))
+    ).execute(context)
+
+    assert result.status == "failed"
+    assert result.error_code == "validation"
+    assert not (context.effective_attempt_directory / "predecessors.json").exists()

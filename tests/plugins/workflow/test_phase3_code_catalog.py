@@ -50,7 +50,8 @@ def test_phase3_durable_code_metadata_is_unique_bounded_and_versioned() -> None:
         for item in language_schema.PHASE3_DURABLE_CODES
     )
     projected = compatibility_code_catalog(
-        WorkflowLanguageProfile.ARCHON_2026_07
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=3,
     )
     canonical_bytes = json.dumps(
         projected,

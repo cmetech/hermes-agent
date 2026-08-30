@@ -60,7 +60,11 @@ def available_actions(
         elif interaction_type == "loop_signal_confirmation":
             try:
                 confirmation = LoopSignalConfirmation.from_mapping(
-                    pending_interaction
+                    {
+                        key: value
+                        for key, value in pending_interaction.items()
+                        if key not in {"loop_group_scope", "attempt_id"}
+                    }
                 )
             except ValueError:
                 actions.append("cancel")

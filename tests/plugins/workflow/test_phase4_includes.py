@@ -7,7 +7,7 @@ import pytest
 import plugins.workflow.language_schema as language_schema
 from plugins.workflow.language_schema import definition_json_schema
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowValidationError
-from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.schema import load_workflow_snapshot, parse_workflow_source_bytes
 
 
 def _parse(path, *, sidecar_bytes=None, source="project", precedence=1):
@@ -53,6 +53,7 @@ def test_literal_include_is_a_source_directive_but_not_an_executable_kind(
         "loop",
         "approval",
         "cancel",
+        "loop_group",
     )
     assert language_schema.COMPILE_DIRECTIVE_TYPES == ("include",)
     assert language_schema.SOURCE_NODE_TYPES == (
@@ -149,8 +150,8 @@ def test_include_target_must_be_one_literal_portable_workflow_name(
     )
 
 
-def test_future_loop_group_shape_cannot_hide_an_include(tmp_path) -> None:
-    """Catch recursive include syntax appearing before loop-group compilation exists."""
+def test_recorded_v5_cannot_hide_an_include_inside_a_future_group_shape(tmp_path) -> None:
+    """Keep v5's pre-group rejection exact after v6 becomes current."""
     workflow_bytes = (
         b"name: invalid-loop-group\n"
         b"description: invalid\n"
@@ -163,10 +164,11 @@ def test_future_loop_group_shape_cannot_hide_an_include(tmp_path) -> None:
     )
 
     with pytest.raises(WorkflowValidationError):
-        parse_workflow_source_bytes(
+        load_workflow_snapshot(
             tmp_path / "invalid-loop-group.yaml",
             workflow_bytes=workflow_bytes,
             sidecar_bytes=b"language_compatibility: archon-2026-07\n",
+            normalizer_version=5,
         )
 
 

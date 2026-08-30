@@ -112,6 +112,75 @@ class WorkflowNode:
     origin: WorkflowNodeOrigin | None = None
 
 
+_PORTABLE_NODE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_STORE_RUN_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+@dataclass(frozen=True, slots=True)
+class LoopGroupChildScope:
+    """Store-owned identity for one bounded loop-group child execution."""
+
+    run_id: str
+    group_id: str
+    controller_generation: int
+    iteration: int
+    node_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.run_id, str)
+            or _STORE_RUN_ID.fullmatch(self.run_id) is None
+        ):
+            raise ValueError("run_id must be a store-owned hexadecimal identifier")
+        for field_name in ("group_id", "node_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or _PORTABLE_NODE_ID.fullmatch(value) is None:
+                raise ValueError(f"{field_name} must be a normalized portable node id")
+        for field_name in ("controller_generation", "iteration"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer")
+
+    @property
+    def worker_node_id(self) -> str:
+        return (
+            f"loop-group/{self.run_id}/{self.group_id}/{self.controller_generation}/"
+            f"{self.iteration:04d}/{self.node_id}"
+        )
+
+    def durable_record(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "group_id": self.group_id,
+            "controller_generation": self.controller_generation,
+            "iteration": self.iteration,
+            "node_id": self.node_id,
+            "worker_node_id": self.worker_node_id,
+        }
+
+    @classmethod
+    def from_durable_record(cls, value: object) -> "LoopGroupChildScope":
+        if not isinstance(value, Mapping) or set(value) != {
+            "run_id",
+            "group_id",
+            "controller_generation",
+            "iteration",
+            "node_id",
+            "worker_node_id",
+        }:
+            raise ValueError("loop group child scope is malformed")
+        scope = cls(
+            run_id=value["run_id"],
+            group_id=value["group_id"],
+            controller_generation=value["controller_generation"],
+            iteration=value["iteration"],
+            node_id=value["node_id"],
+        )
+        if value["worker_node_id"] != scope.worker_node_id:
+            raise ValueError("loop group child worker identity changed")
+        return scope
+
+
 @dataclass(frozen=True, slots=True)
 class ValidatedWorkflowResourceBodies:
     """Authenticated resource templates normalized for later binding."""
@@ -171,9 +240,7 @@ class WorkflowSourceNode:
     source_index: int
     source_line: int | None
     options: Mapping[str, Any]
-    field_lines: Mapping[str, int] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    field_lines: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
     origin: WorkflowNodeOrigin | None = None
 
     def __post_init__(self) -> None:
@@ -226,9 +293,7 @@ class WorkflowSourceDocument:
     sidecar_bytes: bytes | None
     definition_location: str
     sidecar_location: str | None
-    field_lines: Mapping[str, int] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    field_lines: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         _bounded_source_text(
@@ -249,7 +314,9 @@ class WorkflowSourceDocument:
             or not isinstance(self.precedence, int)
             or not 0 <= self.precedence <= 2**31 - 1
         ):
-            raise ValueError("workflow precedence must be a bounded non-negative integer")
+            raise ValueError(
+                "workflow precedence must be a bounded non-negative integer"
+            )
         if not isinstance(self.definition_bytes, bytes):
             raise ValueError("definition_bytes must be immutable bytes")
         if self.sidecar_bytes is not None and not isinstance(self.sidecar_bytes, bytes):
@@ -261,9 +328,7 @@ class WorkflowSourceDocument:
         object.__setattr__(
             self,
             "definition_location",
-            _logical_source_location(
-                self.definition_location, "definition_location"
-            ),
+            _logical_source_location(self.definition_location, "definition_location"),
         )
         if self.sidecar_location is not None:
             object.__setattr__(
@@ -538,7 +603,7 @@ class WorkflowConnectorCapabilities:
         if (
             type(self.schema_version) is not int
             or self.schema_version != 1
-            or not services
+            or not (services or tools)
             or len(services) > 64
             or len(tools) > 512
             or any(
@@ -709,7 +774,9 @@ class LoopSignalConfirmation:
         try:
             message_bytes = message.encode("utf-8")
         except UnicodeEncodeError as exc:
-            raise ValueError("loop signal confirmation message must be valid UTF-8") from exc
+            raise ValueError(
+                "loop signal confirmation message must be valid UTF-8"
+            ) from exc
         if len(message_bytes) > LOOP_SIGNAL_MESSAGE_MAX_BYTES:
             raise ValueError("loop signal confirmation message is too large")
         iteration = value.get("iteration")
@@ -838,7 +905,9 @@ class RetryLedgerGrant:
             or not isinstance(self.requested_total_attempts, int)
             or self.requested_total_attempts != self.requested_retries + 1
         ):
-            raise ValueError("requested_total_attempts must include the initial attempt")
+            raise ValueError(
+                "requested_total_attempts must include the initial attempt"
+            )
         if (
             isinstance(self.effective_total_attempts, bool)
             or not isinstance(self.effective_total_attempts, int)
@@ -939,9 +1008,7 @@ class RetryLedgerGrant:
             "effective_total_attempts": self.effective_total_attempts,
             "retry_consumed": charge.retry_consumed,
             "remaining_attempts": charge.remaining_attempts,
-            "additional_provider_attempts": (
-                charge.additional_provider_attempts
-            ),
+            "additional_provider_attempts": (charge.additional_provider_attempts),
             "provider_attempts_exact": charge.provider_attempts_exact,
             "capped": self.capped,
         }

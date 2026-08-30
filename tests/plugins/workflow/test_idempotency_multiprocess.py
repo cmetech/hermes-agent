@@ -9,7 +9,14 @@ import multiprocessing
 from plugins.workflow.cli import register_cli
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.schema import load_workflow
+from plugins.workflow.models import LoopGroupChildScope
 from plugins.workflow.store import RunStore
+from tests.plugins.workflow.test_phase6_store import (
+    _EXECUTION_AUTHORITY,
+    _admit_group,
+    _initialize,
+    _scope,
+)
 from plugins.workflow.trust import (
     WorkflowTrustStore,
     build_risk_summary,
@@ -55,6 +62,28 @@ def _run_cli_process(workdir, home, *, arguments: str) -> tuple[int, dict]:
     process.join(timeout=20)
     assert process.exitcode == 0
     return result
+
+
+def _claim_loop_group_child_process(
+    home: str,
+    scope: LoopGroupChildScope,
+    state_version: int,
+    start,
+    output,
+) -> None:
+    store = RunStore(home)
+    assert start.wait(timeout=20)
+    try:
+        claim = store.claim_loop_group_child(
+            scope,
+            "multiprocess-child",
+            expected_state_version=state_version,
+            execution_authority=_EXECUTION_AUTHORITY,
+        )
+    except RuntimeError as exc:
+        output.put((None, str(exc)))
+    else:
+        output.put((claim.attempt_id if claim else None, None))
 
 
 def _trusted_cli_fixture(tmp_path, workflow_writer):
@@ -132,3 +161,46 @@ def test_concurrent_same_semantic_start_is_created_once(
     assert len({envelope["result"]["run_id"] for envelope in envelopes}) == 1
     assert all(code == 0 for code, _envelope in child_results)
     assert len(RunStore(profile).list_runs()) == 1
+
+
+def test_concurrent_loop_group_child_claim_is_created_once(
+    tmp_path, workflow_writer
+) -> None:
+    home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    output = context.Queue()
+    processes = [
+        context.Process(
+            target=_claim_loop_group_child_process,
+            args=(
+                str(home),
+                scope,
+                initialized["state_version"],
+                start,
+                output,
+            ),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    results = [output.get(timeout=20) for _ in processes]
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+
+    assert len([attempt_id for attempt_id, _error in results if attempt_id]) == 1
+    assert all(
+        attempt_id is not None or error in {None, "stale loop group state version"}
+        for attempt_id, error in results
+    )
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT node_id FROM worker_claims WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+    assert [row["node_id"] for row in rows] == [scope.worker_node_id]

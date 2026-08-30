@@ -149,12 +149,12 @@
       "entry": "references/capabilities/jira-defect-loop.md",
       "goals": [
         "Triage and fix all my assigned Jira defects.",
-        "Explain the planned Jira Defect Loop.",
-        "Tell me why the batch defect workflow cannot run."
+        "Explain the bounded Jira Defect Loop.",
+        "Review Jira Defect Loop run artifacts."
       ],
       "id": "jira-defect-loop",
-      "maturity": "partially-ported",
-      "recommendationEligible": false
+      "maturity": "available",
+      "recommendationEligible": true
     },
     {
       "aliases": [

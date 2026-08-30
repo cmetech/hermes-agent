@@ -481,6 +481,9 @@ class EvidenceReader:
             value = event.get(field)
             if isinstance(value, str):
                 projected[field] = public_display_identifier(value)
+        scope = event.get("loop_group_scope")
+        if isinstance(scope, Mapping):
+            projected["loop_group_scope"] = dict(scope)
         return projected
 
     @staticmethod
