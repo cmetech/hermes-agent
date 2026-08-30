@@ -509,6 +509,7 @@ function evidenceItem(value: unknown): value is WorkflowEvidenceItem {
       'interaction_id',
       'item_type',
       'iteration',
+      'loop_group_scope',
       'max_iterations',
       'next_actions',
       'node_id',
@@ -560,6 +561,9 @@ function evidenceItem(value: unknown): value is WorkflowEvidenceItem {
           optionalString(value[key])
         ) &&
         optionalFiniteInt(value.iteration) &&
+        (value.loop_group_scope === undefined ||
+          value.loop_group_scope === null ||
+          loopGroupScope(value.loop_group_scope)) &&
         optionalFiniteInt(value.max_iterations) &&
         optionalFiniteInt(value.sequence) &&
         optionalFiniteInt(value.state_version) &&

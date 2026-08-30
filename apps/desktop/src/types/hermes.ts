@@ -762,6 +762,7 @@ export interface WorkflowInteractionEvidence {
   interaction_id?: string
   item_type: 'interaction'
   iteration?: number
+  loop_group_scope?: null | WorkflowLoopGroupScopeProjection
   max_iterations?: number
   next_actions?: WorkflowPublicAction[]
   node_id?: string

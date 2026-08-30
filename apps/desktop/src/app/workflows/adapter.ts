@@ -76,7 +76,7 @@ function exactState(run: WorkflowRunSnapshot, scheduledLabel = 'Scheduled'): str
   return run.presentation_state === 'scheduled_wait' ? scheduledLabel : run.status
 }
 
-function activeLoopGroup(run: WorkflowRunSnapshot) {
+export function activeLoopGroup(run: WorkflowRunSnapshot) {
   return run.current_nodes?.map(nodeId => run.nodes?.[nodeId]?.loop_group).find(group => group != null)
 }
 
@@ -90,51 +90,55 @@ export function workflowBoardModel(
     const selected = runs.filter(run => columnId(run) === id)
 
     return {
-      cards: selected.map(run => ({
-        ariaDescription: [
-          run.workflow,
-          exactState(run, options.scheduledLabel),
-          run.health,
-          run.provenance?.source,
-          run.provenance?.assurance
-        ]
-          .filter(Boolean)
-          .join(', '),
-        badges: [
-          ...(run.provenance
-            ? [
-                {
-                  icon: ORIGIN_ICONS[run.provenance.source],
-                  label: run.provenance.source,
-                  tone: 'muted' as const
-                }
-              ]
-            : []),
-          ...(ATTENTION_HEALTH.has(run.health)
-            ? [
-                {
-                  label: run.health.replaceAll('_', ' '),
-                  tone: 'danger' as const
-                }
-              ]
-            : []),
-          ...(run.current_nodes?.[0] ? [{ label: run.current_nodes[0], tone: 'notice' as const }] : []),
-          ...(activeLoopGroup(run)
-            ? [
-                {
-                  label: `${activeLoopGroup(run)!.iteration}/${activeLoopGroup(run)!.max_iterations}`,
-                  tone: 'notice' as const
-                }
-              ]
-            : []),
-          { label: `${run.progress.completed_nodes}/${run.progress.total_nodes}` }
-        ],
-        exactState: exactState(run, options.scheduledLabel),
-        health: health(run),
-        id: run.run_id,
-        title: run.workflow,
-        updatedAt: Date.parse(run.updated_at)
-      })),
+      cards: selected.map(run => {
+        const loopGroup = activeLoopGroup(run)
+
+        return {
+          ariaDescription: [
+            run.workflow,
+            exactState(run, options.scheduledLabel),
+            run.health,
+            run.provenance?.source,
+            run.provenance?.assurance
+          ]
+            .filter(Boolean)
+            .join(', '),
+          badges: [
+            ...(run.provenance
+              ? [
+                  {
+                    icon: ORIGIN_ICONS[run.provenance.source],
+                    label: run.provenance.source,
+                    tone: 'muted' as const
+                  }
+                ]
+              : []),
+            ...(ATTENTION_HEALTH.has(run.health)
+              ? [
+                  {
+                    label: run.health.replaceAll('_', ' '),
+                    tone: 'danger' as const
+                  }
+                ]
+              : []),
+            ...(run.current_nodes?.[0] ? [{ label: run.current_nodes[0], tone: 'notice' as const }] : []),
+            ...(loopGroup
+              ? [
+                  {
+                    label: `${loopGroup.iteration}/${loopGroup.max_iterations}`,
+                    tone: 'notice' as const
+                  }
+                ]
+              : []),
+            { label: `${run.progress.completed_nodes}/${run.progress.total_nodes}` }
+          ],
+          exactState: exactState(run, options.scheduledLabel),
+          health: health(run),
+          id: run.run_id,
+          title: run.workflow,
+          updatedAt: Date.parse(run.updated_at)
+        }
+      }),
       count: selected.length,
       id,
       label,

@@ -1010,3 +1010,53 @@ def test_loop_group_event_evidence_exposes_only_closed_scope_and_drops_execution
         },
     }
     assert "private" not in str(payload).lower()
+
+
+class _NestedInteractionProjectionStore:
+    def get_run_status(self, _run_id: str, *, operator_scope=None):
+        return {"nodes": {}, "next_actions": [], "state_version": 4}
+
+    def tail_events(self, _run_id: str, *, limit: int, operator_scope=None):
+        assert limit == 200
+        return [
+            {
+                "sequence": 8,
+                "timestamp": "2026-08-29T12:00:01+00:00",
+                "run_id": "run-1",
+                "node_id": "group",
+                "event_type": "interaction_approved",
+                "payload": {
+                    "interaction_id": "interaction-1",
+                    "loop_group_scope": {
+                        "group_id": "group",
+                        "controller_generation": 3,
+                        "iteration": 4,
+                        "node_id": "sink",
+                        "output": "private output",
+                    },
+                },
+            }
+        ]
+
+
+def test_nested_interaction_evidence_preserves_only_authenticated_loop_scope() -> None:
+    page = EvidenceReader(_NestedInteractionProjectionStore()).query(
+        "run-1", kind="interactions"
+    )
+
+    assert page["items"] == [
+        {
+            "item_type": "interaction",
+            "sequence": 8,
+            "event_type": "interaction_approved",
+            "node_id": "group",
+            "interaction_id": "interaction-1",
+            "loop_group_scope": {
+                "group_id": "group",
+                "controller_generation": 3,
+                "iteration": 4,
+                "body_node_id": "sink",
+            },
+        }
+    ]
+    assert "private output" not in str(page)

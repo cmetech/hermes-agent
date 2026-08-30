@@ -300,6 +300,7 @@ describe('workflow public codecs', () => {
           channel: 'desktop',
           event_type: 'interaction_approved',
           item_type: 'interaction',
+          loop_group_scope: { body_node_id: 'work', controller_generation: 2, group_id: 'group', iteration: 3 },
           node_id: 'work',
           sequence: 4
         }
@@ -311,6 +312,17 @@ describe('workflow public codecs', () => {
     }
 
     expect(decodeWorkflowEvidencePage(interactionPage)).toEqual(interactionPage)
+    expect(
+      decodeWorkflowEvidencePage({
+        ...interactionPage,
+        items: [
+          {
+            ...interactionPage.items[0],
+            loop_group_scope: { ...interactionPage.items[0]!.loop_group_scope, output: 'private' }
+          }
+        ]
+      })
+    ).toBeNull()
     expect(
       decodeWorkflowEvidencePage({
         ...interactionPage,

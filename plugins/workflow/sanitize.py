@@ -349,7 +349,10 @@ def _duration_ms(value: Mapping[str, object]) -> int | None:
         return None
     started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-    duration = int((completed - started).total_seconds() * 1000)
+    delta = completed - started
+    if delta.total_seconds() < 0:
+        return None
+    duration = int(delta.total_seconds() * 1000)
     return duration if 0 <= duration <= 1_000_000_000 else None
 
 
@@ -429,10 +432,6 @@ def _public_loop_group_projection(value: object) -> dict[str, object] | None:
     maximum = _strict_bounded_integer(
         value.get("max_iterations"), minimum=1, maximum=100
     )
-    completed = value.get("completed_iterations")
-    if completed is None and iteration is not None:
-        completed = iteration - 1
-    completed = _strict_bounded_integer(completed, minimum=0, maximum=100)
     primary_sink = _strict_identifier(value.get("primary_sink"), maximum=128)
     body = value.get("body")
     history = value.get("iterations", [])
@@ -440,8 +439,6 @@ def _public_loop_group_projection(value: object) -> dict[str, object] | None:
         iteration is None
         or maximum is None
         or iteration > maximum
-        or completed is None
-        or completed > iteration
         or primary_sink is None
         or not isinstance(body, Mapping)
         or not body
@@ -454,6 +451,9 @@ def _public_loop_group_projection(value: object) -> dict[str, object] | None:
         if item is None or item["id"] != child_id:
             return None
         projected_body.append(item)
+    completed = iteration if all(
+        item["state"] in {"succeeded", "skipped"} for item in projected_body
+    ) else iteration - 1
     projected_iterations: list[dict[str, object]] = []
     for summary in history[-25:]:
         item = _public_loop_group_iteration(summary)
@@ -709,10 +709,9 @@ def public_event_projection(value: Mapping[str, object]) -> dict[str, object]:
                 identifier = payload.get(field)
                 if isinstance(identifier, str):
                     projected[field] = public_display_identifier(identifier)
-        if str(event_type).startswith("loop_group_"):
-            scope = _public_loop_group_scope(payload.get("loop_group_scope"))
-            if scope is not None:
-                projected["loop_group_scope"] = scope
+        scope = _public_loop_group_scope(payload.get("loop_group_scope"))
+        if scope is not None:
+            projected["loop_group_scope"] = scope
     if value.get("payload_truncated") is True:
         projected["payload_truncated"] = True
     return projected

@@ -445,6 +445,7 @@ class WorkflowInteractionEvidenceProjection(BaseModel):
     outcome: str | None = None
     actor: str | None = Field(None, max_length=128)
     channel: str | None = Field(None, max_length=128)
+    loop_group_scope: WorkflowLoopGroupScopeProjection | None = None
     state_version: StrictInt | None = Field(None, ge=0)
     next_actions: list[
         Literal[

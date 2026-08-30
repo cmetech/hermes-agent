@@ -18,6 +18,7 @@ import type {
   WorkflowTimelineEvent
 } from '@/types/hermes'
 
+import { activeLoopGroup } from './adapter'
 import { isWorkflowTypedArtifact, TypedArtifactView } from './typed-artifact-view'
 
 interface RunInspectorProps {
@@ -176,7 +177,7 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
   ]
 
   const currentNode = run.current_nodes?.[0]
-  const currentLoopGroup = currentNode ? run.nodes?.[currentNode]?.loop_group : null
+  const currentLoopGroup = activeLoopGroup(run)
   const provenance = run.provenance
   const coordinator = run.coordinator
   const signalConfirmation = isLoopSignalConfirmation(run.pending_interaction)
@@ -276,12 +277,24 @@ export function RunInspector({ actionsDisabled = false, events = [], onAction, r
                 <table aria-label={copy.currentNode} className="w-full text-left text-xs">
                   <thead className="text-(--ui-text-secondary)">
                     <tr>
-                      <th className="py-1 pr-3 font-medium">{copy.currentNode}</th>
-                      <th className="py-1 pr-3 font-medium">{copy.trigger}</th>
-                      <th className="py-1 pr-3 font-medium">{copy.status}</th>
-                      <th className="py-1 pr-3 font-medium">{copy.attempts}</th>
-                      <th className="py-1 pr-3 font-medium">{copy.lastProgress}</th>
-                      <th className="py-1 font-medium">{copy.failureCause}</th>
+                      <th className="py-1 pr-3 font-medium" scope="col">
+                        {copy.currentNode}
+                      </th>
+                      <th className="py-1 pr-3 font-medium" scope="col">
+                        {copy.artifactOutputType}
+                      </th>
+                      <th className="py-1 pr-3 font-medium" scope="col">
+                        {copy.status}
+                      </th>
+                      <th className="py-1 pr-3 font-medium" scope="col">
+                        {copy.attempts}
+                      </th>
+                      <th className="py-1 pr-3 font-medium" scope="col">
+                        {copy.completionEstimate}
+                      </th>
+                      <th className="py-1 font-medium" scope="col">
+                        {copy.failureCause}
+                      </th>
                     </tr>
                   </thead>
                   <tbody>

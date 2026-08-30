@@ -129,8 +129,15 @@ describe('WorkflowRunDrawer', () => {
     renderDrawer({
       run: {
         ...run,
-        current_nodes: ['group'],
+        current_nodes: ['ordinary', 'group'],
         nodes: {
+          ordinary: {
+            attempt_count: 1,
+            attempts: [],
+            depends_on: [],
+            id: 'ordinary',
+            state: 'running'
+          },
           group: {
             attempt_count: 0,
             attempts: [],
@@ -153,7 +160,11 @@ describe('WorkflowRunDrawer', () => {
       }
     })
 
-    expect(screen.getByRole('table', { name: 'Current node' })).toBeTruthy()
+    const table = screen.getByRole('table', { name: 'Current node' })
+
+    expect(table).toBeTruthy()
+    expect(screen.getByRole('columnheader', { name: 'Output type' }).getAttribute('scope')).toBe('col')
+    expect(screen.getByRole('columnheader', { name: 'Completion estimate' }).getAttribute('scope')).toBe('col')
     expect(screen.getByText('fetch')).toBeTruthy()
     expect(screen.getByText('provider_failed')).toBeTruthy()
     expect(globalThis.document.body.textContent).not.toContain('prompt')

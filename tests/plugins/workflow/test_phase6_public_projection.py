@@ -77,7 +77,6 @@ def _controller() -> dict[str, object]:
         "controller_generation": 2,
         "iteration": 30,
         "max_iterations": 100,
-        "completed_iterations": 29,
         "state": "running",
         "primary_sink": "body-002",
         "body": body,
@@ -123,6 +122,59 @@ def test_loop_group_projection_is_closed_bounded_and_definition_ordered() -> Non
 
 
 @pytest.mark.parametrize(
+    ("state", "iteration", "max_iterations", "body_states", "expected"),
+    [
+        ("running", 7, 25, ("succeeded", "running"), 6),
+        ("paused", 7, 25, ("succeeded", "skipped"), 7),
+        ("succeeded", 7, 25, ("succeeded", "skipped"), 7),
+        ("failed", 25, 25, ("succeeded", "skipped"), 25),
+    ],
+)
+def test_runtime_loop_group_completed_iterations_come_from_current_body_state(
+    state: str,
+    iteration: int,
+    max_iterations: int,
+    body_states: tuple[str, ...],
+    expected: int,
+) -> None:
+    controller = {
+        "schema_version": 1,
+        "controller_generation": 2,
+        "iteration": iteration,
+        "max_iterations": max_iterations,
+        "state": state,
+        "primary_sink": "sink",
+        "body": {
+            node_id: {
+                "id": node_id,
+                "type": "bash",
+                "state": body_state,
+                "attempts": [],
+            }
+            for node_id, body_state in zip(
+                ("prepare", "sink"), body_states, strict=True
+            )
+        },
+    }
+
+    public = public_run_projection(_run(controller))
+
+    assert public["nodes"]["group"]["loop_group"]["completed_iterations"] == expected
+
+
+def test_loop_group_duration_rejects_sub_millisecond_timestamp_reversal() -> None:
+    controller = _controller()
+    controller["body"]["body-000"].update(
+        started_at="2026-08-29T12:00:00.000500+00:00",
+        completed_at="2026-08-29T12:00:00+00:00",
+    )
+
+    public = public_run_projection(_run(controller))
+
+    assert "duration_ms" not in public["nodes"]["group"]["loop_group"]["body"][0]
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         lambda value: value.update(iteration=True),
@@ -151,13 +203,19 @@ def test_loop_group_models_reject_nested_extras_and_bounds() -> None:
         module.WorkflowRunProjection.model_validate(public)
 
 
-def test_loop_group_event_scope_is_exact_and_top_level_events_omit_it() -> None:
+@pytest.mark.parametrize(
+    "event_type",
+    ["interaction_approved", "interaction_rejected", "node_reconciled"],
+)
+def test_nested_generic_event_scope_is_exact_and_top_level_events_omit_it(
+    event_type: str,
+) -> None:
     scoped = public_event_projection(
         {
             "sequence": 7,
             "timestamp": "2026-08-29T12:00:00+00:00",
             "run_id": "run-1",
-            "event_type": "loop_group_child_completed",
+            "event_type": event_type,
             "payload": {
                 "loop_group_scope": {
                     "group_id": "group",
@@ -176,7 +234,7 @@ def test_loop_group_event_scope_is_exact_and_top_level_events_omit_it() -> None:
             "sequence": 8,
             "timestamp": "2026-08-29T12:00:01+00:00",
             "run_id": "run-1",
-            "event_type": "node_completed",
+            "event_type": event_type,
             "payload": {"loop_group_scope": None},
         }
     )
@@ -190,3 +248,24 @@ def test_loop_group_event_scope_is_exact_and_top_level_events_omit_it() -> None:
     assert "loop_group_scope" not in top_level
     assert _CANARY not in json.dumps(scoped)
     _api_module().WorkflowTimelineEventProjection.model_validate(scoped)
+
+
+def test_interaction_evidence_scope_model_is_closed() -> None:
+    module = _api_module()
+    interaction = {
+        "item_type": "interaction",
+        "sequence": 9,
+        "event_type": "interaction_approved",
+        "loop_group_scope": {
+            "group_id": "group",
+            "controller_generation": 2,
+            "iteration": 7,
+            "body_node_id": "sink",
+        },
+    }
+
+    module.WorkflowInteractionEvidenceProjection.model_validate(interaction)
+
+    interaction["loop_group_scope"]["output"] = _CANARY
+    with pytest.raises(ValidationError):
+        module.WorkflowInteractionEvidenceProjection.model_validate(interaction)

@@ -1401,6 +1401,88 @@ describe('WorkflowsView', () => {
     expect(client.getQueryData(['workflow-run', 'profile-b', 'run-1'])).toMatchObject({ workflow: 'Profile B run' })
   })
 
+  it('settles a late Profile A mutation only into Profile A cache state', async () => {
+    const pendingMutation = deferred<WorkflowRunSnapshot>()
+
+    const profileARun = run({
+      health: 'healthy',
+      next_actions: ['cancel'],
+      pending_interaction: null,
+      state_version: 7,
+      status: 'running',
+      workflow: 'Profile A run'
+    })
+
+    const profileAUpdated = run({
+      health: 'terminal',
+      next_actions: ['archive'],
+      pending_interaction: null,
+      state_version: 8,
+      status: 'cancelled',
+      workflow: 'Profile A run'
+    })
+
+    const profileBRun = run({
+      health: 'healthy',
+      next_actions: ['cancel'],
+      pending_interaction: null,
+      state_version: 3,
+      status: 'running',
+      workflow: 'Profile B run'
+    })
+
+    let currentProfileARun = profileARun
+
+    getWorkflowRun.mockImplementation(() =>
+      Promise.resolve(apiRequestState.profile === 'profile-a' ? currentProfileARun : profileBRun)
+    )
+    listWorkflowRuns.mockImplementation(() => {
+      const selectedProfileRun = apiRequestState.profile === 'profile-a' ? currentProfileARun : profileBRun
+
+      return Promise.resolve({ next_cursor: null, runs: [selectedProfileRun], schema_version: 1 })
+    })
+    mutateWorkflowRun.mockImplementationOnce(() => pendingMutation.promise)
+    apiRequestState.profile = 'profile-a'
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false }, queries: { retry: false } } })
+    const rendered = await renderView(client)
+
+    expect((await screen.findAllByText('Profile A run')).length).toBeGreaterThan(0)
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+    await waitFor(() =>
+      expect(mutateWorkflowRun).toHaveBeenCalledWith('run-1', 'cancel', {
+        expected_version: 7,
+        interaction_id: undefined
+      })
+    )
+
+    apiRequestState.profile = 'profile-b'
+    rendered.rerender(
+      <QueryClientProvider client={client}>
+        {await import('./index').then(({ WorkflowsView }) => <WorkflowsView />)}
+      </QueryClientProvider>
+    )
+    expect((await screen.findAllByText('Profile B run')).length).toBeGreaterThan(0)
+    const profileBCache = client.getQueryData(['workflow-run', 'profile-b', 'run-1'])
+
+    currentProfileARun = profileAUpdated
+    act(() => pendingMutation.resolve(profileAUpdated))
+
+    await waitFor(() => expect(client.getQueryData(['workflow-run', 'profile-a', 'run-1'])).toEqual(profileAUpdated))
+    expect(client.getQueryData(['workflow-run', 'profile-b', 'run-1'])).toEqual(profileBCache)
+    expect(screen.getAllByText('Profile B run').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Profile A run')).toBeNull()
+
+    apiRequestState.profile = 'profile-a'
+    rendered.rerender(
+      <QueryClientProvider client={client}>
+        {await import('./index').then(({ WorkflowsView }) => <WorkflowsView />)}
+      </QueryClientProvider>
+    )
+    expect((await screen.findAllByText('Profile A run')).length).toBeGreaterThan(0)
+    expect(await screen.findByRole('button', { name: 'Archive' })).toBeTruthy()
+    expect(screen.queryByText('Profile B run')).toBeNull()
+  })
+
   it('renders localized catalog copy without leaking i18n keys', async () => {
     $workflowSelectedRunId.set(null)
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })

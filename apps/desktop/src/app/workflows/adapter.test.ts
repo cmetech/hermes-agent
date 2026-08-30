@@ -90,8 +90,15 @@ describe('workflowBoardModel', () => {
   it('keeps one parent card and adds one active loop iteration badge', () => {
     const grouped: WorkflowRunSnapshot = {
       ...run('running'),
-      current_nodes: ['group'],
+      current_nodes: ['ordinary', 'group'],
       nodes: {
+        ordinary: {
+          attempt_count: 1,
+          attempts: [],
+          depends_on: [],
+          id: 'ordinary',
+          state: 'running'
+        },
         group: {
           attempt_count: 0,
           attempts: [],
