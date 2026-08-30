@@ -27,6 +27,7 @@ from plugins.workflow.sessions import (
 from plugins.workflow.store import (
     ArtifactRef,
     JournalRecoveryError,
+    NodeClaim,
     RunStore,
     StorageQuotaError,
     TypedPublicationCandidate,
@@ -2888,3 +2889,108 @@ def test_loop_group_restart_consumes_the_recorded_predicate_result_once(
     assert [node for node, _rendered in prompt.rendered if node == "sink"] == [
         "sink"
     ]
+
+
+def test_loop_group_predicate_rejects_superseded_same_owner_fence(
+    tmp_path, workflow_writer
+) -> None:
+    started_at = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(started_at, 100.0, "boot-a"))
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-fence-turnover",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1, lease_clock=clock)
+    run_id = _admit(store, compilation, key="phase6-predicate-fence-turnover")
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="same-coordinator",
+        host_kind="gateway",
+        host_instance_id="same-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    first = coordinator.try_acquire(identity, now=started_at, lease_seconds=1)
+    assert first.is_leader
+    fence_a = ExecutionFence(identity.owner_id, first.lease.epoch)
+    scheduler = RunScheduler(
+        store,
+        owner_id="same-predicate-owner",
+        execution_fence=fence_a,
+        max_parallel_nodes=1,
+        utcnow=lambda: clock.sample.utc_now,
+        monotonic=lambda: clock.sample.monotonic_now,
+    )
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    scheduler.executors["bash"] = type(
+        "CrashBeforePredicateSpawn",
+        (),
+        {
+            "execute": lambda self, context: (_ for _ in ()).throw(
+                SystemExit("predicate stopped before spawn")
+            )
+        },
+    )()
+    with pytest.raises(SystemExit, match="before spawn"):
+        scheduler.advance_all([run_id])
+
+    pending = store.load_run(run_id)
+    controller = pending["nodes"]["group"]["loop_group"]
+    scope_record = controller["_pending_loop_decision"]["loop_group_scope"]
+    scope = _scope(run_id, scope_record["node_id"])
+    raw = pending["nodes"]["group"]["claim"]
+    assert raw["execution_fence"] == {
+        "owner_id": fence_a.owner_id,
+        "owner_epoch": fence_a.owner_epoch,
+    }
+    stale_claim = NodeClaim(
+        run_id,
+        "group",
+        raw["attempt_id"],
+        raw["owner_id"],
+        datetime.fromisoformat(raw["lease_expires_at"]),
+        fence_a,
+    )
+    before = store.load_run(run_id)
+    before_events = store.tail_events(run_id)
+
+    turnover_at = started_at + timedelta(seconds=2)
+    clock.sample = LeaseClockSample(turnover_at, 102.0, "boot-a")
+    second = coordinator.try_acquire(identity, now=turnover_at, lease_seconds=30)
+    assert second.is_leader
+    fence_b = ExecutionFence(identity.owner_id, second.lease.epoch)
+    stale_prepare = store.prepare_recorded_loop_group_predicate(scope, stale_claim)
+    stale_result = store.record_loop_group_predicate_decision(
+        scope, stale_claim, {"kind": "until_bash_success"}
+    )
+
+    assert not stale_prepare
+    assert not stale_result
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == before_events
+    winner = store.claim_recorded_loop_group_predicate(
+        scope,
+        "same-predicate-owner",
+        lease_seconds=30,
+        now=clock.sample,
+        execution_fence=fence_b,
+    )
+    assert winner is not None
+    assert store.prepare_recorded_loop_group_predicate(scope, winner)
+    assert store.record_loop_group_predicate_decision(
+        scope, winner, {"kind": "until_bash_success"}
+    )

@@ -2053,7 +2053,11 @@ class RunScheduler:
                 controller.get("body") if isinstance(controller, Mapping) else None
             )
             body_nodes = node.value.get("nodes") if isinstance(node.value, Mapping) else None
-            if not isinstance(body_state, Mapping) or not isinstance(body_nodes, tuple):
+            if (
+                not isinstance(body_state, Mapping)
+                or not isinstance(body_nodes, tuple)
+                or controller.get("_pending_group_transition") is not None
+            ):
                 continue
             generation = controller.get("controller_generation")
             iteration = controller.get("iteration")
@@ -2461,6 +2465,27 @@ class RunScheduler:
                 )
             controller = state.get("loop_group")
             body = controller.get("body") if isinstance(controller, Mapping) else None
+            transition = (
+                controller.get("_pending_group_transition")
+                if isinstance(controller, Mapping)
+                else None
+            )
+            if isinstance(transition, Mapping):
+                transition_scope = transition.get("loop_group_scope")
+                if not isinstance(transition_scope, Mapping):
+                    raise RuntimeError("loop group transition scope is missing")
+                staged_scope = LoopGroupChildScope(
+                    run_id,
+                    group.id,
+                    int(transition["controller_generation"]),
+                    int(transition["iteration"]),
+                    str(transition_scope["node_id"]),
+                )
+                if self.store.resume_loop_group_transition(
+                    staged_scope,
+                    execution_fence=self.execution_fence,
+                ):
+                    return True
             if (
                 state.get("state") != "running"
                 or not isinstance(controller, Mapping)

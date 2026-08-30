@@ -521,7 +521,9 @@ def test_cancel_during_loop_group_predicate_reaps_process_before_group_terminal(
 
     worker = threading.Thread(target=run_scheduler, daemon=True)
     worker.start()
-    deadline = time.monotonic() + 5
+    # ManagedProcessTree pins and exec-confirms the child before publishing its
+    # durable identity; allow loaded macOS runners enough time for that handoff.
+    deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if any(
             event["event_type"] == "process_started"

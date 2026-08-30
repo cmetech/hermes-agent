@@ -20,7 +20,7 @@ from plugins.workflow.store import (
 import plugins.workflow.store as store_module
 import plugins.workflow.sessions as sessions_module
 from tools.managed_process import ProcessIdentity
-from tests.plugins.workflow.test_phase6_scheduler import _admit, _compile
+from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit, _compile
 
 
 def _request(prepared, key: str) -> RunAdmissionRequest:
@@ -739,3 +739,155 @@ def test_loop_group_restart_reconciles_crash_after_outer_publication(
             outer.append(value)
     assert len(outer) == 1
     assert outer[0]["sha256"] == hashlib.sha256(b"result").hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("crash_event", "max_iterations", "expected_status", "expected_terminal"),
+    [
+        ("loop_group_decision_recorded", 1, "succeeded", "loop_group_succeeded"),
+        ("loop_group_succeeded", 1, "succeeded", "loop_group_succeeded"),
+        (
+            "loop_group_next_iteration_created",
+            2,
+            "succeeded",
+            "loop_group_succeeded",
+        ),
+        ("loop_group_failed", 1, "failed", "loop_group_failed"),
+    ],
+)
+def test_loop_group_restart_completes_each_staged_event_family_after_crash(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    crash_event,
+    max_iterations,
+    expected_status,
+    expected_terminal,
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"phase6-staged-{crash_event}",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": max_iterations,
+                "signal_completes": True,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key=f"phase6-staged-{crash_event}")
+
+    executions = []
+
+    def output(_context, _rendered):
+        executions.append(len(executions) + 1)
+        if expected_status == "failed" or (
+            max_iterations > 1 and len(executions) == 1
+        ):
+            return "not complete"
+        return "done <promise>DONE</promise>"
+
+    first = RunScheduler(store, max_parallel_nodes=1)
+    first.executors["prompt"] = OutputExecutor(output)
+    original_append = store._append_locked
+    crashed = False
+
+    def crash_at_boundary(directory, projection, event_type, *args, **kwargs):
+        nonlocal crashed
+        if not crashed and event_type == crash_event:
+            crashed = True
+            raise SystemExit(f"crash before {crash_event}")
+        return original_append(directory, projection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_append_locked", crash_at_boundary)
+    with pytest.raises(SystemExit, match=crash_event):
+        first.advance_all([run_id])
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    restarted = RunStore(home, max_total_workers=1)
+    second = RunScheduler(restarted, max_parallel_nodes=1)
+    second.executors["prompt"] = OutputExecutor(output)
+    recovered = second.advance_all([run_id])[run_id]
+    lifecycle = [
+        event["event_type"]
+        for event in restarted.tail_events(run_id)
+        if event["event_type"]
+        in {
+            "loop_group_iteration_completed",
+            "loop_group_decision_recorded",
+            "loop_group_iteration_committed",
+            "loop_group_iteration_decided",
+            "loop_group_next_iteration_created",
+            "loop_group_succeeded",
+            "loop_group_failed",
+        }
+    ]
+
+    assert recovered["status"] == expected_status
+    assert lifecycle.count("loop_group_iteration_completed") == max_iterations
+    assert lifecycle.count("loop_group_decision_recorded") == max_iterations
+    assert lifecycle.count(expected_terminal) == 1
+    if max_iterations == 2:
+        assert lifecycle.index("loop_group_decision_recorded") < lifecycle.index(
+            "loop_group_next_iteration_created"
+        ) < lifecycle.index("loop_group_succeeded")
+    else:
+        assert lifecycle.index("loop_group_decision_recorded") < lifecycle.index(
+            expected_terminal
+        )
+
+
+def test_loop_group_cancellation_restart_completes_run_event_once(
+    tmp_path, workflow_writer, monkeypatch
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-staged-cancel",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-staged-cancel")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    assert scheduler._advance_loop_group_controllers(
+        run_id,
+        compilation.package.definition.nodes,
+        store.load_run(run_id),
+    )
+    original_append = store._append_locked
+
+    def crash_before_run_cancelled(
+        directory, projection, event_type, *args, **kwargs
+    ):
+        if event_type == "run_cancelled":
+            raise SystemExit("crash before run_cancelled")
+        return original_append(directory, projection, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_append_locked", crash_before_run_cancelled)
+    with pytest.raises(SystemExit, match="run_cancelled"):
+        store.cancel_run(run_id)
+    monkeypatch.setattr(store, "_append_locked", original_append)
+
+    restarted = RunStore(home, max_total_workers=1)
+    recovered = restarted.cancel_run(run_id)
+    lifecycle = [
+        event["event_type"]
+        for event in restarted.tail_events(run_id)
+        if event["event_type"] in {"loop_group_cancelled", "run_cancelled"}
+    ]
+
+    assert recovered["status"] == "cancelled"
+    assert lifecycle == ["loop_group_cancelled", "run_cancelled"]

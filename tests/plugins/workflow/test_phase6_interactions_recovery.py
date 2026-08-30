@@ -689,20 +689,35 @@ def test_group_terminal_events_have_stable_scoped_families(
     store, _scheduler, run_id, _result = _run_group(
         tmp_path,
         workflow_writer,
-        output="result <promise>DONE</promise>",
-        group=_group([{"id": "sink", "prompt": "private prompt"}]),
+        output="result",
+        group={
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "true",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "private prompt"}],
+            },
+        },
     )
 
-    events = store.tail_events(run_id)
-    by_type = {event["event_type"]: event for event in events}
-    expected = {
+    expected = [
         "loop_group_iteration_completed",
+        "loop_group_predicate_pending",
+        "loop_group_predicate_decided",
         "loop_group_decision_recorded",
+        "loop_group_iteration_decided",
         "loop_group_succeeded",
-    }
-    assert expected <= by_type.keys()
-    for event_type in expected:
-        scope = by_type[event_type]["payload"]["loop_group_scope"]
+    ]
+    events = [
+        event
+        for event in store.tail_events(run_id)
+        if event["event_type"] in expected
+    ]
+
+    assert [event["event_type"] for event in events] == expected
+    for event in events:
+        scope = event["payload"]["loop_group_scope"]
         assert scope["run_id"] == run_id
         assert scope["group_id"] == "group"
         assert scope["node_id"] == "sink"
