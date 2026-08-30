@@ -86,7 +86,30 @@ focused/historical GREEN gates, an atomic commit, and a fresh scoped review.
 
 ## Final disposition
 
-All eight controller-confirmed findings are remediated and independently
-re-reviewed. Every scoped remediation review is approved with no remaining
-Critical or Important finding. Final whole-branch verification and adversarial
-re-review remain the release gate before integration options are presented.
+All eight initially controller-confirmed findings are remediated and
+independently re-reviewed. Every scoped remediation review approved its batch
+with no remaining Critical or Important finding.
+
+The subsequent fresh whole-branch review at `5d7a59eed9` approved AR-01 through
+AR-08 but found one independent Important contract defect:
+
+| ID | Source | Controller disposition | Remediation |
+|---|---|---|---|
+| AR-09 | Final whole-branch review | **Confirmed Important** | The Jira manifest node authored `retry.max_attempts: 1`, which Archon v3-v6 seals as one retry and two total workflow attempts despite the binding single-read/single-workflow-attempt contract. Commit `70caca680f` adds the smallest v6-only command/prompt zero-retry boundary, seals the manifest fetch to one total attempt, refreshes the existing package digest, and preserves v1-v5 plus Bash/Script retry semantics. |
+
+The AR-09 RED scheduler regression executed the real admitted workflow twice and
+observed two executor calls before the fix. GREEN asserts
+`requested_retries == 0`, `requested_total_attempts == 1`, and
+`effective_total_attempts == 1`, with only one executor call after an eligible
+failure. The separate scoped re-review approved the finding as addressed with
+no new Critical, Important, or Minor issue.
+
+Final exact-code verification at `70caca680f` passed 305 Phase 6 tests; the
+bounded merge gate passed 4,353 Python tests with 8 platform skips, 3 installed
+distribution tests, and 211 Desktop tests, sealing
+`TESTED_BASE_SHA=70caca680f9d23ead1e132707f151ed46374187d`.
+The canonical repository gate retained the same 145 failures across the same 36
+files as the prior candidate. Its only Phase 6-overlapping file,
+`test_phase6_interactions_recovery.py`, passed 27/27 standalone and 27/27 in the
+bounded four-worker gate. No remaining Critical, Important, or Minor review
+finding is open for this feature.
