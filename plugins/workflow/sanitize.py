@@ -21,6 +21,10 @@ from plugins.workflow.schedule_time import (
 _SECRET_KEY = re.compile(
     r"(?i)(secret|password|token|authorization|api[_-]?key|credential|reasoning|prompt|command|provider[_-]?response|feedback|stderr|base[_-]?url|uri|return[_-]?route)"
 )
+_LOOP_GROUP_PRIVATE_EVENT_KEY = re.compile(
+    r"(?i)(?:^|[_-])(?:argument|bash|body|comment|content|description|env(?:ironment)?|"
+    r"file|input|message|output|path|result|script|tool)(?:$|[_-])"
+)
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _PORTABLE_INPUT_INVALID = re.compile(r'[<>:"/\\|?*]')
@@ -251,6 +255,40 @@ def sanitize_projection(value: object, *, key: str = "", depth: int = 0) -> obje
     if value is None or isinstance(value, bool | int | float):
         return value
     return sanitize_projection(str(value), key=key, depth=depth + 1)
+
+
+def sanitize_loop_group_event_payload(
+    value: object, *, key: str = "", depth: int = 0
+) -> object:
+    """Remove execution content from one namespaced loop-group journal event."""
+    if depth > 12:
+        return "[TRUNCATED_DEPTH]"
+    if projection_key_is_secret(key) or _LOOP_GROUP_PRIVATE_EVENT_KEY.search(key):
+        return "[REDACTED]"
+    if isinstance(value, Mapping):
+        return {
+            str(child): sanitize_loop_group_event_payload(
+                item,
+                key=str(child),
+                depth=depth + 1,
+            )
+            for child, item in list(value.items())[:200]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            sanitize_loop_group_event_payload(item, key=key, depth=depth + 1)
+            for item in value[:200]
+        ]
+    if isinstance(value, str):
+        cleaned, truncated = sanitize_text(value, max_chars=_PROJECTION_MAX_CHARS)
+        if truncated:
+            return cleaned[: _PROJECTION_MAX_CHARS - len(_TRUNCATION_SUFFIX)] + (
+                _TRUNCATION_SUFFIX
+            )
+        return cleaned
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return sanitize_loop_group_event_payload(str(value), key=key, depth=depth + 1)
 
 
 def _bounded_identifier(value: object, *, fallback: str) -> str:

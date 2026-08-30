@@ -45,7 +45,11 @@ from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.cancel import CancelExecutor
-from plugins.workflow.executors.loop import LoopExecutor
+from plugins.workflow.executors.loop import (
+    LoopExecutor,
+    clean_loop_completion,
+    loop_interactivity,
+)
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.locks import WorkflowLockTimeout
 from plugins.workflow.language import (
@@ -64,6 +68,7 @@ from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
     LoopGroupChildScope,
+    LoopSignalConfirmation,
     RetryLedgerGrant,
     RetryPolicy,
     RunExecutionLimits,
@@ -1581,7 +1586,7 @@ class RunScheduler:
             winning_attempt = str(winning_attempt_state["attempt_id"])
             candidate_key = (run_id, node_id, winning_attempt)
             node_type = str(node_state.get("type", ""))
-            requires_candidate = node_type in {"command", "prompt"}
+            requires_candidate = node_type in {"command", "prompt", "loop_group"}
             raw_metadata = winning_attempt_state.get("metadata")
             raw_candidate = (
                 raw_metadata.get(PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY)
@@ -2148,6 +2153,11 @@ class RunScheduler:
             attempt_id=str(descriptor["attempt_id"]),
             descriptor=descriptor,
             candidate=candidate,
+            publication_id=(
+                str(descriptor["publication_id"])
+                if isinstance(descriptor.get("publication_id"), str)
+                else None
+            ),
             strict=True,
         )
         return replace(resolved, node_id=node_id)
@@ -2195,6 +2205,15 @@ class RunScheduler:
             sealed_resource_bytes=sealed_resource_bytes,
             resolved_outputs={},
         )
+        group_state = projection.get("nodes", {}).get(scope.group_id)
+        controller = (
+            group_state.get("loop_group")
+            if isinstance(group_state, Mapping)
+            else None
+        )
+        loop_input = controller.get("loop_user_input_artifact") if isinstance(
+            controller, Mapping
+        ) else None
         return replace(
             variables,
             artifacts_dir=publication_directory,
@@ -2202,6 +2221,16 @@ class RunScheduler:
             current_body_outputs=current,
             allowed_outer_outputs=outer,
             previous_body_outputs=previous,
+            loop_user_input=(
+                self._authenticated_loop_input(
+                    scope.run_id,
+                    projection,
+                    node_id=scope.group_id,
+                    relative_path=loop_input,
+                )
+                if isinstance(loop_input, str)
+                else ""
+            ),
         )
 
     def _scoped_directories(
@@ -2476,10 +2505,176 @@ class RunScheduler:
                 isinstance(child, Mapping)
                 and child.get("state") in {"succeeded", "skipped"}
                 for child in body.values()
-            ) and int(controller["iteration"]) < int(controller["max_iterations"]):
+            ):
+                primary_sink = str(controller["primary_sink"])
+                decision_scope = LoopGroupChildScope(
+                    scope.run_id,
+                    scope.group_id,
+                    scope.controller_generation,
+                    scope.iteration,
+                    primary_sink,
+                )
+                primary = body.get(primary_sink)
+                if not isinstance(primary, Mapping) or primary.get("state") != "succeeded":
+                    return self.store.fail_loop_group(
+                        scope,
+                        error_code="loop_group_output_unavailable",
+                        error_message="loop group primary sink did not succeed",
+                        expected_state_version=int(projection["state_version"]),
+                        execution_fence=self.execution_fence,
+                    )
+                try:
+                    sink_output = self._resolve_loop_child_output(
+                        projection,
+                        decision_scope,
+                        primary_sink,
+                        previous=False,
+                    )
+                except WorkflowOutputReferenceError:
+                    sink_output = None
+                if sink_output is None:
+                    return self.store.fail_loop_group(
+                        scope,
+                        error_code="loop_group_output_unavailable",
+                        error_message="loop group primary sink output is unavailable",
+                        expected_state_version=int(projection["state_version"]),
+                        execution_fence=self.execution_fence,
+                    )
+                completed, cleaned = clean_loop_completion(
+                    sink_output.text,
+                    str(group.value["until"]),
+                    strip_plain=True,
+                )
+                language = projection.get("language")
+                node_semantics = (
+                    language.get("node_semantics")
+                    if isinstance(language, Mapping)
+                    else None
+                )
+                sealed = (
+                    node_semantics.get(group.id)
+                    if isinstance(node_semantics, Mapping)
+                    else None
+                )
+                semantics = sealed.get("loop_group") if isinstance(sealed, Mapping) else None
+                if not isinstance(semantics, Mapping):
+                    raise RuntimeError("loop group decision authority is missing")
+                effective_interactive, signal_completes = loop_interactivity(
+                    semantics
+                )
+                decision = None
+                if completed and signal_completes:
+                    decision = "signal_success"
+                elif completed:
+                    decision = "signal_confirmation"
+                elif isinstance(group.value.get("until_bash"), str):
+                    all_body = replace(
+                        next(child for child in body_nodes if child.id == primary_sink),
+                        depends_on=tuple(child.id for child in body_nodes),
+                    )
+                    decision_item = SchedulerWorkItem(run_id, all_body, scope)
+                    publication = (
+                        self.store.run_directory(run_id)
+                        / "artifacts"
+                        / "loop-groups"
+                        / group.id
+                        / "iterations"
+                        / f"{scope.iteration:04d}"
+                        / "decision"
+                    )
+                    variables = self._scoped_variables(
+                        dict(projection),
+                        self._load_run_package(run_id),
+                        decision_item,
+                        publication_directory=publication,
+                        sealed_resource_paths=None,
+                        sealed_resource_bytes=None,
+                    )
+                    predicate = self.executors["bash"].execute(
+                        NodeExecutionContext(
+                            run_id=run_id,
+                            run_directory=self.store.run_directory(run_id),
+                            node=WorkflowNode(
+                                id=group.id,
+                                node_type="bash",
+                                value=str(group.value["until_bash"]),
+                                depends_on=group.depends_on,
+                                source_index=group.source_index,
+                                source_line=group.source_line,
+                                options=freeze_value({}),
+                            ),
+                            attempt_id=(
+                                f"loop-group-{scope.controller_generation}-"
+                                f"{scope.iteration:04d}-until"
+                            ),
+                            variable_context=replace(
+                                variables, loop_prev_output=cleaned
+                            ),
+                            is_cancelled=lambda: self._cancelled(run_id),
+                            cancellation_reason=lambda: self._cancellation_reason(run_id),
+                            attempt_directory=publication / "attempt",
+                            publication_directory=publication,
+                        )
+                    )
+                    if predicate.status == "succeeded":
+                        decision = "until_bash_success"
+                    elif predicate.error_code != "process_exit":
+                        return self.store.fail_loop_group(
+                            scope,
+                            error_code=predicate.error_code or "until_bash_failed",
+                            error_message=predicate.error_message or "loop group predicate failed",
+                            expected_state_version=int(projection["state_version"]),
+                            execution_fence=self.execution_fence,
+                        )
+                iteration = int(controller["iteration"])
+                maximum = int(controller["max_iterations"])
+                pending = None
+                if decision == "signal_confirmation":
+                    attempt_id = f"loop-group-{scope.controller_generation}-{iteration:04d}"
+                    relative = f"nodes/{group.id}/{attempt_id}/output.txt"
+                    pending = LoopSignalConfirmation.create(
+                        run_id=run_id,
+                        node_id=group.id,
+                        message=str(group.value.get("gate_message", "")),
+                        iteration=iteration,
+                        max_iterations=maximum,
+                        result_artifact=relative,
+                        result_sha256=hashlib.sha256(cleaned.encode()).hexdigest(),
+                    ).to_dict()
+                elif decision is None and iteration < maximum and effective_interactive:
+                    message = str(group.value.get("gate_message", ""))
+                    pending = {
+                        "type": "loop_input",
+                        "interaction_id": hashlib.sha256(
+                            (
+                                f"{run_id}\0{group.id}\0{scope.controller_generation}\0"
+                                f"{iteration}\0{sink_output.sha256}\0{message}"
+                            ).encode()
+                        ).hexdigest(),
+                        "message": message,
+                        "iteration": iteration,
+                    }
+                    decision = "ordinary_input"
+                elif decision is None:
+                    decision = "hard_limit" if iteration >= maximum else "continue"
                 return self.store.record_loop_group_iteration(
-                    scope,
+                    decision_scope,
                     expected_state_version=int(projection["state_version"]),
+                    decision=decision,
+                    output_bytes=(
+                        cleaned.encode()
+                        if decision in {
+                            "signal_success",
+                            "until_bash_success",
+                            "signal_confirmation",
+                            "ordinary_input",
+                        }
+                        else None
+                    ),
+                    output_media_type=sink_output.media_type,
+                    output_schema_fingerprint=sink_output.schema_fingerprint,
+                    output_type=sink_output.output_type,
+                    pending_interaction=pending,
                     execution_fence=self.execution_fence,
                 )
         return False

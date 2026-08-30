@@ -104,6 +104,7 @@ from plugins.workflow.schedule_time import (
 from plugins.workflow.sanitize import (
     public_cleanup_projection,
     public_event_projection,
+    sanitize_loop_group_event_payload,
     sanitize_projection,
     workflow_filename_components_are_distinct,
     workflow_input_name_is_portable,
@@ -360,6 +361,21 @@ def _claim_event_node_id(claim: NodeClaim) -> str:
     )
 
 
+def _loop_group_scope_for_attempt(
+    projection: Mapping[str, object], attempt_id: str
+) -> dict[str, object] | None:
+    """Return the authenticated nested scope for one exact attempt."""
+    matches = []
+    for _node_id, node in _iter_projection_node_states(projection):
+        for attempt in node.get("attempts", ()):
+            if not isinstance(attempt, Mapping) or attempt.get("attempt_id") != attempt_id:
+                continue
+            scope = attempt.get("loop_group_scope")
+            if isinstance(scope, Mapping):
+                matches.append(dict(scope))
+    return matches[0] if len(matches) == 1 else None
+
+
 def _iter_projection_node_states(
     projection: Mapping[str, object],
 ) -> Iterable[tuple[str, MutableMapping[str, object]]]:
@@ -388,6 +404,25 @@ def _iter_projection_node_states(
             except ValueError:
                 continue
             yield scope.worker_node_id, child
+
+
+def _iter_interaction_node_states(
+    projection: Mapping[str, object],
+) -> Iterable[tuple[str, MutableMapping[str, object]]]:
+    """Yield public semantic IDs with their top-level or current child state."""
+    nodes = projection.get("nodes")
+    if not isinstance(nodes, Mapping):
+        return
+    for node_id, node in nodes.items():
+        if not isinstance(node, MutableMapping):
+            continue
+        yield str(node_id), node
+        controller = node.get("loop_group")
+        body = controller.get("body") if isinstance(controller, Mapping) else None
+        if isinstance(body, Mapping):
+            for child_id, child in body.items():
+                if isinstance(child, MutableMapping):
+                    yield f"{node_id}/{child_id}", child
 
 
 def _projection_node_state(
@@ -2499,10 +2534,10 @@ def _journal_corroborates_retired_scoped_publication(
         return False
     semantic_node_id = f"{scope.group_id}/{scope.node_id}"
     expected_projection_artifact = dict(artifact)
-    expected_event_artifact = {
+    expected_event_artifact = sanitize_loop_group_event_payload({
         **expected_projection_artifact,
         "node_id": scope.worker_node_id,
-    }
+    })
     matches = 0
     for event in journal_events:
         sequence = event.get("sequence")
@@ -7678,6 +7713,22 @@ class RunStore:
                 return True
         return False
 
+    def _typed_publication_journal_events(
+        self,
+        directory: Path,
+        projection: Mapping[str, object],
+    ) -> tuple[dict[str, object], ...]:
+        """Read the chain only when a retired scoped publication needs history."""
+        artifacts = projection.get("artifacts")
+        if not isinstance(artifacts, list) or not any(
+            isinstance(artifact, Mapping)
+            and artifact.get("loop_group_scope") is not None
+            and artifact.get("typed_publication_version") is not None
+            for artifact in artifacts
+        ):
+            return ()
+        return tuple(self._read_journal_events(directory))
+
     def _read_journal_tail_event(self, directory: Path) -> dict[str, object]:
         journal_path = directory / "events.jsonl"
         try:
@@ -7771,12 +7822,22 @@ class RunStore:
                     )
                     raise
                 if journal_current:
+                    self._sync_loaded_integrity(
+                        directory,
+                        projection,
+                        migrate_legacy_typed_publications=(
+                            recover_typed_publications
+                        ),
+                    )
                     try:
                         migrated = _validate_typed_publication_metadata(
                             directory,
                             projection,
                             migrate_legacy=recover_typed_publications,
-                            journal_events=self._read_journal_events(directory),
+                            journal_events=self._typed_publication_journal_events(
+                                directory,
+                                projection,
+                            ),
                         )
                     except JournalRecoveryError:
                         self._transition_run_repair(
@@ -8128,6 +8189,10 @@ class RunStore:
                 except ValueError:
                     return False
                 loop_state = node.get("loop_state")
+                if not isinstance(loop_state, Mapping):
+                    controller = node.get("loop_group")
+                    if isinstance(controller, Mapping):
+                        loop_state = controller
                 if (
                     node.get("state") != "paused"
                     or not node["attempts"]
@@ -11221,9 +11286,30 @@ class RunStore:
         scope: LoopGroupChildScope,
         *,
         expected_state_version: int,
+        decision: str = "continue",
+        output_bytes: bytes | None = None,
+        output_media_type: str = "text/plain",
+        output_schema_fingerprint: str | None = None,
+        output_type: str | None = None,
+        pending_interaction: Mapping[str, object] | None = None,
         execution_fence: ExecutionFence | None = None,
         now: LeaseClockSample | None = None,
     ) -> bool:
+        if decision not in {
+            "continue",
+            "signal_success",
+            "until_bash_success",
+            "signal_confirmation",
+            "ordinary_input",
+            "hard_limit",
+        }:
+            raise ValueError("loop group iteration decision is invalid")
+        terminal_success = decision in {"signal_success", "until_bash_success"}
+        paused = decision in {"signal_confirmation", "ordinary_input"}
+        if (terminal_success or paused) != isinstance(output_bytes, bytes):
+            raise ValueError("loop group terminal decision output is incomplete")
+        if paused != isinstance(pending_interaction, Mapping):
+            raise ValueError("loop group interaction decision is incomplete")
         directory = self.run_directory(scope.run_id)
         with workflow_lock(
             self._run_lock_path(scope.run_id)
@@ -11249,8 +11335,6 @@ class RunStore:
                 )
             ):
                 return False
-            if int(controller["iteration"]) >= int(controller["max_iterations"]):
-                return False
             previous_outputs: dict[str, object] = {}
             for child_id, child in body.items():
                 output = child.get("output")
@@ -11264,28 +11348,161 @@ class RunStore:
                 raise ArchonOutputIntegrityError(
                     "loop group primary sink output is missing"
                 )
+            iteration = int(controller["iteration"])
+            maximum = int(controller["max_iterations"])
+            if decision == "continue" and iteration >= maximum:
+                return False
             controller["previous_outputs"] = previous_outputs
-            controller["iteration"] = int(controller["iteration"]) + 1
-            controller["body"] = {
-                child_id: {
-                    "id": child_id,
-                    "type": child["type"],
-                    "depends_on": list(child["depends_on"]),
-                    "state": "pending" if child["depends_on"] else "ready",
-                    "attempts": [],
-                }
-                for child_id, child in body.items()
+            controller.pop("loop_user_input_artifact", None)
+            event_payload: dict[str, object] = {
+                "controller_generation": scope.controller_generation,
+                "iteration": iteration,
+                "decision": decision,
             }
+            if terminal_success or paused:
+                assert output_bytes is not None
+                attempt_id = (
+                    f"loop-group-{scope.controller_generation}-{iteration:04d}"
+                )
+                output_name = (
+                    "output.json"
+                    if output_media_type == _TYPED_PUBLICATION_JSON_MEDIA_TYPE
+                    else "output.md"
+                    if output_type is not None
+                    else "output.txt"
+                )
+                relative = Path("nodes") / scope.group_id / attempt_id / output_name
+                _atomic_bytes(directory / relative, output_bytes)
+                artifact = {
+                    "node_id": scope.group_id,
+                    "attempt_id": attempt_id,
+                    "relative_path": relative.as_posix(),
+                    "media_type": output_media_type,
+                    "size_bytes": len(output_bytes),
+                    "sha256": _sha256(output_bytes),
+                }
+                candidate = {
+                    "attempt_relative_path": relative.as_posix(),
+                    "media_type": output_media_type,
+                    "size_bytes": len(output_bytes),
+                    "sha256": artifact["sha256"],
+                    "schema_fingerprint": output_schema_fingerprint,
+                    "canonicalization_version": 1,
+                    "output_type": output_type,
+                }
+                primary_output_candidate_from_identity(candidate)
+                attempt = {
+                    "attempt_id": attempt_id,
+                    "state": "paused" if paused else "succeeded",
+                    "completed_at": _utc_now(),
+                    "metadata": {PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY: candidate},
+                }
+                group["attempts"].append(attempt)
+                if terminal_success and output_type is not None:
+                    declaration = _sealed_typed_output_declarations(
+                        directory,
+                        projection,
+                    ).get(scope.group_id)
+                    if declaration is None:
+                        raise ArchonOutputIntegrityError(
+                            "loop group typed output has no sealed authority"
+                        )
+                    requirement = _typed_output_requirement(
+                        projection,
+                        node_id=scope.group_id,
+                        declaration=declaration,
+                    )
+                    if (
+                        output_type != requirement.output_type
+                        or output_schema_fingerprint != requirement.schema_fingerprint
+                        or requirement.canonicalization_version != 1
+                    ):
+                        raise ArchonOutputIntegrityError(
+                            "loop group typed output conflicts with sealed authority"
+                        )
+                    publication = self._publish_typed_bundle_locked(
+                        directory,
+                        projection,
+                        run_id=scope.run_id,
+                        node_id=scope.group_id,
+                        attempt_id=attempt_id,
+                        artifact=ArtifactRef(
+                            relative.as_posix(),
+                            output_media_type,
+                            len(output_bytes),
+                            str(artifact["sha256"]),
+                        ),
+                        candidate=TypedPublicationCandidate(
+                            attempt_relative_path=relative.as_posix(),
+                            output_type=output_type,
+                            media_type=output_media_type,
+                            size_bytes=len(output_bytes),
+                            sha256=str(artifact["sha256"]),
+                            schema_fingerprint=output_schema_fingerprint,
+                            canonicalization_version=1,
+                            session_id=None,
+                        ),
+                    )
+                    artifact.update(_typed_publication_fields(publication))
+                projection["artifacts"].append(artifact)
+                group["output"] = candidate
+                if paused:
+                    interaction = dict(pending_interaction or {})
+                    interaction.update({
+                        "loop_group_scope": scope.durable_record(),
+                        "attempt_id": attempt_id,
+                        "result_artifact": relative.as_posix(),
+                        "result_sha256": artifact["sha256"],
+                    })
+                    group["pending_interaction"] = interaction
+                    group["state"] = "paused"
+                    controller["state"] = "paused"
+                    projection["status"] = "paused"
+                else:
+                    group["state"] = "succeeded"
+                    controller["state"] = "succeeded"
+                    states = {item["state"] for item in projection["nodes"].values()}
+                    if states <= {
+                        "succeeded", "failed", "skipped", "cancelled", "interrupted"
+                    }:
+                        projection["status"] = (
+                            "failed" if "failed" in states else "succeeded"
+                        )
+            elif decision == "hard_limit":
+                controller["state"] = "failed"
+                group["state"] = "failed"
+                projection["status"] = "failed"
+                projection["last_error"] = {
+                    "code": "loop_group_max_iterations",
+                    "message": f"loop group reached its hard limit of {maximum} iterations",
+                    "node_id": scope.group_id,
+                }
+            else:
+                controller["iteration"] = iteration + 1
+                controller["body"] = {
+                    child_id: {
+                        "id": child_id,
+                        "type": child["type"],
+                        "depends_on": list(child["depends_on"]),
+                        "state": "pending" if child["depends_on"] else "ready",
+                        "attempts": [],
+                    }
+                    for child_id, child in body.items()
+                }
+                event_payload.update({
+                    "completed_iteration": iteration,
+                    "next_iteration": controller["iteration"],
+                    "output_nodes": list(previous_outputs),
+                })
             self._append_locked(
                 directory,
                 projection,
-                "loop_group_iteration_committed",
-                {
-                    "controller_generation": scope.controller_generation,
-                    "completed_iteration": scope.iteration,
-                    "next_iteration": controller["iteration"],
-                    "output_nodes": list(previous_outputs),
-                },
+                (
+                    "loop_group_iteration_committed"
+                    if decision == "continue"
+                    else "loop_group_iteration_decided"
+                ),
+                event_payload,
                 node_id=scope.group_id,
                 defer_notification=fence_connection is not None,
                 reserve_connection=fence_connection,
@@ -12955,7 +13172,10 @@ class RunStore:
             descriptors = _journaled_typed_publications(
                 projection,
                 declared_outputs,
-                journal_events=self._read_journal_events(directory),
+                journal_events=self._typed_publication_journal_events(
+                    directory,
+                    projection,
+                ),
             )
             expected = {descriptor.publication_id: descriptor for descriptor in descriptors}
             publications = directory / "publications"
@@ -13309,7 +13529,7 @@ class RunStore:
         projection: dict[str, object],
         verified_content: Mapping[str, bytes],
     ) -> None:
-        events = self._read_journal_events(directory)
+        events = self._typed_publication_journal_events(directory, projection)
         descriptors = {
             descriptor.publication_id: descriptor
             for descriptor in _journaled_typed_publications(
@@ -13318,10 +13538,8 @@ class RunStore:
                 journal_events=events,
             )
         }
-        if (
-            not descriptors
-            and not self._journal_may_contain_typed_mirror_events(directory)
-        ):
+        has_mirror_events = self._journal_may_contain_typed_mirror_events(directory)
+        if not descriptors and not has_mirror_events:
             return
         expected = {
             obligation.mirror_id: obligation
@@ -13333,6 +13551,8 @@ class RunStore:
             )
             for obligation in (self._typed_mirror_obligation(projection, descriptor),)
         }
+        if (expected or has_mirror_events) and not events:
+            events = tuple(self._read_journal_events(directory))
         required: dict[str, TypedMirrorObligation] = {}
         completed: dict[str, str] = {}
         for event in events:
@@ -13493,6 +13713,17 @@ class RunStore:
         }:
             raise ValueError(f"invalid node completion state: {status}")
         artifacts = tuple(artifacts)
+        if claim.loop_group_scope is not None and isinstance(
+            (metadata or {}).get("pending_interaction"), Mapping
+        ):
+            metadata = {
+                **dict(metadata or {}),
+                "pending_interaction": {
+                    **dict((metadata or {})["pending_interaction"]),
+                    "loop_group_scope": claim.loop_group_scope.durable_record(),
+                    "attempt_id": claim.attempt_id,
+                },
+            }
         pending_candidate = (metadata or {}).get("pending_interaction")
         confirmation = None
         if (
@@ -15400,6 +15631,15 @@ class RunStore:
                 json.dumps(projection, sort_keys=True, ensure_ascii=False)
             )
         raw_payload = dict(payload or {})
+        if attempt_id is not None:
+            scope = _loop_group_scope_for_attempt(projection, attempt_id)
+            if scope is not None:
+                existing = raw_payload.get("loop_group_scope")
+                if existing is not None and existing != scope:
+                    raise JournalRecoveryError("loop group event scope changed")
+                raw_payload["loop_group_scope"] = scope
+        if isinstance(raw_payload.get("loop_group_scope"), Mapping):
+            raw_payload = dict(sanitize_loop_group_event_payload(raw_payload))
         event = {
             "sequence": sequence,
             "timestamp": now,
@@ -16315,6 +16555,11 @@ class RunStore:
                         "interaction_id": interaction_id,
                         "attempt_id": attempt_id,
                         "reason_code": "lease_expired_outcome_uncertain",
+                        **(
+                            {"loop_group_scope": dict(claim["loop_group_scope"])}
+                            if isinstance(claim.get("loop_group_scope"), Mapping)
+                            else {}
+                        ),
                     }
                     attempt.update({
                         "state": "paused",
@@ -16673,6 +16918,11 @@ class RunStore:
                         "interaction_id": f"reconcile-{claim['attempt_id']}",
                         "attempt_id": claim["attempt_id"],
                         "reason_code": f"{reason}_outcome_uncertain",
+                        **(
+                            {"loop_group_scope": dict(claim["loop_group_scope"])}
+                            if isinstance(claim.get("loop_group_scope"), Mapping)
+                            else {}
+                        ),
                     }
                     attempt.update({
                         "state": "paused",
@@ -17398,6 +17648,68 @@ class RunStore:
         return str(value) if isinstance(value, str) and value else None
 
     @staticmethod
+    def _authenticate_loop_group_interaction(
+        projection: Mapping[str, object],
+        *,
+        node_id: str,
+        node: Mapping[str, object],
+        pending: Mapping[str, object],
+    ) -> LoopGroupChildScope | None:
+        """Authenticate optional nested interaction identity before mutation."""
+        raw_scope = pending.get("loop_group_scope")
+        if raw_scope is None:
+            return None
+        try:
+            scope = LoopGroupChildScope.from_durable_record(raw_scope)
+        except ValueError as exc:
+            raise WorkflowConflict("loop group interaction scope is invalid") from exc
+        nodes = projection.get("nodes")
+        group = nodes.get(scope.group_id) if isinstance(nodes, Mapping) else None
+        controller = group.get("loop_group") if isinstance(group, Mapping) else None
+        body = controller.get("body") if isinstance(controller, Mapping) else None
+        if (
+            scope.run_id != projection.get("run_id")
+            or not isinstance(group, Mapping)
+            or not isinstance(controller, Mapping)
+            or not isinstance(body, Mapping)
+            or controller.get("controller_generation")
+            != scope.controller_generation
+            or controller.get("iteration") != scope.iteration
+            or scope.node_id not in body
+        ):
+            raise WorkflowConflict("loop group interaction scope is stale")
+        if node_id == scope.group_id:
+            if node is not group or scope.node_id != controller.get("primary_sink"):
+                raise WorkflowConflict("loop group interaction target changed")
+        elif (
+            node_id != f"{scope.group_id}/{scope.node_id}"
+            or node is not body.get(scope.node_id)
+        ):
+            raise WorkflowConflict("loop group interaction target changed")
+        attempt_id = pending.get("attempt_id")
+        attempts = node.get("attempts")
+        if (
+            not isinstance(attempt_id, str)
+            or not isinstance(attempts, list)
+            or not attempts
+            or attempts[-1].get("attempt_id") != attempt_id
+        ):
+            raise WorkflowConflict("loop group interaction attempt changed")
+        result_artifact = pending.get("result_artifact")
+        result_sha256 = pending.get("result_sha256")
+        if result_artifact is not None or result_sha256 is not None:
+            artifacts = projection.get("artifacts")
+            if not isinstance(artifacts, list) or sum(
+                isinstance(artifact, Mapping)
+                and artifact.get("attempt_id") == attempt_id
+                and artifact.get("relative_path") == result_artifact
+                and artifact.get("sha256") == result_sha256
+                for artifact in artifacts
+            ) != 1:
+                raise WorkflowConflict("loop group interaction artifact changed")
+        return scope
+
+    @staticmethod
     def _loop_signal_confirmation(
         pending: object,
         *,
@@ -17407,7 +17719,11 @@ class RunStore:
         if not isinstance(pending, Mapping):
             raise ValueError("loop signal confirmation is malformed")
         return LoopSignalConfirmation.from_mapping(
-            pending,
+            {
+                key: value
+                for key, value in pending.items()
+                if key not in {"loop_group_scope", "attempt_id"}
+            },
             run_id=run_id,
             node_id=node_id,
         )
@@ -17777,18 +18093,28 @@ class RunStore:
             raise ArchonOutputIntegrityError(
                 "staged typed publication attempt is not the paused attempt"
             )
-        staged = _typed_publication_candidate_from_metadata(
-            attempt.get("metadata")
-        )
         declaration = _typed_output_declarations_from_definition_bytes(
             authenticated_definition_bytes
         ).get(node_id)
         if declaration is None:
-            if staged is not None:
+            raw_metadata = attempt.get("metadata")
+            raw_candidate = (
+                raw_metadata.get(PRIMARY_OUTPUT_CANDIDATE_METADATA_KEY)
+                if isinstance(raw_metadata, Mapping)
+                else None
+            )
+            if (
+                raw_candidate is not None
+                and primary_output_candidate_from_identity(raw_candidate).output_type
+                is not None
+            ):
                 raise ArchonOutputIntegrityError(
                     "staged typed publication has no sealed output authority"
                 )
             return None
+        staged = _typed_publication_candidate_from_metadata(
+            attempt.get("metadata")
+        )
         if staged is None:
             raise ArchonOutputIntegrityError(
                 "declared loop output has no staged typed publication"
@@ -17857,7 +18183,7 @@ class RunStore:
     ) -> ApprovalDecision | None:
         if not isinstance(interaction_id, str) or not interaction_id.strip():
             return None
-        for node_id, raw_node in projection["nodes"].items():
+        for node_id, raw_node in _iter_interaction_node_states(projection):
             if not isinstance(raw_node, Mapping):
                 continue
             recorded = raw_node.get("approval_last_decision")
@@ -17959,7 +18285,7 @@ class RunStore:
                     == interaction_id
                 )
             )
-            for node in preliminary.get("nodes", {}).values()
+            for _node_id, node in _iter_interaction_node_states(preliminary)
         )
         definitions = None
         from plugins.workflow.scheduler import RunScheduler
@@ -17968,6 +18294,12 @@ class RunStore:
         if not has_signal_confirmation:
             package = scheduler._load_run_package(run_id)
             definitions = {node.id: node for node in package.definition.nodes}
+            for group in package.definition.nodes:
+                body = group.value.get("nodes") if (
+                    group.node_type == "loop_group" and isinstance(group.value, Mapping)
+                ) else None
+                if isinstance(body, tuple):
+                    definitions.update({f"{group.id}/{node.id}": node for node in body})
 
         def authenticated_signal_bytes(
             projection: Mapping[str, object],
@@ -18005,7 +18337,7 @@ class RunStore:
                 == "loop_signal_confirmation"
                 and candidate["approval_last_decision"].get("interaction_id")
                 == interaction_id
-                for candidate in projection.get("nodes", {}).values()
+                for _node_id, candidate in _iter_interaction_node_states(projection)
             )
             if duplicate is not None and duplicate_signal_confirmation:
                 authenticated_signal_bytes(projection)
@@ -18017,7 +18349,7 @@ class RunStore:
                 raise WorkflowConflict("stale approval decision")
             candidates = [
                 (node_id, node)
-                for node_id, node in projection["nodes"].items()
+                for node_id, node in _iter_interaction_node_states(projection)
                 if node.get("state") == "paused"
                 and self._interaction_identity(node) is not None
                 and self._interaction_identity(node) == interaction_id
@@ -18032,6 +18364,12 @@ class RunStore:
             resolved_id = self._interaction_identity(node)
             assert resolved_id is not None
             pending = node["pending_interaction"]
+            self._authenticate_loop_group_interaction(
+                projection,
+                node_id=node_id,
+                node=node,
+                pending=pending,
+            )
             pending_type = str(pending.get("type") or pending.get("kind") or "")
             confirmation = None
             staged_loop_publication = None
@@ -18073,12 +18411,22 @@ class RunStore:
             }
             if pending_type == "loop_signal_confirmation":
                 record["type"] = pending_type
+            if isinstance(pending.get("loop_group_scope"), Mapping):
+                record["loop_group_scope"] = dict(pending["loop_group_scope"])
+            if isinstance(pending.get("attempt_id"), str):
+                record["attempt_id"] = pending["attempt_id"]
             node["approval_last_decision"] = record
             node.pop("pending_interaction", None)
             event_payload: dict[str, object] = {
                 "decision": decision,
                 "interaction_id": resolved_id,
             }
+            if isinstance(pending.get("loop_group_scope"), Mapping):
+                event_payload["loop_group_scope"] = dict(
+                    pending["loop_group_scope"]
+                )
+            if isinstance(pending.get("attempt_id"), str):
+                event_payload["attempt_id"] = pending["attempt_id"]
             if pending_type == "loop_signal_confirmation" and safe_response:
                 event_payload["comment"] = safe_response
             if actor:
@@ -18173,6 +18521,23 @@ class RunStore:
                     node["state"] = "succeeded"
                     if node.get("attempts"):
                         node["attempts"][-1]["state"] = "succeeded"
+                    controller = node.get("loop_group")
+                    if isinstance(controller, MutableMapping):
+                        controller["state"] = "succeeded"
+                    if "/" in node_id:
+                        group_id, _child_id = node_id.split("/", 1)
+                        group = projection["nodes"][group_id]
+                        controller = group["loop_group"]
+                        for candidate in controller["body"].values():
+                            if candidate.get("state") == "pending" and all(
+                                controller["body"][dependency].get("state")
+                                in {"succeeded", "skipped"}
+                                for dependency in candidate.get("depends_on", [])
+                            ):
+                                candidate["state"] = "ready"
+                        group["state"] = "running"
+                        controller["state"] = "running"
+                        projection["status"] = "running"
                 elif pending_type == "approval":
                     node["state"] = "ready"
                     node["action_grant"] = resolved_id
@@ -18204,6 +18569,9 @@ class RunStore:
                     node["state"] = "succeeded"
                     if node.get("attempts"):
                         node["attempts"][-1]["state"] = "succeeded"
+                    controller = node.get("loop_group")
+                    if isinstance(controller, MutableMapping):
+                        controller["state"] = "succeeded"
                 else:
                     raise ValueError("pending interaction is not approvable")
             else:
@@ -18243,6 +18611,11 @@ class RunStore:
                 ),
                 event_payload,
                 node_id=node_id,
+                attempt_id=(
+                    pending["attempt_id"]
+                    if isinstance(pending.get("attempt_id"), str)
+                    else None
+                ),
             )
             if activated_publication_ref is not None:
                 verified_content = self._recover_typed_publications_locked(
@@ -18398,7 +18771,7 @@ class RunStore:
                 raise ValueError("run is not waiting for loop input")
             candidates = [
                 (node_id, node)
-                for node_id, node in projection["nodes"].items()
+                for node_id, node in _iter_interaction_node_states(projection)
                 if node.get("state") == "paused"
                 and isinstance(node.get("pending_interaction"), dict)
                 and node["pending_interaction"].get("type")
@@ -18409,6 +18782,12 @@ class RunStore:
                 raise ValueError("run does not have exactly one pending loop input")
             node_id, node = candidates[0]
             pending = node["pending_interaction"]
+            self._authenticate_loop_group_interaction(
+                projection,
+                node_id=node_id,
+                node=node,
+                pending=pending,
+            )
             pending_type = str(pending.get("type") or "")
             if pending_type == "loop_signal_confirmation":
                 confirmation = self._loop_signal_confirmation(
@@ -18425,6 +18804,8 @@ class RunStore:
                 generation = confirmation.iteration
             else:
                 generation = int(node.get("loop_state", {}).get("iteration", 0))
+                if node.get("type") == "loop_group":
+                    generation = int(pending.get("iteration", 0))
             relative = (
                 Path("nodes")
                 / node_id
@@ -18445,6 +18826,27 @@ class RunStore:
             node["state"] = "ready"
             node.pop("pending_interaction", None)
             node["loop_user_input_artifact"] = relative.as_posix()
+            controller = node.get("loop_group")
+            if isinstance(controller, MutableMapping):
+                body = controller.get("body")
+                if not isinstance(body, Mapping):
+                    raise JournalRecoveryError("loop group interaction body is missing")
+                if int(controller["iteration"]) >= int(controller["max_iterations"]):
+                    raise ValueError("loop group input is unavailable at the hard limit")
+                controller["iteration"] = int(controller["iteration"]) + 1
+                controller["state"] = "running"
+                controller["loop_user_input_artifact"] = relative.as_posix()
+                controller["body"] = {
+                    child_id: {
+                        "id": child_id,
+                        "type": child["type"],
+                        "depends_on": list(child["depends_on"]),
+                        "state": "pending" if child["depends_on"] else "ready",
+                        "attempts": [],
+                    }
+                    for child_id, child in body.items()
+                }
+                node["state"] = "running"
             if pending_type == "loop_signal_confirmation":
                 node["approval_last_decision"] = {
                     "decision": "feedback",
@@ -18456,6 +18858,13 @@ class RunStore:
                 "iteration": generation,
                 "interaction_id": interaction_id,
             }
+            if isinstance(pending.get("loop_group_scope"), Mapping):
+                event_payload["loop_group_scope"] = dict(
+                    pending["loop_group_scope"]
+                )
+            pending_attempt_id = pending.get("attempt_id")
+            if isinstance(pending_attempt_id, str):
+                event_payload["attempt_id"] = pending_attempt_id
             if actor:
                 event_payload["actor"] = _sanitize_diagnostic(actor)
             if channel:
@@ -18470,6 +18879,11 @@ class RunStore:
                 ),
                 event_payload,
                 node_id=node_id,
+                attempt_id=(
+                    pending_attempt_id
+                    if isinstance(pending_attempt_id, str)
+                    else None
+                ),
             )
             return self._request_runnable_locked(
                 directory,
@@ -18561,7 +18975,7 @@ class RunStore:
             ):
                 raise WorkflowConflict("stale reconciliation decision")
             candidates = []
-            for candidate_id, node in projection["nodes"].items():
+            for candidate_id, node in _iter_interaction_node_states(projection):
                 pending = node.get("pending_interaction")
                 is_reconcile = pending == "reconcile" or (
                     isinstance(pending, Mapping) and pending.get("type") == "reconcile"
@@ -18572,6 +18986,14 @@ class RunStore:
             if len(candidates) != 1:
                 raise ValueError("reconcile requires exactly one matching interaction")
             selected_id, node = candidates[0]
+            selected_pending = node.get("pending_interaction")
+            if isinstance(selected_pending, Mapping):
+                self._authenticate_loop_group_interaction(
+                    projection,
+                    node_id=selected_id,
+                    node=node,
+                    pending=selected_pending,
+                )
             recovery = node.get("recovery")
             reconciled_attempt_id: str | None = None
             if (
@@ -18613,12 +19035,53 @@ class RunStore:
             if outcome == "confirmed-succeeded":
                 node["state"] = "succeeded"
                 projection["last_error"] = None
+                if isinstance(attempt, MutableMapping):
+                    attempt["state"] = "succeeded"
             elif outcome == "confirmed-failed":
                 node["state"] = "failed"
                 projection["status"] = "failed"
+                if isinstance(attempt, MutableMapping):
+                    attempt["state"] = "failed"
             else:
                 node["state"] = "ready"
                 projection["last_error"] = None
+            if "/" in selected_id:
+                group_id, _child_id = selected_id.split("/", 1)
+                group = projection["nodes"].get(group_id)
+                controller = (
+                    group.get("loop_group")
+                    if isinstance(group, MutableMapping)
+                    else None
+                )
+                if not isinstance(controller, MutableMapping):
+                    raise JournalRecoveryError(
+                        "loop group reconciliation controller is missing"
+                    )
+                if outcome == "confirmed-failed":
+                    group["state"] = "failed"
+                    controller["state"] = "failed"
+                    projection["last_error"] = {
+                        "code": "reconciliation_confirmed_failed",
+                        "message": "loop group child outcome was confirmed failed",
+                        "node_id": selected_id,
+                    }
+                else:
+                    if outcome == "confirmed-succeeded":
+                        body = controller.get("body")
+                        if not isinstance(body, Mapping):
+                            raise JournalRecoveryError(
+                                "loop group reconciliation body is missing"
+                            )
+                        for candidate in body.values():
+                            if candidate.get("state") == "pending" and all(
+                                body[dependency].get("state")
+                                in {"succeeded", "skipped"}
+                                for dependency in candidate.get("depends_on", [])
+                            ):
+                                candidate["state"] = "ready"
+                    group["state"] = "running"
+                    controller["state"] = "running"
+                    projection["status"] = "running"
             if isinstance(recovery, dict):
                 recovery["reconciled_outcome"] = outcome
                 recovery["reconciled_at"] = _utc_now()
@@ -18689,6 +19152,18 @@ class RunStore:
                     "outcome": outcome,
                     "interaction_id": interaction_id,
                     **(
+                        {
+                            "loop_group_scope": dict(
+                                selected_pending["loop_group_scope"]
+                            )
+                        }
+                        if isinstance(selected_pending, Mapping)
+                        and isinstance(
+                            selected_pending.get("loop_group_scope"), Mapping
+                        )
+                        else {}
+                    ),
+                    **(
                         {"retry_consumed": node["retry_consumed"]}
                         if outcome == "safe-to-retry"
                         and "retry_consumed" in node
@@ -18696,6 +19171,7 @@ class RunStore:
                     ),
                 },
                 node_id=selected_id,
+                attempt_id=reconciled_attempt_id,
             )
             if reconciled_attempt_id is not None:
                 with self._connect() as connection:
