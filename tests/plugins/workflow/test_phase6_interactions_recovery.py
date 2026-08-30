@@ -675,6 +675,47 @@ def test_operator_reopens_only_safe_unstarted_attempted_siblings(
     assert "claim" not in sibling
     assert "recovery" not in sibling
 
+    if sibling_effect == "outward":
+        directory = store.run_directory(run_id)
+        projection_bytes = (directory / "run.json").read_bytes()
+        journal_bytes = (directory / "events.jsonl").read_bytes()
+        projection = store.load_run(run_id)
+        with store._connect() as connection:
+            authority = (
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+                    (sibling_claim.attempt_id,),
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM attempt_journal_reserves "
+                    "WHERE attempt_id=?",
+                    (sibling_claim.attempt_id,),
+                ).fetchone()[0],
+            )
+        expected_error = ValueError if operator_action == "retry" else RuntimeError
+        expected_message = "replay-safe" if operator_action == "retry" else "resume"
+        with pytest.raises(expected_error, match=expected_message):
+            if operator_action == "resume":
+                store.resume_run(run_id, always_run_nodes=set())
+            else:
+                store.retry_run(run_id, node_id="group/flaky")
+        assert (directory / "run.json").read_bytes() == projection_bytes
+        assert (directory / "events.jsonl").read_bytes() == journal_bytes
+        assert store.load_run(run_id) == projection
+        with store._connect() as connection:
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+                    (sibling_claim.attempt_id,),
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM attempt_journal_reserves "
+                    "WHERE attempt_id=?",
+                    (sibling_claim.attempt_id,),
+                ).fetchone()[0],
+            ) == authority
+        return
+
     if operator_action == "resume":
         resumed = store.resume_run(run_id, always_run_nodes=set())
     else:
@@ -682,11 +723,6 @@ def test_operator_reopens_only_safe_unstarted_attempted_siblings(
     resumed_sibling = resumed["nodes"]["group"]["loop_group"]["body"][
         "independent"
     ]
-
-    if sibling_effect == "outward":
-        assert resumed_sibling["state"] == "cancelled"
-        assert len(resumed_sibling["attempts"]) == 1
-        return
 
     assert resumed_sibling["state"] == "ready"
     completed = scheduler.advance_all([run_id])[run_id]

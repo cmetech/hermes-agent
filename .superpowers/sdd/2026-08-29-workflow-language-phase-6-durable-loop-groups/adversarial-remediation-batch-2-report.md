@@ -71,6 +71,12 @@ Result: 2 passed, 2 failed. Outward negative cases remained cancelled, while
 resume and explicit retry both failed to reopen the exact replay-safe sibling
 whose cancelled attempt was corroborated as not started.
 
+The final coherence re-review changed the outward attempted-sibling cases to
+require a transactional refusal and reran the same focused command before the
+production change. Result: 2 passed, 2 failed. The replay-safe rows completed,
+but both outward rows reported `DID NOT RAISE`: resume and retry restarted the
+group/controller despite preserving the unreopenable cancelled sibling.
+
 ## Root-cause changes
 
 - Routed resume, retry, and abandon safety checks through the existing nested
@@ -81,18 +87,19 @@ whose cancelled attempt was corroborated as not started.
   runs and `recovery_pending` registry retries. Existing top-level resume/retry
   error contracts remain intact.
 - Made resume and explicit retry authenticate the current `group/child` body
-  state, reset only failed/interrupted children with replay-safe stopped-process
-  evidence, and restore the existing outer/controller state to `running`. Every
-  attempt-free cancelled child in that current body is restored from its own
-  dependency state, covering both dependency descendants and independent work
-  cancelled as failure fallout. Executed, claimed, recovery-bound, or
-  interaction-bound cancelled children remain terminal, except that an exact
-  last cancelled attempt may reopen when it is replay-safe and the existing
-  attempt observer corroborates `not_started` or `known_stopped`. Outward,
-  malformed, still-running, and outcome-uncertain evidence remains terminal or
-  refused. Attempt history is preserved. Succeeded/skipped siblings, controller
-  generation, and current iteration remain unchanged. The outer group is not a
-  retry candidate.
+  state and preflight the complete current body before mutating any child,
+  group/controller state, run error, or journal. A cancelled failure-fallout
+  child is reopenable only when it has an empty attempt history, or its exact
+  last cancelled attempt is replay-safe and the existing attempt observer
+  corroborates `not_started` or `known_stopped`; it must also have no claim,
+  recovery, or pending interaction. If any cancelled child fails that test,
+  resume or retry refuses with its existing action-specific error contract and
+  leaves the failed projection, journal, claims, and reserves byte/semantically
+  unchanged. Otherwise the selected failed/interrupted child and all safe
+  cancelled fallout are restored from their own dependency states, covering
+  both dependency descendants and independent work. Attempt history is
+  preserved. Succeeded/skipped siblings, controller generation, and current
+  iteration remain unchanged. The outer group is not a retry candidate.
 - Preserved the one durable predicate claim, execution fence, callbacks, and
   obligation-journal reserve while assigning every authorized Bash dispatch a
   fresh physical attempt ID and contained directory beneath the iteration's
@@ -145,7 +152,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_shutdown_recovery.py -q
 ```
 
-Result after the scoped review follow-up: 6 files, 231 tests passed, 0 failed.
+Result after the final coherence re-review: 6 files, 231 tests passed, 0 failed.
 
 Static gates:
 
@@ -162,6 +169,11 @@ git diff --check
 
 Result: Ruff reported `All checks passed!`; `git diff --check` reported no
 errors.
+
+The final coherence follow-up reran focused Ruff on
+`plugins/workflow/store.py` and
+`tests/plugins/workflow/test_phase6_interactions_recovery.py`, followed by
+`git diff --check`; both remained clean.
 
 ## Changed files
 
@@ -186,10 +198,14 @@ resume ordering fix, and regressions.
 atomic second re-review follow-up containing the independent-fallout fix and
 explicit parameter rows.
 
-`fix(workflow): reopen safe attempted loop siblings` — the atomic final
-re-review follow-up containing the observed-attempt classifier fix, positive
-and negative regressions, and this report update. Its final SHA is returned in
-the task handoff because a commit cannot embed its own SHA.
+`226017277f` (`fix(workflow): reopen safe attempted loop siblings`) — the
+atomic attempted-sibling follow-up containing the observed-attempt classifier
+fix and positive/negative regressions.
+
+`fix(workflow): refuse unsafe loop group restart` — the atomic final coherence
+follow-up containing the transactional body preflight, immutable-refusal
+regressions, and this report update. Its final SHA is returned in the task
+handoff because a commit cannot embed its own SHA.
 
 ## Concerns
 

@@ -476,6 +476,8 @@ def _reset_loop_group_child_for_operator(
     projection: Mapping[str, object],
     semantic_id: str,
     child: MutableMapping[str, object],
+    *,
+    action: str,
 ) -> None:
     group_id, child_id = semantic_id.split("/", 1)
     nodes = projection.get("nodes")
@@ -484,6 +486,31 @@ def _reset_loop_group_child_for_operator(
     body = controller.get("body") if isinstance(controller, MutableMapping) else None
     if not isinstance(body, Mapping) or body.get(child_id) is not child:
         raise RuntimeError("loop group retry scope changed")
+    for candidate in body.values():
+        if not isinstance(candidate, Mapping) or candidate.get("state") != "cancelled":
+            continue
+        attempts = candidate.get("attempts")
+        no_attempt = isinstance(attempts, list) and not attempts
+        replay_safe_attempt = bool(
+            isinstance(attempts, list)
+            and attempts
+            and isinstance(attempts[-1], Mapping)
+            and attempts[-1].get("state") == "cancelled"
+            and attempts[-1].get("effect_classification") == "replay_safe"
+            and RunStore._observe_attempt(attempts[-1])
+            in {"not_started", "known_stopped"}
+        )
+        authority_free = all(
+            candidate.get(field) is None
+            for field in ("claim", "recovery", "pending_interaction")
+        )
+        if authority_free and (no_attempt or replay_safe_attempt):
+            continue
+        if action == "retry":
+            raise ValueError(
+                "retry requires exactly one replay-safe failed or interrupted node"
+            )
+        raise RuntimeError("cannot resume an unreplayable loop group child")
     recovery = child.get("recovery")
     if isinstance(recovery, Mapping):
         if (
@@ -503,24 +530,9 @@ def _reset_loop_group_child_for_operator(
         else "pending"
     )
     for candidate in body.values():
-        attempts = candidate.get("attempts") if isinstance(candidate, Mapping) else None
-        replay_safe_attempt = bool(
-            isinstance(attempts, list)
-            and attempts
-            and isinstance(attempts[-1], Mapping)
-            and attempts[-1].get("state") == "cancelled"
-            and attempts[-1].get("effect_classification") == "replay_safe"
-            and RunStore._observe_attempt(attempts[-1])
-            in {"not_started", "known_stopped"}
-        )
         if (
             not isinstance(candidate, MutableMapping)
             or candidate.get("state") != "cancelled"
-            or (attempts and not replay_safe_attempt)
-            or any(
-                candidate.get(field) is not None
-                for field in ("claim", "recovery", "pending_interaction")
-            )
         ):
             continue
         dependencies = candidate.get("depends_on", ())
@@ -18709,6 +18721,7 @@ class RunStore:
                                     projection,
                                     f"{node_id}/{child_id}",
                                     child,
+                                    action="resume",
                                 )
                     continue
                 if node["state"] == "succeeded" and node_id not in always_run:
@@ -20037,7 +20050,7 @@ class RunStore:
             selected_id, node = candidates[0]
             if "/" in selected_id:
                 _reset_loop_group_child_for_operator(
-                    projection, selected_id, node
+                    projection, selected_id, node, action="retry"
                 )
             else:
                 node.pop("claim", None)
