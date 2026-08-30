@@ -120,7 +120,7 @@ def test_explicit_v6_group_interactivity_has_schema_loader_parity(
     document = _workflow({
         "id": "group",
         "loop_group": {
-            "nodes": [{"id": "child", "command": "run"}],
+            "nodes": [{"id": "child", "bash": "true"}],
             "until": "done",
             "max_iterations": 1,
             **group_options,
