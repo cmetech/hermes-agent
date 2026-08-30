@@ -724,6 +724,30 @@ def test_v6_rejects_malformed_previous_reference_boundaries(
 
 
 @pytest.mark.parametrize(
+    "template",
+    (
+        "printf ok # $LOOP_PREV.producer.outputx",
+        r"printf '%s' \$LOOP_PREV.producer.outputx",
+    ),
+    ids=("comment", "escaped-literal"),
+)
+def test_v6_ignores_malformed_previous_text_outside_bash_reference_contexts(
+    tmp_path, workflow_writer, template
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group(
+                [{"id": "producer", "prompt": "produce"}],
+                until_bash=template,
+            )
+        ],
+    )
+
+    assert _load_v6(path).definition.nodes[0].node_type == "loop_group"
+
+
+@pytest.mark.parametrize(
     ("surface", "template"),
     [
         ("prompt", "$LOOP_PREV.producer.output,"),

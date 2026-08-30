@@ -15,7 +15,7 @@ import yaml
 from agent.structured_output import parse_exact_decimal_integer
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
-    bash_loop_previous_reference_spans,
+    bash_loop_previous_output_references,
     bash_output_references,
 )
 from plugins.workflow.conditions import (
@@ -1928,18 +1928,12 @@ def _validate_v6_loop_group_references(
         ) -> None:
             try:
                 previous = tuple(
-                    iter_loop_previous_output_references(
-                        template,
-                        normalizer_version=6,
+                    bash_loop_previous_output_references(template)
+                    if bash_context
+                    else iter_loop_previous_output_references(
+                        template, normalizer_version=6
                     )
                 )
-                if bash_context:
-                    admitted = frozenset(bash_loop_previous_reference_spans(template))
-                    previous = tuple(
-                        reference
-                        for reference in previous
-                        if (reference.start, reference.end) in admitted
-                    )
                 masked = list(template)
                 for reference in previous:
                     masked[reference.start : reference.end] = " " * (

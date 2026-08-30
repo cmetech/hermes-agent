@@ -1510,25 +1510,20 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
     """Parse outputs after validating every substituted Bash reference context."""
     # Local import preserves bash_rendering's dependency-neutral lexer surface.
     from plugins.workflow.language_schema import (
-        iter_loop_previous_output_references,
         iter_output_reference_candidate_spans,
         iter_output_references_in_spans,
     )
 
-    previous_candidates = (
-        tuple(
-            (reference.start, reference.end)
-            for reference in iter_loop_previous_output_references(
-                template,
-                normalizer_version=normalizer_version,
-            )
-        )
+    previous_references = (
+        bash_loop_previous_output_references(template)
         if normalizer_version >= 6
         else ()
     )
     masked = list(template)
-    for start, end in previous_candidates:
-        masked[start:end] = " " * (end - start)
+    for reference in previous_references:
+        masked[reference.start : reference.end] = " " * (
+            reference.end - reference.start
+        )
     ordinary_template = "".join(masked)
     output_candidates = tuple(
         iter_output_reference_candidate_spans(
@@ -1555,9 +1550,7 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
             if start < output_end and end > output_start:
                 continue
         scalar_candidates.append((start, end))
-    candidates = tuple(
-        sorted((*output_candidates, *scalar_candidates, *previous_candidates))
-    )
+    candidates = tuple(sorted((*output_candidates, *scalar_candidates)))
     output_candidate_set = frozenset(output_candidates)
     admitted = tuple(
         (start, end)
@@ -1576,23 +1569,55 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
     )
 
 
-def bash_loop_previous_reference_spans(template: str) -> tuple[tuple[int, int], ...]:
-    """Return lexer-admitted private v6 previous-output spans."""
-    from plugins.workflow.language_schema import iter_loop_previous_output_references
+def bash_loop_previous_output_references(template: str):
+    """Parse private v6 outputs only after Bash lexical admission."""
+    from plugins.workflow.language_schema import (
+        OutputReferenceToken,
+        WorkflowReferenceSyntaxError,
+        iter_loop_previous_output_references,
+        iter_output_reference_candidate_spans,
+    )
 
     candidates = tuple(
-        (reference.start, reference.end)
-        for reference in iter_loop_previous_output_references(
-            template,
-            normalizer_version=6,
-        )
-    )
-    return tuple(
         (start, end)
-        for start, end, _quote in classify_bash_reference_spans(
-            template,
-            candidates,
+        for start, end in iter_output_reference_candidate_spans(
+            template, normalizer_version=6
         )
+        if template.startswith("$LOOP_PREV.", start)
+    )
+    references = []
+    for start, end, _quote in classify_bash_reference_spans(template, candidates):
+        try:
+            parsed = tuple(
+                iter_loop_previous_output_references(
+                    template[start:end], normalizer_version=6
+                )
+            )
+        except WorkflowReferenceSyntaxError as exc:
+            raise WorkflowReferenceSyntaxError(
+                str(exc), start=start + (exc.start or 0)
+            ) from exc
+        if len(parsed) != 1:
+            raise WorkflowReferenceSyntaxError(
+                "output reference uses an unsupported path", start=start
+            )
+        reference = parsed[0]
+        references.append(
+            OutputReferenceToken(
+                reference.node_id,
+                reference.path,
+                start + reference.start,
+                start + reference.end,
+            )
+        )
+    return tuple(references)
+
+
+def bash_loop_previous_reference_spans(template: str) -> tuple[tuple[int, int], ...]:
+    """Return lexer-admitted private v6 previous-output spans."""
+    return tuple(
+        (reference.start, reference.end)
+        for reference in bash_loop_previous_output_references(template)
     )
 
 

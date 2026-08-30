@@ -26,6 +26,32 @@ Result: 13 failed, 0 passed. The failures reproduced all three findings:
 
 The same focused command passed 13 tests after the production changes.
 
+The scoped review follow-up added its regressions before the follow-up
+production edits and ran:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_language.py \
+  tests/plugins/workflow/test_phase6_scheduler.py -q \
+  -k 'outside_bash_reference_contexts or outside_references or outer_evidence_wins_undeclared_body_id_collision'
+```
+
+Result: 6 failed, 0 passed. Two admission cases and two runtime-rendering cases
+showed that malformed previous-reference text in Bash comments and escaped
+literals was parsed before lexical exclusion. Inline and named Script cases
+showed that an undeclared, skipped body node incorrectly replaced approved
+outer predecessor evidence when their IDs collided. The expanded focused
+GREEN command was:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_language.py \
+  tests/plugins/workflow/test_phase6_scheduler.py -q \
+  -k 'outside_bash_reference_contexts or outside_references or outer_evidence_wins_undeclared_body_id_collision or malformed_previous_reference or scoped_renderer_rejects or scoped_script_predecessor'
+```
+
+Result: 15 passed, 0 failed.
+
 ## Root-cause changes
 
 - Reused the canonical v3 output-reference parser to parse the private v6
@@ -41,9 +67,14 @@ The same focused command passed 13 tests after the production changes.
   Previous outputs remain at iteration N-1 while the predicate evaluates and
   advance only after the predicate decision is recorded.
 - Built v6 scoped Script predecessor evidence from the same runtime dependency
-  identity as the Script node, merging approved outer and current-body state
-  with body state winning collisions. The Script executor's exact-set check and
-  predecessor-file cleanup contract remain unchanged.
+  identity as the Script node. A current body state wins an ID collision only
+  when it is a declared current-body dependency; otherwise approved outer state
+  wins, matching scoped variable resolution. The Script executor's exact-set
+  check and predecessor-file cleanup contract remain unchanged.
+- For Bash surfaces, reused the existing reference-candidate scanner and Bash
+  lexer to admit actual `$LOOP_PREV` candidates before applying the canonical
+  strict parser. Comments and escaped literals remain untouched, while genuine
+  malformed executable references still fail admission.
 
 ## Verification
 
@@ -57,7 +88,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_phase6_jira_defect_loop.py -q
 ```
 
-Result: 6 files, 228 tests passed, 0 failed.
+Result after the scoped review follow-up: 6 files, 234 tests passed, 0 failed.
 
 ```bash
 scripts/run_tests.sh \
@@ -101,8 +132,11 @@ Result: Ruff passed and `git diff --check` reported no errors.
 ## Commit
 
 `fix(workflow): align loop group scoped references` — the atomic commit
-containing this report. Its final SHA is returned in the task handoff because a
-commit cannot embed its own SHA.
+for the initial batch.
+
+`fix(workflow): preserve scoped collision semantics` — the atomic follow-up
+commit containing the review fixes and this report update. Its final SHA is
+returned in the task handoff because a commit cannot embed its own SHA.
 
 ## Concerns
 

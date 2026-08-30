@@ -26,7 +26,7 @@ from plugins.workflow.language_schema import (
 )
 from plugins.workflow.bash_rendering import (
     RenderedBashCommand,
-    bash_loop_previous_reference_spans,
+    bash_loop_previous_output_references,
     bash_output_references,
     render_v3_bash,
 )
@@ -1022,21 +1022,14 @@ class StrictSubstitutionRenderer:
         try:
             previous_tokens = (
                 tuple(
-                    iter_loop_previous_output_references(
-                        template,
-                        normalizer_version=self.variables.normalizer_version,
+                    bash_loop_previous_output_references(template)
+                    if bash_contexts
+                    else iter_loop_previous_output_references(
+                        template, normalizer_version=self.variables.normalizer_version
                     )
                 )
                 if self.variables.normalizer_version >= 6
                 else ()
-            )
-            previous_spans = (
-                frozenset(bash_loop_previous_reference_spans(template))
-                if bash_contexts
-                else frozenset(
-                    (reference.start, reference.end)
-                    for reference in previous_tokens
-                )
             )
             previous = tuple(
                 _ScopedOutputReference(
@@ -1047,7 +1040,6 @@ class StrictSubstitutionRenderer:
                     True,
                 )
                 for reference in previous_tokens
-                if (reference.start, reference.end) in previous_spans
             )
             masked = list(template)
             for reference in previous_tokens:

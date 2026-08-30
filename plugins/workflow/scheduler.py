@@ -5138,8 +5138,14 @@ class RunScheduler:
                             package.language.normalizer_version >= 6
                             and runtime_node.node_type == "script"
                         ):
+                            predecessor_nodes = dict(projection["nodes"])
+                            predecessor_nodes.update({
+                                dependency: body_projection[dependency]
+                                for dependency in work_item.node.depends_on
+                                if dependency in body_projection
+                            })
                             predecessor_projection = {
-                                "nodes": {**projection["nodes"], **body_projection}
+                                "nodes": predecessor_nodes
                             }
                         else:
                             predecessor_projection = {"nodes": body_projection}

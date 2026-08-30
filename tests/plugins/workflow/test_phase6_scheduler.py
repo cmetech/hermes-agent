@@ -1110,6 +1110,37 @@ def test_scoped_renderer_rejects_malformed_previous_reference_prefix() -> None:
     assert raised.value.code == "output_reference_path_unsupported"
 
 
+@pytest.mark.parametrize(
+    "template",
+    (
+        "printf ok # $LOOP_PREV.producer.outputx",
+        r"printf '%s' \$LOOP_PREV.producer.outputx",
+    ),
+    ids=("comment", "escaped-literal"),
+)
+def test_scoped_bash_renderer_ignores_malformed_previous_text_outside_references(
+    tmp_path, template
+) -> None:
+    renderer = substitution_renderer(
+        VariableContext(
+            previous_body_outputs={"producer": None},
+            normalizer_version=6,
+        ),
+        direct_dependencies=(),
+    )
+
+    rendered = renderer.render_bash(
+        template,
+        spill_directory=tmp_path / "spills",
+        secure_v3=True,
+    )
+
+    try:
+        assert rendered.command == template
+    finally:
+        rendered.close()
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
 @pytest.mark.parametrize("script", ("inline", "named"))
 @pytest.mark.parametrize("body_dependency", (False, True), ids=("outer-only", "body-outer"))
@@ -1149,6 +1180,62 @@ def test_scoped_script_predecessor_evidence_matches_runtime_dependencies(
     scheduler = RunScheduler(store, max_parallel_nodes=1)
     scheduler.executors["prompt"] = OutputExecutor(
         lambda context, _rendered: context.node.id.rsplit("/", 1)[-1]
+    )
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    script_state = result["nodes"]["group"]["loop_group"]["body"]["reduce"]
+    assert script_state["state"] == "succeeded"
+    assert not list(store.run_directory(run_id).rglob("predecessors.json"))
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize("script", ("inline", "named"))
+def test_scoped_script_outer_evidence_wins_undeclared_body_id_collision(
+    tmp_path, workflow_writer, script
+) -> None:
+    inline = (
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "data = json.loads(Path(os.environ['HERMES_WORKFLOW_PREDECESSORS_FILE']).read_text())\n"
+        "print(data['shared']['output'])\n"
+    )
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"scoped-script-collision-{script}",
+        nodes=[
+            {"id": "shared", "prompt": "outer"},
+            _group(
+                [
+                    {
+                        "id": "shared",
+                        "when": "$LOOP_PREV.shared.output == 'run'",
+                        "prompt": "body",
+                    },
+                    {
+                        "id": "reduce",
+                        "script": inline if script == "inline" else "predecessor-script",
+                        "runtime": "uv",
+                    },
+                    {
+                        "id": "finish",
+                        "depends_on": ["shared", "reduce"],
+                        "trigger_rule": "none_failed_min_one_success",
+                        "prompt": "finish",
+                    },
+                ],
+                depends_on=("shared",),
+            ),
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key=f"scoped-script-collision-{script}")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda context, _rendered: (
+            "outer" if context.node.id == "shared" else "finish"
+        )
     )
 
     result = scheduler.advance_all([run_id])[run_id]
