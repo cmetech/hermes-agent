@@ -113,15 +113,15 @@ upstream_changes:
   - CURRENT_NORMALIZER_BY_PROFILE
   - LATEST_NORMALIZER_VERSION
   - _field_schema
-  - test_v5_is_the_current_archon_admission_contract
-  - test_current_v5_schema_is_bounded_and_explicit_v4_remains_readable
+  - test_v5_remains_an_exact_recorded_archon_contract
+  - test_current_v6_schema_is_bounded_and_explicit_v4_v5_remain_readable
   - test_archon_authoring_contract_is_bounded_and_versioned
-  - test_current_v5_composite_trust_is_consistent_between_catalog_and_detail
+  - test_current_v6_composite_trust_is_consistent_between_catalog_and_detail
   - test_language_status_crosses_real_desktop_middleware_without_mutation
   owned_invariants:
   - current/default archon-2026-07 selects v6 while hermes-legacy remains v2
   - 'current normalizer contract: {"current_normalizer_by_profile":{"archon-2026-07":6,"hermes-legacy":2},"supported_normalizer_versions":[1,2,3,4,5,6]}'
-  - supported and sealed readers remain exactly v1 through v5 without changing snapshot format 2
+  - historical v1-v5 replay remains exact without changing snapshot format 2
   - v5 format-2 admission requires one immutable provider authority while historical v1-v4 tests stay explicitly pinned
   - generated authoring guidance and installed reference assets match the runtime profile mapping
   - catalog detail and Desktop consume backend-authored normalizer and provider capability projections

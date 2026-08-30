@@ -23,18 +23,22 @@ from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.language_schema import (
     iter_output_reference_candidate_spans,
     iter_when_output_references,
+    workflow_authoring_contract,
 )
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.includes import expand_workflow_source
 from plugins.workflow.models import (
     ExecutionFence,
     WorkflowCompilationLimits,
+    WorkflowLanguageProfile,
     WorkflowValidationError,
 )
+from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import parse_workflow_source_bytes
-from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.topology import project_topology
+from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit
+from tests.plugins.workflow_history import load_recorded_v4_workflow as load_workflow
 
 
 def _include_source(path, *, sidecar_bytes=None):
@@ -770,6 +774,48 @@ def test_shared_phase_state_classification_reads_only_linear_characters() -> Non
     assert large_bytes > small_bytes
     assert large_reads <= (3 * small_reads) + large_bytes
     assert large_reads <= 12 * large_bytes
+
+
+def test_current_v6_authoring_admission_and_one_worker_schedule_stay_bounded(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path / "phase6-current-bound" / "workflows",
+        name="phase6-current-bound",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "BATCH_COMPLETE",
+                    "max_iterations": 1,
+                    "nodes": [{"id": "finish", "bash": "printf BATCH_COMPLETE"}],
+                },
+            }
+        ],
+    )
+    sidecar = b"language_compatibility: archon-2026-07\n"
+    path.with_name(f"{path.stem}.hermes.yaml").write_bytes(sidecar)
+    source = _include_source(path, sidecar_bytes=sidecar)
+
+    started = time.process_time()
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+    )
+    store = RunStore(tmp_path / "phase6-current-home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-current-bound")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["bash"] = OutputExecutor(
+        lambda _context, _template: "BATCH_COMPLETE"
+    )
+    result = scheduler.advance_all([run_id])[run_id]
+    elapsed = time.process_time() - started
+
+    assert contract["normalizer_version"] == 6
+    assert compilation.package.language.normalizer_version == 6
+    assert result["status"] == "succeeded"
+    assert elapsed < 2.0
 
 
 def test_resolution_wait_pre_due_sweeps_append_nothing_and_do_not_hot_loop(

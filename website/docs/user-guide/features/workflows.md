@@ -80,7 +80,7 @@ authoritative billed-cost settlement. Retries, repair, fallback, and children
 share the same budget; exhaustion is terminal. One already-started call can
 settle above the remaining amount. Estimated-only providers block instead of
 claiming hard enforcement. No current provider proves provider-native sandbox
-enforcement, so Archon v5 `sandbox` blocks with
+enforcement, so Archon v6 `sandbox` blocks with
 `provider_native_sandbox_unavailable`. Use the companion policy
 `execution_environment: isolated_backend_required` when appropriate; process
 resource limits are not a sandbox or security boundary.
