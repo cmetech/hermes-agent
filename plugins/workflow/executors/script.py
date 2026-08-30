@@ -383,7 +383,7 @@ class ScriptExecutor:
             allowed_env.update(variables.environment())
         allowed_env.update({
             "HERMES_WORKFLOW_RUN_ID": context.run_id,
-            "HERMES_WORKFLOW_RUN_DIR": str(context.run_directory),
+            "HERMES_WORKFLOW_RUN_DIR": str(context.effective_process_directory),
             "HERMES_WORKFLOW_NODE_ID": context.node.id,
             "ARTIFACTS_DIR": str(artifacts_dir),
         })
@@ -440,7 +440,7 @@ class ScriptExecutor:
             tree = ManagedProcessTree.spawn(
                 argv,
                 policy=context.termination_policy,
-                cwd=context.run_directory,
+                cwd=context.effective_process_directory,
                 env=allowed_env,
                 stdout=output.stdout,
                 stderr=output.stderr,

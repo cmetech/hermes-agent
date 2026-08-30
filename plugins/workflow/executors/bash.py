@@ -153,7 +153,7 @@ class BashExecutor:
         }
         allowed_env.update({
             "HERMES_WORKFLOW_RUN_ID": context.run_id,
-            "HERMES_WORKFLOW_RUN_DIR": str(context.run_directory),
+            "HERMES_WORKFLOW_RUN_DIR": str(context.effective_process_directory),
             "ARTIFACTS_DIR": str(artifacts_dir),
         })
         policy = context.termination_policy
@@ -238,7 +238,7 @@ class BashExecutor:
                     inherited_descriptor_identities=(
                         rendered_command.inherited_descriptor_identities
                     ),
-                    cwd=context.run_directory,
+                    cwd=context.effective_process_directory,
                     env=allowed_env,
                     stdout=output.stdout,
                     stderr=output.stderr,

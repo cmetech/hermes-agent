@@ -130,6 +130,12 @@ class NodeExecutionContext:
     def effective_publication_directory(self) -> Path:
         return self.publication_directory or self.run_directory / "artifacts"
 
+    @property
+    def effective_process_directory(self) -> Path:
+        if self.node.node_type in {"bash", "script"} and self.max_artifact_bytes == 0:
+            return self.effective_attempt_directory
+        return self.run_directory
+
 
 @dataclass(frozen=True)
 class NodeExecutionResult:

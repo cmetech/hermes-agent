@@ -114,6 +114,32 @@ def _compile(
         "print(os.environ['ARTIFACTS_DIR'])\n",
         encoding="utf-8",
     )
+    (scripts / "artifact-free-escape.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "run = Path(os.environ['HERMES_WORKFLOW_RUN_DIR'])\n"
+        "cwd = Path.cwd()\n"
+        "artifacts = Path(os.environ['ARTIFACTS_DIR'])\n"
+        "for root, name in ((run, 'env-hidden'), (cwd, 'relative-hidden')):\n"
+        "    root.joinpath('artifacts').mkdir(parents=True, exist_ok=True)\n"
+        "    root.joinpath('artifacts', name).write_text(str(root))\n"
+        "print(run)\n"
+        "print(cwd)\n"
+        "print(artifacts)\n",
+        encoding="utf-8",
+    )
+    (scripts / "publishing-context.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "artifacts = Path(os.environ['ARTIFACTS_DIR'])\n"
+        "artifacts.joinpath('context.txt').write_text('\\n'.join((\n"
+        "    os.environ['HERMES_WORKFLOW_RUN_DIR'],\n"
+        "    str(Path.cwd()),\n"
+        "    str(artifacts),\n"
+        ")))\n"
+        "print('ok <promise>DONE</promise>')\n",
+        encoding="utf-8",
+    )
     workflow = workflow_writer(
         root / "workflows",
         name=name,
@@ -712,6 +738,177 @@ def test_v6_artifact_free_process_uses_one_attempt_private_rendered_workspace(
         else result["nodes"]["artifact-free"]
     )
     assert state["state"] == "succeeded"
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
+    ("surface", "scoped"),
+    (
+        ("bash", False),
+        ("bash", True),
+        ("inline-script", False),
+        ("inline-script", True),
+        ("named-script", False),
+        ("named-script", True),
+    ),
+)
+def test_v6_artifact_free_process_watches_run_env_and_relative_cwd(
+    tmp_path, workflow_writer, surface, scoped
+) -> None:
+    if surface == "bash":
+        value = (
+            'mkdir -p "$HERMES_WORKFLOW_RUN_DIR/artifacts" artifacts; '
+            "printf '%s' \"$HERMES_WORKFLOW_RUN_DIR\" > "
+            '"$HERMES_WORKFLOW_RUN_DIR/artifacts/env-hidden"; '
+            "printf '%s' \"$PWD\" > artifacts/relative-hidden; "
+            "printf '%s\\n%s\\n%s\\n' \"$HERMES_WORKFLOW_RUN_DIR\" "
+            '"$PWD" "$ARTIFACTS_DIR"'
+        )
+        node = {"id": "artifact-free", "bash": value, "artifacts": False}
+        executor = RecordingProcessExecutor(BashExecutor())
+        executor_name = "bash"
+    else:
+        value = (
+            "artifact-free-escape"
+            if surface == "named-script"
+            else (
+                "import os\n"
+                "from pathlib import Path\n"
+                "run = Path(os.environ['HERMES_WORKFLOW_RUN_DIR'])\n"
+                "cwd = Path.cwd()\n"
+                "artifacts = Path(os.environ['ARTIFACTS_DIR'])\n"
+                "for root, name in ((run, 'env-hidden'), (cwd, 'relative-hidden')):\n"
+                "    root.joinpath('artifacts').mkdir(parents=True, exist_ok=True)\n"
+                "    root.joinpath('artifacts', name).write_text(str(root))\n"
+                "print(run)\n"
+                "print(cwd)\n"
+                "print(artifacts)\n"
+            )
+        )
+        node = {
+            "id": "artifact-free",
+            "script": value,
+            "runtime": "uv",
+            "artifacts": False,
+        }
+        executor = RecordingProcessExecutor(ScriptExecutor())
+        executor_name = "script"
+    nodes = [_group([node])] if scoped else [node]
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"artifact-free-process-view-{surface}-{scoped}",
+        nodes=nodes,
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"artifact-free-process-view-{surface}-{scoped}",
+    )
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors[executor_name] = executor
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    [execution] = executor.contexts
+    private_run = execution.effective_attempt_directory
+    private_artifacts = private_run / "artifacts"
+    state = (
+        result["nodes"]["group"]["loop_group"]["body"]["artifact-free"]
+        if scoped
+        else result["nodes"]["artifact-free"]
+    )
+    assert state["state"] != "succeeded", state
+    assert state["attempts"][-1]["error_code"] == "artifact_limit"
+    assert (private_artifacts / "env-hidden").read_text() == str(private_run)
+    assert (private_artifacts / "relative-hidden").read_text() == str(private_run)
+    assert (
+        private_run / "stdout.txt"
+    ).read_text().splitlines() == [
+        str(private_run),
+        str(private_run),
+        str(private_artifacts),
+    ]
+    public_root = store.run_directory(run_id) / "artifacts"
+    assert not public_root.exists() or not list(public_root.rglob("*hidden"))
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
+    ("surface", "scoped", "normalizer_version"),
+    (
+        ("bash", False, 6),
+        ("bash", True, 6),
+        ("inline-script", False, 6),
+        ("inline-script", True, 6),
+        ("named-script", False, 6),
+        ("named-script", True, 6),
+        ("bash", False, 5),
+        ("named-script", False, 5),
+    ),
+)
+def test_publishing_process_keeps_real_run_cwd_env_and_exact_publication(
+    tmp_path, workflow_writer, surface, scoped, normalizer_version
+) -> None:
+    if surface == "bash":
+        value = (
+            "printf '%s\\n%s\\n%s' \"$HERMES_WORKFLOW_RUN_DIR\" "
+            '"$PWD" "$ARTIFACTS_DIR" > "$ARTIFACTS_DIR/context.txt"; '
+            "printf 'ok <promise>DONE</promise>'"
+        )
+        node = {"id": "publisher", "bash": value}
+    else:
+        value = (
+            "publishing-context"
+            if surface == "named-script"
+            else (
+                "import os\n"
+                "from pathlib import Path\n"
+                "artifacts = Path(os.environ['ARTIFACTS_DIR'])\n"
+                "artifacts.joinpath('context.txt').write_text('\\n'.join((\n"
+                "    os.environ['HERMES_WORKFLOW_RUN_DIR'],\n"
+                "    str(Path.cwd()),\n"
+                "    str(artifacts),\n"
+                ")))\n"
+                "print('ok <promise>DONE</promise>')\n"
+            )
+        )
+        node = {"id": "publisher", "script": value, "runtime": "uv"}
+    nodes = [_group([node])] if scoped else [node]
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"publishing-process-view-{surface}-{scoped}-v{normalizer_version}",
+        nodes=nodes,
+        normalizer_version=normalizer_version,
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"publishing-process-view-{surface}-{scoped}-v{normalizer_version}",
+    )
+
+    result = RunScheduler(store, max_parallel_nodes=1).advance_all([run_id])[run_id]
+
+    run_directory = store.run_directory(run_id)
+    publication = (
+        run_directory / "artifacts/loop-groups/group/iterations/0001/publisher"
+        if scoped
+        else run_directory / "artifacts"
+    )
+    state = (
+        result["nodes"]["group"]["loop_group"]["body"]["publisher"]
+        if scoped
+        else result["nodes"]["publisher"]
+    )
+    assert state["state"] == "succeeded", state
+    assert (publication / "context.txt").read_text().splitlines() == [
+        str(run_directory),
+        str(run_directory),
+        str(publication),
+    ]
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
