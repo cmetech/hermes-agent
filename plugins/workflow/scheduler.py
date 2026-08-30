@@ -2331,6 +2331,8 @@ class RunScheduler:
         projection: Mapping[str, object],
         dependencies: Iterable[str],
         outputs: Mapping[str, object],
+        *,
+        include_output_values: bool = False,
     ) -> dict[str, dict[str, object]]:
         results: dict[str, dict[str, object]] = {}
         nodes = projection.get("nodes", {})
@@ -2345,6 +2347,8 @@ class RunScheduler:
                 for field in ("session_id", "cache_fingerprint")
                 if field in state
             }
+            if include_output_values:
+                evidence["state"] = str(state.get("state") or "unknown")
             if state.get("state") == "succeeded":
                 attempts = state.get("attempts")
                 winning_attempts = (
@@ -2382,6 +2386,8 @@ class RunScheduler:
                     "attempt_id": output.attempt_id,
                     "publication_id": output.publication_id,
                 })
+                if include_output_values:
+                    evidence["output"] = output.value
             results[dependency] = evidence
         return results
 
@@ -5144,6 +5150,10 @@ class RunScheduler:
                                     else node.depends_on
                                 ),
                                 variables.node_outputs,
+                                include_output_values=(
+                                    package.language.normalizer_version >= 6
+                                    and runtime_node.node_type == "script"
+                                ),
                             ),
                             node_state=node_state,
                             operator_scope=str(

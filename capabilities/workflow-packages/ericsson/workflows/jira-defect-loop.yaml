@@ -272,13 +272,16 @@ nodes:
           output_format:
             type: object
             additionalProperties: false
-            required: [ticket_key, status, merge_request_id, merge_request_url, warnings]
+            required: [ticket_key, operation, status, merge_request_id, merge_request_url, warnings, attention_needed, reconciliation_status]
             properties:
               ticket_key: {type: string, minLength: 1, maxLength: 128}
+              operation: {type: string, const: review_merge_request}
               status: {type: string, const: success}
               merge_request_id: {type: [string, "null"], maxLength: 512}
               merge_request_url: {type: [string, "null"], maxLength: 4096}
               warnings: {type: array, maxItems: 25, items: {type: string, maxLength: 1024}}
+              attention_needed: {type: boolean}
+              reconciliation_status: {type: string, enum: [not_required, confirmed, failed_closed]}
 
         - id: approve-jira-comment
           depends_on: [review-merge-request, prepare-writes]
@@ -313,9 +316,30 @@ nodes:
           trigger_rule: none_failed_min_one_success
           script: |
             const plan = $prepare-writes.output;
-            const enabled = [plan.should_create_branch, plan.should_commit, plan.should_create_merge_request, plan.should_comment_jira];
-            const attention = plan.terminal_outcome === "permission" || plan.terminal_outcome === "manual_review";
-            console.log(JSON.stringify({ticket_key: plan.ticket_key, outcome: plan.terminal_outcome, status: "terminal", project_path: plan.project_path, branch_name: plan.branch_name, commit_id: null, merge_request_url: null, jira_comment_id: null, warnings: plan.warnings.slice(0, 50), attention_needed: attention, reconciliation_status: enabled.some(Boolean) ? "confirmed" : "not_required"}));
+            const predecessors = JSON.parse(await Bun.file(process.env.HERMES_WORKFLOW_PREDECESSORS_FILE).text());
+            const result = (nodeId, enabled, operation) => {
+              const entry = predecessors[nodeId];
+              if (!enabled) {
+                if (entry?.state === "succeeded") throw new Error(`unexpected ${operation} result`);
+                return null;
+              }
+              const value = entry?.state === "succeeded" ? entry.output : null;
+              if (!value || value.ticket_key !== plan.ticket_key || value.operation !== operation || value.status !== "success" || value.reconciliation_status === "failed_closed") throw new Error(`missing or uncorroborated ${operation} result`);
+              return value;
+            };
+            const branch = result("create-branch", plan.should_create_branch, "create_branch");
+            const commit = result("commit-changes", plan.should_commit, "commit_changes");
+            const review = result("review-merge-request", plan.should_create_merge_request, "review_merge_request");
+            const jira = result("update-jira", plan.should_comment_jira, "add_jira_comment");
+            if (branch && (!branch.object_id || branch.object_id !== plan.branch_name)) throw new Error("branch identity mismatch");
+            if (commit && !commit.object_id) throw new Error("commit identity missing");
+            if (review && (!review.merge_request_id || !review.merge_request_url)) throw new Error("merge request identity missing");
+            if (jira && !jira.object_id) throw new Error("Jira comment identity missing");
+            const present = [branch, commit, review, jira].filter(Boolean);
+            const warnings = [plan, ...present].flatMap((value) => value.warnings || []).slice(0, 50);
+            const attention = plan.terminal_outcome === "permission" || plan.terminal_outcome === "manual_review" || present.some((value) => value.attention_needed);
+            const reconciliation = present.some((value) => value.reconciliation_status === "confirmed") ? "confirmed" : "not_required";
+            console.log(JSON.stringify({ticket_key: plan.ticket_key, outcome: plan.terminal_outcome, status: "terminal", project_path: plan.project_path, branch_name: branch?.object_id || null, commit_id: commit?.object_id || null, merge_request_url: review?.merge_request_url || null, jira_comment_id: jira?.object_id || null, warnings, attention_needed: attention, reconciliation_status: reconciliation}));
           runtime: bun
           artifacts: false
           output_type: JiraDefectTicketRecord
@@ -439,7 +463,12 @@ nodes:
       const lines = ["# Jira Defect Loop", "", `Completed ${state.completed_count} of ${state.manifest_count} immutable manifest tickets.`, ""];
       for (const record of state.records) {
         lines.push(`- **${record.ticket_key}**: ${record.outcome}${record.attention_needed ? " (attention needed)" : ""}`);
+        if (record.project_path) lines.push(`  - Project: ${record.project_path}`);
+        if (record.branch_name) lines.push(`  - Branch: ${record.branch_name}`);
+        if (record.commit_id) lines.push(`  - Commit: ${record.commit_id}`);
         if (record.merge_request_url) lines.push(`  - Merge request: ${record.merge_request_url}`);
+        if (record.jira_comment_id) lines.push(`  - Jira comment: ${record.jira_comment_id}`);
+        lines.push(`  - Reconciliation: ${record.reconciliation_status}`);
         for (const warning of record.warnings) lines.push(`  - Warning: ${warning}`);
       }
       console.log(lines.join("\n"));

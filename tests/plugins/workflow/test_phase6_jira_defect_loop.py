@@ -28,7 +28,7 @@ from plugins.workflow.language import (
 from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import ResolvedNodeOutput
 from plugins.workflow.resources import VariableContext
-from plugins.workflow.scheduler import evaluate_trigger_rule
+from plugins.workflow.scheduler import RunScheduler, evaluate_trigger_rule
 from plugins.workflow.schema import parse_workflow_source_bytes
 from plugins.workflow.topology import iter_scoped_workflow_nodes, primary_terminal_node
 
@@ -373,6 +373,7 @@ def _run_script(
     outputs: dict[str, object],
     previous: dict[str, object | None] | None = None,
     extra_dependencies: tuple[str, ...] = (),
+    predecessor_results: dict[str, dict[str, object]] | None = None,
 ):
     compilation = _compile()
     structured_id = (
@@ -405,6 +406,7 @@ def _run_script(
             node=runtime_node,
             attempt_id="attempt",
             variable_context=variables,
+            predecessor_results=predecessor_results or {},
             output_resolver=variables.output_reference,
             language_profile=WorkflowLanguageProfile.ARCHON_2026_07,
             normalizer_version=6,
@@ -418,6 +420,111 @@ def _run_script(
     if result.artifacts:
         text = (run_directory / result.artifacts[0].relative_path).read_text()
     return result, text
+
+
+def _write_evidence(
+    ticket_key: str,
+    operation: str,
+    *,
+    object_id: str | None,
+    web_url: str | None = None,
+    warnings: list[str] | None = None,
+    attention_needed: bool = False,
+    reconciliation_status: str = "not_required",
+) -> dict[str, object]:
+    return {
+        "ticket_key": ticket_key,
+        "operation": operation,
+        "status": "success",
+        "object_id": object_id,
+        "web_url": web_url,
+        "warnings": warnings or [],
+        "attention_needed": attention_needed,
+        "reconciliation_status": reconciliation_status,
+    }
+
+
+def _terminal_predecessors(
+    plan: dict[str, object],
+    *,
+    create_branch: dict[str, object] | None = None,
+    commit_changes: dict[str, object] | None = None,
+    review_merge_request: dict[str, object] | None = None,
+    update_jira: dict[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
+    values = {
+        "prepare-writes": plan,
+        "create-branch": create_branch,
+        "commit-changes": commit_changes,
+        "review-merge-request": review_merge_request,
+        "update-jira": update_jira,
+    }
+    return {
+        node_id: {
+            "state": "succeeded" if output is not None else "skipped",
+            **({"output": output} if output is not None else {}),
+        }
+        for node_id, output in values.items()
+    }
+
+
+def _terminal_plan(
+    *,
+    outcome: str = "fixed",
+    branch: int = 1,
+    commit: int = 1,
+    merge_request: int = 1,
+    jira: int = 1,
+    warnings: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "ticket_key": "ERIC-1",
+        "manifest_count": 1,
+        "project_path": "team/service",
+        "branch_name": "fix/ERIC-1",
+        "branch_args": {
+            "project": "team/service",
+            "prefix": "fix",
+            "ticket_key": "ERIC-1",
+            "summary": "Fix defect",
+            "source_ref": "main",
+            "dry_run": False,
+        },
+        "commit_args": {
+            "project": "team/service",
+            "branch": "fix/ERIC-1",
+            "commit_message": "Fix ERIC-1",
+            "actions": [
+                {"action": "update", "file_path": "src/app.py", "content": "fixed"}
+            ],
+            "dry_run": False,
+        },
+        "merge_request_args": {
+            "project": "team/service",
+            "source_branch": "fix/ERIC-1",
+            "target_branch": "main",
+            "title": "Fix ERIC-1",
+            "description": "Fix defect",
+            "remove_source_branch": False,
+            "squash": False,
+            "dry_run": False,
+        },
+        "jira_comment_args": {
+            "key": "ERIC-1",
+            "body": "Fixed in merge request",
+            "dry_run": False,
+        },
+        "should_create_branch": branch,
+        "should_commit": commit,
+        "should_create_merge_request": merge_request,
+        "should_comment_jira": jira,
+        "branch_intent_digest": "a" * 64,
+        "commit_intent_digest": "b" * 64,
+        "merge_request_intent_digest": "c" * 64,
+        "jira_comment_intent_digest": "d" * 64,
+        "terminal_outcome": outcome,
+        "warnings": warnings or [],
+    }
 
 
 def test_distributed_v6_workflow_seals_one_immutable_bounded_manifest() -> None:
@@ -685,6 +792,7 @@ def test_nonwrite_outcomes_finish_without_approvals_or_write_outputs(
         tmp_path,
         body["publish-ticket-record"],
         outputs={"prepare-writes": plan},
+        predecessor_results=_terminal_predecessors(plan),
     )
 
     assert result.status == "succeeded"
@@ -693,6 +801,332 @@ def test_nonwrite_outcomes_finish_without_approvals_or_write_outputs(
     assert record["status"] == "terminal"
     assert record["commit_id"] is None
     assert record["merge_request_url"] is None
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_terminal_reducer_publishes_corroborated_write_identities_and_warnings(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    terminal = next(
+        node for node in group.value["nodes"] if node.id == "publish-ticket-record"
+    )
+    plan = _terminal_plan(warnings=["plan warning"])
+    branch = _write_evidence(
+        "ERIC-1", "create_branch", object_id="fix/ERIC-1", warnings=["branch warning"]
+    )
+    commit = _write_evidence(
+        "ERIC-1", "commit_changes", object_id="deadbeef", warnings=["commit warning"]
+    )
+    review = {
+        "ticket_key": "ERIC-1",
+        "operation": "review_merge_request",
+        "status": "success",
+        "merge_request_id": "17",
+        "merge_request_url": "https://gitlab.example/team/service/-/merge_requests/17",
+        "warnings": ["review warning"],
+        "attention_needed": True,
+        "reconciliation_status": "confirmed",
+    }
+    jira = _write_evidence(
+        "ERIC-1",
+        "add_jira_comment",
+        object_id="10001",
+        warnings=["jira warning"],
+    )
+
+    result, text = _run_script(
+        tmp_path,
+        terminal,
+        outputs={"prepare-writes": plan},
+        predecessor_results=_terminal_predecessors(
+            plan,
+            create_branch=branch,
+            commit_changes=commit,
+            review_merge_request=review,
+            update_jira=jira,
+        ),
+    )
+
+    assert result.status == "succeeded"
+    assert json.loads(text) == {
+        "ticket_key": "ERIC-1",
+        "outcome": "fixed",
+        "status": "terminal",
+        "project_path": "team/service",
+        "branch_name": "fix/ERIC-1",
+        "commit_id": "deadbeef",
+        "merge_request_url": "https://gitlab.example/team/service/-/merge_requests/17",
+        "jira_comment_id": "10001",
+        "warnings": [
+            "plan warning",
+            "branch warning",
+            "commit warning",
+            "review warning",
+            "jira warning",
+        ],
+        "attention_needed": True,
+        "reconciliation_status": "confirmed",
+    }
+
+
+def test_v6_script_predecessors_receive_authenticated_state_and_typed_output() -> None:
+    succeeded = _resolved(
+        "create-branch",
+        _write_evidence("ERIC-1", "create_branch", object_id="fix/ERIC-1"),
+    )
+
+    results = RunScheduler._predecessor_results(
+        {
+            "nodes": {
+                "create-branch": {"state": "succeeded"},
+                "commit-changes": {"state": "skipped"},
+            }
+        },
+        ("create-branch", "commit-changes"),
+        {"create-branch": succeeded},
+        include_output_values=True,
+    )
+
+    assert results["create-branch"]["state"] == "succeeded"
+    assert results["create-branch"]["output"] == succeeded.value
+    assert results["commit-changes"] == {"state": "skipped"}
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_terminal_reducer_accepts_a_corroborated_partial_write(tmp_path: Path) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    terminal = next(
+        node for node in group.value["nodes"] if node.id == "publish-ticket-record"
+    )
+    plan = _terminal_plan(commit=0, merge_request=0, jira=0)
+    branch = _write_evidence(
+        "ERIC-1", "create_branch", object_id="fix/ERIC-1", warnings=["created"]
+    )
+
+    result, text = _run_script(
+        tmp_path,
+        terminal,
+        outputs={"prepare-writes": plan},
+        predecessor_results=_terminal_predecessors(plan, create_branch=branch),
+    )
+
+    assert result.status == "succeeded"
+    record = json.loads(text)
+    assert record["outcome"] == "fixed"
+    assert record["branch_name"] == "fix/ERIC-1"
+    assert record["commit_id"] is None
+    assert record["merge_request_url"] is None
+    assert record["jira_comment_id"] is None
+    assert record["warnings"] == ["created"]
+    assert record["reconciliation_status"] == "not_required"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_enabled",
+        "partial_write_chain",
+        "failed_state",
+        "permission_status",
+        "failed_status",
+        "wrong_ticket",
+        "wrong_operation",
+        "failed_reconciliation",
+    ),
+)
+def test_terminal_reducer_fails_closed_on_uncorroborated_write_evidence(
+    tmp_path: Path, case: str
+) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    terminal = next(
+        node for node in group.value["nodes"] if node.id == "publish-ticket-record"
+    )
+    plan = (
+        _terminal_plan()
+        if case == "partial_write_chain"
+        else _terminal_plan(commit=0, merge_request=0, jira=0)
+    )
+    branch = _write_evidence("ERIC-1", "create_branch", object_id="fix/ERIC-1")
+    predecessors = _terminal_predecessors(
+        plan,
+        create_branch=branch,
+        commit_changes=(
+            _write_evidence("ERIC-1", "commit_changes", object_id="deadbeef")
+            if case == "partial_write_chain"
+            else None
+        ),
+    )
+    if case == "missing_enabled":
+        predecessors["create-branch"] = {"state": "skipped"}
+    elif case == "partial_write_chain":
+        pass
+    elif case == "failed_state":
+        predecessors["create-branch"] = {"state": "failed", "output": branch}
+    elif case == "permission_status":
+        predecessors["create-branch"]["output"] = {**branch, "status": "permission"}
+    elif case == "failed_status":
+        predecessors["create-branch"]["output"] = {**branch, "status": "failed"}
+    elif case == "wrong_ticket":
+        predecessors["create-branch"]["output"] = {
+            **branch,
+            "ticket_key": "ERIC-2",
+        }
+    elif case == "wrong_operation":
+        predecessors["create-branch"]["output"] = {
+            **branch,
+            "operation": "commit_changes",
+        }
+    else:
+        predecessors["create-branch"]["output"] = {
+            **branch,
+            "reconciliation_status": "failed_closed",
+        }
+
+    result, _text = _run_script(
+        tmp_path,
+        terminal,
+        outputs={"prepare-writes": plan},
+        predecessor_results=predecessors,
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "process_exit"
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_terminal_reducer_bounds_ordered_warning_aggregation(tmp_path: Path) -> None:
+    compilation = _compile()
+    group = next(
+        node
+        for node in compilation.package.definition.nodes
+        if node.id == "process-ticket-manifest"
+    )
+    terminal = next(
+        node for node in group.value["nodes"] if node.id == "publish-ticket-record"
+    )
+    plan_warnings = [f"plan-{index}" for index in range(25)]
+    branch_warnings = [f"branch-{index}" for index in range(25)]
+    commit_warnings = [f"commit-{index}" for index in range(25)]
+    plan = _terminal_plan(
+        merge_request=0,
+        jira=0,
+        warnings=plan_warnings,
+    )
+    branch = _write_evidence(
+        "ERIC-1",
+        "create_branch",
+        object_id="fix/ERIC-1",
+        warnings=branch_warnings,
+    )
+    commit = _write_evidence(
+        "ERIC-1",
+        "commit_changes",
+        object_id="deadbeef",
+        warnings=commit_warnings,
+    )
+
+    result, text = _run_script(
+        tmp_path,
+        terminal,
+        outputs={"prepare-writes": plan},
+        predecessor_results=_terminal_predecessors(
+            plan,
+            create_branch=branch,
+            commit_changes=commit,
+        ),
+    )
+
+    assert result.status == "succeeded"
+    assert json.loads(text)["warnings"] == plan_warnings + branch_warnings
+
+
+@pytest.mark.skipif(shutil.which("bun") is None, reason="bun is not installed")
+def test_final_json_and_markdown_preserve_full_terminal_write_evidence(
+    tmp_path: Path,
+) -> None:
+    compilation = _compile()
+    nodes = {node.id: node for node in compilation.package.definition.nodes}
+    record = {
+        "ticket_key": "ERIC-1",
+        "outcome": "fixed",
+        "status": "terminal",
+        "project_path": "team/service",
+        "branch_name": "fix/ERIC-1",
+        "commit_id": "deadbeef",
+        "merge_request_url": "https://gitlab.example/team/service/-/merge_requests/17",
+        "jira_comment_id": "10001",
+        "warnings": ["review warning"],
+        "attention_needed": True,
+        "reconciliation_status": "confirmed",
+    }
+    manifest = {
+        "status": "ready",
+        "count": 1,
+        "tickets": [{"key": "ERIC-1"}],
+        "warnings": [],
+    }
+    aggregate = {
+        "manifest_count": 1,
+        "completed_count": 1,
+        "records": [record],
+        "counts": {
+            "fixed": 1,
+            "not_found": 0,
+            "permission": 0,
+            "needs_info": 0,
+            "manual_review": 0,
+            "not_a_code_fix": 0,
+            "safely_skipped": 0,
+        },
+        "warnings": ["review warning"],
+        "completion_marker": "",
+    }
+
+    json_result, json_text = _run_script(
+        tmp_path,
+        nodes["publish-aggregate-json"],
+        outputs={
+            "fetch-ticket-manifest": manifest,
+            "process-ticket-manifest": aggregate,
+        },
+    )
+    assert json_result.status == "succeeded"
+    published = json.loads(json_text)
+    assert published["records"] == [record]
+
+    markdown_result, markdown = _run_script(
+        tmp_path,
+        nodes["publish-aggregate-markdown"],
+        outputs={"publish-aggregate-json": published},
+    )
+    assert markdown_result.status == "succeeded"
+    for value in (
+        "team/service",
+        "fix/ERIC-1",
+        "deadbeef",
+        "https://gitlab.example/team/service/-/merge_requests/17",
+        "10001",
+        "confirmed",
+        "review warning",
+    ):
+        assert value in markdown
 
 
 def test_write_plan_preserves_exact_connector_arguments_and_prompts_use_them() -> None:

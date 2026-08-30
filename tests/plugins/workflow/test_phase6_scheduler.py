@@ -16,6 +16,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.output_resolution import (
     PrimaryOutputCandidate,
     WorkflowOutputReferenceError,
@@ -712,6 +713,15 @@ def test_zero_write_flag_skips_approval_and_tool_node_but_runs_terminal_reducer(
     scheduler = RunScheduler(store, max_parallel_nodes=1)
     scheduler.executors["approval"] = ForbiddenExecutor()
     scheduler.executors["prompt"] = ForbiddenExecutor()
+    observed = []
+
+    class RecordingScriptExecutor:
+        def execute(self, context):
+            if _body_id(context) == "finish":
+                observed.append(context.predecessor_results)
+            return ScriptExecutor().execute(context)
+
+    scheduler.executors["script"] = RecordingScriptExecutor()
 
     result = scheduler.advance_all([run_id])[run_id]
 
@@ -721,6 +731,10 @@ def test_zero_write_flag_skips_approval_and_tool_node_but_runs_terminal_reducer(
     assert body["write"]["state"] == "skipped"
     assert body["finish"]["state"] == "succeeded"
     assert result["nodes"]["group"]["state"] == "succeeded"
+    assert observed[0]["prepare"]["state"] == "succeeded"
+    assert observed[0]["prepare"]["output"] == {"should_write": 0}
+    assert observed[0]["approve"] == {"state": "skipped"}
+    assert observed[0]["write"] == {"state": "skipped"}
 
 
 def test_scoped_shared_context_uses_only_original_body_predecessor_evidence(

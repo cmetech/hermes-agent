@@ -16,6 +16,7 @@ from typing import Callable
 from agent.structured_output import (
     StructuredOutputError,
     StructuredOutputValidatorUnavailable,
+    canonical_json_bytes,
 )
 from plugins.workflow.executors.base import (
     BoundedProcessOutput,
@@ -26,6 +27,7 @@ from plugins.workflow.executors.base import (
     validate_structured_process_output,
 )
 from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.models import WorkflowLanguageProfile
 from plugins.workflow.output_resolution import PrimaryOutputCandidate
 from plugins.workflow.resources import (
     ResourceResolver,
@@ -184,6 +186,23 @@ class ScriptExecutor:
                 context.language_profile, context.variable_context.normalizer_version
             )
         )
+        predecessor_bytes = None
+        if (
+            context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07
+            and context.normalizer_version >= 6
+            and context.predecessor_results
+        ):
+            try:
+                predecessor_bytes = canonical_json_bytes(
+                    context.predecessor_results,
+                    max_bytes=context.max_output_bytes,
+                )
+            except (TypeError, ValueError, UnicodeError) as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="validation",
+                    error_message=f"invalid predecessor outputs: {exc}",
+                )
         execution_plan = None
         if strict_v3:
             try:
@@ -246,6 +265,7 @@ class ScriptExecutor:
             output.close()
             raise RuntimeError("executor spawn intent was rejected")
         source_stream = None
+        predecessor_path = None
         try:
             if source_bytes is not None:
                 source_stream = tempfile.TemporaryFile(mode="w+b")
@@ -264,6 +284,18 @@ class ScriptExecutor:
                     error_code="timeout",
                     error_message="script node exceeded its timeout",
                 )
+            if predecessor_bytes is not None:
+                predecessor_path = attempt / "predecessors.json"
+                descriptor = os.open(
+                    predecessor_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(predecessor_bytes)
+                allowed_env["HERMES_WORKFLOW_PREDECESSORS_FILE"] = str(
+                    predecessor_path
+                )
             tree = ManagedProcessTree.spawn(
                 argv,
                 policy=context.termination_policy,
@@ -275,6 +307,8 @@ class ScriptExecutor:
             )
         except OSError as exc:
             output.close()
+            if predecessor_path is not None:
+                predecessor_path.unlink(missing_ok=True)
             if context.spawn_failed is not None:
                 context.spawn_failed(executor_nonce, type(exc).__name__)
             return NodeExecutionResult(
@@ -341,6 +375,8 @@ class ScriptExecutor:
                 context.process_stopped(
                     tree.identity, cleanup_error is None and tree.reaped
                 )
+            if predecessor_path is not None:
+                predecessor_path.unlink(missing_ok=True)
         returncode = tree.process.returncode
         output_text = stdout_path.read_text(encoding="utf-8").rstrip("\r\n")
         stdout_path.write_text(output_text, encoding="utf-8")
