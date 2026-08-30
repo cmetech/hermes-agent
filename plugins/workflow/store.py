@@ -18708,6 +18708,29 @@ class RunStore:
                     )
                 return projection
             _assert_operator_transition_has_no_live_execution(projection, "resume")
+            for node in projection["nodes"].values():
+                controller = node.get("loop_group")
+                if not isinstance(controller, Mapping) or not (
+                    node.get("state") in {"failed", "interrupted"}
+                    or controller.get("state") in {"failed", "interrupted"}
+                ):
+                    continue
+                body = controller.get("body")
+                restartable = any(
+                    isinstance(child, MutableMapping)
+                    and child.get("state") in {"failed", "interrupted"}
+                    and (
+                        not isinstance((recovery := child.get("recovery")), Mapping)
+                        or recovery.get("effect_classification") == "replay_safe"
+                        and recovery.get("termination_confirmed")
+                    )
+                    for child in body.values()
+                ) if isinstance(body, Mapping) else False
+                if not restartable:
+                    raise RuntimeError(
+                        "cannot resume a terminal loop group without a "
+                        "replay-safe body child"
+                    )
             for node_id, node in projection["nodes"].items():
                 controller = node.get("loop_group")
                 if isinstance(controller, MutableMapping):

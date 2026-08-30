@@ -77,6 +77,20 @@ production change. Result: 2 passed, 2 failed. The replay-safe rows completed,
 but both outward rows reported `DID NOT RAISE`: resume and retry restarted the
 group/controller despite preserving the unreopenable cancelled sibling.
 
+The controller-terminal re-review added hard-limit and predicate-failure rows
+and ran:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_interactions_recovery.py \
+  -k 'resume_refuses_terminal_group_without_a_restartable_body_child' -q
+```
+
+Result: 0 passed, 2 failed. Both rows reported `DID NOT RAISE`: with every body
+child already succeeded, resume skipped nested recovery, cleared the terminal
+controller error, and published a runnable run without restarting the failed
+group/controller.
+
 ## Root-cause changes
 
 - Routed resume, retry, and abandon safety checks through the existing nested
@@ -100,6 +114,13 @@ group/controller despite preserving the unreopenable cancelled sibling.
   both dependency descendants and independent work. Attempt history is
   preserved. Succeeded/skipped siblings, controller generation, and current
   iteration remain unchanged. The outer group is not a retry candidate.
+- Preflight every failed/interrupted loop-group controller before the resume
+  mutation loop and require an authenticated current-body failed/interrupted
+  child that satisfies the existing replay-safe recovery check. Hard-limit,
+  predicate-failure, and other controller-terminal states with no restartable
+  body child now refuse resume before changing `run.json`, `events.jsonl`, the
+  run index, status, error, group/controller, or body state. Explicit retry of
+  the outer group retains its existing refusal contract.
 - Preserved the one durable predicate claim, execution fence, callbacks, and
   obligation-journal reserve while assigning every authorized Bash dispatch a
   fresh physical attempt ID and contained directory beneath the iteration's
@@ -120,11 +141,12 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_phase6_store.py \
   tests/plugins/workflow/test_crash_recovery.py \
   tests/plugins/workflow/test_phase5_execution_authority_continuity.py \
-  -k 'operator_restarts_only_the_failed_current_iteration_child or operator_reopens_only_safe_unstarted_attempted_siblings or operator_preserves_unproven_nested_execution_authority or predicate_redispatch_uses_a_fresh_physical_attempt or phase5_redundant_resume_keeps_a_running_claim_unchanged' \
+  -k 'operator_restarts_only_the_failed_current_iteration_child or operator_reopens_only_safe_unstarted_attempted_siblings or operator_preserves_unproven_nested_execution_authority or predicate_redispatch_uses_a_fresh_physical_attempt or phase5_redundant_resume_keeps_a_running_claim_unchanged or resume_refuses_terminal_group_without_a_restartable_body_child' \
   -q
 ```
 
-Result after the final re-review: 4 files, 16 tests passed, 0 failed.
+Result after the controller-terminal re-review: 4 files, 18 tests passed, 0
+failed.
 
 Required Phase 6 recovery gate:
 
@@ -138,7 +160,8 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_cancel_node.py -q
 ```
 
-Result after the final re-review: 6 files, 218 tests passed, 0 failed.
+Result after the controller-terminal re-review: 6 files, 220 tests passed, 0
+failed.
 
 Required historical compatibility gate:
 
@@ -152,7 +175,8 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_shutdown_recovery.py -q
 ```
 
-Result after the final coherence re-review: 6 files, 231 tests passed, 0 failed.
+Result after the controller-terminal re-review: 6 files, 231 tests passed, 0
+failed.
 
 Static gates:
 
@@ -170,7 +194,7 @@ git diff --check
 Result: Ruff reported `All checks passed!`; `git diff --check` reported no
 errors.
 
-The final coherence follow-up reran focused Ruff on
+The controller-terminal follow-up reran focused Ruff on
 `plugins/workflow/store.py` and
 `tests/plugins/workflow/test_phase6_interactions_recovery.py`, followed by
 `git diff --check`; both remained clean.
@@ -202,10 +226,14 @@ explicit parameter rows.
 atomic attempted-sibling follow-up containing the observed-attempt classifier
 fix and positive/negative regressions.
 
-`fix(workflow): refuse unsafe loop group restart` — the atomic final coherence
-follow-up containing the transactional body preflight, immutable-refusal
-regressions, and this report update. Its final SHA is returned in the task
-handoff because a commit cannot embed its own SHA.
+`1c2c3b2382` (`fix(workflow): refuse unsafe loop group restart`) — the atomic
+cancelled-sibling coherence follow-up containing the transactional body
+preflight and immutable-refusal regressions.
+
+`fix(workflow): refuse terminal loop group resume` — the atomic
+controller-terminal follow-up containing the restartable-child preflight,
+hard-limit/predicate regressions, and this report update. Its final SHA is
+returned in the task handoff because a commit cannot embed its own SHA.
 
 ## Concerns
 

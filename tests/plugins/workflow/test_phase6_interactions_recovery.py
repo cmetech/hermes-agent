@@ -470,6 +470,99 @@ def test_hard_maximum_fails_without_a_dead_interaction(
     assert result["nodes"]["group"].get("pending_interaction") is None
 
 
+@pytest.mark.parametrize(
+    ("terminal_reason", "expected_error"),
+    (
+        pytest.param(
+            "hard_limit", "loop_group_max_iterations", id="hard-limit"
+        ),
+        pytest.param("predicate_failure", "predicate_timeout", id="predicate"),
+    ),
+)
+def test_resume_refuses_terminal_group_without_a_restartable_body_child(
+    tmp_path, workflow_writer, terminal_reason, expected_error
+) -> None:
+    group = {
+        "id": "group",
+        "loop_group": {
+            "until": "DONE",
+            "max_iterations": 1 if terminal_reason == "hard_limit" else 2,
+            "nodes": [{"id": "sink", "prompt": "produce"}],
+        },
+    }
+    if terminal_reason == "predicate_failure":
+        group["loop_group"]["until_bash"] = "true"
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"phase6-terminal-resume-{terminal_reason}",
+        nodes=[group],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"phase6-terminal-resume-{terminal_reason}",
+    )
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    if terminal_reason == "predicate_failure":
+        scheduler.executors["bash"] = type(
+            "FailedPredicate",
+            (),
+            {
+                "execute": lambda self, context: NodeExecutionResult(
+                    "failed",
+                    error_code="predicate_timeout",
+                    error_message="predicate failed",
+                )
+            },
+        )()
+
+    failed = scheduler.advance_all([run_id])[run_id]
+
+    assert failed["status"] == "failed"
+    assert failed["last_error"]["code"] == expected_error
+    group_state = failed["nodes"]["group"]
+    assert group_state["state"] == "failed"
+    assert group_state["loop_group"]["state"] == "failed"
+    assert not any(
+        child["state"] in {"failed", "interrupted"}
+        for child in group_state["loop_group"]["body"].values()
+    )
+    directory = store.run_directory(run_id)
+    projection_bytes = (directory / "run.json").read_bytes()
+    journal_bytes = (directory / "events.jsonl").read_bytes()
+    projection = store.load_run(run_id)
+    with store._connect() as connection:
+        index_row = dict(
+            connection.execute(
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        )
+
+    with pytest.raises(ValueError, match="replay-safe"):
+        store.retry_run(run_id, node_id="group")
+    with pytest.raises(RuntimeError, match="cannot resume"):
+        store.resume_run(run_id, always_run_nodes=set())
+
+    assert (directory / "run.json").read_bytes() == projection_bytes
+    assert (directory / "events.jsonl").read_bytes() == journal_bytes
+    retained = store.load_run(run_id)
+    assert retained == projection
+    assert retained["status"] == "failed"
+    assert retained["last_error"] == failed["last_error"]
+    assert retained["nodes"]["group"] == group_state
+    with store._connect() as connection:
+        assert dict(
+            connection.execute(
+                "SELECT * FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        ) == index_row
+
+
 @pytest.mark.parametrize("operator_action", ("resume", "retry"))
 @pytest.mark.parametrize(
     "include_independent",
