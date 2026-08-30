@@ -31,10 +31,6 @@ _BASH_LEXER_MAX_NESTING = 64
 _BASH_SCALAR_REFERENCE = re.compile(
     r"\$(?:(?P<position>[1-9][0-9]*)|(?P<name>[A-Z][A-Z0-9_]*))"
 )
-_LOOP_PREV_OUTPUT_REFERENCE = re.compile(
-    r"\$LOOP_PREV\.(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output"
-    r"(?:\.(?P<path>[A-Za-z0-9_.-]+))?"
-)
 _BASH_SCALAR_NAMES = frozenset({
     "ARGUMENTS",
     "USER_MESSAGE",
@@ -1514,12 +1510,19 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
     """Parse outputs after validating every substituted Bash reference context."""
     # Local import preserves bash_rendering's dependency-neutral lexer surface.
     from plugins.workflow.language_schema import (
+        iter_loop_previous_output_references,
         iter_output_reference_candidate_spans,
         iter_output_references_in_spans,
     )
 
     previous_candidates = (
-        tuple(match.span() for match in _LOOP_PREV_OUTPUT_REFERENCE.finditer(template))
+        tuple(
+            (reference.start, reference.end)
+            for reference in iter_loop_previous_output_references(
+                template,
+                normalizer_version=normalizer_version,
+            )
+        )
         if normalizer_version >= 6
         else ()
     )
@@ -1575,8 +1578,14 @@ def bash_output_references(template: str, *, normalizer_version: int = 3):
 
 def bash_loop_previous_reference_spans(template: str) -> tuple[tuple[int, int], ...]:
     """Return lexer-admitted private v6 previous-output spans."""
+    from plugins.workflow.language_schema import iter_loop_previous_output_references
+
     candidates = tuple(
-        match.span() for match in _LOOP_PREV_OUTPUT_REFERENCE.finditer(template)
+        (reference.start, reference.end)
+        for reference in iter_loop_previous_output_references(
+            template,
+            normalizer_version=6,
+        )
     )
     return tuple(
         (start, end)

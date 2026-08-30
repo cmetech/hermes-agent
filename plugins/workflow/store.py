@@ -11814,7 +11814,8 @@ class RunStore:
             maximum = int(controller["max_iterations"])
             if decision == "continue" and iteration >= maximum:
                 return False
-            controller["previous_outputs"] = previous_outputs
+            if not predicate_pending:
+                controller["previous_outputs"] = previous_outputs
             controller.pop("loop_user_input_artifact", None)
             primary = body[str(controller["primary_sink"])]
             primary_attempt_id = str(primary["attempts"][-1]["attempt_id"])

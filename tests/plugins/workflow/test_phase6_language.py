@@ -627,6 +627,129 @@ def test_v6_validates_group_control_template_references(
     _assert_issue(path, code, f"nodes[1].loop_group.{field}")
 
 
+def test_v6_admits_all_group_until_bash_reference_scopes(
+    tmp_path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {"id": "outer", "prompt": "prepare"},
+            {
+                **_group(
+                    [{"id": "sink", "prompt": "produce"}],
+                    until_bash=(
+                        "test \"$sink.output|$outer.output|"
+                        "$LOOP_PREV.sink.output\" = expected"
+                    ),
+                ),
+                "depends_on": ["outer"],
+            },
+        ],
+    )
+
+    package = _load_v6(path)
+
+    assert package.definition.nodes[1].value["until_bash"].endswith("= expected")
+
+
+@pytest.mark.parametrize(
+    ("template", "expected_code"),
+    [
+        ("test -n '$LOOP_PREV.missing.output'", "loop_group_scope_invalid"),
+        ("test -n '$sink.output.missing'", "loop_group_scope_invalid"),
+    ],
+)
+def test_v6_rejects_invalid_group_until_bash_scoped_references(
+    tmp_path, workflow_writer, template, expected_code
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group(
+                [{"id": "sink", "prompt": "produce"}],
+                until_bash=template,
+            )
+        ],
+    )
+
+    _assert_issue(
+        path,
+        expected_code,
+        "nodes[0].loop_group.until_bash",
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "template", "expected_path"),
+    [
+        (
+            "prompt",
+            "$LOOP_PREV.producer.outputx",
+            "nodes[0].loop_group.nodes[1].prompt",
+        ),
+        (
+            "script",
+            "print('$LOOP_PREV.producer.output_')",
+            "nodes[0].loop_group.nodes[1].script",
+        ),
+        (
+            "until_bash",
+            "printf '%s' \"$LOOP_PREV.producer.output/path\"",
+            "nodes[0].loop_group.until_bash",
+        ),
+        (
+            "until_bash",
+            "printf '%s' \"$LOOP_PREV.producer.output.missing\"",
+            "nodes[0].loop_group.until_bash",
+        ),
+    ],
+)
+def test_v6_rejects_malformed_previous_reference_boundaries(
+    tmp_path, workflow_writer, surface, template, expected_path
+) -> None:
+    body = [{"id": "producer", "prompt": "produce"}]
+    group_options = {}
+    if surface == "until_bash":
+        group_options["until_bash"] = template
+    else:
+        body.append({
+            "id": "consumer",
+            "depends_on": ["producer"],
+            surface: template,
+            **({"runtime": "uv"} if surface == "script" else {}),
+        })
+    path = workflow_writer(tmp_path, nodes=[_group(body, **group_options)])
+
+    _assert_issue(path, "loop_group_scope_invalid", expected_path)
+
+
+@pytest.mark.parametrize(
+    ("surface", "template"),
+    [
+        ("prompt", "$LOOP_PREV.producer.output,"),
+        ("script", "print('$LOOP_PREV.producer.output;')"),
+        ("until_bash", "printf '%s' \"$LOOP_PREV.producer.output,\""),
+    ],
+)
+def test_v6_accepts_previous_reference_adjacent_punctuation(
+    tmp_path, workflow_writer, surface, template
+) -> None:
+    body = [{"id": "producer", "prompt": "produce"}]
+    group_options = {"max_iterations": 1}
+    if surface == "until_bash":
+        group_options["until_bash"] = template
+    else:
+        body.append({
+            "id": "consumer",
+            "depends_on": ["producer"],
+            surface: template,
+            **({"runtime": "uv"} if surface == "script" else {}),
+        })
+    path = workflow_writer(tmp_path, nodes=[_group(body, **group_options)])
+
+    assert _load_v6(path).definition.nodes[0].node_type == "loop_group"
+
+
 @pytest.mark.parametrize(
     ("prompt", "depends_on", "expected_path"),
     [

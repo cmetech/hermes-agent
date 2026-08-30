@@ -15,6 +15,7 @@ import yaml
 from agent.structured_output import parse_exact_decimal_integer
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
+    bash_loop_previous_reference_spans,
     bash_output_references,
 )
 from plugins.workflow.conditions import (
@@ -58,6 +59,7 @@ from plugins.workflow.language_schema import (
     hook_specific_field_names,
     contains_output_reference,
     is_reference_safe_node_id,
+    iter_loop_previous_output_references,
     iter_output_references,
     loop_field_names,
     loop_group_field_names,
@@ -1809,6 +1811,12 @@ def _validate_v3_static_output_references(
             named_script_bodies=named_script_bodies,
             include_phase4_templates=phase4_templates,
         ):
+            if (
+                normalizer_version >= 6
+                and node.node_type == "loop_group"
+                and surface_path.endswith(".loop_group.until_bash")
+            ):
+                continue
             try:
                 if surface_path.endswith(".when"):
                     references = validate_v3_condition_syntax(template)
@@ -1876,12 +1884,6 @@ def _validate_v3_static_output_references(
         raise WorkflowValidationError(tuple(issues))
 
 
-_LOOP_PREV_REFERENCE = re.compile(
-    r"\$LOOP_PREV\.([A-Za-z_][A-Za-z0-9_-]*)\.output"
-    r"(?:\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*))?"
-)
-
-
 def _validate_v6_loop_group_references(
     nodes: tuple[WorkflowNode, ...],
     structured_outputs: Mapping[str, object],
@@ -1914,6 +1916,118 @@ def _validate_v6_loop_group_references(
         )
         body_ids = frozenset(child.id for child in body)
         group_path = f"nodes[{group.source_index}].loop_group.nodes"
+
+        def validate_template(
+            nested_path: str,
+            template: str,
+            *,
+            current_dependencies: frozenset[str],
+            line: int,
+            bash_context: bool = False,
+            group_predicate: bool = False,
+        ) -> None:
+            try:
+                previous = tuple(
+                    iter_loop_previous_output_references(
+                        template,
+                        normalizer_version=6,
+                    )
+                )
+                if bash_context:
+                    admitted = frozenset(bash_loop_previous_reference_spans(template))
+                    previous = tuple(
+                        reference
+                        for reference in previous
+                        if (reference.start, reference.end) in admitted
+                    )
+                masked = list(template)
+                for reference in previous:
+                    masked[reference.start : reference.end] = " " * (
+                        reference.end - reference.start
+                    )
+                ordinary_template = "".join(masked)
+                references = (
+                    bash_output_references(ordinary_template, normalizer_version=6)
+                    if bash_context
+                    else tuple(
+                        iter_output_references(
+                            ordinary_template,
+                            normalizer_version=6,
+                        )
+                    )
+                )
+            except (BashRenderingError, WorkflowReferenceSyntaxError) as exc:
+                issues.append(
+                    _issue(
+                        nested_path,
+                        "loop_group_scope_invalid",
+                        str(exc),
+                        line=line,
+                    )
+                )
+                return
+            for reference in previous:
+                producer_id = reference.node_id
+                if producer_id not in body_ids:
+                    issues.append(
+                        _issue(
+                            nested_path,
+                            "loop_group_scope_invalid",
+                            f"unknown previous-iteration body node: {producer_id}",
+                            line=line,
+                        )
+                    )
+                    continue
+                if reference.path:
+                    output = structured_outputs.get(f"{group.id}/{producer_id}")
+                    schema = getattr(output, "canonical_schema", None)
+                    if not isinstance(schema, Mapping) or _v3_output_path_impossible(
+                        schema, reference.path
+                    ):
+                        issues.append(
+                            _issue(
+                                nested_path,
+                                "loop_group_scope_invalid",
+                                "previous-iteration field requires a compatible structured output",
+                                line=line,
+                            )
+                        )
+            for reference in references:
+                if reference.node_id in body_ids:
+                    allowed = reference.node_id in current_dependencies
+                    output_id = f"{group.id}/{reference.node_id}"
+                else:
+                    allowed = reference.node_id in group.depends_on
+                    output_id = reference.node_id
+                if not allowed:
+                    issues.append(
+                        _issue(
+                            nested_path,
+                            (
+                                "output_reference_not_declared_dependency"
+                                if group_predicate
+                                else "loop_group_scope_invalid"
+                            ),
+                            f"output reference {reference.node_id} is outside the loop-group scope",
+                            line=line,
+                        )
+                    )
+                    continue
+                if reference.path:
+                    output = structured_outputs.get(output_id)
+                    schema = getattr(output, "canonical_schema", None)
+                    if not isinstance(schema, Mapping) or _v3_output_path_impossible(
+                        schema, reference.path
+                    ):
+                        issues.append(
+                            _issue(
+                                nested_path,
+                                "loop_group_scope_invalid",
+                                "loop-group field reference is incompatible with its structured output",
+                                line=line,
+                            )
+                        )
+
         for child in body:
             child_prefix = f"{group_path}[{child.source_index}]"
             logical_prefix = f"nodes[{child.source_index}]"
@@ -1924,81 +2038,23 @@ def _validate_v6_loop_group_references(
                 include_phase4_templates=True,
             ):
                 nested_path = child_prefix + surface_path.removeprefix(logical_prefix)
-                for previous in _LOOP_PREV_REFERENCE.finditer(template):
-                    producer_id = previous.group(1)
-                    if producer_id not in body_ids:
-                        issues.append(
-                            _issue(
-                                nested_path,
-                                "loop_group_scope_invalid",
-                                f"unknown previous-iteration body node: {producer_id}",
-                                line=child.source_line,
-                            )
-                        )
-                        continue
-                    raw_path = previous.group(2)
-                    if raw_path:
-                        output = structured_outputs.get(f"{group.id}/{producer_id}")
-                        schema = getattr(output, "canonical_schema", None)
-                        if not isinstance(
-                            schema, Mapping
-                        ) or _v3_output_path_impossible(
-                            schema, tuple(raw_path.split("."))
-                        ):
-                            issues.append(
-                                _issue(
-                                    nested_path,
-                                    "loop_group_scope_invalid",
-                                    "previous-iteration field requires a compatible structured output",
-                                    line=child.source_line,
-                                )
-                            )
-                masked = _LOOP_PREV_REFERENCE.sub("", template)
-                try:
-                    references = tuple(
-                        iter_output_references(masked, normalizer_version=6)
-                    )
-                except WorkflowReferenceSyntaxError as exc:
-                    issues.append(
-                        _issue(
-                            nested_path,
-                            "loop_group_scope_invalid",
-                            str(exc),
-                            line=child.source_line,
-                        )
-                    )
-                    continue
-                for reference in references:
-                    if reference.node_id in body_ids:
-                        allowed = reference.node_id in child.depends_on
-                        output_id = f"{group.id}/{reference.node_id}"
-                    else:
-                        allowed = reference.node_id in group.depends_on
-                        output_id = reference.node_id
-                    if not allowed:
-                        issues.append(
-                            _issue(
-                                nested_path,
-                                "loop_group_scope_invalid",
-                                f"output reference {reference.node_id} is outside the loop-group scope",
-                                line=child.source_line,
-                            )
-                        )
-                        continue
-                    if reference.path:
-                        output = structured_outputs.get(output_id)
-                        schema = getattr(output, "canonical_schema", None)
-                        if not isinstance(
-                            schema, Mapping
-                        ) or _v3_output_path_impossible(schema, reference.path):
-                            issues.append(
-                                _issue(
-                                    nested_path,
-                                    "loop_group_scope_invalid",
-                                    "loop-group field reference is incompatible with its structured output",
-                                    line=child.source_line,
-                                )
-                            )
+                validate_template(
+                    nested_path,
+                    template,
+                    current_dependencies=frozenset(child.depends_on),
+                    line=child.source_line,
+                    bash_context=surface_path.endswith((".bash", ".until_bash")),
+                )
+        until_bash = group.value.get("until_bash")
+        if isinstance(until_bash, str):
+            validate_template(
+                f"nodes[{group.source_index}].loop_group.until_bash",
+                until_bash,
+                current_dependencies=body_ids,
+                line=group.source_line,
+                bash_context=True,
+                group_predicate=True,
+            )
     if issues:
         raise WorkflowValidationError(tuple(issues))
 

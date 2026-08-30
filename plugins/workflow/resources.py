@@ -21,6 +21,7 @@ import yaml
 
 from plugins.workflow.language_schema import (
     WorkflowReferenceSyntaxError,
+    iter_loop_previous_output_references,
     iter_output_references,
 )
 from plugins.workflow.bash_rendering import (
@@ -65,12 +66,6 @@ _SCALAR_VARIABLE = re.compile(
 _REFERENCE_NODE_CANDIDATE = re.compile(
     r"\$(?P<node>[A-Za-z_][A-Za-z0-9_-]*)"
 )
-_LOOP_PREV_OUTPUT_REFERENCE = re.compile(
-    r"\$LOOP_PREV\.(?P<node>[A-Za-z_][A-Za-z0-9_-]*)\.output"
-    r"(?:\.(?P<dot>[A-Za-z0-9_.-]+))?"
-)
-
-
 @dataclass(frozen=True, slots=True)
 class _ScopedOutputReference:
     node_id: str
@@ -1024,36 +1019,42 @@ class StrictSubstitutionRenderer:
         return self.variables.previous_output_reference(node_id, path).rendered_text
 
     def _references(self, template: str, *, bash_contexts: bool = False):
-        previous_matches = (
-            tuple(_LOOP_PREV_OUTPUT_REFERENCE.finditer(template))
-            if self.variables.normalizer_version >= 6
-            else ()
-        )
-        previous_spans = (
-            frozenset(bash_loop_previous_reference_spans(template))
-            if bash_contexts
-            else frozenset(match.span() for match in previous_matches)
-        )
-        previous = tuple(
-            _ScopedOutputReference(
-                match.group("node"),
-                tuple(match.group("dot").split("."))
-                if match.group("dot")
-                else (),
-                match.start(),
-                match.end(),
-                True,
-            )
-            for match in previous_matches
-            if match.span() in previous_spans
-        )
-        masked = list(template)
-        for match in previous_matches:
-            masked[match.start() : match.end()] = " " * (
-                match.end() - match.start()
-            )
-        ordinary_template = "".join(masked)
         try:
+            previous_tokens = (
+                tuple(
+                    iter_loop_previous_output_references(
+                        template,
+                        normalizer_version=self.variables.normalizer_version,
+                    )
+                )
+                if self.variables.normalizer_version >= 6
+                else ()
+            )
+            previous_spans = (
+                frozenset(bash_loop_previous_reference_spans(template))
+                if bash_contexts
+                else frozenset(
+                    (reference.start, reference.end)
+                    for reference in previous_tokens
+                )
+            )
+            previous = tuple(
+                _ScopedOutputReference(
+                    reference.node_id,
+                    reference.path,
+                    reference.start,
+                    reference.end,
+                    True,
+                )
+                for reference in previous_tokens
+                if (reference.start, reference.end) in previous_spans
+            )
+            masked = list(template)
+            for reference in previous_tokens:
+                masked[reference.start : reference.end] = " " * (
+                    reference.end - reference.start
+                )
+            ordinary_template = "".join(masked)
             if bash_contexts:
                 ordinary = bash_output_references(
                     ordinary_template,

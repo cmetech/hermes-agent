@@ -100,6 +100,13 @@ def _compile(
         "print('script')\n",
         encoding="utf-8",
     )
+    (scripts / "predecessor-script.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "data = json.loads(Path(os.environ['HERMES_WORKFLOW_PREDECESSORS_FILE']).read_text())\n"
+        "print(','.join(sorted(data)))\n",
+        encoding="utf-8",
+    )
     workflow = workflow_writer(
         root / "workflows",
         name=name,
@@ -1043,6 +1050,112 @@ def test_current_outer_and_previous_outputs_stay_in_their_scopes(
         "[current-1]|[outer]|[]",
         "[current-2]|[outer]|[current-1]",
     ]
+
+
+def test_group_until_bash_executes_current_outer_and_previous_scopes(
+    tmp_path, workflow_writer
+) -> None:
+    group = _group(
+        [{"id": "sink", "prompt": "sink"}],
+        maximum=2,
+        depends_on=("outer",),
+    )
+    group["loop_group"]["until_bash"] = (
+        "test \"$sink.output|$outer.output|$LOOP_PREV.sink.output\" "
+        "= \"sink-2|outer|sink-1\""
+    )
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-until-bash",
+        nodes=[
+            {"id": "outer", "prompt": "outer"},
+            group,
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-until-bash")
+
+    def output(context, _rendered):
+        if context.node.id == "outer":
+            return "outer"
+        iteration = (
+            2
+            if "iterations/0002" in context.effective_attempt_directory.as_posix()
+            else 1
+        )
+        return f"sink-{iteration}"
+
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(output)
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    assert result["status"] == "succeeded"
+    assert result["nodes"]["group"]["loop_group"]["iteration"] == 2
+
+
+def test_scoped_renderer_rejects_malformed_previous_reference_prefix() -> None:
+    renderer = substitution_renderer(
+        VariableContext(
+            previous_body_outputs={"producer": None},
+            normalizer_version=6,
+        ),
+        direct_dependencies=(),
+    )
+
+    with pytest.raises(WorkflowOutputReferenceError) as raised:
+        renderer.render_prompt("$LOOP_PREV.producer.outputx")
+
+    assert raised.value.code == "output_reference_path_unsupported"
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize("script", ("inline", "named"))
+@pytest.mark.parametrize("body_dependency", (False, True), ids=("outer-only", "body-outer"))
+def test_scoped_script_predecessor_evidence_matches_runtime_dependencies(
+    tmp_path, workflow_writer, script, body_dependency
+) -> None:
+    inline = (
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "data = json.loads(Path(os.environ['HERMES_WORKFLOW_PREDECESSORS_FILE']).read_text())\n"
+        "print(','.join(sorted(data)))\n"
+    )
+    body = []
+    if body_dependency:
+        body.append({"id": "producer", "prompt": "producer"})
+    body.append({
+        "id": "reduce",
+        "depends_on": ["producer"] if body_dependency else [],
+        "script": inline if script == "inline" else "predecessor-script",
+        "runtime": "uv",
+    })
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"scoped-script-{script}-{body_dependency}",
+        nodes=[
+            {"id": "outer", "prompt": "outer"},
+            _group(body, depends_on=("outer",)),
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"scoped-script-{script}-{body_dependency}",
+    )
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda context, _rendered: context.node.id.rsplit("/", 1)[-1]
+    )
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    script_state = result["nodes"]["group"]["loop_group"]["body"]["reduce"]
+    assert script_state["state"] == "succeeded"
+    assert not list(store.run_directory(run_id).rglob("predecessors.json"))
 
 
 def test_previous_output_body_conditions_replay_from_authenticated_recovery_state(

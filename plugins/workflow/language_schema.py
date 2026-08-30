@@ -283,6 +283,34 @@ def _output_reference_at(template: str, start: int) -> OutputReferenceToken | No
     return None
 
 
+def iter_loop_previous_output_references(
+    template: str,
+    *,
+    normalizer_version: int,
+) -> Iterator[OutputReferenceToken]:
+    """Parse v6 previous outputs through the canonical closed grammar."""
+    _require_strict_reference_semantics(normalizer_version)
+    prefix = "$LOOP_PREV."
+    position = 0
+    while True:
+        start = template.find(prefix, position)
+        if start < 0:
+            return
+        suffix = "$" + template[start + len(prefix) :]
+        try:
+            token = _output_reference_at(suffix, 0)
+        except WorkflowReferenceSyntaxError as exc:
+            raise WorkflowReferenceSyntaxError(str(exc), start=start) from exc
+        if token is None:
+            raise WorkflowReferenceSyntaxError(
+                "output reference uses an unsupported path",
+                start=start,
+            )
+        end = start + len(prefix) - 1 + token.end
+        yield OutputReferenceToken(token.node_id, token.path, start, end)
+        position = end
+
+
 def iter_output_references(
     template: str,
     *,

@@ -2764,15 +2764,19 @@ class RunScheduler:
                         / f"{scope.iteration:04d}"
                         / "decision"
                     )
+                    package = self._load_run_package(run_id)
                     variables = self._scoped_variables(
                         dict(projection),
-                        self._load_run_package(run_id),
+                        package,
                         decision_item,
                         publication_directory=publication,
                         sealed_resource_paths=None,
                         sealed_resource_bytes=None,
                     )
                     if decision is None:
+                        predicate_dependencies = tuple(
+                            dict.fromkeys((*all_body.depends_on, *group.depends_on))
+                        )
                         predicate = self.executors["bash"].execute(
                             NodeExecutionContext(
                             run_id=run_id,
@@ -2781,7 +2785,7 @@ class RunScheduler:
                                 id=group.id,
                                 node_type="bash",
                                 value=str(group.value["until_bash"]),
-                                depends_on=group.depends_on,
+                                depends_on=predicate_dependencies,
                                 source_index=group.source_index,
                                 source_line=group.source_line,
                                 options=freeze_value({}),
@@ -2790,6 +2794,8 @@ class RunScheduler:
                             variable_context=replace(
                                 variables, loop_prev_output=cleaned
                             ),
+                            language_profile=package.language.effective_profile,
+                            normalizer_version=package.language.normalizer_version,
                             is_cancelled=lambda: self._cancelled(run_id),
                             cancellation_reason=lambda: self._cancellation_reason(run_id),
                             spawn_intent=lambda nonce: self.store.record_spawn_intent(
@@ -5122,6 +5128,22 @@ class RunScheduler:
                         if sealed_node_authority is not None
                         else None
                     )
+                    predecessor_projection = projection
+                    predecessor_dependencies = node.depends_on
+                    if work_item.loop_group_scope is not None:
+                        body_projection = projection["nodes"][
+                            work_item.loop_group_scope.group_id
+                        ]["loop_group"]["body"]
+                        if (
+                            package.language.normalizer_version >= 6
+                            and runtime_node.node_type == "script"
+                        ):
+                            predecessor_projection = {
+                                "nodes": {**projection["nodes"], **body_projection}
+                            }
+                        else:
+                            predecessor_projection = {"nodes": body_projection}
+                            predecessor_dependencies = work_item.node.depends_on
                     result = executor.execute(
                         NodeExecutionContext(
                             run_id=run_id,
@@ -5150,20 +5172,8 @@ class RunScheduler:
                                 else None
                             ),
                             predecessor_results=self._predecessor_results(
-                                (
-                                    {
-                                        "nodes": projection["nodes"][
-                                            work_item.loop_group_scope.group_id
-                                        ]["loop_group"]["body"]
-                                    }
-                                    if work_item.loop_group_scope is not None
-                                    else projection
-                                ),
-                                (
-                                    work_item.node.depends_on
-                                    if work_item.loop_group_scope is not None
-                                    else node.depends_on
-                                ),
+                                predecessor_projection,
+                                predecessor_dependencies,
                                 variables.node_outputs,
                                 include_output_values=(
                                     package.language.normalizer_version >= 6
