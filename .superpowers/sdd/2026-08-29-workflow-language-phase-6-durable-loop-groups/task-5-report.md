@@ -307,3 +307,138 @@ Output: 2 targeted cases passed, then all 645 schema tests passed.
 
 No concern remains. The v6 schema/loader fixture defect was corrected without
 weakening the runtime loader or broadening the Task 5 implementation.
+
+## Fix round 2: typed publication rollover recovery
+
+### Root cause and RED evidence
+
+`record_loop_group_iteration()` intentionally carries only authenticated
+primary-output descriptors into `previous_outputs`, increments the iteration,
+and replaces the completed body's attempts with bounded iteration N+1 state.
+The typed publication descriptor remains in the run's artifact projection and
+its exact scoped success remains in the immutable journal. However,
+`_journaled_typed_publications()` accepted a descriptor only when its attempt
+still appeared as succeeded in the current body. The first store load after a
+rollover therefore rejected valid iteration-N evidence.
+
+A real normalizer-v6 two-iteration group with one typed Bash child was added
+before production changes. It executes iteration one through `RunScheduler`,
+commits the rollover, reopens a fresh `RunStore`, executes iteration two,
+reopens again, and reads both immutable publications.
+
+Focused RED command:
+
+```bash
+export HERMES_PYTHON=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent/.venv/bin/python
+scripts/run_tests.sh tests/plugins/workflow/test_phase6_scheduler.py::test_scoped_typed_publications_recover_across_iteration_rollover -v
+```
+
+The first RED failed after `loop_group_iteration_committed` while
+`_resolve_graph()` reopened the run:
+`JournalRecoveryError: typed publication winning attempt is not corroborated`.
+After the rollover validator was implemented, extending the same test to call
+`lookup_publication()` for both iterations produced the second RED:
+`PublicationIntegrityError: publication descriptor or content is not
+corroborated`. That exposed the selected-descriptor caller still requiring a
+historical requested descriptor to be the current iteration's winner.
+
+### Minimal fix
+
+- `_journaled_typed_publications()` now receives the journal events already
+  read and validated by each store caller. It consults them only when a scoped
+  descriptor's attempt has retired from the current bounded body.
+- Retired evidence is accepted only when exactly one earlier
+  `loop_group_child_succeeded` frame agrees on run, group, controller
+  generation, iteration, body, worker key, attempt, exact event artifact,
+  successful scoped attempt snapshot, exact projected descriptor, event
+  sequence, and projection digest.
+- Scoped descriptors may accumulate only through the already-admitted bounded
+  iteration/artifact products. Every descriptor must match the sealed output
+  declaration, and a currently succeeded scoped child must still have exactly
+  one descriptor for its current successful attempt.
+- Top-level publication corroboration remains unchanged: it still requires
+  exactly one current succeeded attempt and exactly one winning descriptor.
+- `lookup_publication()` validates the complete descriptor projection first and
+  only then selects the requested publication ID, so an older scoped
+  publication stays readable without bypassing the current-winner or sibling
+  integrity checks.
+
+No child attempt history, table, schema, repository, flattened child state, or
+new authority mechanism was added.
+
+### Caller audit
+
+All `_journaled_typed_publications()` paths now consume the same journal-backed
+scoped corroboration:
+
+- `_validate_typed_publication_metadata()` on ordinary load and journal replay;
+- `_recover_typed_publications_locked()` for bundle/body verification;
+- `_recover_typed_mirrors_checked_locked()` for persistent typed mirrors; and
+- `_requested_publication_descriptor()` for direct publication lookup.
+
+Replay passes the already-read bounded event list; mirror recovery reuses its
+existing event read; load, body recovery, and direct lookup use the existing
+validated journal reader. Future events cannot authorize an earlier projection
+because the corroborating sequence must not exceed that projection's journal
+head.
+
+### GREEN verification
+
+Focused rollover/reopen/lookup regression:
+
+```bash
+scripts/run_tests.sh tests/plugins/workflow/test_phase6_scheduler.py::test_scoped_typed_publications_recover_across_iteration_rollover -v
+```
+
+Output: 1 passed, 0 failed.
+
+Required Task 5 plus deadline gate:
+
+```bash
+scripts/run_tests.sh tests/plugins/workflow/test_phase6_scheduler.py tests/plugins/workflow/test_parallel_scheduler.py tests/plugins/workflow/test_scheduler.py tests/plugins/workflow/test_phase4_references.py tests/plugins/workflow/test_phase6_store.py tests/plugins/workflow/test_phase6_execution_context.py tests/plugins/workflow/test_deadlines.py -v
+```
+
+Output: 7 files, 148 passed, 0 failed.
+
+Typed publication and recovery caller gate:
+
+```bash
+scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_scheduler.py \
+  tests/plugins/workflow/test_typed_publication.py \
+  tests/plugins/workflow/test_typed_publication_recovery.py \
+  tests/plugins/workflow/test_crash_recovery.py \
+  tests/plugins/workflow/test_persistent_session_recovery.py \
+  tests/plugins/workflow/test_shutdown_recovery.py -v
+```
+
+Output: 6 files, 315 passed, 0 failed.
+
+Static verification:
+
+```bash
+$HERMES_PYTHON -m ruff check \
+  plugins/workflow/store.py \
+  tests/plugins/workflow/test_phase6_scheduler.py
+git diff --check
+```
+
+Output: Ruff reported `All checks passed!`; diff check was clean.
+
+### Round-2 self-review
+
+- The fallback is reachable only for a descriptor carrying authenticated v6
+  `LoopGroupChildScope`; v1-v5 and top-level winner rules do not change.
+- The controller generation must still match, and only a strictly earlier
+  scoped iteration can use retired journal evidence.
+- Both the event payload and the event's checksummed projection independently
+  corroborate the descriptor and successful attempt.
+- Multiple scoped descriptors are iteration/attempt identities, not competing
+  winners; exactly one descriptor must match the current successful attempt.
+- The change reuses the existing journal, projection digest, sealed
+  declaration, publication body, and mirror validators without adding durable
+  surface.
+
+### Round-2 concerns
+
+None.

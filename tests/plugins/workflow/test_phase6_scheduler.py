@@ -671,6 +671,74 @@ def test_scoped_typed_publication_is_canonical_and_recovers(
     ) == publication["publication_id"]
 
 
+def test_scoped_typed_publications_recover_across_iteration_rollover(
+    tmp_path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="scoped-typed-publication-rollover",
+        nodes=[
+            _group(
+                [
+                    {
+                        "id": "typed",
+                        "bash": "printf durable-report",
+                        "output_type": "Report",
+                    }
+                ],
+                maximum=2,
+            )
+        ],
+    )
+    home = tmp_path / "home"
+    store = RunStore(home, max_total_workers=1)
+    run_id = _admit(store, compilation, key="scoped-typed-publication-rollover")
+
+    first = RunScheduler(store, max_parallel_nodes=1).advance(run_id, max_nodes=1)
+
+    controller = first["nodes"]["group"]["loop_group"]
+    assert controller["iteration"] == 2
+    assert controller["body"]["typed"]["attempts"] == []
+    events = [
+        json.loads(line)
+        for line in (store.run_directory(run_id) / "events.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        event["event_type"] == "loop_group_iteration_committed"
+        and event["payload"]["completed_iteration"] == 1
+        for event in events
+    )
+    [first_publication] = [
+        artifact for artifact in first["artifacts"] if "publication_id" in artifact
+    ]
+    assert first_publication["loop_group_scope"]["iteration"] == 1
+
+    reopened_store = RunStore(home, max_total_workers=1)
+    reopened = reopened_store.load_run(run_id)
+    assert reopened["nodes"]["group"]["loop_group"]["iteration"] == 2
+
+    RunScheduler(reopened_store, max_parallel_nodes=1).advance(run_id, max_nodes=1)
+    recovered = RunStore(home).load_run(run_id)
+    publications = [
+        artifact
+        for artifact in recovered["artifacts"]
+        if "publication_id" in artifact
+    ]
+    assert len(publications) == 2
+    assert [
+        publication["loop_group_scope"]["iteration"]
+        for publication in publications
+    ] == [1, 2]
+    assert all(publication["node_id"] == "group/typed" for publication in publications)
+    assert [
+        RunStore(home).lookup_publication(
+            run_id, publication["publication_id"]
+        ).content
+        for publication in publications
+    ] == [b"durable-report", b"durable-report"]
+
+
 def test_persistent_ai_child_reuses_scoped_session_across_iterations(
     tmp_path, workflow_writer
 ) -> None:

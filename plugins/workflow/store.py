@@ -2475,9 +2475,111 @@ def _typed_output_requirement(
     )
 
 
+def _journal_corroborates_retired_scoped_publication(
+    projection: Mapping[str, object],
+    artifact: Mapping[str, object],
+    scope: LoopGroupChildScope,
+    journal_events: Iterable[Mapping[str, object]],
+) -> bool:
+    run_id = projection.get("run_id")
+    event_sequence = projection.get("event_sequence")
+    nodes = projection.get("nodes")
+    group = nodes.get(scope.group_id) if isinstance(nodes, Mapping) else None
+    controller = group.get("loop_group") if isinstance(group, Mapping) else None
+    if (
+        run_id != scope.run_id
+        or isinstance(event_sequence, bool)
+        or not isinstance(event_sequence, int)
+        or not isinstance(controller, Mapping)
+        or controller.get("controller_generation") != scope.controller_generation
+        or not isinstance(controller.get("iteration"), int)
+        or isinstance(controller.get("iteration"), bool)
+        or int(controller["iteration"]) <= scope.iteration
+    ):
+        return False
+    semantic_node_id = f"{scope.group_id}/{scope.node_id}"
+    expected_projection_artifact = dict(artifact)
+    expected_event_artifact = {
+        **expected_projection_artifact,
+        "node_id": scope.worker_node_id,
+    }
+    matches = 0
+    for event in journal_events:
+        sequence = event.get("sequence")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence > event_sequence
+            or event.get("event_type") != "loop_group_child_succeeded"
+            or event.get("run_id") != run_id
+            or event.get("node_id") != scope.worker_node_id
+            or event.get("attempt_id") != artifact.get("attempt_id")
+        ):
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        try:
+            event_scope = LoopGroupChildScope.from_durable_record(
+                payload.get("loop_group_scope")
+            )
+        except ValueError:
+            continue
+        event_artifacts = payload.get("artifacts")
+        if event_scope != scope or not isinstance(event_artifacts, list):
+            continue
+        if sum(
+            isinstance(candidate, Mapping)
+            and dict(candidate) == expected_event_artifact
+            for candidate in event_artifacts
+        ) != 1:
+            continue
+        snapshot = event.get("projection")
+        if (
+            not isinstance(snapshot, Mapping)
+            or snapshot.get("run_id") != run_id
+            or snapshot.get("event_sequence") != sequence
+            or event.get("projection_sha256") != _projection_digest(snapshot)
+        ):
+            continue
+        snapshot_node = _projection_node_state(snapshot, semantic_node_id)
+        attempts = (
+            snapshot_node.get("attempts")
+            if isinstance(snapshot_node, Mapping)
+            else None
+        )
+        if (
+            not isinstance(attempts, list)
+            or sum(
+                isinstance(attempt, Mapping)
+                and attempt.get("attempt_id") == artifact.get("attempt_id")
+                and attempt.get("state") == "succeeded"
+                and attempt.get("loop_group_scope") == scope.durable_record()
+                for attempt in attempts
+            )
+            != 1
+        ):
+            continue
+        snapshot_artifacts = snapshot.get("artifacts")
+        if (
+            not isinstance(snapshot_artifacts, list)
+            or sum(
+                isinstance(candidate, Mapping)
+                and dict(candidate) == expected_projection_artifact
+                for candidate in snapshot_artifacts
+            )
+            != 1
+        ):
+            continue
+        matches += 1
+    return matches == 1
+
+
 def _journaled_typed_publications(
     projection: Mapping[str, object],
     declared_outputs: Mapping[str, _DeclaredTypedOutput],
+    *,
+    journal_events: Iterable[Mapping[str, object]],
 ) -> tuple[_JournaledTypedPublication, ...]:
     run_id = projection.get("run_id")
     nodes = projection.get("nodes")
@@ -2511,6 +2613,7 @@ def _journaled_typed_publications(
         )
     descriptors: list[_JournaledTypedPublication] = []
     publication_ids: set[str] = set()
+    scoped_descriptor_nodes: set[str] = set()
     for artifact in artifacts:
         if not isinstance(artifact, Mapping):
             continue
@@ -2621,6 +2724,7 @@ def _journaled_typed_publications(
                 _safe_component("node", node_id),
                 _safe_component("attempt", nested_attempt),
             ))
+        scope = None
         if artifact.get("loop_group_scope") is not None:
             try:
                 scope = LoopGroupChildScope.from_durable_record(
@@ -2660,18 +2764,40 @@ def _journaled_typed_publications(
                 if isinstance(attempt, Mapping)
                 and attempt.get("attempt_id") == attempt_id
                 and attempt.get("state") == "succeeded"
+                and (
+                    scope is None
+                    or attempt.get("loop_group_scope") == scope.durable_record()
+                )
             ]
             if isinstance(attempts, list)
             else []
         )
         if len(winners) != 1:
-            raise JournalRecoveryError(
-                "typed publication winning attempt is not corroborated"
-            )
+            if scope is None or not _journal_corroborates_retired_scoped_publication(
+                projection,
+                artifact,
+                scope,
+                journal_events,
+            ):
+                raise JournalRecoveryError(
+                    "typed publication winning attempt is not corroborated"
+                )
         if not archon:
             raise JournalRecoveryError(
                 "typed publication language authority is invalid"
             )
+        if scope is not None:
+            scoped_descriptor_nodes.add(node_id)
+            declaration = declared_outputs.get(node_id)
+            if declaration is not None:
+                requirements.setdefault(
+                    node_id,
+                    _typed_output_requirement(
+                        projection,
+                        node_id=node_id,
+                        declaration=declaration,
+                    ),
+                )
         publication_ids.add(publication_id)
         descriptors.append(
             _JournaledTypedPublication(
@@ -2701,20 +2827,49 @@ def _journaled_typed_publications(
         )
     for node_id, requirement in requirements.items():
         matches = descriptors_by_node.get(node_id, [])
-        if len(matches) != 1:
+        if node_id not in scoped_descriptor_nodes and len(matches) != 1:
             raise JournalRecoveryError(
                 "typed publication requires exactly one winning descriptor"
             )
-        descriptor = matches[0]
-        if (
-            descriptor.output_type != requirement.output_type
-            or descriptor.schema_fingerprint != requirement.schema_fingerprint
-            or descriptor.canonicalization_version
-            != requirement.canonicalization_version
-        ):
-            raise JournalRecoveryError(
-                "typed publication descriptor conflicts with sealed output authority"
+        if node_id in scoped_descriptor_nodes:
+            node = _projection_node_state(projection, node_id)
+            if not isinstance(node, Mapping):
+                raise JournalRecoveryError(
+                    "typed publication node authority is invalid"
+                )
+            attempts = node.get("attempts")
+            current_winners = (
+                {
+                    str(attempt["attempt_id"])
+                    for attempt in attempts
+                    if isinstance(attempt, Mapping)
+                    and isinstance(attempt.get("attempt_id"), str)
+                    and attempt.get("state") == "succeeded"
+                }
+                if isinstance(attempts, list)
+                else set()
             )
+            if node.get("state") == "succeeded" and (
+                len(current_winners) != 1
+                or sum(
+                    descriptor.attempt_id in current_winners
+                    for descriptor in matches
+                )
+                != 1
+            ):
+                raise JournalRecoveryError(
+                    "typed publication requires exactly one winning descriptor"
+                )
+        for descriptor in matches:
+            if (
+                descriptor.output_type != requirement.output_type
+                or descriptor.schema_fingerprint != requirement.schema_fingerprint
+                or descriptor.canonicalization_version
+                != requirement.canonicalization_version
+            ):
+                raise JournalRecoveryError(
+                    "typed publication descriptor conflicts with sealed output authority"
+                )
     return tuple(descriptors)
 
 
@@ -2723,6 +2878,7 @@ def _validate_typed_publication_metadata(
     projection: Mapping[str, object],
     *,
     migrate_legacy: bool,
+    journal_events: Iterable[Mapping[str, object]],
 ) -> int:
     """Validate descriptor authority without opening versioned publication bodies."""
     declared_outputs = _sealed_typed_output_declarations(
@@ -2740,6 +2896,7 @@ def _validate_typed_publication_metadata(
     _journaled_typed_publications(
         projection,
         declared_outputs,
+        journal_events=journal_events,
     )
     return migrated
 
@@ -7619,6 +7776,7 @@ class RunStore:
                             directory,
                             projection,
                             migrate_legacy=recover_typed_publications,
+                            journal_events=self._read_journal_events(directory),
                         )
                     except JournalRecoveryError:
                         self._transition_run_repair(
@@ -7858,22 +8016,15 @@ class RunStore:
             directory,
             projection,
         )
-        requested_node_ids = {
-            artifact.get("node_id")
-            for artifact in matches
-            if isinstance(artifact.get("node_id"), str)
-        }
-        selected_declarations = {
-            node_id: declarations[node_id]
-            for node_id in requested_node_ids
-            if node_id in declarations
-        }
-        selected_projection = dict(projection)
-        selected_projection["artifacts"] = matches
-        descriptors = _journaled_typed_publications(
-            selected_projection,
-            selected_declarations,
-        )
+        descriptors = [
+            descriptor
+            for descriptor in _journaled_typed_publications(
+                projection,
+                declarations,
+                journal_events=self._read_journal_events(directory),
+            )
+            if descriptor.publication_id == publication_id
+        ]
         if len(descriptors) != 1:
             raise JournalRecoveryError(
                 "requested typed publication descriptor is ambiguous"
@@ -8094,6 +8245,7 @@ class RunStore:
                             migrate_legacy=(
                                 migrate_legacy_typed_publications
                             ),
+                            journal_events=events,
                         )
                     )
                 except JournalRecoveryError:
@@ -12803,6 +12955,7 @@ class RunStore:
             descriptors = _journaled_typed_publications(
                 projection,
                 declared_outputs,
+                journal_events=self._read_journal_events(directory),
             )
             expected = {descriptor.publication_id: descriptor for descriptor in descriptors}
             publications = directory / "publications"
@@ -13156,11 +13309,13 @@ class RunStore:
         projection: dict[str, object],
         verified_content: Mapping[str, bytes],
     ) -> None:
+        events = self._read_journal_events(directory)
         descriptors = {
             descriptor.publication_id: descriptor
             for descriptor in _journaled_typed_publications(
                 projection,
                 _sealed_typed_output_declarations(directory, projection),
+                journal_events=events,
             )
         }
         if (
@@ -13178,7 +13333,6 @@ class RunStore:
             )
             for obligation in (self._typed_mirror_obligation(projection, descriptor),)
         }
-        events = self._read_journal_events(directory)
         required: dict[str, TypedMirrorObligation] = {}
         completed: dict[str, str] = {}
         for event in events:
