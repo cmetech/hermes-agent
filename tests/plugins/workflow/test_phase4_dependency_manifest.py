@@ -725,3 +725,54 @@ def test_sealer_binds_future_loop_command_handoff_without_live_reread(
     assert yaml.safe_load(bound_definition)["nodes"][0]["loop"]["command"] == (
         binding.snapshot_path
     )
+
+
+def test_v6_manifest_uses_scoped_ids_for_nested_executable_resources(
+    tmp_path: Path, workflow_writer
+) -> None:
+    from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+    from plugins.workflow.schema import parse_workflow_source_bytes
+
+    root = tmp_path / "nested"
+    (root / "commands").mkdir(parents=True)
+    (root / "commands/review.md").write_text("review\n", encoding="utf-8")
+    path = workflow_writer(
+        root / "workflows",
+        name="nested-manifest",
+        filename="nested-manifest.yaml",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 2,
+                "nodes": [{"id": "review", "command": "review"}],
+            },
+        }],
+    )
+    policy = b"language_compatibility: archon-2026-07\n"
+    path.with_name("nested-manifest.hermes.yaml").write_bytes(policy)
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=policy,
+        source="project",
+        precedence=1,
+    )
+
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=6,
+    )
+    binding = next(
+        item
+        for item in compilation.dependency_manifest.resources
+        if item.resource_kind == "command"
+    )
+
+    assert binding.node_id == "group/review"
+    assert binding.binding_id == "group/review:command"
+    definition = yaml.safe_load(compilation.definition_bytes)
+    assert definition["nodes"][0]["loop_group"]["nodes"][0]["command"] == (
+        binding.snapshot_path
+    )

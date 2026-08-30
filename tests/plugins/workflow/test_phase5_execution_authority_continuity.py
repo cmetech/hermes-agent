@@ -381,6 +381,38 @@ def test_phase5_approval_restart_cannot_exceed_durable_attempt_remainder(
     assert exhausted["nodes"]["ask"]["retry_consumed"] == 2
 
 
+def test_phase5_redundant_resume_keeps_a_running_claim_unchanged(
+    tmp_path,
+    workflow_writer,
+) -> None:
+    store, run_id = _admit_phase5_run(
+        tmp_path,
+        workflow_writer,
+        name="phase5-running-resume-noop",
+        nodes=[{"id": "ask", "prompt": "keep running"}],
+    )
+    claim = store.claim_node(
+        run_id,
+        "ask",
+        "active-owner",
+        executor_id="prompt",
+        execution_authority=_VALID_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    before = store.load_run(run_id)
+
+    resumed = store.resume_run(run_id, always_run_nodes=set())
+
+    assert resumed == before
+    assert resumed["status"] == "running"
+    assert resumed["nodes"]["ask"]["claim"]["attempt_id"] == claim.attempt_id
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE attempt_id=?",
+            (claim.attempt_id,),
+        ).fetchone()[0] == 1
+
+
 def test_phase5_cancelled_result_after_provider_dispatch_charges_exactly_once(
     tmp_path,
     workflow_writer,
@@ -1120,6 +1152,7 @@ def test_phase5_duplicate_succeeded_persistence_fails_closed_without_mutation(
         "attempt_id": attempt["attempt_id"],
         "owner_id": attempt["owner_id"],
         "execution_fence": None,
+        "loop_group_scope": None,
     })()
 
     try:

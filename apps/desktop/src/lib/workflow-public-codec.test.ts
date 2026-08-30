@@ -34,6 +34,27 @@ const run = {
   workflow: 'portable'
 }
 
+const loopGroup = {
+  body: [
+    { attempt_count: 1, duration_ms: 125, failure_code: null, id: 'fetch', node_type: 'bash', state: 'succeeded' },
+    {
+      attempt_count: 2,
+      duration_ms: null,
+      failure_code: 'provider_failed',
+      id: 'publish',
+      node_type: 'tool',
+      state: 'failed'
+    }
+  ],
+  completed_iterations: 6,
+  iteration: 7,
+  iterations: [
+    { completed_nodes: 2, duration_ms: 250, failure_code: null, iteration: 6, state: 'succeeded', total_nodes: 2 }
+  ],
+  max_iterations: 25,
+  primary_sink: 'publish'
+}
+
 const structuredOutputCapability = {
   mixed: false,
   summaries: [
@@ -66,9 +87,9 @@ const serializedLegacyArtifact = {
 describe('workflow public codecs', () => {
   it('accepts only the exact backend structured-output catalog projection', () => {
     expect(isWorkflowStructuredOutputCapabilitySummary(structuredOutputCapability)).toBe(true)
-    expect(isWorkflowStructuredOutputCapabilitySummary({ ...structuredOutputCapability, private_extra: 'rejected' })).toBe(
-      false
-    )
+    expect(
+      isWorkflowStructuredOutputCapabilitySummary({ ...structuredOutputCapability, private_extra: 'rejected' })
+    ).toBe(false)
     expect(
       isWorkflowStructuredOutputCapabilitySummary({
         ...structuredOutputCapability,
@@ -107,6 +128,69 @@ describe('workflow public codecs', () => {
           node_id: 'work',
           type: 'workflow_approval'
         }
+      })
+    ).toBeNull()
+  })
+
+  it('accepts only the exact bounded loop-group and scope projections', () => {
+    const grouped = {
+      ...run,
+      nodes: {
+        group: {
+          attempt_count: 0,
+          attempts: [],
+          depends_on: [],
+          id: 'group',
+          loop_group: loopGroup,
+          state: 'running'
+        }
+      }
+    }
+
+    const event = {
+      event_type: 'loop_group_child_completed',
+      item_type: 'timeline_event',
+      loop_group_scope: { body_node_id: 'publish', controller_generation: 2, group_id: 'group', iteration: 7 },
+      run_id: 'run-1',
+      sequence: 3,
+      timestamp: '2026-08-29T12:00:00Z'
+    }
+
+    expect(decodeWorkflowRun(grouped)).toEqual(grouped)
+    expect(
+      decodeWorkflowRun({
+        ...grouped,
+        nodes: { group: { ...grouped.nodes.group, loop_group: { ...loopGroup, output: 'private' } } }
+      })
+    ).toBeNull()
+    expect(
+      decodeWorkflowRun({
+        ...grouped,
+        nodes: {
+          group: { ...grouped.nodes.group, loop_group: { ...loopGroup, body: Array(513).fill(loopGroup.body[0]) } }
+        }
+      })
+    ).toBeNull()
+    expect(
+      decodeWorkflowRun({
+        ...grouped,
+        nodes: {
+          group: {
+            ...grouped.nodes.group,
+            loop_group: { ...loopGroup, iterations: Array(26).fill(loopGroup.iterations[0]) }
+          }
+        }
+      })
+    ).toBeNull()
+    expect(
+      decodeWorkflowEventPage({ cursor_reset: false, events: [event], next_cursor: 3, schema_version: 1 })
+    ).not.toBeNull()
+    expect(
+      decodeWorkflowEventPage({
+        cursor_reset: false,
+        events: [{ ...event, loop_group_scope: { ...event.loop_group_scope, output: 'private' } }],
+        next_cursor: 3,
+        schema_version: 1
       })
     ).toBeNull()
   })
@@ -216,6 +300,7 @@ describe('workflow public codecs', () => {
           channel: 'desktop',
           event_type: 'interaction_approved',
           item_type: 'interaction',
+          loop_group_scope: { body_node_id: 'work', controller_generation: 2, group_id: 'group', iteration: 3 },
           node_id: 'work',
           sequence: 4
         }
@@ -227,6 +312,17 @@ describe('workflow public codecs', () => {
     }
 
     expect(decodeWorkflowEvidencePage(interactionPage)).toEqual(interactionPage)
+    expect(
+      decodeWorkflowEvidencePage({
+        ...interactionPage,
+        items: [
+          {
+            ...interactionPage.items[0],
+            loop_group_scope: { ...interactionPage.items[0]!.loop_group_scope, output: 'private' }
+          }
+        ]
+      })
+    ).toBeNull()
     expect(
       decodeWorkflowEvidencePage({
         ...interactionPage,

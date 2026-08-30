@@ -10,13 +10,15 @@ import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Mapping
 
-from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.language import supports_phase3_semantics, supports_phase6_semantics
 from plugins.workflow.models import (
     RunExecutionLimits,
     WorkflowLanguageProfile,
     WorkflowPackage,
     freeze_value,
 )
+from plugins.workflow.resources import effective_scoped_node_options
+from plugins.workflow.topology import iter_scoped_workflow_nodes
 
 if TYPE_CHECKING:
     from plugins.workflow.provider_authority import WorkflowProviderAuthority
@@ -523,8 +525,16 @@ def build_phase3_execution_semantics(
     effective_limits = _validated_limits(limits)
     node_semantics = package.language.node_semantics
     nodes: dict[str, Mapping[str, object]] = {}
-    for node in package.definition.nodes:
-        requested = node_semantics.get(node.id, MappingProxyType({}))
+    phase6 = supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    )
+    for scoped in iter_scoped_workflow_nodes(package.definition):
+        node = scoped.node
+        if phase6 and node.node_type == "loop_group":
+            continue
+        node_id = scoped.semantic_id
+        options = effective_scoped_node_options(package.definition, scoped)
+        requested = node_semantics.get(node_id, MappingProxyType({}))
         if node.node_type in {"bash", "script"}:
             requested_wall = float(requested["wall_timeout_seconds"])
             attempt_wall = min(
@@ -535,7 +545,7 @@ def build_phase3_execution_semantics(
             idle = None
             provider = None
             timeout_source = (
-                "authored" if "timeout" in node.options else "archon_default"
+                "authored" if "timeout" in options else "archon_default"
             )
             timeout_capped = attempt_wall < requested_wall
         else:
@@ -566,7 +576,7 @@ def build_phase3_execution_semantics(
                 requested_idle is not None and idle is not None and idle < requested_idle
             )
         retry = requested.get("retry")
-        nodes[node.id] = {
+        nodes[node_id] = {
             "requested_attempt_wall_timeout_seconds": requested_wall,
             "attempt_wall_timeout_seconds": attempt_wall,
             "requested_idle_timeout_seconds": requested_idle,

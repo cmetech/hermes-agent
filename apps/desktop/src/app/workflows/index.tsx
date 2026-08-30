@@ -67,6 +67,15 @@ function workflowRunSearchText(run: WorkflowRunSnapshot): string {
     .toLowerCase()
 }
 
+interface WorkflowRunMutation {
+  action: string
+  body?: Record<string, unknown>
+  interactionId?: string
+  profile: string
+  runId: string
+  stateVersion: number
+}
+
 export function loadWorkflowRunPage(view: WorkflowRunView, cursor?: string): Promise<WorkflowRunPage> {
   if (view === 'workflows') {
     return Promise.reject(new Error('The workflows catalog view does not list workflow runs.'))
@@ -226,31 +235,52 @@ export function WorkflowsView() {
   }, [eventQueryKey, isVisible, queryClient, selectedRunId])
 
   const mutation = useMutation({
-    mutationFn: ({ action, body = {} }: { action: string; body?: Record<string, unknown> }) =>
-      mutateWorkflowRun(selectedRunId!, action, {
+    mutationFn: ({ action, body = {}, interactionId, runId, stateVersion }: WorkflowRunMutation) =>
+      mutateWorkflowRun(runId, action, {
         ...body,
-        expected_version: selected.data?.state_version ?? -1,
-        interaction_id: selected.data?.pending_interaction?.interaction_id
+        expected_version: stateVersion,
+        interaction_id: interactionId
       }),
-    onError: async error => {
+    onError: async (error, origin) => {
       if (!isConflict(error)) {
+        return
+      }
+
+      const originIsCurrent = (getApiRequestProfile() ?? 'default') === origin.profile
+
+      if (!originIsCurrent) {
+        await Promise.all([
+          queryClient.invalidateQueries({
+            queryKey: ['workflow-run', origin.profile, origin.runId],
+            refetchType: 'none'
+          }),
+          queryClient.invalidateQueries({ queryKey: ['workflow-runs', origin.profile], refetchType: 'none' }),
+          queryClient.invalidateQueries({ queryKey: ['workflow-attention', origin.profile], refetchType: 'none' }),
+          queryClient.invalidateQueries({
+            queryKey: ['workflow-events', origin.profile, origin.runId],
+            refetchType: 'none'
+          })
+        ])
+
         return
       }
 
       await queryClient.refetchQueries({
         exact: true,
-        queryKey: ['workflow-run', profile, selectedRunId]
+        queryKey: ['workflow-run', origin.profile, origin.runId]
       })
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['workflow-runs', profile] }),
-        queryClient.invalidateQueries({ queryKey: ['workflow-attention', profile] }),
-        queryClient.invalidateQueries({ queryKey: eventQueryKey })
+        queryClient.invalidateQueries({ queryKey: ['workflow-runs', origin.profile] }),
+        queryClient.invalidateQueries({ queryKey: ['workflow-attention', origin.profile] }),
+        queryClient.invalidateQueries({ queryKey: ['workflow-events', origin.profile, origin.runId] })
       ])
     },
-    onSuccess: run => {
-      queryClient.setQueryData(['workflow-run', profile, selectedRunId], run)
-      void queryClient.invalidateQueries({ queryKey: ['workflow-runs', profile] })
-      void queryClient.invalidateQueries({ queryKey: ['workflow-attention', profile] })
+    onSuccess: (run, origin) => {
+      const refetchType = (getApiRequestProfile() ?? 'default') === origin.profile ? 'active' : 'none'
+
+      queryClient.setQueryData(['workflow-run', origin.profile, origin.runId], run)
+      void queryClient.invalidateQueries({ queryKey: ['workflow-runs', origin.profile], refetchType })
+      void queryClient.invalidateQueries({ queryKey: ['workflow-attention', origin.profile], refetchType })
     }
   })
 
@@ -272,7 +302,14 @@ export function WorkflowsView() {
     actionInFlight.current = true
     setActionPending(true)
     mutation.mutate(
-      { action, body },
+      {
+        action,
+        body,
+        interactionId: selected.data?.pending_interaction?.interaction_id ?? undefined,
+        profile,
+        runId: selectedRunId!,
+        stateVersion: selected.data?.state_version ?? -1
+      },
       {
         onSettled: () => {
           actionInFlight.current = false
@@ -378,11 +415,7 @@ export function WorkflowsView() {
       />
       {view === 'workflows' ? (
         <div className="mt-4 min-h-0 flex-1 overflow-y-auto">
-          <WorkflowCatalog
-            onRunWorkflow={openReview}
-            onViewWorkflow={openView}
-            requestProfile={requestProfile}
-          />
+          <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} requestProfile={requestProfile} />
         </div>
       ) : (
         <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>

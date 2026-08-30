@@ -1884,7 +1884,9 @@ export const ar = defineLocale({
     workflowProviderReadiness: 'جاهزية المزوّد',
     workflowProviderAuthorityDigest: 'بصمة الصلاحية',
     workflowProviderCapabilityLevel: 'مستوى الإمكانية',
-    workflowProviderRoute: (node, provider, model) => `${node}: ${provider} · ${model}`
+    workflowProviderRoute: (node, provider, model) => `${node}: ${provider} · ${model}`,
+    workflowLoopNodeType: 'النوع',
+    workflowLoopDuration: 'المدة'
   },
   composer: {
     message: 'الرسالة',

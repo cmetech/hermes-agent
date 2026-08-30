@@ -834,3 +834,15 @@ def test_configured_provider_alias_may_classify_to_a_distinct_effective_provider
 
     assert authority.routes["ask:primary"].provider == "claude"
     assert authority.routes["ask:primary"].effective_provider == "anthropic"
+
+
+def test_v5_authority_route_ids_remain_outer_node_ids(tmp_path, workflow_writer):
+    package = _load_v5(
+        workflow_writer(
+            tmp_path,
+            model="@primary",
+            nodes=[{"id": "ask", "prompt": "hello"}],
+        )
+    )
+
+    assert set(_authority(package).routes) == {"ask:primary"}

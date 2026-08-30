@@ -62,7 +62,9 @@ class _RecordingAuthorizationRunStore(RunStore):
         return authorization
 
 
-def _archon_package(tmp_path, workflow_writer, *, nodes, sidecar=None):
+def _archon_package(
+    tmp_path, workflow_writer, *, nodes, sidecar=None, normalizer_version=4
+):
     path = workflow_writer(tmp_path, name="phase3-execution", nodes=nodes)
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
         yaml.safe_dump(
@@ -78,8 +80,50 @@ def _archon_package(tmp_path, workflow_writer, *, nodes, sidecar=None):
         path,
         workflow_bytes=path.read_bytes(),
         sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
-        normalizer_version=4,
+        normalizer_version=normalizer_version,
     )
+
+
+def test_v6_execution_semantics_seal_scoped_body_limits(
+    tmp_path, workflow_writer
+) -> None:
+    package = _archon_package(
+        tmp_path,
+        workflow_writer,
+        normalizer_version=6,
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [
+                    {"id": "shell", "bash": "true", "timeout": 30_000},
+                    {
+                        "id": "prompt",
+                        "prompt": "finish",
+                        "idle_timeout": 12_000,
+                        "retry": {"max_attempts": 1},
+                    },
+                ],
+            },
+        }],
+    )
+    module = _execution_semantics_module()
+
+    semantics = module.build_phase3_execution_semantics(
+        package, RunExecutionLimits()
+    )
+    decoded = module.read_phase3_execution_semantics(
+        semantics.to_dict(), package=package
+    )
+
+    assert set(semantics.nodes) == {"group/shell", "group/prompt"}
+    assert semantics.nodes["group/shell"]["attempt_wall_timeout_seconds"] == 30.0
+    assert semantics.nodes["group/prompt"]["idle_timeout_seconds"] == 12.0
+    assert semantics.nodes["group/prompt"]["retry"][
+        "requested_total_attempts"
+    ] == 2
+    assert decoded == semantics
 
 
 def test_effective_execution_semantics_round_trip_exact_schema_and_caps(

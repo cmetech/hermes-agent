@@ -36,12 +36,13 @@ from plugins.workflow.models import (
 WORKFLOW_NORMALIZER_VERSION = 2
 CURRENT_NORMALIZER_BY_PROFILE = MappingProxyType({
     WorkflowLanguageProfile.HERMES_LEGACY: 2,
-    WorkflowLanguageProfile.ARCHON_2026_07: 5,
+    WorkflowLanguageProfile.ARCHON_2026_07: 6,
 })
 LATEST_NORMALIZER_VERSION = max(CURRENT_NORMALIZER_BY_PROFILE.values())
-SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4, 5})
+SUPPORTED_NORMALIZER_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
 STRUCTURED_OUTPUT_CANONICALIZATION_VERSION = 1
 MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS = 32
+MAX_SNAPSHOTTED_NODE_SEMANTICS = 1024
 # The normalized type-tag document expands the already bounded workflow and
 # structured schemas. This conservative ceiling keeps semantic hashing bounded
 # without constraining any admitted 2 MiB workflow or its 32 schema snapshots.
@@ -60,6 +61,8 @@ ARCHON_LANGUAGE_FINDING_FIELDS = frozenset({
     "output_format",
     "output_type",
     "maxBudgetUsd",
+    "maxTurns",
+    "tool_call_contract",
     "sandbox",
 })
 WORKFLOW_LANGUAGE_FINDINGS_PER_NODE_MAX = max(
@@ -102,6 +105,23 @@ _PHASE5_UNSUPPORTED_HOOK_EVENTS = frozenset({
 _PHASE5_HOOK_EVENTS = frozenset(_PHASE5_HOOK_EVENT_MAP) | (
     _PHASE5_UNSUPPORTED_HOOK_EVENTS
 )
+_PHASE6_GROUP_DEFAULT_FIELDS = frozenset({
+    "provider",
+    "model",
+    "allowed_tools",
+    "denied_tools",
+    "hooks",
+    "mcp",
+    "skills",
+    "agents",
+    "effort",
+    "thinking",
+    "maxBudgetUsd",
+    "systemPrompt",
+    "fallbackModel",
+    "betas",
+    "sandbox",
+})
 _PHASE5_RESPONSE_OPERATIONS = MappingProxyType({
     "continue": "continue",
     "decision": "decision",
@@ -158,40 +178,35 @@ def supports_structured_outputs(
     profile: WorkflowLanguageProfile, normalizer_version: int
 ) -> bool:
     """Return whether this sealed language version has v2 output semantics."""
-    return (
-        profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and normalizer_version >= 2
-    )
+    return profile is WorkflowLanguageProfile.ARCHON_2026_07 and normalizer_version >= 2
 
 
 def supports_phase3_semantics(
     profile: WorkflowLanguageProfile, normalizer_version: int
 ) -> bool:
     """Return whether this sealed language version inherits Phase 3 semantics."""
-    return (
-        profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and normalizer_version >= 3
-    )
+    return profile is WorkflowLanguageProfile.ARCHON_2026_07 and normalizer_version >= 3
 
 
 def supports_phase4_semantics(
     profile: WorkflowLanguageProfile, normalizer_version: int
 ) -> bool:
     """Return whether this sealed language version enables Phase 4 semantics."""
-    return (
-        profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and normalizer_version >= 4
-    )
+    return profile is WorkflowLanguageProfile.ARCHON_2026_07 and normalizer_version >= 4
 
 
 def supports_phase5_semantics(
     profile: WorkflowLanguageProfile, normalizer_version: int
 ) -> bool:
     """Return whether this sealed language version enables Phase 5 semantics."""
-    return (
-        profile is WorkflowLanguageProfile.ARCHON_2026_07
-        and normalizer_version >= 5
-    )
+    return profile is WorkflowLanguageProfile.ARCHON_2026_07 and normalizer_version >= 5
+
+
+def supports_phase6_semantics(
+    profile: WorkflowLanguageProfile, normalizer_version: int
+) -> bool:
+    """Return whether this sealed language version enables Phase 6 semantics."""
+    return profile is WorkflowLanguageProfile.ARCHON_2026_07 and normalizer_version >= 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,12 +297,8 @@ class WorkflowLanguageSnapshot:
             value["structured_outputs"] = _structured_outputs_projection(
                 self.structured_outputs
             )
-        if supports_phase3_semantics(
-            self.effective_profile, self.normalizer_version
-        ):
-            value["node_semantics"] = _node_semantics_projection(
-                self.node_semantics
-            )
+        if supports_phase3_semantics(self.effective_profile, self.normalizer_version):
+            value["node_semantics"] = _node_semantics_projection(self.node_semantics)
         return value
 
 
@@ -340,6 +351,9 @@ def normalize_workflow(
             normalized_definition,
             selection.effective_profile,
             structured_outputs,
+            allow_ai_retry_opt_out=supports_phase6_semantics(
+                selection.effective_profile, normalizer_version
+            ),
         )
     if supports_phase4_semantics(selection.effective_profile, normalizer_version):
         normalized_definition, structured_outputs, node_semantics = _normalize_v4(
@@ -350,6 +364,13 @@ def normalize_workflow(
         )
     if supports_phase5_semantics(selection.effective_profile, normalizer_version):
         normalized_definition, structured_outputs, node_semantics = _normalize_v5(
+            normalized_definition,
+            selection.effective_profile,
+            structured_outputs,
+            node_semantics,
+        )
+    if supports_phase6_semantics(selection.effective_profile, normalizer_version):
+        normalized_definition, structured_outputs, node_semantics = _normalize_v6(
             normalized_definition,
             selection.effective_profile,
             structured_outputs,
@@ -392,7 +413,7 @@ def _normalized_definition_document(
                 {
                     "id": node.id,
                     "node_type": node.node_type,
-                    "value": node.value,
+                    "value": _normalized_node_value(node),
                     "depends_on": list(node.depends_on),
                     "options": node.options,
                 }
@@ -402,14 +423,28 @@ def _normalized_definition_document(
         },
     }
     if normalizer_version >= 2:
-        value["structured_outputs"] = (
-            _structured_outputs_projection(structured_outputs)
-        )
+        value["structured_outputs"] = _structured_outputs_projection(structured_outputs)
     if supports_phase3_semantics(profile, normalizer_version):
-        value["node_semantics"] = _node_semantics_projection(
-            node_semantics
-        )
+        value["node_semantics"] = _node_semantics_projection(node_semantics)
     return _json_safe(value)
+
+
+def _normalized_node_value(node: WorkflowNode) -> object:
+    if node.node_type != "loop_group" or not isinstance(node.value, Mapping):
+        return node.value
+    return {
+        **{key: value for key, value in node.value.items() if key != "nodes"},
+        "nodes": [
+            {
+                "id": child.id,
+                "node_type": child.node_type,
+                "value": _normalized_node_value(child),
+                "depends_on": list(child.depends_on),
+                "options": child.options,
+            }
+            for child in node.value["nodes"]
+        ],
+    }
 
 
 def bind_v4_loop_command_semantics(
@@ -424,12 +459,14 @@ def bind_v4_loop_command_semantics(
         if command_bindings:
             raise ValueError("loop command bindings require Phase 4 semantics")
         return package
+    from plugins.workflow.topology import iter_scoped_workflow_nodes
+
     command_nodes = {
-        node.id
-        for node in package.definition.nodes
-        if node.node_type == "loop"
-        and isinstance(node.value, Mapping)
-        and "command" in node.value
+        scoped.semantic_id
+        for scoped in iter_scoped_workflow_nodes(package.definition)
+        if scoped.node.node_type == "loop"
+        and isinstance(scoped.node.value, Mapping)
+        and "command" in scoped.node.value
     }
     if set(command_bindings) != command_nodes or any(
         not isinstance(binding, str) or not binding
@@ -543,6 +580,8 @@ def _normalize_v3(
     normalized_definition: WorkflowDefinition,
     profile: WorkflowLanguageProfile,
     structured_outputs: Mapping[str, WorkflowStructuredOutput],
+    *,
+    allow_ai_retry_opt_out: bool = False,
 ) -> tuple[
     WorkflowDefinition,
     Mapping[str, WorkflowStructuredOutput],
@@ -607,8 +646,16 @@ def _normalize_v3(
                     "archon_retry_invalid",
                     "Archon retry must be a mapping",
                 )
-            retry = _normalize_v3_retry(authored, node=node)
-            if explicit and node.node_type in {"bash", "script"} and "max_attempts" not in retry:
+            retry = _normalize_v3_retry(
+                authored,
+                node=node,
+                allow_ai_retry_opt_out=allow_ai_retry_opt_out,
+            )
+            if (
+                explicit
+                and node.node_type in {"bash", "script"}
+                and "max_attempts" not in retry
+            ):
                 raise WorkflowSemanticNormalizationError(
                     node.source_index,
                     "retry.max_attempts",
@@ -650,12 +697,8 @@ def _normalize_v4(
         if node.node_type != "loop" or not isinstance(node.value, Mapping):
             continue
         loop = node.value
-        effective_interactive = (
-            root_interactive and loop.get("interactive") is True
-        )
-        signal_completes = loop.get(
-            "signal_completes", not effective_interactive
-        )
+        effective_interactive = root_interactive and loop.get("interactive") is True
+        signal_completes = loop.get("signal_completes", not effective_interactive)
         if signal_completes is False and not effective_interactive:
             raise WorkflowSemanticNormalizationError(
                 node.source_index,
@@ -734,8 +777,7 @@ def _phase5_hook_operation_value(name: str, value: object) -> object:
     ):
         raise ValueError("Phase 5 hook permission decision is invalid")
     if name == "elicitation_action" and (
-        not isinstance(value, str)
-        or value not in {"accept", "decline", "cancel"}
+        not isinstance(value, str) or value not in {"accept", "decline", "cancel"}
     ):
         raise ValueError("Phase 5 hook elicitation action is invalid")
     if name in {
@@ -887,8 +929,148 @@ def _normalize_v5(
     return normalized_definition, structured_outputs, MappingProxyType(semantics)
 
 
+def _normalize_v6(
+    normalized_definition: WorkflowDefinition,
+    profile: WorkflowLanguageProfile,
+    structured_outputs: Mapping[str, WorkflowStructuredOutput],
+    node_semantics: Mapping[str, Mapping[str, object]],
+) -> tuple[
+    WorkflowDefinition,
+    Mapping[str, WorkflowStructuredOutput],
+    Mapping[str, Mapping[str, object]],
+]:
+    """Normalize one sealed body level and scope its semantic identities."""
+    if profile is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return normalized_definition, structured_outputs, node_semantics
+
+    from plugins.workflow.schema import (
+        _loop_group_capacity_bounds,
+        _loop_group_work_bounds,
+    )
+    from plugins.workflow.topology import primary_terminal_node
+
+    outputs = dict(structured_outputs)
+    semantics = dict(node_semantics)
+    normalized_nodes: list[WorkflowNode] = []
+    root_interactive = normalized_definition.options.get("interactive") is True
+    for group in normalized_definition.nodes:
+        if group.node_type != "loop_group" or not isinstance(group.value, Mapping):
+            normalized_nodes.append(group)
+            continue
+        body = tuple(group.value["nodes"])
+        defaults = {
+            key: value
+            for key, value in group.options.items()
+            if key in _PHASE6_GROUP_DEFAULT_FIELDS
+        }
+        effective_body = tuple(
+            replace(
+                child,
+                options=freeze_value({**defaults, **dict(child.options)}),
+            )
+            if child.node_type in {"command", "prompt"}
+            else child
+            for child in body
+        )
+        body_definition = replace(normalized_definition, nodes=effective_body)
+        body_definition, body_outputs = _normalize_v2(body_definition, profile)
+        body_definition, body_outputs, body_semantics = _normalize_v3(
+            body_definition,
+            profile,
+            body_outputs,
+            allow_ai_retry_opt_out=True,
+        )
+        body_definition, body_outputs, body_semantics = _normalize_v4(
+            body_definition, profile, body_outputs, body_semantics
+        )
+        body_definition, body_outputs, body_semantics = _normalize_v5(
+            body_definition, profile, body_outputs, body_semantics
+        )
+        normalized_body = tuple(
+            replace(
+                child,
+                options=freeze_value({
+                    key: value
+                    for key, value in child.options.items()
+                    if key not in defaults or key in body[index].options
+                }),
+            )
+            for index, child in enumerate(body_definition.nodes)
+        )
+        sink = primary_terminal_node(normalized_body)
+        for node_id, output in body_outputs.items():
+            outputs[f"{group.id}/{node_id}"] = output
+        if sink.id in body_outputs:
+            outputs[group.id] = body_outputs[sink.id]
+        for node_id, value in body_semantics.items():
+            semantics[f"{group.id}/{node_id}"] = value
+        effective_interactive = (
+            root_interactive and group.value.get("interactive") is True
+        )
+        signal_completes = group.value.get(
+            "signal_completes", not effective_interactive
+        )
+        if signal_completes is False and not effective_interactive:
+            raise WorkflowSemanticNormalizationError(
+                group.source_index,
+                "loop_group.signal_completes",
+                "loop_group_shape_invalid",
+                "signal_completes cannot be false without an effective interactive operator path",
+            )
+        child_executions, child_attempts = _loop_group_work_bounds(
+            normalized_body, int(group.value["max_iterations"])
+        )
+        capacity = _loop_group_capacity_bounds(
+            normalized_body,
+            int(group.value["max_iterations"]),
+            group_id=group.id,
+            root_options=normalized_definition.options,
+            group_options=group.options,
+            structured_output_ids=frozenset(outputs),
+        )
+        semantics[group.id] = freeze_value({
+            "loop_group": {
+                "primary_sink": sink.id,
+                "effective_interactive": effective_interactive,
+                "signal_completes": signal_completes,
+                "child_executions": child_executions,
+                "child_attempts": child_attempts,
+                "capacity": capacity,
+            }
+        })
+        if len(semantics) > MAX_SNAPSHOTTED_NODE_SEMANTICS:
+            raise WorkflowSemanticNormalizationError(
+                group.source_index,
+                "loop_group",
+                "loop_group_product_limit",
+                "workflow exceeds the 1024 scoped-semantic entry limit",
+            )
+        normalized_nodes.append(
+            replace(
+                group,
+                value=freeze_value({
+                    **dict(group.value),
+                    "nodes": normalized_body,
+                }),
+            )
+        )
+    if len(outputs) > MAX_SNAPSHOTTED_STRUCTURED_OUTPUTS:
+        raise WorkflowStructuredOutputNormalizationError(
+            0,
+            StructuredOutputError("workflow exceeds structured outputs limit"),
+        )
+    return (
+        replace(normalized_definition, nodes=tuple(normalized_nodes)),
+        MappingProxyType(outputs),
+        MappingProxyType(semantics),
+    )
+
+
 def _normalize_v3_retry(
-    value: object | None, *, node: WorkflowNode
+    value: object | None,
+    *,
+    node: WorkflowNode,
+    allow_ai_retry_opt_out: bool = False,
 ) -> Mapping[str, object]:
     if value is None:
         return MappingProxyType({})
@@ -904,16 +1086,19 @@ def _normalize_v3_retry(
             "Archon retry must contain only max_attempts, delay_ms, and on_error",
         )
     maximum = value.get("max_attempts")
+    minimum = (
+        0 if allow_ai_retry_opt_out and node.node_type in {"command", "prompt"} else 1
+    )
     if "max_attempts" in value and (
         isinstance(maximum, bool)
         or not isinstance(maximum, int)
-        or not 1 <= maximum <= 5
+        or not minimum <= maximum <= 5
     ):
         raise WorkflowSemanticNormalizationError(
             node.source_index,
             "retry.max_attempts",
             "archon_retry_invalid",
-            "Archon retry.max_attempts must be an integer from 1 through 5",
+            f"Archon retry.max_attempts must be an integer from {minimum} through 5",
         )
     delay = value.get("delay_ms", 3000)
     if (
@@ -938,9 +1123,7 @@ def _normalize_v3_retry(
     return value
 
 
-def _milliseconds_to_seconds(
-    value: object, *, node: WorkflowNode, field: str
-) -> float:
+def _milliseconds_to_seconds(value: object, *, node: WorkflowNode, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise WorkflowSemanticNormalizationError(
             node.source_index,
@@ -1054,17 +1237,15 @@ def language_compatibility_findings(
                     )
                 elif total_attempts == 1 and node.node_type in {"bash", "script"}:
                     retry_migration = (
-                        "For one total deterministic attempt under Archon, omit "
-                        "retry."
+                        "For one total deterministic attempt under Archon, omit retry."
                     )
                 elif total_attempts == 1 and node.node_type in {
                     "command",
                     "prompt",
                 }:
                     retry_migration = (
-                        "An AI node requiring exactly one total attempt cannot "
-                        "migrate until a compatible explicit opt-out exists; "
-                        "Archon v3 defaults AI nodes to three total attempts."
+                        "For one total attempt on an AI node under Archon v6, author "
+                        "max_attempts as 0."
                     )
                 else:
                     retry_migration = (
@@ -1146,6 +1327,22 @@ def language_compatibility_findings(
                 "Remove maxBudgetUsd or wait for Phase 5 budget enforcement.",
                 blocking=True,
             )
+        if metadata.normalizer_version < 6 and "maxTurns" in options:
+            add(
+                f"{prefix}.maxTurns",
+                "archon_model_turn_cap_unavailable",
+                "Archon per-node model-turn caps require Phase 6",
+                "Remove maxTurns or use normalizer version 6.",
+                blocking=True,
+            )
+        if metadata.normalizer_version < 6 and "tool_call_contract" in options:
+            add(
+                f"{prefix}.tool_call_contract",
+                "archon_tool_call_contract_unavailable",
+                "Archon exact tool-call contracts require Phase 6",
+                "Remove tool_call_contract or use normalizer version 6.",
+                blocking=True,
+            )
         if "sandbox" in options:
             add(
                 f"{prefix}.sandbox",
@@ -1186,9 +1383,7 @@ def bind_semantic_fingerprint(
     if supports_phase3_semantics(
         metadata.effective_profile, metadata.normalizer_version
     ):
-        document["node_semantics"] = _node_semantics_projection(
-            metadata.node_semantics
-        )
+        document["node_semantics"] = _node_semantics_projection(metadata.node_semantics)
     return _sha256_json(document)
 
 
@@ -1383,18 +1578,14 @@ def _copy_structured_outputs(
 def _node_semantics_projection(
     node_semantics: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
-    return {
-        node_id: _thaw(value)
-        for node_id, value in sorted(node_semantics.items())
-    }
+    return {node_id: _thaw(value) for node_id, value in sorted(node_semantics.items())}
 
 
 def _copy_node_semantics(
     node_semantics: Mapping[str, Mapping[str, object]],
 ) -> Mapping[str, Mapping[str, object]]:
     return MappingProxyType({
-        node_id: freeze_value(_thaw(value))
-        for node_id, value in node_semantics.items()
+        node_id: freeze_value(_thaw(value)) for node_id, value in node_semantics.items()
     })
 
 
@@ -1526,7 +1717,7 @@ def _read_node_semantics(
     profile: WorkflowLanguageProfile,
     normalizer_version: int,
 ) -> Mapping[str, Mapping[str, object]]:
-    if not isinstance(value, Mapping) or len(value) > 512:
+    if not isinstance(value, Mapping) or len(value) > MAX_SNAPSHOTTED_NODE_SEMANTICS:
         raise WorkflowLanguageCompatibilityError(
             "workflow_language_snapshot_invalid",
             "workflow language snapshot node semantics are invalid",
@@ -1544,11 +1735,14 @@ def _read_node_semantics(
     result: dict[str, Mapping[str, object]] = {}
     phase4 = supports_phase4_semantics(profile, normalizer_version)
     phase5 = supports_phase5_semantics(profile, normalizer_version)
+    phase6 = supports_phase6_semantics(profile, normalizer_version)
     allowed_node_keys = {"wall_timeout_seconds", "idle_timeout_seconds", "retry"}
     if phase4:
         allowed_node_keys.add("loop")
     if phase5:
         allowed_node_keys.add("provider_portability")
+    if phase6:
+        allowed_node_keys.add("loop_group")
     retry_keys = {
         "explicit",
         "requested_retries",
@@ -1567,11 +1761,9 @@ def _read_node_semantics(
                 "retry" not in raw
                 and "loop" not in raw
                 and "provider_portability" not in raw
+                and "loop_group" not in raw
             )
-            or (
-                "wall_timeout_seconds" in raw
-                and "idle_timeout_seconds" in raw
-            )
+            or ("wall_timeout_seconds" in raw and "idle_timeout_seconds" in raw)
         ):
             raise WorkflowLanguageCompatibilityError(
                 "workflow_language_snapshot_invalid",
@@ -1580,6 +1772,118 @@ def _read_node_semantics(
         portability = raw.get("provider_portability")
         if portability is not None:
             _read_phase5_provider_portability(portability)
+        loop_group = raw.get("loop_group")
+        if loop_group is not None:
+            from plugins.workflow.executors.base import NodeExecutionContext
+            from plugins.workflow.language_schema import (
+                WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES,
+            )
+            from plugins.workflow.models import (
+                RunExecutionLimits,
+                TerminalJournalReserve,
+            )
+
+            capacity = (
+                loop_group.get("capacity")
+                if isinstance(loop_group, Mapping)
+                else None
+            )
+            output_limit = int(
+                NodeExecutionContext.__dataclass_fields__["max_output_bytes"].default
+            )
+            artifact_limit = int(
+                NodeExecutionContext.__dataclass_fields__["max_artifact_bytes"].default
+            )
+            journal_unit = TerminalJournalReserve.for_projection(
+                4096
+            ).terminal_reserve_bytes
+            execution_limits = RunExecutionLimits()
+            if (
+                set(raw) != {"loop_group"}
+                or not isinstance(loop_group, Mapping)
+                or set(loop_group)
+                != {
+                    "primary_sink",
+                    "effective_interactive",
+                    "signal_completes",
+                    "child_executions",
+                    "child_attempts",
+                    "capacity",
+                }
+                or not isinstance(loop_group["primary_sink"], str)
+                or not loop_group["primary_sink"]
+                or not isinstance(loop_group["effective_interactive"], bool)
+                or not isinstance(loop_group["signal_completes"], bool)
+                or isinstance(loop_group["child_executions"], bool)
+                or not isinstance(loop_group["child_executions"], int)
+                or not 1 <= loop_group["child_executions"] <= 4096
+                or isinstance(loop_group["child_attempts"], bool)
+                or not isinstance(loop_group["child_attempts"], int)
+                or not 1 <= loop_group["child_attempts"] <= 4096
+                or loop_group["child_attempts"] < loop_group["child_executions"]
+                or not isinstance(capacity, Mapping)
+                or set(capacity)
+                != {
+                    "provider_routes",
+                    "provider_obligations",
+                    "output_attempts",
+                    "artifact_executions",
+                    "artifact_bytes",
+                    "run_bytes",
+                    "journal_reserve_bytes",
+                    "process_executions",
+                    "process_tree_rss_byte_executions",
+                    "process_tree_cpu_second_executions",
+                    "process_descendant_executions",
+                }
+                or any(
+                    isinstance(item, bool)
+                    or not isinstance(item, int)
+                    or item < 0
+                    for item in capacity.values()
+                )
+                or capacity["output_attempts"] > loop_group["child_attempts"]
+                or capacity["artifact_executions"]
+                > loop_group["child_attempts"]
+                or capacity["process_executions"]
+                > loop_group["child_attempts"]
+                or capacity["process_executions"]
+                < capacity["artifact_executions"]
+                or capacity["artifact_bytes"]
+                != capacity["artifact_executions"] * artifact_limit
+                or capacity["journal_reserve_bytes"]
+                != loop_group["child_attempts"] * journal_unit
+                or capacity["run_bytes"]
+                != capacity["output_attempts"] * output_limit
+                + capacity["artifact_bytes"]
+                + capacity["journal_reserve_bytes"]
+                + min(
+                    capacity["process_executions"],
+                    execution_limits.max_parallel_nodes,
+                )
+                * WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
+                or capacity["process_tree_rss_byte_executions"]
+                != capacity["process_executions"]
+                * execution_limits.process_tree_rss_bytes
+                or capacity["process_tree_cpu_second_executions"]
+                != int(
+                    capacity["process_executions"]
+                    * execution_limits.process_tree_cpu_seconds
+                )
+                or capacity["process_descendant_executions"]
+                != capacity["process_executions"]
+                * execution_limits.max_descendants
+                or (
+                    loop_group["signal_completes"] is False
+                    and loop_group["effective_interactive"] is False
+                )
+            ):
+                raise WorkflowLanguageCompatibilityError(
+                    "workflow_language_snapshot_invalid",
+                    "workflow language snapshot node semantics are invalid",
+                )
+            result[node_id] = freeze_value(_thaw(raw))
+            continue
         loop = raw.get("loop")
         if loop is not None:
             loop_keys = {
@@ -1614,8 +1918,7 @@ def _read_node_semantics(
                 )
             if (
                 set(raw) != {"loop"}
-                or
-                prompt_source not in {"inline", "command"}
+                or prompt_source not in {"inline", "command"}
                 or not isinstance(effective_interactive, bool)
                 or not isinstance(signal_completes, bool)
                 or (signal_completes is False and not effective_interactive)

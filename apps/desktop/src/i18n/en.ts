@@ -2554,6 +2554,8 @@ export const en: Translations = {
     origin: 'Origin',
     assurance: 'Identity assurance',
     coordinator: 'Coordinator',
+    workflowLoopNodeType: 'Type',
+    workflowLoopDuration: 'Duration',
     currentNode: 'Current node',
     previousNode: 'Previous node',
     lastProgress: 'Last meaningful progress',

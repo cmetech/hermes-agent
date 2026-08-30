@@ -18,6 +18,13 @@ from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from tools.managed_process import ManagedProcessTree, ProcessIdentity, TerminationPolicy
+from tests.plugins.workflow.test_phase6_store import (
+    _EXECUTION_AUTHORITY,
+    _admit_group,
+    _initialize,
+    _scope,
+)
+from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit, _compile
 
 
 def _start(store: RunStore, package, *, key: str = "cancel-test"):
@@ -454,3 +461,215 @@ def test_uninterruptible_recorded_process_reports_cleanup_failed_and_blocks_work
     events = store.tail_events(admitted.run_id)
     assert any(event["event_type"] == "cleanup_failed" for event in events)
     assert not any(event["event_type"] == "process_reaped" for event in events)
+
+
+def test_cancelled_nested_outward_reconciliation_retains_exact_scope(
+    tmp_path: Path, workflow_writer
+) -> None:
+    _home, store, run_id, group = _admit_group(tmp_path, workflow_writer)
+    initialized = _initialize(store, run_id, group)
+    scope = _scope(run_id, "select")
+    claim = store.claim_loop_group_child(
+        scope,
+        "worker",
+        expected_state_version=initialized["state_version"],
+        executor_id="bash",
+        effect_classification="outward",
+        execution_authority=_EXECUTION_AUTHORITY,
+    )
+    assert claim is not None
+    store.mark_node_started(claim)
+
+    result = store.cancel_run(run_id)
+
+    child = result["nodes"]["group"]["loop_group"]["body"]["select"]
+    assert result["cancellation_outcome"] == "reconciliation_required"
+    assert child["recovery"]["loop_group_scope"] == scope.durable_record()
+    assert child["pending_interaction"]["loop_group_scope"] == scope.durable_record()
+
+
+def test_cancel_during_loop_group_predicate_reaps_process_before_group_terminal(
+    tmp_path: Path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-predicate-cancel",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "until_bash": "sleep 30",
+                "max_iterations": 1,
+                "nodes": [{"id": "sink", "prompt": "produce"}],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-predicate-cancel")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "not complete"
+    )
+    finished = threading.Event()
+
+    def run_scheduler() -> None:
+        try:
+            scheduler.advance_all([run_id])
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=run_scheduler, daemon=True)
+    worker.start()
+    # ManagedProcessTree pins and exec-confirms the child before publishing its
+    # durable identity; allow loaded macOS runners enough time for that handoff.
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if any(
+            event["event_type"] == "process_started"
+            for event in store.tail_events(run_id)
+        ):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("predicate process did not start")
+
+    cancelled = store.cancel_run(run_id)
+    worker.join(timeout=5)
+
+    assert finished.is_set()
+    assert cancelled["status"] == "cancelled"
+    event_types = [event["event_type"] for event in store.tail_events(run_id)]
+    assert "process_reaped" in event_types
+    assert "loop_group_cancelled" in event_types
+    with store._connect() as connection:
+        predicate_reserves = connection.execute(
+            "SELECT COUNT(*) FROM obligation_journal_reserves WHERE run_id=?",
+            (run_id,),
+        ).fetchone()[0]
+    assert predicate_reserves == 0
+
+
+def test_run_cancel_does_not_relabel_an_already_succeeded_group(
+    tmp_path: Path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-completed-group-cancel",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "DONE",
+                    "max_iterations": 1,
+                    "signal_completes": True,
+                    "nodes": [{"id": "sink", "prompt": "produce"}],
+                },
+            },
+            {"id": "later", "bash": "true", "depends_on": ["group"]},
+        ],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key="phase6-completed-group-cancel")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["prompt"] = OutputExecutor(
+        lambda _context, _rendered: "done <promise>DONE</promise>"
+    )
+
+    partial = scheduler.advance(run_id, max_nodes=1)
+    cancelled = store.cancel_run(run_id)
+
+    assert partial["nodes"]["group"]["state"] == "succeeded"
+    assert cancelled["nodes"]["group"]["state"] == "succeeded"
+    cancelled_groups = [
+        event
+        for event in store.tail_events(run_id)
+        if event["event_type"] == "loop_group_cancelled"
+    ]
+    assert cancelled_groups == []
+
+
+def test_nested_approval_rejection_reaps_a_parallel_body_process(
+    tmp_path: Path, workflow_writer
+) -> None:
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name="phase6-nested-rejection-process",
+        nodes=[{
+            "id": "group",
+            "loop_group": {
+                "until": "DONE",
+                "max_iterations": 1,
+                "nodes": [
+                    {"id": "gate", "approval": {"message": "approve"}},
+                    {"id": "slow", "bash": "sleep 30"},
+                ],
+            },
+        }],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=2)
+    run_id = _admit(store, compilation, key="phase6-nested-rejection-process")
+    scheduler = RunScheduler(store, max_parallel_nodes=2)
+    finished = threading.Event()
+
+    def run_scheduler() -> None:
+        try:
+            scheduler.advance_all([run_id])
+        except RuntimeError:
+            pass
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=run_scheduler, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 5
+    identity = None
+    paused = None
+    while time.monotonic() < deadline:
+        paused = store.load_run(run_id)
+        controller = paused["nodes"]["group"].get("loop_group")
+        if not isinstance(controller, dict):
+            time.sleep(0.01)
+            continue
+        body = controller["body"]
+        pending = body["gate"].get("pending_interaction")
+        active = body["slow"].get("claim")
+        serialized = active.get("process_identity") if isinstance(active, dict) else None
+        if isinstance(pending, dict) and isinstance(serialized, dict):
+            identity = ProcessIdentity(
+                pid=int(serialized["pid"]),
+                start_time=serialized.get("start_time"),
+                group_id=serialized.get("group_id"),
+                job_name=serialized.get("job_name"),
+            )
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("nested approval and process did not overlap")
+
+    assert identity is not None
+    assert paused is not None
+    pending = paused["nodes"]["group"]["loop_group"]["body"]["gate"][
+        "pending_interaction"
+    ]
+    try:
+        store.reject_run(
+            run_id,
+            interaction_id=pending["interaction_id"],
+            expected_state_version=paused["state_version"],
+        )
+        worker.join(timeout=5)
+
+        assert finished.is_set()
+        assert not identity.is_current()
+        assert store.load_run(run_id)["status"] == "cancelled"
+        assert any(
+            event["event_type"] == "process_reaped"
+            for event in store.tail_events(run_id)
+        )
+    finally:
+        if identity.is_current():
+            ManagedProcessTree.terminate_existing(identity)
+        worker.join(timeout=5)

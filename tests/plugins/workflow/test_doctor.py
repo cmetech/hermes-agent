@@ -13,7 +13,11 @@ from plugins.workflow.cli import doctor_package
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.compat import CompatibilityLevel
 from plugins.workflow.models import WorkflowRuntimeConfig, WorkflowStructuredOutput
-from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
+from plugins.workflow.schema import (
+    load_workflow,
+    load_workflow_snapshot,
+    parse_workflow_source_bytes,
+)
 from plugins.workflow.trust import WorkflowTrustStore
 
 
@@ -150,6 +154,38 @@ def test_doctor_reports_resources_trust_inputs_and_capacity_without_remote_calls
         finding.level is CompatibilityLevel.UNSUPPORTED and finding.blocking
         for finding in report.findings
     )
+
+
+def test_doctor_accepts_dormant_v6_group_without_executing_it(
+    tmp_path: Path, workflow_writer
+) -> None:
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "nodes": [{"id": "child", "bash": "true"}],
+                    "until": "DONE",
+                    "max_iterations": 2,
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    package = load_workflow_snapshot(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=path.with_name(f"{path.stem}.hermes.yaml").read_bytes(),
+        normalizer_version=6,
+    )
+
+    report = doctor_package(package, hermes_home=tmp_path / "home")
+
+    assert report.workflow == "example"
+    assert package.language.normalizer_version == 6
 
 
 def test_phase4_doctor_reports_logical_resources_across_include_origins(

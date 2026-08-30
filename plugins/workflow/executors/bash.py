@@ -8,6 +8,10 @@ import time
 import uuid
 from pathlib import Path
 
+from agent.structured_output import (
+    StructuredOutputError,
+    StructuredOutputValidatorUnavailable,
+)
 from plugins.workflow.bash_rendering import (
     BashRenderingError,
     RenderedBashCommand,
@@ -17,9 +21,13 @@ from plugins.workflow.executors.base import (
     BoundedProcessOutput,
     NodeExecutionContext,
     NodeExecutionResult,
+    StructuredProcessOutputIntegrityError,
+    publication_tree_snapshot,
     process_tree_active,
+    validate_structured_process_output,
 )
 from plugins.workflow.language import supports_phase3_semantics
+from plugins.workflow.output_resolution import PrimaryOutputCandidate
 from plugins.workflow.store import ArtifactRef
 from plugins.workflow.resources import VariableContext, substitution_renderer
 from tools.managed_process import ManagedProcessTree
@@ -48,13 +56,23 @@ class BashExecutor:
                     error_code="timeout",
                     error_message="bash node exceeded its timeout",
                 )
-        attempt = context.run_directory / "nodes" / context.node.id / context.attempt_id
+        attempt = context.effective_attempt_directory
         attempt.mkdir(parents=True, exist_ok=False)
         stdout_path = attempt / "stdout.txt"
         stderr_path = attempt / "stderr.txt"
         variable_spill = attempt / ("variables-v3" if secure_v3 else "variables")
-        artifacts_dir = context.run_directory / "artifacts"
-        artifacts_dir.mkdir(exist_ok=True)
+        artifacts_dir = context.effective_publication_directory
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        artifact_free_before = None
+        if context.max_artifact_bytes == 0:
+            try:
+                artifact_free_before = publication_tree_snapshot(artifacts_dir)
+            except (OSError, ValueError):
+                return NodeExecutionResult(
+                    "failed",
+                    error_code="artifact_limit",
+                    error_message="bash artifacts are disabled for this node",
+                )
         command = str(context.node.value)
         try:
             if context.variable_context is not None:
@@ -101,6 +119,7 @@ class BashExecutor:
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 artifacts_dir=artifacts_dir,
+                artifact_free_before=artifact_free_before,
             )
         finally:
             # Ownership begins as soon as rendering returns. This guard covers
@@ -117,6 +136,7 @@ class BashExecutor:
         stdout_path: Path,
         stderr_path: Path,
         artifacts_dir: Path,
+        artifact_free_before: dict[str, tuple[object, ...]] | None,
     ) -> NodeExecutionResult:
         bash_metadata = {"bash": rendered_command.evidence()} if secure_v3 else {}
         if os.name == "nt":  # pragma: no cover - Windows CI path
@@ -133,7 +153,7 @@ class BashExecutor:
         }
         allowed_env.update({
             "HERMES_WORKFLOW_RUN_ID": context.run_id,
-            "HERMES_WORKFLOW_RUN_DIR": str(context.run_directory),
+            "HERMES_WORKFLOW_RUN_DIR": str(context.effective_process_directory),
             "ARTIFACTS_DIR": str(artifacts_dir),
         })
         policy = context.termination_policy
@@ -218,7 +238,7 @@ class BashExecutor:
                     inherited_descriptor_identities=(
                         rendered_command.inherited_descriptor_identities
                     ),
-                    cwd=context.run_directory,
+                    cwd=context.effective_process_directory,
                     env=allowed_env,
                     stdout=output.stdout,
                     stderr=output.stderr,
@@ -327,6 +347,19 @@ class BashExecutor:
                 artifacts.append(
                     _artifact(stderr_path, context.run_directory, "text/plain")
                 )
+            if artifact_free_before is not None:
+                try:
+                    artifact_free_after = publication_tree_snapshot(artifacts_dir)
+                except (OSError, ValueError):
+                    artifact_free_after = None
+                if artifact_free_after != artifact_free_before:
+                    return NodeExecutionResult(
+                        "failed",
+                        tuple(artifacts),
+                        "artifact_limit",
+                        "bash artifacts are disabled for this node",
+                        bash_metadata,
+                    )
             if spill_integrity_failed:
                 return NodeExecutionResult(
                     "failed",
@@ -387,10 +420,61 @@ class BashExecutor:
                     f"bash node exited with status {returncode}",
                     bash_metadata,
                 )
+            try:
+                structured = validate_structured_process_output(
+                    context, stdout_path.read_text(encoding="utf-8")
+                )
+            except StructuredOutputValidatorUnavailable as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "structured_output_unavailable",
+                    str(exc),
+                    bash_metadata,
+                )
+            except StructuredProcessOutputIntegrityError as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "structured_output_integrity",
+                    str(exc),
+                    bash_metadata,
+                )
+            except StructuredOutputError as exc:
+                return NodeExecutionResult(
+                    "failed",
+                    tuple(artifacts),
+                    "structured_output_invalid",
+                    str(exc),
+                    bash_metadata,
+                )
+            candidate = None
+            if structured is not None:
+                json_path = stdout_path.with_name("output.json")
+                json_path.write_bytes(structured.canonical_bytes)
+                stdout_path.unlink()
+                artifacts[0] = _artifact(
+                    json_path, context.run_directory, structured.media_type
+                )
+                candidate = PrimaryOutputCandidate(
+                    attempt_relative_path=artifacts[0].relative_path,
+                    media_type=artifacts[0].media_type,
+                    size_bytes=artifacts[0].size_bytes,
+                    sha256=artifacts[0].sha256,
+                    structured_value=structured.value,
+                    schema_fingerprint=context.structured_output.schema_fingerprint,
+                    canonicalization_version=structured.canonicalization_version,
+                    output_type=(
+                        str(context.node.options["output_type"])
+                        if context.node.options.get("output_type") is not None
+                        else None
+                    ),
+                )
             return NodeExecutionResult(
                 "succeeded",
                 tuple(artifacts),
                 metadata=bash_metadata,
+                primary_output=candidate,
             )
         finally:
             # Emergency cleanup never masks the triggering exception. Normal

@@ -215,6 +215,7 @@ def compile_workflow(
         resolve_language_profile,
         select_normalizer_version,
         supports_phase4_semantics,
+        supports_phase6_semantics,
     )
 
     cached = _COMPILED_ROOT_CACHE.pop(cache_key, None)
@@ -248,6 +249,18 @@ def compile_workflow(
         source_to_compile,
         normalizer_version=normalizer_version,
     )
+    if supports_phase6_semantics(
+        package.language.effective_profile,
+        package.language.normalizer_version,
+    ):
+        from plugins.workflow.provider_authority import (
+            validate_v6_provider_capacity,
+        )
+
+        validate_v6_provider_capacity(package)
+        from plugins.workflow.schema import validate_v6_storage_capacity
+
+        validate_v6_storage_capacity(package)
     from plugins.workflow.dependency_manifest import (
         composite_workflow_digest,
         digest_expanded_compilation,

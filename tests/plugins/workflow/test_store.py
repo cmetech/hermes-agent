@@ -24,6 +24,26 @@ def test_store_connection_context_closes_the_database_handle(tmp_path) -> None:
         connection.execute("SELECT 1")
 
 
+def test_loop_groups_reuse_the_existing_worker_claim_schema(tmp_path) -> None:
+    store = RunStore(tmp_path / "home")
+
+    with store._connect() as connection:
+        objects = connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE type IN ('table','index') ORDER BY type, name"
+        ).fetchall()
+        columns = connection.execute("PRAGMA table_info(worker_claims)").fetchall()
+
+    assert not any("loop_group" in row["name"] for row in objects)
+    assert [row["name"] for row in columns] == [
+        "attempt_id",
+        "run_id",
+        "node_id",
+        "owner_id",
+        "lease_expires_at",
+    ]
+
+
 def test_prepare_snapshot_copies_inputs_immutably(tmp_path, workflow_writer):
     workflow = workflow_writer(tmp_path / "package", name="copy-input")
     source = tmp_path / "evidence.txt"

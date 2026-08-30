@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
+import os
 from pathlib import Path
+import stat
 import time
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
 
+from agent.structured_output import (
+    StructuredOutputError,
+    StructuredOutputRequest,
+    StructuredOutputStrategy,
+    StructuredOutputValue,
+    normalize_schema,
+    parse_validate_canonicalize,
+)
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.models import (
@@ -106,6 +117,24 @@ class NodeExecutionContext:
     provider_execute_release: Callable[[str], bool] | None = None
     record_loop_decision: (Callable[[Mapping[str, object]], None] | None) = None
     max_model_iterations: int = 90
+    attempt_directory: Path | None = None
+    publication_directory: Path | None = None
+
+    @property
+    def effective_attempt_directory(self) -> Path:
+        return self.attempt_directory or (
+            self.run_directory / "nodes" / self.node.id / self.attempt_id
+        )
+
+    @property
+    def effective_publication_directory(self) -> Path:
+        return self.publication_directory or self.run_directory / "artifacts"
+
+    @property
+    def effective_process_directory(self) -> Path:
+        if self.node.node_type in {"bash", "script"} and self.max_artifact_bytes == 0:
+            return self.effective_attempt_directory
+        return self.run_directory
 
 
 @dataclass(frozen=True)
@@ -119,6 +148,121 @@ class NodeExecutionResult:
     session_registry_update: SessionRegistryUpdateCandidate | None = None
     session_registry_authority: SessionRegistryUpdateCandidate | None = None
     session_recovery_outcome: str | None = None
+
+
+def publication_tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
+    """Capture one no-follow publication identity, including empty directories."""
+
+    def identity(observed: os.stat_result) -> tuple[int, ...]:
+        return (
+            observed.st_mode,
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_nlink,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+
+    root_before = root.lstat()
+    if stat.S_ISLNK(root_before.st_mode) or not stat.S_ISDIR(root_before.st_mode):
+        raise ValueError("publication root is not a regular directory")
+    snapshot: dict[str, tuple[object, ...]] = {
+        ".": ("directory", *identity(root_before))
+    }
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise ValueError("publication tree contains a symlink")
+        if stat.S_ISDIR(before.st_mode):
+            after = path.lstat()
+            if identity(before) != identity(after):
+                raise ValueError("publication directory changed during snapshot")
+            snapshot[relative] = ("directory", *identity(after))
+            continue
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("publication tree contains an unsafe entry")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ValueError("publication file is not regular")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            opened_after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after = path.lstat()
+        if not (
+            identity(before) == identity(opened) == identity(opened_after) == identity(after)
+        ):
+            raise ValueError("publication file changed during snapshot")
+        snapshot[relative] = ("file", *identity(after), digest.hexdigest())
+    root_after = root.lstat()
+    if identity(root_before) != identity(root_after):
+        raise ValueError("publication root changed during snapshot")
+    return snapshot
+
+
+class StructuredProcessOutputIntegrityError(ValueError):
+    """A sealed deterministic output declaration changed after admission."""
+
+
+def validate_structured_process_output(
+    context: NodeExecutionContext,
+    response: str,
+) -> StructuredOutputValue | None:
+    """Validate one v6 script/bash stdout value against its sealed schema."""
+    if (
+        context.language_profile is not WorkflowLanguageProfile.ARCHON_2026_07
+        or context.normalizer_version < 6
+    ):
+        return None
+    declared = context.structured_output
+    if declared is None:
+        if context.node.options.get("output_format") is not None:
+            raise StructuredProcessOutputIntegrityError(
+                "admitted structured-output schema is missing"
+            )
+        return None
+
+    def thaw(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key): thaw(item) for key, item in value.items()}
+        if isinstance(value, tuple | list):
+            return [thaw(item) for item in value]
+        return value
+
+    try:
+        normalized = normalize_schema(thaw(declared.canonical_schema))
+    except StructuredOutputError as exc:
+        raise StructuredProcessOutputIntegrityError(
+            "admitted structured-output schema is invalid"
+        ) from exc
+    if (
+        normalized.schema_fingerprint != declared.schema_fingerprint
+        or declared.canonicalization_version != 1
+    ):
+        raise StructuredProcessOutputIntegrityError(
+            "admitted structured-output identity is contradictory"
+        )
+    return parse_validate_canonicalize(
+        response,
+        StructuredOutputRequest(
+            schema=normalized,
+            strategy=StructuredOutputStrategy.PROMPT_JSON_SCHEMA,
+            adapter_version=1,
+            output_bytes_limit=context.max_output_bytes,
+            canonicalization_version=declared.canonicalization_version,
+        ),
+    )
 
 
 def pretransport_zero_metadata(

@@ -27,6 +27,16 @@ PHASE_1_LANGUAGE_DESKTOP_SUITES = (
     "src/app/workflows/index.test.tsx",
     "src/app/workflows/view-workflow-dialog.test.tsx",
 )
+PHASE_6_BACKEND_SUITES = (
+    "tests/plugins/workflow/test_phase6_language.py",
+    "tests/plugins/workflow/test_phase6_admission.py",
+    "tests/plugins/workflow/test_phase6_execution_context.py",
+    "tests/plugins/workflow/test_phase6_store.py",
+    "tests/plugins/workflow/test_phase6_scheduler.py",
+    "tests/plugins/workflow/test_phase6_interactions_recovery.py",
+    "tests/plugins/workflow/test_phase6_public_projection.py",
+    "tests/plugins/workflow/test_phase6_jira_defect_loop.py",
+)
 PHASE_1_LANGUAGE_CUSTOMIZATION_IDS = {
     "workflow-language-contracts",
     "workflow-language-profile-normalization",
@@ -278,6 +288,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/plugins/workflow/test_phase3_bash_descriptor_faults.py",
         "tests/plugins/workflow/test_phase3_bash_reference_ordering.py",
         *PHASE_1_LANGUAGE_BACKEND_SUITES,
+        *PHASE_6_BACKEND_SUITES,
     ):
         assert selected_python.count(path) == 1
         assert (ROOT / path).is_file()

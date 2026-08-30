@@ -16,6 +16,13 @@ corresponding 2026-07-18 operator-experience design and plan. Earlier language
 that assigns continuation to a request, cron firing, renderer, or incidental
 foreground process is not authoritative.
 
+**2026-08-30 Phase 6 amendment:** `archon-2026-07` admissions now use
+normalizer v6 and support one-level, bounded `loop_group` nodes. Snapshot format
+2 remains authoritative, and recorded v1-v5 runs continue through their sealed
+normalizer versions without reinterpretation. The controller exposes ready body
+children to the existing fair scheduler and `worker_claims` capacity; it adds no
+executor pool, database table, core model tool, or child workflow runtime.
+
 ## Summary
 
 Co-worker will gain a production-grade workflow capability that accepts Archon-shaped workflow packages with minimal or no edits, executes them through Hermes agents and tools, and is available from natural chat, `/workflow`, `hermes workflow`, and Hermes cron. A bundled offline-first showcase suite will exercise the real runtime on a production installation without external integrations or mandatory workflow-node model calls.
@@ -25,7 +32,7 @@ The workflow engine will live at the edge as an additive plugin plus skills. Her
 ## Goals
 
 1. Load valid Archon DAG workflow YAML without rewriting its structure.
-2. Support the portable semantics of Archon command, prompt, bash, script, loop, approval, and cancel nodes.
+2. Support the portable semantics of Archon command, prompt, bash, script, loop, loop-group, approval, and cancel nodes.
 3. Reuse Hermes skills, tools, plugins, hooks, MCP, sessions, approvals, cron, profiles, and provider routing.
 4. Preserve Hermes prompt caching. `context: fresh` creates an isolated child session; it never clears or rewrites the parent conversation.
 5. Make runs durable, resumable, concurrency-safe, observable, and bounded in resource use.
@@ -105,6 +112,7 @@ Each node has exactly one node-type field:
 - `bash`
 - `script`
 - `loop`
+- `loop_group`
 - `approval`
 - `cancel`
 
@@ -141,6 +149,7 @@ This table is the implementation contract, not a claim that similarly named conc
 | `bash` | Hermes terminal environment, approval policy, timeout, process-group cancellation, bounded stdout/stderr | Portable |
 | `script` + `runtime`/`deps` | Argument-vector `uv` or Bun worker with contained named resources | Portable when the declared runtime exists |
 | `loop` | Sequential persisted iterations, completion signal/`until_bash`, hard maximum, interactive pause | Portable |
+| `loop_group` | Sequential bounded iterations of a sealed multi-node DAG through the shared scheduler and claim pool | Portable in normalizer v6; one level only |
 | `approval` + `on_reject` | Durable compare-and-set gate, captured response, bounded rework | Portable |
 | `cancel` | Durable cancellation plus in-flight worker/process-tree termination | Portable |
 | DAG, `depends_on`, `trigger_rule`, `when` | Deterministic topological scheduler and Archon's documented condition grammar/precedence | Portable |
@@ -643,6 +652,29 @@ Strict JSON Schema validation reuses `jsonschema` from Hermes' existing `mcp`/`a
 
 Loop state records each iteration independently. `max_iterations` is mandatory and enforced. Completion may come from the declared signal or a successful `until_bash` check. Interactive loops persist the gate and return control to the user rather than occupying a worker.
 
+A `loop_group` is one outer node whose body is a sealed, one-level DAG. Body
+layers may run concurrently, but iterations never overlap and the controller
+consumes no worker while waiting. Body children use the existing executors,
+fair scheduler, profile/run limits, and `worker_claims` rows. Their durable
+identity binds run, outer group, controller generation, iteration, body node,
+attempt, output, artifact, process, and interaction, so recovery preserves
+corroborated work, replays only safe interrupted work, and sends uncertain
+outward effects to reconciliation.
+
+Normalizer v6 seals nested semantics and resources in the existing snapshot
+format 2; snapshot reload never repairs from the installed package. Public run
+and Desktop projections retain one parent run card and expose only bounded
+group progress and sanitized child summaries. Every list, detail, event,
+artifact, cache key, and mutation remains selected-profile scoped.
+
+Nested groups, includes or runtime workflows inside a group, dynamic fan-out,
+and group-level retry remain deferred. The Jira Defect Loop is the sole migrated
+consumer among the eight assessed legacy iterative flows: it processes one
+immutable manifest of at most 25 Jira keys and publishes bounded JSON and
+Markdown history with exact per-write approvals. The other seven assessed
+legacy flows, spreadsheet/email delivery, and cross-profile workflow views or
+mutations remain explicitly out of scope.
+
 ### Approvals
 
 Approval state includes the originating profile, conversation identity when available, capture policy, and rejection-attempt count. Decisions are compare-and-set operations: only the first valid approve/reject transition wins. `on_reject` rework is bounded and returns to the same gate.
@@ -701,6 +733,11 @@ Retries are driven by classified errors and persisted next-attempt time. Exponen
 Generic runtime code and skills are shared by OTTO and LOOP24. Ericsson packages contain only Ericsson workflows, commands, scripts, MCP references, sidecars, and required capability metadata.
 
 The existing `my-tickets-summary` and `inbox-digest` files will be replaced with Archon-shaped workflows. Long prompts move to neutral package-local `commands/` resources. Current custom fields such as required environment values, reports, and side-effect flags move to capability configuration or Hermes sidecars.
+
+Phase 6 additionally ships Jira Defect Loop as the only migrated legacy
+iterative flow. Its immutable 25-ticket manifest, exact Jira/GitLab approvals,
+reconciliation stops, and aggregate JSON/Markdown artifacts use the portable
+v6 runtime; the other seven assessed iterative flows remain deferred.
 
 Capability staging will copy complete workflow packages atomically instead of copying isolated YAML files. Brand branches select the shared capability through descriptors; workflow runtime code is not duplicated into branded branches.
 

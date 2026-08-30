@@ -199,6 +199,50 @@ class WorkflowPendingInteractionProjection(BaseModel):
     max_iterations: StrictInt | None = Field(None, ge=0)
 
 
+class WorkflowLoopGroupBodyProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    node_type: str = Field(..., min_length=1, max_length=32)
+    state: str = Field(..., min_length=1, max_length=32)
+    attempt_count: StrictInt = Field(..., ge=0)
+    duration_ms: StrictInt | None = Field(None, ge=0)
+    failure_code: str | None = Field(None, max_length=128)
+
+
+class WorkflowLoopGroupIterationProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: StrictInt = Field(..., ge=1, le=100)
+    state: str = Field(..., min_length=1, max_length=32)
+    completed_nodes: StrictInt = Field(..., ge=0, le=512)
+    total_nodes: StrictInt = Field(..., ge=1, le=512)
+    duration_ms: StrictInt | None = Field(None, ge=0)
+    failure_code: str | None = Field(None, max_length=128)
+
+
+class WorkflowLoopGroupScopeProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str = Field(..., min_length=1, max_length=128)
+    controller_generation: StrictInt = Field(..., ge=1, le=1_000_000)
+    iteration: StrictInt = Field(..., ge=1, le=100)
+    body_node_id: str | None = Field(None, min_length=1, max_length=128)
+
+
+class WorkflowLoopGroupProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    iteration: StrictInt = Field(..., ge=1, le=100)
+    max_iterations: StrictInt = Field(..., ge=1, le=100)
+    completed_iterations: StrictInt = Field(..., ge=0, le=100)
+    primary_sink: str = Field(..., min_length=1, max_length=128)
+    body: list[WorkflowLoopGroupBodyProjection] = Field(..., max_length=512)
+    iterations: list[WorkflowLoopGroupIterationProjection] = Field(
+        ..., max_length=25
+    )
+
+
 class WorkflowNodeProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -218,6 +262,7 @@ class WorkflowNodeProjection(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     error: WorkflowPublicError | None = None
+    loop_group: WorkflowLoopGroupProjection | None = None
 
 
 class WorkflowArtifactProjection(BaseModel):
@@ -373,6 +418,7 @@ class WorkflowTimelineEventProjection(BaseModel):
     actor: str | None = Field(None, max_length=128)
     channel: str | None = Field(None, max_length=128)
     payload_truncated: StrictBool | None = None
+    loop_group_scope: WorkflowLoopGroupScopeProjection | None = None
 
 
 class WorkflowEventPageProjection(BaseModel):
@@ -399,6 +445,7 @@ class WorkflowInteractionEvidenceProjection(BaseModel):
     outcome: str | None = None
     actor: str | None = Field(None, max_length=128)
     channel: str | None = Field(None, max_length=128)
+    loop_group_scope: WorkflowLoopGroupScopeProjection | None = None
     state_version: StrictInt | None = Field(None, ge=0)
     next_actions: list[
         Literal[
@@ -730,7 +777,7 @@ class WorkflowCatalogLanguageStatus(BaseModel):
 
     effective_profile: WorkflowLanguageProfile
     legacy: StrictBool
-    normalizer_version: StrictInt = Field(..., ge=1, le=5)
+    normalizer_version: StrictInt = Field(..., ge=1, le=6)
 
     @model_validator(mode="after")
     def require_consistent_legacy_status(self):
@@ -745,7 +792,7 @@ class WorkflowDetailLanguageStatus(BaseModel):
     declared_profile: WorkflowLanguageProfile | None
     effective_profile: WorkflowLanguageProfile
     legacy: StrictBool
-    normalizer_version: StrictInt = Field(..., ge=1, le=5)
+    normalizer_version: StrictInt = Field(..., ge=1, le=6)
     normalized_definition_digest: str = Field(
         ..., min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )

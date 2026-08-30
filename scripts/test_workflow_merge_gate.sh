@@ -433,6 +433,14 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_phase5_provider_snapshot.py \
       tests/plugins/workflow/test_phase5_public_projection_contract.py \
       tests/plugins/workflow/test_phase5_public_run_evidence_contract.py \
+      tests/plugins/workflow/test_phase6_language.py \
+      tests/plugins/workflow/test_phase6_admission.py \
+      tests/plugins/workflow/test_phase6_execution_context.py \
+      tests/plugins/workflow/test_phase6_store.py \
+      tests/plugins/workflow/test_phase6_scheduler.py \
+      tests/plugins/workflow/test_phase6_interactions_recovery.py \
+      tests/plugins/workflow/test_phase6_public_projection.py \
+      tests/plugins/workflow/test_phase6_jira_defect_loop.py \
       tests/plugins/workflow/test_structured_output_language.py \
       tests/plugins/workflow/test_admission.py \
       tests/plugins/workflow/test_schedule_store_identity.py \

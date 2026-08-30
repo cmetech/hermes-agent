@@ -22,7 +22,10 @@ from plugins.workflow.models import (
     WorkflowSourceDocument,
     WorkflowValidationError,
 )
-from plugins.workflow.resources import parse_command_resource
+from plugins.workflow.resources import (
+    effective_scoped_node_options,
+    parse_command_resource,
+)
 from plugins.workflow.schema import (
     is_inline_script,
     validate_authenticated_resource_references,
@@ -37,6 +40,7 @@ from plugins.workflow.trust import (
     _validation_error,
     _walk_strings,
 )
+from plugins.workflow.topology import ScopedWorkflowNode, iter_scoped_workflow_nodes
 
 
 WORKFLOW_DEPENDENCY_MANIFEST_SCHEMA_VERSION = 1
@@ -1261,9 +1265,56 @@ def _rewrite_mcp_local_paths(value: object, paths: Mapping[str, str]) -> object:
     return value
 
 
+def _validate_v6_declared_resource_capacity(
+    package: WorkflowPackage,
+    sources: tuple[WorkflowSourceDocument, ...],
+    scoped_nodes: tuple[ScopedWorkflowNode, ...],
+) -> None:
+    """Reject the declared lower-bound file product before resource reads."""
+    product = sum(
+        1 + int(source.sidecar_bytes is not None)
+        for source in sources
+    )
+    group_ids: set[str] = set()
+    for scoped in scoped_nodes:
+        node = scoped.node
+        if node.node_type == "loop_group":
+            continue
+        if "/" in scoped.semantic_id:
+            group_ids.add(scoped.semantic_id.split("/", 1)[0])
+        if node.node_type == "command" or (
+            node.node_type == "loop"
+            and isinstance(node.value, Mapping)
+            and isinstance(node.value.get("command"), str)
+        ) or (
+            node.node_type == "script"
+            and isinstance(node.value, str)
+            and not is_inline_script(node.value)
+        ):
+            product += 1
+        options = effective_scoped_node_options(package.definition, scoped)
+        mcp = options.get("mcp")
+        product += (
+            1
+            if isinstance(mcp, str)
+            else len(mcp)
+            if isinstance(mcp, tuple | list)
+            else 0
+        )
+        if product > WORKFLOW_RESOURCE_MAX_FILES:
+            group_label = ",".join(sorted(group_ids)) or "unknown"
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource file product {product} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_FILES}",
+            )
+
+
 def _bind_definition_resources(
     definition_bytes: bytes,
     bindings: tuple[WorkflowResourceBinding, ...],
+    package: WorkflowPackage,
 ) -> bytes:
     executable = tuple(binding for binding in bindings if binding.node_id is not None)
     if not executable:
@@ -1276,10 +1327,23 @@ def _bind_definition_resources(
         assert binding.node_id is not None
         by_kind = by_node.setdefault(binding.node_id, {})
         by_kind.setdefault(binding.resource_kind, []).append(binding)
+    outer_by_id = {}
     for raw_node in document["nodes"]:
         if not isinstance(raw_node, dict) or not isinstance(raw_node.get("id"), str):
             raise ValueError("expanded workflow definition node is invalid")
-        node_bindings = by_node.get(raw_node["id"], {})
+        outer_by_id[raw_node["id"]] = raw_node
+    for scoped in iter_scoped_workflow_nodes(package.definition):
+        raw_node = outer_by_id.get(scoped.node.id)
+        if scoped.group_id is not None:
+            group = outer_by_id.get(scoped.group_id)
+            group_value = group.get("loop_group") if isinstance(group, dict) else None
+            body = group_value.get("nodes") if isinstance(group_value, dict) else None
+            if not isinstance(body, list) or scoped.node.source_index >= len(body):
+                raise ValueError("expanded loop-group definition is invalid")
+            raw_node = body[scoped.node.source_index]
+        if not isinstance(raw_node, dict):
+            raise ValueError("expanded workflow definition node is invalid")
+        node_bindings = by_node.get(scoped.semantic_id, {})
         commands = node_bindings.get("command", ())
         if commands:
             raw_node["command"] = commands[0].snapshot_path
@@ -1324,6 +1388,18 @@ def seal_workflow_compilation(
     sources_by_key = {_source_package_key(source): source for source in sources}
     if len(sources_by_key) != len(sources):
         raise ValueError("workflow closure package keys must be unique")
+    scoped_nodes = tuple(
+        iter_scoped_workflow_nodes(package.definition)
+        if bind_executable_resources
+        else ()
+    )
+    from plugins.workflow.language import supports_phase6_semantics
+
+    phase6 = supports_phase6_semantics(
+        package.language.effective_profile, package.language.normalizer_version
+    )
+    if phase6:
+        _validate_v6_declared_resource_capacity(package, sources, scoped_nodes)
     budget = WorkflowResourceReadBudget(
         max_file_bytes=WORKFLOW_RESOURCE_MAX_FILE_BYTES,
         max_total_bytes=WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
@@ -1378,7 +1454,10 @@ def seal_workflow_compilation(
             )
         contents_by_package[package_key] = contents
 
-    for node in package.definition.nodes if bind_executable_resources else ():
+    scoped_by_id = {scoped.semantic_id: scoped for scoped in scoped_nodes}
+    for scoped in scoped_nodes:
+        node = scoped.node
+        node_id = scoped.semantic_id
         origin = node.origin
         if origin is None:
             raise ValueError("compiled Phase 4 nodes require exact logical origins")
@@ -1398,8 +1477,8 @@ def seal_workflow_compilation(
                     "invalid_command_resource",
                     "authenticated command resource is invalid",
                 ) from exc
-            command_source_bodies[node.id] = body
-            command_raw[node.id] = (raw, relative, "command")
+            command_source_bodies[node_id] = body
+            command_raw[node_id] = (raw, relative, "command")
         elif (
             node.node_type == "loop"
             and isinstance(node.value, Mapping)
@@ -1420,8 +1499,8 @@ def seal_workflow_compilation(
                     "invalid_command_resource",
                     "authenticated loop command resource is invalid",
                 ) from exc
-            command_source_bodies[node.id] = body
-            command_raw[node.id] = (raw, relative, "loop_command")
+            command_source_bodies[node_id] = body
+            command_raw[node_id] = (raw, relative, "loop_command")
         elif node.node_type == "script" and isinstance(node.value, str):
             if not is_inline_script(node.value):
                 path = _source_script_path(
@@ -1432,9 +1511,14 @@ def seal_workflow_compilation(
                 )
                 relative, raw = _read_source_resource(source, path, budget)
                 package_contents[relative] = raw
-                script_raw[node.id] = raw
+                script_raw[node_id] = raw
 
-        mcp_value = node.options.get("mcp")
+        if node.node_type == "loop_group":
+            continue
+        effective_options = effective_scoped_node_options(
+            package.definition, scoped
+        )
+        mcp_value = effective_options.get("mcp")
         references = (
             (mcp_value,)
             if isinstance(mcp_value, str)
@@ -1450,8 +1534,8 @@ def seal_workflow_compilation(
             package_contents[relative] = raw
             uses.append(
                 _CompilationResourceUse(
-                    binding_id=f"{node.id}:mcp:{index}",
-                    node_id=node.id,
+                    binding_id=f"{node_id}:mcp:{index}",
+                    node_id=node_id,
                     resource_kind="mcp",
                     package_key=origin.package_key,
                     source_relative_path=relative,
@@ -1495,7 +1579,7 @@ def seal_workflow_compilation(
                     )
                     package_contents[local_relative] = local_raw
                     local_binding_id = (
-                        f"{node.id}:mcp_resource:{index}:{local_relative}"
+                        f"{node_id}:mcp_resource:{index}:{local_relative}"
                     )
                     mcp_local_aliases.setdefault(local_binding_id, set()).add(
                         candidate
@@ -1506,7 +1590,7 @@ def seal_workflow_compilation(
                     uses.append(
                         _CompilationResourceUse(
                             binding_id=local_binding_id,
-                            node_id=node.id,
+                            node_id=node_id,
                             resource_kind="mcp_resource",
                             package_key=origin.package_key,
                             source_relative_path=local_relative,
@@ -1525,13 +1609,13 @@ def seal_workflow_compilation(
         },
     )
     for node_id, (raw, relative, resource_kind) in command_raw.items():
-        node = next(item for item in package.definition.nodes if item.id == node_id)
+        node = scoped_by_id[node_id].node
         assert node.origin is not None
         compiled_body = validated.command_bodies[node_id]
         uses.append(
             _CompilationResourceUse(
-                binding_id=f"{node.id}:{resource_kind}",
-                node_id=node.id,
+                binding_id=f"{node_id}:{resource_kind}",
+                node_id=node_id,
                 resource_kind=resource_kind,
                 package_key=node.origin.package_key,
                 source_relative_path=relative,
@@ -1545,7 +1629,7 @@ def seal_workflow_compilation(
             )
         )
     for node_id, raw in script_raw.items():
-        node = next(item for item in package.definition.nodes if item.id == node_id)
+        node = scoped_by_id[node_id].node
         assert node.origin is not None
         source = sources_by_key[node.origin.package_key]
         path = _source_script_path(
@@ -1557,8 +1641,8 @@ def seal_workflow_compilation(
         relative = path.relative_to(source.root).as_posix()
         uses.append(
             _CompilationResourceUse(
-                binding_id=f"{node.id}:named_script",
-                node_id=node.id,
+                binding_id=f"{node_id}:named_script",
+                node_id=node_id,
                 resource_kind="named_script",
                 package_key=node.origin.package_key,
                 source_relative_path=relative,
@@ -1625,6 +1709,43 @@ def seal_workflow_compilation(
             )
         )
     uses = rewritten_uses
+    if phase6:
+        group_ids = tuple(sorted({
+            use.node_id.split("/", 1)[0]
+            for use in uses
+            if use.node_id is not None and "/" in use.node_id
+        }))
+        group_label = ",".join(group_ids) or "unknown"
+        compiled_bytes = sum(len(use.compiled_bytes) for use in uses)
+        if len(uses) > WORKFLOW_RESOURCE_MAX_FILES:
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource file product {len(uses)} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_FILES}",
+            )
+        oversized = next(
+            (
+                len(use.compiled_bytes)
+                for use in uses
+                if len(use.compiled_bytes) > WORKFLOW_RESOURCE_MAX_FILE_BYTES
+            ),
+            None,
+        )
+        if oversized is not None:
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource byte product {oversized} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_FILE_BYTES}",
+            )
+        if compiled_bytes > WORKFLOW_RESOURCE_MAX_TOTAL_BYTES:
+            raise _validation_error(
+                "loop_group",
+                "loop_group_product_limit",
+                f"loop_group {group_label} resource byte product {compiled_bytes} "
+                f"exceeds ceiling {WORKFLOW_RESOURCE_MAX_TOTAL_BYTES}",
+            )
     bindings: list[WorkflowResourceBinding] = []
     sealed_files: dict[str, bytes] = {}
     for use in uses:
@@ -1671,6 +1792,7 @@ def seal_workflow_compilation(
     bound_definition_bytes = _bind_definition_resources(
         definition_bytes,
         bindings_tuple,
+        package,
     )
     origins = tuple(
         sorted(

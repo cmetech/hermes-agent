@@ -448,7 +448,7 @@ def test_current_archon_inherits_phase3_timeout_and_retry_fields(
         for issue in result["issues"]
         if issue["code"] == "provider_profile_resolution"
     } == expected_resolution_paths
-    assert result["language"]["normalizer_version"] == 5
+    assert result["language"]["normalizer_version"] == 6
 
 
 def test_archon_cli_admission_seals_resolved_profile_execution_authority(

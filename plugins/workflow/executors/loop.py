@@ -40,7 +40,7 @@ def _artifact(path: Path, run_directory: Path, media_type: str) -> ArtifactRef:
     )
 
 
-def _clean_completion(
+def clean_loop_completion(
     output: str,
     signal: str,
     *,
@@ -57,6 +57,19 @@ def _clean_completion(
     plain = re.compile(rf"(?:^|\n)\s*{re.escape(signal)}\s*[.!?]*\s*$", re.IGNORECASE)
     matched = plain.search(output) is not None
     return matched, plain.sub("", output).rstrip() if matched and strip_plain else output.rstrip()
+
+
+def loop_interactivity(
+    semantics: Mapping[str, object] | None,
+    *,
+    legacy_interactive: bool = False,
+) -> tuple[bool, bool]:
+    """Return effective-interactive and signal-completes decisions."""
+    if semantics is None:
+        return legacy_interactive, True
+    return bool(semantics["effective_interactive"]), bool(
+        semantics["signal_completes"]
+    )
 
 
 class LoopExecutor:
@@ -142,15 +155,9 @@ class LoopExecutor:
                 )
         else:
             prompt = str(loop.get("prompt", ""))
-        effective_interactive = (
-            bool(loop_semantics["effective_interactive"])
-            if phase4
-            else loop.get("interactive") is True
-        )
-        signal_completes = (
-            bool(loop_semantics["signal_completes"])
-            if phase4
-            else True
+        effective_interactive, signal_completes = loop_interactivity(
+            loop_semantics if phase4 else None,
+            legacy_interactive=loop.get("interactive") is True,
         )
         signal = str(loop.get("until", ""))
         maximum = loop.get("max_iterations")
@@ -202,7 +209,7 @@ class LoopExecutor:
             )
 
             def frozen_output_resolver(node_id, path):
-                return reference_snapshot[(node_id, tuple(path))]
+                return reference_snapshot[(False, node_id, tuple(path))]
 
             loop_output_resolver = frozen_output_resolver
         previous_output = ""
@@ -341,6 +348,17 @@ class LoopExecutor:
                     else {}
                 ),
                 node_state={},
+                attempt_directory=(
+                    context.effective_attempt_directory / f"iteration-{iteration:04d}"
+                    if context.attempt_directory is not None
+                    else None
+                ),
+                publication_directory=(
+                    context.effective_publication_directory
+                    / f"iteration-{iteration:04d}"
+                    if context.publication_directory is not None
+                    else None
+                ),
             )
             result = self._agent.execute(child_context)
             iteration_artifacts = list(result.artifacts)
@@ -369,7 +387,7 @@ class LoopExecutor:
                 )
             output_path = context.run_directory / result.artifacts[-1].relative_path
             output = output_path.read_text(encoding="utf-8")
-            completed, cleaned = _clean_completion(
+            completed, cleaned = clean_loop_completion(
                 output,
                 signal,
                 strip_plain=phase4,
@@ -502,6 +520,18 @@ class LoopExecutor:
                         output_resolver=loop_output_resolver,
                         predecessor_results={},
                         node_state={},
+                        attempt_directory=(
+                            context.effective_attempt_directory
+                            / f"until-{iteration:04d}"
+                            if context.attempt_directory is not None
+                            else None
+                        ),
+                        publication_directory=(
+                            context.effective_publication_directory
+                            / f"until-{iteration:04d}"
+                            if context.publication_directory is not None
+                            else None
+                        ),
                     )
                 )
                 if check.status == "succeeded":
@@ -628,4 +658,4 @@ class LoopExecutor:
         )
 
 
-__all__ = ["LoopExecutor"]
+__all__ = ["LoopExecutor", "clean_loop_completion", "loop_interactivity"]
