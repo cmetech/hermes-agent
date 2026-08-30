@@ -128,6 +128,18 @@ def _compile(
         "print(artifacts)\n",
         encoding="utf-8",
     )
+    (scripts / "artifact-free-docs-escape.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "docs = Path(os.environ['DOCS_DIR'])\n"
+        "artifacts = Path(os.environ['ARTIFACTS_DIR'])\n"
+        "target = docs.joinpath('..', 'artifacts', 'docs-hidden')\n"
+        "target.parent.mkdir(parents=True, exist_ok=True)\n"
+        "target.write_text(str(docs))\n"
+        "print(docs)\n"
+        "print(artifacts)\n",
+        encoding="utf-8",
+    )
     (scripts / "publishing-context.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
@@ -136,6 +148,7 @@ def _compile(
         "    os.environ['HERMES_WORKFLOW_RUN_DIR'],\n"
         "    str(Path.cwd()),\n"
         "    str(artifacts),\n"
+        "    os.environ['DOCS_DIR'],\n"
         ")))\n"
         "print('ok <promise>DONE</promise>')\n",
         encoding="utf-8",
@@ -836,6 +849,100 @@ def test_v6_artifact_free_process_watches_run_env_and_relative_cwd(
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
 @pytest.mark.parametrize(
+    ("surface", "scoped"),
+    (
+        ("bash", False),
+        ("bash", True),
+        ("inline-script", False),
+        ("inline-script", True),
+        ("named-script", False),
+        ("named-script", True),
+    ),
+)
+def test_v6_artifact_free_process_watches_docs_traversal(
+    tmp_path, workflow_writer, surface, scoped
+) -> None:
+    if surface == "bash":
+        value = (
+            'mkdir -p "$DOCS_DIR/../artifacts"; '
+            "printf '%s' \"$DOCS_DIR\" > "
+            '"$DOCS_DIR/../artifacts/docs-hidden"; '
+            "printf '%s\\n%s\\n' \"$DOCS_DIR\" \"$ARTIFACTS_DIR\""
+        )
+        node = {"id": "artifact-free", "bash": value, "artifacts": False}
+        executor = RecordingProcessExecutor(BashExecutor())
+        executor_name = "bash"
+    else:
+        value = (
+            "artifact-free-docs-escape"
+            if surface == "named-script"
+            else (
+                "import os\n"
+                "from pathlib import Path\n"
+                "docs = Path(os.environ['DOCS_DIR'])\n"
+                "artifacts = Path(os.environ['ARTIFACTS_DIR'])\n"
+                "target = docs.joinpath('..', 'artifacts', 'docs-hidden')\n"
+                "target.parent.mkdir(parents=True, exist_ok=True)\n"
+                "target.write_text(str(docs))\n"
+                "print(docs)\n"
+                "print(artifacts)\n"
+            )
+        )
+        node = {
+            "id": "artifact-free",
+            "script": value,
+            "runtime": "uv",
+            "artifacts": False,
+        }
+        executor = RecordingProcessExecutor(ScriptExecutor())
+        executor_name = "script"
+    nodes = [_group([node])] if scoped else [node]
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"artifact-free-docs-view-{surface}-{scoped}",
+        nodes=nodes,
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(
+        store,
+        compilation,
+        key=f"artifact-free-docs-view-{surface}-{scoped}",
+    )
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors[executor_name] = executor
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    [execution] = executor.contexts
+    private_artifacts = execution.effective_attempt_directory / "artifacts"
+    state = (
+        result["nodes"]["group"]["loop_group"]["body"]["artifact-free"]
+        if scoped
+        else result["nodes"]["artifact-free"]
+    )
+    assert state["state"] != "succeeded", state
+    assert state["attempts"][-1]["error_code"] == "artifact_limit"
+    assert (private_artifacts / "docs-hidden").read_text() == str(
+        private_artifacts
+    )
+    assert (
+        execution.effective_attempt_directory / "stdout.txt"
+    ).read_text().splitlines() == [
+        str(private_artifacts),
+        str(private_artifacts),
+    ]
+    run_directory = store.run_directory(run_id)
+    public_artifacts = run_directory / "artifacts"
+    public_docs = run_directory / "docs"
+    assert not public_artifacts.exists() or not list(
+        public_artifacts.rglob("*hidden")
+    )
+    assert not public_docs.exists() or not list(public_docs.rglob("*hidden"))
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
     ("surface", "scoped", "normalizer_version"),
     (
         ("bash", False, 6),
@@ -853,8 +960,9 @@ def test_publishing_process_keeps_real_run_cwd_env_and_exact_publication(
 ) -> None:
     if surface == "bash":
         value = (
-            "printf '%s\\n%s\\n%s' \"$HERMES_WORKFLOW_RUN_DIR\" "
-            '"$PWD" "$ARTIFACTS_DIR" > "$ARTIFACTS_DIR/context.txt"; '
+            "printf '%s\\n%s\\n%s\\n%s' \"$HERMES_WORKFLOW_RUN_DIR\" "
+            '"$PWD" "$ARTIFACTS_DIR" "$DOCS_DIR" > '
+            '"$ARTIFACTS_DIR/context.txt"; '
             "printf 'ok <promise>DONE</promise>'"
         )
         node = {"id": "publisher", "bash": value}
@@ -870,6 +978,7 @@ def test_publishing_process_keeps_real_run_cwd_env_and_exact_publication(
                 "    os.environ['HERMES_WORKFLOW_RUN_DIR'],\n"
                 "    str(Path.cwd()),\n"
                 "    str(artifacts),\n"
+                "    os.environ['DOCS_DIR'],\n"
                 ")))\n"
                 "print('ok <promise>DONE</promise>')\n"
             )
@@ -908,6 +1017,7 @@ def test_publishing_process_keeps_real_run_cwd_env_and_exact_publication(
         str(run_directory),
         str(run_directory),
         str(publication),
+        str(run_directory / "docs"),
     ]
 
 

@@ -5048,10 +5048,11 @@ class RunScheduler:
                             ),
                         )
                     )
-                    if artifact_free_process and work_item.loop_group_scope is None:
+                    if artifact_free_process:
                         variables = replace(
                             variables,
                             artifacts_dir=publication_directory,
+                            docs_dir=publication_directory,
                         )
                     loop_input = self._work_item_state(projection, work_item).get(
                         "loop_user_input_artifact"
