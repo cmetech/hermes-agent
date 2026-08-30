@@ -46,6 +46,19 @@ attempt-free downstream child `cancelled` after restarting its failed
 predecessor. The v5 case showed that a redundant resume of a running run raised
 on its active claim instead of returning the existing projection unchanged.
 
+The second scoped re-review expanded the one-worker operator regression with an
+independent source child and ran:
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_phase6_interactions_recovery.py \
+  -k 'operator_restarts_only_the_failed_current_iteration_child' -q
+```
+
+Result: 0 passed, 2 failed. Both resume and explicit nested retry restored the
+failed child and its dependency descendant but left the independent,
+attempt-free cancellation stranded, reproducing the running controller wedge.
+
 ## Root-cause changes
 
 - Routed resume, retry, and abandon safety checks through the existing nested
@@ -57,12 +70,13 @@ on its active claim instead of returning the existing projection unchanged.
   error contracts remain intact.
 - Made resume and explicit retry authenticate the current `group/child` body
   state, reset only failed/interrupted children with replay-safe stopped-process
-  evidence, and restore the existing outer/controller state to `running`. Only
-  attempt-free cancelled descendants reachable through current-body dependency
-  edges are restored to pending/ready; executed, claimed, recovery-bound, or
+  evidence, and restore the existing outer/controller state to `running`. Every
+  attempt-free cancelled child in that current body is restored from its own
+  dependency state, covering both dependency descendants and independent work
+  cancelled as failure fallout. Executed, claimed, recovery-bound, or
   interaction-bound cancelled children remain terminal. Succeeded/skipped
-  siblings, controller generation, current iteration, and attempt history remain
-  unchanged. The outer group is not a retry candidate.
+  siblings, controller generation, current iteration, and attempt history
+  remain unchanged. The outer group is not a retry candidate.
 - Preserved the one durable predicate claim, execution fence, callbacks, and
   obligation-journal reserve while assigning every authorized Bash dispatch a
   fresh physical attempt ID and contained directory beneath the iteration's
@@ -87,7 +101,7 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   -q
 ```
 
-Result after the scoped review follow-up: 4 files, 10 tests passed, 0 failed.
+Result after the second scoped re-review: 4 files, 12 tests passed, 0 failed.
 
 Required Phase 6 recovery gate:
 
@@ -101,7 +115,7 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_cancel_node.py -q
 ```
 
-Result: 6 files, 212 tests passed, 0 failed.
+Result after the second scoped re-review: 6 files, 214 tests passed, 0 failed.
 
 Required historical compatibility gate:
 
@@ -148,10 +162,14 @@ errors.
 `ef809667ad` (`fix(workflow): preserve nested recovery coherence`) — the
 initial atomic implementation commit.
 
-`fix(workflow): restore loop group downstream recovery` — the atomic scoped
-review follow-up containing the downstream-fallout reset, resume ordering fix,
-regressions, and this report update. Its final SHA is returned in the task
-handoff because a commit cannot embed its own SHA.
+`4c82a4392d` (`fix(workflow): restore loop group downstream recovery`) — the
+first atomic scoped-review follow-up containing the descendant-fallout reset,
+resume ordering fix, and regressions.
+
+`fix(workflow): restore parallel loop group fallout` — the atomic second
+re-review follow-up containing the independent-fallout fix, explicit parameter
+rows, and this report update. Its final SHA is returned in the task handoff
+because a commit cannot embed its own SHA.
 
 ## Concerns
 

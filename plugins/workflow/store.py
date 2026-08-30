@@ -502,35 +502,26 @@ def _reset_loop_group_child_for_operator(
         )
         else "pending"
     )
-    affected = {child_id}
-    restored = True
-    while restored:
-        restored = False
-        for candidate_id, candidate in body.items():
-            if (
-                candidate_id in affected
-                or not isinstance(candidate, MutableMapping)
-                or candidate.get("state") != "cancelled"
-                or candidate.get("attempts")
-                or any(
-                    candidate.get(field) is not None
-                    for field in ("claim", "recovery", "pending_interaction")
-                )
-            ):
-                continue
-            dependencies = candidate.get("depends_on", ())
-            if not any(dependency in affected for dependency in dependencies):
-                continue
-            candidate["state"] = (
-                "ready"
-                if all(
-                    body[dependency].get("state") in {"succeeded", "skipped"}
-                    for dependency in dependencies
-                )
-                else "pending"
+    for candidate in body.values():
+        if (
+            not isinstance(candidate, MutableMapping)
+            or candidate.get("state") != "cancelled"
+            or candidate.get("attempts")
+            or any(
+                candidate.get(field) is not None
+                for field in ("claim", "recovery", "pending_interaction")
             )
-            affected.add(candidate_id)
-            restored = True
+        ):
+            continue
+        dependencies = candidate.get("depends_on", ())
+        candidate["state"] = (
+            "ready"
+            if all(
+                body[dependency].get("state") in {"succeeded", "skipped"}
+                for dependency in dependencies
+            )
+            else "pending"
+        )
     group["state"] = "running"
     controller["state"] = "running"
 

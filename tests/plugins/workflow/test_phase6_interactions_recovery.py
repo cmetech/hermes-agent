@@ -471,28 +471,35 @@ def test_hard_maximum_fails_without_a_dead_interaction(
 
 
 @pytest.mark.parametrize("operator_action", ("resume", "retry"))
+@pytest.mark.parametrize(
+    "include_independent",
+    (pytest.param(False, id="descendant"), pytest.param(True, id="independent")),
+)
 def test_operator_restarts_only_the_failed_current_iteration_child(
-    tmp_path, workflow_writer, operator_action
+    tmp_path, workflow_writer, operator_action, include_independent
 ) -> None:
+    body = [
+        {"id": "completed", "prompt": "completed"},
+        {
+            "id": "flaky",
+            "prompt": "flaky",
+            "depends_on": ["completed"],
+        },
+        {
+            "id": "downstream",
+            "prompt": "downstream",
+            "depends_on": ["flaky"],
+        },
+    ]
+    if include_independent:
+        body.append({"id": "independent", "prompt": "independent"})
     compilation = _compile(
         tmp_path,
         workflow_writer,
         name=f"phase6-operator-{operator_action}",
         nodes=[
             _group(
-                [
-                    {"id": "completed", "prompt": "completed"},
-                    {
-                        "id": "flaky",
-                        "prompt": "flaky",
-                        "depends_on": ["completed"],
-                    },
-                    {
-                        "id": "downstream",
-                        "prompt": "downstream",
-                        "depends_on": ["flaky"],
-                    },
-                ],
+                body,
                 maximum=2,
             )
         ],
@@ -500,12 +507,16 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
     store = RunStore(tmp_path / "home", max_total_workers=1)
     run_id = _admit(store, compilation, key=f"phase6-operator-{operator_action}")
     calls = {"completed": 0, "flaky": 0, "downstream": 0}
+    if include_independent:
+        calls["independent"] = 0
 
     def output(context, _rendered):
         child_id = context.node.id.rsplit("/", 1)[-1]
         calls[child_id] += 1
         if child_id == "completed":
             return "completed"
+        if child_id == "independent":
+            return "independent"
         if child_id == "downstream":
             if "iterations/0002" in context.effective_attempt_directory.as_posix():
                 return "finished <promise>DONE</promise>"
@@ -540,6 +551,10 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
     assert failed_controller["body"]["flaky"]["state"] == "failed"
     assert failed_controller["body"]["downstream"]["state"] == "cancelled"
     assert failed_controller["body"]["downstream"]["attempts"] == []
+    if include_independent:
+        assert failed_controller["body"]["independent"]["state"] == "cancelled"
+        assert failed_controller["body"]["independent"]["attempts"] == []
+        assert calls["independent"] == 1
 
     if operator_action == "resume":
         resumed = store.resume_run(run_id, always_run_nodes=set())
@@ -558,14 +573,25 @@ def test_operator_restarts_only_the_failed_current_iteration_child(
     ] == completed_attempt
     assert resumed_controller["body"]["flaky"]["state"] == "ready"
     assert resumed_controller["body"]["downstream"]["state"] == "pending"
+    if include_independent:
+        assert resumed_controller["body"]["independent"]["state"] == "ready"
 
     completed = scheduler.advance_all([run_id])[run_id]
     completed_body = completed["nodes"]["group"]["loop_group"]["body"]
     assert completed["status"] == "succeeded"
-    assert calls == {"completed": 2, "flaky": 3, "downstream": 2}
+    expected_calls = {
+        "completed": 2,
+        "flaky": 3,
+        "downstream": 2,
+    }
+    if include_independent:
+        expected_calls["independent"] = 2
+    assert calls == expected_calls
     assert len(completed_body["completed"]["attempts"]) == 1
     assert len(completed_body["flaky"]["attempts"]) == 2
     assert len(completed_body["downstream"]["attempts"]) == 1
+    if include_independent:
+        assert len(completed_body["independent"]["attempts"]) == 1
 
 
 def test_body_approval_resumes_exact_child_without_replaying_succeeded_sibling(
