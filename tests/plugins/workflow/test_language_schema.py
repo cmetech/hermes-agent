@@ -1205,6 +1205,7 @@ def _structural_outcomes(
     profile: WorkflowLanguageProfile = WorkflowLanguageProfile.HERMES_LEGACY,
     *,
     normalizer_version: int | None = None,
+    path: str | Path = "structural-parity.yaml",
 ) -> tuple[bool, bool]:
     schema = definition_json_schema(
         profile,
@@ -1213,7 +1214,7 @@ def _structural_outcomes(
     schema_valid = not list(Draft202012Validator(schema).iter_errors(document))
     try:
         load_workflow_snapshot(
-            "structural-parity.yaml",
+            path,
             workflow_bytes=yaml.safe_dump(document, sort_keys=False).encode(),
             sidecar_bytes=(
                 f"language_compatibility: {profile.value}\n".encode()
@@ -1235,6 +1236,54 @@ def _workflow(node: dict[str, object]) -> dict[str, object]:
         "description": "schema and loader agree",
         "nodes": [node],
     }
+
+
+@pytest.mark.parametrize(
+    ("node_type", "normalizer_version", "nested", "expected"),
+    [
+        pytest.param("command", 6, False, True, id="v6-command-opt-out"),
+        pytest.param("prompt", 6, False, True, id="v6-prompt-opt-out"),
+        pytest.param("bash", 6, False, False, id="v6-bash-still-requires-retry"),
+        pytest.param("script", 6, False, False, id="v6-script-still-requires-retry"),
+        pytest.param("command", 5, False, False, id="v5-command-unchanged"),
+        pytest.param("prompt", 5, False, False, id="v5-prompt-unchanged"),
+        pytest.param("command", 6, True, True, id="v6-body-command-opt-out"),
+        pytest.param("prompt", 6, True, True, id="v6-body-prompt-opt-out"),
+    ],
+)
+def test_v6_ai_retry_opt_out_has_schema_loader_version_and_node_parity(
+    tmp_path, node_type, normalizer_version, nested, expected
+):
+    child = {
+        "id": "child" if nested else "n",
+        node_type: "print('ok')" if node_type == "script" else "run",
+        "retry": {"max_attempts": 0},
+    }
+    if node_type == "script":
+        child["runtime"] = "uv"
+    if node_type == "command":
+        commands = tmp_path / "commands"
+        commands.mkdir()
+        (commands / "run.md").write_text("fixture command\n", encoding="utf-8")
+    document = (
+        _workflow({
+            "id": "group",
+            "loop_group": {
+                "nodes": [child],
+                "until": "done",
+                "max_iterations": 2,
+            },
+        })
+        if nested
+        else _workflow(child)
+    )
+
+    assert _structural_outcomes(
+        document,
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=normalizer_version,
+        path=tmp_path / "structural-parity.yaml",
+    ) == (expected, expected)
 
 
 _NODE_FIELD_VALUES = {

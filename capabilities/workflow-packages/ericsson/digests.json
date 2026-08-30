@@ -3,7 +3,7 @@
   "packages": {
     "inbox-digest": "b959fcfc7b0b9d360c14c19047c9f7371981883271d1333daf12e21d3732ade4",
     "jira-single-ticket-showcase": "7b68553cdde8a88495ff9a5986fd4f14e2824cb673e541568facdb6e6d74e202",
-    "jira-defect-loop": "a6e147fd406436703e7eaf0dedfb6c3915838cf4fbab3938e1b19b7769d25d5a",
+    "jira-defect-loop": "f83ebf3f2eb48ae91c20193896ccb08f6d03c8a1c62a9133305f83faefb0b037",
     "jira-to-gitlab": "dd5c5e67549df15b537803bc1bf9ba8ea901933ed57be3414adaede1e5112d98",
     "my-tickets-summary": "849d70a6716b07dd3966cf38be5ff3a1389558a8855c1827e344bd47f28a72a2",
     "sharepoint-document-intake": "bb4a258bdd00f0aedccc2075100dcaffb1a8829116c22722305cb4ecc72358e7"

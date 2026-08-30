@@ -2443,7 +2443,16 @@ def _schema_for_shape(
     if shape == "runtime":
         return {"type": "string", "enum": ["bun", "uv"]}
     if shape == "retry_attempts":
-        return {"type": "integer", "minimum": 1, "maximum": 5}
+        return {
+            "type": "integer",
+            "minimum": (
+                0
+                if normalizer_version is not None
+                and supports_phase6_semantics(profile, normalizer_version)
+                else 1
+            ),
+            "maximum": 5,
+        }
     if shape == "retry_delay":
         return {"type": "integer", "minimum": 1000, "maximum": 60_000}
     if shape == "retry_error":
@@ -2726,6 +2735,15 @@ def _nodes_schema(
             for spec in specs
             if _node_field_is_structural(spec, node_type, profile)
         }
+        if (
+            supports_phase6_semantics(profile, selected_version)
+            and node_type in {"bash", "script"}
+            and "retry" in properties
+        ):
+            properties["retry"] = _object_schema(
+                "retry", profile, normalizer_version=selected_version
+            )
+            properties["retry"]["properties"]["max_attempts"]["minimum"] = 1
         variants.append({
             "type": "object",
             "properties": properties,
@@ -2765,8 +2783,9 @@ def _body_nodes_schema(
         }
         for spec in specs
     }
-    variants = [
-        {
+    variants = []
+    for node_type in NODE_TYPES:
+        variant = {
             "type": "object",
             "properties": {
                 spec.yaml_name: True
@@ -2780,8 +2799,16 @@ def _body_nodes_schema(
             ],
             "additionalProperties": False,
         }
-        for node_type in NODE_TYPES
-    ]
+        if (
+            supports_phase6_semantics(profile, selected_version)
+            and node_type in {"bash", "script"}
+            and "retry" in variant["properties"]
+        ):
+            variant["properties"]["retry"] = _object_schema(
+                "retry", profile, normalizer_version=selected_version
+            )
+            variant["properties"]["retry"]["properties"]["max_attempts"]["minimum"] = 1
+        variants.append(variant)
     return {
         "type": "array",
         "minItems": 1,

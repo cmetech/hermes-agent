@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,9 +17,13 @@ from agent.structured_output import (
     normalize_schema,
     parse_validate_canonicalize,
 )
+from hermes_cli.runtime_provider import classify_execution_runtime
+from hermes_cli.workflow_model_resolution import parse_workflow_model_config
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.conditions import evaluate_v3_condition
-from plugins.workflow.executors.base import NodeExecutionContext
+from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.loop import clean_loop_completion
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.language import (
@@ -30,9 +36,17 @@ from plugins.workflow.output_resolution import (
     ResolvedNodeOutput,
     resolved_output_publication_identity,
 )
+from plugins.workflow.provider_authority import (
+    ProviderAuthorityEnvironment,
+)
 from plugins.workflow.resources import VariableContext
+from plugins.workflow.runner_binding import (
+    RunnerCapabilities,
+    execution_capability_context,
+)
 from plugins.workflow.scheduler import RunScheduler, evaluate_trigger_rule
 from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.store import RunStore
 from plugins.workflow.topology import iter_scoped_workflow_nodes, primary_terminal_node
 
 
@@ -596,7 +610,7 @@ def test_distributed_v6_workflow_seals_one_immutable_bounded_manifest() -> None:
         },
     }
     assert fetch.options["maxTurns"] == 2
-    assert fetch.options["retry"]["max_attempts"] == 1
+    assert fetch.options["retry"]["max_attempts"] == 0
     assert '"max_results": 25' in fetch.value
     assert "exactly one" in fetch.value.lower()
     assert "first occurrence" in fetch.value.lower()
@@ -628,6 +642,94 @@ def test_distributed_v6_workflow_seals_one_immutable_bounded_manifest() -> None:
     assert nodes["publish-empty-markdown"].node_type == "script"
     assert nodes["publish-aggregate-json"].node_type == "script"
     assert nodes["publish-aggregate-markdown"].node_type == "script"
+
+
+def test_manifest_fetch_has_one_total_attempt_and_cannot_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    compilation = _compile()
+    package = compilation.package
+    store = RunStore(tmp_path / "home")
+    model_config = parse_workflow_model_config({
+        "model": {"provider": "openrouter", "default": "openai/gpt-5.4"}
+    })
+    execution_context = execution_capability_context(
+        surface="background",
+        entitlement=AIEntitlementResolution("real"),
+        runner_capabilities=RunnerCapabilities(starts_request_mcp=True),
+        runtime_capabilities=classify_execution_runtime(
+            provider="openrouter",
+            model_config={"provider": "openrouter", "default": "openai/gpt-5.4"},
+        ),
+        model_config_snapshot=model_config,
+        provider_authority_environment=ProviderAuthorityEnvironment(
+            session_store_available=True,
+            mcp_available=True,
+            hook_lifecycle_available=True,
+            inline_agent_available=True,
+            web_service_available=True,
+            authoritative_cost_available=True,
+        ),
+    )
+    connector_capabilities = SimpleNamespace(
+        ready_services=frozenset(package.definition.options["requires"]),
+        available_tools=frozenset(
+            tool
+            for item in iter_scoped_workflow_nodes(package.definition)
+            for tool in item.node.options.get("allowed_tools", ())
+        ),
+        fingerprint="a" * 64,
+        scoped_fingerprint=lambda *_: "b" * 64,
+    )
+    monkeypatch.setattr(
+        "plugins.workflow.scheduler.connector_capability_snapshot",
+        lambda: connector_capabilities,
+    )
+    prepared = store.prepare_run_snapshot(
+        package,
+        compilation=compilation,
+        provider_authority=execution_context.provider_authority(package),
+        connector_capabilities=connector_capabilities,
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="one-manifest-attempt",
+            concurrency_key=package.definition.name,
+            run_metadata=execution_context.structured_output_run_metadata(package),
+        ),
+        immutable_snapshot=prepared,
+    )
+    now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    calls = 0
+
+    class EligibleFailure:
+        def execute(self, _context):
+            nonlocal calls
+            calls += 1
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_timeout",
+                metadata={"provider_attempts": 0, "provider_attempts_exact": True},
+            )
+
+    scheduler = RunScheduler(store, utcnow=lambda: now, jitter=lambda: 0.5)
+    scheduler.executors["prompt"] = EligibleFailure()
+
+    first = scheduler.advance(admitted.run_id)
+    now += timedelta(minutes=1)
+    second = scheduler.advance(admitted.run_id)
+
+    assert calls == 1
+    assert first["status"] == second["status"] == "failed"
+    retry = first["nodes"]["fetch-ticket-manifest"]["attempts"][0]["metadata"]
+    assert retry["requested_retries"] == 0
+    assert retry["requested_total_attempts"] == 1
+    assert retry["effective_total_attempts"] == 1
 
 
 @pytest.mark.parametrize(

@@ -351,6 +351,9 @@ def normalize_workflow(
             normalized_definition,
             selection.effective_profile,
             structured_outputs,
+            allow_ai_retry_opt_out=supports_phase6_semantics(
+                selection.effective_profile, normalizer_version
+            ),
         )
     if supports_phase4_semantics(selection.effective_profile, normalizer_version):
         normalized_definition, structured_outputs, node_semantics = _normalize_v4(
@@ -577,6 +580,8 @@ def _normalize_v3(
     normalized_definition: WorkflowDefinition,
     profile: WorkflowLanguageProfile,
     structured_outputs: Mapping[str, WorkflowStructuredOutput],
+    *,
+    allow_ai_retry_opt_out: bool = False,
 ) -> tuple[
     WorkflowDefinition,
     Mapping[str, WorkflowStructuredOutput],
@@ -641,7 +646,11 @@ def _normalize_v3(
                     "archon_retry_invalid",
                     "Archon retry must be a mapping",
                 )
-            retry = _normalize_v3_retry(authored, node=node)
+            retry = _normalize_v3_retry(
+                authored,
+                node=node,
+                allow_ai_retry_opt_out=allow_ai_retry_opt_out,
+            )
             if (
                 explicit
                 and node.node_type in {"bash", "script"}
@@ -966,7 +975,10 @@ def _normalize_v6(
         body_definition = replace(normalized_definition, nodes=effective_body)
         body_definition, body_outputs = _normalize_v2(body_definition, profile)
         body_definition, body_outputs, body_semantics = _normalize_v3(
-            body_definition, profile, body_outputs
+            body_definition,
+            profile,
+            body_outputs,
+            allow_ai_retry_opt_out=True,
         )
         body_definition, body_outputs, body_semantics = _normalize_v4(
             body_definition, profile, body_outputs, body_semantics
@@ -1055,7 +1067,10 @@ def _normalize_v6(
 
 
 def _normalize_v3_retry(
-    value: object | None, *, node: WorkflowNode
+    value: object | None,
+    *,
+    node: WorkflowNode,
+    allow_ai_retry_opt_out: bool = False,
 ) -> Mapping[str, object]:
     if value is None:
         return MappingProxyType({})
@@ -1071,16 +1086,19 @@ def _normalize_v3_retry(
             "Archon retry must contain only max_attempts, delay_ms, and on_error",
         )
     maximum = value.get("max_attempts")
+    minimum = (
+        0 if allow_ai_retry_opt_out and node.node_type in {"command", "prompt"} else 1
+    )
     if "max_attempts" in value and (
         isinstance(maximum, bool)
         or not isinstance(maximum, int)
-        or not 1 <= maximum <= 5
+        or not minimum <= maximum <= 5
     ):
         raise WorkflowSemanticNormalizationError(
             node.source_index,
             "retry.max_attempts",
             "archon_retry_invalid",
-            "Archon retry.max_attempts must be an integer from 1 through 5",
+            f"Archon retry.max_attempts must be an integer from {minimum} through 5",
         )
     delay = value.get("delay_ms", 3000)
     if (
@@ -1226,9 +1244,8 @@ def language_compatibility_findings(
                     "prompt",
                 }:
                     retry_migration = (
-                        "An AI node requiring exactly one total attempt cannot "
-                        "migrate until a compatible explicit opt-out exists; "
-                        "Archon v3 defaults AI nodes to three total attempts."
+                        "For one total attempt on an AI node under Archon v6, author "
+                        "max_attempts as 0."
                     )
                 else:
                     retry_migration = (

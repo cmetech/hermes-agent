@@ -474,8 +474,8 @@ def test_phase3_archon_fields_are_implemented_and_legacy_guidance_is_exact(
     assert "1,000" in by_path["nodes[0].timeout"].migration
     assert "omit retry" in by_path["nodes[0].retry.max_attempts"].migration
     assert "N - 1" in by_path["nodes[1].retry.max_attempts"].migration
-    assert "cannot migrate" in by_path["nodes[2].retry.max_attempts"].migration
-    assert "three total attempts" in by_path["nodes[2].retry.max_attempts"].migration
+    assert "max_attempts as 0" in by_path["nodes[2].retry.max_attempts"].migration
+    assert "one total attempt" in by_path["nodes[2].retry.max_attempts"].migration
 
     profile_guidance = by_path["sidecar.language_compatibility"].migration
     assert "directly to depends_on" in profile_guidance

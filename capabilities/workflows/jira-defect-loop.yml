@@ -24,7 +24,7 @@ nodes:
         nonempty_status: ready
         max_items: 25
     maxTurns: 2
-    retry: {max_attempts: 1}
+    retry: {max_attempts: 0}
     output_format:
       type: object
       additionalProperties: false
