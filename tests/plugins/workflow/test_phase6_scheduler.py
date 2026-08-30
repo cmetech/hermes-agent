@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.entitlement import AIEntitlementResolution
 from plugins.workflow.executors.base import NodeExecutionResult
+from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.script import ScriptExecutor
 from plugins.workflow.output_resolution import (
     PrimaryOutputCandidate,
@@ -107,6 +109,11 @@ def _compile(
         "print(','.join(sorted(data)))\n",
         encoding="utf-8",
     )
+    (scripts / "artifact-free-path.py").write_text(
+        "import os\n"
+        "print(os.environ['ARTIFACTS_DIR'])\n",
+        encoding="utf-8",
+    )
     workflow = workflow_writer(
         root / "workflows",
         name=name,
@@ -191,6 +198,16 @@ class SucceedingExecutor:
     def execute(self, context):
         self.contexts.append(context)
         return NodeExecutionResult("succeeded")
+
+
+class RecordingProcessExecutor:
+    def __init__(self, executor) -> None:
+        self.executor = executor
+        self.contexts = []
+
+    def execute(self, context):
+        self.contexts.append(context)
+        return self.executor.execute(context)
 
 
 class OutputExecutor:
@@ -610,6 +627,334 @@ def test_artifact_free_scoped_script_receives_zero_runtime_ceiling(
 
     assert len(executor.contexts) == 1
     assert executor.contexts[0].max_artifact_bytes == 0
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
+    ("surface", "scoped"),
+    (
+        ("bash", False),
+        ("bash", True),
+        ("inline-script", False),
+        ("inline-script", True),
+        ("named-script", False),
+    ),
+)
+def test_v6_artifact_free_process_uses_one_attempt_private_rendered_workspace(
+    tmp_path, workflow_writer, surface, scoped
+) -> None:
+    if surface == "bash":
+        value = (
+            "rendered='$ARTIFACTS_DIR'; "
+            "exported=$(printenv ARTIFACTS_DIR); "
+            'test "$rendered" = "$exported"; printf \'%s\' "$exported"'
+        )
+        node = {"id": "artifact-free", "bash": value, "artifacts": False}
+        executor = RecordingProcessExecutor(BashExecutor())
+        executor_name = "bash"
+    else:
+        value = (
+            "artifact-free-path"
+            if surface == "named-script"
+            else (
+                "import os\n"
+                "rendered = '$ARTIFACTS_DIR'\n"
+                "assert rendered == os.environ['ARTIFACTS_DIR']\n"
+                "print(rendered)\n"
+            )
+        )
+        node = {
+            "id": "artifact-free",
+            "script": value,
+            "runtime": "uv",
+            "artifacts": False,
+        }
+        executor = RecordingProcessExecutor(ScriptExecutor())
+        executor_name = "script"
+    if scoped:
+        if executor_name == "bash":
+            value = str(node[executor_name]) + (
+                "\nprintf '\\n<promise>DONE</promise>'"
+            )
+        else:
+            value = str(node[executor_name]).replace(
+                "print(rendered)\n",
+                "print(rendered)\nprint('<promise>DONE</promise>')\n",
+            )
+        node[executor_name] = value
+        nodes = [_group([node])]
+    else:
+        nodes = [node]
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"artifact-free-path-{surface}-{scoped}",
+        nodes=nodes,
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key=f"artifact-free-path-{surface}-{scoped}")
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors[executor_name] = executor
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    [execution] = executor.contexts
+    private_workspace = execution.effective_attempt_directory / "artifacts"
+    assert execution.effective_publication_directory == private_workspace
+    assert isinstance(execution.variable_context, VariableContext)
+    assert execution.variable_context.artifacts_dir == private_workspace
+    assert (
+        execution.effective_attempt_directory / "stdout.txt"
+    ).read_text(encoding="utf-8").splitlines()[0] == str(private_workspace)
+    state = (
+        result["nodes"]["group"]["loop_group"]["body"]["artifact-free"]
+        if scoped
+        else result["nodes"]["artifact-free"]
+    )
+    assert state["state"] == "succeeded"
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize(
+    ("surface", "scoped"),
+    (("bash", False), ("script", True)),
+)
+def test_v6_artifact_free_retry_keeps_failed_residue_in_its_original_attempt(
+    tmp_path, workflow_writer, surface, scoped
+) -> None:
+    marker = tmp_path / f"retry-{surface}-{scoped}.marker"
+    if surface == "bash":
+        command = (
+            f"if [ ! -e {str(marker)!r} ]; then "
+            f": > {str(marker)!r}; "
+            "printf residue > \"$ARTIFACTS_DIR/forbidden.txt\"; fi; "
+            "printf 'ok <promise>DONE</promise>'"
+        )
+        node = {"id": "artifact-free", "bash": command, "artifacts": False}
+        executor = RecordingProcessExecutor(BashExecutor())
+    else:
+        command = (
+            "import os\n"
+            "from pathlib import Path\n"
+            f"marker = Path({str(marker)!r})\n"
+            "if not marker.exists():\n"
+            "    marker.touch()\n"
+            "    Path(os.environ['ARTIFACTS_DIR']).joinpath('forbidden.txt').write_text('residue')\n"
+            "print('ok <promise>DONE</promise>')\n"
+        )
+        node = {
+            "id": "artifact-free",
+            "script": command,
+            "runtime": "uv",
+            "artifacts": False,
+        }
+        executor = RecordingProcessExecutor(ScriptExecutor())
+    node["retry"] = {"max_attempts": 2, "on_error": "all", "delay_ms": 1000}
+    if scoped:
+        group = _group([node])
+        group["loop_group"]["signal_completes"] = True
+        nodes = [group]
+    else:
+        nodes = [node]
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"artifact-free-retry-{surface}-{scoped}",
+        nodes=nodes,
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key=f"artifact-free-retry-{surface}-{scoped}")
+
+    class RetryableArtifactExecutor:
+        def execute(self, context):
+            result = executor.execute(context)
+            if result.error_code != "artifact_limit":
+                return result
+            return NodeExecutionResult(
+                "failed",
+                error_code="provider_timeout",
+                error_message=result.error_message,
+                metadata={
+                    "known_no_effect": True,
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": True,
+                },
+            )
+
+    now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    scheduler = RunScheduler(
+        store,
+        max_parallel_nodes=1,
+        utcnow=lambda: now,
+        jitter=lambda: 0.5,
+    )
+    scheduler.executors[surface] = RetryableArtifactExecutor()
+
+    waiting = scheduler.advance_all([run_id])[run_id]
+    waiting_target = (
+        waiting["nodes"]["group"]["loop_group"]["body"]["artifact-free"]
+        if scoped
+        else waiting["nodes"]["artifact-free"]
+    )
+    assert waiting_target["state"] == "waiting_retry", (
+        waiting.get("last_error"),
+        waiting_target.get("retry_consumed"),
+        waiting_target["attempts"][-1].get("metadata"),
+    )
+    now += timedelta(seconds=1)
+    result = scheduler.advance_all([run_id])[run_id]
+
+    target_state = (
+        result["nodes"]["group"]["loop_group"]["body"]["artifact-free"]
+        if scoped
+        else result["nodes"]["artifact-free"]
+    )
+    assert target_state["state"] == "succeeded", target_state
+    assert len(executor.contexts) == 2
+    first, second = executor.contexts
+    assert first.attempt_id != second.attempt_id
+    assert first.effective_publication_directory == (
+        first.effective_attempt_directory / "artifacts"
+    )
+    assert second.effective_publication_directory == (
+        second.effective_attempt_directory / "artifacts"
+    )
+    assert first.effective_publication_directory != second.effective_publication_directory
+    assert (first.effective_publication_directory / "forbidden.txt").read_text() == (
+        "residue"
+    )
+    assert not (second.effective_publication_directory / "forbidden.txt").exists()
+    assert not list(
+        (store.run_directory(run_id) / "artifacts").rglob("forbidden.txt")
+    )
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+@pytest.mark.parametrize("surface", ("bash", "script"))
+def test_top_level_artifact_free_process_ignores_concurrent_child_publication(
+    tmp_path, workflow_writer, surface
+) -> None:
+    ready = tmp_path / f"concurrent-{surface}.ready"
+    published = tmp_path / f"concurrent-{surface}.published"
+    if surface == "bash":
+        node = {
+            "id": "artifact-free",
+            "bash": (
+                f": > {str(ready)!r}; "
+                f"while [ ! -e {str(published)!r} ]; do sleep 0.01; done; "
+                "printf ok"
+            ),
+            "artifacts": False,
+        }
+        executor = RecordingProcessExecutor(BashExecutor())
+    else:
+        node = {
+            "id": "artifact-free",
+            "script": (
+                "import time\n"
+                "from pathlib import Path\n"
+                f"ready = Path({str(ready)!r})\n"
+                f"published = Path({str(published)!r})\n"
+                "ready.touch()\n"
+                "while not published.exists():\n"
+                "    time.sleep(0.01)\n"
+                "print('ok')\n"
+            ),
+            "runtime": "uv",
+            "artifacts": False,
+        }
+        executor = RecordingProcessExecutor(ScriptExecutor())
+    publisher = {
+        "id": "publisher",
+        "bash": (
+            f"while [ ! -e {str(ready)!r} ]; do sleep 0.01; done; "
+            'printf published > "$ARTIFACTS_DIR/result.txt"; '
+            f": > {str(published)!r}; "
+            "printf published"
+        ),
+    }
+    group = _group([publisher])
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"artifact-free-concurrent-{surface}",
+        nodes=[node, group],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=2)
+    run_id = _admit(store, compilation, key=f"artifact-free-concurrent-{surface}")
+    scheduler = RunScheduler(store, max_parallel_nodes=2)
+    scheduler.executors[surface] = executor
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    run_directory = store.run_directory(run_id)
+    [execution] = [
+        context for context in executor.contexts if context.node.id == "artifact-free"
+    ]
+    assert result["nodes"]["artifact-free"]["state"] == "succeeded", result["nodes"]
+    publisher_state = result["nodes"]["group"]["loop_group"]["body"]["publisher"]
+    assert publisher_state["state"] == "succeeded", publisher_state
+    assert execution.effective_publication_directory == (
+        execution.effective_attempt_directory / "artifacts"
+    )
+    publication = (
+        run_directory
+        / "artifacts/loop-groups/group/iterations/0001/publisher/result.txt"
+    )
+    assert publication.read_text() == "published"
+
+
+@pytest.mark.parametrize(
+    ("case", "command"),
+    (
+        ("file", ': > "$ARTIFACTS_DIR/entry"'),
+        ("directory", 'mkdir "$ARTIFACTS_DIR/entry"'),
+        ("create-remove", ': > "$ARTIFACTS_DIR/entry"; rm "$ARTIFACTS_DIR/entry"'),
+        ("symlink", 'ln -s nowhere "$ARTIFACTS_DIR/entry"'),
+        (
+            "hardlink",
+            ': > "$HERMES_WORKFLOW_RUN_DIR/hardlink-source"; '
+            'ln "$HERMES_WORKFLOW_RUN_DIR/hardlink-source" "$ARTIFACTS_DIR/entry"',
+        ),
+        ("fifo", 'mkfifo "$ARTIFACTS_DIR/entry"'),
+        (
+            "root-replacement",
+            'mv "$ARTIFACTS_DIR" "$ARTIFACTS_DIR-old"; mkdir "$ARTIFACTS_DIR"',
+        ),
+    ),
+)
+def test_attempt_private_artifact_workspace_keeps_filesystem_checks_fail_closed(
+    tmp_path, workflow_writer, case, command
+) -> None:
+    node = {
+        "id": "artifact-free",
+        "bash": f"{command}; printf ok",
+        "artifacts": False,
+        "retry": {"max_attempts": 1},
+    }
+    compilation = _compile(
+        tmp_path,
+        workflow_writer,
+        name=f"artifact-free-filesystem-{case}",
+        nodes=[node],
+    )
+    store = RunStore(tmp_path / "home", max_total_workers=1)
+    run_id = _admit(store, compilation, key=f"artifact-free-filesystem-{case}")
+    executor = RecordingProcessExecutor(BashExecutor())
+    scheduler = RunScheduler(store, max_parallel_nodes=1)
+    scheduler.executors["bash"] = executor
+
+    result = scheduler.advance_all([run_id])[run_id]
+
+    [execution] = executor.contexts
+    assert execution.effective_publication_directory == (
+        execution.effective_attempt_directory / "artifacts"
+    )
+    state = result["nodes"]["artifact-free"]
+    assert state["state"] != "succeeded"
+    assert state["attempts"][-1]["error_code"] == "artifact_limit"
+    public_root = store.run_directory(run_id) / "artifacts"
+    assert not public_root.exists() or not any(public_root.iterdir())
 
 
 def test_scoped_script_receives_its_semantic_structured_output_contract(

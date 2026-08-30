@@ -5002,6 +5002,22 @@ class RunScheduler:
                     attempt_directory, publication_directory = (
                         self._scoped_directories(work_item, claim.attempt_id)
                     )
+                    artifact_free_process = (
+                        supports_phase6_semantics(
+                            package.language.effective_profile,
+                            package.language.normalizer_version,
+                        )
+                        and node.node_type in {"bash", "script"}
+                        and node.options.get("artifacts") is False
+                    )
+                    if artifact_free_process:
+                        publication_directory = (
+                            attempt_directory
+                            or self.store.run_directory(run_id)
+                            / "nodes"
+                            / node.id
+                            / claim.attempt_id
+                        ) / "artifacts"
                     variables = (
                         self._scoped_variables(
                             projection,
@@ -5032,6 +5048,11 @@ class RunScheduler:
                             ),
                         )
                     )
+                    if artifact_free_process and work_item.loop_group_scope is None:
+                        variables = replace(
+                            variables,
+                            artifacts_dir=publication_directory,
+                        )
                     loop_input = self._work_item_state(projection, work_item).get(
                         "loop_user_input_artifact"
                     )
@@ -5163,8 +5184,7 @@ class RunScheduler:
                             timeout_seconds=timeout,
                             **(
                                 {"max_artifact_bytes": 0}
-                                if runtime_node.node_type in {"bash", "script"}
-                                and runtime_node.options.get("artifacts") is False
+                                if artifact_free_process
                                 else {}
                             ),
                             is_cancelled=lambda: self._cancelled(run_id),
