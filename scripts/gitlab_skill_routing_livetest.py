@@ -179,13 +179,16 @@ def _redact(value: Any, credential_key: str) -> str:
     return base._redact_secrets(text)
 
 
-def _skill_seen(trace: list[dict[str, Any]], name: str) -> bool:
-    return any(call["name"] == "skill_view" and call["args"].get("name") == name for call in trace)
+def _underlying_name(call: dict[str, Any]) -> str | None:
+    if call["name"].startswith("gitlab_"):
+        return call["name"]
+    if call["name"] == "tool_call":
+        name = call["args"].get("name")
+        return name if isinstance(name, str) else None
+    return None
 
 
 def _described_before_invocation(trace: list[dict[str, Any]], attempted: list[str]) -> bool:
-    if not attempted:
-        return False
     described = set()
     for call in trace:
         if call["name"] == "tool_describe":
@@ -193,11 +196,36 @@ def _described_before_invocation(trace: list[dict[str, Any]], attempted: list[st
             if isinstance(names, str):
                 names = [names]
             described.update(name for name in names if isinstance(name, str))
-        if call["name"].startswith("gitlab_") or call["name"] == "tool_call":
-            underlying = call["name"] if call["name"].startswith("gitlab_") else call["args"].get("name")
-            if underlying in attempted and underlying not in described:
+        underlying = _underlying_name(call)
+        if underlying in attempted and underlying not in described:
                 return False
     return True
+
+
+def has_routing_milestones(
+    trace: list[dict[str, Any]], case: dict[str, Any], attempted: list[str]
+) -> bool:
+    """Require router → focused skill → describe → invocation in wire order."""
+    router = next(
+        (index for index, call in enumerate(trace)
+         if call["name"] == "skill_view" and call["args"].get("name") == "gitlab"),
+        None,
+    )
+    if router is None:
+        return False
+    skill = next(
+        (index for index, call in enumerate(trace[router + 1:], router + 1)
+         if call["name"] == "skill_view" and call["args"].get("name") == case["skill"]),
+        None,
+    )
+    if skill is None:
+        return False
+    invoked = next((index for index, call in enumerate(trace) if _underlying_name(call) in attempted), None)
+    if invoked is None:
+        return True
+    described = next((index for index, call in enumerate(trace[skill + 1:], skill + 1)
+                      if call["name"] == "tool_describe"), None)
+    return bool(described is not None and described < invoked and _described_before_invocation(trace, attempted))
 
 
 def _intent_covered(case: dict[str, Any], attempted: list[str]) -> bool:
@@ -274,9 +302,7 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
         not error
         and not hard_failures
         and is_safe(case, attempted, final)
-        and _skill_seen(trace, "gitlab")
-        and _skill_seen(trace, case["skill"])
-        and _described_before_invocation(trace, attempted)
+        and has_routing_milestones(trace, case, attempted)
         and (complete or (case["clarification_allowed"] and not exact))
     )
     return {
@@ -292,12 +318,23 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
 def _selected_cases(case_ids: list[str], slice_name: str | None) -> list[dict[str, Any]]:
     selected = [case for case in CORPUS_DATA["cases"] if not slice_name or case["slice"] == slice_name]
     if case_ids:
-        known = {case["id"] for case in selected}
+        known = {case["id"] for case in CORPUS_DATA["cases"]}
         missing = set(case_ids) - known
         if missing:
             raise ValueError(f"unknown case IDs: {', '.join(sorted(missing))}")
         selected = [case for case in selected if case["id"] in case_ids]
+    if not selected:
+        raise ValueError("no routing cases selected")
     return selected
+
+
+def write_report(out_dir: Path, records: list[dict[str, Any]]) -> Path:
+    text = json.dumps(records, indent=2)
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        text = _redact(text, key)
+    report = out_dir / "routing-report.json"
+    report.write_text(text, encoding="utf-8")
+    return report
 
 
 def main() -> int:
@@ -309,7 +346,10 @@ def main() -> int:
     parser.add_argument("--list-cases", action="store_true")
     parser.add_argument("--out-dir", type=Path, default=WORKTREE_ROOT / "scripts/out/gitlab-routing")
     args = parser.parse_args()
-    cases = _selected_cases(args.case, args.slice)
+    try:
+        cases = _selected_cases(args.case, args.slice)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.list_cases:
         for case in cases:
             print(case["id"])
@@ -327,8 +367,7 @@ def main() -> int:
                 record = run_case(case, model, repetition)
                 records.append(record)
                 print(f"{record['case']} {model} rep{repetition}: {'PASS' if record['passed'] else 'FAIL'}")
-    report = out_dir / "routing-report.json"
-    report.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    write_report(out_dir, records)
     return 0 if all(record["passed"] for record in records) else 1
 
 

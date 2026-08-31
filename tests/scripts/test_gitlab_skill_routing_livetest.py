@@ -38,6 +38,61 @@ def test_sequence_classifier_rejects_incomplete_and_wrong_order_prefixes():
     assert not runner.is_safe(multi_case, ["gitlab_job_log", "gitlab_read_job"], "Done.")
 
 
+def test_zero_call_clarification_keeps_the_safe_routing_prefix():
+    """A question before any GitLab invocation must not need a description."""
+    case = _case(sequences=[["gitlab_read_job"]])
+    case["skill"] = "ericsson-gitlab:ci-investigation"
+    trace = [
+        {"name": "skill_view", "args": {"name": "gitlab"}},
+        {"name": "skill_view", "args": {"name": case["skill"]}},
+    ]
+    assert runner.is_safe(case, [], "Which job should I inspect?")
+    assert runner.has_routing_milestones(trace, case, [])
+
+
+@pytest.mark.parametrize(
+    "trace",
+    [
+        [
+            {"name": "skill_view", "args": {"name": "ericsson-gitlab:ci-investigation"}},
+            {"name": "skill_view", "args": {"name": "gitlab"}},
+            {"name": "tool_describe", "args": {"names": ["gitlab_read_job"]}},
+            {"name": "gitlab_read_job", "args": {}},
+        ],
+        [
+            {"name": "skill_view", "args": {"name": "gitlab"}},
+            {"name": "tool_describe", "args": {"names": ["gitlab_read_job"]}},
+            {"name": "skill_view", "args": {"name": "ericsson-gitlab:ci-investigation"}},
+            {"name": "gitlab_read_job", "args": {}},
+        ],
+    ],
+)
+def test_routing_milestones_reject_reversed_or_late_skill_views(trace):
+    """Reordering either skill view must fail before the read is scored."""
+    case = _case(sequences=[["gitlab_read_job"]])
+    case["skill"] = "ericsson-gitlab:ci-investigation"
+    assert not runner.has_routing_milestones(trace, case, ["gitlab_read_job"])
+
+
+def test_selected_cases_rejects_unknown_and_empty_slices():
+    """A typo must not turn a list or live run into a silent no-op."""
+    with pytest.raises(ValueError, match="unknown case IDs"):
+        runner._selected_cases(["missing-case"], None)
+    with pytest.raises(ValueError, match="no routing cases"):
+        runner._selected_cases([], "missing-slice")
+
+
+def test_report_writer_redacts_trace_arguments(monkeypatch, tmp_path):
+    """A tool argument must not leak either live-provider or fake GitLab secret."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
+    report = runner.write_report(tmp_path, [{
+        "trace": [{"name": "tool_call", "args": {"token": "provider-secret", "pat": "gitlab-routing-fake-pat"}}],
+    }])
+    text = report.read_text(encoding="utf-8")
+    assert "provider-secret" not in text
+    assert "gitlab-routing-fake-pat" not in text
+
+
 def test_transcript_extractor_records_write_before_dispatch():
     """A pre-dispatch approval block cannot hide a selected GitLab write."""
     messages = [{

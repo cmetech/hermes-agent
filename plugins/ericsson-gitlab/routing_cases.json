@@ -182,7 +182,7 @@
     {
       "id": "ci-job-metadata-clear",
       "slice": "ci",
-      "prompt": "Show the status, stage, timing, and runner metadata for job 41 in division/platform/team/repo.",
+      "prompt": "Show the status, stage, and timing for job 41 in division/platform/team/repo.",
       "router": "gitlab",
       "skill": "ericsson-gitlab:ci-investigation",
       "required_intents": ["read_job"],
