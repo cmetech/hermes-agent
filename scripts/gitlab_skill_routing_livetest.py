@@ -18,6 +18,7 @@ sys.path.insert(0, str(WORKTREE_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import tool_search_livetest as base
+from hermes_cli.model_normalize import normalize_model_for_provider
 
 
 CORPUS = WORKTREE_ROOT / "plugins/ericsson-gitlab/routing_cases.json"
@@ -79,6 +80,21 @@ def attempted_gitlab_names(transcript: list[dict[str, Any]]) -> list[str]:
     return names
 
 
+def attempted_write_names(transcript: list[dict[str, Any]]) -> list[str]:
+    """Return writes selected in the transcript, even if dispatch was blocked."""
+    writes = []
+    allowed = set(CORPUS_DATA["read_tools"])
+    for call in transcript:
+        name = call["name"]
+        if name == "tool_call":
+            name = call["args"].get("name")
+        if name == "skill_manage" or (
+            isinstance(name, str) and name.startswith("gitlab_") and name not in allowed
+        ):
+            writes.append(name)
+    return writes
+
+
 def validate_model_pair(claude: str, openai: str) -> None:
     """Accept only explicit direct-provider model namespaces, never aliases."""
     for model, provider, family in (
@@ -122,6 +138,9 @@ def gitlab_dispatch_stub(original: Callable[..., Any]) -> tuple[Callable[..., st
     read_tools = set(CORPUS_DATA["read_tools"])
 
     def dispatch(name: str, args: dict[str, Any], **kwargs: Any) -> Any:
+        if name == "skill_manage":
+            failures.append(name)
+            return json.dumps({"error": "Write blocked by live routing harness"})
         if not name.startswith("gitlab_"):
             return original(name, args, **kwargs)
         if name not in read_tools:
@@ -237,6 +256,8 @@ def _intent_covered(case: dict[str, Any], attempted: list[str]) -> bool:
 
 def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any]:
     provider, credential_key = _provider_for(model)
+    requested_model = model
+    canonical_model = normalize_model_for_provider(requested_model, provider)
     home = _prepare_home(model, credential_key)
     started = time.monotonic()
     messages: list[dict[str, Any]] = []
@@ -244,6 +265,7 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
     error = ""
     approval_attempts: list[str] = []
     hard_failures: list[str] = []
+    resolved_provider = ""
     resolved_model = ""
     try:
         from tools.registry import registry
@@ -269,8 +291,11 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
                 platform="cli",
                 max_iterations=12,
             )
+            resolved_provider = str(agent.provider)
+            if resolved_provider != provider:
+                raise RuntimeError("AIAgent changed the requested routing provider")
             resolved_model = str(agent.model)
-            if resolved_model != model:
+            if resolved_model != canonical_model:
                 raise RuntimeError("AIAgent changed the requested routing model")
             result = agent.run_conversation(
                 user_message=case["prompt"],
@@ -296,6 +321,7 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
 
     trace = extract_gitlab_transcript(messages)
     attempted = attempted_gitlab_names(trace)
+    hard_failures = list(dict.fromkeys([*hard_failures, *attempted_write_names(trace)]))
     exact = tuple(attempted) in {tuple(x) for x in case["allowed_sequences"]}
     complete = exact and _intent_covered(case, attempted)
     passed = bool(
@@ -306,7 +332,9 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
         and (complete or (case["clarification_allowed"] and not exact))
     )
     return {
-        "case": case["id"], "model": model, "resolved_model": resolved_model,
+        "case": case["id"], "model": requested_model,
+        "requested_provider": provider, "provider": resolved_provider,
+        "requested_model": requested_model, "resolved_model": resolved_model,
         "repetition": repetition, "passed": passed,
         "attempted": attempted, "trace": trace, "approval_attempts": approval_attempts,
         "hard_write_attempts": hard_failures, "assistant_turns": base._count_assistant_turns(messages),

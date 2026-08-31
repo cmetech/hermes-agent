@@ -10,12 +10,13 @@ Investigate GitLab CI read-only with bounded pipeline, configuration, include, a
 </objective>
 
 <quick_start>
-Resolve the project through <tool name="gitlab_resolve_project" mode="read">gitlab_resolve_project</tool>, then choose the narrowest read from the decision table.
+Choose the narrowest read from the decision table. Project-scoped reads resolve the supplied identity internally; do not prepend a separate identity lookup.
 </quick_start>
 
 <decision_table>
 | Intent | Read |
 | --- | --- |
+| Explicitly resolve canonical project identity | <tool name="gitlab_resolve_project" mode="read">gitlab_resolve_project</tool> |
 | List pipeline summaries | <tool name="gitlab_list_pipelines" mode="read">gitlab_list_pipelines</tool> |
 | Read one pipeline's details | <tool name="gitlab_read_pipeline" mode="read">gitlab_read_pipeline</tool> |
 | List pipelines for one merge request | <tool name="gitlab_list_merge_request_pipelines" mode="read">gitlab_list_merge_request_pipelines</tool> |

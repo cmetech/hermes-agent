@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,21 @@ def test_transcript_extractor_records_write_before_dispatch():
     assert not runner.is_safe(_case(sequences=[[]]), [call["name"] for call in calls], "Blocked.")
 
 
+def test_transcript_classification_rejects_skill_manage_before_dispatch():
+    """A blocked skill mutation must remain a hard write in the transcript."""
+    messages = [{
+        "role": "assistant",
+        "tool_calls": [{
+            "function": {
+                "name": "tool_call",
+                "arguments": '{"name":"skill_manage","arguments":{"action":"create"}}',
+            },
+        }],
+    }]
+    calls = runner.extract_gitlab_transcript(messages)
+    assert runner.attempted_write_names(calls) == ["skill_manage"]
+
+
 def test_transcript_extractor_keeps_direct_assistant_calls_in_order():
     """Dropping a direct call would make the stored transcript incomplete."""
     messages = [{
@@ -165,6 +181,74 @@ def test_model_validation_accepts_distinct_explicit_provider_namespaces():
     runner.validate_model_pair("anthropic/claude-sonnet-4", "openai/gpt-5")
 
 
+def _run_case_with_fake_agent(
+    monkeypatch, tmp_path, *, resolved_provider="anthropic", resolved_model=None
+):
+    reached = []
+
+    class FakeAgent:
+        def __init__(self, *, provider, model, **_kwargs):
+            self.provider = resolved_provider
+            self.model = resolved_model or runner.normalize_model_for_provider(
+                model, provider
+            )
+
+        def run_conversation(self, **_kwargs):
+            reached.append(True)
+            return {"messages": [], "final_response": "Which job?"}
+
+    home = tmp_path / "isolated" / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_prepare_home", lambda *_args: home)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    result = runner.run_case(
+        {
+            "id": "model-boundary",
+            "prompt": "Inspect a job.",
+            "skill": "ericsson-gitlab:ci-investigation",
+            "required_intents": ["read_job"],
+            "allowed_sequences": [["gitlab_read_job"]],
+            "clarification_allowed": True,
+        },
+        "anthropic/claude-sonnet-4.6",
+        1,
+    )
+    return result, reached
+
+
+def test_namespaced_anthropic_model_reaches_conversation_with_canonical_id(
+    monkeypatch, tmp_path
+):
+    """Native Anthropic strips its namespace before the provider boundary."""
+    result, reached = _run_case_with_fake_agent(monkeypatch, tmp_path)
+    assert reached == [True]
+    assert result["error"] == ""
+    assert result["provider"] == "anthropic"
+    assert result["requested_model"] == "anthropic/claude-sonnet-4.6"
+    assert result["resolved_model"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.parametrize(
+    ("resolved_provider", "resolved_model", "message"),
+    [
+        ("openai", "claude-sonnet-4-6", "provider"),
+        ("anthropic", "claude-opus-4-6", "model"),
+    ],
+)
+def test_runner_rejects_genuinely_changed_provider_or_model_before_conversation(
+    monkeypatch, tmp_path, resolved_provider, resolved_model, message
+):
+    """Only provider-native canonicalization is accepted before the live boundary."""
+    result, reached = _run_case_with_fake_agent(
+        monkeypatch,
+        tmp_path,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+    )
+    assert reached == []
+    assert message in result["error"].lower()
+
+
 def test_output_directory_must_be_ignored_when_inside_worktree(tmp_path, monkeypatch):
     """An in-repo report directory is rejected unless Git ignores it."""
     monkeypatch.setattr(runner, "WORKTREE_ROOT", tmp_path)
@@ -183,7 +267,11 @@ def test_dispatch_stub_never_calls_real_gitlab_handler():
     dispatch, failures = runner.gitlab_dispatch_stub(real_dispatch)
     read = json.loads(dispatch("gitlab_list_pipelines", {"project": "x"}))
     write = json.loads(dispatch("gitlab_create_issue", {"project": "x"}))
+    skill_write = json.loads(dispatch("skill_manage", {"action": "create"}))
+    skill_read = dispatch("skill_view", {"name": "gitlab"})
     assert read["result"] == "fake GitLab read"
     assert write["error"] == "GitLab write blocked by live routing harness"
-    assert failures == ["gitlab_create_issue"]
-    assert invoked == []
+    assert skill_write["error"] == "Write blocked by live routing harness"
+    assert skill_read == "network"
+    assert failures == ["gitlab_create_issue", "skill_manage"]
+    assert invoked == ["skill_view"]

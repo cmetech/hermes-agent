@@ -1078,7 +1078,10 @@ class GitLabOperations:
                 return None
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise GitLabError("invalid_remote_data")
-            normalized = float(value)
+            try:
+                normalized = float(value)
+            except OverflowError:
+                raise GitLabError("invalid_remote_data") from None
             if normalized < 0 or not math.isfinite(normalized):
                 raise GitLabError("invalid_remote_data")
             return normalized
@@ -2503,17 +2506,19 @@ class GitLabOperations:
         ):
             raise GitLabError("invalid_input")
         page = start_page
+        pages_fetched = 0
         first_page = True
         items: list[dict[str, Any]] = []
         truncated = False
         next_page: int | None = None
         next_offset: int | None = None
-        while page <= self.client.max_pages:
+        while pages_fetched < self.client.max_pages:
             query = dict(params)
             query.update({"per_page": 100, "page": page})
             payload, headers = self.client.get_json_page(
                 path, params=query, deadline=deadline
             )
+            pages_fetched += 1
             values = _as_list(payload)
             offset_base = start_offset if first_page else 0
             if offset_base > len(values):
@@ -2539,7 +2544,7 @@ class GitLabOperations:
                     raise GitLabError("invalid_remote_data") from None
                 if candidate <= page:
                     raise GitLabError("invalid_remote_data")
-            if candidate > self.client.max_pages:
+            if pages_fetched >= self.client.max_pages:
                 truncated = True
                 next_page = candidate
                 break
