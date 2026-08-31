@@ -88,6 +88,18 @@ def test_routing_milestones_rejects_description_before_focused_skill():
     assert not runner.has_routing_milestones(trace, case, ["gitlab_read_job"])
 
 
+def test_routing_milestones_rejects_invocation_before_focused_skill():
+    """A focused skill loaded after an invocation cannot validate that route."""
+    case = _case(sequences=[["gitlab_read_job"]])
+    case["skill"] = "ericsson-gitlab:ci-investigation"
+    trace = [
+        {"name": "skill_view", "args": {"name": "gitlab"}},
+        {"name": "gitlab_read_job", "args": {}},
+        {"name": "skill_view", "args": {"name": case["skill"]}},
+    ]
+    assert not runner.has_routing_milestones(trace, case, ["gitlab_read_job"])
+
+
 def test_selected_cases_rejects_unknown_and_empty_slices():
     """A typo must not turn a list or live run into a silent no-op."""
     with pytest.raises(ValueError, match="unknown case IDs"):

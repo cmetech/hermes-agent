@@ -223,6 +223,8 @@ def has_routing_milestones(
     invoked = next((index for index, call in enumerate(trace) if _underlying_name(call) in attempted), None)
     if invoked is None:
         return True
+    if invoked <= skill:
+        return False
     return _described_before_invocation(trace[skill + 1:], attempted)
 
 
