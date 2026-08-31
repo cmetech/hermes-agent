@@ -215,6 +215,30 @@ def _as_list(value: Any) -> list[Any]:
     return value
 
 
+def _remote_commit_text(
+    commit: Mapping[str, Any],
+    field: str,
+    maximum: int,
+    *,
+    optional: bool = False,
+) -> str | None:
+    value = commit.get(field)
+    if optional and value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or "\x00" in value
+    ):
+        raise GitLabError("invalid_remote_data")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise GitLabError("invalid_remote_data") from None
+    return value
+
+
 def _same_origin_url(value: Any, origin: str) -> str:
     if not isinstance(value, str) or not value or len(value) > _MAX_PROJECT_REFERENCE:
         raise GitLabError("invalid_remote_data")
@@ -1166,17 +1190,6 @@ class GitLabOperations:
         if not sha.startswith(short_sha):
             raise GitLabError("invalid_remote_data")
 
-        def required_text(field: str, maximum: int) -> str:
-            value = commit.get(field)
-            if (
-                not isinstance(value, str)
-                or not value
-                or len(value) > maximum
-                or "\x00" in value
-            ):
-                raise GitLabError("invalid_remote_data")
-            return value
-
         _committed, committed_at = _rfc3339(
             commit.get("committed_date"), remote=True
         )
@@ -1187,10 +1200,14 @@ class GitLabOperations:
             "commit": {
                 "sha": sha,
                 "short_sha": short_sha,
-                "title": required_text("title", _MAX_COMMIT_TEXT),
+                "title": _remote_commit_text(commit, "title", _MAX_COMMIT_TEXT),
                 "committed_at": committed_at,
-                "author_name": required_text("author_name", 512),
-                "committer_name": required_text("committer_name", 512),
+                "author_name": _remote_commit_text(
+                    commit, "author_name", 512, optional=True
+                ),
+                "committer_name": _remote_commit_text(
+                    commit, "committer_name", 512, optional=True
+                ),
             },
         }
 
@@ -1262,17 +1279,6 @@ class GitLabOperations:
         if not sha.startswith(short_sha):
             raise GitLabError("invalid_remote_data")
 
-        def required_text(field: str, maximum: int) -> str:
-            value = commit.get(field)
-            if (
-                not isinstance(value, str)
-                or not value
-                or len(value) > maximum
-                or "\x00" in value
-            ):
-                raise GitLabError("invalid_remote_data")
-            return value
-
         _committed, committed_at = _rfc3339(
             commit.get("committed_date"), remote=True
         )
@@ -1289,10 +1295,14 @@ class GitLabOperations:
             "commit": {
                 "sha": sha,
                 "short_sha": short_sha,
-                "title": required_text("title", _MAX_COMMIT_TEXT),
+                "title": _remote_commit_text(commit, "title", _MAX_COMMIT_TEXT),
                 "committed_at": committed_at,
-                "author_name": required_text("author_name", 512),
-                "committer_name": required_text("committer_name", 512),
+                "author_name": _remote_commit_text(
+                    commit, "author_name", 512, optional=True
+                ),
+                "committer_name": _remote_commit_text(
+                    commit, "committer_name", 512, optional=True
+                ),
             },
         }
 
