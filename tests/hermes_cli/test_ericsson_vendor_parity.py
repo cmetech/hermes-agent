@@ -25,18 +25,27 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _managed_files(root: Path) -> dict[str, bytes]:
+def _git_blob(repo: Path, relative: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(repo), "show", f"HEAD:{relative}"],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+    ).stdout
+
+
+def _managed_file_inventory(root: Path) -> set[str]:
     if root.is_file():
-        return {"": root.read_bytes()}
+        return {""}
     assert root.is_dir(), f"managed path is missing: {root}"
-    result = {}
+    result = set()
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if any(part in IGNORED_TREE_NAMES for part in relative.parts):
             continue
         assert not path.is_symlink(), f"managed path is a symlink: {path}"
         if path.is_file():
-            result[relative.as_posix()] = path.read_bytes()
+            result.add(relative.as_posix())
     return result
 
 
@@ -66,12 +75,75 @@ def _fail_if_managed_bytes_differ(vendored: bytes, expected: bytes) -> None:
         pytest.fail("managed file bytes differ", pytrace=False)
 
 
-def test_managed_byte_mismatch_failure_does_not_disclose_contents() -> None:
-    source_bytes = b"source-proprietary-sentinel"
-    vendored_bytes = b"vendored-sensitive-sentinel"
+def _assert_committed_file_bytes_match(
+    source_repo: Path,
+    source_relative: str,
+    vendored_repo: Path,
+    vendored_relative: str,
+) -> None:
+    _fail_if_managed_bytes_differ(
+        _git_blob(vendored_repo, vendored_relative),
+        _git_blob(source_repo, source_relative),
+    )
+
+
+def _committed_payload_repo(
+    tmp_path: Path, name: str, payload: bytes, *, checkout_eol: str | None = None
+) -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "parity-test@example.invalid")
+    _git(repo, "config", "user.name", "Parity Test")
+    if checkout_eol is not None:
+        (repo / ".gitattributes").write_text(
+            f"payload.txt text eol={checkout_eol}\n", encoding="utf-8"
+        )
+    (repo / "payload.txt").write_bytes(payload)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "fixture")
+    if checkout_eol is not None:
+        (repo / "payload.txt").unlink()
+        _git(repo, "checkout", "--", "payload.txt")
+    return repo
+
+
+def test_committed_blob_comparison_ignores_checkout_eol_filters(tmp_path: Path) -> None:
+    payload = b"first line\nsecond line\n"
+    source = _committed_payload_repo(tmp_path, "source", payload)
+    vendored = _committed_payload_repo(
+        tmp_path, "vendored", payload, checkout_eol="crlf"
+    )
+
+    assert (source / "payload.txt").read_bytes() != (
+        vendored / "payload.txt"
+    ).read_bytes()
+    assert _git(source, "rev-parse", "HEAD:payload.txt") == _git(
+        vendored, "rev-parse", "HEAD:payload.txt"
+    )
+    assert _git(source, "status", "--porcelain=v1") == ""
+    assert _git(vendored, "status", "--porcelain=v1") == ""
+
+    _assert_committed_file_bytes_match(
+        source, "payload.txt", vendored, "payload.txt"
+    )
+
+
+def test_committed_blob_mismatch_failure_does_not_disclose_contents(
+    tmp_path: Path,
+) -> None:
+    source_bytes = b"source-proprietary-sentinel\n"
+    vendored_bytes = b"vendored-sensitive-sentinel\n"
+    source = _committed_payload_repo(tmp_path, "source", source_bytes)
+    vendored = _committed_payload_repo(tmp_path, "vendored", vendored_bytes)
+    assert _git(source, "rev-parse", "HEAD:payload.txt") != _git(
+        vendored, "rev-parse", "HEAD:payload.txt"
+    )
 
     with pytest.raises(pytest.fail.Exception) as failure:
-        _fail_if_managed_bytes_differ(vendored_bytes, source_bytes)
+        _assert_committed_file_bytes_match(
+            source, "payload.txt", vendored, "payload.txt"
+        )
 
     message = str(failure.value)
     assert message == "managed file bytes differ"
@@ -109,13 +181,18 @@ def test_vendored_ericsson_snapshot_matches_exact_source_authority() -> None:
     assert ledger == sorted(pairs), "vendored managed-path inventory differs from source"
 
     for destination, source_relative in sorted(pairs.items()):
-        source_files = _managed_files(source / source_relative)
-        vendored_files = _managed_files(REPO / destination)
-        assert vendored_files.keys() == source_files.keys(), (
+        source_files = _managed_file_inventory(source / source_relative)
+        vendored_files = _managed_file_inventory(REPO / destination)
+        assert vendored_files == source_files, (
             f"managed file inventory differs: {destination}"
         )
-        for relative, expected in source_files.items():
-            _fail_if_managed_bytes_differ(vendored_files[relative], expected)
+        for relative in sorted(source_files):
+            _assert_committed_file_bytes_match(
+                source,
+                (Path(source_relative) / relative).as_posix(),
+                REPO,
+                (Path(destination) / relative).as_posix(),
+            )
 
     expected_manifest = dict(source_manifest)
     source_skills = set(source_manifest.get("skills", []))
