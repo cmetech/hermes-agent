@@ -61,6 +61,24 @@ def _source_destination_pairs(source: Path, manifest: dict) -> dict[str, str]:
     return pairs
 
 
+def _fail_if_managed_bytes_differ(vendored: bytes, expected: bytes) -> None:
+    if vendored != expected:
+        pytest.fail("managed file bytes differ", pytrace=False)
+
+
+def test_managed_byte_mismatch_failure_does_not_disclose_contents() -> None:
+    source_bytes = b"source-proprietary-sentinel"
+    vendored_bytes = b"vendored-sensitive-sentinel"
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        _fail_if_managed_bytes_differ(vendored_bytes, source_bytes)
+
+    message = str(failure.value)
+    assert message == "managed file bytes differ"
+    assert source_bytes.decode() not in message
+    assert vendored_bytes.decode() not in message
+
+
 def test_vendored_ericsson_snapshot_matches_exact_source_authority() -> None:
     source_value = os.environ.get("ERICSSON_CAPABILITIES_DIR")
     expected_sha = os.environ.get("ERICSSON_CAPABILITIES_EXPECTED_SHA")
@@ -97,9 +115,7 @@ def test_vendored_ericsson_snapshot_matches_exact_source_authority() -> None:
             f"managed file inventory differs: {destination}"
         )
         for relative, expected in source_files.items():
-            assert vendored_files[relative] == expected, (
-                f"managed bytes differ: {destination}/{relative}".rstrip("/")
-            )
+            _fail_if_managed_bytes_differ(vendored_files[relative], expected)
 
     expected_manifest = dict(source_manifest)
     source_skills = set(source_manifest.get("skills", []))
