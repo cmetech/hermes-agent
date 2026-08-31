@@ -276,6 +276,78 @@ SCHEMAS = {
         },
         ["project", "pipeline_id"],
     ),
+    "gitlab_read_job": _schema(
+        "gitlab_read_job",
+        "Read one bounded normalized GitLab CI job without its trace.",
+        {
+            "project": _PROJECT,
+            "job_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2147483647,
+            },
+        },
+        ["project", "job_id"],
+    ),
+    "gitlab_list_pipeline_jobs": _schema(
+        "gitlab_list_pipeline_jobs",
+        "List bounded normalized GitLab CI jobs for one pipeline without traces.",
+        {
+            "project": _PROJECT,
+            "pipeline_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2147483647,
+            },
+            "statuses": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "created",
+                        "waiting_for_callback",
+                        "waiting_for_resource",
+                        "preparing",
+                        "pending",
+                        "running",
+                        "success",
+                        "failed",
+                        "canceled",
+                        "canceling",
+                        "skipped",
+                        "manual",
+                        "scheduled",
+                    ],
+                },
+            },
+            "include_retried": {"type": "boolean"},
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project", "pipeline_id"],
+    ),
+    "gitlab_list_merge_request_pipelines": _schema(
+        "gitlab_list_merge_request_pipelines",
+        "List bounded pipeline summaries for one GitLab merge request.",
+        {
+            "project": _PROJECT,
+            "iid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 500},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project", "iid"],
+    ),
+    "gitlab_list_ci_variables": _schema(
+        "gitlab_list_ci_variables",
+        "List bounded project CI variable metadata without variable values.",
+        {
+            "project": _PROJECT,
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project"],
+    ),
     "gitlab_inspect_ci": _schema(
         "gitlab_inspect_ci",
         "Inspect bounded GitLab pipeline, CI include, and variable metadata "
@@ -670,6 +742,30 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
         if name == "gitlab_read_pipeline":
             return operations.read_pipeline(
                 values["project"], values["pipeline_id"]
+            )
+        if name == "gitlab_read_job":
+            return operations.read_job(values["project"], values["job_id"])
+        if name == "gitlab_list_pipeline_jobs":
+            return operations.list_pipeline_jobs(
+                values["project"],
+                values["pipeline_id"],
+                statuses=values.get("statuses"),
+                include_retried=values.get("include_retried", False),
+                max_items=values.get("max_items", 100),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_list_merge_request_pipelines":
+            return operations.list_merge_request_pipelines(
+                values["project"],
+                values["iid"],
+                max_items=values.get("max_items", 100),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_list_ci_variables":
+            return operations.list_ci_variables(
+                values["project"],
+                max_items=values.get("max_items", 100),
+                continuation=values.get("continuation"),
             )
         if name == "gitlab_inspect_ci":
             return operations.inspect_ci(

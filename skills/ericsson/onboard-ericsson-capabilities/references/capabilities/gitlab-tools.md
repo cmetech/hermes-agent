@@ -34,6 +34,10 @@ implementation:
     - gitlab_list_merge_request_discussions
     - gitlab_list_pipelines
     - gitlab_read_pipeline
+    - gitlab_read_job
+    - gitlab_list_pipeline_jobs
+    - gitlab_list_merge_request_pipelines
+    - gitlab_list_ci_variables
     - gitlab_inspect_ci
     - gitlab_job_log
     - gitlab_retry_job
@@ -79,9 +83,9 @@ troubleshooting: [plugin disabled, missing or invalid configuration, permission 
 
 ## What it solves
 
-The standalone Ericsson GitLab plugin provides 30 tools: 18 bounded reads and
-12 approval-gated writes. It covers recursive group discovery, repository and
-commit research, actionable merge-request review, and CI diagnosis and recovery.
+The standalone Ericsson GitLab plugin provides bounded GitLab research, review,
+CI diagnosis, and approval-gated recovery. Its surface follows the registered
+schema authority rather than a hand-maintained operation count.
 
 ## Direct shell commands
 
@@ -94,18 +98,17 @@ configuration and is not a connector to enable; execution still requires
 write requires exactly one of `--dry-run` and `--confirm`, and origins,
 credentials, certificate paths, and profile selection stay off argv.
 
-The read surface resolves projects; lists group projects, repository trees,
-commits, commit comments and discussions, merge requests, merge-request commits
-and discussions, and pipelines; reads files, commits, merge requests, exact
-pipeline metadata, CI job-log tails, and merge-request approval state; and
-inspects CI structure and variable metadata without returning variable values.
+The surface is grouped by the bounded outcomes it returns:
 
-The write surface creates ticket-derived or explicitly named branches, atomic
-commits, and merge requests; posts merge-request notes; replies to and resolves
-or reopens discussions; approves, SHA-pins and merges, or updates merge requests;
-and retries jobs, starts manual jobs, or retries failed and canceled pipeline
-jobs. Pipeline/job cancellation and merge-request rebasing remain deliberately
-unavailable.
+| Area | Available bounded operations |
+| --- | --- |
+| Identity and repository | Resolve projects; list group projects, repository trees, commits, commit comments, and commit discussions; read files and commits. |
+| Merge requests | List merge requests, commits, and discussions; `gitlab_read_merge_request` includes bounded structured per-file diffs; inspect approval state. |
+| CI and jobs | List and read pipelines; read job metadata with `gitlab_read_job`, list jobs for one pipeline, list pipelines for one merge request, inspect CI structure, list project variable metadata without values, and read separately capped job-log traces with `gitlab_job_log`. Project variable metadata is distinct from the inherited metadata available through `gitlab_inspect_ci`. |
+| Approval-gated writes | Create branches, commits, and merge requests; post or resolve discussions; approve, SHA-pin and merge, or update merge requests; and retry or start bounded CI recovery actions. |
+
+Webhook enumeration, pipeline/job cancellation, merge-request rebasing, and
+remaining writes remain deliberately unavailable.
 
 ## Try saying
 
@@ -135,12 +138,13 @@ not provide credentials in chat.
 ## Reads and writes
 
 Reads return canonical identities with explicit page, item, byte, time, warning,
-untrusted-content, and truncation facts. Job logs are tail-biased and byte-capped;
-CI variable values are never returned.
+untrusted-content, and truncation facts. `gitlab_read_job` returns job metadata;
+`gitlab_job_log` separately returns a tail-biased, byte-capped trace. Project CI
+variable reads and inherited CI inspection return metadata only, never values.
 
-All 12 writes accept `dry_run` and require visible host approval whose scope is
-derived from the current call's exact arguments. Start with `dry_run=true` and
-have the user authorize that exact preview. The nine review-loop and CI writes
+Approval-gated writes accept `dry_run` and require visible host approval whose
+scope is derived from the current call's exact arguments. Start with `dry_run=true` and
+have the user authorize that exact preview. The review-loop and CI writes
 then require a new call with `confirm=true`; they refuse a call that supplies
 neither intent. The original branch, atomic-commit, and merge-request creation
 tools have no `confirm` argument: after their preview, execution uses

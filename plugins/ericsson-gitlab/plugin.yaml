@@ -19,6 +19,10 @@ provides_tools:
   - gitlab_read_merge_request
   - gitlab_list_pipelines
   - gitlab_read_pipeline
+  - gitlab_read_job
+  - gitlab_list_pipeline_jobs
+  - gitlab_list_merge_request_pipelines
+  - gitlab_list_ci_variables
   - gitlab_inspect_ci
   - gitlab_job_log
   - gitlab_retry_job

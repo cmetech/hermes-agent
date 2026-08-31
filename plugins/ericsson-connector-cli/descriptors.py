@@ -226,6 +226,10 @@ _GITLAB_PROJECT_OPERATIONS = (
     "gitlab_read_merge_request",
     "gitlab_list_pipelines",
     "gitlab_read_pipeline",
+    "gitlab_read_job",
+    "gitlab_list_pipeline_jobs",
+    "gitlab_list_merge_request_pipelines",
+    "gitlab_list_ci_variables",
     "gitlab_inspect_ci",
     "gitlab_job_log",
     "gitlab_retry_job",
@@ -398,6 +402,21 @@ _add_validation(
         },
         "gitlab_read_pipeline": {
             "pipeline_id": _v(minimum=1, maximum=2147483647),
+        },
+        "gitlab_read_job": {
+            "job_id": _v(minimum=1, maximum=2147483647),
+        },
+        "gitlab_list_pipeline_jobs": {
+            "pipeline_id": _v(minimum=1, maximum=2147483647),
+            "statuses": _v(min_items=1),
+            "max_items": _v(minimum=1, maximum=2000),
+        },
+        "gitlab_list_merge_request_pipelines": {
+            "iid": _v(minimum=1, maximum=2147483647),
+            "max_items": _v(minimum=1, maximum=500),
+        },
+        "gitlab_list_ci_variables": {
+            "max_items": _v(minimum=1, maximum=2000),
         },
         "gitlab_inspect_ci": {
             "branch_spec": _v(min_length=1, max_length=512),
@@ -1134,6 +1153,80 @@ DESCRIPTORS: tuple[CommandDescriptor, ...] = (
             _pos("pipeline-id", value_type="integer"),
         ),
         render_hint="pipeline-detail",
+    ),
+    _command(
+        _GITLAB,
+        ("gitlab", "job", "show"),
+        "gitlab_read_job",
+        "read",
+        positionals=(
+            _pos("project", value_type="string_or_integer"),
+            _pos("job-id", value_type="integer"),
+        ),
+        render_hint="job-detail",
+    ),
+    _command(
+        _GITLAB,
+        ("gitlab", "pipeline", "job-list"),
+        "gitlab_list_pipeline_jobs",
+        "read",
+        positionals=(
+            _pos("project", value_type="string_or_integer"),
+            _pos("pipeline-id", value_type="integer"),
+        ),
+        options=(
+            _opt(
+                "status",
+                "statuses",
+                repeatable=True,
+                choices=(
+                    "created",
+                    "waiting_for_callback",
+                    "waiting_for_resource",
+                    "preparing",
+                    "pending",
+                    "running",
+                    "success",
+                    "failed",
+                    "canceled",
+                    "canceling",
+                    "skipped",
+                    "manual",
+                    "scheduled",
+                ),
+            ),
+            _opt("include-retried", value_type="boolean"),
+            _opt("max-items", value_type="integer"),
+            _CONTINUATION,
+        ),
+        render_hint="job-list",
+    ),
+    _command(
+        _GITLAB,
+        ("gitlab", "mr", "pipeline-list"),
+        "gitlab_list_merge_request_pipelines",
+        "read",
+        positionals=(
+            _pos("project", value_type="string_or_integer"),
+            _pos("iid", value_type="integer"),
+        ),
+        options=(
+            _opt("max-items", value_type="integer"),
+            _CONTINUATION,
+        ),
+        render_hint="pipeline-list",
+    ),
+    _command(
+        _GITLAB,
+        ("gitlab", "variable", "list"),
+        "gitlab_list_ci_variables",
+        "read",
+        positionals=(_pos("project", value_type="string_or_integer"),),
+        options=(
+            _opt("max-items", value_type="integer"),
+            _CONTINUATION,
+        ),
+        render_hint="variable-list",
     ),
     _command(
         _GITLAB,

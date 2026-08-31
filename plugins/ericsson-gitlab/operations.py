@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
@@ -35,7 +36,9 @@ _MAX_GROUP_SLUG = 1024
 _MAX_GROUPS = 2000
 _MAX_GROUP_PROJECTS = 5000
 _MAX_COMMITS = 2000
+_MAX_JOBS = 2000
 _MAX_COMMIT_TEXT = 128 * 1024
+_MAX_JOB_TEXT = 2048
 _MAX_COMMIT_STAT = 1_000_000_000
 _MAX_COMMENTS = 2000
 _MAX_DISCUSSIONS = 1000
@@ -1044,6 +1047,105 @@ class GitLabOperations:
             result["stats"] = normalized_stats
         return result
 
+    def _normalize_job(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        project_path: str,
+        expected_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Project one GitLab job without trace, artifacts, variables, or email."""
+        identifier = _remote_positive_int(payload.get("id"))
+        if expected_id is not None and identifier != expected_id:
+            raise GitLabError("invalid_remote_data")
+
+        def required_text(source: Mapping[str, Any], field: str, maximum: int) -> str:
+            value = source.get(field)
+            if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
+                raise GitLabError("invalid_remote_data")
+            return value
+
+        def optional_time(field: str) -> str | None:
+            value = payload.get(field)
+            if value is None:
+                return None
+            _parsed, normalized = _rfc3339(value, remote=True)
+            return normalized
+
+        def optional_duration(field: str) -> float | None:
+            value = payload.get(field)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise GitLabError("invalid_remote_data")
+            normalized = float(value)
+            if normalized < 0 or not math.isfinite(normalized):
+                raise GitLabError("invalid_remote_data")
+            return normalized
+
+        tag = payload.get("tag")
+        allow_failure = payload.get("allow_failure")
+        if not isinstance(tag, bool) or not isinstance(allow_failure, bool):
+            raise GitLabError("invalid_remote_data")
+        pipeline_raw = _as_object(payload.get("pipeline"))
+        commit_raw = _as_object(payload.get("commit"))
+        pipeline_id = _remote_positive_int(pipeline_raw.get("id"))
+        commit_sha = _commit_sha(commit_raw.get("id"))
+        short_sha = _commit_sha(commit_raw.get("short_id"), short=True)
+        if not commit_sha.startswith(short_sha):
+            raise GitLabError("invalid_remote_data")
+        encoded_project = quote(project_path, safe="/")
+        pipeline_url = (
+            f"{self.client.auth.origin}/{encoded_project}/-/pipelines/{pipeline_id}"
+        )
+        commit_url = (
+            f"{self.client.auth.origin}/{encoded_project}/-/commit/{commit_sha}"
+        )
+        web_url = _same_origin_url(
+            required_text(payload, "web_url", _MAX_PROJECT_REFERENCE),
+            self.client.auth.origin,
+        )
+        failure_reason = payload.get("failure_reason")
+        if failure_reason is not None and (
+            not isinstance(failure_reason, str)
+            or len(failure_reason) > _MAX_JOB_TEXT
+            or "\x00" in failure_reason
+        ):
+            raise GitLabError("invalid_remote_data")
+        return {
+            "id": identifier,
+            "name": required_text(payload, "name", _MAX_JOB_TEXT),
+            "stage": required_text(payload, "stage", _MAX_JOB_TEXT),
+            "status": required_text(payload, "status", 64),
+            "ref": _validate_remote_ref(payload.get("ref")),
+            "tag": tag,
+            "allow_failure": allow_failure,
+            "created_at": optional_time("created_at"),
+            "queued_at": optional_time("queued_at"),
+            "started_at": optional_time("started_at"),
+            "finished_at": optional_time("finished_at"),
+            "erased_at": optional_time("erased_at"),
+            "duration": optional_duration("duration"),
+            "queued_duration": optional_duration("queued_duration"),
+            "failure_reason": failure_reason,
+            "pipeline": {
+                "id": pipeline_id,
+                "status": required_text(pipeline_raw, "status", 64),
+                "web_url": pipeline_url,
+            },
+            "commit": {
+                "sha": commit_sha,
+                "short_sha": short_sha,
+                "title": required_text(commit_raw, "title", _MAX_COMMIT_TEXT),
+                "web_url": commit_url,
+            },
+            "user": (
+                None if payload.get("user") is None
+                else self._normalize_user(payload.get("user"))
+            ),
+            "web_url": web_url,
+        }
+
     def list_commits(
         self,
         project: str | int,
@@ -1142,6 +1244,81 @@ class GitLabOperations:
                 project_path=resolved["path_with_namespace"],
                 include_stats=True,
             ),
+        }
+
+    def read_job(self, project: str | int, job_id: int) -> dict[str, Any]:
+        job_id = _positive_bound(job_id, 2_147_483_647)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        payload = _as_object(self.client.get_json(
+            f"/api/v4/projects/{resolved['id']}/jobs/{job_id}",
+            deadline=deadline,
+        ))
+        return {
+            "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
+            "job": self._normalize_job(
+                payload,
+                project_path=resolved["path_with_namespace"],
+                expected_id=job_id,
+            ),
+        }
+
+    def list_pipeline_jobs(
+        self,
+        project: str | int,
+        pipeline_id: int,
+        *,
+        statuses: list[str] | None = None,
+        include_retried: bool = False,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        pipeline_id = _positive_bound(pipeline_id, 2_147_483_647)
+        max_items = _positive_bound(max_items, _MAX_JOBS)
+        if type(include_retried) is not bool:
+            raise GitLabError("invalid_input")
+        start_page, start_offset = _continuation_source(continuation)
+        if statuses is not None:
+            allowed_statuses = {
+                "created", "waiting_for_callback", "waiting_for_resource",
+                "preparing", "pending", "running", "success", "failed",
+                "canceled", "canceling", "skipped", "manual", "scheduled",
+            }
+            if (
+                not isinstance(statuses, list)
+                or not statuses
+                or any(
+                    not isinstance(status, str) or status not in allowed_statuses
+                    for status in statuses
+                )
+                or len(statuses) != len(set(statuses))
+            ):
+                raise GitLabError("invalid_input")
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        params: dict[str, Any] = {"include_retried": include_retried}
+        if statuses is not None:
+            params["scope[]"] = statuses
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/pipelines/{pipeline_id}/jobs",
+            params=params,
+            max_items=max_items,
+            normalize=lambda item: self._normalize_job(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
+            "pipeline": {"id": pipeline_id},
+            "statuses": statuses,
+            "include_retried": include_retried,
+            "jobs": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
         }
 
     @staticmethod
@@ -2579,6 +2756,38 @@ class GitLabOperations:
         _same_origin_url(result["web_url"], self.client.auth.origin)
         return result
 
+    def _normalize_pipeline_summary(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        identifier = _remote_positive_int(payload.get("id"))
+        projected: dict[str, Any] = {"id": identifier}
+        iid = payload.get("iid")
+        if iid is not None:
+            projected["iid"] = _remote_positive_int(iid)
+        ref = payload.get("ref")
+        projected["ref"] = None if ref is None else _validate_remote_ref(ref)
+        sha = payload.get("sha")
+        projected["sha"] = None if sha is None else _commit_sha(sha)
+        for field in ("status", "source"):
+            value = payload.get(field)
+            if value is not None and (
+                not isinstance(value, str)
+                or not value
+                or len(value) > _MAX_PROJECT_REFERENCE
+                or "\x00" in value
+            ):
+                raise GitLabError("invalid_remote_data")
+            projected[field] = value
+        for field in ("created_at", "updated_at"):
+            value = payload.get(field)
+            if value is None:
+                projected[field] = None
+            else:
+                _parsed, projected[field] = _rfc3339(value, remote=True)
+        web_url = payload.get("web_url")
+        projected["web_url"] = (
+            None if web_url is None else _same_origin_url(web_url, self.client.auth.origin)
+        )
+        return projected
+
     def list_pipelines(
         self,
         project: str | int,
@@ -2595,41 +2804,45 @@ class GitLabOperations:
         if status is not None:
             params["status"] = _bounded_string(status, 64)
 
-        def normalize(item: Mapping[str, Any]) -> dict[str, Any]:
-            identifier = item.get("id")
-            if isinstance(identifier, bool) or not isinstance(identifier, int):
-                raise GitLabError("invalid_remote_data")
-            projected: dict[str, Any] = {"id": identifier}
-            iid = item.get("iid")
-            if isinstance(iid, int) and not isinstance(iid, bool):
-                projected["iid"] = iid
-            for field in (
-                "ref",
-                "sha",
-                "status",
-                "source",
-                "web_url",
-                "created_at",
-                "updated_at",
-            ):
-                value = item.get(field)
-                if value is not None and (
-                    not isinstance(value, str) or len(value) > _MAX_PROJECT_REFERENCE
-                ):
-                    raise GitLabError("invalid_remote_data")
-                projected[field] = value
-            if projected.get("web_url") is not None:
-                _same_origin_url(projected["web_url"], self.client.auth.origin)
-            return projected
-
         pages = self._paginate(
             f"/api/v4/projects/{project_endpoint}/pipelines",
             params=params,
             max_items=max_items,
-            normalize=normalize,
+            normalize=self._normalize_pipeline_summary,
         )
         return {
             "project": str(project),
+            "pipelines": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def list_merge_request_pipelines(
+        self,
+        project: str | int,
+        iid: int,
+        *,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        iid = _positive_bound(iid, 2_147_483_647)
+        max_items = _positive_bound(max_items, _MAX_PIPELINES)
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/merge_requests/{iid}/pipelines",
+            params={},
+            max_items=max_items,
+            normalize=self._normalize_pipeline_summary,
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
+            "merge_request": {"iid": iid},
             "pipelines": list(pages.items),
             "count": len(pages.items),
             "truncated": pages.truncated,
@@ -4163,6 +4376,53 @@ class GitLabOperations:
             "description": description,
             "scope": scope,
             "source": source,
+        }
+
+    def list_ci_variables(
+        self,
+        project: str | int,
+        *,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        max_items = _positive_bound(max_items, _MAX_CI_VARIABLES)
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+
+        def normalize(raw: Mapping[str, Any]) -> dict[str, Any]:
+            metadata = self._variable_metadata(
+                raw, scope="project", source=resolved["path_with_namespace"]
+            )
+            return {
+                key: metadata[key]
+                for key in (
+                    "key",
+                    "type",
+                    "protected",
+                    "masked",
+                    "hidden",
+                    "raw",
+                    "environment_scope",
+                    "description",
+                )
+            }
+
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/variables",
+            params={},
+            max_items=max_items,
+            normalize=normalize,
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
+            "variables": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
         }
 
     def _collect_variable_endpoint(

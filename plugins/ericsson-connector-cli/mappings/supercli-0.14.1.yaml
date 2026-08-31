@@ -310,10 +310,12 @@ rows:
     operation: gitlab_retry_job
     rationale: Retry is authorized once and does not retry an unproved mutation outcome.
     evidence_ref: out/func-strings.txt:2995; PLUGIN-GAP-ANALYSIS.md sections 2 and 4
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab job view
-    rationale: A standalone normalized job-detail operation is not exposed in this release.
+    replacement: '{brand} gitlab job show <project> <job-id>'
+    operation: gitlab_read_job
+    rationale: The replacement returns bounded normalized job metadata without the trace, which remains a separate capped job-log read.
     evidence_ref: out/func-strings.txt:2932; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *renamed_read
     service: gitlab
@@ -343,10 +345,12 @@ rows:
     operation: gitlab_create_merge_request
     rationale: MR creation uses bounded fields and refuses ambiguous mutation retries.
     evidence_ref: out/func-strings.txt:2904; PLUGIN-GAP-ANALYSIS.md sections 1.2 and 2
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab mr diff
-    rationale: The connector reads MR metadata but does not expose the source command's per-file diff contract.
+    replacement: '{brand} gitlab mr show <project> <iid>'
+    operation: gitlab_read_merge_request
+    rationale: The replacement returns bounded merge-request metadata with structured per-file diffs instead of an arbitrary raw diff payload.
     evidence_ref: out/func-strings.txt:2869; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *safer_write
     service: gitlab
@@ -404,10 +408,12 @@ rows:
     operation: gitlab_reply_to_discussion
     rationale: Replies are bound to one discussion and use bounded file input and explicit intent.
     evidence_ref: out/func-strings.txt:2879; PLUGIN-GAP-ANALYSIS.md section 4
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab mr pipeline list
-    rationale: MR-specific pipeline enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab mr pipeline-list <project> <iid>'
+    operation: gitlab_list_merge_request_pipelines
+    rationale: The replacement returns bounded normalized pipeline summaries for one merge request rather than an unbounded vendor response.
     evidence_ref: out/func-strings.txt:2984; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *gap
     service: gitlab
@@ -426,10 +432,12 @@ rows:
     source_command: super-cli gitlab pipeline cancel
     rationale: Pipeline cancellation has no reviewed preview and confirmation path in this release.
     evidence_ref: out/func-strings.txt:2988; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab pipeline job list
-    rationale: Pipeline-job enumeration is not exposed as a standalone connector operation.
+    replacement: '{brand} gitlab pipeline job-list <project> <pipeline-id>'
+    operation: gitlab_list_pipeline_jobs
+    rationale: The replacement returns bounded normalized jobs for one pipeline without job traces or arbitrary raw payload fields.
     evidence_ref: out/func-strings.txt:2928; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *equivalent_read
     service: gitlab
@@ -514,10 +522,12 @@ rows:
     source_command: super-cli gitlab todo list
     rationale: User-scoped to-do enumeration is not part of the project-scoped connector contract.
     evidence_ref: out/func-strings.txt:3015; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *excluded
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab variable list
-    rationale: CI/CD variable enumeration can expose protected configuration and is deliberately excluded.
+    replacement: '{brand} gitlab variable list <project>'
+    operation: gitlab_list_ci_variables
+    rationale: The replacement returns bounded project variable metadata without values, unlike broader inherited CI inspection.
     evidence_ref: out/func-strings.txt:3012; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *excluded
     service: gitlab
