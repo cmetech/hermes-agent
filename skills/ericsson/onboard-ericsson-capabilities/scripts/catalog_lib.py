@@ -327,6 +327,25 @@ def validate_workflow_sidecar(
     return sorted(set(problems))
 
 
+def workflow_node_ids(nodes: object) -> set[str]:
+    """Return top-level and loop-group node ids in runtime scoped form."""
+    if not isinstance(nodes, list):
+        return set()
+    result: set[str] = set()
+    pending = [("", nodes)]
+    while pending:
+        scope, members = pending.pop()
+        for node in members:
+            if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+                continue
+            semantic_id = f"{scope}/{node['id']}" if scope else node["id"]
+            result.add(semantic_id)
+            group = node.get("loop_group")
+            if isinstance(group, dict) and isinstance(group.get("nodes"), list):
+                pending.append((semantic_id, group["nodes"]))
+    return result
+
+
 def _relative_label(path: Path) -> str:
     return path.as_posix()
 
@@ -368,16 +387,7 @@ def _workflow_language_profile(
     )
     if metadata is None:
         return None
-    nodes = workflow_metadata.get("nodes", [])
-    node_ids = (
-        {
-            node["id"]
-            for node in nodes
-            if isinstance(node, dict) and isinstance(node.get("id"), str)
-        }
-        if isinstance(nodes, list)
-        else set()
-    )
+    node_ids = workflow_node_ids(workflow_metadata.get("nodes", []))
     for field in validate_workflow_sidecar(metadata, node_ids=node_ids):
         problems.append(f"invalid workflow sidecar: {relative}: {field}")
     profile = metadata.get("language_compatibility")
