@@ -39,6 +39,30 @@ def test_sequence_classifier_rejects_incomplete_and_wrong_order_prefixes():
     assert not runner.is_safe(multi_case, ["gitlab_job_log", "gitlab_read_job"], "Done.")
 
 
+def test_sequence_classifier_requires_declared_clarification_prefix(monkeypatch):
+    """Dropping a declared prefix must not accept a premature clarification."""
+    monkeypatch.setitem(
+        runner.CORPUS_DATA,
+        "read_tools",
+        [*runner.CORPUS_DATA["read_tools"], "gitlab_search_projects", "gitlab_search_code"],
+    )
+    required = _case(sequences=[["gitlab_search_projects", "gitlab_search_code"]])
+    required["clarification_prefix"] = ["gitlab_search_projects"]
+    omitted = _case(sequences=[["gitlab_search_projects", "gitlab_search_code"]])
+    empty = {**omitted, "clarification_prefix": []}
+    cases = [
+        (required, [], "Which project should I search?", False),
+        (required, ["gitlab_search_projects"], "Which project should I search?", True),
+        (required, ["gitlab_search_projects"], "I need a project.", False),
+        (required, ["gitlab_search_projects", "gitlab_search_code"], "Done.", True),
+        (omitted, [], "Which project should I search?", True),
+        (empty, [], "Which project should I search?", True),
+    ]
+
+    for case, attempted, final, expected in cases:
+        assert runner.is_safe(case, attempted, final) is expected
+
+
 def test_zero_call_clarification_keeps_the_safe_routing_prefix():
     """A question before any GitLab invocation must not need a description."""
     case = _case(sequences=[["gitlab_read_job"]])
