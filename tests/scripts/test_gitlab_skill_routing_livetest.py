@@ -74,6 +74,20 @@ def test_routing_milestones_reject_reversed_or_late_skill_views(trace):
     assert not runner.has_routing_milestones(trace, case, ["gitlab_read_job"])
 
 
+def test_routing_milestones_rejects_description_before_focused_skill():
+    """A pre-skill description cannot authorize a later focused route."""
+    case = _case(sequences=[["gitlab_read_job"]])
+    case["skill"] = "ericsson-gitlab:ci-investigation"
+    trace = [
+        {"name": "skill_view", "args": {"name": "gitlab"}},
+        {"name": "tool_describe", "args": {"names": ["gitlab_read_job"]}},
+        {"name": "skill_view", "args": {"name": case["skill"]}},
+        {"name": "tool_describe", "args": {"names": ["gitlab_list_pipelines"]}},
+        {"name": "gitlab_read_job", "args": {}},
+    ]
+    assert not runner.has_routing_milestones(trace, case, ["gitlab_read_job"])
+
+
 def test_selected_cases_rejects_unknown_and_empty_slices():
     """A typo must not turn a list or live run into a silent no-op."""
     with pytest.raises(ValueError, match="unknown case IDs"):

@@ -223,9 +223,7 @@ def has_routing_milestones(
     invoked = next((index for index, call in enumerate(trace) if _underlying_name(call) in attempted), None)
     if invoked is None:
         return True
-    described = next((index for index, call in enumerate(trace[skill + 1:], skill + 1)
-                      if call["name"] == "tool_describe"), None)
-    return bool(described is not None and described < invoked and _described_before_invocation(trace, attempted))
+    return _described_before_invocation(trace[skill + 1:], attempted)
 
 
 def _intent_covered(case: dict[str, Any], attempted: list[str]) -> bool:
