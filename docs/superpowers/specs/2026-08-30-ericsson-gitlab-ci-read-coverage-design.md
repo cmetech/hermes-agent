@@ -90,9 +90,11 @@ The result contains canonical project identity and one normalized job with:
 - ID, name, stage, status, ref, tag state, and `allow_failure`;
 - created, queued, started, finished, erased, and duration facts when present;
 - bounded failure reason;
-- pipeline ID/status/web URL;
-- commit SHA/short SHA/title/web URL;
-- display-safe triggering user; and
+- pipeline ID/status and a canonical same-origin web URL derived from the
+  project and pipeline ID when GitLab omits the nested URL;
+- commit SHA/short SHA/title and a canonical same-origin web URL derived from
+  the project and SHA when GitLab omits the nested URL;
+- display-safe triggering user when present, otherwise `None`; and
 - same-origin job web URL.
 
 It does not return trace text, artifact contents, runner authentication data,
@@ -155,6 +157,12 @@ for inherited project and ancestor-group metadata continue to use
 multi-source behavior.
 
 ## Collection and safety invariants
+
+Job normalization accepts documented GitLab shapes where `user` is `null` and
+nested pipeline/commit summaries omit their own `web_url`. A present user uses
+the connector's existing `{id, username, name, state}` projection. Optional
+runner, artifact, and timestamp members remain optional; their absence does
+not turn a valid job into `invalid_remote_data`.
 
 All three collection operations use the existing page-size and page-ceiling
 machinery, enforce a result limit after normalization, and return a usable
@@ -231,7 +239,8 @@ Their `glab` execution commands are not copied; this connector uses its own
 bounded REST operations and safety envelope.
 
 A shared checked-in routing corpus records prompt, expected router, expected
-qualified skill, allowed first GitLab read, and allowed follow-up reads. This
+qualified skill, allowed ordered GitLab-read sequences, required intents, and
+whether clarification is an allowed terminal outcome. This
 slice contributes clear, paraphrased, terse-ID, and ambiguous cases for all
 four new operations plus their existing neighbors. Static tests prove every
 referenced skill/tool exists and no case permits a write. A Hermes live eval
@@ -241,7 +250,9 @@ real GitLab server.
 
 Before completion, clear cases must pass on one configured Claude model and
 one configured OpenAI/Codex model. Ambiguous cases run three times per model
-and must select an allowed safe route or ask for clarification every time.
+and must complete an allowed ordered sequence or ask a genuine clarification
+every time. A safe prefix that neither completes every required intent nor
+asks for clarification is a failure.
 Any GitLab write selection is a hard failure.
 
 ## Connector CLI and documentation

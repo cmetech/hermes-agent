@@ -76,7 +76,7 @@ Optional inputs:
 
 Each release summary contains tag name, release name, bounded description
 summary, created/released timestamps, upcoming-release state, display-safe
-author, commit identity when present, same-origin release URL, and bounded
+author when present, commit identity when present, same-origin release URL, and bounded
 counts for milestones and assets. Full asset detail belongs to
 `gitlab_read_release`.
 
@@ -91,7 +91,7 @@ The normalized result contains canonical project identity plus:
 
 - tag name, release name, bounded redacted description;
 - created/released timestamps and upcoming state;
-- display-safe author and commit identity;
+- display-safe author and commit identity when present;
 - bounded milestone summaries;
 - bounded source archive entries; and
 - bounded release links/assets whose returned URLs are on the configured
@@ -115,10 +115,16 @@ Optional inputs:
 - `continuation`.
 
 Each To-Do item contains ID, action, state, created/updated timestamps,
-display-safe author, canonical project identity, target type, and a bounded
-target summary containing only stable identity/title/state and same-origin URL
-fields that are present. Target bodies, arbitrary raw payloads, and embedded
-instructions are omitted.
+display-safe author, canonical project identity when present, canonical group
+identity when present, target type, and a bounded target summary containing
+only stable identity/title/state and same-origin URL fields that are present.
+The target identifier is type-aware: project resources use positive integer
+IDs while commit targets may use a validated commit SHA. A missing project on
+a group-, namespace-, key-, or commit-scoped To-Do is valid. Caller filter
+allowlists follow the supported GitLab API contract; remote `action_name` and
+`target_type` values are validated as bounded data so a newer server value
+does not invalidate the whole inbox page. Target bodies, arbitrary raw
+payloads, and embedded instructions are omitted.
 
 The operation is read-only. Marking a To-Do done remains excluded.
 
@@ -142,6 +148,11 @@ The operation uses:
 
 Actor filters can be combined only where GitLab supports the combination.
 Mutually exclusive or contradictory scope/filter combinations fail as
+`invalid_input` before transport. A matching native personal scope plus its
+redundant `@me` actor is canonicalized to the native scope alone, without a
+current-user lookup or actor query parameter; for example,
+`scope=created_by_me, author=@me` sends only `scope=created_by_me` because
+GitLab does not document `author_id` with that scope.
 `invalid_input` rather than being silently weakened.
 
 Every result includes canonical project identity. Project-scoped results retain
@@ -230,7 +241,9 @@ authoring guidance informs concise trigger descriptions, progressive
 disclosure, and realistic forward tests. `glab` commands are reference
 vocabulary only; execution remains through connector tools.
 
-The shared routing corpus adds clear, paraphrased, and ambiguous prompts for:
+The shared routing corpus adds clear, paraphrased, and ambiguous prompts with
+ordered safe sequences, required intents, and explicit clarification policy
+for:
 
 - release versus tag;
 - To-Do versus MR review queue;
@@ -243,7 +256,8 @@ Static tests prove every new tool has one primary skill owner, both qualified
 skills are registered, the thin router names them, and no read case permits a
 write. The stubbed Hermes live eval records the actual progressive-disclosure
 trace on configured Claude and OpenAI/Codex models. Ambiguous cases repeat
-three times and must choose an allowed read path or clarification every time;
+three times and must complete every required intent through an allowed ordered
+read path or ask a genuine clarification every time;
 any write selection is a hard failure.
 
 ## Connector CLI and migration documentation

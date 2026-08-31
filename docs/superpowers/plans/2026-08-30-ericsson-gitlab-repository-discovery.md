@@ -31,6 +31,9 @@ YAML/Markdown docs, and Node.js vendoring.
   `plugins/ericsson-gitlab/routing_cases.json` and
   `scripts/gitlab_skill_routing_livetest.py` exist. This slice extends them;
   it does not add another harness.
+- Do not infer completion from file presence. Consume the exact
+  `CI_SOURCE_SHA` and `CI_HERMES_SHA` recorded by the CI plan and prove they
+  are ancestors of source `main` and Hermes `base` before branching.
 - `ericsson-capabilities/main` remains authoritative; Hermes receives only a
   clean committed vendor snapshot.
 - Start source work from current clean `main` and Hermes work from `base`.
@@ -69,15 +72,19 @@ Authoritative source:
 - `skills/ericsson/gitlab/SKILL.md` and onboarding GitLab reference/catalog —
   thin routing and user-facing discovery flow.
 - `tests/test_gitlab_exploration.py`, `tests/test_gitlab_plugin.py`,
-  `tests/test_gitlab_skills.py`, and
-  `tests/test_connector_cli_gitlab_port.py` — contract tests.
+  `tests/test_gitlab_skills.py`, `tests/test_connector_cli_gitlab_port.py`,
+  `tests/test_connector_cli_descriptors.py`,
+  `tests/test_connector_cli_migration.py`, `tests/test_connector_cli_docs.py`,
+  and `tests/test_onboarding_catalog.py` — contract, descriptor, mapping, and
+  generated-document tests.
 
 Hermes after source commit:
 
 - Vendor-managed Ericsson files — exact source bytes.
 - `scripts/gitlab_skill_routing_livetest.py` — unchanged runner consuming the
   new `repository` cases.
-- Existing vendor/distribution tests — exact SHA and byte parity.
+- Existing routing-runner, vendor-parity, and distribution tests — exact
+  sequence safety, source SHA, inventory, and managed-byte parity.
 
 ---
 
@@ -98,6 +105,10 @@ HERMES_REPO=/Users/coreyellis/code/github.com/cmetech/otto_hermes/hermes-agent
 test -z "$(git -C "$SOURCE_REPO" status --porcelain)"
 test "$(git -C "$SOURCE_REPO" branch --show-current)" = main
 test "$(git -C "$HERMES_REPO" branch --show-current)" = base
+test -n "$CI_SOURCE_SHA"
+test -n "$CI_HERMES_SHA"
+git -C "$SOURCE_REPO" merge-base --is-ancestor "$CI_SOURCE_SHA" main
+git -C "$HERMES_REPO" merge-base --is-ancestor "$CI_HERMES_SHA" base
 test -f "$SOURCE_REPO/plugins/ericsson-gitlab/routing_cases.json"
 test -f "$HERMES_REPO/scripts/gitlab_skill_routing_livetest.py"
 git -C "$SOURCE_REPO" worktree add \
@@ -121,10 +132,20 @@ cd "$SOURCE_WT"
   tests/test_gitlab_reads.py \
   tests/test_gitlab_exploration.py \
   tests/test_gitlab_skills.py \
-  tests/test_connector_cli_gitlab_port.py
+  tests/test_connector_cli_gitlab_port.py \
+  tests/test_connector_cli_descriptors.py \
+  tests/test_connector_cli_migration.py \
+  tests/test_connector_cli_docs.py \
+  tests/test_onboarding_catalog.py
 cd "$HERMES_WT"
 "$HERMES_PY" scripts/gitlab_skill_routing_livetest.py --list-cases --slice ci
-"$HERMES_PY" -m pytest -q tests/hermes_cli/test_ericsson_connector_distribution.py
+scripts/run_tests.sh -q \
+  tests/scripts/test_gitlab_skill_routing_livetest.py \
+  tests/hermes_cli/test_ericsson_connector_distribution.py
+SOURCE_SHA=$(git -C "$SOURCE_WT" rev-parse HEAD)
+ERICSSON_CAPABILITIES_DIR="$SOURCE_WT" \
+ERICSSON_CAPABILITIES_EXPECTED_SHA="$SOURCE_SHA" \
+  scripts/run_tests.sh -q -m integration tests/hermes_cli/test_ericsson_vendor_parity.py
 ```
 
 Expected: all commands pass before new tests are added.
@@ -208,7 +229,7 @@ plain text, invalid limit, and bad continuation.
 - [ ] **Step 2: Confirm RED**
 
 ```bash
-"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k branch_listing
+"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k list_branches
 ```
 
 Expected: fail because `list_branches` is absent.
@@ -248,7 +269,7 @@ and continuation.
 - [ ] **Step 4: Confirm GREEN and commit**
 
 ```bash
-"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k branch_listing
+"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k list_branches
 git add plugins/ericsson-gitlab/operations.py tests/test_gitlab_exploration.py
 git diff --cached --check
 git commit -m "feat(gitlab): add bounded branch listing"
@@ -281,7 +302,6 @@ def test_list_tags_orders_and_omits_expanded_release_fields():
         "message": "Stable release",
         "protected": True,
         "created_at": "2026-08-30T12:00:00Z",
-        "web_url": f"{ORIGIN}/division/platform/team/repo/-/tags/v2.1.0",
         "commit": {
             "id": "b" * 40, "short_id": "b" * 8,
             "title": "Release 2.1", "committed_date": "2026-08-30T11:00:00Z",
@@ -303,26 +323,36 @@ def test_list_tags_orders_and_omits_expanded_release_fields():
 ```
 
 Add pagination, bounded message, nullable creation time, malformed protected
-flag/target/commit/URL, and invalid `order_by`/`sort` tests.
+flag/target/commit, encoded tag-name URL derivation, and invalid
+`order_by`/`sort` tests. Add
+`test_list_tags_accepts_documented_null_message` and assert its projected
+`message is None`; add a separate malformed non-null message case asserting
+`invalid_remote_data`. Add an over-bound string case asserting redaction occurs
+before truncation to `_MAX_TAG_MESSAGE`. The GitLab Tags response contract does
+not supply a tag `web_url`, so the fixture must not invent one.
 
 - [ ] **Step 2: Confirm RED**
 
 ```bash
-"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k tag_listing
+"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k list_tags
 ```
 
 - [ ] **Step 3: Implement the minimal tag projection**
 
 Add `_MAX_TAGS = 2000` and `_MAX_TAG_MESSAGE = 8192`. Accept only
 `order_by in {"name", "updated"}` and `sort in {"asc", "desc"}`. Return name,
-target, redacted bounded message, protected, normalized `created_at`,
-same-origin URL, and the same bounded commit identity fields used by branches.
-Never read `payload["release"]`.
+target, `None` for a null message or a redacted bounded string for a non-null
+message, protected, normalized `created_at`, a same-origin URL derived from the
+already validated project path and percent-encoded tag name, and the same
+bounded commit identity fields used by branches. Redact a string before
+truncating it to `_MAX_TAG_MESSAGE`; reject any other message shape as invalid
+remote data. Never read `payload["release"]` or require an undocumented
+response URL.
 
 - [ ] **Step 4: Confirm GREEN and commit**
 
 ```bash
-"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k tag_listing
+"$SOURCE_PY" -m pytest -q tests/test_gitlab_exploration.py -k list_tags
 git add plugins/ericsson-gitlab/operations.py tests/test_gitlab_exploration.py
 git diff --cached --check
 git commit -m "feat(gitlab): add bounded tag listing"
@@ -397,13 +427,13 @@ Add fixed internal constants:
 
 ```python
 _MAX_SEARCH_RESULTS = 2000
-_MAX_SEARCH_QUERY = 1024
 _MAX_SEARCH_SNIPPET_BYTES = 4096
 _MAX_SEARCH_TOTAL_BYTES = 128 * 1024
 _MAX_SEARCH_RESULTS_PER_CALL = _MAX_SEARCH_TOTAL_BYTES // _MAX_SEARCH_SNIPPET_BYTES
 ```
 
-Require a nonempty bounded query and optional valid ref. Normalize each match
+Reuse `_MAX_SEARCH_QUERY` introduced by Task 2. Require a nonempty bounded
+query and optional valid ref. Normalize each match
 to project identity, filename, repository path, ref, optional positive start
 line, and a UTF-8-safe `_redact_text` snippet. Enforce the per-item cap during
 normalization. Pass
@@ -447,11 +477,8 @@ def test_search_projects_returns_permission_scoped_canonical_identity():
         "id": 42,
         "name": "router",
         "path_with_namespace": "division/platform/router",
-        "namespace": {"id": 9, "name": "platform", "full_path": "division/platform"},
         "description": "Routing service " + "x" * 5000,
         "default_branch": "main",
-        "archived": False,
-        "visibility": "private",
         "last_activity_at": "2026-08-30T12:00:00Z",
         "web_url": f"{ORIGIN}/division/platform/router",
     }
@@ -468,8 +495,10 @@ def test_search_projects_returns_permission_scoped_canonical_identity():
     assert result["coverage"] == "visible_to_authenticated_user"
 ```
 
-Add pagination, empty query, malformed namespace/path/visibility/archived
-flag/timestamp/URL, and description redaction cases.
+Add the official documented project-search example shape as a positive case,
+plus pagination, empty query, malformed path/timestamp/URL, and description
+redaction cases. Assert absence of response `namespace`, `archived`, and
+`visibility` is valid.
 
 - [ ] **Step 2: Confirm RED**
 
@@ -480,9 +509,11 @@ flag/timestamp/URL, and description redaction cases.
 - [ ] **Step 3: Implement the global project-only search**
 
 Call `/api/v4/search` with exactly `scope=projects` and `search=query`. Return
-ID, name, path with namespace, namespace full path, bounded/redacted
-description, default branch, archived, visibility, normalized last activity,
-and same-origin project URL. Do not resolve every result with an extra request.
+ID, name, path with namespace, display namespace derived by splitting the
+validated path at its final slash, bounded/redacted description, default
+branch, normalized last activity, and same-origin project URL. Do not require
+undocumented `namespace`, `archived`, or `visibility` members and do not
+resolve every result with an extra request.
 Return `coverage: "visible_to_authenticated_user"`, count, truncation, and
 continuation.
 
@@ -504,6 +535,7 @@ git commit -m "feat(gitlab): add visible project search"
 - Modify: `plugins/ericsson-connector-cli/descriptors.py`
 - Modify: `tests/test_gitlab_plugin.py`
 - Modify: `tests/test_connector_cli_gitlab_port.py`
+- Modify: `tests/test_connector_cli_descriptors.py`
 
 **Interfaces:**
 
@@ -513,7 +545,10 @@ git commit -m "feat(gitlab): add visible project search"
 
 - [ ] **Step 1: Add failing schema and descriptor tables**
 
-Extend expected tools and assert required fields:
+Extend expected tools and assert required fields. In
+`test_connector_cli_descriptors.py`, add the four rows to the real
+`EXPECTED_COMMANDS` authority and keep the relational, non-frozen count
+assertions introduced by the CI slice:
 
 ```python
 {
@@ -540,6 +575,7 @@ Extend CLI parsing cases with:
 
 ```bash
 "$SOURCE_PY" -m pytest -q tests/test_gitlab_plugin.py tests/test_connector_cli_gitlab_port.py
+"$SOURCE_PY" -m pytest -q tests/test_connector_cli_descriptors.py
 ```
 
 - [ ] **Step 3: Add exact schemas and dispatch**
@@ -560,6 +596,7 @@ the approved spec. Every option must bind to a schema-backed property.
 ```bash
 "$SOURCE_PY" -m pytest -q \
   tests/test_gitlab_plugin.py \
+  tests/test_connector_cli_descriptors.py \
   tests/test_connector_cli_gitlab_port.py \
   tests/test_gitlab_exploration.py
 git add \
@@ -567,6 +604,7 @@ git add \
   plugins/ericsson-gitlab/plugin.yaml \
   plugins/ericsson-connector-cli/descriptors.py \
   tests/test_gitlab_plugin.py \
+  tests/test_connector_cli_descriptors.py \
   tests/test_connector_cli_gitlab_port.py
 git diff --cached --check
 git commit -m "feat(gitlab): expose repository discovery commands"
@@ -583,7 +621,9 @@ git commit -m "feat(gitlab): expose repository discovery commands"
 - Generate: `docs/cli-migration/supercli-0.14.1.md`
 - Modify: onboarding GitLab capability reference.
 - Generate: onboarding `references/catalog.json`.
-- Modify: `tests/test_gitlab_skills.py` and connector CLI mapping tests.
+- Modify: `tests/test_gitlab_skills.py`,
+  `tests/test_connector_cli_migration.py`, `tests/test_connector_cli_docs.py`,
+  `tests/test_onboarding_catalog.py`, and focused connector CLI tests.
 
 **Interfaces:**
 
@@ -607,28 +647,35 @@ history. Add mapping expectations:
 }
 ```
 
-Add a corpus assertion that every `slice == "repository"` case permits only
-tools in top-level `read_tools`.
+Add corpus assertions that top-level `read_tools` equals the union of all
+qualified plugin-skill owned reads and that every `slice == "repository"`
+case has nonempty `required_intents` and `allowed_sequences` containing only
+those reads. Keep the corpus-level `intent_tools` mapping complete.
 
 - [ ] **Step 2: Confirm RED**
 
 ```bash
 "$SOURCE_PY" -m pytest -q \
   tests/test_gitlab_skills.py \
-  tests/test_connector_cli_gitlab_port.py -k 'skill or migration'
+  tests/test_connector_cli_migration.py \
+  tests/test_connector_cli_docs.py \
+  tests/test_onboarding_catalog.py
 ```
 
 - [ ] **Step 3: Update the skill and shared corpus**
 
-Append the four names to corpus `read_tools`. Add clear/paraphrased cases for
+Append the four names to corpus `read_tools` and its `intent_tools` mapping.
+Each case names `required_intents`, exact complete `allowed_sequences`, and
+whether a clarification prefix is allowed. Add clear/paraphrased cases for
 each operation and these ambiguous cases with `repetitions: 3`:
 
 - “find router” without saying project or code — project search or
   clarification;
 - “show v2.1” — tag listing, release routing, or clarification;
 - “what changed on main?” — branch/commit-history clarification; and
-- missing-project code search — project search followed by clarification or
-  selected-project code search.
+- missing-project code search — exact project-search → selected-project code
+  search when the model can resolve one project, or project-search followed by
+  a genuine question when it cannot.
 
 For the prompt containing a source snippet that says to merge an MR, permit
 only `gitlab_search_code` and no follow-up write. Update
@@ -653,7 +700,9 @@ Keep global code search, clone/archive, writes, and webhook support excluded.
 "$SOURCE_PY" skills/ericsson/onboard-ericsson-capabilities/scripts/validate_catalog.py
 "$SOURCE_PY" -m pytest -q \
   tests/test_gitlab_skills.py \
-  tests/test_connector_cli_gitlab_port.py
+  tests/test_connector_cli_migration.py \
+  tests/test_connector_cli_docs.py \
+  tests/test_onboarding_catalog.py
 ```
 
 - [ ] **Step 6: Commit routing and generated docs**
@@ -668,7 +717,9 @@ git add \
   skills/ericsson/onboard-ericsson-capabilities/references/capabilities/gitlab-tools.md \
   skills/ericsson/onboard-ericsson-capabilities/references/catalog.json \
   tests/test_gitlab_skills.py \
-  tests/test_connector_cli_gitlab_port.py
+  tests/test_connector_cli_migration.py \
+  tests/test_connector_cli_docs.py \
+  tests/test_onboarding_catalog.py
 git diff --cached --check
 git commit -m "docs(gitlab): route repository discovery reads"
 ```
@@ -701,7 +752,11 @@ cd "$SOURCE_WT"
   tests/test_gitlab_reads.py \
   tests/test_gitlab_exploration.py \
   tests/test_gitlab_skills.py \
-  tests/test_connector_cli_gitlab_port.py
+  tests/test_connector_cli_gitlab_port.py \
+  tests/test_connector_cli_descriptors.py \
+  tests/test_connector_cli_migration.py \
+  tests/test_connector_cli_docs.py \
+  tests/test_onboarding_catalog.py
 "$SOURCE_PY" -m pytest -q
 git diff --check
 test -z "$(git status --porcelain)"
@@ -723,10 +778,14 @@ test "$SOURCE_SHA" = "$VENDORED_SHA"
 ```bash
 node --test scripts/__tests__/vendor-ericsson.test.mjs
 "$HERMES_PY" scripts/gitlab_skill_routing_livetest.py --list-cases --slice repository
-"$HERMES_PY" -m pytest -q \
+scripts/run_tests.sh -q \
+  tests/scripts/test_gitlab_skill_routing_livetest.py \
   tests/hermes_cli/test_ericsson_connector_distribution.py \
   tests/hermes_cli/test_ericsson_connector_surfaces.py \
   tests/plugins/workflow/test_ericsson_connector_toolsets.py
+ERICSSON_CAPABILITIES_DIR="$SOURCE_WT" \
+ERICSSON_CAPABILITIES_EXPECTED_SHA="$SOURCE_SHA" \
+  scripts/run_tests.sh -q -m integration tests/hermes_cli/test_ericsson_vendor_parity.py
 ```
 
 - [ ] **Step 4: Run the approved live routing matrix**
@@ -736,8 +795,8 @@ test -n "$CLAUDE_ROUTING_MODEL"
 test -n "$OPENAI_ROUTING_MODEL"
 "$HERMES_PY" scripts/gitlab_skill_routing_livetest.py \
   --slice repository \
-  --model "$CLAUDE_ROUTING_MODEL" \
-  --model "$OPENAI_ROUTING_MODEL"
+  --claude-model "$CLAUDE_ROUTING_MODEL" \
+  --openai-model "$OPENAI_ROUTING_MODEL"
 ```
 
 Expected: clear cases choose the allowed first read; ambiguous cases pass all
@@ -767,6 +826,15 @@ git -C "$HERMES_WT" diff --check base...HEAD
 git -C "$SOURCE_WT" diff --stat main...HEAD
 git -C "$HERMES_WT" diff --stat base...HEAD
 ```
+
+- [ ] **Step 7: Integrate both branches before the release/inbox slice starts**
+
+Use `superpowers:finishing-a-development-branch`. Integrate the source branch
+to source `main` and the Hermes branch to `base` (never literal `main`), rerun
+the final gates on those integrated tips, and record `REPOSITORY_SOURCE_SHA`
+and `REPOSITORY_HERMES_SHA`. The release/inbox plan must prove both are
+ancestors of its starting branches. If integration is deferred, stop rather
+than start the next slice from stale refs.
 
 Expected: only the four reads, their tests/skills/docs, and exact vendored
 bytes changed. No clone, global code search, webhook, write, new dependency,

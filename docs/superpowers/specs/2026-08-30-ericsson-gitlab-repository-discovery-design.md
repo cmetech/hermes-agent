@@ -98,8 +98,13 @@ Optional inputs:
 - bounded `max_items`; and
 - `continuation`.
 
-Each tag contains name, target, bounded message, protected state, creation
-timestamp when present, same-origin web URL, and bounded commit identity.
+Each tag contains name, target, nullable bounded message, protected state,
+creation timestamp when present, a canonical same-origin web URL derived from
+the validated project path and URL-encoded tag name, and bounded commit
+identity. A null message is preserved as `None`; a non-null message is
+redacted and truncated to the documented bound, and any other shape is invalid
+remote data. The operation does not require an undocumented `web_url` member
+in the Tags API response.
 Release notes and assets are not expanded here; those belong to the release
 operations in the release/inbox slice.
 
@@ -126,9 +131,11 @@ Required input: bounded nonempty `query`.
 
 Optional inputs are bounded `max_items` and `continuation`.
 
-Each visible project result contains ID, name, path with namespace, namespace,
-description within a fixed bound, default branch, archived/visibility facts,
-last-activity timestamp, and same-origin web URL. Search observes the
+Each visible project result contains ID, name, path with namespace, a display
+namespace derived from that validated path, description within a fixed bound,
+default branch, last-activity timestamp, and same-origin web URL. The contract
+does not require `namespace`, `archived`, or `visibility` response members that
+GitLab's Search API does not document. Search observes the
 authenticated account's GitLab permissions and does not imply global tenant
 coverage.
 
@@ -193,7 +200,8 @@ and
 guidance on concise activation descriptions, progressive disclosure, and
 forward tests. It does not copy their `glab` execution layer.
 
-The shared routing corpus adds:
+The shared routing corpus adds ordered safe sequences and required-intent
+markers for:
 
 - clear prompts for each of the four new operations;
 - paraphrases with no tool-name wording;
@@ -206,8 +214,10 @@ The shared routing corpus adds:
 Static tests require one primary skill owner per new tool and forbid write
 tools in all read scenarios. The stubbed live harness records router, focused
 skill, described schemas, and invoked underlying tools on configured Claude
-and OpenAI/Codex models. Ambiguous cases run three times and must choose an
-allowed safe read sequence or clarification every time.
+and OpenAI/Codex models. Ambiguous cases run three times and must complete an
+allowed safe read sequence or ask a genuine clarification every time. A
+project-search-only prefix does not pass a code-search request unless the
+response actually asks the user to select or clarify the project.
 
 ## Connector CLI and migration documentation
 
