@@ -244,10 +244,12 @@ rows:
     evidence_ref: out/func-strings.txt:3097; PLUGIN-GAP-ANALYSIS.md section 4
 
   # GitLab — 46 exact source commands.
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab branch list
-    rationale: Branch enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab branch list <project>'
+    operation: gitlab_list_branches
+    rationale: The replacement returns bounded normalized branch refs and commit identity for one project.
     evidence_ref: out/func-strings.txt:2943; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *equivalent_read
     service: gitlab
@@ -475,10 +477,12 @@ rows:
     source_command: super-cli gitlab project edit
     rationale: Broad project-settings mutation is deliberately excluded from the bounded connector contract.
     evidence_ref: out/func-strings.txt:2978; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab project search
-    rationale: Fuzzy project search is not exposed; the connector resolves one exact project identity.
+    replacement: '{brand} gitlab project search --query <query>'
+    operation: gitlab_search_projects
+    rationale: The replacement returns a bounded permission-scoped set of visible project identities.
     evidence_ref: out/func-strings.txt:2972; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *safer_read
     service: gitlab
@@ -502,15 +506,19 @@ rows:
     source_command: super-cli gitlab release view
     rationale: GitLab release detail is not exposed by the approved connector contract.
     evidence_ref: out/func-strings.txt:2955; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab search code
-    rationale: Repository code search and snippets are not exposed by the bounded connector contract.
+    replacement: '{brand} gitlab search code <project> --query <query>'
+    operation: gitlab_search_code
+    rationale: The replacement searches one selected project and returns bounded redacted snippets as untrusted data.
     evidence_ref: out/func-strings.txt:2968; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab tag list
-    rationale: Repository tag enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab tag list <project>'
+    operation: gitlab_list_tags
+    rationale: The replacement returns bounded normalized tag refs without expanding release notes or assets.
     evidence_ref: out/func-strings.txt:2947; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *gap
     service: gitlab

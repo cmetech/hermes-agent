@@ -36,6 +36,14 @@ _MAX_GROUP_SLUG = 1024
 _MAX_GROUPS = 2000
 _MAX_GROUP_PROJECTS = 5000
 _MAX_COMMITS = 2000
+_MAX_BRANCHES = 2000
+_MAX_TAGS = 2000
+_MAX_SEARCH_QUERY = 1024
+_MAX_SEARCH_RESULTS = 2000
+_MAX_PROJECT_DESCRIPTION = 2048
+_MAX_SEARCH_SNIPPET_BYTES = 4096
+_MAX_SEARCH_TOTAL_BYTES = 128 * 1024
+_MAX_SEARCH_RESULTS_PER_CALL = _MAX_SEARCH_TOTAL_BYTES // _MAX_SEARCH_SNIPPET_BYTES
 _MAX_JOBS = 2000
 _MAX_COMMIT_TEXT = 128 * 1024
 _MAX_JOB_TEXT = 2048
@@ -64,6 +72,7 @@ _MAX_LOG_BYTES = 200_000
 _MAX_WRITE_ACTIONS = 100
 _MAX_WRITE_BYTES = 512 * 1024
 _MAX_COMMIT_MESSAGE = 4096
+_MAX_TAG_MESSAGE = 8192
 _MAX_MR_TITLE = 255
 _MAX_MR_TITLE_INPUT = 1024
 _MAX_MR_DESCRIPTION = 64 * 1024
@@ -142,6 +151,10 @@ def _validate_path(path: str, *, allow_empty: bool = True) -> str:
 
 def _git_ref_is_valid(ref: Any) -> bool:
     if not isinstance(ref, str) or not ref or len(ref) > _MAX_REF:
+        return False
+    try:
+        ref.encode("utf-8")
+    except UnicodeEncodeError:
         return False
     if ref == "@" or ref.startswith(("/", "-")) or ref.endswith(("/", ".")):
         return False
@@ -332,9 +345,13 @@ def _commit_sha(value: Any, *, short: bool = False, remote: bool = True) -> str:
 def _remote_repo_path(value: Any) -> str:
     if not isinstance(value, str) or not value or len(value) > _MAX_PATH:
         raise GitLabError("invalid_remote_data")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise GitLabError("invalid_remote_data") from None
     if value != value.strip() or value.startswith("/") or any(
         part in {"", ".", ".."} for part in value.split("/")
-    ):
+    ) or "\x00" in value:
         raise GitLabError("invalid_remote_data")
     return value
 
@@ -969,6 +986,361 @@ class GitLabOperations:
             "path_with_namespace": project["path_with_namespace"],
             "default_branch": project["default_branch"],
             "web_url": project["web_url"],
+        }
+
+    def _normalize_project_search_result(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        project_id = _remote_positive_int(payload.get("id"))
+        name = payload.get("name")
+        path = _namespace_path(payload.get("path_with_namespace"), remote=True)
+        if "/" not in path or not isinstance(name, str) or not name or len(name) > 512:
+            raise GitLabError("invalid_remote_data")
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitLabError("invalid_remote_data") from None
+        description = payload.get("description")
+        if description is not None:
+            if not isinstance(description, str):
+                raise GitLabError("invalid_remote_data")
+            try:
+                description = self._redact_text(description).encode("utf-8")
+            except UnicodeEncodeError:
+                raise GitLabError("invalid_remote_data") from None
+            description = description[:_MAX_PROJECT_DESCRIPTION].decode(
+                "utf-8", errors="ignore"
+            )
+        default_branch = payload.get("default_branch")
+        if default_branch is not None:
+            default_branch = _validate_remote_ref(default_branch)
+        _, last_activity_at = _rfc3339(payload.get("last_activity_at"), remote=True)
+        return {
+            "id": project_id,
+            "name": name,
+            "path_with_namespace": path,
+            "namespace": path.rsplit("/", 1)[0],
+            "description": description,
+            "default_branch": default_branch,
+            "last_activity_at": last_activity_at,
+            "web_url": _same_origin_url(payload.get("web_url"), self.client.auth.origin),
+        }
+
+    def search_projects(
+        self,
+        query: str,
+        *,
+        max_items: int = 50,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query = _bounded_string(query, _MAX_SEARCH_QUERY)
+        max_items = _positive_bound(max_items, _MAX_SEARCH_RESULTS)
+        start_page, start_offset = _continuation_source(continuation)
+        pages = self._paginate(
+            "/api/v4/search",
+            params={"scope": "projects", "search": query},
+            max_items=max_items,
+            normalize=self._normalize_project_search_result,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "query": query,
+            "coverage": "visible_to_authenticated_user",
+            "projects": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "complete": not pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def _normalize_code_match(
+        self, payload: Mapping[str, Any], *, project: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        project_id = _remote_positive_int(payload.get("project_id"))
+        if project_id != project["id"]:
+            raise GitLabError("invalid_remote_data")
+        path = _remote_repo_path(payload.get("path"))
+        filename = _remote_repo_path(payload.get("filename"))
+        basename = _remote_repo_path(payload.get("basename"))
+        if "/" in basename or filename != path or basename != path.rsplit("/", 1)[-1]:
+            raise GitLabError("invalid_remote_data")
+        ref = _validate_remote_ref(payload.get("ref"))
+        start_line = payload.get("startline")
+        if start_line is not None:
+            start_line = _remote_positive_int(start_line)
+        snippet = payload.get("data")
+        if not isinstance(snippet, str):
+            raise GitLabError("invalid_remote_data")
+        try:
+            snippet = self._redact_text(snippet).encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitLabError("invalid_remote_data") from None
+        result: dict[str, Any] = {
+            "project": {"id": project_id, "path": project["path_with_namespace"]},
+            "filename": basename,
+            "path": path,
+            "ref": ref,
+            "snippet": snippet[:_MAX_SEARCH_SNIPPET_BYTES].decode(
+                "utf-8", errors="ignore"
+            ),
+        }
+        if start_line is not None:
+            result["start_line"] = start_line
+        return result
+
+    def search_code(
+        self,
+        project: str | int,
+        query: str,
+        *,
+        ref: str | None = None,
+        max_items: int = 50,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        query = _bounded_string(query, _MAX_SEARCH_QUERY)
+        if ref is not None:
+            ref = _validate_ref(ref)
+        requested_max_items = _positive_bound(max_items, _MAX_SEARCH_RESULTS)
+        start_page, start_offset = _continuation_source(continuation)
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        applied_max_items = min(requested_max_items, _MAX_SEARCH_RESULTS_PER_CALL)
+        params: dict[str, Any] = {"scope": "blobs", "search": query}
+        if ref is not None:
+            params["ref"] = ref
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/search",
+            params=params,
+            max_items=applied_max_items,
+            normalize=lambda item: self._normalize_code_match(item, project=resolved),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
+            "query": query,
+            "ref": ref,
+            "requested_max_items": requested_max_items,
+            "applied_max_items": applied_max_items,
+            "matches": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "complete": not pages.truncated,
+            "continuation": self._continuation(pages),
+            "untrusted_content": True,
+        }
+
+    def _normalize_branch(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        project_path: str,
+    ) -> dict[str, Any]:
+        name = _validate_remote_ref(payload.get("name"))
+        flags = {}
+        for field in (
+            "default",
+            "merged",
+            "protected",
+            "developers_can_push",
+            "developers_can_merge",
+            "can_push",
+        ):
+            value = payload.get(field)
+            if not isinstance(value, bool):
+                raise GitLabError("invalid_remote_data")
+            flags[field] = value
+
+        web_url = _same_origin_url(payload.get("web_url"), self.client.auth.origin)
+        if unquote(urlsplit(web_url).path) != f"/{project_path}/-/tree/{name}":
+            raise GitLabError("invalid_remote_data")
+        web_url = (
+            f"{self.client.auth.origin}/{quote(project_path, safe='/')}/-/tree/"
+            f"{quote(name, safe='')}"
+        )
+        commit = _as_object(payload.get("commit"))
+        sha = _commit_sha(commit.get("id"))
+        short_sha = _commit_sha(commit.get("short_id"), short=True)
+        if not sha.startswith(short_sha):
+            raise GitLabError("invalid_remote_data")
+
+        def required_text(field: str, maximum: int) -> str:
+            value = commit.get(field)
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > maximum
+                or "\x00" in value
+            ):
+                raise GitLabError("invalid_remote_data")
+            return value
+
+        _committed, committed_at = _rfc3339(
+            commit.get("committed_date"), remote=True
+        )
+        return {
+            "name": name,
+            "web_url": web_url,
+            **flags,
+            "commit": {
+                "sha": sha,
+                "short_sha": short_sha,
+                "title": required_text("title", _MAX_COMMIT_TEXT),
+                "committed_at": committed_at,
+                "author_name": required_text("author_name", 512),
+                "committer_name": required_text("committer_name", 512),
+            },
+        }
+
+    def list_branches(
+        self,
+        project: str | int,
+        *,
+        search: str | None = None,
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        max_items = _positive_bound(max_items, _MAX_BRANCHES)
+        if search is not None:
+            search = _bounded_string(search, _MAX_SEARCH_QUERY)
+        start_page, start_offset = _continuation_source(continuation)
+
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        params: dict[str, Any] = {}
+        if search is not None:
+            params["search"] = search
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/repository/branches",
+            params=params,
+            max_items=max_items,
+            normalize=lambda item: self._normalize_branch(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "filters": {"search": search},
+            "branches": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
+        }
+
+    def _normalize_tag(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        project_path: str,
+    ) -> dict[str, Any]:
+        name = _validate_remote_ref(payload.get("name"))
+        target = _commit_sha(payload.get("target"))
+        message = payload.get("message")
+        if message is not None:
+            if not isinstance(message, str) or "\x00" in message:
+                raise GitLabError("invalid_remote_data")
+            try:
+                redacted = self._redact_text(message).encode("utf-8")
+            except UnicodeEncodeError:
+                raise GitLabError("invalid_remote_data") from None
+            message = redacted[:_MAX_TAG_MESSAGE].decode("utf-8", errors="ignore")
+        protected = payload.get("protected")
+        if not isinstance(protected, bool):
+            raise GitLabError("invalid_remote_data")
+        created_at = payload.get("created_at")
+        if created_at is not None:
+            _created, created_at = _rfc3339(created_at, remote=True)
+
+        commit = _as_object(payload.get("commit"))
+        sha = _commit_sha(commit.get("id"))
+        short_sha = _commit_sha(commit.get("short_id"), short=True)
+        if not sha.startswith(short_sha):
+            raise GitLabError("invalid_remote_data")
+
+        def required_text(field: str, maximum: int) -> str:
+            value = commit.get(field)
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > maximum
+                or "\x00" in value
+            ):
+                raise GitLabError("invalid_remote_data")
+            return value
+
+        _committed, committed_at = _rfc3339(
+            commit.get("committed_date"), remote=True
+        )
+        return {
+            "name": name,
+            "target": target,
+            "message": message,
+            "protected": protected,
+            "created_at": created_at,
+            "web_url": (
+                f"{self.client.auth.origin}/{quote(project_path, safe='/')}/-/tags/"
+                f"{quote(name, safe='')}"
+            ),
+            "commit": {
+                "sha": sha,
+                "short_sha": short_sha,
+                "title": required_text("title", _MAX_COMMIT_TEXT),
+                "committed_at": committed_at,
+                "author_name": required_text("author_name", 512),
+                "committer_name": required_text("committer_name", 512),
+            },
+        }
+
+    def list_tags(
+        self,
+        project: str | int,
+        *,
+        search: str | None = None,
+        order_by: str = "name",
+        sort: str = "asc",
+        max_items: int = 100,
+        continuation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        max_items = _positive_bound(max_items, _MAX_TAGS)
+        if search is not None:
+            search = _bounded_string(search, _MAX_SEARCH_QUERY)
+        if (
+            not isinstance(order_by, str)
+            or order_by not in {"name", "updated"}
+            or not isinstance(sort, str)
+            or sort not in {"asc", "desc"}
+        ):
+            raise GitLabError("invalid_input")
+        start_page, start_offset = _continuation_source(continuation)
+
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
+        params: dict[str, Any] = {"order_by": order_by, "sort": sort}
+        if search is not None:
+            params["search"] = search
+        pages = self._paginate(
+            f"/api/v4/projects/{resolved['id']}/repository/tags",
+            params=params,
+            max_items=max_items,
+            normalize=lambda item: self._normalize_tag(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            deadline=deadline,
+            start_page=start_page,
+            start_offset=start_offset,
+        )
+        return {
+            "project": self._project_summary(resolved),
+            "filters": {"search": search, "order_by": order_by, "sort": sort},
+            "tags": list(pages.items),
+            "count": len(pages.items),
+            "truncated": pages.truncated,
+            "continuation": self._continuation(pages),
         }
 
     def _normalize_commit(

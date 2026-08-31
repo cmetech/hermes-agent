@@ -98,6 +98,52 @@ SCHEMAS = {
         },
         ["group"],
     ),
+    "gitlab_list_branches": _schema(
+        "gitlab_list_branches",
+        "List bounded normalized repository branches.",
+        {
+            "project": _PROJECT,
+            "search": {"type": "string", "minLength": 1, "maxLength": 512},
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project"],
+    ),
+    "gitlab_list_tags": _schema(
+        "gitlab_list_tags",
+        "List bounded normalized repository tags.",
+        {
+            "project": _PROJECT,
+            "search": {"type": "string", "minLength": 1, "maxLength": 512},
+            "order_by": {"type": "string", "enum": ["name", "updated"]},
+            "sort": {"type": "string", "enum": ["asc", "desc"]},
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project"],
+    ),
+    "gitlab_search_code": _schema(
+        "gitlab_search_code",
+        "Search bounded repository code matches for one project.",
+        {
+            "project": _PROJECT,
+            "query": {"type": "string", "minLength": 1, "maxLength": 512},
+            "ref": _REF,
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project", "query"],
+    ),
+    "gitlab_search_projects": _schema(
+        "gitlab_search_projects",
+        "Search bounded visible GitLab projects.",
+        {
+            "query": {"type": "string", "minLength": 1, "maxLength": 512},
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["query"],
+    ),
     "gitlab_list_commits": _schema(
         "gitlab_list_commits",
         "List bounded Git commit history newest-first for a project, ref, path, "
@@ -658,6 +704,36 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
                 search=values.get("search"),
                 max_groups=values.get("max_groups", 200),
                 max_projects=values.get("max_projects", 500),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_list_branches":
+            return operations.list_branches(
+                values["project"],
+                search=values.get("search"),
+                max_items=values.get("max_items", 100),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_list_tags":
+            return operations.list_tags(
+                values["project"],
+                search=values.get("search"),
+                order_by=values.get("order_by", "name"),
+                sort=values.get("sort", "asc"),
+                max_items=values.get("max_items", 100),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_search_code":
+            return operations.search_code(
+                values["project"],
+                values["query"],
+                ref=values.get("ref"),
+                max_items=values.get("max_items", 50),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_search_projects":
+            return operations.search_projects(
+                values["query"],
+                max_items=values.get("max_items", 50),
                 continuation=values.get("continuation"),
             )
         if name == "gitlab_list_commits":

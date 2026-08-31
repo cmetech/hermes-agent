@@ -7,6 +7,10 @@ config_schema: config.schema.json
 provides_tools:
   - gitlab_resolve_project
   - gitlab_list_group_projects
+  - gitlab_list_branches
+  - gitlab_list_tags
+  - gitlab_search_code
+  - gitlab_search_projects
   - gitlab_list_commits
   - gitlab_read_commit
   - gitlab_list_commit_comments
