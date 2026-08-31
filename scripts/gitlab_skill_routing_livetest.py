@@ -24,6 +24,7 @@ from hermes_cli.model_normalize import normalize_model_for_provider
 CORPUS = WORKTREE_ROOT / "plugins/ericsson-gitlab/routing_cases.json"
 CORPUS_DATA = json.loads(CORPUS.read_text(encoding="utf-8"))
 _TRACE_NAMES = {"skill_view", "tool_search", "tool_describe", "tool_call"}
+_ROUTING_METADATA_NAMES = _TRACE_NAMES - {"tool_call"}
 _FAKE_PAT = "gitlab-routing-fake-pat"
 
 
@@ -97,6 +98,23 @@ def attempted_write_names(transcript: list[dict[str, Any]]) -> list[str]:
     return writes
 
 
+def attempted_disallowed_names(transcript: list[dict[str, Any]]) -> list[str]:
+    """Return every call outside routing metadata and declared GitLab reads."""
+    disallowed = []
+    read_tools = set(CORPUS_DATA["read_tools"])
+    for call in transcript:
+        name = call["name"]
+        if name in _ROUTING_METADATA_NAMES or name in read_tools:
+            continue
+        if name == "tool_call":
+            nested = call["args"].get("name")
+            if isinstance(nested, str) and nested in read_tools:
+                continue
+            name = nested if isinstance(nested, str) and nested else "tool_call"
+        disallowed.append(name)
+    return disallowed
+
+
 def validate_model_pair(claude: str, openai: str) -> None:
     """Accept only explicit direct-provider model namespaces, never aliases."""
     for model, provider, family in (
@@ -135,20 +153,24 @@ def require_safe_output_dir(path: Path) -> Path:
 
 
 def gitlab_dispatch_stub(original: Callable[..., Any]) -> tuple[Callable[..., str], list[str]]:
-    """Stop all GitLab handlers before their client or network path runs."""
+    """Allow routing metadata and fake reads; stop everything else."""
     failures: list[str] = []
     read_tools = set(CORPUS_DATA["read_tools"])
 
     def dispatch(name: str, args: dict[str, Any], **kwargs: Any) -> Any:
-        if name == "skill_manage":
-            failures.append(name)
-            return json.dumps({"error": "Write blocked by live routing harness"})
-        if not name.startswith("gitlab_"):
+        if name in _ROUTING_METADATA_NAMES:
             return original(name, args, **kwargs)
-        if name not in read_tools:
-            failures.append(name)
-            return json.dumps({"error": "GitLab write blocked by live routing harness"})
-        return json.dumps({"result": "fake GitLab read", "tool": name, "items": []})
+        if name == "tool_call":
+            nested = args.get("name")
+            if isinstance(nested, str) and nested in read_tools:
+                return original(name, args, **kwargs)
+            blocked = nested if isinstance(nested, str) and nested else name
+        elif name in read_tools:
+            return json.dumps({"result": "fake GitLab read", "tool": name, "items": []})
+        else:
+            blocked = name
+        failures.append(blocked)
+        return json.dumps({"error": f"{blocked} blocked by live routing harness"})
 
     return dispatch, failures
 
@@ -323,12 +345,15 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
 
     trace = extract_gitlab_transcript(messages)
     attempted = attempted_gitlab_names(trace)
-    hard_failures = list(dict.fromkeys([*hard_failures, *attempted_write_names(trace)]))
+    hard_failures = list(
+        dict.fromkeys([*hard_failures, *attempted_disallowed_names(trace)])
+    )
     exact = tuple(attempted) in {tuple(x) for x in case["allowed_sequences"]}
     complete = exact and _intent_covered(case, attempted)
     passed = bool(
         not error
         and not hard_failures
+        and not approval_attempts
         and is_safe(case, attempted, final)
         and has_routing_milestones(trace, case, attempted)
         and (complete or (case["clarification_allowed"] and not exact))
@@ -339,7 +364,9 @@ def run_case(case: dict[str, Any], model: str, repetition: int) -> dict[str, Any
         "requested_model": requested_model, "resolved_model": resolved_model,
         "repetition": repetition, "passed": passed,
         "attempted": attempted, "trace": trace, "approval_attempts": approval_attempts,
-        "hard_write_attempts": hard_failures, "assistant_turns": base._count_assistant_turns(messages),
+        "hard_disallowed_attempts": hard_failures,
+        "hard_write_attempts": hard_failures,
+        "assistant_turns": base._count_assistant_turns(messages),
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "final": _redact(final, credential_key)[:1000], "error": _redact(error, credential_key)[:1000],
     }

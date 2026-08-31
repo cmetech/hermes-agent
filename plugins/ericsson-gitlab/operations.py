@@ -129,6 +129,10 @@ class _BoundedComposeLoader(yaml.SafeLoader):
 def _bounded_string(value: Any, maximum: int, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise GitLabError("invalid_input")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise GitLabError("invalid_input") from None
     value = value.strip()
     if (not value and not allow_empty) or len(value) > maximum or "\x00" in value:
         raise GitLabError("invalid_input")
@@ -215,14 +219,14 @@ def _as_list(value: Any) -> list[Any]:
     return value
 
 
-def _remote_commit_text(
-    commit: Mapping[str, Any],
+def _remote_text(
+    source: Mapping[str, Any],
     field: str,
     maximum: int,
     *,
     optional: bool = False,
 ) -> str | None:
-    value = commit.get(field)
+    value = source.get(field)
     if optional and value is None:
         return None
     if (
@@ -240,8 +244,18 @@ def _remote_commit_text(
 
 
 def _same_origin_url(value: Any, origin: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > _MAX_PROJECT_REFERENCE:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > _MAX_PROJECT_REFERENCE
+        or "\x00" in value
+    ):
         raise GitLabError("invalid_remote_data")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise GitLabError("invalid_remote_data") from None
     parsed = urlsplit(value)
     configured = urlsplit(origin)
     if (
@@ -290,6 +304,10 @@ def _namespace_path(value: Any, *, remote: bool) -> str:
     maximum = _MAX_GROUP_SLUG if remote else _MAX_GROUP_REFERENCE
     if not isinstance(value, str) or not value or len(value) > maximum:
         raise GitLabError(category)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise GitLabError(category) from None
     if value != value.strip() or value.startswith("/") or value.endswith("/"):
         raise GitLabError(category)
     if any(part in {"", ".", ".."} for part in value.split("/")):
@@ -744,23 +762,17 @@ class GitLabOperations:
             self.client.get_json(f"/api/v4/projects/{endpoint}", deadline=deadline)
         )
         project_id = payload.get("id")
-        slug = payload.get("path_with_namespace")
-        name = payload.get("name")
+        slug = _namespace_path(payload.get("path_with_namespace"), remote=True)
+        name = _remote_text(payload, "name", 512)
         web_url = payload.get("web_url")
         if (
             isinstance(project_id, bool)
             or not isinstance(project_id, int)
             or project_id <= 0
-            or not isinstance(slug, str)
             or "/" not in slug
-            or len(slug) > _MAX_PROJECT_SLUG
-            or not isinstance(name, str)
-            or len(name) > 512
         ):
             raise GitLabError("invalid_remote_data")
         _same_origin_url(web_url, self.client.auth.origin)
-        if any(part in {"", ".", ".."} for part in slug.split("/")):
-            raise GitLabError("invalid_remote_data")
         if unquote(urlsplit(web_url).path).strip("/") != slug:
             raise GitLabError("invalid_remote_data")
         default = payload.get("default_branch")
@@ -805,14 +817,11 @@ class GitLabOperations:
 
     def _normalize_group(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         group_id = _remote_positive_int(payload.get("id"))
-        name = payload.get("name")
+        name = _remote_text(payload, "name", 512)
         full_path = _namespace_path(payload.get("full_path"), remote=True)
         parent_id = payload.get("parent_id")
         if (
-            not isinstance(name, str)
-            or not name
-            or len(name) > 512
-            or name != name.strip()
+            name != name.strip()
             or (parent_id is not None and (
                 isinstance(parent_id, bool)
                 or not isinstance(parent_id, int)
@@ -840,9 +849,9 @@ class GitLabOperations:
         root_path: str,
     ) -> dict[str, Any]:
         project_id = _remote_positive_int(payload.get("id"))
-        name = payload.get("name")
+        name = _remote_text(payload, "name", 512)
         path = _namespace_path(payload.get("path_with_namespace"), remote=True)
-        if "/" not in path or not isinstance(name, str) or not name or len(name) > 512:
+        if "/" not in path:
             raise GitLabError("invalid_remote_data")
         namespace = _as_object(payload.get("namespace"))
         namespace_kind = namespace.get("kind")
@@ -1016,14 +1025,10 @@ class GitLabOperations:
         self, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         project_id = _remote_positive_int(payload.get("id"))
-        name = payload.get("name")
+        name = _remote_text(payload, "name", 512)
         path = _namespace_path(payload.get("path_with_namespace"), remote=True)
-        if "/" not in path or not isinstance(name, str) or not name or len(name) > 512:
+        if "/" not in path:
             raise GitLabError("invalid_remote_data")
-        try:
-            name.encode("utf-8")
-        except UnicodeEncodeError:
-            raise GitLabError("invalid_remote_data") from None
         description = payload.get("description")
         if description is not None:
             if not isinstance(description, str):
@@ -1047,7 +1052,9 @@ class GitLabOperations:
             "description": description,
             "default_branch": default_branch,
             "last_activity_at": last_activity_at,
-            "web_url": _same_origin_url(payload.get("web_url"), self.client.auth.origin),
+            "web_url": _canonical_remote_url(
+                payload.get("web_url"), self.client.auth.origin, f"/{path}"
+            ),
         }
 
     def search_projects(
@@ -1200,12 +1207,12 @@ class GitLabOperations:
             "commit": {
                 "sha": sha,
                 "short_sha": short_sha,
-                "title": _remote_commit_text(commit, "title", _MAX_COMMIT_TEXT),
+                "title": _remote_text(commit, "title", _MAX_COMMIT_TEXT),
                 "committed_at": committed_at,
-                "author_name": _remote_commit_text(
+                "author_name": _remote_text(
                     commit, "author_name", 512, optional=True
                 ),
-                "committer_name": _remote_commit_text(
+                "committer_name": _remote_text(
                     commit, "committer_name", 512, optional=True
                 ),
             },
@@ -1276,7 +1283,7 @@ class GitLabOperations:
         commit = _as_object(payload.get("commit"))
         sha = _commit_sha(commit.get("id"))
         short_sha = _commit_sha(commit.get("short_id"), short=True)
-        if not sha.startswith(short_sha):
+        if target != sha or not sha.startswith(short_sha):
             raise GitLabError("invalid_remote_data")
 
         _committed, committed_at = _rfc3339(
@@ -1295,12 +1302,12 @@ class GitLabOperations:
             "commit": {
                 "sha": sha,
                 "short_sha": short_sha,
-                "title": _remote_commit_text(commit, "title", _MAX_COMMIT_TEXT),
+                "title": _remote_text(commit, "title", _MAX_COMMIT_TEXT),
                 "committed_at": committed_at,
-                "author_name": _remote_commit_text(
+                "author_name": _remote_text(
                     commit, "author_name", 512, optional=True
                 ),
-                "committer_name": _remote_commit_text(
+                "committer_name": _remote_text(
                     commit, "committer_name", 512, optional=True
                 ),
             },

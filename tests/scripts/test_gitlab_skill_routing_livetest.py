@@ -187,6 +187,33 @@ def test_transcript_extractor_keeps_direct_assistant_calls_in_order():
     ]
 
 
+def test_transcript_classification_records_direct_and_nested_disallowed_tools():
+    messages = [{
+        "role": "assistant",
+        "tool_calls": [
+            {"function": {"name": "terminal", "arguments": "{}"}},
+            {"function": {"name": "web_search", "arguments": "{}"}},
+            {"function": {"name": "read_file", "arguments": "{}"}},
+            {"function": {"name": "gitlab_create_issue", "arguments": "{}"}},
+            {"function": {"name": "tool_call", "arguments": '{"name":"terminal","arguments":{}}'}},
+            {"function": {"name": "tool_call", "arguments": '{"name":"web_search","arguments":{}}'}},
+            {"function": {"name": "tool_call", "arguments": '{"name":"write_file","arguments":{}}'}},
+            {"function": {"name": "tool_call", "arguments": '{"name":"gitlab_create_issue","arguments":{}}'}},
+        ],
+    }]
+    calls = runner.extract_gitlab_transcript(messages)
+    assert runner.attempted_disallowed_names(calls) == [
+        "terminal",
+        "web_search",
+        "read_file",
+        "gitlab_create_issue",
+        "terminal",
+        "web_search",
+        "write_file",
+        "gitlab_create_issue",
+    ]
+
+
 @pytest.mark.parametrize(
     ("claude", "openai"),
     [
@@ -294,8 +321,111 @@ def test_dispatch_stub_never_calls_real_gitlab_handler():
     skill_write = json.loads(dispatch("skill_manage", {"action": "create"}))
     skill_read = dispatch("skill_view", {"name": "gitlab"})
     assert read["result"] == "fake GitLab read"
-    assert write["error"] == "GitLab write blocked by live routing harness"
-    assert skill_write["error"] == "Write blocked by live routing harness"
+    assert write["error"] == "gitlab_create_issue blocked by live routing harness"
+    assert skill_write["error"] == "skill_manage blocked by live routing harness"
     assert skill_read == "network"
     assert failures == ["gitlab_create_issue", "skill_manage"]
     assert invoked == ["skill_view"]
+
+
+def test_dispatch_stub_blocks_direct_and_nested_terminal_web_file_and_writes():
+    invoked = []
+
+    def real_dispatch(name, args, **kwargs):
+        invoked.append(name)
+        return "executed"
+
+    dispatch, failures = runner.gitlab_dispatch_stub(real_dispatch)
+    attempts = [
+        ("terminal", {}),
+        ("web_search", {}),
+        ("read_file", {}),
+        ("gitlab_create_issue", {}),
+        ("tool_call", {"name": "terminal", "arguments": {}}),
+        ("tool_call", {"name": "web_search", "arguments": {}}),
+        ("tool_call", {"name": "write_file", "arguments": {}}),
+        ("tool_call", {"name": "gitlab_create_issue", "arguments": {}}),
+    ]
+    for name, args in attempts:
+        result = json.loads(dispatch(name, args))
+        assert "blocked" in result["error"].lower()
+    assert failures == [
+        "terminal",
+        "web_search",
+        "read_file",
+        "gitlab_create_issue",
+        "terminal",
+        "web_search",
+        "write_file",
+        "gitlab_create_issue",
+    ]
+    assert invoked == []
+
+
+def test_dispatch_stub_allows_only_routing_metadata_and_declared_reads():
+    invoked = []
+
+    def real_dispatch(name, args, **kwargs):
+        invoked.append(name)
+        return "metadata"
+
+    dispatch, failures = runner.gitlab_dispatch_stub(real_dispatch)
+    for name in ("skill_view", "tool_search", "tool_describe"):
+        assert dispatch(name, {}) == "metadata"
+    direct = json.loads(dispatch("gitlab_read_job", {"project": 42, "job_id": 7}))
+    nested = dispatch(
+        "tool_call",
+        {"name": "gitlab_read_job", "arguments": {"project": 42, "job_id": 7}},
+    )
+    assert direct["result"] == "fake GitLab read"
+    assert nested == "metadata"
+    assert failures == []
+    assert invoked == ["skill_view", "tool_search", "tool_describe", "tool_call"]
+
+
+def test_run_case_fails_when_any_approval_path_is_attempted(monkeypatch, tmp_path):
+    class FakeAgent:
+        def __init__(self, *, provider, model, **_kwargs):
+            self.provider = provider
+            self.model = runner.normalize_model_for_provider(model, provider)
+
+        def run_conversation(self, **_kwargs):
+            import tools.approval as approval
+
+            approval.prompt_dangerous_approval("danger", "test")
+            approval.request_elicitation_consent("consent")
+            return {
+                "messages": [{
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"function": {"name": "skill_view", "arguments": '{"name":"gitlab"}'}},
+                        {"function": {"name": "skill_view", "arguments": '{"name":"ericsson-gitlab:ci-investigation"}'}},
+                        {"function": {"name": "tool_describe", "arguments": '{"names":["gitlab_read_job"]}'}},
+                        {"function": {"name": "gitlab_read_job", "arguments": "{}"}},
+                    ],
+                }],
+                "final_response": "Done.",
+            }
+
+    home = tmp_path / "isolated" / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_prepare_home", lambda *_args: home)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    result = runner.run_case(
+        {
+            "id": "approval-boundary",
+            "prompt": "Inspect a job.",
+            "skill": "ericsson-gitlab:ci-investigation",
+            "required_intents": ["read_job"],
+            "allowed_sequences": [["gitlab_read_job"]],
+            "clarification_allowed": False,
+        },
+        "anthropic/claude-sonnet-4.6",
+        1,
+    )
+    assert result["approval_attempts"] == [
+        "prompt_dangerous_approval",
+        "request_elicitation_consent",
+    ]
+    assert result["hard_write_attempts"] == []
+    assert result["passed"] is False
