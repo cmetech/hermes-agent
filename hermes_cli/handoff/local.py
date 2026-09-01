@@ -30,8 +30,8 @@ from .service import (
 
 
 MAX_RESPONSE_BYTES = 600_000
+_READ_CHUNK_BYTES = 64 * 1024
 _VALIDATE_BUDGET_SECONDS = 2.0
-_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,13 +53,19 @@ class _Deadline:
 
 def _listener_url(host: object, port: object) -> str | None:
     configured = str(host or DEFAULT_HOST).strip()
-    if configured in _WILDCARD_HOSTS:
-        configured = "127.0.0.1"
     lookup = (
         configured[1:-1]
         if configured.startswith("[") and configured.endswith("]")
         else configured
     )
+    if lookup == "*":
+        lookup = "127.0.0.1"
+    else:
+        try:
+            if ipaddress.ip_address(lookup).is_unspecified:
+                lookup = "127.0.0.1"
+        except ValueError:
+            pass
     try:
         addresses = {
             row[4][0].split("%", 1)[0]
@@ -77,6 +83,39 @@ def _listener_url(host: object, port: object) -> str | None:
 
 def _failure_code(exc: urllib.error.HTTPError) -> str:
     return f"http_{int(exc.code)}"
+
+
+def _direct_local_opener(redirect_handler):
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        redirect_handler,
+    )
+    opener.addheaders = []
+    return opener
+
+
+def _read_response(response, deadline: _Deadline) -> bytes:
+    read = getattr(response, "read1", None) or response.read
+    chunks = []
+    total = 0
+    while True:
+        remaining = deadline.remaining()
+        sock = getattr(
+            getattr(getattr(response, "fp", None), "raw", None), "_sock", None
+        )
+        if sock is not None:
+            try:
+                sock.settimeout(remaining)
+            except (OSError, ValueError):
+                pass
+        chunk = read(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - total))
+        deadline.remaining()
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise ValueError("handoff response exceeds byte limit")
+        chunks.append(chunk)
 
 
 def _request_json(
@@ -104,10 +143,12 @@ def _request_json(
         method=method,
         headers=request_headers,
     )
-    with open_credentialed_url(request, timeout=deadline.remaining()) as response:
-        raw = response.read(MAX_RESPONSE_BYTES + 1)
-    if len(raw) > MAX_RESPONSE_BYTES:
-        raise ValueError("handoff response exceeds byte limit")
+    with open_credentialed_url(
+        request,
+        timeout=deadline.remaining(),
+        opener_factory=_direct_local_opener,
+    ) as response:
+        raw = _read_response(response, deadline)
     try:
         value = json.loads(raw)
     except (UnicodeDecodeError, ValueError) as exc:
@@ -175,8 +216,8 @@ class LocalHermesChannel:
         )
         if (
             not isinstance(contract, dict)
-            or not contract.get("supported")
-            or not contract.get("durable")
+            or contract.get("supported") is not True
+            or contract.get("durable") is not True
         ):
             return "runs_not_durable"
         return None
