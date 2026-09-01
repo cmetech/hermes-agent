@@ -186,6 +186,24 @@ def test_validate_create_and_read_facade_are_consumer_neutral(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "endpoint",
+    [
+        HandoffEndpoint("hermes://local/reviewer?", "reviewer"),
+        HandoffEndpoint("hermes://local/reviewer", "other"),
+    ],
+)
+def test_validate_endpoint_rejects_preconstructed_noncanonical_values(
+    tmp_path, endpoint: HandoffEndpoint
+):
+    service, _store, channel, _snapshot = _service(tmp_path)
+
+    with pytest.raises(ValueError, match="handoff endpoint"):
+        service.validate_endpoint(endpoint, "workflow/run-1")
+
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
     ("phase", "expected_operation"),
     [
         ("unbound", "bind"),
@@ -269,6 +287,84 @@ def test_crash_after_submit_journal_recovers_only_by_reconcile(tmp_path):
 
     assert recovered.snapshot.phase == "submitted"
     assert [name for name, _ in channel.calls] == ["reconcile"]
+
+
+def test_cancel_after_unconfirmed_submit_reconciles_before_delivery(tmp_path):
+    service, store, channel, snapshot = _service(tmp_path)
+    snapshot = _bind(service, channel, snapshot.handoff_id)
+    channel.outcomes["submit"] = _Crash()
+    with pytest.raises(_Crash):
+        service.advance(snapshot.handoff_id)
+    service.command(
+        snapshot.handoff_id,
+        "cancel",
+        command_id="cancel-1",
+        actor="workflow",
+    )
+    channel.outcomes["reconcile"] = ChannelObservation(
+        phase="active", checkpoint={"run_id": "run-1"}
+    )
+    channel.calls.clear()
+
+    reconciled = service.advance(snapshot.handoff_id)
+
+    assert reconciled.snapshot.phase == "cancelling"
+    assert reconciled.snapshot.checkpoint == {"run_id": "run-1"}
+    assert [name for name, _ in channel.calls] == ["reconcile"]
+
+    channel.outcomes["cancel"] = ChannelObservation(
+        phase="cancelled", checkpoint={"run_id": "run-1"}
+    )
+    channel.calls.clear()
+    terminal = service.advance(snapshot.handoff_id)
+
+    assert terminal.snapshot.phase == "cancelled"
+    assert [name for name, _ in channel.calls] == ["cancel"]
+    assert [
+        event.kind
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    ].count("submit_attempted") == 1
+
+
+def test_ambiguous_cancel_reconciles_before_repeating_cancel(tmp_path):
+    service, store, channel, snapshot = _service(tmp_path)
+    snapshot = _bind(service, channel, snapshot.handoff_id)
+    snapshot = _seed_phase(store, snapshot, "active")
+    service.command(
+        snapshot.handoff_id,
+        "cancel",
+        command_id="cancel-1",
+        actor="workflow",
+    )
+    channel.outcomes["cancel"] = RuntimeError("cancel receipt lost")
+    channel.calls.clear()
+
+    ambiguous = service.advance(snapshot.handoff_id)
+
+    assert ambiguous.snapshot.phase == "indeterminate"
+    assert [name for name, _ in channel.calls] == ["cancel"]
+
+    channel.outcomes["reconcile"] = ChannelObservation(
+        phase="active", checkpoint={"run_id": "run-1"}
+    )
+    channel.calls.clear()
+    reconciled = service.advance(snapshot.handoff_id)
+
+    assert reconciled.snapshot.phase == "cancelling"
+    assert [name for name, _ in channel.calls] == ["reconcile"]
+
+    channel.outcomes["cancel"] = ChannelObservation(
+        phase="succeeded",
+        checkpoint={"run_id": "run-1"},
+        terminal_result=_result(),
+    )
+    channel.calls.clear()
+    terminal = service.advance(snapshot.handoff_id)
+
+    assert terminal.snapshot.phase == "succeeded"
+    assert [name for name, _ in channel.calls] == ["cancel"]
 
 
 @pytest.mark.parametrize("terminal_phase", ["succeeded", "cancelled"])
@@ -521,6 +617,58 @@ def test_illegal_channel_transition_becomes_protocol_failure(tmp_path):
 
     assert result.snapshot.phase == "failed"
     assert result.snapshot.failure_code == "protocol_violation"
+
+
+def test_pre_submit_binding_contradiction_becomes_stable_protocol_failure(tmp_path):
+    service, store, channel, snapshot = _service(tmp_path)
+    channel.outcomes["bind"] = ChannelObservation(
+        phase="prepared",
+        mechanism="runs",
+        binding={"profile": "reviewer", "mechanism": "cli"},
+    )
+
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.snapshot.phase == "failed"
+    assert result.snapshot.failure_code == "protocol_violation"
+    encoded = json.dumps([
+        dict(event.data)
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    ])
+    assert "does not match" not in encoded
+
+
+def test_post_submit_binding_contradiction_is_indeterminate_and_keeps_durable_facts(
+    tmp_path,
+):
+    service, store, channel, snapshot = _service(tmp_path)
+    snapshot = _bind(service, channel, snapshot.handoff_id)
+    snapshot = _seed_phase(store, snapshot, "active")
+    durable_binding = snapshot.binding
+    durable_checkpoint = snapshot.checkpoint
+    channel.outcomes["observe"] = ChannelObservation(
+        phase="active",
+        mechanism="cli",
+        binding={"profile": "reviewer", "mechanism": "cli"},
+        checkpoint={"run_id": "contradictory"},
+    )
+
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.snapshot.phase == "indeterminate"
+    assert result.snapshot.failure_code == "protocol_violation"
+    assert result.snapshot.mechanism == "runs"
+    assert result.snapshot.binding == durable_binding
+    assert result.snapshot.checkpoint == durable_checkpoint
+    encoded = json.dumps([
+        dict(event.data)
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    ])
+    assert "contradictory" not in encoded
 
 
 def test_future_due_time_is_a_durable_noop(tmp_path):

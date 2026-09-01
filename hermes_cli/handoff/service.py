@@ -13,6 +13,7 @@ from uuid import uuid4
 from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot, HandoffSpec
 from .store import (
     EvidencePage,
+    HandoffConflict,
     HandoffStateConflict,
     HandoffStore,
     StaleAdvanceLease,
@@ -119,11 +120,11 @@ class AgentHandoffService:
     def validate_endpoint(
         self, endpoint: str | HandoffEndpoint, initiator: object
     ) -> EndpointAssessment:
-        parsed = (
-            endpoint
-            if isinstance(endpoint, HandoffEndpoint)
-            else HandoffEndpoint.parse(endpoint)
+        parsed = HandoffEndpoint.parse(
+            endpoint.canonical if isinstance(endpoint, HandoffEndpoint) else endpoint
         )
+        if isinstance(endpoint, HandoffEndpoint) and parsed != endpoint:
+            raise ValueError("handoff endpoint is invalid")
         scope = _initiator_scope(initiator)
         if self.channel is None:
             return EndpointAssessment(
@@ -229,19 +230,40 @@ class AgentHandoffService:
                 pass
         return AdvanceResult(self.store.get(handoff_id), operation, folded)
 
-    @staticmethod
-    def _select_operation(snapshot: HandoffSnapshot) -> str | None:
+    def _select_operation(self, snapshot: HandoffSnapshot) -> str | None:
         if snapshot.phase in _TERMINAL_PHASES:
             return None
-        if snapshot.phase == "cancelling":
+        if snapshot.phase == "indeterminate":
+            return "reconcile"
+        if snapshot.cancel_requested_at is not None:
+            if (
+                snapshot.submit_attempted_at is not None
+                and not snapshot.checkpoint
+                and not self._was_authoritatively_admitted(snapshot.handoff_id)
+            ):
+                return "reconcile"
             return "cancel"
         if snapshot.mechanism is None:
             return "bind"
         if snapshot.phase == "prepared":
             return "reconcile" if snapshot.submit_attempted_at else "submit"
-        if snapshot.phase == "indeterminate":
-            return "reconcile"
         return "observe"
+
+    def _was_authoritatively_admitted(self, handoff_id: str) -> bool:
+        after_sequence = 0
+        while True:
+            page = self.store.evidence(
+                handoff_id, after_sequence=after_sequence, limit=100
+            )
+            if any(
+                event.kind == "observed"
+                and event.phase_after in {"submitted", "active", "needs_input"}
+                for event in page.events
+            ):
+                return True
+            if not page.has_more:
+                return False
+            after_sequence = page.next_after_sequence
 
     def _call_channel(
         self, operation: str, snapshot: HandoffSnapshot, budget_seconds: float
@@ -318,20 +340,47 @@ class AgentHandoffService:
                         phase="failed", failure_code="protocol_violation"
                     )
             else:
-                return (
-                    self.store.commit_binding(
-                        lease,
-                        observation.mechanism,
-                        observation.binding,
-                        observation.checkpoint,
-                    ),
-                    True,
-                )
+                try:
+                    return (
+                        self.store.commit_binding(
+                            lease,
+                            observation.mechanism,
+                            observation.binding,
+                            observation.checkpoint,
+                        ),
+                        True,
+                    )
+                except (HandoffConflict, ValueError):
+                    return (
+                        self.store.commit_observation(
+                            lease,
+                            ChannelObservation(
+                                phase="failed", failure_code="protocol_violation"
+                            ),
+                        ),
+                        True,
+                    )
 
         current = self.store.get(lease.handoff_id)
         observation = self._preserve_cancellation(current, observation)
         try:
             return self.store.commit_observation(lease, observation), True
+        except (HandoffConflict, ValueError):
+            current = self.store.get(lease.handoff_id)
+            phase = (
+                "indeterminate" if current.submit_attempted_at is not None else "failed"
+            )
+            return (
+                self.store.commit_observation(
+                    lease,
+                    ChannelObservation(
+                        phase=phase,
+                        checkpoint=current.checkpoint or {},
+                        failure_code="protocol_violation",
+                    ),
+                ),
+                True,
+            )
         except HandoffStateConflict:
             current = self.store.get(lease.handoff_id)
             if current.phase in _TERMINAL_PHASES:
@@ -353,7 +402,7 @@ class AgentHandoffService:
     def _preserve_cancellation(
         current: HandoffSnapshot, observation: ChannelObservation
     ) -> ChannelObservation:
-        if current.phase != "cancelling" or observation.phase in (
+        if current.cancel_requested_at is None or observation.phase in (
             _TERMINAL_PHASES | {"cancelling", "indeterminate"}
         ):
             return observation
