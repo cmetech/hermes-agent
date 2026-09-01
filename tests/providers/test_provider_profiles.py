@@ -287,7 +287,6 @@ class TestBaseProfile:
         msgs = [{"role": "user", "content": "hi"}]
         assert p.prepare_messages(msgs) is msgs
 
-
     def test_build_api_kwargs_extras_empty(self):
         p = ProviderProfile(name="test")
         eb, tl = p.build_api_kwargs_extras()
@@ -622,3 +621,49 @@ def test_configured_route_snapshot_rejects_unclassified_query_values():
     assert route.route_evidence_error == "unclassified_query_parameter"
     assert "base_url" not in route.provider_config
     assert "opaque-secret" not in serialized
+
+
+class TestAlibabaRegionalAndTokenPlanProfiles:
+    def test_alibaba_cn_registered(self):
+        p = get_provider_profile("alibaba-cn")
+        assert p is not None and p.name == "alibaba-cn"
+        assert p.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        assert "DASHSCOPE_API_KEY" in p.env_vars
+        assert "DASHSCOPE_CN_BASE_URL" in p.env_vars
+
+    def test_alibaba_coding_plan_cn_registered(self):
+        p = get_provider_profile("alibaba-coding-plan-cn")
+        assert p is not None and p.name == "alibaba-coding-plan-cn"
+        assert p.base_url == "https://coding.dashscope.aliyuncs.com/v1"
+        assert "ALIBABA_CODING_PLAN_API_KEY" in p.env_vars
+
+    def test_alibaba_token_plan_registered(self):
+        p = get_provider_profile("alibaba-token-plan")
+        assert p is not None and p.name == "alibaba-token-plan"
+        assert p.base_url == "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+        assert "ALIBABA_TOKEN_PLAN_API_KEY" in p.env_vars
+
+    def test_alibaba_token_plan_cn_registered(self):
+        p = get_provider_profile("alibaba-token-plan-cn")
+        assert p is not None and p.name == "alibaba-token-plan-cn"
+        assert p.base_url == "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        assert "ALIBABA_TOKEN_PLAN_API_KEY" in p.env_vars
+
+    def test_cn_variants_resolve_in_auth_registry(self, monkeypatch):
+        from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider
+
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test")
+        monkeypatch.setenv("ALIBABA_CODING_PLAN_API_KEY", "sk-test")
+        monkeypatch.setenv("ALIBABA_TOKEN_PLAN_API_KEY", "sk-test")
+        for provider_id in (
+            "alibaba-cn",
+            "alibaba-coding-plan-cn",
+            "alibaba-token-plan",
+            "alibaba-token-plan-cn",
+        ):
+            assert provider_id in PROVIDER_REGISTRY
+            assert resolve_provider(provider_id) == provider_id
+        assert (
+            PROVIDER_REGISTRY["alibaba-token-plan-cn"].inference_base_url
+            == "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        )

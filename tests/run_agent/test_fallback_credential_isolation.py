@@ -335,7 +335,7 @@ def test_post_adoption_auth_failure_runs_exactly_one_fallback(
     )
     monkeypatch.setattr(run_agent, "OpenAI", barrier)
     monkeypatch.setattr(
-        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
         refresh_oauth,
     )
     monkeypatch.setattr(

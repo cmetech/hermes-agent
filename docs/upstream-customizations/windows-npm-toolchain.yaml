@@ -91,4 +91,4 @@ upstream_changes:
     version and not only Test-NodeVersionOk. At that point drop these helpers in
     favour of upstream's, but KEEP tests/test_install_ps1_npm_band_guard.py:
     the pwsh parity assertion is what stops the band drifting from the manifest.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

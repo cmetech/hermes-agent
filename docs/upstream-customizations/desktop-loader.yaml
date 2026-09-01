@@ -111,4 +111,4 @@ upstream_changes:
     appears in loader.tsx and the animation is expressed declaratively there.
     At that point delete loader-native.tsx and the delegation, but KEEP
     loader.test.tsx: the no-frames assertion is what stops the loop returning.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

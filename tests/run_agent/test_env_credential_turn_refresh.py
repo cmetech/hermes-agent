@@ -1074,7 +1074,7 @@ def test_sealed_pool_constructor_failure_retries_same_real_oauth_token_once(
         }
 
     monkeypatch.setattr(
-        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
         refresh_oauth,
     )
     barrier = _LowestConstructorBarrier(
@@ -1178,7 +1178,7 @@ def test_sealed_pool_two_adoption_failures_clear_candidate(
     )
     oauth_refresh_calls: list[str] = []
     monkeypatch.setattr(
-        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
         lambda refresh_token, **_kwargs: oauth_refresh_calls.append(refresh_token)
         or {
             "access_token": fresh_token,
