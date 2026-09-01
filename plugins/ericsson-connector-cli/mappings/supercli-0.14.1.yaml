@@ -244,10 +244,12 @@ rows:
     evidence_ref: out/func-strings.txt:3097; PLUGIN-GAP-ANALYSIS.md section 4
 
   # GitLab — 46 exact source commands.
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab branch list
-    rationale: Branch enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab branch list <project>'
+    operation: gitlab_list_branches
+    rationale: The replacement returns bounded normalized branch refs and commit identity for one project.
     evidence_ref: out/func-strings.txt:2943; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *equivalent_read
     service: gitlab
@@ -310,10 +312,12 @@ rows:
     operation: gitlab_retry_job
     rationale: Retry is authorized once and does not retry an unproved mutation outcome.
     evidence_ref: out/func-strings.txt:2995; PLUGIN-GAP-ANALYSIS.md sections 2 and 4
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab job view
-    rationale: A standalone normalized job-detail operation is not exposed in this release.
+    replacement: '{brand} gitlab job show <project> <job-id>'
+    operation: gitlab_read_job
+    rationale: The replacement returns bounded normalized job metadata without the trace, which remains a separate capped job-log read.
     evidence_ref: out/func-strings.txt:2932; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *renamed_read
     service: gitlab
@@ -343,10 +347,12 @@ rows:
     operation: gitlab_create_merge_request
     rationale: MR creation uses bounded fields and refuses ambiguous mutation retries.
     evidence_ref: out/func-strings.txt:2904; PLUGIN-GAP-ANALYSIS.md sections 1.2 and 2
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab mr diff
-    rationale: The connector reads MR metadata but does not expose the source command's per-file diff contract.
+    replacement: '{brand} gitlab mr show <project> <iid>'
+    operation: gitlab_read_merge_request
+    rationale: The replacement returns bounded merge-request metadata with structured per-file diffs instead of an arbitrary raw diff payload.
     evidence_ref: out/func-strings.txt:2869; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *safer_write
     service: gitlab
@@ -372,9 +378,9 @@ rows:
   - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab mr list
-    replacement: '{brand} gitlab mr list <project>'
+    replacement: '{brand} gitlab mr list [project]'
     operation: gitlab_list_merge_requests
-    rationale: The replacement requires a project and does not preserve SuperCLI's user-scoped no-project mode.
+    rationale: The bounded project-optional replacement preserves project discovery and native personal scopes plus explicit @me actor filters across GitLab.
     evidence_ref: out/func-strings.txt:2861; post-Wave-3 reconciliation
   - <<: *safer_write
     service: gitlab
@@ -404,10 +410,12 @@ rows:
     operation: gitlab_reply_to_discussion
     rationale: Replies are bound to one discussion and use bounded file input and explicit intent.
     evidence_ref: out/func-strings.txt:2879; PLUGIN-GAP-ANALYSIS.md section 4
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab mr pipeline list
-    rationale: MR-specific pipeline enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab mr pipeline-list <project> <iid>'
+    operation: gitlab_list_merge_request_pipelines
+    rationale: The replacement returns bounded normalized pipeline summaries for one merge request rather than an unbounded vendor response.
     evidence_ref: out/func-strings.txt:2984; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *gap
     service: gitlab
@@ -426,10 +434,12 @@ rows:
     source_command: super-cli gitlab pipeline cancel
     rationale: Pipeline cancellation has no reviewed preview and confirmation path in this release.
     evidence_ref: out/func-strings.txt:2988; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab pipeline job list
-    rationale: Pipeline-job enumeration is not exposed as a standalone connector operation.
+    replacement: '{brand} gitlab pipeline job-list <project> <pipeline-id>'
+    operation: gitlab_list_pipeline_jobs
+    rationale: The replacement returns bounded normalized jobs for one pipeline without job traces or arbitrary raw payload fields.
     evidence_ref: out/func-strings.txt:2928; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *equivalent_read
     service: gitlab
@@ -467,10 +477,12 @@ rows:
     source_command: super-cli gitlab project edit
     rationale: Broad project-settings mutation is deliberately excluded from the bounded connector contract.
     evidence_ref: out/func-strings.txt:2978; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab project search
-    rationale: Fuzzy project search is not exposed; the connector resolves one exact project identity.
+    replacement: '{brand} gitlab project search --query <query>'
+    operation: gitlab_search_projects
+    rationale: The replacement returns a bounded permission-scoped set of visible project identities.
     evidence_ref: out/func-strings.txt:2972; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *safer_read
     service: gitlab
@@ -484,40 +496,52 @@ rows:
     source_command: super-cli gitlab release create
     rationale: GitLab release creation is not exposed by the approved connector contract.
     evidence_ref: out/func-strings.txt:3003; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab release list
-    rationale: GitLab release enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab release list <project>'
+    operation: gitlab_list_releases
+    rationale: The replacement lists bounded published release summaries without following assets.
     evidence_ref: out/func-strings.txt:2951; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab release view
-    rationale: GitLab release detail is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab release show <project> <tag>'
+    operation: gitlab_read_release
+    rationale: The replacement reads one bounded published release with only returned same-origin asset metadata.
     evidence_ref: out/func-strings.txt:2955; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab search code
-    rationale: Repository code search and snippets are not exposed by the bounded connector contract.
+    replacement: '{brand} gitlab search code <project> --query <query>'
+    operation: gitlab_search_code
+    rationale: The replacement searches one selected project and returns bounded redacted snippets as untrusted data.
     evidence_ref: out/func-strings.txt:2968; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab tag list
-    rationale: Repository tag enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab tag list <project>'
+    operation: gitlab_list_tags
+    rationale: The replacement returns bounded normalized tag refs without expanding release notes or assets.
     evidence_ref: out/func-strings.txt:2947; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *gap
     service: gitlab
     source_command: super-cli gitlab todo done
     rationale: User to-do mutation is not part of the project-scoped connector contract.
     evidence_ref: out/func-strings.txt:3019; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab todo list
-    rationale: User-scoped to-do enumeration is not part of the project-scoped connector contract.
+    replacement: '{brand} gitlab todo list'
+    operation: gitlab_list_todos
+    rationale: The replacement lists a bounded read-only personal To-Do queue, optionally narrowed to a project.
     evidence_ref: out/func-strings.txt:3015; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *excluded
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab variable list
-    rationale: CI/CD variable enumeration can expose protected configuration and is deliberately excluded.
+    replacement: '{brand} gitlab variable list <project>'
+    operation: gitlab_list_ci_variables
+    rationale: The replacement returns bounded project variable metadata without values, unlike broader inherited CI inspection.
     evidence_ref: out/func-strings.txt:3012; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *excluded
     service: gitlab

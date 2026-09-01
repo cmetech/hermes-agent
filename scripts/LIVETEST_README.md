@@ -14,6 +14,25 @@ python3 scripts/analyze_livetest.py            # side-by-side report
 
 Requires `OPENROUTER_API_KEY` set or present in `~/.hermes/.env`.
 
+## Ericsson GitLab routing gate
+
+`gitlab_skill_routing_livetest.py` exercises the vendored routing corpus with
+two explicit provider-qualified model IDs. GitLab handlers are always replaced
+with bounded fake reads; any attempted GitLab write is recorded and fails the
+run before a real handler or network call.
+
+```bash
+python3 scripts/gitlab_skill_routing_livetest.py --list-cases --slice ci
+python3 scripts/gitlab_skill_routing_livetest.py --slice ci \
+  --claude-model anthropic/claude-sonnet-4 \
+  --openai-model openai/gpt-5
+```
+
+The full gate needs `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. It copies only
+the selected provider credential into an isolated home, never copies
+`auth.json` or a GitLab credential, and writes redacted reports under the
+ignored `scripts/out/gitlab-routing/` directory.
+
 ## What it verifies
 
 | Scenario | Tests |
