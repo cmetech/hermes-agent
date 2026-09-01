@@ -20,6 +20,7 @@ from agent import secret_scope
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+import hermes_cli.handoff.local as local_module
 from hermes_cli.handoff.local import LocalHermesChannel
 from hermes_cli.handoff.models import HandoffEndpoint, HandoffSpec
 from hermes_cli.handoff.service import AgentHandoffService, ChannelDefinitelyNotAccepted
@@ -462,18 +463,25 @@ async def test_stop_active_run_converges_through_cancelling_to_authoritative_tru
 
 
 @pytest.mark.asyncio
-async def test_capability_downgrade_refuses_binding(profile_env):
+async def test_capability_downgrade_refuses_runs_and_falls_back_to_cli(profile_env):
     default_home, _target_home = profile_env
     async with _gateway(profile_env, durable=False):
         service, created = _service(default_home)
         assessment = await asyncio.to_thread(
             service.validate_endpoint, created.spec.endpoint, "workflow/run-1"
         )
+        runs_connection, runs_failure = await asyncio.to_thread(
+            service.channel._assess,
+            created.spec.endpoint,
+            local_module._Deadline(2),
+        )
         bound = (await asyncio.to_thread(service.advance, created.handoff_id)).snapshot
-        assert assessment.available is False
-        assert assessment.failure_code == "runs_not_durable"
-        assert bound.mechanism is None
-        assert bound.failure_code == "runs_not_durable"
+        assert runs_connection is None
+        assert runs_failure == "runs_not_durable"
+        assert assessment.available is True
+        assert assessment.mechanism == "local_cli"
+        assert bound.mechanism == "local_cli"
+        assert "session_id" not in bound.checkpoint
 
 
 @pytest.mark.parametrize(
@@ -484,7 +492,7 @@ async def test_capability_downgrade_refuses_binding(profile_env):
     ],
 )
 @pytest.mark.asyncio
-async def test_truthy_non_boolean_capability_values_refuse_binding(
+async def test_truthy_non_boolean_capability_values_refuse_runs_before_cli_fallback(
     profile_env, contract
 ):
     default_home, target_home = profile_env
@@ -501,18 +509,28 @@ async def test_truthy_non_boolean_capability_values_refuse_binding(
     await server.start_server()
     _write_config(default_home, port=server.port)
     try:
+        channel = LocalHermesChannel()
+        service = AgentHandoffService(
+            store=HandoffStore(default_home / "malformed-capability.db"),
+            channel=channel,
+        )
+        runs_connection, runs_failure = await asyncio.to_thread(
+            channel._assess,
+            HandoffEndpoint.parse("hermes://local/reviewer"),
+            local_module._Deadline(2),
+        )
         assessment = await asyncio.to_thread(
-            AgentHandoffService(
-                store=HandoffStore(default_home / "malformed-capability.db")
-            ).validate_endpoint,
+            service.validate_endpoint,
             "hermes://local/reviewer",
             "workflow/run-1",
         )
     finally:
         await server.close()
 
-    assert assessment.available is False
-    assert assessment.failure_code == "runs_not_durable"
+    assert runs_connection is None
+    assert runs_failure == "runs_not_durable"
+    assert assessment.available is True
+    assert assessment.mechanism == "local_cli"
 
 
 @pytest.mark.asyncio
@@ -547,15 +565,21 @@ async def test_unspecified_listener_connects_through_ipv4_loopback(
         ({}, "short", "api_server_key_weak"),
     ],
 )
-def test_binding_gates_fail_closed(profile_env, changes, key, expected):
+def test_runs_binding_gates_fail_closed_before_cli_fallback(
+    profile_env, changes, key, expected
+):
     default_home, target_home = profile_env
     (target_home / ".env").write_text(f"API_SERVER_KEY={key}\n", encoding="utf-8")
     _write_config(default_home, port=9, **changes)
+    channel = LocalHermesChannel()
+    runs_connection, runs_failure = channel._connection("reviewer")
     assessment = AgentHandoffService(
-        store=HandoffStore(default_home / f"{expected}.db")
+        store=HandoffStore(default_home / f"{expected}.db"), channel=channel
     ).validate_endpoint("hermes://local/reviewer", "workflow/run-1")
-    assert assessment.available is False
-    assert assessment.failure_code == expected
+    assert runs_connection is None
+    assert runs_failure == expected
+    assert assessment.available is True
+    assert assessment.mechanism == "local_cli"
 
 
 def test_target_secret_never_borrows_ambient_default_key(profile_env, monkeypatch):
@@ -563,10 +587,15 @@ def test_target_secret_never_borrows_ambient_default_key(profile_env, monkeypatc
     (target_home / ".env").unlink(missing_ok=True)
     monkeypatch.setenv("API_SERVER_KEY", DEFAULT_KEY)
     _write_config(default_home, port=9)
+    channel = LocalHermesChannel()
+    runs_connection, runs_failure = channel._connection("reviewer")
     assessment = AgentHandoffService(
-        store=HandoffStore(default_home / "ambient.db")
+        store=HandoffStore(default_home / "ambient.db"), channel=channel
     ).validate_endpoint("hermes://local/reviewer", "workflow/run-1")
-    assert assessment.failure_code == "api_server_key_missing"
+    assert runs_connection is None
+    assert runs_failure == "api_server_key_missing"
+    assert assessment.available is True
+    assert assessment.mechanism == "local_cli"
 
 
 @pytest.mark.asyncio
