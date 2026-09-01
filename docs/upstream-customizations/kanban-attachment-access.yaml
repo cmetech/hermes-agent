@@ -88,7 +88,7 @@ upstream_changes:
     Remove when upstream's own kanban drawer makes an attachment openable --
     i.e. when a completed task's attached output file can be reached from the
     desktop UI without this code. Keep the tests.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 - id: kanban-attachment-preview
   change_class: product-surface-generic
   owner: downstream-edge-capability
@@ -146,4 +146,4 @@ upstream_changes:
     Remove when upstream's own kanban drawer opens an attachment in the preview
     rail -- i.e. when clicking a completed task's output file shows it in the
     app without this code. Keep the tests.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

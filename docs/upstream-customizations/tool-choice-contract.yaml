@@ -41,7 +41,7 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream exposes an equivalent one-shot explicit tool-choice
     control on all three surfaces with the same session isolation.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 
 - id: provider-tool-policy-transport
   change_class: provider-contract
@@ -79,7 +79,7 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream owns equivalent cross-provider required, named, none,
     retry, and post-tool semantics without request-global state.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 
 - id: api-tool-contract-lifecycle-and-diagnostics
   change_class: api-contract
@@ -122,7 +122,7 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream provides equivalent request-scoped admission,
     lifecycle, explicit failure, streaming preflight, and bounded diagnostics.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 
 - id: native-structured-output-transports
   change_class: provider-contract
@@ -157,4 +157,4 @@ upstream_changes:
   removal_condition: >-
     Remove when upstream provides equivalent native-schema handling for direct
     Anthropic, Chat Completions, and Responses transports.
-  last_verified_upstream: 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
