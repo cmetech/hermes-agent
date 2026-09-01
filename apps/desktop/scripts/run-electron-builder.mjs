@@ -8,6 +8,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
 import { createRequire } from "node:module"
+import { forceNoPublishArgs } from "./electron-builder-args.mjs"
 
 const require = createRequire(import.meta.url)
 
@@ -46,17 +47,18 @@ const dist = electronDistDir()
 // (only the repo root does) and no "repository" field in its package.json —
 // so it fails with "Cannot detect repository by .git/config". Pin publish to
 // "never" so electron-builder skips that lookup entirely.
-const args = ["--publish", "never"]
+// Release workflows also pass `--publish never`. Yargs turns duplicate option
+// values into an array, which electron-builder mistakes for an enabled publish
+// policy. Normalize every caller form to one forced value.
+const args = forceNoPublishArgs(process.argv.slice(2))
 if (dist && fs.existsSync(distBinary(dist))) {
-  args.push(`-c.electronDist=${dist}`)
+  args.splice(2, 0, `-c.electronDist=${dist}`)
 } else {
   console.warn(
     "[run-electron-builder] no local electron dist; electron-builder will fetch " +
       "via @electron/get (electronVersion + ELECTRON_MIRROR)."
   )
 }
-args.push(...process.argv.slice(2))
-
 const result = spawnSync(process.execPath, [electronBuilderCli(), ...args], {
   stdio: "inherit",
 })
