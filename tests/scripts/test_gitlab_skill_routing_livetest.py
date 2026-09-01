@@ -364,6 +364,24 @@ def test_run_case_requires_expected_personal_scope_arguments(
     assert result["passed"] is expected
 
 
+def test_vendored_project_mr_case_rejects_missing_and_wrong_project_arguments():
+    case = next(
+        case
+        for case in runner.CORPUS_DATA["cases"]
+        if case["id"] == "mr-project-discovery-clear"
+    )
+
+    def trace(project=None):
+        arguments = {} if project is None else {"project": project}
+        return [{"name": "gitlab_list_merge_requests", "args": arguments}]
+
+    assert not runner.expected_arguments_match(case, trace())
+    assert not runner.expected_arguments_match(case, trace("division/platform/other"))
+    assert runner.expected_arguments_match(
+        case, trace("division/platform/team/repo")
+    )
+
+
 @pytest.mark.parametrize(
     ("resolved_provider", "resolved_model", "message"),
     [

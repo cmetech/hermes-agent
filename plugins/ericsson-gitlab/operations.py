@@ -51,6 +51,7 @@ _MAX_SEARCH_SNIPPET_BYTES = 4096
 _MAX_SEARCH_TOTAL_BYTES = 128 * 1024
 _MAX_SEARCH_RESULTS_PER_CALL = _MAX_SEARCH_TOTAL_BYTES // _MAX_SEARCH_SNIPPET_BYTES
 _MAX_JOBS = 2000
+_MAX_CONTINUATION_IDENTITIES = _MAX_GROUP_PROJECTS
 _MAX_COMMIT_TEXT = 128 * 1024
 _MAX_JOB_TEXT = 2048
 _MAX_COMMIT_STAT = 1_000_000_000
@@ -407,7 +408,7 @@ def _continuation_source(value: Any) -> tuple[int, int]:
     if value is None:
         return 1, 0
     if not isinstance(value, Mapping) or not set(value).issubset(
-        {"page", "next_page", "offset"}
+        {"page", "next_page", "offset", "seen"}
     ):
         raise GitLabError("invalid_input")
     if "page" in value and "next_page" in value:
@@ -424,7 +425,41 @@ def _continuation_source(value: Any) -> tuple[int, int]:
         or offset >= 100
     ):
         raise GitLabError("invalid_input")
+    _continuation_seen(value)
     return page, offset
+
+
+def _continuation_seen(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise GitLabError("invalid_input")
+    seen = value.get("seen", [])
+    if not isinstance(seen, list) or len(seen) > _MAX_CONTINUATION_IDENTITIES:
+        raise GitLabError("invalid_input")
+    if (
+        any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[0-9a-f]{64}", item) is None
+            for item in seen
+        )
+        or len(seen) != len(set(seen))
+    ):
+        raise GitLabError("invalid_input")
+    return tuple(seen)
+
+
+def _identity_digest(value: Any) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise GitLabError("invalid_remote_data") from None
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _rfc3339(value: Any, *, remote: bool) -> tuple[datetime, str]:
@@ -1016,9 +1051,11 @@ class GitLabOperations:
                 params={"order_by": "path", "sort": "asc"},
                 max_items=max_groups - 1,
                 normalize=self._normalize_group,
+                identity=lambda item: item["id"],
                 deadline=deadline,
                 start_page=group_page,
                 start_offset=group_offset,
+                start_seen=_continuation_seen(continuation.get("groups")),
             )
             groups.extend(group_pages.items)
         elif recursive:
@@ -1044,9 +1081,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_group_project(
                 item, root_path=root["full_path"]
             ),
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=project_page,
             start_offset=project_offset,
+            start_seen=_continuation_seen(continuation.get("projects")),
         )
         projects = [
             project
@@ -1152,8 +1191,10 @@ class GitLabOperations:
             params={"scope": "projects", "search": query},
             max_items=max_items,
             normalize=self._normalize_project_search_result,
+            identity=lambda item: item["id"],
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "query": query,
@@ -1173,8 +1214,7 @@ class GitLabOperations:
             raise GitLabError("invalid_remote_data")
         path = _remote_repo_path(payload.get("path"))
         filename = _remote_repo_path(payload.get("filename"))
-        basename = _remote_repo_path(payload.get("basename"))
-        if "/" in basename or filename != path or basename != path.rsplit("/", 1)[-1]:
+        if filename != path:
             raise GitLabError("invalid_remote_data")
         ref = _validate_remote_ref(payload.get("ref"))
         start_line = payload.get("startline")
@@ -1189,7 +1229,7 @@ class GitLabOperations:
             raise GitLabError("invalid_remote_data") from None
         result: dict[str, Any] = {
             "project": {"id": project_id, "path": project["path_with_namespace"]},
-            "filename": basename,
+            "filename": path.rsplit("/", 1)[-1],
             "path": path,
             "ref": ref,
             "snippet": snippet[:_MAX_SEARCH_SNIPPET_BYTES].decode(
@@ -1225,9 +1265,16 @@ class GitLabOperations:
             params=params,
             max_items=applied_max_items,
             normalize=lambda item: self._normalize_code_match(item, project=resolved),
+            identity=lambda item: (
+                item.get("project_id"),
+                item.get("path"),
+                item.get("ref"),
+                item.get("startline"),
+            ),
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
@@ -1323,9 +1370,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_branch(
                 item, project_path=resolved["path_with_namespace"]
             ),
+            identity=lambda item: item["name"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": self._project_summary(resolved),
@@ -1363,7 +1412,7 @@ class GitLabOperations:
         commit = _as_object(payload.get("commit"))
         sha = _commit_sha(commit.get("id"))
         short_sha = _commit_sha(commit.get("short_id"), short=True)
-        if target != sha or not sha.startswith(short_sha):
+        if not sha.startswith(short_sha):
             raise GitLabError("invalid_remote_data")
 
         _committed, committed_at = _rfc3339(
@@ -1422,7 +1471,11 @@ class GitLabOperations:
         ):
             raise GitLabError("invalid_remote_data")
         links = _as_object(payload.get("_links"))
-        _same_origin_url(links.get("self"), self.client.auth.origin)
+        _canonical_remote_url(
+            links.get("self"),
+            self.client.auth.origin,
+            f"/{project_path}/-/releases/{tag}",
+        )
 
         result: dict[str, Any] = {
             "tag": tag,
@@ -1632,10 +1685,6 @@ class GitLabOperations:
         )
         if detail["tag"] != tag:
             raise GitLabError("invalid_remote_data")
-        link = _as_object(payload.get("_links")).get("self")
-        expected_path = f"/api/v4/projects/{resolved['id']}/releases/{tag}"
-        if unquote(urlsplit(link).path) != expected_path:
-            raise GitLabError("invalid_remote_data")
         return {"project": self._project_summary(resolved), "release": detail}
 
     def list_releases(
@@ -1668,25 +1717,20 @@ class GitLabOperations:
         resolved = self.resolve_project(project, deadline=deadline)
 
         def normalize(item: Mapping[str, Any]) -> dict[str, Any]:
-            result = self._normalize_release_summary(
+            return self._normalize_release_summary(
                 item, project_path=resolved["path_with_namespace"]
             )
-            link = _as_object(item.get("_links")).get("self")
-            expected_path = (
-                f"/api/v4/projects/{resolved['id']}/releases/{result['tag']}"
-            )
-            if unquote(urlsplit(link).path) != expected_path:
-                raise GitLabError("invalid_remote_data")
-            return result
 
         pages = self._paginate(
             f"/api/v4/projects/{resolved['id']}/releases",
             params={"order_by": order_by, "sort": sort},
             max_items=max_items,
             normalize=normalize,
+            identity=lambda item: item.get("tag_name"),
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": self._project_summary(resolved),
@@ -1901,9 +1945,11 @@ class GitLabOperations:
             params=params,
             max_items=max_items,
             normalize=normalize,
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "filters": {
@@ -1953,9 +1999,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_tag(
                 item, project_path=resolved["path_with_namespace"]
             ),
+            identity=lambda item: item["name"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": self._project_summary(resolved),
@@ -2099,9 +2147,12 @@ class GitLabOperations:
         commit_url = (
             f"{self.client.auth.origin}/{encoded_project}/-/commit/{commit_sha}"
         )
-        web_url = _same_origin_url(
+        _same_origin_url(
             required_text(payload, "web_url", _MAX_PROJECT_REFERENCE),
             self.client.auth.origin,
+        )
+        web_url = (
+            f"{self.client.auth.origin}/{encoded_project}/-/jobs/{identifier}"
         )
         failure_reason = payload.get("failure_reason")
         if failure_reason is not None and (
@@ -2200,9 +2251,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_commit(
                 item, project_path=resolved["path_with_namespace"]
             ),
+            identity=lambda item: item.get("id"),
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": self._project_summary(resolved),
@@ -2304,9 +2357,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_job(
                 item, project_path=resolved["path_with_namespace"]
             ),
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
@@ -2490,9 +2545,18 @@ class GitLabOperations:
             params={},
             max_items=max_items,
             normalize=self._normalize_commit_comment,
+            identity=lambda item: (
+                _as_object(item.get("author")).get("id"),
+                item.get("created_at"),
+                item.get("path"),
+                item.get("line"),
+                item.get("line_type"),
+                item.get("note"),
+            ),
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": self._project_summary(resolved),
@@ -2527,9 +2591,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_discussion(
                 item, max_notes=max_notes_per_discussion
             ),
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         discussions = list(pages.items)
         return {
@@ -2797,9 +2863,11 @@ class GitLabOperations:
             params=params,
             max_items=max_items,
             normalize=normalize,
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         activity_basis = (
             "created"
@@ -2852,9 +2920,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_commit(
                 item, project_path=resolved["path_with_namespace"]
             ),
+            identity=lambda item: item.get("id"),
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": self._project_summary(resolved),
@@ -2889,9 +2959,11 @@ class GitLabOperations:
             normalize=lambda item: self._normalize_discussion(
                 item, max_notes=max_notes_per_discussion
             ),
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         discussions = list(pages.items)
         notes = [note for discussion in discussions for note in discussion["notes"]]
@@ -3595,9 +3667,11 @@ class GitLabOperations:
         params: Mapping[str, Any],
         max_items: int,
         normalize: Callable[[Mapping[str, Any]], dict[str, Any]],
+        identity: Callable[[Mapping[str, Any]], Any],
         deadline: float | None = None,
         start_page: int = 1,
         start_offset: int = 0,
+        start_seen: tuple[str, ...] = (),
     ) -> PageResult:
         if deadline is None:
             deadline = self.client.operation_deadline()
@@ -3614,6 +3688,7 @@ class GitLabOperations:
         pages_fetched = 0
         first_page = True
         items: list[dict[str, Any]] = []
+        seen = set(start_seen)
         truncated = False
         next_page: int | None = None
         next_offset: int | None = None
@@ -3629,12 +3704,21 @@ class GitLabOperations:
             if offset_base > len(values):
                 raise GitLabError("invalid_input")
             for offset, raw in enumerate(values[offset_base:], start=offset_base):
+                item = _as_object(raw)
+                item_identity = _identity_digest(identity(item))
+                if item_identity in seen:
+                    normalize(item)
+                    continue
                 if len(items) >= max_items:
                     truncated = True
                     next_page = page
                     next_offset = offset
                     break
-                items.append(normalize(_as_object(raw)))
+                normalized = normalize(item)
+                if len(seen) >= _MAX_CONTINUATION_IDENTITIES:
+                    raise GitLabError("capacity")
+                seen.add(item_identity)
+                items.append(normalized)
             if truncated:
                 break
             first_page = False
@@ -3654,15 +3738,26 @@ class GitLabOperations:
                 next_page = candidate
                 break
             page = candidate
-        return PageResult(tuple(items), truncated, next_page, next_offset)
+        return PageResult(
+            tuple(items),
+            truncated,
+            next_page,
+            next_offset,
+            tuple(sorted(seen)),
+        )
 
     @staticmethod
-    def _continuation(pages: PageResult) -> dict[str, int] | None:
+    def _continuation(pages: PageResult) -> dict[str, Any] | None:
         if pages.next_page is None:
             return None
+        cursor: dict[str, Any]
         if pages.next_offset is not None:
-            return {"page": pages.next_page, "offset": pages.next_offset}
-        return {"next_page": pages.next_page}
+            cursor = {"page": pages.next_page, "offset": pages.next_offset}
+        else:
+            cursor = {"next_page": pages.next_page}
+        if pages.seen:
+            cursor["seen"] = list(pages.seen)
+        return cursor
 
     def list_repository_tree(
         self,
@@ -3696,6 +3791,7 @@ class GitLabOperations:
             params={"ref": ref, "path": path, "recursive": str(recursive).lower()},
             max_items=max_items,
             normalize=normalize,
+            identity=lambda item: (item.get("type"), item.get("path")),
         )
         entries = sorted(pages.items, key=lambda item: (item["path"], item["id"]))
         return {
@@ -3866,7 +3962,9 @@ class GitLabOperations:
         _same_origin_url(result["web_url"], self.client.auth.origin)
         return result
 
-    def _normalize_pipeline_summary(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def _normalize_pipeline_summary(
+        self, payload: Mapping[str, Any], *, project_path: str
+    ) -> dict[str, Any]:
         identifier = _remote_positive_int(payload.get("id"))
         projected: dict[str, Any] = {"id": identifier}
         iid = payload.get("iid")
@@ -3893,8 +3991,11 @@ class GitLabOperations:
             else:
                 _parsed, projected[field] = _rfc3339(value, remote=True)
         web_url = payload.get("web_url")
+        if web_url is not None:
+            _same_origin_url(web_url, self.client.auth.origin)
         projected["web_url"] = (
-            None if web_url is None else _same_origin_url(web_url, self.client.auth.origin)
+            f"{self.client.auth.origin}/{quote(project_path, safe='/')}/-/pipelines/"
+            f"{identifier}"
         )
         return projected
 
@@ -3906,7 +4007,6 @@ class GitLabOperations:
         status: str | None = None,
         max_items: int = 50,
     ) -> dict[str, Any]:
-        project_endpoint = _project_endpoint(project)
         max_items = _positive_bound(max_items, _MAX_PIPELINES)
         params: dict[str, Any] = {"order_by": "id", "sort": "desc"}
         if ref is not None:
@@ -3914,11 +4014,17 @@ class GitLabOperations:
         if status is not None:
             params["status"] = _bounded_string(status, 64)
 
+        deadline = self.client.operation_deadline()
+        resolved = self.resolve_project(project, deadline=deadline)
         pages = self._paginate(
-            f"/api/v4/projects/{project_endpoint}/pipelines",
+            f"/api/v4/projects/{resolved['id']}/pipelines",
             params=params,
             max_items=max_items,
-            normalize=self._normalize_pipeline_summary,
+            normalize=lambda item: self._normalize_pipeline_summary(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            identity=lambda item: item["id"],
+            deadline=deadline,
         )
         return {
             "project": str(project),
@@ -3945,10 +4051,14 @@ class GitLabOperations:
             f"/api/v4/projects/{resolved['id']}/merge_requests/{iid}/pipelines",
             params={},
             max_items=max_items,
-            normalize=self._normalize_pipeline_summary,
+            normalize=lambda item: self._normalize_pipeline_summary(
+                item, project_path=resolved["path_with_namespace"]
+            ),
+            identity=lambda item: item["id"],
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},
@@ -4002,9 +4112,16 @@ class GitLabOperations:
             "ref": required_string("ref", _MAX_REF),
             "sha": required_string("sha", 128),
             "source": required_string("source", 128),
-            "web_url": required_string("web_url", _MAX_PROJECT_REFERENCE),
+            "web_url": (
+                f"{self.client.auth.origin}/"
+                f"{quote(project_result['path_with_namespace'], safe='/')}"
+                f"/-/pipelines/{pipeline_id}"
+            ),
         }
-        _same_origin_url(result["web_url"], self.client.auth.origin)
+        _same_origin_url(
+            required_string("web_url", _MAX_PROJECT_REFERENCE),
+            self.client.auth.origin,
+        )
         for field in ("created_at", "updated_at", "started_at", "finished_at"):
             if field not in payload:
                 raise GitLabError("invalid_remote_data")
@@ -5443,9 +5560,8 @@ class GitLabOperations:
                     truncated = True
         return results, truncated, parse_status
 
-    @staticmethod
     def _variable_metadata(
-        raw: Mapping[str, Any], *, scope: str, source: str
+        self, raw: Mapping[str, Any], *, scope: str, source: str
     ) -> dict[str, Any]:
         key = raw.get("key")
         variable_type = raw.get("variable_type", "env_var")
@@ -5461,12 +5577,15 @@ class GitLabOperations:
             or not isinstance(environment_scope, str)
             or not environment_scope
             or len(environment_scope) > 512
-            or (
-                description is not None
-                and (not isinstance(description, str) or len(description) > 2048)
-            )
+            or (description is not None and not isinstance(description, str))
         ):
             raise GitLabError("invalid_remote_data")
+        if description is not None:
+            try:
+                description = self._redact_text(description).encode("utf-8")
+            except UnicodeEncodeError:
+                raise GitLabError("invalid_remote_data") from None
+            description = description[:2048].decode("utf-8", errors="ignore")
         flags = {}
         for source_name, target_name in (
             ("protected", "protected"),
@@ -5523,9 +5642,14 @@ class GitLabOperations:
             params={},
             max_items=max_items,
             normalize=normalize,
+            identity=lambda item: (
+                item.get("key"),
+                item.get("environment_scope", "*"),
+            ),
             deadline=deadline,
             start_page=start_page,
             start_offset=start_offset,
+            start_seen=_continuation_seen(continuation),
         )
         return {
             "project": {"id": resolved["id"], "path": resolved["path_with_namespace"]},

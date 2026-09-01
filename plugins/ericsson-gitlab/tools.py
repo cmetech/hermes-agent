@@ -42,6 +42,12 @@ _PAGE_CONTINUATION = {
         "page": {"type": "integer", "minimum": 1},
         "next_page": {"type": "integer", "minimum": 1},
         "offset": {"type": "integer", "minimum": 0, "maximum": 99},
+        "seen": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "maxItems": 5000,
+            "uniqueItems": True,
+        },
     },
     "additionalProperties": False,
 }
@@ -767,6 +773,11 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
         any(not isinstance(key, str) for key in args)
         or not required.issubset(args)
         or not set(args).issubset(allowed)
+        or (
+            name == "gitlab_list_merge_requests"
+            and "project" in args
+            and args["project"] is None
+        )
     ):
         raise GitLabError("invalid_input")
     operations = operations_from_configuration(configuration, **client_options)
