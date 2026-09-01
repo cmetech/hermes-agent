@@ -23,6 +23,17 @@ from .store import (
 
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
 _OPERATIONS = frozenset({"bind", "submit", "reconcile", "observe", "cancel"})
+_BIND_RETRYABLE_FAILURES = frozenset({
+    "api_server_disabled",
+    "api_server_key_missing",
+    "api_server_key_weak",
+    "endpoint_unavailable",
+    "listener_not_loopback",
+    "multiplex_required",
+    "observation_retryable",
+    "profile_not_served",
+    "runs_not_durable",
+})
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 
 
@@ -115,6 +126,10 @@ class AgentHandoffService:
         clock: Callable[[], float] = monotonic,
     ) -> None:
         self.store = store or HandoffStore()
+        if channel is None:
+            from .local import LocalHermesChannel
+
+            channel = LocalHermesChannel()
         self.channel = channel
         self._clock = clock
 
@@ -324,10 +339,9 @@ class AgentHandoffService:
     ) -> tuple[HandoffSnapshot, bool]:
         if operation == "bind" and observation.phase == "prepared":
             if observation.mechanism is None or observation.binding is None:
-                if observation.failure_code not in {
-                    "endpoint_unavailable",
-                    "observation_retryable",
-                }:
+                if observation.failure_code not in _BIND_RETRYABLE_FAILURES and not str(
+                    observation.failure_code or ""
+                ).startswith("http_"):
                     observation = ChannelObservation(
                         phase="failed", failure_code="protocol_violation"
                     )
