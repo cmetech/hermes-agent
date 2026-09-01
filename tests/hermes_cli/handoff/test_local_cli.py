@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
+import io
 import json
 import os
 from pathlib import Path
@@ -62,15 +63,18 @@ def _bound(tmp_path, monkeypatch):
     )
 
 
-def _write_receipt(snapshot, *, stdout=b"done", stderr=b"", exit_code=0):
+def _write_receipt(
+    snapshot, *, stdout=b"done", stderr=b"", exit_code=0, outcome="completed"
+):
     paths = local_module._cli_paths(snapshot.handoff_id)
     local_module._atomic_bytes(paths.stdout, stdout)
     local_module._atomic_bytes(paths.stderr, stderr)
     receipt = {
-        "version": 1,
+        "version": local_module._CLI_RECEIPT_VERSION,
         "handoff_id": snapshot.handoff_id,
         "profile": snapshot.spec.endpoint.profile,
         "request_sha256": snapshot.checkpoint["request_sha256"],
+        "outcome": outcome,
         "exit_code": exit_code,
         "stdout_size": len(stdout),
         "stderr_size": len(stderr),
@@ -129,14 +133,28 @@ def test_wrapper_keeps_prompt_out_of_argv_holds_profile_lock_and_bounds_output(
 
     monkeypatch.setattr(local_module, "acquire_turn_lock", lambda *_a, **_k: _Lock())
 
-    def run(argv, **kwargs):
+    class _Process:
+        returncode = 0
+        stdout = io.BytesIO(b"x" * (local_module.MAX_CLI_OUTPUT_BYTES + 50))
+        stderr = io.BytesIO()
+
+        def wait(self, timeout):
+            return self.returncode
+
+    def popen(argv, **kwargs):
         seen["argv"] = argv
         assert seen["locked"]
         assert snapshot.spec.prompt not in "\0".join(argv)
         assert Path(argv[argv.index("--query-file") + 1]).read_text() == snapshot.spec.prompt
-        return SimpleNamespace(returncode=0, stdout=b"x" * (local_module.MAX_CLI_OUTPUT_BYTES + 50), stderr=b"")
+        assert kwargs["pass_fds"]
+        return _Process()
 
-    monkeypatch.setattr(local_module.subprocess, "run", run)
+    monkeypatch.setattr(
+        local_module.subprocess,
+        "run",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("unbounded run")),
+    )
+    monkeypatch.setattr(local_module.subprocess, "Popen", popen)
     assert local_module._run_cli_wrapper(snapshot.handoff_id, "reviewer") == 0
     observation = local_module.LocalHermesChannel().observe(snapshot, budget_seconds=1)
 
@@ -158,13 +176,61 @@ def test_wrapper_refuses_symlinked_handoff_spool(tmp_path, monkeypatch):
     assert list(outside.iterdir()) == []
 
 
+def test_pinned_spool_directory_survives_path_replacement(tmp_path, monkeypatch):
+    _channel, snapshot = _bound(tmp_path, monkeypatch)
+    paths = local_module._cli_paths(snapshot.handoff_id)
+    displaced = paths.root.with_name("displaced")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "prompt.txt").write_text("attacker replacement", encoding="utf-8")
+    (outside / "prompt.txt").chmod(0o600)
+
+    with local_module._open_cli_dir(snapshot.handoff_id) as (_paths, directory_fd):
+        paths.root.rename(displaced)
+        paths.root.symlink_to(outside, target_is_directory=True)
+        assert (
+            local_module._read_bounded_at(directory_fd, "prompt.txt").decode("utf-8")
+            == snapshot.spec.prompt
+        )
+        local_module._atomic_bytes_at(directory_fd, "stdout.txt", b"safe")
+
+    assert (displaced / "stdout.txt").read_bytes() == b"safe"
+    assert not (outside / "stdout.txt").exists()
+
+
+def test_output_collectors_discard_bytes_above_the_bound():
+    class _Process:
+        returncode = 0
+        stdout = io.BytesIO(b"x" * (local_module.MAX_CLI_OUTPUT_BYTES * 3))
+        stderr = io.BytesIO(b"y" * (local_module.MAX_CLI_OUTPUT_BYTES * 2))
+
+        def wait(self, timeout):
+            return self.returncode
+
+    returncode, stdout, stderr, timed_out = local_module._collect_process_output(
+        _Process(), timeout_seconds=1
+    )
+
+    assert returncode == 0
+    assert timed_out is False
+    assert len(stdout) == local_module.MAX_CLI_OUTPUT_BYTES
+    assert len(stderr) == local_module.MAX_CLI_OUTPUT_BYTES
+
+
 def test_signal_exit_cannot_be_recorded_as_success(tmp_path, monkeypatch):
     channel, snapshot = _bound(tmp_path, monkeypatch)
+    process = SimpleNamespace(
+        returncode=-9,
+        stdout=io.BytesIO(),
+        stderr=io.BytesIO(),
+        wait=lambda timeout: -9,
+    )
     monkeypatch.setattr(
         local_module.subprocess,
         "run",
-        lambda *_a, **_k: SimpleNamespace(returncode=-9, stdout=b"", stderr=b""),
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("unbounded run")),
     )
+    monkeypatch.setattr(local_module.subprocess, "Popen", lambda *_a, **_k: process)
 
     local_module._run_cli_wrapper(snapshot.handoff_id, "reviewer")
     observed = channel.observe(snapshot, budget_seconds=1)
@@ -264,18 +330,42 @@ def test_reconcile_never_blindly_replays_a_local_cli_submission(tmp_path, monkey
     assert channel.reconcile(snapshot, budget_seconds=1).phase == "indeterminate"
 
 
-def test_timeout_writes_error_receipt_and_cancel_needs_authoritative_stop(tmp_path, monkeypatch):
+def test_timeout_receipt_is_indeterminate(tmp_path, monkeypatch):
     channel, snapshot = _bound(tmp_path, monkeypatch)
+
+    class _TimedOutProcess:
+        returncode = None
+        stdout = io.BytesIO(b"partial")
+        stderr = io.BytesIO()
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired(["hermes"], timeout)
+
+        def kill(self):
+            return None
+
     monkeypatch.setattr(
         local_module.subprocess,
         "run",
-        lambda *_a, **_k: (_ for _ in ()).throw(subprocess.TimeoutExpired(["hermes"], 1)),
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("unbounded run")),
+    )
+    monkeypatch.setattr(
+        local_module.subprocess, "Popen", lambda *_a, **_k: _TimedOutProcess()
     )
     local_module._run_cli_wrapper(snapshot.handoff_id, "reviewer")
-    assert channel.observe(snapshot, budget_seconds=1).phase == "failed"
+    timeout = channel.observe(snapshot, budget_seconds=1)
+    receipt = json.loads(
+        local_module._cli_paths(snapshot.handoff_id).receipt.read_text()
+    )
+    assert receipt["outcome"] == "timeout"
+    assert timeout.phase == "indeterminate"
+    assert timeout.failure_code == "local_cli_timeout"
 
-    paths = local_module._cli_paths(snapshot.handoff_id)
-    paths.receipt.unlink()
+
+def test_cancel_requires_proven_identity_disappearance_after_terminate_true(
+    tmp_path, monkeypatch
+):
+    channel, snapshot = _bound(tmp_path, monkeypatch)
     submitted = replace(snapshot, phase="cancelling", checkpoint={
         **snapshot.checkpoint,
         "process_pid": 123,
@@ -284,7 +374,30 @@ def test_timeout_writes_error_receipt_and_cancel_needs_authoritative_stop(tmp_pa
         "status": "running",
     })
     monkeypatch.setattr(channel, "_identity_is_current", lambda identity: True)
-    monkeypatch.setattr(local_module.ManagedProcessTree, "terminate_existing", lambda identity: False)
+    monkeypatch.setattr(
+        local_module.ManagedProcessTree, "terminate_existing", lambda identity: False
+    )
     assert channel.cancel(submitted, budget_seconds=1).phase == "cancelling"
-    monkeypatch.setattr(local_module.ManagedProcessTree, "terminate_existing", lambda identity: True)
+    monkeypatch.setattr(
+        local_module.ManagedProcessTree, "terminate_existing", lambda identity: True
+    )
+    monkeypatch.setattr(channel, "_identity_is_gone", lambda identity: False)
+    assert channel.cancel(submitted, budget_seconds=1).phase == "cancelling"
+    monkeypatch.setattr(channel, "_identity_is_gone", lambda identity: True)
     assert channel.cancel(submitted, budget_seconds=1).phase == "cancelled"
+
+
+def test_identity_disappearance_requires_recorded_process_group_to_be_absent(
+    monkeypatch,
+):
+    identity = ProcessIdentity(pid=123, start_time=456, group_id=123)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    monkeypatch.setattr(local_module.os, "killpg", lambda group_id, signal: None)
+
+    assert LocalHermesChannel._identity_is_gone(identity) is False
+
+    def missing_group(group_id, signal):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(local_module.os, "killpg", missing_group)
+    assert LocalHermesChannel._identity_is_gone(identity) is True
