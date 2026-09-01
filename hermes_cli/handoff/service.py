@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
@@ -238,8 +239,7 @@ class AgentHandoffService:
         if snapshot.cancel_requested_at is not None:
             if (
                 snapshot.submit_attempted_at is not None
-                and not snapshot.checkpoint
-                and not self._was_authoritatively_admitted(snapshot.handoff_id)
+                and not self._checkpoint_proves_admission(snapshot.checkpoint)
             ):
                 return "reconcile"
             return "cancel"
@@ -249,21 +249,13 @@ class AgentHandoffService:
             return "reconcile" if snapshot.submit_attempted_at else "submit"
         return "observe"
 
-    def _was_authoritatively_admitted(self, handoff_id: str) -> bool:
-        after_sequence = 0
-        while True:
-            page = self.store.evidence(
-                handoff_id, after_sequence=after_sequence, limit=100
-            )
-            if any(
-                event.kind == "observed"
-                and event.phase_after in {"submitted", "active", "needs_input"}
-                for event in page.events
-            ):
-                return True
-            if not page.has_more:
-                return False
-            after_sequence = page.next_after_sequence
+    @staticmethod
+    def _checkpoint_proves_admission(
+        checkpoint: Mapping[str, object] | None,
+    ) -> bool:
+        return checkpoint is not None and (
+            "run_id" in checkpoint or "process_pid" in checkpoint
+        )
 
     def _call_channel(
         self, operation: str, snapshot: HandoffSnapshot, budget_seconds: float

@@ -155,6 +155,18 @@ def _seed_phase(store: HandoffStore, snapshot, phase: str):
                 lease,
                 ChannelObservation(
                     phase=observed,
+                    checkpoint=(
+                        {"run_id": "run-1"}
+                        if observed
+                        in {
+                            "submitted",
+                            "active",
+                            "needs_input",
+                            "succeeded",
+                            "cancelled",
+                        }
+                        else {}
+                    ),
                     terminal_result=_result() if observed == "succeeded" else None,
                     failure_code="remote_failed" if observed == "failed" else None,
                 ),
@@ -326,6 +338,79 @@ def test_cancel_after_unconfirmed_submit_reconciles_before_delivery(tmp_path):
             snapshot.handoff_id, after_sequence=0, limit=100
         ).events
     ].count("submit_attempted") == 1
+
+
+def test_bind_session_checkpoint_is_not_admission_before_cancel(tmp_path):
+    service, store, channel, snapshot = _service(tmp_path)
+    channel.outcomes["bind"] = ChannelObservation(
+        phase="prepared",
+        mechanism="runs",
+        binding={"profile": "reviewer", "mechanism": "runs"},
+        checkpoint={"session_id": "session-1"},
+    )
+    snapshot = _bind(service, channel, snapshot.handoff_id)
+    channel.outcomes["submit"] = _Crash()
+    with pytest.raises(_Crash):
+        service.advance(snapshot.handoff_id)
+    service.command(
+        snapshot.handoff_id,
+        "cancel",
+        command_id="cancel-1",
+        actor="workflow",
+    )
+    channel.outcomes["reconcile"] = ChannelObservation(
+        phase="active", checkpoint={"run_id": "run-1"}
+    )
+    channel.calls.clear()
+
+    reconciled = service.advance(snapshot.handoff_id)
+
+    assert reconciled.snapshot.phase == "cancelling"
+    assert reconciled.snapshot.checkpoint == {"run_id": "run-1"}
+    assert [name for name, _ in channel.calls] == ["reconcile"]
+
+    channel.outcomes["cancel"] = ChannelObservation(
+        phase="cancelled", checkpoint={"run_id": "run-1"}
+    )
+    channel.calls.clear()
+    terminal = service.advance(snapshot.handoff_id)
+
+    assert terminal.snapshot.phase == "cancelled"
+    assert [name for name, _ in channel.calls] == ["cancel"]
+    assert [
+        event.kind
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    ].count("submit_attempted") == 1
+
+
+def test_admission_selection_never_reads_evidence_history(tmp_path, monkeypatch):
+    service, store, channel, snapshot = _service(tmp_path)
+    snapshot = _bind(service, channel, snapshot.handoff_id)
+    channel.outcomes["submit"] = _Crash()
+    with pytest.raises(_Crash):
+        service.advance(snapshot.handoff_id)
+    service.command(
+        snapshot.handoff_id,
+        "cancel",
+        command_id="cancel-1",
+        actor="workflow",
+    )
+    channel.outcomes["reconcile"] = ChannelObservation(
+        phase="active", checkpoint={"run_id": "run-1"}
+    )
+    channel.calls.clear()
+
+    def fail_evidence_scan(*_args, **_kwargs):
+        raise AssertionError("admission selection scanned evidence history")
+
+    monkeypatch.setattr(store, "evidence", fail_evidence_scan)
+
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.snapshot.phase == "cancelling"
+    assert [name for name, _ in channel.calls] == ["reconcile"]
 
 
 def test_ambiguous_cancel_reconciles_before_repeating_cancel(tmp_path):
