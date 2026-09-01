@@ -419,6 +419,92 @@ def test_submit_requires_a_sealed_binding_and_cannot_be_attempted_twice(tmp_path
         store.journal_attempt(lease, "submit")
 
 
+def test_fenced_binding_journals_before_commit_and_preserves_immutable_rules(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    lease = _claim(store, snapshot.handoff_id)
+
+    journaled = store.journal_attempt(lease, "bind")
+    assert journaled.binding is None
+    assert (
+        store.evidence(snapshot.handoff_id, after_sequence=0, limit=10).events[-1].kind
+        == "bind_attempted"
+    )
+
+    bound = store.commit_binding(
+        lease,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {"run_id": "run-1"},
+    )
+    assert bound.mechanism == "runs"
+    assert bound.checkpoint == {"run_id": "run-1"}
+
+    assert (
+        store.commit_binding(
+            lease,
+            "runs",
+            {"profile": "reviewer", "mechanism": "runs"},
+            {"run_id": "run-1"},
+        )
+        == bound
+    )
+    with pytest.raises(HandoffConflict):
+        store.commit_binding(
+            lease,
+            "cli",
+            {"profile": "reviewer", "mechanism": "cli"},
+            {"session_id": "session-1"},
+        )
+
+
+@pytest.mark.parametrize("taken_over", [False, True])
+def test_expired_or_taken_over_lease_cannot_commit_binding(
+    tmp_path, monkeypatch, taken_over: bool
+):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    first = _claim(store, snapshot.handoff_id, "worker-1")
+    monkeypatch.setattr(store_module, "_utc_now", lambda: first.expires_at)
+    if taken_over:
+        assert (
+            store.claim_advance(
+                snapshot.handoff_id,
+                "worker-2",
+                now=first.expires_at,
+                lease_seconds=30,
+            )
+            is not None
+        )
+
+    with pytest.raises(StaleAdvanceLease):
+        store.commit_binding(
+            first,
+            "runs",
+            {"profile": "reviewer", "mechanism": "runs"},
+            {},
+        )
+
+    assert store.get(snapshot.handoff_id).binding is None
+
+
+def test_fenced_binding_rejects_terminal_handoff(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    lease = _claim(store, snapshot.handoff_id)
+    store.commit_observation(
+        lease, ChannelObservation(phase="failed", failure_code="policy_denied")
+    )
+
+    with pytest.raises(HandoffStateConflict):
+        store.commit_binding(
+            lease,
+            "runs",
+            {"profile": "reviewer", "mechanism": "runs"},
+            {},
+        )
+
+
 def test_cancel_winner_prevents_any_later_submit_fact_or_event(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot = _create(store)
@@ -675,6 +761,33 @@ def test_unbound_terminal_handoff_cannot_be_bound(tmp_path):
         )
 
     assert store.get(terminal.handoff_id) == terminal
+
+
+@pytest.mark.parametrize("phase", ["succeeded", "cancelled"])
+def test_prepared_handoff_accepts_terminal_reconciliation_only_after_submit_journal(
+    tmp_path, phase: str
+):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    lease = _claim(store, snapshot.handoff_id)
+    observation = ChannelObservation(
+        phase=phase,
+        terminal_result=_result() if phase == "succeeded" else None,
+    )
+
+    with pytest.raises(HandoffStateConflict):
+        store.commit_observation(lease, observation)
+
+    store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        snapshot.state_version,
+    )
+    store.journal_attempt(lease, "submit")
+
+    assert store.commit_observation(lease, observation).phase == phase
 
 
 def test_submit_fact_and_event_roll_back_together_on_event_failure(tmp_path):

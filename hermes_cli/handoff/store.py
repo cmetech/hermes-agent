@@ -31,7 +31,7 @@ _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 _SEMANTIC_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,511}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMAND_KINDS = frozenset({"cancel", "reconcile"})
-_ATTEMPT_OPERATIONS = frozenset({"submit", "reconcile", "observe", "cancel"})
+_ATTEMPT_OPERATIONS = frozenset({"bind", "submit", "reconcile", "observe", "cancel"})
 _SAFE_DATA_KEYS = frozenset({
     "actor",
     "command_id",
@@ -58,7 +58,9 @@ _LEGAL_TRANSITIONS = {
         "active",
         "needs_input",
         "indeterminate",
+        "succeeded",
         "failed",
+        "cancelled",
     }),
     "submitted": frozenset({
         "submitted",
@@ -625,6 +627,30 @@ class HandoffStore:
         checkpoint: Mapping[str, object],
         expected_version: int,
     ) -> HandoffSnapshot:
+        with self._lock, write_txn(self._conn):
+            row = self._row(handoff_id)
+            if row["state_version"] != expected_version:
+                raise HandoffStateConflict("handoff state version changed")
+            return self._bind_row(row, mechanism, binding, checkpoint)
+
+    def commit_binding(
+        self,
+        lease: AdvanceLease,
+        mechanism: str,
+        binding: Mapping[str, object],
+        checkpoint: Mapping[str, object],
+    ) -> HandoffSnapshot:
+        with self._lock, write_txn(self._conn):
+            row = self._lease_row(lease, _utc_now())
+            return self._bind_row(row, mechanism, binding, checkpoint)
+
+    def _bind_row(
+        self,
+        row: sqlite3.Row,
+        mechanism: str,
+        binding: Mapping[str, object],
+        checkpoint: Mapping[str, object],
+    ) -> HandoffSnapshot:
         mechanism = _identifier(mechanism, "mechanism")
         candidate = ChannelObservation(
             phase="prepared",
@@ -636,39 +662,39 @@ class HandoffStore:
             raise ValueError("handoff binding mechanism does not match")
         binding_json = _json(candidate.binding)
         checkpoint_json = _json(candidate.checkpoint)
+        if row["phase"] in _TERMINAL_PHASES:
+            raise HandoffStateConflict("terminal handoff cannot be bound")
+        if row["mechanism"] is not None:
+            if (
+                row["mechanism"] == mechanism
+                and row["binding_json"] == binding_json
+                and row["checkpoint_json"] == checkpoint_json
+            ):
+                return self._snapshot(row)
+            raise HandoffConflict("handoff mechanism binding is immutable")
+        if row["submit_attempted_at"] is not None:
+            raise HandoffStateConflict("handoff mechanism cannot bind after submission")
         now = _utc_now()
-        with self._lock, write_txn(self._conn):
-            row = self._row(handoff_id)
-            if row["state_version"] != expected_version:
-                raise HandoffStateConflict("handoff state version changed")
-            if row["phase"] in _TERMINAL_PHASES:
-                raise HandoffStateConflict("terminal handoff cannot be bound")
-            if row["mechanism"] is not None:
-                if (
-                    row["mechanism"] == mechanism
-                    and row["binding_json"] == binding_json
-                    and row["checkpoint_json"] == checkpoint_json
-                ):
-                    return self._snapshot(row)
-                raise HandoffConflict("handoff mechanism binding is immutable")
-            if row["submit_attempted_at"] is not None:
-                raise HandoffStateConflict(
-                    "handoff mechanism cannot bind after submission"
-                )
-            self._conn.execute(
-                """UPDATE handoffs SET mechanism=?, binding_json=?, checkpoint_json=?,
-                   state_version=state_version+1, updated_at=? WHERE handoff_id=?""",
-                (mechanism, binding_json, checkpoint_json, _timestamp(now), handoff_id),
-            )
-            self._append_event(
-                handoff_id,
-                phase_before=row["phase"],
-                phase_after=row["phase"],
-                kind="bound",
-                data={"mechanism": mechanism},
-                created_at=now,
-            )
-            return self._snapshot(self._row(handoff_id))
+        self._conn.execute(
+            """UPDATE handoffs SET mechanism=?, binding_json=?, checkpoint_json=?,
+               state_version=state_version+1, updated_at=? WHERE handoff_id=?""",
+            (
+                mechanism,
+                binding_json,
+                checkpoint_json,
+                _timestamp(now),
+                row["handoff_id"],
+            ),
+        )
+        self._append_event(
+            row["handoff_id"],
+            phase_before=row["phase"],
+            phase_after=row["phase"],
+            kind="bound",
+            data={"mechanism": mechanism},
+            created_at=now,
+        )
+        return self._snapshot(self._row(row["handoff_id"]))
 
     def claim_advance(
         self,
@@ -951,8 +977,15 @@ class HandoffStore:
                     phase_after = "cancelling"
                 self._conn.execute(
                     """UPDATE handoffs SET phase=?, cancel_requested_at=COALESCE(cancel_requested_at, ?),
-                       state_version=state_version+1, updated_at=? WHERE handoff_id=?""",
+                       next_advance_at=NULL, state_version=state_version+1, updated_at=?
+                       WHERE handoff_id=?""",
                     (phase_after, stamp, stamp, handoff_id),
+                )
+            else:
+                self._conn.execute(
+                    """UPDATE handoffs SET next_advance_at=NULL,
+                       state_version=state_version+1, updated_at=? WHERE handoff_id=?""",
+                    (stamp, handoff_id),
                 )
             self._append_event(
                 handoff_id,
