@@ -115,8 +115,9 @@ def cmd_handoff(args) -> int:
     if action in {"reconcile", "cancel"}:
         command_id = getattr(args, "command_id", None) or f"operator-{uuid4().hex}"
 
-    service = _service()
+    service = None
     try:
+        service = _service()
         if action == "list":
             query = {"phase": args.phase} if args.phase else None
             snapshots = service.list(query, limit=args.limit)
@@ -145,15 +146,18 @@ def cmd_handoff(args) -> int:
             return 0
 
         if action == "evidence":
+            snapshot = service.get(args.handoff_id)
             page = service.evidence(
                 args.handoff_id,
                 after_sequence=args.after,
                 limit=args.limit,
             )
-            payload = _evidence_payload(page)
+            payload = {**_summary(snapshot), **_evidence_payload(page)}
             if json_output:
                 print(json.dumps(payload, sort_keys=True))
             else:
+                _print_snapshot(snapshot)
+                print()
                 for event in payload["events"]:
                     print(
                         f"{event['sequence']}\t{event['created_at']}\t{event['kind']}\t"

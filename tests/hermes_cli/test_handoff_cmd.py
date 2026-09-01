@@ -220,6 +220,51 @@ def test_evidence_is_paginated_and_exposes_only_redacted_store_data(
     assert "secret-token" not in json.dumps((first, second))
 
 
+def test_text_evidence_starts_with_safe_handoff_diagnostics(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    snapshot = _create(tmp_path, "text-evidence")
+
+    rc, _ = _run(["handoff", "evidence", snapshot.handoff_id])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    for label in (
+        "handoff_id:",
+        "endpoint:",
+        "mechanism:",
+        "phase:",
+        "age:",
+        "next_observation:",
+        "terminal_summary:",
+        "failure_code:",
+    ):
+        assert label in output
+    assert output.index("handoff_id:") < output.index("1\t")
+    assert "secret-token" not in output
+
+
+def test_empty_json_evidence_page_retains_safe_handoff_identity(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    snapshot = _create(tmp_path, "empty-evidence")
+
+    rc, _ = _run(
+        ["handoff", "evidence", snapshot.handoff_id, "--after", "99", "--json"]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["handoff_id"] == snapshot.handoff_id
+    assert payload["endpoint"] == "hermes://local/worker"
+    assert payload["events"] == []
+    assert payload["next_after_sequence"] == 99
+    assert "prompt" not in json.dumps(payload).lower()
+    assert "secret-token" not in json.dumps(payload)
+
+
 @pytest.mark.parametrize("action", ["reconcile", "cancel"])
 def test_mutation_command_id_is_printed_and_replay_is_idempotent(
     action, monkeypatch, tmp_path, capsys
@@ -313,3 +358,44 @@ def test_handler_does_not_render_untrusted_exception_text(monkeypatch, capsys):
     error = capsys.readouterr().err
     assert "handoff_internal_error" in error
     assert "leaked-secret" not in error
+
+
+def test_mutation_constructor_failure_is_redacted_and_reports_generated_command_id(
+    monkeypatch, capsys
+):
+    def fail_constructor():
+        raise RuntimeError("Authorization: Bearer constructor-secret")
+
+    monkeypatch.setattr("hermes_cli.handoff.cli._service", fail_constructor)
+
+    rc = cmd_handoff(
+        SimpleNamespace(
+            handoff_action="cancel",
+            handoff_id="x",
+            command_id=None,
+            json=True,
+        )
+    )
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["code"] == "handoff_internal_error"
+    assert payload["command_id"].startswith("operator-")
+    assert "constructor-secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("action", ["list", "show", "evidence"])
+def test_read_constructor_failures_return_stable_redacted_error(
+    action, monkeypatch, capsys
+):
+    def fail_constructor():
+        raise RuntimeError("password=constructor-secret")
+
+    monkeypatch.setattr("hermes_cli.handoff.cli._service", fail_constructor)
+
+    rc = cmd_handoff(SimpleNamespace(handoff_action=action, json=False))
+
+    assert rc == 1
+    error = capsys.readouterr().err
+    assert "handoff_internal_error" in error
+    assert "constructor-secret" not in error
