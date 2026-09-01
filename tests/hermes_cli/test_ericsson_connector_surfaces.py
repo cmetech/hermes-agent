@@ -41,6 +41,8 @@ PLUGIN_SKILLS = {
     "ericsson-gitlab:merge-request-review",
     "ericsson-gitlab:ci-investigation",
     "ericsson-gitlab:gitlab-activity-digest",
+    "ericsson-gitlab:release-research",
+    "ericsson-gitlab:personal-inbox",
 }
 JIRA_TOOL_NAMES = {
     "jira_my_tickets",

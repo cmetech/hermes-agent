@@ -378,9 +378,9 @@ rows:
   - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab mr list
-    replacement: '{brand} gitlab mr list <project>'
+    replacement: '{brand} gitlab mr list [project]'
     operation: gitlab_list_merge_requests
-    rationale: The replacement requires a project and does not preserve SuperCLI's user-scoped no-project mode.
+    rationale: The bounded project-optional replacement preserves project discovery and native personal scopes plus explicit @me actor filters across GitLab.
     evidence_ref: out/func-strings.txt:2861; post-Wave-3 reconciliation
   - <<: *safer_write
     service: gitlab
@@ -496,15 +496,19 @@ rows:
     source_command: super-cli gitlab release create
     rationale: GitLab release creation is not exposed by the approved connector contract.
     evidence_ref: out/func-strings.txt:3003; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab release list
-    rationale: GitLab release enumeration is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab release list <project>'
+    operation: gitlab_list_releases
+    rationale: The replacement lists bounded published release summaries without following assets.
     evidence_ref: out/func-strings.txt:2951; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab release view
-    rationale: GitLab release detail is not exposed by the approved connector contract.
+    replacement: '{brand} gitlab release show <project> <tag>'
+    operation: gitlab_read_release
+    rationale: The replacement reads one bounded published release with only returned same-origin asset metadata.
     evidence_ref: out/func-strings.txt:2955; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *safer_read
     service: gitlab
@@ -525,10 +529,12 @@ rows:
     source_command: super-cli gitlab todo done
     rationale: User to-do mutation is not part of the project-scoped connector contract.
     evidence_ref: out/func-strings.txt:3019; SUPER-CLI-ARCHITECTURE.md section 6.5
-  - <<: *gap
+  - <<: *safer_read
     service: gitlab
     source_command: super-cli gitlab todo list
-    rationale: User-scoped to-do enumeration is not part of the project-scoped connector contract.
+    replacement: '{brand} gitlab todo list'
+    operation: gitlab_list_todos
+    rationale: The replacement lists a bounded read-only personal To-Do queue, optionally narrowed to a project.
     evidence_ref: out/func-strings.txt:3015; SUPER-CLI-ARCHITECTURE.md section 6.5
   - <<: *safer_read
     service: gitlab

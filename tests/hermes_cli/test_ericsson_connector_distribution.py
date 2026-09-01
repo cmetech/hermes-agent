@@ -347,6 +347,8 @@ def test_actual_gitlab_source_stages_disabled_with_complete_static_assets(
         "merge-request-review",
         "ci-investigation",
         "gitlab-activity-digest",
+        "release-research",
+        "personal-inbox",
     }
 
 

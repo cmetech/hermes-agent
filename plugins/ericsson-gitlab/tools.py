@@ -122,6 +122,37 @@ SCHEMAS = {
         },
         ["project"],
     ),
+    "gitlab_list_releases": _schema(
+        "gitlab_list_releases",
+        "List bounded normalized published project releases.",
+        {
+            "project": _PROJECT,
+            "order_by": {
+                "type": "string",
+                "enum": ["released_at", "created_at"],
+                "default": "released_at",
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["asc", "desc"],
+                "default": "desc",
+            },
+            "max_items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "default": 50,
+            },
+            "continuation": _PAGE_CONTINUATION,
+        },
+        ["project"],
+    ),
+    "gitlab_read_release": _schema(
+        "gitlab_read_release",
+        "Read one bounded normalized project release and same-origin assets.",
+        {"project": _PROJECT, "tag": _REF},
+        ["project", "tag"],
+    ),
     "gitlab_search_code": _schema(
         "gitlab_search_code",
         "Search bounded repository code matches for one project.",
@@ -210,9 +241,20 @@ SCHEMAS = {
         "created MRs; updated_after means recently active MRs.",
         {
             "project": _PROJECT,
+            "scope": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "enum": ["all", "created_by_me", "assigned_to_me", "reviews_for_me"],
+                "default": "all",
+            },
+            "author": {"type": "string", "minLength": 1, "maxLength": 255},
+            "assignee": {"type": "string", "minLength": 1, "maxLength": 255},
+            "reviewer": {"type": "string", "minLength": 1, "maxLength": 255},
             "state": {
                 "type": "string",
                 "enum": ["open", "opened", "closed", "merged", "all"],
+                "default": "opened",
             },
             "source_branch": _REF,
             "target_branch": _REF,
@@ -220,8 +262,9 @@ SCHEMAS = {
             "order_by": {
                 "type": "string",
                 "enum": ["created_at", "updated_at"],
+                "default": "created_at",
             },
-            "sort": {"type": "string", "enum": ["asc", "desc"]},
+            "sort": {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
             "created_after": _TIMESTAMP,
             "updated_after": _TIMESTAMP,
             "lookback_hours": {
@@ -229,10 +272,46 @@ SCHEMAS = {
                 "minimum": 1,
                 "maximum": 8760,
             },
-            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "max_items": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 100},
             "continuation": _PAGE_CONTINUATION,
         },
-        ["project"],
+        [],
+    ),
+    "gitlab_list_todos": _schema(
+        "gitlab_list_todos",
+        "List bounded normalized authenticated GitLab To-Dos without mutation.",
+        {
+            "project": _PROJECT,
+            "state": {"type": "string", "minLength": 1, "maxLength": 64, "enum": ["pending", "done"], "default": "pending"},
+            "action": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "enum": [
+                    "assigned", "mentioned", "build_failed", "marked",
+                    "approval_required", "unmergeable", "directly_addressed",
+                    "merge_train_removed", "member_access_requested",
+                ],
+            },
+            "target_type": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "enum": [
+                    "Issue", "MergeRequest", "Commit", "Epic",
+                    "DesignManagement::Design", "AlertManagement::Alert",
+                    "Project", "Namespace", "Vulnerability", "WikiPage::Meta",
+                ],
+            },
+            "max_items": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2000,
+                "default": 100,
+            },
+            "continuation": _PAGE_CONTINUATION,
+        },
+        [],
     ),
     "gitlab_list_merge_request_commits": _schema(
         "gitlab_list_merge_request_commits",
@@ -722,6 +801,16 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
                 max_items=values.get("max_items", 100),
                 continuation=values.get("continuation"),
             )
+        if name == "gitlab_list_releases":
+            return operations.list_releases(
+                values["project"],
+                order_by=values.get("order_by", "released_at"),
+                sort=values.get("sort", "desc"),
+                max_items=values.get("max_items", 50),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_read_release":
+            return operations.read_release(values["project"], values["tag"])
         if name == "gitlab_search_code":
             return operations.search_code(
                 values["project"],
@@ -768,7 +857,11 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
             )
         if name == "gitlab_list_merge_requests":
             return operations.list_merge_requests(
-                values["project"],
+                values.get("project"),
+                scope=values.get("scope", "all"),
+                author=values.get("author"),
+                assignee=values.get("assignee"),
+                reviewer=values.get("reviewer"),
                 state=values.get("state", "opened"),
                 source_branch=values.get("source_branch"),
                 target_branch=values.get("target_branch"),
@@ -778,6 +871,15 @@ def invoke(name: str, args: Mapping[str, Any], configuration, **client_options):
                 created_after=values.get("created_after"),
                 updated_after=values.get("updated_after"),
                 lookback_hours=values.get("lookback_hours"),
+                max_items=values.get("max_items", 100),
+                continuation=values.get("continuation"),
+            )
+        if name == "gitlab_list_todos":
+            return operations.list_todos(
+                project=values.get("project"),
+                state=values.get("state", "pending"),
+                action=values.get("action"),
+                target_type=values.get("target_type"),
                 max_items=values.get("max_items", 100),
                 continuation=values.get("continuation"),
             )

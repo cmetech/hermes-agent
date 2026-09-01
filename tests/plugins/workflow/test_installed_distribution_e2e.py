@@ -198,6 +198,8 @@ def test_installed_distribution_contains_complete_gitlab_connector(
             "ci-investigation",
             "gitlab-activity-digest",
             "merge-request-review",
+            "personal-inbox",
+            "release-research",
             "repository-research",
         ],
         "router_present": True,

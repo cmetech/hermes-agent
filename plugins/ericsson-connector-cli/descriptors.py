@@ -216,12 +216,15 @@ _GITLAB_PROJECT_OPERATIONS = (
     "gitlab_resolve_project",
     "gitlab_list_branches",
     "gitlab_list_tags",
+    "gitlab_list_releases",
+    "gitlab_read_release",
     "gitlab_search_code",
     "gitlab_list_commits",
     "gitlab_read_commit",
     "gitlab_list_commit_comments",
     "gitlab_list_commit_discussions",
     "gitlab_list_merge_requests",
+    "gitlab_list_todos",
     "gitlab_list_merge_request_commits",
     "gitlab_list_merge_request_discussions",
     "gitlab_list_repository_tree",
@@ -355,6 +358,12 @@ _add_validation(
             "search": _v(min_length=1, max_length=512),
             "max_items": _v(minimum=1, maximum=2000),
         },
+        "gitlab_list_releases": {
+            "max_items": _v(minimum=1, maximum=1000),
+        },
+        "gitlab_read_release": {
+            "tag": _v(min_length=1, max_length=512),
+        },
         "gitlab_search_code": {
             "query": _v(min_length=1, max_length=512),
             "ref": _v(min_length=1, max_length=512),
@@ -385,12 +394,22 @@ _add_validation(
             "max_notes_per_discussion": _v(minimum=1, maximum=500),
         },
         "gitlab_list_merge_requests": {
+            "scope": _v(min_length=1, max_length=64),
+            "author": _v(min_length=1, max_length=255),
+            "assignee": _v(min_length=1, max_length=255),
+            "reviewer": _v(min_length=1, max_length=255),
             "source_branch": _v(min_length=1, max_length=512),
             "target_branch": _v(min_length=1, max_length=512),
             "search": _v(min_length=1, max_length=512),
             "created_after": _v(min_length=1, max_length=128),
             "updated_after": _v(min_length=1, max_length=128),
             "lookback_hours": _v(minimum=1, maximum=8760),
+            "max_items": _v(minimum=1, maximum=2000),
+        },
+        "gitlab_list_todos": {
+            "state": _v(min_length=1, max_length=64),
+            "action": _v(min_length=1, max_length=512),
+            "target_type": _v(min_length=1, max_length=512),
             "max_items": _v(minimum=1, maximum=2000),
         },
         "gitlab_list_merge_request_commits": {
@@ -637,6 +656,16 @@ _SCHEMA_DESCRIPTIONS = {
 _SCHEMA_DEFAULTS = {
     ("jira_list_fields", "custom_only"): False,
     ("gitlab_create_branch", "prefix"): "fix",
+    ("gitlab_list_releases", "order_by"): "released_at",
+    ("gitlab_list_releases", "sort"): "desc",
+    ("gitlab_list_releases", "max_items"): 50,
+    ("gitlab_list_todos", "state"): "pending",
+    ("gitlab_list_todos", "max_items"): 100,
+    ("gitlab_list_merge_requests", "scope"): "all",
+    ("gitlab_list_merge_requests", "state"): "opened",
+    ("gitlab_list_merge_requests", "order_by"): "created_at",
+    ("gitlab_list_merge_requests", "sort"): "desc",
+    ("gitlab_list_merge_requests", "max_items"): 100,
 }
 
 
@@ -1029,6 +1058,31 @@ DESCRIPTORS: tuple[CommandDescriptor, ...] = (
     ),
     _command(
         _GITLAB,
+        ("gitlab", "release", "list"),
+        "gitlab_list_releases",
+        "read",
+        positionals=(_pos("project", value_type="string_or_integer"),),
+        options=(
+            _opt("order-by", choices=("released_at", "created_at")),
+            _opt("sort", choices=("asc", "desc")),
+            _opt("max-items", value_type="integer"),
+            _CONTINUATION,
+        ),
+        render_hint="release-list",
+    ),
+    _command(
+        _GITLAB,
+        ("gitlab", "release", "show"),
+        "gitlab_read_release",
+        "read",
+        positionals=(
+            _pos("project", value_type="string_or_integer"),
+            _pos("tag"),
+        ),
+        render_hint="release-detail",
+    ),
+    _command(
+        _GITLAB,
         ("gitlab", "search", "code"),
         "gitlab_search_code",
         "read",
@@ -1117,8 +1171,17 @@ DESCRIPTORS: tuple[CommandDescriptor, ...] = (
         ("gitlab", "mr", "list"),
         "gitlab_list_merge_requests",
         "read",
-        positionals=(_pos("project", value_type="string_or_integer"),),
+        positionals=(
+            _pos("project", value_type="string_or_integer", required=False),
+        ),
         options=(
+            _opt(
+                "scope",
+                choices=("all", "created_by_me", "assigned_to_me", "reviews_for_me"),
+            ),
+            _opt("author"),
+            _opt("assignee"),
+            _opt("reviewer"),
             _opt("state", choices=("open", "opened", "closed", "merged", "all")),
             _opt("source-branch"),
             _opt("target-branch"),
@@ -1132,6 +1195,35 @@ DESCRIPTORS: tuple[CommandDescriptor, ...] = (
             _CONTINUATION,
         ),
         render_hint="merge-request-list",
+    ),
+    _command(
+        _GITLAB,
+        ("gitlab", "todo", "list"),
+        "gitlab_list_todos",
+        "read",
+        options=(
+            _opt("project", value_type="string_or_integer"),
+            _opt("state", choices=("pending", "done")),
+            _opt(
+                "action",
+                choices=(
+                    "assigned", "mentioned", "build_failed", "marked",
+                    "approval_required", "unmergeable", "directly_addressed",
+                    "merge_train_removed", "member_access_requested",
+                ),
+            ),
+            _opt(
+                "target-type",
+                choices=(
+                    "Issue", "MergeRequest", "Commit", "Epic",
+                    "DesignManagement::Design", "AlertManagement::Alert",
+                    "Project", "Namespace", "Vulnerability", "WikiPage::Meta",
+                ),
+            ),
+            _opt("max-items", value_type="integer"),
+            _CONTINUATION,
+        ),
+        render_hint="todo-list",
     ),
     _command(
         _GITLAB,

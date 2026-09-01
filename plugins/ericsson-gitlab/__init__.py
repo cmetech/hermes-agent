@@ -286,6 +286,14 @@ _PLUGIN_SKILLS = (
         "Research bounded GitLab repository evidence.",
     ),
     (
+        "release-research",
+        "Research bounded GitLab releases and published assets.",
+    ),
+    (
+        "personal-inbox",
+        "Read bounded GitLab To-Dos and personal merge-request queues.",
+    ),
+    (
         "merge-request-review",
         "Review bounded GitLab merge request evidence.",
     ),

@@ -9,6 +9,8 @@ provides_tools:
   - gitlab_list_group_projects
   - gitlab_list_branches
   - gitlab_list_tags
+  - gitlab_list_releases
+  - gitlab_read_release
   - gitlab_search_code
   - gitlab_search_projects
   - gitlab_list_commits
@@ -16,6 +18,7 @@ provides_tools:
   - gitlab_list_commit_comments
   - gitlab_list_commit_discussions
   - gitlab_list_merge_requests
+  - gitlab_list_todos
   - gitlab_list_merge_request_commits
   - gitlab_list_merge_request_discussions
   - gitlab_list_repository_tree

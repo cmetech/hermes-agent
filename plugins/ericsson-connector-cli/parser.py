@@ -243,7 +243,10 @@ def _argument_kwargs(binding: ArgumentBinding, *, dest: str) -> dict[str, Any]:
         kwargs["required"] = True
     if binding.source == "positional":
         kwargs.pop("dest")
-        kwargs.pop("default")
+        if binding.required or binding.repeatable:
+            kwargs.pop("default")
+        else:
+            kwargs["nargs"] = "?"
     return kwargs
 
 
