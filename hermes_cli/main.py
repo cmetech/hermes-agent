@@ -12783,7 +12783,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "handoff", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
@@ -14045,6 +14045,10 @@ def main() -> int:
     from hermes_cli.subcommands.peer import build_peer_parser
 
     build_peer_parser(subparsers)
+
+    from hermes_cli.handoff.cli import build_handoff_parser
+
+    build_handoff_parser(subparsers)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing
