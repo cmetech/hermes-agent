@@ -4,6 +4,9 @@ display_name: GitLab Tools
 aliases: [Ericsson GitLab, repository tools, merge request tools, GitLab CI tools, "<brand> gitlab commands", Ericsson GitLab connector CLI]
 goals:
   - Explore nested groups, subgroups, and visible projects recursively.
+  - Use project search, select or clarify one result, then use project-scoped code search; list branch and tag refs separately.
+  - List published releases, inspect one release read-only, and keep raw tags distinct from releases.
+  - Read personal To-Dos and project-optional personal merge-request queues without mutation.
   - Inspect recent commits, commit details, comments, and discussions.
   - Discover merge requests and inspect their commits and discussions.
   - Research a GitLab repository or merge request with bounded evidence.
@@ -22,6 +25,12 @@ implementation:
   tools:
     - gitlab_resolve_project
     - gitlab_list_group_projects
+    - gitlab_list_branches
+    - gitlab_list_tags
+    - gitlab_list_releases
+    - gitlab_read_release
+    - gitlab_search_code
+    - gitlab_search_projects
     - gitlab_list_repository_tree
     - gitlab_read_file
     - gitlab_read_merge_request
@@ -30,10 +39,15 @@ implementation:
     - gitlab_list_commit_comments
     - gitlab_list_commit_discussions
     - gitlab_list_merge_requests
+    - gitlab_list_todos
     - gitlab_list_merge_request_commits
     - gitlab_list_merge_request_discussions
     - gitlab_list_pipelines
     - gitlab_read_pipeline
+    - gitlab_read_job
+    - gitlab_list_pipeline_jobs
+    - gitlab_list_merge_request_pipelines
+    - gitlab_list_ci_variables
     - gitlab_inspect_ci
     - gitlab_job_log
     - gitlab_retry_job
@@ -68,7 +82,7 @@ configuration:
     kind: static-setting
     required: false
     guidance: Optionally configure a bounded regular-file mTLS key path together with its certificate.
-reads: [canonical group and project identity, recursive subgroup and project discovery, bounded repository files and trees, commit history and feedback, merge request discovery, diffs, discussions, and approval state, pipelines and tail-biased job logs, CI structure and variable metadata without values]
+reads: [canonical group and project identity, permission-scoped project search, bounded branch and tag refs, published release list/detail with same-origin asset metadata, project-scoped code search with redacted snippets, recursive subgroup and project discovery, bounded repository files and trees, commit history and feedback, project-specific and personal merge-request discovery, diffs, discussions, and approval state, read-only To-Do queues, pipelines and tail-biased job logs, CI structure and variable metadata without values]
 writes: [explicitly previewed and host-approved branches, atomic commits, and merge request creation, merge request notes, discussion replies and resolution changes, merge request approval, SHA-pinned merge, and metadata updates, CI job retry and play, pipeline retry]
 artifacts: [canonical GitLab links and identities, bounded evidence, continuation, content-warning, and truncation facts, dry-run previews, proven or reconciled write identities, explicit write_ambiguous outcomes]
 demonstrations: [read-only-live, approved-live]
@@ -79,9 +93,9 @@ troubleshooting: [plugin disabled, missing or invalid configuration, permission 
 
 ## What it solves
 
-The standalone Ericsson GitLab plugin provides 30 tools: 18 bounded reads and
-12 approval-gated writes. It covers recursive group discovery, repository and
-commit research, actionable merge-request review, and CI diagnosis and recovery.
+The standalone Ericsson GitLab plugin provides bounded GitLab research, review,
+CI diagnosis, and approval-gated recovery. Its surface follows the registered
+schema authority rather than a hand-maintained operation count.
 
 ## Direct shell commands
 
@@ -94,22 +108,28 @@ configuration and is not a connector to enable; execution still requires
 write requires exactly one of `--dry-run` and `--confirm`, and origins,
 credentials, certificate paths, and profile selection stay off argv.
 
-The read surface resolves projects; lists group projects, repository trees,
-commits, commit comments and discussions, merge requests, merge-request commits
-and discussions, and pipelines; reads files, commits, merge requests, exact
-pipeline metadata, CI job-log tails, and merge-request approval state; and
-inspects CI structure and variable metadata without returning variable values.
+The surface is grouped by the bounded outcomes it returns:
 
-The write surface creates ticket-derived or explicitly named branches, atomic
-commits, and merge requests; posts merge-request notes; replies to and resolves
-or reopens discussions; approves, SHA-pins and merges, or updates merge requests;
-and retries jobs, starts manual jobs, or retries failed and canceled pipeline
-jobs. Pipeline/job cancellation and merge-request rebasing remain deliberately
-unavailable.
+| Area | Available bounded operations |
+| --- | --- |
+| Identity and repository | Search visible projects; resolve exact projects; list group projects, branches, tags, repository trees, commits, commit comments, and commit discussions; search code in one selected project; read files and commits. Project discovery flows from project search to select or clarify to code search. Tags are Git refs; releases contain separate published metadata, notes, and assets. |
+| Releases and inbox | List published releases with `gitlab_list_releases`; inspect one release with `gitlab_read_release` without following assets; list read-only personal To-Dos with `gitlab_list_todos`. |
+| Merge requests | List project merge requests or project-optional personal queues with native `created_by_me`, `assigned_to_me`, and `reviews_for_me` scopes; use explicit `@me` only for an actor filter. List commits and discussions; `gitlab_read_merge_request` includes bounded structured per-file diffs; inspect approval state. |
+| CI and jobs | List and read pipelines; read job metadata with `gitlab_read_job`, list jobs for one pipeline, list pipelines for one merge request, inspect CI structure, list project variable metadata without values, and read separately capped job-log traces with `gitlab_job_log`. Project variable metadata is distinct from the inherited metadata available through `gitlab_inspect_ci`. |
+| Approval-gated writes | Create branches, commits, and merge requests; post or resolve discussions; approve, SHA-pin and merge, or update merge requests; and retry or start bounded CI recovery actions. |
+
+Global code search, repository clone or archive download, release creation,
+To-Do completion (`super-cli gitlab todo done`), webhook enumeration, pipeline/job cancellation, merge-request
+rebasing, and remaining writes remain
+deliberately excluded.
 
 ## Try saying
 
 - “Research this project at its default branch and explain the relevant files.”
+- “Find visible projects about router configuration, then let me select or clarify before searching their code.”
+- “List the branches and version tags in this project; keep tags distinct from releases.”
+- “List published releases for this project, then inspect v2.1.0 without downloading assets.”
+- “Show my GitLab To-Dos and MRs requesting my review across GitLab.”
 - “Show me every subgroup and project under sd-macs-att-rnam-hosting.”
 - “What was the latest commit in this repo, and are there comments on it?”
 - “What merge requests were created in the last 24 hours?”
@@ -126,7 +146,9 @@ and rerun safe reads when needed. Never rerun an ambiguous write.
 
 ## Questions
 
-Expect the exact project, ref or ticket identity and desired evidence boundary.
+Expect the exact project, release tag, ref or ticket identity and desired evidence boundary.
+Personal queues can omit a project and use native scopes; request `@me` only for
+an explicit actor filter.
 For review actions, expect the merge-request IID, discussion ID, reviewed head
 SHA, message, resolution choice, and merge options. For CI actions, expect the
 job or pipeline ID. For every write, confirm the exact dry-run preview and do
@@ -135,12 +157,15 @@ not provide credentials in chat.
 ## Reads and writes
 
 Reads return canonical identities with explicit page, item, byte, time, warning,
-untrusted-content, and truncation facts. Job logs are tail-biased and byte-capped;
-CI variable values are never returned.
+untrusted-content, and truncation facts. Release and To-Do text is untrusted;
+release assets remain returned same-origin metadata and To-Dos stay read-only.
+`gitlab_read_job` returns job metadata;
+`gitlab_job_log` separately returns a tail-biased, byte-capped trace. Project CI
+variable reads and inherited CI inspection return metadata only, never values.
 
-All 12 writes accept `dry_run` and require visible host approval whose scope is
-derived from the current call's exact arguments. Start with `dry_run=true` and
-have the user authorize that exact preview. The nine review-loop and CI writes
+Approval-gated writes accept `dry_run` and require visible host approval whose
+scope is derived from the current call's exact arguments. Start with `dry_run=true` and
+have the user authorize that exact preview. The review-loop and CI writes
 then require a new call with `confirm=true`; they refuse a call that supplies
 neither intent. The original branch, atomic-commit, and merge-request creation
 tools have no `confirm` argument: after their preview, execution uses

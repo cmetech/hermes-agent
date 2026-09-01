@@ -93,6 +93,9 @@
       "entry": "references/capabilities/gitlab-tools.md",
       "goals": [
         "Explore nested groups, subgroups, and visible projects recursively.",
+        "Use project search, select or clarify one result, then use project-scoped code search; list branch and tag refs separately.",
+        "List published releases, inspect one release read-only, and keep raw tags distinct from releases.",
+        "Read personal To-Dos and project-optional personal merge-request queues without mutation.",
         "Inspect recent commits, commit details, comments, and discussions.",
         "Discover merge requests and inspect their commits and discussions.",
         "Research a GitLab repository or merge request with bounded evidence.",

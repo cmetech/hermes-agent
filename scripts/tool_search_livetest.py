@@ -250,7 +250,9 @@ SCENARIOS: List[Dict[str, Any]] = [
 
 def setup_isolated_home(enabled: bool, listing: str = "off",
                         listing_max_tokens: int = 4000,
-                        model: str = "anthropic/claude-haiku-4.5") -> Path:
+                        model: str = "anthropic/claude-haiku-4.5",
+                        credential_keys: Tuple[str, ...] | None = None,
+                        copy_auth: bool = True) -> Path:
     """Create a fresh ~/.hermes/ for one test, copying minimal credentials.
 
     Also reads OPENROUTER_API_KEY from the user's real ``~/.hermes/.env`` so
@@ -260,13 +262,13 @@ def setup_isolated_home(enabled: bool, listing: str = "off",
     hermes_home = home_dir / ".hermes"
     hermes_home.mkdir(parents=True)
 
-    if ORIGINAL_AUTH.exists():
+    if copy_auth and ORIGINAL_AUTH.exists():
         shutil.copy(ORIGINAL_AUTH, hermes_home / "auth.json")
 
-    # Copy .env so OPENROUTER_API_KEY (or others) are visible to the agent
-    # running inside the isolated home.
+    # The default preserves the original benchmark. Focused live gates can
+    # instead copy just the named provider credential(s), never auth.json.
     real_env_file = Path.home() / ".hermes" / ".env"
-    if real_env_file.exists():
+    if credential_keys is None and real_env_file.exists():
         shutil.copy(real_env_file, hermes_home / ".env")
         # Also load the real user env into this process so the provider
         # resolver can authenticate. We go through the canonical loader
@@ -276,6 +278,17 @@ def setup_isolated_home(enabled: bool, listing: str = "off",
         # static analysis from tainting the transcript records with the key.
         from hermes_cli.env_loader import load_hermes_dotenv
         load_hermes_dotenv(hermes_home=str(Path.home() / ".hermes"))
+    elif credential_keys:
+        from dotenv import dotenv_values, set_key
+        values = dotenv_values(real_env_file) if real_env_file.exists() else {}
+        isolated_env = hermes_home / ".env"
+        isolated_env.touch()
+        for key in credential_keys:
+            value = values.get(key) or os.environ.get(key)
+            if value:
+                set_key(isolated_env, key, value, quote_mode="always")
+        from hermes_cli.env_loader import load_hermes_dotenv
+        load_hermes_dotenv(hermes_home=str(hermes_home))
 
     cfg = {
         "model": {

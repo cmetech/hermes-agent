@@ -1,6 +1,6 @@
 ---
 name: gitlab
-description: Use when a user asks to enable or configure Ericsson GitLab, explore groups or repositories, inspect commits or merge requests, investigate CI, or schedule an activity digest.
+description: Use when a user asks to enable or configure Ericsson GitLab, explore groups or repositories, inspect releases or merge requests, check a personal inbox, investigate CI, or schedule an activity digest.
 metadata:
   hermes:
     tags: [Ericsson, GitLab, Onboarding]
@@ -14,7 +14,7 @@ Check whether the ericsson-gitlab plugin is disabled. Guide the user through ena
 </quick_start>
 
 <routing>
-When the plugin is configured and ready, route group, subgroup, project, file, “latest commit,” commit-comment, and commit-discussion questions to `ericsson-gitlab:repository-research`. Route merge-request discovery, “recent merge request,” commits, discussions, and reviews to `ericsson-gitlab:merge-request-review`. Route pipeline and CI questions to `ericsson-gitlab:ci-investigation`. Route one-time summaries and a recurring or daily digest of commits or merge requests to `ericsson-gitlab:gitlab-activity-digest`.
+When the plugin is configured and ready, route project search, group or subgroup browsing, branch or tag listing, project-scoped code search, files, “latest commit,” commit-comment, and commit-discussion questions to `ericsson-gitlab:repository-research`. Route published releases to `ericsson-gitlab:release-research`; raw tags remain with repository-research. Route my queue/inbox/across GitLab to `ericsson-gitlab:personal-inbox`. Route MRs in project, a recent merge request, and one selected MR to `ericsson-gitlab:merge-request-review`; do not use it for cross-project personal queues. Route pipeline, job, CI configuration/include, and variable metadata questions to `ericsson-gitlab:ci-investigation`. Route one-time summaries and a recurring or daily digest of commits or merge requests to `ericsson-gitlab:gitlab-activity-digest`.
 </routing>
 
 <boundaries>

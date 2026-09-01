@@ -10,10 +10,10 @@ maturity: available
 recommendation_eligible: true
 source_flows: [docs/flows/jira-defect-loop.md]
 implementation:
-  skills: [jira-to-gitlab]
-  plugins: [workflow, ericsson-jira, ericsson-gitlab]
+  skills: [skills/ericsson/jira-to-gitlab]
+  plugins: [plugins/workflow, plugins/ericsson-jira, plugins/ericsson-gitlab]
   mcp_servers: []
-  workflows: [jira-defect-loop]
+  workflows: [workflows/jira-defect-loop.yml]
   tools: [jira_my_tickets, jira_get_issue, jira_add_comment, gitlab_resolve_project, gitlab_list_repository_tree, gitlab_read_file, gitlab_create_branch, gitlab_commit_changes, gitlab_create_merge_request, gitlab_read_merge_request]
 platforms: [macos, linux, windows]
 configuration: []
@@ -44,6 +44,9 @@ keys. Tickets discovered after that read wait for the next run.
 
 Confirm that the Jira and GitLab connectors are ready. Explain that every outward
 operation receives its own current approval; batch intent never authorizes a write.
+The assigned-and-unresolved Jira filter, 25-ticket limit, and manifest order are fixed.
+Review each exact write preview, output format and artifact destination, exclusions,
+and warnings. Reconcile an uncertain write before any rerun.
 
 ## Reads and writes
 

@@ -62,3 +62,4 @@ class PageResult:
     truncated: bool
     next_page: int | None
     next_offset: int | None = None
+    seen: tuple[str, ...] = ()
