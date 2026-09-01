@@ -128,6 +128,13 @@ def test_local_delivery_falls_back_to_bare_name(tmp_path, monkeypatch):
     assert argv[1:3] == ["-p", "ops"]
 
 
+def test_local_delivery_title_is_keyword_only():
+    import pytest
+
+    with pytest.raises(TypeError):
+        bot_relay.local_delivery_command("ops", "query.json", "Other Chat")
+
+
 def test_delivery_lock_recognizes_resolved_cli_paths(tmp_path, monkeypatch):
     """The #93091 per-profile turn lock must keep matching delivery argvs
     now that argv[0] may be a resolved absolute path (or hermes.exe)."""

@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from hashlib import sha256
 import ipaddress
 import json
+import os
+from pathlib import Path
+import re
 import socket
+import stat
+import subprocess
+import sys
+import tempfile
 from time import monotonic
 import urllib.error
 import urllib.parse
@@ -16,9 +24,15 @@ from agent.secret_scope import build_profile_secret_scope
 from gateway.config import Platform, load_gateway_config
 from gateway.platforms.api_server import DEFAULT_HOST, DEFAULT_PORT
 from hermes_cli.auth import has_usable_secret
-from hermes_cli.profiles import get_profile_dir, profiles_to_serve
+from hermes_cli.profiles import get_profile_dir, profiles_to_serve, validate_profile_name
 from hermes_cli.urllib_security import open_credentialed_url
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
+from tools.bot_relay import acquire_turn_lock, local_delivery_command
+from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot
 from .service import (
@@ -32,12 +46,195 @@ from .service import (
 MAX_RESPONSE_BYTES = 600_000
 _READ_CHUNK_BYTES = 64 * 1024
 _VALIDATE_BUDGET_SECONDS = 2.0
+MAX_CLI_OUTPUT_BYTES = 500_000
+_CLI_TIMEOUT_SECONDS = 600
+_CLI_RECEIPT_VERSION = 1
+_HANDOFF_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_AUTHORITATIVE_RUNS_FAILURES = frozenset({
+    "api_server_disabled",
+    "api_server_key_missing",
+    "api_server_key_weak",
+    "listener_not_loopback",
+    "multiplex_required",
+    "profile_not_served",
+    "runs_not_durable",
+    "http_404",
+    "http_405",
+})
+_INTERACTIVE_CAPABILITIES = frozenset({"approval", "interactive", "needs_input"})
 
 
 @dataclass(frozen=True, slots=True)
 class _Connection:
     base_url: str
     key: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CLIPaths:
+    root: Path
+    prompt: Path
+    stdout: Path
+    stderr: Path
+    receipt: Path
+
+
+def _local_cli_failure(
+    required_capabilities: frozenset[str], *, host_os: str
+) -> str | None:
+    if host_os == "nt":
+        return "local_cli_lock_unavailable"
+    if required_capabilities & _INTERACTIVE_CAPABILITIES:
+        return "local_cli_capabilities_unavailable"
+    return None
+
+
+def _cli_paths(handoff_id: str) -> _CLIPaths:
+    if not isinstance(handoff_id, str) or not _HANDOFF_ID.fullmatch(handoff_id):
+        raise ValueError("handoff id is invalid")
+    spool = get_hermes_home() / "handoffs"
+    root = spool / handoff_id
+    spool.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _verify_owner_dir(spool)
+    root.mkdir(mode=0o700, exist_ok=True)
+    _verify_owner_dir(root)
+    return _CLIPaths(
+        root=root,
+        prompt=root / "prompt.txt",
+        stdout=root / "stdout.txt",
+        stderr=root / "stderr.txt",
+        receipt=root / "receipt.json",
+    )
+
+
+def _verify_owner_dir(path: Path) -> None:
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ValueError("handoff spool directory is unsafe")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError("handoff spool directory has a different owner")
+    os.chmod(path, 0o700)
+
+
+def _verify_owner_file(path: Path, *, required: bool = False) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise ValueError("handoff spool file is missing") from None
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise ValueError("handoff spool file is unsafe")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ValueError("handoff spool file has a different owner")
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    if len(data) > MAX_CLI_OUTPUT_BYTES:
+        raise ValueError("handoff spool file exceeds byte limit")
+    _verify_owner_file(path)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_json(path: Path, value: dict[str, object]) -> None:
+    _atomic_bytes(
+        path,
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def _read_bounded(path: Path) -> bytes:
+    _verify_owner_file(path, required=True)
+    with path.open("rb") as stream:
+        data = stream.read(MAX_CLI_OUTPUT_BYTES + 1)
+    if len(data) > MAX_CLI_OUTPUT_BYTES:
+        raise ValueError("handoff spool file exceeds byte limit")
+    return data
+
+
+def _profile_root(home: Path) -> Path:
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def _wrapper_argv(handoff_id: str, profile: str) -> list[str]:
+    return [
+        sys.executable or "python3",
+        "-m",
+        "hermes_cli.handoff.local",
+        "--run-cli",
+        handoff_id,
+        profile,
+    ]
+
+
+def _command_sha256(argv: list[str]) -> str:
+    return sha256("\0".join(argv).encode("utf-8")).hexdigest()
+
+
+def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
+    validate_profile_name(profile)
+    paths = _cli_paths(handoff_id)
+    _verify_owner_file(paths.prompt, required=True)
+    for path in (paths.stdout, paths.stderr, paths.receipt):
+        _verify_owner_file(path)
+    prompt = _read_bounded(paths.prompt)
+    request_sha256 = sha256(prompt).hexdigest()
+    argv = local_delivery_command(
+        profile,
+        str(paths.prompt),
+        title=f"Handoff: {handoff_id}",
+    )
+    try:
+        with acquire_turn_lock(_profile_root(get_hermes_home()), profile):
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=_CLI_TIMEOUT_SECONDS,
+            )
+        returncode = int(completed.returncode)
+        exit_code = returncode if returncode >= 0 else 128 - returncode
+        stdout = bytes(completed.stdout or b"")[:MAX_CLI_OUTPUT_BYTES]
+        stderr = bytes(completed.stderr or b"")[:MAX_CLI_OUTPUT_BYTES]
+    except subprocess.TimeoutExpired as exc:
+        exit_code = 124
+        stdout = bytes(exc.stdout or b"")[:MAX_CLI_OUTPUT_BYTES]
+        stderr = (bytes(exc.stderr or b"") + b"\nlocal CLI timed out")[-MAX_CLI_OUTPUT_BYTES:]
+    except Exception as exc:
+        exit_code = 125
+        stdout = b""
+        stderr = f"local CLI wrapper failed: {type(exc).__name__}".encode("utf-8")
+    _atomic_bytes(paths.stdout, stdout)
+    _atomic_bytes(paths.stderr, stderr)
+    _atomic_json(paths.receipt, {
+        "version": _CLI_RECEIPT_VERSION,
+        "handoff_id": handoff_id,
+        "profile": profile,
+        "request_sha256": request_sha256,
+        "exit_code": exit_code,
+        "stdout_size": len(stdout),
+        "stderr_size": len(stderr),
+        "stdout_sha256": sha256(stdout).hexdigest(),
+        "stderr_sha256": sha256(stderr).hexdigest(),
+    })
+    return exit_code
 
 
 class _Deadline:
@@ -246,6 +443,13 @@ class LocalHermesChannel:
         _connection, failure = self._assess(
             endpoint, _Deadline(_VALIDATE_BUDGET_SECONDS)
         )
+        if failure in _AUTHORITATIVE_RUNS_FAILURES:
+            cli_failure = _local_cli_failure(frozenset(), host_os=os.name)
+            if cli_failure is None:
+                return EndpointAssessment(
+                    endpoint=endpoint, available=True, mechanism="local_cli"
+                )
+            failure = cli_failure
         return EndpointAssessment(
             endpoint=endpoint,
             available=failure is None,
@@ -305,6 +509,15 @@ class LocalHermesChannel:
         deadline = _Deadline(budget_seconds)
         connection, failure = self._assess(snapshot.spec.endpoint, deadline)
         if connection is None:
+            if failure in _AUTHORITATIVE_RUNS_FAILURES:
+                cli_failure = _local_cli_failure(
+                    snapshot.spec.required_capabilities, host_os=os.name
+                )
+                if cli_failure is not None:
+                    return ChannelObservation(
+                        phase="failed", failure_code=cli_failure
+                    )
+                return self._bind_cli(snapshot)
             return ChannelObservation(phase="prepared", failure_code=failure)
         try:
             session_id = self._ensure_session(connection, snapshot.handoff_id, deadline)
@@ -319,6 +532,149 @@ class LocalHermesChannel:
             mechanism="runs",
             binding={"profile": snapshot.spec.endpoint.profile, "mechanism": "runs"},
             checkpoint={"session_id": session_id},
+        )
+
+    @staticmethod
+    def _bind_cli(snapshot: HandoffSnapshot) -> ChannelObservation:
+        paths = _cli_paths(snapshot.handoff_id)
+        prompt = snapshot.spec.prompt.encode("utf-8")
+        _atomic_bytes(paths.prompt, prompt)
+        return ChannelObservation(
+            phase="prepared",
+            mechanism="local_cli",
+            binding={
+                "profile": snapshot.spec.endpoint.profile,
+                "mechanism": "local_cli",
+            },
+            checkpoint={"request_sha256": sha256(prompt).hexdigest()},
+        )
+
+    @staticmethod
+    def _process_identity(snapshot: HandoffSnapshot) -> ProcessIdentity | None:
+        checkpoint = snapshot.checkpoint or {}
+        pid = checkpoint.get("process_pid")
+        started_at = checkpoint.get("process_started_at")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(started_at, bool)
+            or not isinstance(started_at, int)
+            or started_at < 0
+        ):
+            return None
+        return ProcessIdentity(pid=pid, start_time=started_at, group_id=pid)
+
+    @staticmethod
+    def _identity_is_current(identity: ProcessIdentity) -> bool:
+        if not identity.is_current():
+            return False
+        current = ProcessIdentity.capture(identity.pid)
+        return (
+            current.pid == identity.pid
+            and current.start_time == identity.start_time
+            and current.group_id == identity.group_id
+        )
+
+    @staticmethod
+    def _receipt_observation(snapshot: HandoffSnapshot) -> ChannelObservation | None:
+        paths = _cli_paths(snapshot.handoff_id)
+        try:
+            raw_receipt = _read_bounded(paths.receipt)
+            receipt = json.loads(raw_receipt)
+            if not isinstance(receipt, dict) or set(receipt) != {
+                "version", "handoff_id", "profile", "request_sha256", "exit_code",
+                "stdout_size", "stderr_size", "stdout_sha256", "stderr_sha256",
+            }:
+                return None
+            stdout = _read_bounded(paths.stdout)
+            stderr = _read_bounded(paths.stderr)
+            if (
+                receipt["version"] != _CLI_RECEIPT_VERSION
+                or receipt["handoff_id"] != snapshot.handoff_id
+                or receipt["profile"] != snapshot.spec.endpoint.profile
+                or receipt["request_sha256"]
+                != (snapshot.checkpoint or {}).get("request_sha256")
+                or receipt["stdout_size"] != len(stdout)
+                or receipt["stderr_size"] != len(stderr)
+                or receipt["stdout_sha256"] != sha256(stdout).hexdigest()
+                or receipt["stderr_sha256"] != sha256(stderr).hexdigest()
+                or isinstance(receipt["exit_code"], bool)
+                or not isinstance(receipt["exit_code"], int)
+                or receipt["exit_code"] < 0
+            ):
+                return None
+            text = stdout.decode("utf-8")
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            return None
+        checkpoint = _checkpoint(
+            snapshot,
+            receipt_version=_CLI_RECEIPT_VERSION,
+            exit_code=receipt["exit_code"],
+            receipt_sha256=sha256(raw_receipt).hexdigest(),
+            stdout_sha256=receipt["stdout_sha256"],
+            stderr_sha256=receipt["stderr_sha256"],
+            output_sha256=sha256(text.encode("utf-8")).hexdigest(),
+            status="completed" if receipt["exit_code"] == 0 else "failed",
+        )
+        if receipt["exit_code"] != 0:
+            return ChannelObservation(
+                phase="failed",
+                checkpoint=checkpoint,
+                failure_code="local_cli_failed",
+            )
+        return ChannelObservation(
+            phase="succeeded",
+            checkpoint=checkpoint,
+            terminal_result=LocalHermesChannel._terminal_result(text),
+        )
+
+    def _submit_cli(self, snapshot: HandoffSnapshot) -> ChannelObservation:
+        paths = _cli_paths(snapshot.handoff_id)
+        prompt = _read_bounded(paths.prompt)
+        if sha256(prompt).hexdigest() != (snapshot.checkpoint or {}).get(
+            "request_sha256"
+        ):
+            raise ChannelDefinitelyNotAccepted("local_cli_prompt_changed")
+        argv = _wrapper_argv(
+            snapshot.handoff_id, snapshot.spec.endpoint.profile
+        )
+        tree = ManagedProcessTree.spawn(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        identity = tree.identity
+        if identity.start_time is None or identity.group_id != identity.pid:
+            ManagedProcessTree.terminate_existing(identity)
+            raise ChannelIndeterminate("local_cli_identity_unavailable")
+        return ChannelObservation(
+            phase="submitted",
+            checkpoint=_checkpoint(
+                snapshot,
+                process_pid=identity.pid,
+                process_started_at=identity.start_time,
+                process_command_sha256=_command_sha256(argv),
+                status="running",
+            ),
+        )
+
+    def _observe_cli(
+        self, snapshot: HandoffSnapshot, *, cancelling: bool = False
+    ) -> ChannelObservation:
+        receipt = self._receipt_observation(snapshot)
+        if receipt is not None:
+            return receipt
+        identity = self._process_identity(snapshot)
+        if identity is not None and self._identity_is_current(identity):
+            return ChannelObservation(
+                phase="cancelling" if cancelling else "active",
+                checkpoint=_checkpoint(snapshot, status="running"),
+            )
+        return ChannelObservation(
+            phase="indeterminate",
+            checkpoint=snapshot.checkpoint or {},
+            failure_code="local_cli_process_lost",
         )
 
     def _bound_connection(self, snapshot: HandoffSnapshot) -> _Connection:
@@ -371,6 +727,8 @@ class LocalHermesChannel:
     def submit(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "local_cli":
+            return self._submit_cli(snapshot)
         return self._submit(snapshot, _Deadline(budget_seconds))
 
     @staticmethod
@@ -455,6 +813,10 @@ class LocalHermesChannel:
     def reconcile(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "local_cli":
+            return self._observe_cli(
+                snapshot, cancelling=snapshot.cancel_requested_at is not None
+            )
         deadline = _Deadline(budget_seconds)
         if (snapshot.checkpoint or {}).get("run_id"):
             return self._observe(
@@ -467,11 +829,42 @@ class LocalHermesChannel:
     def observe(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "local_cli":
+            return self._observe_cli(
+                snapshot, cancelling=snapshot.cancel_requested_at is not None
+            )
         return self._observe(snapshot, _Deadline(budget_seconds))
 
     def cancel(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "local_cli":
+            receipt = self._receipt_observation(snapshot)
+            if receipt is not None:
+                return receipt
+            identity = self._process_identity(snapshot)
+            if identity is None:
+                return ChannelObservation(
+                    phase="indeterminate",
+                    checkpoint=snapshot.checkpoint or {},
+                    failure_code="cancellation_indeterminate",
+                )
+            if not self._identity_is_current(identity):
+                return ChannelObservation(
+                    phase="indeterminate",
+                    checkpoint=snapshot.checkpoint or {},
+                    failure_code="cancellation_indeterminate",
+                )
+            if ManagedProcessTree.terminate_existing(identity):
+                receipt = self._receipt_observation(snapshot)
+                return receipt or ChannelObservation(
+                    phase="cancelled",
+                    checkpoint=_checkpoint(snapshot, status="stopped"),
+                )
+            return ChannelObservation(
+                phase="cancelling",
+                checkpoint=_checkpoint(snapshot, status="stopping"),
+            )
         deadline = _Deadline(budget_seconds)
         if (snapshot.checkpoint or {}).get("status") == "stopping":
             return self._observe(snapshot, deadline, cancelling=True)
@@ -497,4 +890,19 @@ class LocalHermesChannel:
         )
 
 
-__all__ = ["LocalHermesChannel", "MAX_RESPONSE_BYTES"]
+def _main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--run-cli", action="store_true")
+    parser.add_argument("handoff_id")
+    parser.add_argument("profile")
+    args = parser.parse_args(argv)
+    if not args.run_cli or os.name == "nt":
+        return 2
+    return _run_cli_wrapper(args.handoff_id, args.profile)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
+
+
+__all__ = ["LocalHermesChannel", "MAX_CLI_OUTPUT_BYTES", "MAX_RESPONSE_BYTES"]
