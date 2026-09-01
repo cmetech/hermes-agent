@@ -502,6 +502,12 @@ class GitLabOperations:
             value = value.replace(secret, "<redacted>")
         return value
 
+    def _remote_display_text(
+        self, source: Mapping[str, Any], field: str, maximum: int
+    ) -> str:
+        value = self._redact_text(_remote_text(source, field, maximum))
+        return value.encode("utf-8")[:maximum].decode("utf-8", errors="ignore")
+
     @staticmethod
     def _iid(value: Any) -> int:
         if type(value) is not int or value < 1:
@@ -1474,9 +1480,9 @@ class GitLabOperations:
                 raise GitLabError("invalid_remote_data")
         except UnicodeEncodeError:
             raise GitLabError("invalid_remote_data") from None
-        parsed = urlsplit(value)
-        configured = urlsplit(self.client.auth.origin)
         try:
+            parsed = urlsplit(value)
+            configured = urlsplit(self.client.auth.origin)
             port = parsed.port
             configured_port = configured.port
         except ValueError:
@@ -1491,8 +1497,7 @@ class GitLabOperations:
             return None
         return _same_origin_url(value, self.client.auth.origin)
 
-    @staticmethod
-    def _normalize_release_milestone(payload: Any) -> dict[str, Any]:
+    def _normalize_release_milestone(self, payload: Any) -> dict[str, Any]:
         milestone = _as_object(payload)
         result: dict[str, Any] = {"id": _remote_positive_int(milestone.get("id"))}
         iid = milestone.get("iid")
@@ -1501,7 +1506,9 @@ class GitLabOperations:
         for field, maximum in (("title", 512), ("state", 64)):
             value = milestone.get(field)
             if value is not None:
-                result[field] = _remote_text(milestone, field, maximum)
+                result[field] = self._remote_display_text(
+                    milestone, field, maximum
+                )
         return result
 
     def _normalize_release_detail(
@@ -1561,7 +1568,9 @@ class GitLabOperations:
                 continue
             normalized = {"url": url}
             if source.get("format") is not None:
-                normalized["format"] = _remote_text(source, "format", 64)
+                normalized["format"] = self._remote_display_text(
+                    source, "format", 64
+                )
             normalized_sources.append(normalized)
 
         normalized_links = []
@@ -1578,8 +1587,8 @@ class GitLabOperations:
                 continue
             normalized = {
                 "id": _remote_positive_int(link.get("id")),
-                "name": _remote_text(link, "name", 512),
-                "link_type": _remote_text(link, "link_type", 64),
+                "name": self._remote_display_text(link, "name", 512),
+                "link_type": self._remote_display_text(link, "link_type", 64),
                 "url": url,
             }
             if direct_url is not None:
@@ -1705,7 +1714,7 @@ class GitLabOperations:
         }
         name = source.get("name")
         if name is not None:
-            result["name"] = _remote_text(source, "name", 512)
+            result["name"] = self._remote_display_text(source, "name", 512)
         expected_path = f"{url_prefix}{path}"
         web_url = source.get("web_url")
         result["web_url"] = (
@@ -1744,30 +1753,59 @@ class GitLabOperations:
         for field in ("title", "name", "state"):
             value = target.get(field)
             if value is not None:
-                value = self._redact_text(_remote_text(target, field, 512))
-                result[field] = value.encode("utf-8")[:512].decode(
-                    "utf-8", errors="ignore"
-                )
+                result[field] = self._remote_display_text(target, field, 512)
 
         expected_path = None
+        target_path = unquote(urlsplit(target_url).path)
         project_path = project and project["path_with_namespace"]
         group_path = group and group["full_path"]
-        if target_type == "Issue" and project_path:
-            expected_path = f"/{project_path}/-/issues/{result['iid']}"
-        elif target_type == "MergeRequest" and project_path:
-            expected_path = f"/{project_path}/-/merge_requests/{result['iid']}"
-        elif target_type == "Commit" and project_path:
-            expected_path = f"/{project_path}/-/commit/{result['sha']}"
-        elif target_type == "Epic" and group_path:
-            expected_path = f"/groups/{group_path}/-/epics/{result['iid']}"
-        elif target_type == "DesignManagement::Design" and project_path:
-            expected_path = f"/{project_path}/-/designs/{result['iid']}"
-        elif target_type == "AlertManagement::Alert" and project_path:
-            expected_path = f"/{project_path}/-/alert_management/alerts/{result['id']}"
-        elif target_type == "Vulnerability" and project_path:
-            expected_path = f"/{project_path}/-/security/vulnerabilities/{result['id']}"
-        elif target_type == "WikiPage::Meta" and project_path:
-            expected_path = f"/{project_path}/-/wikis/{result['id']}"
+        suffixes = {
+            "Issue": f"/-/issues/{result.get('iid')}",
+            "MergeRequest": f"/-/merge_requests/{result.get('iid')}",
+            "Commit": f"/-/commit/{result.get('sha')}",
+            "Epic": f"/-/epics/{result.get('iid')}",
+            "DesignManagement::Design": f"/-/designs/{result.get('iid')}",
+            "AlertManagement::Alert": f"/-/alert_management/alerts/{result.get('id')}",
+            "Vulnerability": f"/-/security/vulnerabilities/{result.get('id')}",
+            "WikiPage::Meta": f"/-/wikis/{result.get('id')}",
+        }
+        if target_type in suffixes:
+            suffix = suffixes[target_type]
+            if not target_path.endswith(suffix):
+                raise GitLabError("invalid_remote_data")
+            parent_path = target_path[: -len(suffix)]
+            if target_type == "Epic":
+                if not parent_path.startswith("/groups/"):
+                    raise GitLabError("invalid_remote_data")
+                path = _namespace_path(parent_path.removeprefix("/groups/"), remote=True)
+                if group_path is not None and path != group_path:
+                    raise GitLabError("invalid_remote_data")
+                expected_path = f"/groups/{group_path or path}{suffix}"
+            else:
+                if not parent_path.startswith("/"):
+                    raise GitLabError("invalid_remote_data")
+                path = _namespace_path(parent_path[1:], remote=True)
+                if project_path is not None and path != project_path:
+                    raise GitLabError("invalid_remote_data")
+                expected_path = f"/{project_path or path}{suffix}"
+        elif target_type == "Project":
+            if not target_path.startswith("/") or "/-/" in target_path:
+                raise GitLabError("invalid_remote_data")
+            path = _namespace_path(target_path[1:], remote=True)
+            if project is not None and (
+                result["id"] != project["id"] or path != project_path
+            ):
+                raise GitLabError("invalid_remote_data")
+            expected_path = f"/{project_path or path}"
+        elif target_type == "Namespace":
+            if not target_path.startswith("/groups/") or "/-/" in target_path:
+                raise GitLabError("invalid_remote_data")
+            path = _namespace_path(target_path.removeprefix("/groups/"), remote=True)
+            if group is not None and (
+                result["id"] != group["id"] or path != group_path
+            ):
+                raise GitLabError("invalid_remote_data")
+            expected_path = f"/groups/{group_path or path}"
         if expected_path is not None:
             target_url = _canonical_remote_url(
                 target_url, self.client.auth.origin, expected_path

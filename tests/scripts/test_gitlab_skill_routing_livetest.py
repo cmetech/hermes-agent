@@ -280,6 +280,91 @@ def test_namespaced_anthropic_model_reaches_conversation_with_canonical_id(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "nested", "expected"),
+    [
+        ({}, False, False),
+        ({"scope": "all"}, False, False),
+        ({"scope": "created_by_me"}, False, True),
+        ({}, True, False),
+        ({"scope": "created_by_me"}, True, True),
+    ],
+)
+def test_run_case_requires_expected_personal_scope_arguments(
+    monkeypatch, tmp_path, arguments, nested, expected
+):
+    class FakeAgent:
+        def __init__(self, *, provider, model, **_kwargs):
+            self.provider = provider
+            self.model = runner.normalize_model_for_provider(model, provider)
+
+        def run_conversation(self, **_kwargs):
+            function = {
+                "name": "gitlab_list_merge_requests",
+                "arguments": json.dumps(arguments),
+            }
+            if nested:
+                function = {
+                    "name": "tool_call",
+                    "arguments": json.dumps(
+                        {
+                            "name": "gitlab_list_merge_requests",
+                            "arguments": arguments,
+                        }
+                    ),
+                }
+            return {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "skill_view",
+                                    "arguments": '{"name":"gitlab"}',
+                                }
+                            },
+                            {
+                                "function": {
+                                    "name": "skill_view",
+                                    "arguments": '{"name":"ericsson-gitlab:personal-inbox"}',
+                                }
+                            },
+                            {
+                                "function": {
+                                    "name": "tool_describe",
+                                    "arguments": '{"names":["gitlab_list_merge_requests"]}',
+                                }
+                            },
+                            {"function": function},
+                        ],
+                    }
+                ],
+                "final_response": "Done.",
+            }
+
+    home = tmp_path / "isolated" / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_prepare_home", lambda *_args: home)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=FakeAgent))
+    result = runner.run_case(
+        {
+            "id": "personal-scope-boundary",
+            "prompt": "List MRs I authored.",
+            "skill": "ericsson-gitlab:personal-inbox",
+            "required_intents": ["list_personal_mrs"],
+            "expected_arguments": {
+                "gitlab_list_merge_requests": {"scope": "created_by_me"}
+            },
+            "allowed_sequences": [["gitlab_list_merge_requests"]],
+            "clarification_allowed": False,
+        },
+        "anthropic/claude-sonnet-4.6",
+        1,
+    )
+    assert result["passed"] is expected
+
+
+@pytest.mark.parametrize(
     ("resolved_provider", "resolved_model", "message"),
     [
         ("openai", "claude-sonnet-4-6", "provider"),

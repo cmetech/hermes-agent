@@ -10,14 +10,16 @@ Read a bounded GitLab personal inbox read-only: To-Dos and cross-project merge-r
 </objective>
 
 <quick_start>
-Use <tool name="gitlab_list_todos" mode="read">gitlab_list_todos</tool> for notifications, attention, or To-Dos. Use global <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> for merge requests created by, assigned to, or awaiting review from the authenticated user. “My queue,” “inbox,” and “across GitLab” belong here. Prefer native personal scopes; use `@me` only for an explicitly requested actor filter.
+Use <tool name="gitlab_list_todos" mode="read">gitlab_list_todos</tool> for notifications, attention, or To-Dos. Use global <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> with native scope `created_by_me`, `assigned_to_me`, or `reviews_for_me` for merge requests created by, assigned to, or awaiting review from the authenticated user. “My queue,” “inbox,” and “across GitLab” belong here. Use `@me` only for an explicitly requested actor filter.
 </quick_start>
 
 <decision_table>
 | Intent | Read |
 | --- | --- |
 | GitLab notifications, attention queue, or To-Dos | <tool name="gitlab_list_todos" mode="read">gitlab_list_todos</tool> |
-| MRs authored, assigned, or requesting review across GitLab | Global <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> |
+| MRs authored by me across GitLab | Global <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> with `scope=created_by_me` |
+| MRs assigned to me across GitLab | Global <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> with `scope=assigned_to_me` |
+| MRs requesting my review across GitLab | Global <tool name="gitlab_list_merge_requests" mode="read">gitlab_list_merge_requests</tool> with `scope=reviews_for_me` |
 | MRs in one project or one selected MR | Route to merge-request-review; this skill does not own project-specific review reads. |
 </decision_table>
 

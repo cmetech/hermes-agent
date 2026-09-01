@@ -566,18 +566,21 @@
       "id": "inbox-authored-clear", "slice": "release-inbox",
       "prompt": "List merge requests I authored across GitLab.", "router": "gitlab",
       "skill": "ericsson-gitlab:personal-inbox", "required_intents": ["list_personal_mrs"],
+      "expected_arguments": {"gitlab_list_merge_requests": {"scope": "created_by_me"}},
       "allowed_sequences": [["gitlab_list_merge_requests"]], "clarification_allowed": false, "ambiguous": false, "repetitions": 1
     },
     {
       "id": "inbox-assigned-clear", "slice": "release-inbox",
       "prompt": "Show merge requests assigned to me across GitLab.", "router": "gitlab",
       "skill": "ericsson-gitlab:personal-inbox", "required_intents": ["list_personal_mrs"],
+      "expected_arguments": {"gitlab_list_merge_requests": {"scope": "assigned_to_me"}},
       "allowed_sequences": [["gitlab_list_merge_requests"]], "clarification_allowed": false, "ambiguous": false, "repetitions": 1
     },
     {
       "id": "inbox-reviewer-clear", "slice": "release-inbox",
       "prompt": "List MRs requesting my review across GitLab.", "router": "gitlab",
       "skill": "ericsson-gitlab:personal-inbox", "required_intents": ["list_personal_mrs"],
+      "expected_arguments": {"gitlab_list_merge_requests": {"scope": "reviews_for_me"}},
       "allowed_sequences": [["gitlab_list_merge_requests"]], "clarification_allowed": false, "ambiguous": false, "repetitions": 1
     },
     {
@@ -626,18 +629,21 @@
       "id": "inbox-authored-paraphrased", "slice": "release-inbox",
       "prompt": "Which MRs did I create anywhere in GitLab?", "router": "gitlab",
       "skill": "ericsson-gitlab:personal-inbox", "required_intents": ["list_personal_mrs"],
+      "expected_arguments": {"gitlab_list_merge_requests": {"scope": "created_by_me"}},
       "allowed_sequences": [["gitlab_list_merge_requests"]], "clarification_allowed": false, "ambiguous": false, "repetitions": 1
     },
     {
       "id": "inbox-assigned-paraphrased", "slice": "release-inbox",
       "prompt": "What GitLab MRs are waiting on me as assignee?", "router": "gitlab",
       "skill": "ericsson-gitlab:personal-inbox", "required_intents": ["list_personal_mrs"],
+      "expected_arguments": {"gitlab_list_merge_requests": {"scope": "assigned_to_me"}},
       "allowed_sequences": [["gitlab_list_merge_requests"]], "clarification_allowed": false, "ambiguous": false, "repetitions": 1
     },
     {
       "id": "inbox-reviewer-paraphrased", "slice": "release-inbox",
       "prompt": "Which MRs need me to review them anywhere in GitLab?", "router": "gitlab",
       "skill": "ericsson-gitlab:personal-inbox", "required_intents": ["list_personal_mrs"],
+      "expected_arguments": {"gitlab_list_merge_requests": {"scope": "reviews_for_me"}},
       "allowed_sequences": [["gitlab_list_merge_requests"]], "clarification_allowed": false, "ambiguous": false, "repetitions": 1
     },
     {
