@@ -265,6 +265,8 @@ class HandoffSnapshot:
                 "checkpoint": _normalize_checkpoint,
                 "terminal_result": _normalize_terminal_result,
             }[name](getattr(self, name)))
+        if self.mechanism is not None and not _safe_identifier(self.mechanism):
+            raise ValueError("handoff mechanism is invalid")
         if self.failure_code is not None and not _safe_identifier(self.failure_code):
             raise ValueError("handoff failure code is invalid")
 
@@ -288,6 +290,8 @@ class ChannelObservation:
             ("terminal_result", _normalize_terminal_result),
         ):
             object.__setattr__(self, name, normalizer(getattr(self, name)))
+        if self.mechanism is not None and not _safe_identifier(self.mechanism):
+            raise ValueError("handoff mechanism is invalid")
         if self.failure_code is not None and not _safe_identifier(self.failure_code):
             raise ValueError("handoff failure code is invalid")
         object.__setattr__(self, "next_advance_at", _aware_utc(self.next_advance_at, "next advance"))

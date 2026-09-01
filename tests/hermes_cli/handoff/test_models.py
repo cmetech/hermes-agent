@@ -219,6 +219,18 @@ def test_fact_failure_code_must_be_a_safe_identifier():
         ChannelObservation(phase="failed", failure_code="raw provider error")
 
 
+@pytest.mark.parametrize("mechanism", [
+    "Bearer secret",
+    "/Users/example/.hermes",
+    "raw header error prose",
+])
+def test_top_level_mechanism_must_be_a_safe_identifier(mechanism: str):
+    with pytest.raises(ValueError):
+        HandoffSnapshot("id", "scope", "key", _spec(), "f", "prepared", 0, mechanism=mechanism)
+    with pytest.raises(ValueError):
+        ChannelObservation(phase="prepared", mechanism=mechanism)
+
+
 def test_snapshot_and_observation_accept_closed_stage_one_facts_immutably():
     result = {
         "text": "answer",
