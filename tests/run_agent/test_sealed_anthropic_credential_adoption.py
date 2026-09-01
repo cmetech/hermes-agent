@@ -400,7 +400,7 @@ def test_sealed_anthropic_pool_failure_preserves_all_mode_fields(
     old = _snapshot_anthropic_state(agent)
     refreshes: list[str] = []
     monkeypatch.setattr(
-        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
         lambda refresh_token, **_kwargs: refreshes.append(refresh_token)
         or {
             "access_token": FRESH_TOKEN,

@@ -21,6 +21,8 @@ import {
 // Native completion notification.
 import { bindCompletionNotify, type CompletionEvent, onKanbanEventsFrame } from './completion-notify'
 import type {
+  BoardExportResult,
+  BoardImportResult,
   BoardMeta,
   BoardsResponse,
   KanbanBoard,
@@ -41,7 +43,8 @@ type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 type Os = { revealPath: (path: string) => Promise<boolean> }
 
 let rest: null | Rest = null
-let os: null | Os = null
+let os: null | PluginOs = null
+let revealOs: null | Os = null
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
@@ -104,6 +107,8 @@ export function bindApi(
   notifyDoors?: { os?: PluginOs; t?: PluginTranslate }
 ): () => void {
   rest = r
+  os = notifyDoors?.os ?? null
+  revealOs = notifyDoors?.os ?? null
   bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
   const unsubs: Array<() => void> = []
 
@@ -132,6 +137,8 @@ export function bindApi(
     unsubs.forEach(unsub => unsub())
     close?.()
     rest = null
+    os = null
+    revealOs = null
   }
 }
 
@@ -139,15 +146,19 @@ export function bindApi(
  *  `bindApi` because it is optional: an older desktop shell — or a plain
  *  browser — has no bridge, and the reveal control simply stays hidden. */
 export function bindOs(door: null | Os): void {
-  os = door
+  revealOs = door
 }
 
 /** Open the OS file manager on an attachment's stored path. Resolves false
  *  when no door is bound or the shell can't oblige, so callers can tell the
  *  user instead of leaving a click that does nothing. */
 export function revealAttachment(path: string): Promise<boolean> {
-  return os && path ? os.revealPath(path) : Promise.resolve(false)
+  return revealOs && path ? revealOs.revealPath(path) : Promise.resolve(false)
 }
+
+/** The plugin's OS door, for components too deep to be handed `ctx`. Null
+ *  before `bindApi` and after unload. */
+export const pluginOs = (): null | PluginOs => os
 
 function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
   return rest ? rest<T>(path, opts) : Promise.reject(new Error('kanban api not ready'))
@@ -275,6 +286,22 @@ export const estimateNew = (title: string, body: string) =>
  *  `default_workdir: ''` to clear it. Slug is immutable. */
 export const updateBoard = (slug: string, patch: Record<string, unknown>) =>
   call<{ board: BoardMeta }>(`/boards/${encodeURIComponent(slug)}`, { method: 'PATCH', body: patch })
+
+/** Archive a board to `boards/_archived/` — recoverable, and the backend
+ *  refuses to touch `default`. (`?delete=true` hard-deletes; no caller yet.) */
+export const deleteBoard = (slug: string) =>
+  call<{ result: { action: string; new_path: string }; current: string }>(`/boards/${encodeURIComponent(slug)}`, {
+    method: 'DELETE'
+  })
+
+// Board transfer exchanges filesystem paths, not bytes — the picker runs on
+// the machine hosting the backend, so the backend reads and writes the file.
+
+export const exportBoard = (slug: string, output: string) =>
+  call<BoardExportResult>(`/boards/${encodeURIComponent(slug)}/export`, { method: 'POST', body: { output } })
+
+export const importBoard = (archive: string) =>
+  call<BoardImportResult>('/boards/import', { method: 'POST', body: { archive } })
 
 export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
 

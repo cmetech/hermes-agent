@@ -165,7 +165,7 @@ def _write_runtime_config(
         ),
         encoding="utf-8",
     )
-    bundled_skill = Path(__file__).parents[3] / "skills/creative/ascii-art"
+    bundled_skill = Path(__file__).parents[3] / "optional-skills/creative/ascii-art"
     shutil.copytree(
         bundled_skill,
         home / "skills/creative/ascii-art",

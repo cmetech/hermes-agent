@@ -69,23 +69,17 @@ def test_test_node_gates_a_system_toolchain_on_the_npm_band() -> None:
     in the checkout dies with EBADENGINE.
     """
     body = _extract_function("Test-Node")
-    accept_branch = re.search(
-        r"if \(Test-NodeVersionOk \$version\) \{(.*?)\n {8}\}", body, re.DOTALL
-    )
-    assert accept_branch, "Test-Node's system-Node accept branch not found"
-    guarded = re.search(
-        r"if \(\$systemNpmUsable\) \{[^}]*?\$script:HasNode = \$true",
-        accept_branch.group(1),
+    assert "if (Test-SystemNodeReady)" in body
+
+    probe = _extract_function("Test-SystemNodeReady")
+    assert "Test-NodeVersionOk" in probe
+    assert "Get-NpmRange" in probe
+    assert "Test-NpmVersionOk" in probe
+    assert re.search(
+        r"Test-NpmVersionOk \$npmVersion \$npmRange\).*?return \$true",
+        probe,
         re.DOTALL,
-    )
-    assert guarded, (
-        "Test-Node must require a usable npm before adopting the system "
-        "toolchain (HasNode = true), mirroring check_node() in install.sh."
-    )
-    assert "Test-SystemNpmUsable" in body, (
-        "Test-Node must derive $systemNpmUsable from the band predicate."
-    )
-    assert "Test-NpmSupportsNpmrc" in _extract_function("Test-SystemNpmUsable")
+    ), "the system toolchain must be accepted only after its npm range passes"
 
 
 def test_node_deps_stage_prefers_a_usable_npm() -> None:
