@@ -132,8 +132,8 @@ def test_spec_fingerprint_input_is_stable_canonical_json_of_semantics():
 
 
 def test_snapshot_validates_lifecycle_metadata_and_freezes_mappings():
-    binding = {"run_id": "run-1"}
-    checkpoint = {"cursor": "1"}
+    binding = {"profile": "reviewer", "mechanism": "runs"}
+    checkpoint = {"run_id": "run-1", "cursor": 1}
     snapshot = HandoffSnapshot(
         handoff_id="handoff-1",
         key_scope="workflow/run-1",
@@ -147,11 +147,11 @@ def test_snapshot_validates_lifecycle_metadata_and_freezes_mappings():
         created_at=datetime(2026, 9, 1, 12, tzinfo=timezone.utc),
     )
 
-    binding["run_id"] = "changed"
-    checkpoint["cursor"] = "2"
+    binding["profile"] = "changed"
+    checkpoint["cursor"] = 2
 
-    assert snapshot.binding["run_id"] == "run-1"
-    assert snapshot.checkpoint["cursor"] == "1"
+    assert snapshot.binding["profile"] == "reviewer"
+    assert snapshot.checkpoint["cursor"] == 1
     with pytest.raises(ValueError):
         HandoffSnapshot("id", "scope", "key", _spec(), "f", "unknown", 0)
     with pytest.raises(ValueError):
@@ -163,33 +163,38 @@ def test_snapshot_validates_lifecycle_metadata_and_freezes_mappings():
         )
 
 
-def test_channel_observation_is_fact_only_and_normalizes_safe_values():
+def test_channel_observation_uses_closed_immutable_facts():
     checkpoint = {"run_id": "run-1"}
-    safe_data = {"status": "running"}
     observation = ChannelObservation(
         phase="active",
         checkpoint=checkpoint,
-        safe_data=safe_data,
+        binding={"profile": "reviewer", "mechanism": "runs"},
+        failure_code="transient_failure",
         next_advance_at=datetime(2026, 9, 1, 12, tzinfo=timezone.utc),
     )
 
     checkpoint["run_id"] = "changed"
-    safe_data["status"] = "changed"
 
     assert observation.checkpoint["run_id"] == "run-1"
-    assert observation.safe_data["status"] == "running"
+    assert observation.binding["profile"] == "reviewer"
     with pytest.raises(ValueError):
         ChannelObservation(phase="unknown")
     with pytest.raises(ValueError):
         ChannelObservation(phase="active", next_advance_at=datetime(2026, 9, 1, 12))
+    with pytest.raises(TypeError):
+        ChannelObservation(phase="active", safe_data={})
 
 
 @pytest.mark.parametrize("field, value", [
-    ("binding", {"nested": {"token": "secret"}}),
-    ("checkpoint", {"headers": {"Authorization": "Bearer secret"}}),
-    ("terminal_result", {"provider_error": "unredacted upstream response"}),
+    ("binding", {"opaque": "provider error: unredacted"}),
+    ("checkpoint", {"opaque": {"value": "Bearer secret"}}),
+    ("checkpoint", {"opaque": {"value": "/Users/example/.hermes"}}),
+    ("checkpoint", {"run_id": "run/unsafe"}),
+    ("checkpoint", {"request_sha256": "A" * 64}),
+    ("checkpoint", {"process_pid": True}),
+    ("checkpoint", {"process_started_at": -1}),
 ])
-def test_snapshot_rejects_unsafe_durable_facts(field: str, value: dict[str, object]):
+def test_snapshot_rejects_noncontract_durable_facts(field: str, value: dict[str, object]):
     values = {field: value}
 
     with pytest.raises(ValueError):
@@ -198,12 +203,45 @@ def test_snapshot_rejects_unsafe_durable_facts(field: str, value: dict[str, obje
         )
 
 
-@pytest.mark.parametrize("values", [
-    {"checkpoint": {"profile_home": "/Users/example/.hermes/profiles/reviewer"}},
-    {"binding": {"raw_headers": {"x-request-id": "request-1"}}},
-    {"safe_data": {"upstream_error": "raw provider exception"}},
-    {"safe_data": {"nested": {"authorization": "Basic secret"}}},
+@pytest.mark.parametrize("result", [
+    {"text": "answer", "sha256": "0" * 64, "media_type": "text/plain", "size_bytes": 6},
+    {"text": "answer", "sha256": sha256(b"answer").hexdigest(), "media_type": "text/html", "size_bytes": 6},
+    {"text": "answer", "sha256": sha256(b"answer").hexdigest(), "media_type": "text/plain", "size_bytes": 5},
+    {"text": "answer", "sha256": sha256(b"answer").hexdigest(), "media_type": "text/plain", "size_bytes": 6, "detail": "provider error"},
 ])
-def test_observation_rejects_unsafe_durable_facts(values: dict[str, object]):
+def test_observation_rejects_malformed_result_integrity(result: dict[str, object]):
     with pytest.raises(ValueError):
-        ChannelObservation(phase="active", **values)
+        ChannelObservation(phase="succeeded", terminal_result=result)
+
+
+def test_fact_failure_code_must_be_a_safe_identifier():
+    with pytest.raises(ValueError):
+        ChannelObservation(phase="failed", failure_code="raw provider error")
+
+
+def test_snapshot_and_observation_accept_closed_stage_one_facts_immutably():
+    result = {
+        "text": "answer",
+        "sha256": sha256(b"answer").hexdigest(),
+        "media_type": "text/plain",
+        "size_bytes": 6,
+    }
+    snapshot = HandoffSnapshot(
+        "id", "scope", "key", _spec(), "f", "succeeded", 1,
+        binding={"profile": "reviewer", "mechanism": "runs"},
+        checkpoint={"run_id": "run-1", "request_sha256": "a" * 64, "process_pid": 12},
+        terminal_result=result,
+        failure_code="none",
+    )
+    observation = ChannelObservation(
+        phase="succeeded",
+        binding={"profile": "reviewer", "mechanism": "runs"},
+        checkpoint={"status": "completed", "version": 1},
+        terminal_result=result,
+        failure_code="none",
+    )
+
+    result["text"] = "changed"
+
+    assert snapshot.terminal_result["text"] == "answer"
+    assert observation.terminal_result["text"] == "answer"

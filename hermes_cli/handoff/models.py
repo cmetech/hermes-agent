@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
+import math
 import re
 from types import MappingProxyType
 from typing import Literal
@@ -26,6 +27,16 @@ _MAX_ATTRIBUTION_BYTES = 16_384
 _CREDENTIAL_KEY_PARTS = (
     "api_key", "authorization", "bearer", "credential", "password", "secret", "token",
 )
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CHECKPOINT_IDENTIFIERS = frozenset({"session_id", "run_id", "idempotency_key", "status"})
+_CHECKPOINT_SHA256 = frozenset({
+    "request_sha256", "process_command_sha256", "receipt_sha256", "output_sha256",
+    "stdout_sha256", "stderr_sha256",
+})
+_CHECKPOINT_INTEGERS = frozenset({"process_pid", "receipt_version", "exit_code", "cursor", "version"})
+_CHECKPOINT_KEYS = _CHECKPOINT_IDENTIFIERS | _CHECKPOINT_SHA256 | _CHECKPOINT_INTEGERS | {"process_started_at"}
+_MAX_FACT_INTEGER = 2**63 - 1
 
 
 def _contains_control(value: str) -> bool:
@@ -40,39 +51,69 @@ def _freeze(value: object) -> object:
     return value
 
 
-def _unsafe_fact_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    collapsed = normalized.replace("_", "")
-    return (
-        any(part in normalized or part.replace("_", "") in collapsed for part in _CREDENTIAL_KEY_PARTS)
-        or "header" in normalized
-        or ("error" in normalized and not normalized.endswith("_code"))
-    )
+def _safe_identifier(value: object) -> bool:
+    return isinstance(value, str) and bool(_SAFE_IDENTIFIER.fullmatch(value))
 
 
-def _unsafe_fact_value(value: str) -> bool:
-    if value.lower().startswith(("bearer", "basic", "~", "/", "\\\\")):
-        return True
-    if re.match(r"^[A-Za-z]:[\\/]", value):
-        return True
+def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) not in (set(), {"profile", "mechanism"}):
+        raise ValueError("handoff binding is invalid")
+    if not value:
+        return MappingProxyType({})
+    profile, mechanism = value["profile"], value["mechanism"]
+    if not isinstance(profile, str) or not _safe_identifier(mechanism):
+        raise ValueError("handoff binding is invalid")
     try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return True
-    return bool(parsed.scheme or parsed.netloc)
+        validate_profile_name(profile)
+    except ValueError as exc:
+        raise ValueError("handoff binding is invalid") from exc
+    return MappingProxyType({"profile": profile, "mechanism": mechanism})
 
 
-def _validate_durable_facts(value: object) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str) or _unsafe_fact_key(key):
-                raise ValueError("handoff durable facts are unsafe")
-            _validate_durable_facts(item)
-    elif isinstance(value, list | tuple):
-        for item in value:
-            _validate_durable_facts(item)
-    elif isinstance(value, str) and _unsafe_fact_value(value):
-        raise ValueError("handoff durable facts are unsafe")
+def _normalize_checkpoint(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not set(value) <= _CHECKPOINT_KEYS:
+        raise ValueError("handoff checkpoint is invalid")
+    for key, item in value.items():
+        if key in _CHECKPOINT_IDENTIFIERS and not _safe_identifier(item):
+            raise ValueError("handoff checkpoint is invalid")
+        if key in _CHECKPOINT_SHA256 and (not isinstance(item, str) or not _SHA256.fullmatch(item)):
+            raise ValueError("handoff checkpoint is invalid")
+        if key in _CHECKPOINT_INTEGERS and (
+            isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= _MAX_FACT_INTEGER
+        ):
+            raise ValueError("handoff checkpoint is invalid")
+        if key == "process_started_at" and (
+            isinstance(item, bool) or not isinstance(item, int | float) or not math.isfinite(item) or item < 0
+        ):
+            raise ValueError("handoff checkpoint is invalid")
+    return _freeze(value)
+
+
+def _normalize_terminal_result(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"text", "sha256", "media_type", "size_bytes"}:
+        raise ValueError("handoff terminal result is invalid")
+    text, digest, media_type, size_bytes = (
+        value["text"], value["sha256"], value["media_type"], value["size_bytes"],
+    )
+    if not isinstance(text, str) or len(text.encode("utf-8")) > _MAX_PROMPT_BYTES:
+        raise ValueError("handoff terminal result is invalid")
+    encoded = text.encode("utf-8")
+    if (
+        not isinstance(digest, str)
+        or digest != sha256(encoded).hexdigest()
+        or media_type not in {"text/plain", "application/json"}
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes != len(encoded)
+    ):
+        raise ValueError("handoff terminal result is invalid")
+    return _freeze(value)
 
 
 def _aware_utc(value: datetime | None, name: str) -> datetime | None:
@@ -219,12 +260,13 @@ class HandoffSnapshot:
         ):
             object.__setattr__(self, name, _aware_utc(getattr(self, name), name))
         for name in ("binding", "checkpoint", "terminal_result"):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, Mapping):
-                raise ValueError(f"{name} must be a mapping")
-            if value is not None:
-                _validate_durable_facts(value)
-            object.__setattr__(self, name, _freeze(value) if value is not None else None)
+            object.__setattr__(self, name, {
+                "binding": _normalize_binding,
+                "checkpoint": _normalize_checkpoint,
+                "terminal_result": _normalize_terminal_result,
+            }[name](getattr(self, name)))
+        if self.failure_code is not None and not _safe_identifier(self.failure_code):
+            raise ValueError("handoff failure code is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,17 +277,17 @@ class ChannelObservation:
     mechanism: str | None = None
     terminal_result: Mapping[str, object] | None = None
     failure_code: str | None = None
-    safe_data: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     next_advance_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.phase not in HANDOFF_PHASES:
             raise ValueError("observation phase is invalid")
-        for name in ("checkpoint", "binding", "terminal_result", "safe_data"):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, Mapping):
-                raise ValueError(f"{name} must be a mapping")
-            if value is not None:
-                _validate_durable_facts(value)
-            object.__setattr__(self, name, _freeze(value) if value is not None else None)
+        for name, normalizer in (
+            ("checkpoint", _normalize_checkpoint),
+            ("binding", _normalize_binding),
+            ("terminal_result", _normalize_terminal_result),
+        ):
+            object.__setattr__(self, name, normalizer(getattr(self, name)))
+        if self.failure_code is not None and not _safe_identifier(self.failure_code):
+            raise ValueError("handoff failure code is invalid")
         object.__setattr__(self, "next_advance_at", _aware_utc(self.next_advance_at, "next advance"))
