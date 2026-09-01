@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
+import re
 from types import MappingProxyType
 from typing import Literal
 from urllib.parse import urlsplit
@@ -39,6 +40,41 @@ def _freeze(value: object) -> object:
     return value
 
 
+def _unsafe_fact_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    collapsed = normalized.replace("_", "")
+    return (
+        any(part in normalized or part.replace("_", "") in collapsed for part in _CREDENTIAL_KEY_PARTS)
+        or "header" in normalized
+        or ("error" in normalized and not normalized.endswith("_code"))
+    )
+
+
+def _unsafe_fact_value(value: str) -> bool:
+    if value.lower().startswith(("bearer", "basic", "~", "/", "\\\\")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return True
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return True
+    return bool(parsed.scheme or parsed.netloc)
+
+
+def _validate_durable_facts(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str) or _unsafe_fact_key(key):
+                raise ValueError("handoff durable facts are unsafe")
+            _validate_durable_facts(item)
+    elif isinstance(value, list | tuple):
+        for item in value:
+            _validate_durable_facts(item)
+    elif isinstance(value, str) and _unsafe_fact_value(value):
+        raise ValueError("handoff durable facts are unsafe")
+
+
 def _aware_utc(value: datetime | None, name: str) -> datetime | None:
     if value is None:
         return None
@@ -69,8 +105,8 @@ class HandoffEndpoint:
         if (
             parsed.scheme != "hermes"
             or parsed.netloc != "local"
-            or parsed.query
-            or parsed.fragment
+            or "?" in value
+            or "#" in value
             or not parsed.path.startswith("/")
             or parsed.path.count("/") != 1
         ):
@@ -120,7 +156,7 @@ class HandoffSpec:
             ):
                 raise ValueError("handoff attribution is unsafe")
             parsed = urlsplit(value)
-            if parsed.scheme and parsed.netloc:
+            if parsed.scheme or parsed.netloc:
                 raise ValueError("handoff attribution must not contain URLs")
             attribution[key] = value
         try:
@@ -186,6 +222,8 @@ class HandoffSnapshot:
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise ValueError(f"{name} must be a mapping")
+            if value is not None:
+                _validate_durable_facts(value)
             object.__setattr__(self, name, _freeze(value) if value is not None else None)
 
 
@@ -207,5 +245,7 @@ class ChannelObservation:
             value = getattr(self, name)
             if value is not None and not isinstance(value, Mapping):
                 raise ValueError(f"{name} must be a mapping")
+            if value is not None:
+                _validate_durable_facts(value)
             object.__setattr__(self, name, _freeze(value) if value is not None else None)
         object.__setattr__(self, "next_advance_at", _aware_utc(self.next_advance_at, "next advance"))

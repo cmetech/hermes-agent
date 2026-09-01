@@ -46,7 +46,9 @@ def test_endpoint_parses_only_canonical_local_profile_uri():
     "hermes://peer/reviewer",
     "hermes://local:8080/reviewer",
     "hermes://local/reviewer?x=1",
+    "hermes://local/reviewer?",
     "hermes://local/reviewer#fragment",
+    "hermes://local/reviewer#",
     "hermes://local/reviewer%2Fextra",
     "hermes://local/review%00er",
     "hermes://local/Reviewer",
@@ -86,6 +88,8 @@ def test_spec_normalizes_aware_deadline_and_freezes_semantic_values():
     {"attribution": {"api_token": "redacted"}},
     {"attribution": {"source": "Bearer abc"}},
     {"attribution": {"source": "https://example.test/path"}},
+    {"attribution": {"source": "mailto:reviewer@example.test"}},
+    {"attribution": {"source": "//example.test/path"}},
     {"attribution": {"source": "line\nbreak"}},
     {"required_capabilities": {"remote_execution"}},
 ])
@@ -178,3 +182,28 @@ def test_channel_observation_is_fact_only_and_normalizes_safe_values():
         ChannelObservation(phase="unknown")
     with pytest.raises(ValueError):
         ChannelObservation(phase="active", next_advance_at=datetime(2026, 9, 1, 12))
+
+
+@pytest.mark.parametrize("field, value", [
+    ("binding", {"nested": {"token": "secret"}}),
+    ("checkpoint", {"headers": {"Authorization": "Bearer secret"}}),
+    ("terminal_result", {"provider_error": "unredacted upstream response"}),
+])
+def test_snapshot_rejects_unsafe_durable_facts(field: str, value: dict[str, object]):
+    values = {field: value}
+
+    with pytest.raises(ValueError):
+        HandoffSnapshot(
+            "id", "scope", "key", _spec(), "f", "prepared", 0, **values,
+        )
+
+
+@pytest.mark.parametrize("values", [
+    {"checkpoint": {"profile_home": "/Users/example/.hermes/profiles/reviewer"}},
+    {"binding": {"raw_headers": {"x-request-id": "request-1"}}},
+    {"safe_data": {"upstream_error": "raw provider exception"}},
+    {"safe_data": {"nested": {"authorization": "Basic secret"}}},
+])
+def test_observation_rejects_unsafe_durable_facts(values: dict[str, object]):
+    with pytest.raises(ValueError):
+        ChannelObservation(phase="active", **values)
