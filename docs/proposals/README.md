@@ -9,7 +9,9 @@ status and decision section as authoritative for its current stage.
 - [Shared Agent Handoff Facade for Workflows and Bot Mode — Consolidated Design](2026-09-01-shared-agent-handoff-facade-workflow-bot-mode-consolidated.md)
   — accepted implementation baseline for local and remote Hermes handoffs,
   GitLab+ICM town-hall communication, Workflow and Bot Mode integration,
-  durable reconciliation, audit evidence, and Needs Attention.
+  durable reconciliation, audit evidence, and Needs Attention. Stage 1 is
+  [verified ready](../assessments/2026-09-01-agent-handoff-stage-1-implementation-readiness.md)
+  and has an [implementation plan](../superpowers/plans/2026-09-01-local-workflow-agent-handoff-stage-1.md).
 
 ## Supporting analyses
 

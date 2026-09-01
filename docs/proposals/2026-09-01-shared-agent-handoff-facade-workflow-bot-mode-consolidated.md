@@ -37,6 +37,11 @@ After reading this proposal, an engineer should be able to:
 This is a solution proposal, not an implementation plan or a claim that the
 feature already exists.
 
+Implementation artifacts:
+
+- [Stage 1 post-merge readiness assessment](../assessments/2026-09-01-agent-handoff-stage-1-implementation-readiness.md)
+- [Stage 1 local Workflow implementation plan](../superpowers/plans/2026-09-01-local-workflow-agent-handoff-stage-1.md)
+
 ## 2. Executive decision
 
 Hermes should introduce a small, host-owned **Agent Handoff Service** shared by
@@ -1755,8 +1760,9 @@ The feature is ready only when a user can:
 
 ### 20.2 Remaining implementation risks
 
-- The upstream merge may alter current fork seams around API server, peer,
-  Bot Mode, or Desktop relay and must be resolved before detailed planning.
+- Future upstream merges may alter the now-verified seams around API server,
+  peer, Bot Mode, or Desktop relay; keep the focused readiness suites in the
+  merge gate.
 - Cross-platform file locking needs real Windows validation, not only a mocked
   import path.
 - Local loopback Runs require a clear, secure profile-specific credential and
