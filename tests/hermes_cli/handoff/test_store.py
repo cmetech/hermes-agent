@@ -9,6 +9,7 @@ import stat
 
 import pytest
 
+import hermes_cli.handoff.store as store_module
 from hermes_cli.handoff.models import ChannelObservation, HandoffEndpoint, HandoffSpec
 from hermes_cli.handoff.store import (
     HandoffConflict,
@@ -38,13 +39,11 @@ def _create(store: HandoffStore, key: str = "node/review"):
     return store.create_or_get("workflow/run-1", key, spec, spec.fingerprint)
 
 
-def _claim(
-    store: HandoffStore, handoff_id: str, owner: str = "worker-1", second: int = 0
-):
+def _claim(store: HandoffStore, handoff_id: str, owner: str = "worker-1"):
     lease = store.claim_advance(
         handoff_id,
         owner,
-        now=datetime(2026, 9, 1, 12, 0, second, tzinfo=UTC),
+        now=datetime.now(UTC),
         lease_seconds=30,
     )
     assert lease is not None
@@ -420,6 +419,61 @@ def test_submit_requires_a_sealed_binding_and_cannot_be_attempted_twice(tmp_path
         store.journal_attempt(lease, "submit")
 
 
+def test_cancel_winner_prevents_any_later_submit_fact_or_event(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        snapshot.state_version,
+    )
+    lease = _claim(store, snapshot.handoff_id)
+    cancelled = store.record_command(
+        snapshot.handoff_id, "cancel-1", "cancel", {"actor": "workflow"}
+    )
+    before = store.get(snapshot.handoff_id)
+
+    with pytest.raises(HandoffStateConflict):
+        store.journal_attempt(lease, "submit")
+
+    after = store.get(snapshot.handoff_id)
+    assert cancelled.kind == "cancel"
+    assert before.phase == after.phase == "cancelling"
+    assert after.submit_attempted_at is None
+    assert "submit_attempted" not in {
+        event.kind
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    }
+
+
+def test_submit_winner_may_be_followed_by_durable_cancellation(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        snapshot.state_version,
+    )
+    lease = _claim(store, snapshot.handoff_id)
+
+    submitted = store.journal_attempt(lease, "submit")
+    store.record_command(
+        snapshot.handoff_id, "cancel-1", "cancel", {"actor": "workflow"}
+    )
+
+    cancelled = store.get(snapshot.handoff_id)
+    assert submitted.submit_attempted_at is not None
+    assert cancelled.submit_attempted_at == submitted.submit_attempted_at
+    assert cancelled.cancel_requested_at is not None
+    assert cancelled.phase == "cancelling"
+
+
 def test_cancel_fact_is_recorded_without_mutating_a_terminal_result(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot = _create(store)
@@ -504,6 +558,71 @@ def test_list_is_filtered_bounded_and_cursor_paginated(tmp_path):
     }
 
 
+def test_list_cursor_order_is_immutable_when_cursor_row_updates(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshots = [_create(store, f"node/{index}") for index in range(3)]
+    first = store.list({"key_scope": "workflow/run-1"}, limit=2, before=None)
+    cursor = first[-1]
+
+    store.bind(
+        cursor.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        cursor.state_version,
+    )
+    second = store.list(
+        {"key_scope": "workflow/run-1"}, limit=2, before=cursor.handoff_id
+    )
+
+    assert not (
+        {item.handoff_id for item in first} & {item.handoff_id for item in second}
+    )
+    assert {item.handoff_id for item in first + second} == {
+        item.handoff_id for item in snapshots
+    }
+
+
+@pytest.mark.parametrize("expiry_offset_seconds", [0, 1])
+@pytest.mark.parametrize("operation", ["journal", "observe", "release"])
+def test_expired_lease_is_stale_before_takeover(
+    tmp_path, monkeypatch, expiry_offset_seconds: int, operation: str
+):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        snapshot.state_version,
+    )
+    lease = _claim(store, snapshot.handoff_id)
+    operation_time = lease.expires_at + timedelta(seconds=expiry_offset_seconds)
+    monkeypatch.setattr(store_module, "_utc_now", lambda: operation_time)
+    before = store.get(snapshot.handoff_id)
+    event_count = len(
+        store.evidence(snapshot.handoff_id, after_sequence=0, limit=100).events
+    )
+
+    with pytest.raises(StaleAdvanceLease):
+        if operation == "journal":
+            store.journal_attempt(lease, "observe")
+        elif operation == "observe":
+            store.commit_observation(
+                lease,
+                ChannelObservation(phase="failed", failure_code="remote_failed"),
+            )
+        else:
+            store.release_advance(lease, next_advance_at=operation_time)
+
+    assert store.get(snapshot.handoff_id) == before
+    assert (
+        len(store.evidence(snapshot.handoff_id, after_sequence=0, limit=100).events)
+        == event_count
+    )
+
+
 def test_expired_lease_takeover_fences_every_old_worker_write(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot = _create(store)
@@ -511,7 +630,7 @@ def test_expired_lease_takeover_fences_every_old_worker_write(tmp_path):
     takeover = store.claim_advance(
         snapshot.handoff_id,
         "worker-2",
-        now=datetime(2026, 9, 1, 12, 0, 31, tzinfo=UTC),
+        now=first.expires_at,
         lease_seconds=30,
     )
 
@@ -536,6 +655,70 @@ def test_expired_lease_takeover_fences_every_old_worker_write(tmp_path):
         len(store.evidence(snapshot.handoff_id, after_sequence=0, limit=100).events)
         == event_count
     )
+
+
+def test_unbound_terminal_handoff_cannot_be_bound(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    lease = _claim(store, snapshot.handoff_id)
+    terminal = store.commit_observation(
+        lease, ChannelObservation(phase="failed", failure_code="policy_denied")
+    )
+
+    with pytest.raises(HandoffStateConflict):
+        store.bind(
+            terminal.handoff_id,
+            "runs",
+            {"profile": "reviewer", "mechanism": "runs"},
+            {},
+            terminal.state_version,
+        )
+
+    assert store.get(terminal.handoff_id) == terminal
+
+
+def test_submit_fact_and_event_roll_back_together_on_event_failure(tmp_path):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    snapshot = _create(store)
+    store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        snapshot.state_version,
+    )
+    lease = _claim(store, snapshot.handoff_id)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_submit_event BEFORE INSERT ON handoff_events "
+            "WHEN NEW.kind = 'submit_attempted' "
+            "BEGIN SELECT RAISE(ABORT, 'injected submit event failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected submit event failure"):
+        store.journal_attempt(lease, "submit")
+
+    rolled_back = store.get(snapshot.handoff_id)
+    assert rolled_back.submit_attempted_at is None
+    assert "submit_attempted" not in {
+        event.kind
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    }
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TRIGGER reject_submit_event")
+    committed = store.journal_attempt(lease, "submit")
+
+    assert committed.submit_attempted_at is not None
+    assert [
+        event.kind
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    ].count("submit_attempted") == 1
 
 
 def test_database_reopens_in_wal_mode_with_foreign_keys_and_durable_state(tmp_path):

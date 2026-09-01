@@ -330,7 +330,7 @@ _SCHEMA = (
         PRIMARY KEY (handoff_id, command_id)
     )""",
     "CREATE INDEX IF NOT EXISTS handoffs_due_idx ON handoffs(phase, next_advance_at)",
-    "CREATE INDEX IF NOT EXISTS handoffs_updated_idx ON handoffs(updated_at DESC, handoff_id DESC)",
+    "CREATE INDEX IF NOT EXISTS handoffs_created_idx ON handoffs(created_at DESC, handoff_id DESC)",
 )
 
 
@@ -555,16 +555,16 @@ class HandoffStore:
             if before is not None:
                 cursor = self._row(before)
                 clauses.append(
-                    "(updated_at < ? OR (updated_at = ? AND handoff_id < ?))"
+                    "(created_at < ? OR (created_at = ? AND handoff_id < ?))"
                 )
                 values.extend((
-                    cursor["updated_at"],
-                    cursor["updated_at"],
+                    cursor["created_at"],
+                    cursor["created_at"],
                     cursor["handoff_id"],
                 ))
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             rows = self._conn.execute(
-                f"SELECT * FROM handoffs{where} ORDER BY updated_at DESC, handoff_id DESC LIMIT ?",
+                f"SELECT * FROM handoffs{where} ORDER BY created_at DESC, handoff_id DESC LIMIT ?",
                 (*values, limit),
             ).fetchall()
             return tuple(self._snapshot(row) for row in rows)
@@ -641,6 +641,8 @@ class HandoffStore:
             row = self._row(handoff_id)
             if row["state_version"] != expected_version:
                 raise HandoffStateConflict("handoff state version changed")
+            if row["phase"] in _TERMINAL_PHASES:
+                raise HandoffStateConflict("terminal handoff cannot be bound")
             if row["mechanism"] is not None:
                 if (
                     row["mechanism"] == mechanism
@@ -705,11 +707,17 @@ class HandoffStore:
             )
             return AdvanceLease(handoff_id, owner, epoch, expires_at)
 
-    def _lease_row(self, lease: AdvanceLease) -> sqlite3.Row:
+    def _lease_row(self, lease: AdvanceLease, now: datetime) -> sqlite3.Row:
         if not isinstance(lease, AdvanceLease):
             raise ValueError("handoff advance lease is invalid")
         row = self._row(lease.handoff_id)
-        if row["advance_owner"] != lease.owner or row["advance_epoch"] != lease.epoch:
+        expires_at = _parse_timestamp(row["advance_expires_at"])
+        if (
+            row["advance_owner"] != lease.owner
+            or row["advance_epoch"] != lease.epoch
+            or expires_at is None
+            or expires_at <= now
+        ):
             raise StaleAdvanceLease("handoff advance lease is stale")
         return row
 
@@ -724,12 +732,16 @@ class HandoffStore:
             raise ValueError("handoff advance operation is invalid")
         redacted = dict(_safe_data(data, reject_unsafe=False))
         redacted["operation"] = operation
-        now = _utc_now()
         kind = f"{operation}_attempted"
         with self._lock, write_txn(self._conn):
-            row = self._lease_row(lease)
+            now = _utc_now()
+            row = self._lease_row(lease, now)
             if row["phase"] in _TERMINAL_PHASES:
                 raise HandoffStateConflict("terminal handoff cannot start external I/O")
+            if operation == "submit" and (
+                row["phase"] != "prepared" or row["cancel_requested_at"] is not None
+            ):
+                raise HandoffStateConflict("cancelled handoff cannot be submitted")
             if operation == "submit" and (
                 row["mechanism"] is None or row["binding_json"] is None
             ):
@@ -764,9 +776,9 @@ class HandoffStore:
     ) -> HandoffSnapshot:
         if not isinstance(observation, ChannelObservation):
             raise ValueError("handoff observation is invalid")
-        now = _utc_now()
         with self._lock, write_txn(self._conn):
-            row = self._lease_row(lease)
+            now = _utc_now()
+            row = self._lease_row(lease, now)
             current = self._snapshot(row)
             if observation.phase not in _LEGAL_TRANSITIONS[current.phase]:
                 raise HandoffStateConflict(
@@ -886,9 +898,9 @@ class HandoffStore:
     ) -> None:
         if next_advance_at is not None:
             next_advance_at = _aware_utc(next_advance_at, "next advance")
-        now = _utc_now()
         with self._lock, write_txn(self._conn):
-            self._lease_row(lease)
+            now = _utc_now()
+            self._lease_row(lease, now)
             self._conn.execute(
                 """UPDATE handoffs SET advance_owner=NULL, advance_expires_at=NULL,
                    next_advance_at=?, state_version=state_version+1, updated_at=?
