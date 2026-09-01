@@ -112,7 +112,7 @@ def _write_runtime_config(home: Path, base_url: str) -> None:
         encoding="utf-8",
     )
     shutil.copytree(
-        Path(__file__).parents[3] / "skills/creative/ascii-art",
+        Path(__file__).parents[3] / "optional-skills/creative/ascii-art",
         home / "skills/creative/ascii-art",
         dirs_exist_ok=True,
     )

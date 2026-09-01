@@ -997,6 +997,7 @@ class TestInitSessionFailure:
                 "output": "USER_OUTPUT",
                 "returncode": 0,
                 "cwd_observed": True,
+                "cwd": str(tmp_path),
             }
             assert token not in result["output"]
             assert env._session_mode == "snapshot"
@@ -1244,7 +1245,12 @@ trap __hermes_debug_attack DEBUG
 
             assert result["returncode"] == 0
             assert result["output"].endswith("RECOVERED")
-            assert set(result) == {"output", "returncode", "cwd_observed"}
+            assert set(result) == {
+                "output",
+                "returncode",
+                "cwd_observed",
+                "cwd",
+            }
             assert env._session_mode == "degraded_nonlogin"
         finally:
             set_interrupt(False)
