@@ -1175,6 +1175,9 @@ class RunScheduler:
                 break
             if not self._execution_fence_is_current():
                 break
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
             attempted += 1
             try:
                 result = service.advance(
@@ -1229,7 +1232,10 @@ class RunScheduler:
                 or returned_version <= wait.last_observed_version
             ):
                 error_code = "handoff_stale_observation"
-            elif returned_phase not in HANDOFF_PHASES:
+            elif (
+                not isinstance(returned_phase, str)
+                or returned_phase not in HANDOFF_PHASES
+            ):
                 error_code = "handoff_protocol_violation"
             elif (
                 next_advance_at is not None
@@ -1274,7 +1280,6 @@ class RunScheduler:
                 observed_phase=returned_phase,
                 next_observation_at=next_observation_at,
                 fence=self.execution_fence,
-                now=self.store._lease_clock(),
             ):
                 terminal += int(is_terminal)
                 continue
@@ -1332,7 +1337,6 @@ class RunScheduler:
                 next_observation_at=next_observation_at,
                 error_code=error_code,
                 fence=fence,
-                now=self.store._lease_clock(),
             )
 
         if defer(wait):

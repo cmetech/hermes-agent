@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
+import time
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +13,8 @@ import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.lease_clock import LeaseClockSample
+from plugins.workflow.locks import workflow_lock
 from plugins.workflow.models import ExecutionFence, HandoffWaitProjection
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
@@ -672,6 +676,103 @@ def test_handoff_wait_deferral_is_exact_fenced_and_safe(
         )
     assert store.load_run(run_id) == before
     assert store.tail_events(run_id) == before_events
+
+
+def test_handoff_deferral_rechecks_lease_after_waiting_for_workflow_lock(
+    tmp_path, workflow_writer
+) -> None:
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    samples = [LeaseClockSample(base, 100.0, "boot-a")]
+    lease_clock = lambda: samples[0]
+    store = RunStore(tmp_path / "home", lease_clock=lease_clock)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="handoff-lock-expiry",
+            nodes=[{"id": "start", "prompt": "review"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="handoff-lock-expiry",
+            concurrency_key="handoff-lock-expiry",
+        ),
+        immutable_snapshot=prepared,
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="handoff-lock-expiry-leader",
+        host_kind="gateway",
+        host_instance_id="handoff-lock-expiry-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database, clock=lease_clock).try_acquire(
+        identity,
+        now=base,
+        lease_seconds=1,
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "handoff-worker",
+        execution_fence=fence,
+    )
+    assert claim is not None
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=3,
+        observed_phase="active",
+        next_observation_at=base,
+        deadline_at=base + timedelta(hours=1),
+        now=samples[0],
+    )
+    before = store.load_run(admitted.run_id)
+    before_events = store.tail_events(admitted.run_id)
+    entered = threading.Event()
+    result: list[bool] = []
+    pre_lock_authority = samples[0]
+
+    def defer() -> None:
+        entered.set()
+        result.append(store.defer_handoff_wait(
+            admitted.run_id,
+            "start",
+            handoff_id="handoff-1",
+            generation=1,
+            expected_observed_version=3,
+            expected_observed_phase="active",
+            next_observation_at=base + timedelta(seconds=5),
+            error_code="handoff_advance_exception",
+            fence=fence,
+            now=pre_lock_authority,
+        ))
+
+    with workflow_lock(store._run_lock_path(admitted.run_id)):
+        worker = threading.Thread(target=defer)
+        worker.start()
+        assert entered.wait(timeout=1)
+        time.sleep(0.05)
+        samples[0] = LeaseClockSample(
+            base + timedelta(seconds=2),
+            102.0,
+            "boot-a",
+        )
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert store.load_run(admitted.run_id) == before
+    assert store.tail_events(admitted.run_id) == before_events
 
 
 def test_handoff_retry_requires_definitive_observation_and_new_generation(

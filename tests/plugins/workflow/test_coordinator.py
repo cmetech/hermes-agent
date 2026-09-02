@@ -1693,6 +1693,145 @@ def test_handoff_contradictions_and_current_fence_cas_rejection_are_deferred(
     assert "raw-secret" not in str(event)
 
 
+@pytest.mark.parametrize(
+    "returned_phase",
+    [
+        pytest.param(["Bearer raw-secret"], id="list"),
+        pytest.param({"Authorization": "raw-secret"}, id="mapping"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_non_string_handoff_phase_protocol_defers_and_continues_batch(
+    tmp_path,
+    workflow_writer,
+    returned_phase: object,
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("handoff-non-string-phase")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=(("bad", now), ("healthy", now)),
+    )
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            self.calls.append(handoff_id)
+            if handoff_id == "handoff-bad":
+                snapshot = MagicMock()
+                snapshot.handoff_id = handoff_id
+                snapshot.state_version = 10
+                snapshot.phase = returned_phase
+                snapshot.next_advance_at = now + timedelta(seconds=1)
+                return MagicMock(snapshot=snapshot)
+            return AdvanceResult(
+                _handoff_snapshot(
+                    handoff_id,
+                    phase="active",
+                    version=20,
+                    next_advance_at=now + timedelta(seconds=5),
+                ),
+                "observe",
+                True,
+            )
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+            max_items=2,
+        ) == (2, 1, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls == ["handoff-bad", "handoff-healthy"]
+    projection = store.load_run(run_id)
+    assert projection["nodes"]["bad"]["handoff"]["last_observed_version"] == 1
+    assert projection["nodes"]["healthy"]["handoff"][
+        "last_observed_version"
+    ] == 20
+    event = next(
+        event
+        for event in reversed(store.tail_events(run_id))
+        if event["node_id"] == "bad"
+    )
+    assert event["payload"]["error_code"] == "handoff_protocol_violation"
+    assert "raw-secret" not in str(event)
+
+
+def test_handoff_deadline_is_recomputed_after_per_item_fence_check(
+    tmp_path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("handoff-fence-budget")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=(("start", now),),
+    )
+    monotonic_now = [100.0]
+    fence_checks = 0
+
+    def blocking_fence_check() -> bool:
+        nonlocal fence_checks
+        fence_checks += 1
+        if fence_checks == 2:
+            monotonic_now[0] = 101.0
+        return True
+
+    service = MagicMock()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: now,
+        monotonic=lambda: monotonic_now[0],
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_execution_fence_is_current",
+        blocking_fence_check,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=100.5,
+            max_items=1,
+        ) == (0, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert fence_checks == 2
+    service.advance.assert_not_called()
+
+
 def test_stale_coordinator_cannot_advance_or_project_handoff(
     tmp_path, workflow_writer
 ) -> None:

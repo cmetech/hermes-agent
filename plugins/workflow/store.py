@@ -13236,6 +13236,7 @@ class RunStore:
         now: LeaseClockSample | None = None,
     ) -> bool:
         """Fenced CAS that backs off one unchanged handoff observation."""
+        del now  # Lease authority is sampled only after acquiring the run lock.
         if not isinstance(fence, ExecutionFence):
             raise ValueError("handoff deferral requires an execution fence")
         if error_code not in _HANDOFF_ADVANCE_DEFERRAL_CODES:
@@ -13244,7 +13245,7 @@ class RunStore:
         try:
             with workflow_lock(
                 self._run_lock_path(run_id)
-            ), self._execution_fence_transaction(fence, now) as fence_connection:
+            ), self._execution_fence_transaction(fence) as fence_connection:
                 projection = json.loads((directory / "run.json").read_text())
                 node = projection.get("nodes", {}).get(node_id)
                 if not isinstance(node, MutableMapping):
