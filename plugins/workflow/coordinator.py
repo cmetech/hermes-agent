@@ -525,6 +525,8 @@ class WorkflowCoordinatorService:
                 processed_page = False
                 break
             processed_periodic_cursor = (str(row["created_at"]), run_id)
+        if processed_page:
+            processed_periodic_cursor = _page_cursor
         scheduled_processed = True
         scheduled_cursor = self._scheduled_sweep_cursor
         for row in scheduled_continuation:

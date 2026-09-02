@@ -2636,6 +2636,122 @@ def test_repair_lock_timeout_does_not_block_delivery_or_scheduling(
     scheduler.submit.assert_any_call(queued.run_id, fence)
 
 
+def test_filtered_periodic_page_advances_raw_cursor(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(
+        tmp_path,
+        max_queued_runs=102,
+        max_nonterminal_runs=102,
+        max_start_requests_per_minute=200,
+        lease_clock=clock,
+    )
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("filtered-page")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+
+    paused_run_ids = []
+    for index in range(100):
+        run_id = _waiting_handoff_run(
+            store,
+            workflow_writer,
+            tmp_path / f"paused-{index:03d}",
+            now=now,
+            fence=fence,
+            handoffs=(("review", now + timedelta(minutes=1)),),
+            deadlines={"review": now + timedelta(hours=1)},
+            interaction_policies={"review": "pause"},
+        )
+        assert store.refresh_handoff_wait(
+            run_id,
+            "review",
+            handoff_id="handoff-review",
+            generation=1,
+            expected_observed_version=1,
+            observed_version=2,
+            observed_phase="needs_input",
+            next_observation_at=now + timedelta(minutes=1),
+            approval_request_id=f"approval-{index:03d}",
+            approval_choices=("once", "deny"),
+            fence=fence,
+            now=clock.sample,
+        )
+        paused_run_ids.append(run_id)
+
+    package = load_workflow(
+        workflow_writer(tmp_path / "target", name="filtered-page-target")
+    )
+    prepared = store.prepare_run_snapshot(package)
+    target = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="filtered-page-target",
+            concurrency_key="filtered-page-target",
+            concurrency_policy="allow",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    ).run_id
+
+    while wakes := coordinator.pending_wakes(
+        identity,
+        epoch=leadership.lease.epoch,
+        now=now,
+        limit=100,
+    ):
+        for wake in wakes:
+            assert coordinator.complete_wake(
+                wake.generation,
+                identity,
+                epoch=leadership.lease.epoch,
+                now=now,
+                outcome="test_setup",
+            )
+
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="filtered-page",
+        ),
+        hermes_home=tmp_path,
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
+    scheduler.submit.side_effect = lambda run_id, _fence: run_id == target
+
+    first_actionable, cursor, _first_progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        scheduler,
+    )
+    second_actionable, next_cursor, _second_progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        scheduler,
+        cursor=cursor,
+    )
+
+    last_paused = store.load_run(paused_run_ids[-1])
+    assert first_actionable is False
+    assert cursor == (last_paused["created_at"], paused_run_ids[-1])
+    assert second_actionable is True
+    scheduler.submit.assert_called_once_with(target, fence)
+    assert next_cursor is None
+
+
 def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
     tmp_path, workflow_writer
 ) -> None:
