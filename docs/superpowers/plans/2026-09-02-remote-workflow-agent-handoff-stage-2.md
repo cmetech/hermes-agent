@@ -1301,6 +1301,45 @@ git diff --cached --check
 git commit -m "docs(handoff): record remote workflow customization"
 ```
 
+## Task 11A: Keep installed-wheel handoff registration additive
+
+**Live defect found by Task 11:** The extracted wheel exposes the Stage 2
+`respond`, `steer`, and `message` commands correctly, but the installed-package
+smoke test freezes the exact Stage 1 argparse choice string and rejects any
+additive command. This is a stale change-detector assertion, not a packaging
+failure.
+
+**Owns:**
+
+- `tests/plugins/workflow/test_installed_distribution_e2e.py`
+
+**Consumes:** The real extracted-wheel CLI invocation already performed by the
+test.
+
+**Produces:** A behavioral registration assertion that requires every Stage 1
+and Stage 2 handoff command while permitting future additive commands.
+
+### RED
+
+The Task 11 installed-distribution command must fail on the frozen Stage 1
+choice string while showing the three Stage 2 commands in the real wheel help.
+
+### GREEN and commit
+
+Parse the argparse choice set from the real help output and assert that the
+required commands are a subset.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_installed_distribution_e2e.py \
+  -m integration \
+  -k extracted_wheel_registers_workflow_cli_from_a_clean_home -q
+
+git add tests/plugins/workflow/test_installed_distribution_e2e.py
+git diff --cached --check
+git commit -m "test(handoff): accept additive installed commands"
+```
+
 ## Mandatory adversarial review gate
 
 Do not declare Stage 2 complete after Task 11. Request an adversarial review of
