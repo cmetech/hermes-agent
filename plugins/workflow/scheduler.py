@@ -71,6 +71,7 @@ from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
+    HandoffResponseIntent,
     HandoffWaitProjection,
     LoopGroupChildScope,
     LoopSignalConfirmation,
@@ -1152,9 +1153,19 @@ class RunScheduler:
         nodes = projection.get("nodes")
         if not isinstance(nodes, Mapping):
             return 0, 0, 0
-        due: list[tuple[str, HandoffWaitProjection, str | None]] = []
+        due: list[
+            tuple[
+                str,
+                HandoffWaitProjection,
+                str | None,
+                HandoffResponseIntent | None,
+            ]
+        ] = []
         for node_id, node in sorted(nodes.items()):
-            if not isinstance(node, Mapping) or node.get("state") != "waiting_handoff":
+            if not isinstance(node, Mapping) or node.get("state") not in {
+                "waiting_handoff",
+                "paused",
+            }:
                 continue
             try:
                 wait = HandoffWaitProjection.from_durable_record(node.get("handoff"))
@@ -1168,27 +1179,47 @@ class RunScheduler:
                 and isinstance(cancel.get("command_id"), str)
                 else None
             )
+            response = None
+            if command_id is None and node.get("state") == "waiting_handoff":
+                try:
+                    response = HandoffResponseIntent.from_durable_record(
+                        node.get("handoff_response")
+                    )
+                except ValueError:
+                    pass
             deadline_due = (
                 command_id is None
+                and response is None
                 and wait.deadline_at is not None
                 and wait.deadline_at <= observed
             )
             if (
-                wait.next_observation_at <= observed
+                (
+                    node.get("state") == "waiting_handoff"
+                    and wait.next_observation_at <= observed
+                )
                 or deadline_due
                 or command_id is not None
+                or response is not None
             ):
-                due.append((str(node_id), wait, command_id))
+                due.append((str(node_id), wait, command_id, response))
         def priority(
-            candidate: tuple[str, HandoffWaitProjection, str | None],
+            candidate: tuple[
+                str,
+                HandoffWaitProjection,
+                str | None,
+                HandoffResponseIntent | None,
+            ],
         ) -> int:
             return (
                 0
                 if candidate[2] is not None
                 else 1
+                if candidate[3] is not None
+                else 2
                 if candidate[1].deadline_at is not None
                 and candidate[1].deadline_at <= observed
-                else 2
+                else 3
             )
 
         due.sort(
@@ -1200,7 +1231,7 @@ class RunScheduler:
         )
         reserved = [
             next(candidate for candidate in due if priority(candidate) == value)
-            for value in range(3)
+            for value in range(4)
             if any(priority(candidate) == value for candidate in due)
         ]
         if len(due) > max_items and len(reserved) <= max_items:
@@ -1225,7 +1256,7 @@ class RunScheduler:
             remaining = deadline - self._monotonic()
             return remaining if remaining > 0 else None
 
-        for node_id, wait, cancel_command_id in due:
+        for node_id, wait, cancel_command_id, response in due:
             remaining = remaining_if_current()
             if remaining is None:
                 break
@@ -1269,6 +1300,33 @@ class RunScheduler:
                     remaining = remaining_if_current()
                     if remaining is None:
                         break
+                elif response is not None:
+                    if response.state == "pending":
+                        service.command(
+                            wait.handoff_id,
+                            "respond",
+                            command_id=response.command_id,
+                            actor="workflow",
+                            request_id=response.request_id,
+                            choice=response.choice,
+                        )
+                        remaining = remaining_if_current()
+                        if remaining is None:
+                            break
+                        if not self.store.mark_handoff_response_recorded(
+                            run_id,
+                            node_id,
+                            handoff_id=wait.handoff_id,
+                            generation=wait.generation,
+                            command_id=response.command_id,
+                            fence=self.execution_fence,
+                        ):
+                            raise RuntimeError(
+                                "handoff response projection conflict"
+                            )
+                        remaining = remaining_if_current()
+                        if remaining is None:
+                            break
                 result = service.advance(
                     wait.handoff_id,
                     budget_seconds=remaining,
@@ -1297,6 +1355,7 @@ class RunScheduler:
                 returned_phase = snapshot.phase
                 returned_failure_code = snapshot.failure_code
                 next_advance_at = snapshot.next_advance_at
+                returned_checkpoint = snapshot.checkpoint
             except Exception:
                 logger.warning(
                     "Workflow handoff advance deferred for %s: "
@@ -1337,6 +1396,24 @@ class RunScheduler:
                 error_code = "handoff_protocol_violation"
             else:
                 error_code = None
+            approval_request_id = None
+            approval_choices = None
+            if error_code is None and returned_phase == "needs_input":
+                if not isinstance(returned_checkpoint, Mapping):
+                    error_code = "handoff_protocol_violation"
+                else:
+                    approval_request_id = returned_checkpoint.get(
+                        "approval_request_id"
+                    )
+                    raw_choices = returned_checkpoint.get("approval_choices")
+                    if (
+                        not isinstance(approval_request_id, str)
+                        or not isinstance(raw_choices, tuple | list)
+                        or any(not isinstance(choice, str) for choice in raw_choices)
+                    ):
+                        error_code = "handoff_protocol_violation"
+                    else:
+                        approval_choices = tuple(raw_choices)
             if error_code is not None:
                 logger.warning(
                     "Workflow handoff advance deferred for %s: %s",
@@ -1370,6 +1447,8 @@ class RunScheduler:
                 observed_phase=returned_phase,
                 next_observation_at=next_observation_at,
                 observed_failure_code=returned_failure_code,
+                approval_request_id=approval_request_id,
+                approval_choices=approval_choices,
                 fence=self.execution_fence,
             ):
                 terminal += int(is_terminal)

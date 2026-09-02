@@ -16,6 +16,12 @@ from typing import Any, Mapping
 from hermes_cli.handoff.models import HANDOFF_PHASES
 
 
+_HANDOFF_APPROVAL_CHOICES = ("once", "session", "always", "deny")
+_HANDOFF_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_HANDOFF_NODE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_/-]{0,255}$")
+_HANDOFF_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionFence:
     """Exact durable coordinator ownership required for background execution."""
@@ -125,6 +131,169 @@ class HandoffWaitProjection:
             last_observed_phase=value["last_observed_phase"],
             next_observation_at=next_observation_at,
             deadline_at=deadline_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffInputProjection:
+    """Private exact remote approval plus its bounded public identity."""
+
+    interaction_id: str
+    node_id: str
+    remote_request_id: str
+    remote_choices: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        choices = tuple(self.remote_choices)
+        if (
+            not isinstance(self.interaction_id, str)
+            or _HANDOFF_SHA256.fullmatch(self.interaction_id) is None
+            or not isinstance(self.node_id, str)
+            or _HANDOFF_NODE_ID.fullmatch(self.node_id) is None
+            or not isinstance(self.remote_request_id, str)
+            or _HANDOFF_SAFE_ID.fullmatch(self.remote_request_id) is None
+            or not choices
+            or len(choices) != len(set(choices))
+            or choices
+            != tuple(choice for choice in _HANDOFF_APPROVAL_CHOICES if choice in choices)
+        ):
+            raise ValueError("handoff input projection is malformed")
+        object.__setattr__(self, "remote_choices", choices)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: str,
+        node_id: str,
+        handoff_id: str,
+        generation: int,
+        remote_request_id: str,
+        remote_choices: tuple[str, ...],
+    ) -> "HandoffInputProjection":
+        digest = hashlib.sha256(b"hermes.workflow.handoff-input.v1\0")
+        for value in (
+            run_id,
+            node_id,
+            handoff_id,
+            str(generation),
+            remote_request_id,
+        ):
+            if not isinstance(value, str):
+                raise ValueError("handoff input identity is malformed")
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return cls(
+            digest.hexdigest(),
+            node_id,
+            remote_request_id,
+            remote_choices,
+        )
+
+    def durable_record(self) -> dict[str, object]:
+        return {
+            "type": "handoff_input",
+            "interaction_id": self.interaction_id,
+            "node_id": self.node_id,
+            "remote_request_id": self.remote_request_id,
+            "remote_choices": list(self.remote_choices),
+        }
+
+    def public_record(self) -> dict[str, object]:
+        return {
+            "type": "handoff_input",
+            "interaction_id": self.interaction_id,
+            "node_id": self.node_id,
+        }
+
+    @classmethod
+    def from_durable_record(cls, value: object) -> "HandoffInputProjection":
+        if not isinstance(value, Mapping) or set(value) != {
+            "type",
+            "interaction_id",
+            "node_id",
+            "remote_request_id",
+            "remote_choices",
+        } or value.get("type") != "handoff_input":
+            raise ValueError("handoff input projection is malformed")
+        choices = value.get("remote_choices")
+        if not isinstance(choices, list) or any(
+            not isinstance(choice, str) for choice in choices
+        ):
+            raise ValueError("handoff input projection is malformed")
+        return cls(
+            value.get("interaction_id"),
+            value.get("node_id"),
+            value.get("remote_request_id"),
+            tuple(choices),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffResponseIntent:
+    """Closed Workflow-side intent for one exact remote approval response."""
+
+    command_id: str
+    request_id: str
+    choice: str
+    state: str = "pending"
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.command_id, str)
+            or _HANDOFF_SAFE_ID.fullmatch(self.command_id) is None
+            or not isinstance(self.request_id, str)
+            or _HANDOFF_SAFE_ID.fullmatch(self.request_id) is None
+            or not isinstance(self.choice, str)
+            or self.choice not in _HANDOFF_APPROVAL_CHOICES
+            or not isinstance(self.state, str)
+            or self.state not in {"pending", "recorded"}
+        ):
+            raise ValueError("handoff response intent is malformed")
+
+    @classmethod
+    def create(
+        cls, input_projection: HandoffInputProjection, choice: str
+    ) -> "HandoffResponseIntent":
+        if choice not in input_projection.remote_choices:
+            raise ValueError("handoff response choice was not advertised")
+        digest = hashlib.sha256(
+            (
+                "hermes.workflow.handoff-response.v1\0"
+                + input_projection.interaction_id
+                + "\0"
+                + choice
+            ).encode("utf-8")
+        ).hexdigest()
+        return cls(
+            f"workflow-{digest}",
+            input_projection.remote_request_id,
+            choice,
+        )
+
+    def durable_record(self) -> dict[str, object]:
+        return {
+            "command_id": self.command_id,
+            "request_id": self.request_id,
+            "choice": self.choice,
+            "state": self.state,
+        }
+
+    @classmethod
+    def from_durable_record(cls, value: object) -> "HandoffResponseIntent":
+        if not isinstance(value, Mapping) or set(value) != {
+            "command_id",
+            "request_id",
+            "choice",
+            "state",
+        }:
+            raise ValueError("handoff response intent is malformed")
+        return cls(
+            value.get("command_id"),
+            value.get("request_id"),
+            value.get("choice"),
+            value.get("state"),
         )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import multiprocessing
 import os
 from pathlib import Path
@@ -54,6 +55,7 @@ def _handoff_snapshot(
     phase: str,
     version: int,
     next_advance_at: datetime | None,
+    checkpoint: dict[str, object] | None = None,
 ) -> HandoffSnapshot:
     spec = HandoffSpec(
         mode="task",
@@ -72,6 +74,7 @@ def _handoff_snapshot(
         spec_fingerprint=spec.fingerprint,
         phase=phase,
         state_version=version,
+        checkpoint=checkpoint,
         next_advance_at=next_advance_at,
     )
 
@@ -85,6 +88,7 @@ def _waiting_handoff_run(
     fence: ExecutionFence,
     handoffs: tuple[tuple[str, datetime], ...],
     deadlines: dict[str, datetime] | None = None,
+    interaction_policies: dict[str, str] | None = None,
 ) -> str:
     package = load_workflow(
         workflow_writer(
@@ -97,6 +101,18 @@ def _waiting_handoff_run(
         )
     )
     prepared = store.prepare_run_snapshot(package)
+    if interaction_policies:
+        prepared = replace(
+            prepared,
+            assignments={
+                node_id: {
+                    "endpoint": "hermes://peer/office/reviewer",
+                    "interaction_policy": policy,
+                    "on_deadline": "cancel_and_fail",
+                }
+                for node_id, policy in interaction_policies.items()
+            },
+        )
     admitted = store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
@@ -1365,6 +1381,94 @@ def test_due_handoff_sweep_projects_exact_versions_and_wakes_only_terminal(
     ] == [
         (run_id, "handoff_terminal")
     ]
+
+
+def test_handoff_response_is_journaled_before_advance_and_survives_restart_cut(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("handoff-response")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package-response",
+        now=now,
+        fence=fence,
+        handoffs=(("review", now),),
+        interaction_policies={"review": "pause"},
+    )
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+            self.version = 1
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            self.calls.append(("advance", handoff_id))
+            self.version += 1
+            return AdvanceResult(
+                _handoff_snapshot(
+                    handoff_id,
+                    phase="needs_input",
+                    version=self.version,
+                    next_advance_at=now + timedelta(seconds=5),
+                    checkpoint={
+                        "approval_request_id": "approval-1",
+                        "approval_choices": ["once", "deny"],
+                    },
+                ),
+                "observe",
+                True,
+            )
+
+        def command(
+            self,
+            handoff_id,
+            kind,
+            *,
+            command_id,
+            actor,
+            request_id,
+            choice,
+        ):
+            self.calls.append(
+                (kind, handoff_id, command_id, actor, request_id, choice)
+            )
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(run_id, deadline=101.0) == (1, 0, 0)
+        paused = store.load_run(run_id)
+        interaction_id = paused["nodes"]["review"]["pending_interaction"][
+            "interaction_id"
+        ]
+        store.approve_run(
+            run_id,
+            expected_state_version=paused["state_version"],
+            interaction_id=interaction_id,
+        )
+        service.calls.clear()
+        assert scheduler.advance_due_handoffs(run_id, deadline=101.0) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls[0][0] == "respond"
+    assert service.calls[0][3:] == ("workflow", "approval-1", "once")
+    assert service.calls[1] == ("advance", "handoff-review")
+    response = store.load_run(run_id)["nodes"]["review"]["handoff_response"]
+    assert response["state"] == "recorded"
 
 
 def test_handoff_sweep_is_bounded_isolates_safe_failures_and_honors_shutdown(

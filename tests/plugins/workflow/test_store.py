@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from collections import namedtuple
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,9 +16,18 @@ from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.locks import workflow_lock
-from plugins.workflow.models import ExecutionFence, HandoffWaitProjection
+from plugins.workflow.models import (
+    ExecutionFence,
+    HandoffInputProjection,
+    HandoffWaitProjection,
+)
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
+from plugins.workflow.store import (
+    InputSnapshotError,
+    RunStore,
+    StorageQuotaError,
+    WorkflowConflict,
+)
 from plugins.workflow.trust import WorkflowResourceReadBudget
 from tools.managed_process import ProcessIdentity
 
@@ -322,7 +332,9 @@ def _start_package_failure_store_run(tmp_path, workflow_writer, *, name):
     return store, admitted.run_id
 
 
-def _start_handoff_store_run(tmp_path, workflow_writer, *, name):
+def _start_handoff_store_run(
+    tmp_path, workflow_writer, *, name, interaction_policy=None
+):
     store = RunStore(tmp_path / f"home-{name}")
     package = load_workflow(
         workflow_writer(
@@ -332,6 +344,17 @@ def _start_handoff_store_run(tmp_path, workflow_writer, *, name):
         )
     )
     prepared = store.prepare_run_snapshot(package)
+    if interaction_policy is not None:
+        prepared = replace(
+            prepared,
+            assignments={
+                "start": {
+                    "endpoint": "hermes://peer/office/reviewer",
+                    "interaction_policy": interaction_policy,
+                    "on_deadline": "cancel_and_fail",
+                }
+            },
+        )
     admitted = store.start_run(
         RunAdmissionRequest(
             workflow_name=name,
@@ -573,6 +596,152 @@ def test_handoff_observation_refresh_and_terminal_wake_are_fenced(
     assert terminal["status"] == "running"
     assert terminal["nodes"]["start"]["state"] == "ready"
     assert terminal["nodes"]["start"]["handoff"]["generation"] == 1
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_choice"),
+    [("approve_run", "once"), ("reject_run", "deny")],
+)
+def test_pause_handoff_input_records_exact_response_and_resumes(
+    tmp_path, workflow_writer, method_name, expected_choice
+) -> None:
+    store, run_id = _start_handoff_store_run(
+        tmp_path,
+        workflow_writer,
+        name=f"handoff-input-{expected_choice}",
+        interaction_policy="pause",
+    )
+    claim = store.claim_node(run_id, "start", "handoff-worker")
+    assert claim is not None
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=3,
+        observed_phase="active",
+        next_observation_at=base,
+        deadline_at=base + timedelta(hours=1),
+    )
+
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="needs_input",
+        next_observation_at=base + timedelta(seconds=5),
+        approval_request_id="approval-1",
+        approval_choices=("once", "deny"),
+    )
+    paused = store.load_run(run_id)
+    node = paused["nodes"]["start"]
+    pending = HandoffInputProjection.from_durable_record(
+        node["pending_interaction"]
+    )
+    assert paused["status"] == "paused"
+    assert node["state"] == "paused"
+    assert node["attempts"][-1]["state"] == "paused"
+    assert pending.remote_request_id == "approval-1"
+    assert pending.remote_choices == ("once", "deny")
+    assert pending.public_record() == {
+        "type": "handoff_input",
+        "interaction_id": pending.interaction_id,
+        "node_id": "start",
+    }
+    before_decision = store.load_run(run_id)
+    with pytest.raises(WorkflowConflict, match="stale approval decision"):
+        getattr(store, method_name)(
+            run_id,
+            expected_state_version=paused["state_version"] - 1,
+            interaction_id=pending.interaction_id,
+        )
+    with pytest.raises(ValueError, match="matching pending interaction"):
+        getattr(store, method_name)(
+            run_id,
+            expected_state_version=paused["state_version"],
+            interaction_id="0" * 64,
+        )
+    assert store.load_run(run_id) == before_decision
+
+    result = getattr(store, method_name)(
+        run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending.interaction_id,
+    )
+    resumed = store.load_run(run_id)
+    response = resumed["nodes"]["start"]["handoff_response"]
+    assert result.outcome == "applied"
+    assert resumed["status"] == "running"
+    assert resumed["nodes"]["start"]["state"] == "waiting_handoff"
+    assert resumed["nodes"]["start"]["attempts"][-1]["state"] == "waiting_handoff"
+    assert response == {
+        "command_id": response["command_id"],
+        "request_id": "approval-1",
+        "choice": expected_choice,
+        "state": "pending",
+    }
+    assert getattr(store, method_name)(
+        run_id,
+        expected_state_version=paused["state_version"],
+        interaction_id=pending.interaction_id,
+    ).outcome == "already_decided"
+
+
+@pytest.mark.parametrize(
+    ("interaction_policy", "choices", "expected_control"),
+    [
+        ("deny", ("deny",), "response"),
+        ("deny", ("once",), "cancel"),
+        ("auto_cancel", ("once", "deny"), "cancel"),
+    ],
+)
+def test_non_pausing_handoff_input_policy_fails_closed(
+    tmp_path,
+    workflow_writer,
+    interaction_policy,
+    choices,
+    expected_control,
+) -> None:
+    store, run_id = _start_handoff_store_run(
+        tmp_path,
+        workflow_writer,
+        name=f"handoff-policy-{interaction_policy}-{expected_control}",
+        interaction_policy=interaction_policy,
+    )
+    claim = store.claim_node(run_id, "start", "handoff-worker")
+    assert claim is not None
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase="active",
+        next_observation_at=base,
+        deadline_at=base + timedelta(hours=1),
+    )
+
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=1,
+        observed_version=2,
+        observed_phase="needs_input",
+        next_observation_at=base + timedelta(seconds=5),
+        approval_request_id="approval-1",
+        approval_choices=choices,
+    )
+
+    node = store.load_run(run_id)["nodes"]["start"]
+    assert node["state"] == "waiting_handoff"
+    assert "pending_interaction" not in node
+    assert ("handoff_response" in node) == (expected_control == "response")
+    assert ("handoff_cancel" in node) == (expected_control == "cancel")
 
 
 def test_handoff_wait_deferral_is_exact_fenced_and_safe(

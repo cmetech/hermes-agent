@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import threading
 
@@ -9,7 +11,7 @@ import pytest
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import RunStore, WorkflowConflict
 
 
 def _decide(home, run_id, version, interaction_id, decision, start, output):
@@ -137,6 +139,99 @@ def test_null_interaction_does_not_apply_or_reuse_prior_gate_decision(
     assert unchanged["nodes"]["second"]["pending_interaction"][
         "interaction_id"
     ] == second_id
+
+
+def test_handoff_cancel_wins_concurrent_local_approval(
+    tmp_path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "handoff-package",
+            name="handoff-approval-cancel-race",
+            nodes=[{"id": "review", "prompt": "Review"}],
+        )
+    )
+    store = RunStore(tmp_path / "handoff-home")
+    prepared = replace(
+        store.prepare_run_snapshot(package),
+        assignments={
+            "review": {
+                "endpoint": "hermes://peer/office/reviewer",
+                "interaction_policy": "pause",
+                "on_deadline": "cancel_and_fail",
+            }
+        },
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="handoff-race",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "review", "handoff-worker")
+    assert claim is not None
+    now = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase="active",
+        next_observation_at=now,
+        deadline_at=now + timedelta(hours=1),
+    )
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "review",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=1,
+        observed_version=2,
+        observed_phase="needs_input",
+        next_observation_at=now + timedelta(seconds=5),
+        approval_request_id="approval-1",
+        approval_choices=("once", "deny"),
+    )
+    paused = store.load_run(admitted.run_id)
+    interaction_id = paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+    barrier = threading.Barrier(3)
+
+    def approve() -> None:
+        barrier.wait()
+        try:
+            store.approve_run(
+                admitted.run_id,
+                expected_state_version=paused["state_version"],
+                interaction_id=interaction_id,
+            )
+        except (ValueError, WorkflowConflict):
+            pass
+
+    def cancel() -> None:
+        barrier.wait()
+        store.cancel_run(admitted.run_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(approve), pool.submit(cancel)]
+        barrier.wait()
+        for future in futures:
+            future.result(timeout=10)
+
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["review"]
+    assert projection["desired_status"] == "cancelled"
+    assert node["state"] == "waiting_handoff"
+    assert "pending_interaction" not in node
+    assert "handoff_response" not in node
+    assert node["handoff_cancel"]["state"] == "pending"
 
 
 def test_resume_approve_and_input_capacity_race_queues_every_continuation(

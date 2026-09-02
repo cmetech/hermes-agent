@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import os
@@ -35,8 +36,25 @@ from tests.plugins.workflow.test_phase6_store import (
 from tests.plugins.workflow.test_phase6_scheduler import OutputExecutor, _admit, _compile
 
 
-def _start(store: RunStore, package, *, key: str = "cancel-test"):
+def _start(
+    store: RunStore,
+    package,
+    *,
+    key: str = "cancel-test",
+    interaction_policy: str | None = None,
+):
     prepared = store.prepare_run_snapshot(package)
+    if interaction_policy is not None:
+        prepared = replace(
+            prepared,
+            assignments={
+                "start": {
+                    "endpoint": "hermes://peer/office/reviewer",
+                    "interaction_policy": interaction_policy,
+                    "on_deadline": "cancel_and_fail",
+                }
+            },
+        )
     return store.start_run(
         RunAdmissionRequest(
             workflow_name=package.definition.name,
@@ -58,8 +76,13 @@ def _wait_on_handoff(
     handoff_id: str = "handoff-cancel",
     next_observation_at: datetime | None = None,
     deadline_at: datetime | None = None,
+    interaction_policy: str | None = None,
 ):
-    admitted = _start(store, package)
+    admitted = _start(
+        store,
+        package,
+        interaction_policy=interaction_policy,
+    )
     claim = store.claim_node(admitted.run_id, "start", "handoff-worker")
     assert claim is not None
     now = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
@@ -112,6 +135,107 @@ def test_cancel_waiting_handoff_records_one_stable_command_and_waits_for_truth(
     event_types = [event["event_type"] for event in store.tail_events(run_id)]
     assert "handoff_admitted" in event_types
     assert "handoff_active" in event_types
+
+
+@pytest.mark.parametrize("response_recorded", [False, True])
+def test_cancel_handoff_input_discards_unsent_response_and_wins(
+    tmp_path: Path,
+    workflow_writer,
+    response_recorded: bool,
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name=f"cancel-handoff-input-{response_recorded}",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    run_id = _wait_on_handoff(
+        store,
+        package,
+        interaction_policy="pause",
+    )
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="needs_input",
+        next_observation_at=observed + timedelta(seconds=5),
+        approval_request_id="approval-1",
+        approval_choices=("once", "deny"),
+    )
+    paused = store.load_run(run_id)
+    if response_recorded:
+        store.approve_run(
+            run_id,
+            expected_state_version=paused["state_version"],
+            interaction_id=paused["nodes"]["start"]["pending_interaction"][
+                "interaction_id"
+            ],
+        )
+
+    cancelled = store.cancel_run(run_id)
+
+    node = cancelled["nodes"]["start"]
+    assert cancelled["desired_status"] == "cancelled"
+    assert node["state"] == "waiting_handoff"
+    assert "pending_interaction" not in node
+    assert "handoff_response" not in node
+    assert node["handoff_cancel"]["state"] == "pending"
+
+
+def test_handoff_deadline_unpauses_input_and_uses_cancel_path(
+    tmp_path: Path,
+    workflow_writer,
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="deadline-handoff-input",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    run_id = _wait_on_handoff(
+        store,
+        package,
+        interaction_policy="pause",
+    )
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="needs_input",
+        next_observation_at=observed + timedelta(seconds=5),
+        approval_request_id="approval-1",
+        approval_choices=("once", "deny"),
+    )
+
+    command_id = store.request_handoff_cancel(
+        run_id,
+        "start",
+        reason_code="deadline_exceeded",
+    )
+
+    projection = store.load_run(run_id)
+    node = projection["nodes"]["start"]
+    assert projection["status"] == "running"
+    assert node["state"] == "waiting_handoff"
+    assert "pending_interaction" not in node
+    assert node["handoff_cancel"] == {
+        "command_id": command_id,
+        "state": "pending",
+        "reason_code": "deadline_exceeded",
+    }
 
 
 def test_coordinator_records_cancel_command_before_delivering_it(
