@@ -165,11 +165,36 @@ _DELIVERY_PAYLOAD_FIELDS = frozenset(
 )
 _PUBLIC_HANDOFF_FAILURE_CODES = frozenset(
     {
+        "authentication_failed",
+        "capability_mismatch",
         "cancellation_indeterminate",
+        "channel_unavailable",
+        "deadline_exceeded",
+        "destination_busy",
+        "endpoint_invalid",
+        "endpoint_unavailable",
         "handoff_attention_required",
         "handoff_deadline_exceeded",
         "handoff_indeterminate",
         "handoff_remote_failed",
+        "identity_unverified",
+        "integrity_failed",
+        "local_cli_failed",
+        "local_cli_process_lost",
+        "local_cli_timeout",
+        "local_cli_wrapper_error",
+        "needs_input",
+        "observation_retryable",
+        "output_invalid",
+        "policy_denied",
+        "protocol_violation",
+        "remote_failed",
+        "return_delivery_failed",
+        "run_interrupted",
+        "run_status_unknown",
+        "submission_indeterminate",
+        "submission_rejected",
+        "supervisor_unhealthy",
     }
 )
 _RECOVERY_PAYLOAD_FIELDS = frozenset(
@@ -302,6 +327,7 @@ def projected_handoff_attention(
     node_id: object,
     *,
     observed_at: datetime,
+    failure_code: object = None,
 ) -> dict[str, object] | None:
     if not isinstance(node_id, str):
         return None
@@ -323,17 +349,19 @@ def projected_handoff_attention(
     except (KeyError, TypeError, ValueError):
         return None
     phase = handoff.get("last_observed_phase")
-    failure_code = (
-        "handoff_deadline_exceeded"
-        if node.get("handoff_deadline_exceeded") is True
-        else {
-            "indeterminate": "handoff_indeterminate",
-            "failed": "handoff_remote_failed",
-        }.get(str(phase), "handoff_attention_required")
+    safe_failure_code = public_handoff_failure_code(
+        failure_code,
+        phase=str(phase),
+        deadline_exceeded=node.get("handoff_deadline_exceeded") is True,
+        cancelling=(
+            projection.get("desired_status") == "cancelled"
+            or isinstance(node.get("handoff_cancel"), Mapping)
+        ),
     )
     return _closed_handoff(
         {
             "handoff_id": handoff.get("handoff_id"),
+            "generation": handoff.get("generation"),
             "endpoint": assignment.get("endpoint"),
             "phase": phase,
             "age_seconds": age_seconds,
@@ -341,10 +369,33 @@ def projected_handoff_attention(
                 "handoff_last_successful_observation_at",
             ),
             "next_action": "reconcile",
-            "failure_code": failure_code,
+            "failure_code": safe_failure_code or "handoff_attention_required",
         },
         node_id=node_id,
     )
+
+
+def public_handoff_failure_code(
+    value: object,
+    *,
+    phase: str,
+    deadline_exceeded: bool,
+    cancelling: bool,
+) -> str | None:
+    """Return one stable public failure code without provider-controlled prose."""
+    if isinstance(value, str) and value in _PUBLIC_HANDOFF_FAILURE_CODES:
+        return value
+    if deadline_exceeded:
+        return "deadline_exceeded"
+    if phase == "failed":
+        return "remote_failed"
+    if phase == "indeterminate":
+        return (
+            "cancellation_indeterminate"
+            if cancelling
+            else "submission_indeterminate"
+        )
+    return None
 
 
 def notification_kind(event_type: str, projection: Mapping[str, object]) -> str | None:
@@ -477,9 +528,10 @@ def _closed_handoff(
     if not isinstance(value, Mapping):
         return None
     handoff_id = _logical_identifier(value.get("handoff_id"))
+    generation = _bounded_int(value.get("generation"), maximum=1_000_000_000)
     node = _public_identifier(node_id)
     phase = value.get("phase")
-    if handoff_id is None or node is None or phase not in {
+    if handoff_id is None or generation is None or generation < 1 or node is None or phase not in {
         "prepared",
         "submitted",
         "active",
@@ -511,6 +563,7 @@ def _closed_handoff(
         return None
     return {
         "handoff_id": handoff_id,
+        "generation": generation,
         "endpoint": endpoint,
         "node_id": node,
         "phase": phase,
@@ -864,6 +917,83 @@ class NotificationOutbox:
                         now=observed,
                     )
                 return notification_id
+            handoff = projected_payload.get("handoff")
+            if safe_kind == "reconciliation_required" and isinstance(
+                handoff, Mapping
+            ):
+                identity = (
+                    handoff.get("node_id"),
+                    handoff.get("handoff_id"),
+                    handoff.get("generation"),
+                )
+                rows = connection.execute(
+                    "SELECT * FROM workflow_notification_outbox "
+                    "WHERE run_id=? AND kind=? AND destination=? "
+                    "ORDER BY updated_at DESC LIMIT 200",
+                    (run_id, safe_kind, destination),
+                ).fetchall()
+                candidate = next(
+                    (
+                        row
+                        for row in rows
+                        if (
+                            (decoded := _load_notification_payload(
+                                row["payload_json"],
+                                transition_version=int(row["transition_version"]),
+                            ))[1]
+                            and isinstance(decoded[0].get("handoff"), Mapping)
+                            and (
+                                decoded[0]["handoff"].get("node_id"),
+                                decoded[0]["handoff"].get("handoff_id"),
+                                decoded[0]["handoff"].get("generation"),
+                            )
+                            == identity
+                        )
+                    ),
+                    None,
+                )
+                if candidate is not None:
+                    connection.execute(
+                        "UPDATE workflow_notification_outbox SET transition_key=?, "
+                        "transition_version=?, coalesced_count=coalesced_count+1, "
+                        "payload_json=?, updated_at=? WHERE notification_id=?",
+                        (
+                            transition_key,
+                            transition_version,
+                            safe_payload,
+                            timestamp,
+                            candidate["notification_id"],
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO workflow_notification_facts ("
+                        "transition_key, notification_id, run_id, kind, destination, "
+                        "transition_version, payload_json, occurred_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            transition_key,
+                            candidate["notification_id"],
+                            run_id,
+                            safe_kind,
+                            destination,
+                            transition_version,
+                            safe_payload,
+                            timestamp,
+                        ),
+                    )
+                    connection.commit()
+                    notification_id = str(candidate["notification_id"])
+                    if gateway_destination is not None:
+                        self.record(
+                            run_id=run_id,
+                            kind=kind,
+                            destination=gateway_destination,
+                            transition_version=transition_version,
+                            payload=payload,
+                            delivery_state=delivery_state,
+                            now=observed,
+                        )
+                    return notification_id
             if safe_kind in COALESCED_KINDS:
                 window = (observed - timedelta(seconds=60)).isoformat()
                 candidate = connection.execute(
@@ -1122,12 +1252,20 @@ class NotificationOutbox:
                     if isinstance(payload, Mapping)
                     else None
                 )
+                generation = (
+                    payload.get("generation")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
                 if isinstance(node_id, str):
                     repaired += self.clear_handoff_attention(
                         run_id=str(candidate["run_id"]),
                         node_id=node_id,
                         handoff_id=(
                             str(handoff_id) if isinstance(handoff_id, str) else None
+                        ),
+                        generation=(
+                            generation if isinstance(generation, int) else None
                         ),
                         now=timestamp,
                     )
@@ -1149,6 +1287,11 @@ class NotificationOutbox:
                         projection,
                         event.get("node_id"),
                         observed_at=timestamp,
+                        failure_code=(
+                            event.get("payload", {}).get("failure_code")
+                            if isinstance(event.get("payload"), Mapping)
+                            else None
+                        ),
                     ),
                 },
                 delivery_state=(
@@ -1712,6 +1855,7 @@ class NotificationOutbox:
         run_id: str,
         node_id: str,
         handoff_id: str | None = None,
+        generation: int | None = None,
         now: datetime | None = None,
     ) -> int:
         """Resolve current attention deliveries for one terminal handoff node."""
@@ -1719,6 +1863,16 @@ class NotificationOutbox:
             raise ValueError("run_id and node_id must be bounded identifiers")
         if handoff_id is not None and _logical_identifier(handoff_id) is None:
             raise ValueError("handoff_id must be a bounded identifier")
+        if (
+            generation is not None
+            and (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+                or generation > 1_000_000_000
+            )
+        ):
+            raise ValueError("generation must be a bounded positive integer")
         timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
         with self.store._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1741,6 +1895,10 @@ class NotificationOutbox:
                     and (
                         handoff_id is None
                         or handoff.get("handoff_id") == handoff_id
+                    )
+                    and (
+                        generation is None
+                        or handoff.get("generation") == generation
                     )
                 ):
                     ids.append(str(row["notification_id"]))

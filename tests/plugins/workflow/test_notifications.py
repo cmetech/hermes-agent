@@ -110,6 +110,7 @@ def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
         "node_id": "review",
         "handoff": {
             "handoff_id": "handoff-1",
+            "generation": 1,
             "endpoint": "hermes://local/reviewer",
             "phase": "indeterminate",
             "age_seconds": 90,
@@ -134,6 +135,7 @@ def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
     assert item["notification_id"] == notification_id
     assert item["payload"]["handoff"] == {
         "handoff_id": "handoff-1",
+        "generation": 1,
         "endpoint": "hermes://local/reviewer",
         "node_id": "review",
         "phase": "indeterminate",
@@ -160,19 +162,76 @@ def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
         transition_version=5,
         payload={
             **payload,
-            "handoff": {**payload["handoff"], "handoff_id": "handoff-2"},
+            "handoff": {**payload["handoff"], "generation": 2},
         },
     )
     assert outbox.clear_handoff_attention(
         run_id="handoff-run",
         node_id="review",
         handoff_id="handoff-1",
+        generation=1,
     ) == 1
     assert [
         item["notification_id"]
         for item in outbox.pending_attention(run_id="handoff-run")
     ] == [newer_id]
     assert outbox.history(run_id="handoff-run")[0]["state"] == "pending"
+
+
+def test_handoff_reconciliation_coalesces_by_exact_generation_after_ack(
+    tmp_path,
+) -> None:
+    outbox = NotificationOutbox(RunStore(tmp_path / "handoff-coalescing"))
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+
+    def record(version: int, generation: int) -> str:
+        return outbox.record(
+            run_id="handoff-coalesce-run",
+            kind="reconciliation_required",
+            destination="desktop",
+            transition_version=version,
+            payload={
+                "workflow": "review",
+                "status": "running",
+                "event_type": "handoff_indeterminate",
+                "node_id": "review",
+                "handoff": {
+                    "handoff_id": "handoff-coalesce",
+                    "generation": generation,
+                    "endpoint": "hermes://local/reviewer",
+                    "phase": "indeterminate",
+                    "age_seconds": version,
+                    "last_successful_observation_at": observed.isoformat(),
+                    "next_action": "reconcile",
+                    "failure_code": "cancellation_indeterminate",
+                },
+            },
+            now=observed + timedelta(minutes=version),
+        )
+
+    first = record(4, 1)
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="electron",
+        now=observed + timedelta(minutes=4),
+        lease_seconds=30,
+    )
+    assert [item["notification_id"] for item in leased] == [first]
+    assert outbox.ack(
+        first,
+        owner_id="electron",
+        now=observed + timedelta(minutes=4),
+    )
+
+    repeated = record(5, 1)
+    newer_generation = record(6, 2)
+
+    assert repeated == first
+    assert newer_generation != first
+    assert [
+        item["notification_id"]
+        for item in outbox.pending_attention(run_id="handoff-coalesce-run")
+    ] == [newer_generation]
 
 
 def test_journal_reconciliation_clears_deferred_terminal_handoff_attention(
@@ -224,6 +283,7 @@ def test_journal_reconciliation_clears_deferred_terminal_handoff_attention(
             "node_id": "start",
             "handoff": {
                 "handoff_id": "handoff-terminal-repair",
+                "generation": 1,
                 "endpoint": "hermes://local/reviewer",
                 "phase": "indeterminate",
                 "age_seconds": 1,

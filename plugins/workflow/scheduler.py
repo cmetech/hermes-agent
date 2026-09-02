@@ -1173,23 +1173,27 @@ class RunScheduler:
                 and wait.deadline_at is not None
                 and wait.deadline_at <= observed
             )
-            if wait.next_observation_at <= observed or deadline_due:
+            if (
+                wait.next_observation_at <= observed
+                or deadline_due
+                or command_id is not None
+            ):
                 due.append((str(node_id), wait, command_id))
                 if len(due) == max_items:
                     break
 
         attempted = deferred = terminal = 0
         service = self._handoff_service_instance() if due else None
+
+        def remaining_if_current() -> float | None:
+            if self._shutdown.is_set() or not self._execution_fence_is_current():
+                return None
+            remaining = deadline - self._monotonic()
+            return remaining if remaining > 0 else None
+
         for node_id, wait, cancel_command_id in due:
-            if self._shutdown.is_set():
-                break
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                break
-            if not self._execution_fence_is_current():
-                break
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
+            remaining = remaining_if_current()
+            if remaining is None:
                 break
             attempted += 1
             try:
@@ -1202,7 +1206,13 @@ class RunScheduler:
                         run_id,
                         node_id,
                         reason_code="deadline_exceeded",
+                        fence=self.execution_fence,
                     )
+                    remaining = remaining_if_current()
+                    if remaining is None:
+                        break
+                    if cancel_command_id is None:
+                        continue
                 if cancel_command_id is not None:
                     service.command(
                         wait.handoff_id,
@@ -1210,14 +1220,21 @@ class RunScheduler:
                         command_id=cancel_command_id,
                         actor="workflow",
                     )
+                    remaining = remaining_if_current()
+                    if remaining is None:
+                        break
                     if not self.store.mark_handoff_cancel_recorded(
                         run_id,
                         node_id,
                         handoff_id=wait.handoff_id,
                         generation=wait.generation,
                         command_id=cancel_command_id,
+                        fence=self.execution_fence,
                     ):
                         raise RuntimeError("handoff cancel projection conflict")
+                    remaining = remaining_if_current()
+                    if remaining is None:
+                        break
                 result = service.advance(
                     wait.handoff_id,
                     budget_seconds=remaining,
@@ -1244,6 +1261,7 @@ class RunScheduler:
                 returned_id = snapshot.handoff_id
                 returned_version = snapshot.state_version
                 returned_phase = snapshot.phase
+                returned_failure_code = snapshot.failure_code
                 next_advance_at = snapshot.next_advance_at
             except Exception:
                 logger.warning(
@@ -1317,6 +1335,7 @@ class RunScheduler:
                 observed_version=returned_version,
                 observed_phase=returned_phase,
                 next_observation_at=next_observation_at,
+                observed_failure_code=returned_failure_code,
                 fence=self.execution_fence,
             ):
                 terminal += int(is_terminal)

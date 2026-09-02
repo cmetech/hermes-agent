@@ -584,6 +584,7 @@ class WorkflowAttentionHandoffProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     handoff_id: str
+    generation: StrictInt = Field(..., ge=1)
     endpoint: str
     node_id: str
     phase: Literal[

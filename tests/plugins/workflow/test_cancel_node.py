@@ -125,7 +125,12 @@ def test_coordinator_records_cancel_command_before_delivering_it(
         )
     )
     store = RunStore(tmp_path / "home")
-    run_id = _wait_on_handoff(store, package)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    run_id = _wait_on_handoff(
+        store,
+        package,
+        next_observation_at=observed + timedelta(hours=1),
+    )
     process = ProcessIdentity.capture(os.getpid())
     identity = CoordinatorIdentity(
         owner_id="cancel-coordinator",
@@ -136,7 +141,7 @@ def test_coordinator_records_cancel_command_before_delivering_it(
     )
     leadership = CoordinatorStore(store.database).try_acquire(
         identity,
-        now=datetime.now(timezone.utc),
+        now=observed,
         lease_seconds=30,
     )
     fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
@@ -180,6 +185,7 @@ def test_coordinator_records_cancel_command_before_delivering_it(
         store,
         execution_fence=fence,
         handoff_service=service,
+        utcnow=lambda: observed,
     )
     try:
         scheduler.advance_due_handoffs(
@@ -197,6 +203,63 @@ def test_coordinator_records_cancel_command_before_delivering_it(
     assert store.load_run(run_id)["nodes"]["start"]["handoff_cancel"] == {
         "command_id": command_id,
         "state": "recorded",
+    }
+
+
+def test_cancel_crash_persists_every_handoff_command_for_reopen_repair(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="cancel-crash-two-handoffs",
+            nodes=[
+                {"id": "start", "prompt": "delegate one"},
+                {"id": "other", "prompt": "delegate two"},
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    for index, node_id in enumerate(("start", "other"), start=1):
+        claim = store.claim_node(admitted.run_id, node_id, f"worker-{index}")
+        assert claim is not None
+        assert store.begin_handoff_wait(
+            claim,
+            handoff_id=f"handoff-{node_id}",
+            generation=1,
+            observed_version=3,
+            observed_phase="active",
+            next_observation_at=observed + timedelta(hours=1),
+            deadline_at=observed + timedelta(hours=2),
+        )
+
+    def crash_after_first_durable_cancel_write() -> None:
+        raise RuntimeError("simulated process death")
+
+    monkeypatch.setattr(
+        store,
+        "_notify_coordinator",
+        crash_after_first_durable_cancel_write,
+    )
+    with pytest.raises(RuntimeError, match="simulated process death"):
+        store.cancel_run(admitted.run_id)
+
+    reopened = RunStore(store.hermes_home).load_run(admitted.run_id)
+    assert reopened["desired_status"] == "cancelled"
+    assert {
+        node_id: reopened["nodes"][node_id].get("handoff_cancel")
+        for node_id in ("start", "other")
+    } == {
+        "start": {
+            "command_id": f"workflow-{admitted.run_id}-start-1-cancel",
+            "state": "pending",
+        },
+        "other": {
+            "command_id": f"workflow-{admitted.run_id}-other-1-cancel",
+            "state": "pending",
+        },
     }
 
 
@@ -286,6 +349,153 @@ def test_coordinator_delivers_deadline_cancel_before_a_later_poll(
         ("command", "handoff-cancel", "cancel", command_id, "workflow"),
         ("advance", "handoff-cancel"),
     ]
+
+
+def test_cancel_command_consuming_cycle_deadline_skips_followup_advance(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="cancel-command-deadline",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(
+        store,
+        package,
+        next_observation_at=observed + timedelta(hours=1),
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="deadline-budget-coordinator",
+        host_kind="gateway",
+        host_instance_id="deadline-budget-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=observed,
+        lease_seconds=30,
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    monotonic = [100.0]
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def command(self, handoff_id, kind, *, command_id, actor):
+            self.calls.append(("command", handoff_id))
+            monotonic[0] = 102.0
+
+        def advance(self, handoff_id, *, budget_seconds):
+            self.calls.append(("advance", handoff_id))
+            raise AssertionError("advance must not outlive the cycle deadline")
+
+    service = Service()
+    store.cancel_run(run_id)
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: observed,
+        monotonic=lambda: monotonic[0],
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+        ) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls == [("command", "handoff-cancel")]
+
+
+def test_coordinator_takeover_during_deadline_recording_prevents_external_io(
+    tmp_path: Path, workflow_writer, monkeypatch
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="deadline-takeover",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    observed = datetime.now(timezone.utc)
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(
+        store,
+        package,
+        next_observation_at=observed + timedelta(hours=1),
+        deadline_at=observed - timedelta(seconds=1),
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="old-deadline-coordinator",
+        host_kind="gateway",
+        host_instance_id="old-deadline-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    coordinator = CoordinatorStore(store.database)
+    leadership = coordinator.try_acquire(identity, now=observed, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    original = store.request_handoff_cancel
+
+    def record_then_take_over(*args, **kwargs):
+        command_id = original(*args, **kwargs)
+        assert coordinator.release(
+            identity,
+            epoch=leadership.lease.epoch,
+            now=observed,
+        )
+        successor = CoordinatorIdentity(
+            owner_id="new-deadline-coordinator",
+            host_kind="gateway",
+            host_instance_id="new-deadline-host",
+            pid=process.pid,
+            process_start_time=process.start_time,
+        )
+        assert coordinator.try_acquire(
+            successor,
+            now=observed,
+            lease_seconds=30,
+        ).is_leader
+        return command_id
+
+    monkeypatch.setattr(store, "request_handoff_cancel", record_then_take_over)
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def command(self, *args, **kwargs):
+            self.calls.append("command")
+
+        def advance(self, *args, **kwargs):
+            self.calls.append("advance")
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: observed,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=time.monotonic() + 2,
+        ) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls == []
 
 
 @pytest.mark.parametrize(
@@ -438,6 +648,35 @@ def test_indeterminate_cancel_stays_nonterminal_and_actionable(
     )
 
 
+def test_same_handoff_phase_updates_health_without_repeating_transition(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="handoff-same-phase",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="active",
+        next_observation_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+    )
+
+    event_types = [event["event_type"] for event in store.tail_events(run_id)]
+    assert event_types.count("handoff_active") == 1
+    assert "handoff_observed" in event_types
+
+
 def test_success_before_cancel_is_validated_then_blocks_downstream(
     tmp_path: Path, workflow_writer
 ) -> None:
@@ -525,6 +764,67 @@ def test_handoff_deadline_uses_the_same_idempotent_cancel_intent(
         for event in store.tail_events(run_id)
         if event["event_type"] == "handoff_deadline_exceeded"
     ] == ["handoff_deadline_exceeded"]
+
+
+def test_deadline_success_is_validated_before_run_fails_and_blocks_downstream(
+    tmp_path: Path, workflow_writer
+) -> None:
+    marker = tmp_path / "deadline-downstream-must-not-run"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="handoff-deadline-success",
+            nodes=[
+                {"id": "start", "prompt": "delegate"},
+                {
+                    "id": "after",
+                    "bash": f"touch {marker}",
+                    "depends_on": ["start"],
+                },
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+    store.request_handoff_cancel(
+        run_id,
+        "start",
+        reason_code="deadline_exceeded",
+    )
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="succeeded",
+        next_observation_at=datetime.now(timezone.utc),
+    )
+
+    claim = store.claim_node(run_id, "start", "deadline-validator")
+    assert claim is not None
+    store.mark_node_started(claim)
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={"handoff_id": "handoff-cancel", "validated": True},
+    )
+
+    projection = store.load_run(run_id)
+    assert projection["status"] == "failed"
+    assert projection["last_error"] == {
+        "code": "handoff_deadline_exceeded",
+        "message": "handoff deadline exceeded",
+        "node_id": "start",
+    }
+    assert projection["nodes"]["start"]["state"] == "failed"
+    assert projection["nodes"]["after"]["state"] == "cancelled"
+    assert any(
+        event["event_type"] == "node_succeeded"
+        for event in store.tail_events(run_id)
+    )
+    assert not marker.exists()
 
 
 def test_cancel_executor_returns_typed_reason_without_allocating_process(

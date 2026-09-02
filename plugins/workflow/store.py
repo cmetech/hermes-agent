@@ -13167,6 +13167,7 @@ class RunStore:
         observed_version: int,
         observed_phase: str,
         next_observation_at: datetime,
+        observed_failure_code: str | None = None,
         fence: ExecutionFence | None = None,
         now: LeaseClockSample | None = None,
     ) -> bool:
@@ -13276,6 +13277,24 @@ class RunStore:
                             else "cancelled"
                         )
                         projection["desired_status"] = None
+                from plugins.workflow.notifications import (
+                    public_handoff_failure_code,
+                )
+
+                public_failure_code = public_handoff_failure_code(
+                    observed_failure_code,
+                    phase=observed_phase,
+                    deadline_exceeded=deadline_cancel,
+                    cancelling=cancelling,
+                )
+                event_payload = {
+                    **updated.durable_record(),
+                    **(
+                        {"failure_code": public_failure_code}
+                        if public_failure_code is not None
+                        else {}
+                    ),
+                }
                 if (
                     current.last_observed_phase == "indeterminate"
                     and observed_phase != "indeterminate"
@@ -13284,7 +13303,7 @@ class RunStore:
                         directory,
                         projection,
                         "handoff_reconciled",
-                        updated.durable_record(),
+                        event_payload,
                         node_id=node_id,
                         defer_notification=fence_connection is not None,
                         reserve_connection=fence_connection,
@@ -13297,9 +13316,11 @@ class RunStore:
                         if observed_phase == "failed" or deadline_cancel and terminal
                         else "handoff_terminal"
                         if terminal
+                        else "handoff_observed"
+                        if observed_phase == current.last_observed_phase
                         else f"handoff_{observed_phase}"
                     ),
-                    updated.durable_record(),
+                    event_payload,
                     node_id=node_id,
                     defer_notification=fence_connection is not None,
                     reserve_connection=fence_connection,
@@ -13353,54 +13374,70 @@ class RunStore:
         handoff_id: str,
         generation: int,
         command_id: str,
+        fence: ExecutionFence | None = None,
     ) -> bool:
         """Mark the exact durable handoff cancel command as recorded."""
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
-            projection = json.loads((directory / "run.json").read_text())
-            node = projection.get("nodes", {}).get(node_id)
-            if not isinstance(node, MutableMapping):
-                return False
-            try:
-                wait = HandoffWaitProjection.from_durable_record(node.get("handoff"))
-            except ValueError:
-                return False
-            cancel = node.get("handoff_cancel")
-            authorized = bool(
-                projection.get("desired_status") == "cancelled"
-                or isinstance(cancel, Mapping)
-                and cancel.get("reason_code") == "deadline_exceeded"
-            )
-            if (
-                not authorized
-                or node.get("state") != "waiting_handoff"
-                or wait.handoff_id != handoff_id
-                or wait.generation != generation
-                or not isinstance(cancel, MutableMapping)
-                or cancel.get("command_id") != command_id
-            ):
-                return False
-            if cancel.get("state") == "recorded":
-                return True
-            if cancel.get("state") != "pending":
-                return False
-            cancel["state"] = "recorded"
-            self._append_locked(
-                directory,
-                projection,
-                "handoff_cancel_recorded",
-                {"handoff_id": handoff_id, "command_id": command_id},
-                node_id=node_id,
-            )
-            with self._connect() as connection:
-                self._sync_integrity_index(
-                    connection,
-                    projection=projection,
-                    journal_sha256=_sha256(
-                        (directory / "events.jsonl").read_bytes()
-                    ),
+        try:
+            with workflow_lock(
+                self._run_lock_path(run_id)
+            ), self._execution_fence_transaction(fence) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection.get("nodes", {}).get(node_id)
+                if not isinstance(node, MutableMapping):
+                    return False
+                try:
+                    wait = HandoffWaitProjection.from_durable_record(
+                        node.get("handoff")
+                    )
+                except ValueError:
+                    return False
+                cancel = node.get("handoff_cancel")
+                authorized = bool(
+                    projection.get("desired_status") == "cancelled"
+                    or isinstance(cancel, Mapping)
+                    and cancel.get("reason_code") == "deadline_exceeded"
                 )
-            return True
+                if (
+                    not authorized
+                    or node.get("state") != "waiting_handoff"
+                    or wait.handoff_id != handoff_id
+                    or wait.generation != generation
+                    or not isinstance(cancel, MutableMapping)
+                    or cancel.get("command_id") != command_id
+                ):
+                    return False
+                if cancel.get("state") == "recorded":
+                    return True
+                if cancel.get("state") != "pending":
+                    return False
+                cancel["state"] = "recorded"
+                self._append_locked(
+                    directory,
+                    projection,
+                    "handoff_cancel_recorded",
+                    {"handoff_id": handoff_id, "command_id": command_id},
+                    node_id=node_id,
+                    defer_notification=fence_connection is not None,
+                    reserve_connection=fence_connection,
+                )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as connection:
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     def request_handoff_cancel(
         self,
@@ -13408,57 +13445,75 @@ class RunStore:
         node_id: str,
         *,
         reason_code: str,
+        fence: ExecutionFence | None = None,
     ) -> str | None:
         """Record one policy-driven cancel intent for a waiting handoff."""
         if reason_code != "deadline_exceeded":
             raise ValueError("handoff cancel reason is invalid")
         directory = self.run_directory(run_id)
-        with workflow_lock(self._run_lock_path(run_id)):
-            projection = json.loads((directory / "run.json").read_text())
-            node = projection.get("nodes", {}).get(node_id)
-            if not isinstance(node, MutableMapping) or node.get("state") != "waiting_handoff":
-                return None
-            wait = HandoffWaitProjection.from_durable_record(node.get("handoff"))
-            existing = node.get("handoff_cancel")
-            if isinstance(existing, Mapping):
-                command_id = existing.get("command_id")
-                return str(command_id) if isinstance(command_id, str) else None
-            command_id = (
-                f"workflow-{run_id}-{node_id}-{wait.generation}-deadline-cancel"
-            )
-            node["handoff_cancel"] = {
-                "command_id": command_id,
-                "state": "pending",
-                "reason_code": reason_code,
-            }
-            node["handoff_deadline_exceeded"] = True
-            self._append_locked(
-                directory,
-                projection,
-                "handoff_deadline_exceeded",
-                {
-                    "handoff_id": wait.handoff_id,
-                    "phase": wait.last_observed_phase,
+        command_id = None
+        try:
+            with workflow_lock(
+                self._run_lock_path(run_id)
+            ), self._execution_fence_transaction(fence) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection.get("nodes", {}).get(node_id)
+                if (
+                    not isinstance(node, MutableMapping)
+                    or node.get("state") != "waiting_handoff"
+                ):
+                    return None
+                wait = HandoffWaitProjection.from_durable_record(node.get("handoff"))
+                existing = node.get("handoff_cancel")
+                if isinstance(existing, Mapping):
+                    existing_id = existing.get("command_id")
+                    return str(existing_id) if isinstance(existing_id, str) else None
+                command_id = (
+                    f"workflow-{run_id}-{node_id}-{wait.generation}-deadline-cancel"
+                )
+                node["handoff_cancel"] = {
                     "command_id": command_id,
+                    "state": "pending",
                     "reason_code": reason_code,
-                },
-                node_id=node_id,
-            )
-            with self._connect() as connection:
-                self._sync_integrity_index(
-                    connection,
-                    projection=projection,
-                    journal_sha256=_sha256(
-                        (directory / "events.jsonl").read_bytes()
-                    ),
+                }
+                node["handoff_deadline_exceeded"] = True
+                self._append_locked(
+                    directory,
+                    projection,
+                    "handoff_deadline_exceeded",
+                    {
+                        "handoff_id": wait.handoff_id,
+                        "phase": wait.last_observed_phase,
+                        "command_id": command_id,
+                        "reason_code": reason_code,
+                    },
+                    node_id=node_id,
+                    defer_notification=fence_connection is not None,
+                    reserve_connection=fence_connection,
                 )
-                self._record_coordinator_wake(
-                    connection,
-                    run_id=run_id,
-                    reason_code="handoff_deadline_exceeded",
-                )
-            self._notify_coordinator()
-            return command_id
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as connection:
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    self._record_coordinator_wake(
+                        connection,
+                        run_id=run_id,
+                        reason_code="handoff_deadline_exceeded",
+                    )
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return None
+            raise
+        self._notify_coordinator()
+        return command_id
 
     def defer_handoff_wait(
         self,
@@ -15691,8 +15746,15 @@ class RunStore:
                 else f"node_{status}"
             )
             active = node.get("claim", {})
+            deadline_handoff_resolution = bool(
+                node.get("handoff_deadline_exceeded") is True
+                and node.get("handoff_resolution_pending") is True
+            )
             handoff_resolution = bool(
-                projection.get("desired_status") == "cancelled"
+                (
+                    projection.get("desired_status") == "cancelled"
+                    or deadline_handoff_resolution
+                )
                 and node.get("handoff_resolution_pending") is True
             )
             if not _active_claim_matches(active, claim):
@@ -16146,6 +16208,19 @@ class RunStore:
                 terminal_reserve_attempt_id=claim.attempt_id,
                 reserve_connection=fence_connection,
             )
+            if deadline_handoff_resolution:
+                node["state"] = "failed"
+                node["attempts"][-1].update({
+                    "state": "failed",
+                    "error_code": "handoff_deadline_exceeded",
+                    "error_message": "handoff deadline exceeded",
+                })
+                node.pop("handoff_deadline_exceeded", None)
+                projection["last_error"] = {
+                    "code": "handoff_deadline_exceeded",
+                    "message": "handoff deadline exceeded",
+                    "node_id": event_node_id,
+                }
             if publication_ref is not None:
                 verified_content = self._recover_typed_publications_locked(
                     directory,
@@ -16186,7 +16261,8 @@ class RunStore:
                     projection["desired_status"] = None
                     terminal = (
                         "failed"
-                        if status == "failed"
+                        if deadline_handoff_resolution
+                        or status == "failed"
                         or any(
                             other.get("state") == "failed"
                             for other in projection["nodes"].values()
@@ -17738,6 +17814,12 @@ class RunStore:
                         and isinstance(event["payload"].get("handoff_id"), str)
                         else None
                     ),
+                    generation=(
+                        event["payload"].get("generation")
+                        if isinstance(event.get("payload"), Mapping)
+                        and isinstance(event["payload"].get("generation"), int)
+                        else None
+                    ),
                     now=datetime.fromisoformat(str(event["timestamp"])),
                 )
             if kind is not None:
@@ -17760,6 +17842,11 @@ class RunStore:
                             node_id,
                             observed_at=datetime.fromisoformat(
                                 str(event["timestamp"])
+                            ),
+                            failure_code=(
+                                event.get("payload", {}).get("failure_code")
+                                if isinstance(event.get("payload"), Mapping)
+                                else None
                             ),
                         ),
                     },
@@ -19225,6 +19312,36 @@ class RunStore:
                 }
             if projection.get("desired_status") != "cancelled":
                 projection["desired_status"] = "cancelled"
+                newly_cancelling_handoffs = []
+                for node_id, node in _iter_projection_node_states(projection):
+                    if (
+                        node.get("state") != "waiting_handoff"
+                        or node.get("handoff_cancel") is not None
+                    ):
+                        continue
+                    wait = HandoffWaitProjection.from_durable_record(
+                        node.get("handoff")
+                    )
+                    command_id = (
+                        f"workflow-{run_id}-{node_id}-{wait.generation}-cancel"
+                    )
+                    node["handoff_cancel"] = {
+                        "command_id": command_id,
+                        "state": "pending",
+                    }
+                    newly_cancelling_handoffs.append((node_id, wait, command_id))
+                for node_id, wait, command_id in newly_cancelling_handoffs:
+                    self._append_locked(
+                        directory,
+                        projection,
+                        "handoff_cancelling",
+                        {
+                            "handoff_id": wait.handoff_id,
+                            "phase": wait.last_observed_phase,
+                            "command_id": command_id,
+                        },
+                        node_id=node_id,
+                    )
                 self._append_locked(directory, projection, "cancel_requested")
                 with self._connect() as connection:
                     connection.execute(
