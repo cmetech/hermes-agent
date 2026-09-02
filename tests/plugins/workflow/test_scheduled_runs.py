@@ -671,6 +671,7 @@ def test_real_pending_wake_completes_not_due_then_indexed_sweep_submits_once(
         schedule_at=due.isoformat().replace("+00:00", "Z"),
     )
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     stall_calls: list[str] = []
     original_stall = store.record_stall_if_due
@@ -1169,6 +1170,7 @@ def test_unrecoverable_migrated_run_does_not_block_healthy_scheduled_sweep(
     assert restarted._active_run_repair_reasons(healthy.run_id) == ()
 
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = _service(home, clocks)
     service.notification_repair_seconds = 0.01
@@ -1296,6 +1298,7 @@ def test_v13_migration_revalidates_rewritten_projection_before_later_submission(
     )
 
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = _service(home, clocks)
 
@@ -1400,6 +1403,7 @@ def test_restored_legacy_effect_policy_is_revalidated_before_submission(
     policy.write_bytes(original_policy)
 
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = _service(tmp_path / "home", clocks)
 
@@ -1488,6 +1492,7 @@ def test_repair_revalidation_cursor_bypasses_locked_and_corrupt_rows(
     holder.start()
     assert ready.wait(timeout=1)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = _service(tmp_path / "home", clocks)
     try:
@@ -1586,6 +1591,7 @@ def test_disappearing_repair_candidate_does_not_abort_healthy_sweep(
 
     monkeypatch.setattr(store, "run_directory", run_directory_after_cleanup)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = _service(tmp_path / "home", clocks)
     service._notification_repair_due_at = clocks.monotonic_value + 100
@@ -2028,6 +2034,7 @@ def test_repair_revalidation_accepts_valid_journal_above_fixed_probe_sizes(
         outcome="repair_required",
     )
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = _service(tmp_path / "home", clocks)
 
@@ -2104,6 +2111,7 @@ def test_real_sweep_rescues_newly_due_work_behind_both_active_cursors(
 
     service = _service(tmp_path / "home", clocks)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     _actionable, normal_cursor, _progress = service._sweep_once(
         store, coordinator, identity, epoch, scheduler
@@ -2172,6 +2180,7 @@ def test_consecutive_forward_jump_discovers_new_due_work_during_backlogs(
 
     service = _service(tmp_path / "home", clocks)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     _actionable, ordinary_cursor, _progress = service._sweep_once(
         store, coordinator, identity, epoch, scheduler
@@ -2229,6 +2238,7 @@ def test_due_and_ordinary_candidates_share_one_global_admission_order(
     _complete_pending_wakes(coordinator, identity, epoch, now=clocks.wall)
     service = _service(tmp_path / "home", clocks)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
 
     service._sweep_once(store, coordinator, identity, epoch, scheduler)
@@ -2294,6 +2304,9 @@ def test_full_due_backlog_cannot_starve_periodic_running_page(
     class DeadlineScheduler:
         def begin_sweep(self) -> None:
             submissions_by_sweep.append([])
+
+        def advance_due_handoffs(self, *_args, **_kwargs) -> tuple[int, int, int]:
+            return 0, 0, 0
 
         def submit(self, run_id: str, fence: ExecutionFence) -> bool:
             assert fence == ExecutionFence(identity.owner_id, epoch)
@@ -2377,6 +2390,7 @@ def test_newer_pending_wake_does_not_bypass_older_due_admissions(
     clocks.wall = due_at
     service = _service(tmp_path / "home", clocks)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
 
     service._sweep_once(store, coordinator, identity, epoch, scheduler)
@@ -2426,6 +2440,7 @@ def test_future_wake_is_completed_outside_a_full_execution_order_page(
     )
     service = _service(tmp_path / "home", clocks)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
 
     service._sweep_once(store, coordinator, identity, epoch, scheduler)
@@ -2958,6 +2973,7 @@ def test_leader_never_waits_more_than_five_monotonic_seconds_for_far_future_run(
     )
     service = _service(tmp_path / "home", clocks)
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.shutdown_deadline_seconds = 1.0
     submissions: list[tuple[str, datetime]] = []
 

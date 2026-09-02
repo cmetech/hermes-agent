@@ -41,9 +41,15 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from hermes_cli.peers import (
+    load_peer_registry,
+    parse_peer_target,
+    peer_base_url,
+    peer_key_env,
+    valid_peer_name,
+)
+
 BOT_CHAT_TITLE = "Bot Chat"
-_PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
@@ -51,15 +57,11 @@ LIST_TIMEOUT_S = 30
 
 
 def _peer_key_env(name: str) -> str:
-    return f"HERMES_PEER_{name.upper().replace('-', '_')}_KEY"
+    return peer_key_env(name)
 
 
 def _load_peers() -> dict:
-    from hermes_cli.config import load_config
-
-    cfg = load_config() or {}
-    peers = cfg.get("bot_peers")
-    return peers if isinstance(peers, dict) else {}
+    return load_peer_registry()
 
 
 def _save_peers(peers: dict) -> None:
@@ -123,11 +125,7 @@ def _request(
 
 
 def _base_url(peer: dict, profile: str | None) -> str:
-    url = str(peer.get("url") or "").rstrip("/")
-    if profile:
-        # Multiplex mirror: same handlers, scoped to the named profile.
-        return f"{url}/p/{urllib.parse.quote(profile, safe='')}"
-    return url
+    return peer_base_url(peer, profile)
 
 
 def _find_bot_chat(base: str, key: str) -> str | None:
@@ -182,16 +180,7 @@ def _ensure_bot_chat(base: str, key: str) -> str:
 
 
 def _parse_target(target: str) -> tuple[str, str | None]:
-    """``<peer>`` or ``<peer>/<profile>`` → (peer, profile|None)."""
-    raw = (target or "").strip()
-    peer, _, profile = raw.partition("/")
-    peer = peer.strip()
-    profile = profile.strip() or None
-    if not peer:
-        raise ValueError("Peer name required (hermes peer dm <peer>[/<agent>] ...)")
-    if profile and not _PROFILE_RE.match(profile):
-        raise ValueError(f"Invalid agent/profile name: {profile!r}")
-    return peer, profile
+    return parse_peer_target(target)
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
@@ -246,7 +235,7 @@ def cmd_peer(args) -> int:
 
     if action in ("add", "set"):
         name = (args.name or "").strip().lower()
-        if not _PEER_NAME_RE.match(name):
+        if not valid_peer_name(name):
             print(f"Invalid peer name: {name!r} (lowercase, digits, -, _; max 64)", file=sys.stderr)
             return 2
         url = (args.url or "").strip()

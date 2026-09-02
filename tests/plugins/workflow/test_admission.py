@@ -6,11 +6,21 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
+import textwrap
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import plugins.workflow.admission as workflow_admission
+from hermes_cli.handoff import EndpointAssessment
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.cli import build_catalog, show_package
+from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -37,6 +47,642 @@ def _request(snapshot, *, key="delivery-1", policy="queue", name="demo"):
         idempotency_key=key,
         concurrency_key=name,
         concurrency_policy=policy,
+    )
+
+
+def _assigned_package(workflow_writer, root, *, endpoint="hermes://local/reviewer"):
+    path = workflow_writer(
+        root,
+        name="assigned",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        f"    endpoint: {endpoint}\n",
+        encoding="utf-8",
+    )
+    return load_workflow(path)
+
+
+def _run_never_returning_admission_child(body: str, *, timeout: float = 2.0):
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import plugins.workflow.admission as admission
+        from plugins.workflow.models import WorkflowValidationError
+
+        package = SimpleNamespace(
+            sidecar={
+                "assignments": {
+                    "review": {"endpoint": "hermes://local/reviewer"},
+                }
+            }
+        )
+
+        class NeverReturningChannel:
+            def __init__(self):
+                self.calls = 0
+                self.release = threading.Event()
+
+            def validate_endpoint(self, endpoint, initiator):
+                self.calls += 1
+                self.release.wait()
+
+        admission._ASSIGNMENT_ADMISSION_BUDGET_SECONDS = 0.03
+        channel = NeverReturningChannel()
+        """
+    )
+    script += textwrap.dedent(body)
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.fspath(Path(__file__).resolve().parents[3]),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def test_assignment_admission_rejects_missing_self_and_unavailable_profiles(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = _assigned_package(workflow_writer, tmp_path / "missing")
+
+    with pytest.raises(WorkflowValidationError, match="target profile does not exist"):
+        workflow_admission.validate_assignment_admission(
+            package, initiator_profile="default"
+        )
+
+    self_package = _assigned_package(
+        workflow_writer,
+        tmp_path / "self",
+        endpoint="hermes://local/default",
+    )
+    with pytest.raises(WorkflowValidationError, match="must differ"):
+        workflow_admission.validate_assignment_admission(
+            self_package, initiator_profile="default"
+        )
+
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+
+    class UnavailableChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return type(
+                "Assessment",
+                (),
+                {
+                    "available": False,
+                    "failure_code": "local_cli_lock_unavailable",
+                    "mechanism": None,
+                },
+            )()
+
+        def create(self, *_args, **_kwargs):
+            raise AssertionError("admission must not create a handoff")
+
+        submit = create
+
+    with pytest.raises(WorkflowValidationError, match="local_cli_lock_unavailable"):
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=UnavailableChannel(),
+        )
+
+    assert os.environ["HERMES_HOME"] == str(home)
+
+
+def test_assignment_admission_returns_available_mechanism_without_dispatch(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    monkeypatch.setattr("hermes_cli.profiles.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = _assigned_package(workflow_writer, tmp_path / "available")
+
+    class AvailableChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return type(
+                "Assessment",
+                (),
+                {
+                    "available": True,
+                    "failure_code": None,
+                    "mechanism": "local_cli",
+                },
+            )()
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=AvailableChannel(),
+    ) == {"review": "local_cli"}
+
+
+def test_peer_assignment_does_not_use_local_profile_checks(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {
+                    "endpoint": "hermes://peer/office/default",
+                    "interaction_policy": "deny",
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda _profile: (_ for _ in ()).throw(
+            AssertionError("peer profiles are not local filesystem profiles")
+        ),
+    )
+
+    class PeerChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return EndpointAssessment(
+                endpoint,
+                True,
+                "peer_runs",
+                capabilities=frozenset({
+                    "authoritative_status",
+                    "durable_admission",
+                    "cancellation",
+                }),
+            )
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=PeerChannel(),
+    ) == {"review": "peer_runs"}
+
+
+@pytest.mark.parametrize(
+    ("policy", "capabilities"),
+    [
+        ("pause", {"authoritative_status", "durable_admission", "cancellation"}),
+        ("deny", {"authoritative_status", "durable_admission"}),
+        ("auto_cancel", {"authoritative_status", "durable_admission"}),
+    ],
+)
+def test_peer_assignment_rejects_policy_capability_mismatch(policy, capabilities):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {
+                    "endpoint": "hermes://peer/office/reviewer",
+                    "interaction_policy": policy,
+                }
+            }
+        }
+    )
+
+    class PeerChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return EndpointAssessment(
+                endpoint,
+                True,
+                "peer_runs",
+                capabilities=frozenset(capabilities),
+            )
+
+    with pytest.raises(WorkflowValidationError) as caught:
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=PeerChannel(),
+        )
+
+    assert caught.value.issues[0].code == "assignment_capability_mismatch"
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ["peer_not_found", "peer_auth_unavailable", "peer_profile_not_found", "runs_not_durable"],
+)
+def test_peer_assignment_registry_and_runs_failures_stop_admission(failure_code):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {"endpoint": "hermes://peer/office/reviewer"}
+            }
+        }
+    )
+
+    class UnavailablePeer:
+        def validate_endpoint(self, endpoint, initiator):
+            return EndpointAssessment(
+                endpoint,
+                False,
+                failure_code=failure_code,
+            )
+
+        def create(self, *_args, **_kwargs):
+            raise AssertionError("admission must not create a Workflow handoff")
+
+    with pytest.raises(WorkflowValidationError, match=failure_code):
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=UnavailablePeer(),
+        )
+
+
+def test_assignment_admission_probes_one_canonical_endpoint_once(monkeypatch):
+    endpoint = "hermes://local/reviewer"
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                f"review-{index:03d}": {"endpoint": endpoint}
+                for index in range(512)
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    class SlowChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls += 1
+            time.sleep(0.002)
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = SlowChannel()
+    started = time.monotonic()
+    mechanisms = workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=channel,
+    )
+    elapsed = time.monotonic() - started
+
+    assert channel.calls == 1
+    assert mechanisms == {
+        f"review-{index:03d}": "local_cli" for index in range(512)
+    }
+    assert elapsed < 2.0
+
+
+def test_assignment_admission_releases_probe_slot_after_success(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review-a": {"endpoint": "hermes://local/reviewer-a"},
+                "review-b": {"endpoint": "hermes://local/reviewer-b"},
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    class AvailableChannel:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls.append(parsed.canonical)
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = AvailableChannel()
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=channel,
+    ) == {"review-a": "local_cli", "review-b": "local_cli"}
+    assert channel.calls == [
+        "hermes://local/reviewer-a",
+        "hermes://local/reviewer-b",
+    ]
+
+
+def test_assignment_admission_waits_for_healthy_concurrent_probe(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {"endpoint": "hermes://local/reviewer"},
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+    first_probe_started = threading.Event()
+    release_first_probe = threading.Event()
+    second_admission_started = threading.Event()
+    activity_lock = threading.Lock()
+
+    class PausedChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.active = 0
+            self.max_active = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            with activity_lock:
+                self.calls += 1
+                call_number = self.calls
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if call_number == 1:
+                    first_probe_started.set()
+                    assert release_first_probe.wait(timeout=2)
+                return EndpointAssessment(parsed, True, "local_cli")
+            finally:
+                with activity_lock:
+                    self.active -= 1
+
+    channel = PausedChannel()
+
+    def admit():
+        return workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=channel,
+        )
+
+    def admit_second():
+        second_admission_started.set()
+        return admit()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(admit)
+        assert first_probe_started.wait(timeout=2)
+        second = pool.submit(admit_second)
+        assert second_admission_started.wait(timeout=2)
+        try:
+            time.sleep(0.05)
+            assert not second.done()
+        finally:
+            release_first_probe.set()
+
+        assert first.result(timeout=2) == {"review": "local_cli"}
+        assert second.result(timeout=2) == {"review": "local_cli"}
+
+    assert channel.calls == 2
+    assert channel.max_active == 1
+
+
+def test_assignment_admission_releases_probe_slot_after_validator_exception(
+    monkeypatch,
+):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {"endpoint": "hermes://local/reviewer"},
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    class FailingOnceChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("validator failed")
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = FailingOnceChannel()
+
+    with pytest.raises(RuntimeError, match="validator failed"):
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=channel,
+        )
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=channel,
+    ) == {"review": "local_cli"}
+    assert channel.calls == 2
+
+
+def test_assignment_admission_bounds_distinct_endpoint_probes(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                f"review-{index}": {
+                    "endpoint": f"hermes://local/reviewer-{index}"
+                }
+                for index in range(4)
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+    monkeypatch.setattr(
+        workflow_admission,
+        "_ASSIGNMENT_ADMISSION_BUDGET_SECONDS",
+        0.03,
+        raising=False,
+    )
+    release_probe = threading.Event()
+
+    class SlowChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls += 1
+            assert release_probe.wait(timeout=2)
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = SlowChannel()
+    started = time.monotonic()
+    try:
+        with pytest.raises(WorkflowValidationError) as caught:
+            workflow_admission.validate_assignment_admission(
+                package,
+                initiator_profile="default",
+                channel=channel,
+            )
+    finally:
+        release_probe.set()
+        assert workflow_admission._assignment_probe_slot.acquire(timeout=2)
+        workflow_admission._assignment_probe_slot.release()
+    elapsed = time.monotonic() - started
+
+    assert caught.value.issues[0].path == "sidecar.assignments.review-0.endpoint"
+    assert caught.value.issues[0].code == "assignment_mechanism_unavailable"
+    assert "admission_budget_exhausted" in caught.value.issues[0].message
+    assert channel.calls == 1
+    assert elapsed < 2.0
+
+
+def test_assignment_admission_timeout_does_not_block_interpreter_shutdown():
+    completed = _run_never_returning_admission_child(
+        """
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            try:
+                admission.validate_assignment_admission(
+                    package,
+                    initiator_profile="default",
+                    channel=channel,
+                )
+            except WorkflowValidationError as exc:
+                issue = exc.issues[0]
+                print(
+                    json.dumps({"code": issue.code, "message": issue.message}),
+                    flush=True,
+                )
+        """
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["code"] == "assignment_mechanism_unavailable"
+    assert "admission_budget_exhausted" in result["message"]
+
+
+def test_assignment_admission_repeated_timeouts_keep_one_probe_worker():
+    completed = _run_never_returning_admission_child(
+        """
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            for _ in range(3):
+                try:
+                    admission.validate_assignment_admission(
+                        package,
+                        initiator_profile="default",
+                        channel=channel,
+                    )
+                except WorkflowValidationError:
+                    pass
+
+        workers = sum(
+            thread.name.startswith(("workflow-admission", "deadline-workflow"))
+            for thread in threading.enumerate()
+        )
+        print(json.dumps({"calls": channel.calls, "workers": workers}), flush=True)
+        os._exit(0)
+        """
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"calls": 1, "workers": 1}
+
+
+def test_assignment_owner_is_derived_from_explicit_anchored_profile_home(tmp_path):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    named = root / "profiles" / "reviewer"
+    named.mkdir(parents=True)
+
+    assert workflow_admission.workflow_profile_for_home(root) == "default"
+    assert workflow_admission.workflow_profile_for_home(named) == "reviewer"
+
+
+def test_assignment_snapshot_requires_explicit_profile_before_staging(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    package = _assigned_package(
+        workflow_writer,
+        tmp_path / "explicit-owner",
+        endpoint="hermes://local/default",
+    )
+
+    with pytest.raises(WorkflowValidationError, match="initiator profile"):
+        store.prepare_run_snapshot(package)
+
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
+
+
+@pytest.mark.parametrize(
+    ("home_profile", "claimed_profile"),
+    [
+        ("default", "reviewer"),
+        ("reviewer", "default"),
+    ],
+)
+def test_assignment_snapshot_rejects_profile_mismatch_before_endpoint_preview(
+    tmp_path, workflow_writer, monkeypatch, home_profile, claimed_profile
+):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    home = root
+    if home_profile != "default":
+        home = root / "profiles" / home_profile
+        home.mkdir(parents=True)
+    store = RunStore(home)
+    package = _assigned_package(
+        workflow_writer,
+        tmp_path / f"mislabeled-{home_profile}",
+        endpoint=f"hermes://local/{home_profile}",
+    )
+    previews = []
+
+    def preview(*args, **kwargs):
+        previews.append((args, kwargs))
+        raise AssertionError("profile mismatch must fail before endpoint preview")
+
+    monkeypatch.setattr(
+        "hermes_cli.handoff.local.LocalHermesChannel.validate_endpoint",
+        preview,
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    with pytest.raises(WorkflowValidationError) as caught:
+        store.prepare_run_snapshot(package, initiator_profile=claimed_profile)
+
+    assert caught.value.issues[0].code == "assignment_initiator_profile_mismatch"
+    assert previews == []
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
+
+
+def test_assignment_is_sealed_in_snapshot_run_catalog_and_inspection(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        "plugins.workflow.store.validate_assignment_admission",
+        lambda *_args, **_kwargs: {"review": "local_cli"},
+    )
+    store = RunStore(home)
+    package = _assigned_package(workflow_writer, tmp_path / "sealed")
+
+    snapshot = store.prepare_run_snapshot(package, initiator_profile="default")
+    admitted = store.start_run(
+        _request(snapshot, key="assigned", name="assigned"),
+        immutable_snapshot=snapshot,
+    )
+    run = store.load_run(admitted.run_id)
+    expected = {
+        "review": {
+            "endpoint": "hermes://local/reviewer",
+            "interaction_policy": "deny",
+            "on_deadline": "cancel_and_fail",
+        }
+    }
+
+    assert snapshot.assignments == expected
+    assert run["assignments"] == expected
+    assert build_catalog([package])[0]["assignments"] == expected
+    assert (
+        show_package(
+            package,
+            compatibility_report=assess_compatibility(package),
+        )["assignments"]
+        == expected
     )
 
 

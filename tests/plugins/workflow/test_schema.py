@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 
 import pytest
+import yaml
+from jsonschema import Draft202012Validator
 
 from plugins.workflow import schema as schema_module
+from plugins.workflow.language_schema import sidecar_json_schema
 from plugins.workflow.models import WorkflowLanguageProfile, WorkflowValidationError
 from plugins.workflow.schema import load_workflow, validate_package
 
@@ -425,6 +428,280 @@ def test_sidecar_cannot_declare_trust_or_invalid_node_references(
         "outward_action_nodes: [missing]\n", encoding="utf-8"
     )
     with pytest.raises(WorkflowValidationError, match="unknown node"):
+        load_workflow(path)
+
+
+def _write_assignment(path, node_id="review", **changes):
+    assignment = {
+        "endpoint": "hermes://local/security-reviewer",
+        "interaction_policy": "deny",
+        "deadline": "PT4H",
+        "on_deadline": "cancel_and_fail",
+        **changes,
+    }
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        yaml.safe_dump({
+            "outward_action_nodes": [node_id],
+            "assignments": {node_id: assignment},
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_assignment_accepts_one_closed_local_prompt_contract(workflow_writer, tmp_path):
+    path = workflow_writer(
+        tmp_path / "assigned",
+        nodes=[{"id": "review", "prompt": "Review this"}],
+    )
+    _write_assignment(path)
+
+    assignment = load_workflow(path).sidecar["assignments"]["review"]
+
+    assert dict(assignment) == {
+        "endpoint": "hermes://local/security-reviewer",
+        "interaction_policy": "deny",
+        "deadline": "PT4H",
+        "on_deadline": "cancel_and_fail",
+    }
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "accepted"),
+    [
+        ("hermes://local/reviewer", True),
+        ("hermes://local/default", True),
+        ("hermes://peer/office/reviewer", True),
+        ("hermes://peer/office/default", True),
+        ("hermes://peer/Office/reviewer", False),
+        ("hermes://peer/office/root", False),
+        ("hermes://local/root", False),
+        ("hermes://local/hermes", False),
+        ("HERMES://local/reviewer", False),
+    ],
+)
+def test_assignment_endpoint_generated_schema_and_runtime_are_strictly_equivalent(
+    workflow_writer, tmp_path, endpoint, accepted
+):
+    sidecar = {
+        "outward_action_nodes": ["review"],
+        "assignments": {"review": {"endpoint": endpoint}},
+    }
+    schema_accepted = not list(
+        Draft202012Validator(
+            sidecar_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+        ).iter_errors(sidecar)
+    )
+    path = workflow_writer(
+        tmp_path / endpoint.replace("://", "-").replace("/", "-"),
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        yaml.safe_dump(sidecar), encoding="utf-8"
+    )
+    try:
+        load_workflow(path)
+    except WorkflowValidationError:
+        runtime_accepted = False
+    else:
+        runtime_accepted = True
+
+    assert (schema_accepted, runtime_accepted) == (accepted, accepted)
+
+
+@pytest.mark.parametrize(
+    ("policy", "accepted"),
+    [
+        ("pause", True),
+        ("deny", True),
+        ("auto_cancel", True),
+        ("ask", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_assignment_interaction_policy_schema_and_runtime_are_equivalent(
+    workflow_writer, tmp_path, policy, accepted
+):
+    sidecar = {
+        "outward_action_nodes": ["review"],
+        "assignments": {
+            "review": {
+                "endpoint": "hermes://peer/office/reviewer",
+                "interaction_policy": policy,
+            }
+        },
+    }
+    schema_accepted = not list(
+        Draft202012Validator(
+            sidecar_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+        ).iter_errors(sidecar)
+    )
+    path = workflow_writer(
+        tmp_path / f"policy-{policy or 'empty'}",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        yaml.safe_dump(sidecar), encoding="utf-8"
+    )
+    try:
+        load_workflow(path)
+    except WorkflowValidationError:
+        runtime_accepted = False
+    else:
+        runtime_accepted = True
+
+    assert (schema_accepted, runtime_accepted) == (accepted, accepted)
+
+
+@pytest.mark.parametrize(
+    ("deadline", "accepted"),
+    [
+        ("PT1M", True),
+        ("P30D", True),
+        ("P29DT23H59M", True),
+        ("PT0H", False),
+        ("P31D", False),
+        ("P29DT99H", False),
+        ("P1DT24H", False),
+        ("P1DT", False),
+    ],
+)
+def test_assignment_deadline_generated_schema_and_runtime_are_strictly_equivalent(
+    workflow_writer, tmp_path, deadline, accepted
+):
+    sidecar = {
+        "outward_action_nodes": ["review"],
+        "assignments": {
+            "review": {
+                "endpoint": "hermes://local/reviewer",
+                "deadline": deadline,
+            }
+        },
+    }
+    schema_accepted = not list(
+        Draft202012Validator(
+            sidecar_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+        ).iter_errors(sidecar)
+    )
+    path = workflow_writer(
+        tmp_path / deadline,
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        yaml.safe_dump(sidecar), encoding="utf-8"
+    )
+    try:
+        load_workflow(path)
+    except WorkflowValidationError:
+        runtime_accepted = False
+    else:
+        runtime_accepted = True
+
+    assert (schema_accepted, runtime_accepted) == (accepted, accepted)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"credential": "secret"}, "unknown assignment field"),
+        ({"endpoint": "https://example.test/agent"}, "handoff endpoint"),
+        ({"endpoint": "HERMES://local/security-reviewer"}, "canonical handoff endpoint"),
+        ({"interaction_policy": "ask"}, "interaction_policy"),
+        ({"on_deadline": "keep_waiting"}, "on_deadline"),
+        ({"deadline": "P31D"}, "deadline"),
+        ({"deadline": "PT0H"}, "deadline"),
+        ({"deadline": "PT4H30S"}, "deadline"),
+    ],
+)
+def test_assignment_rejects_unknown_fields_nonlocal_endpoints_and_bad_policies(
+    workflow_writer, tmp_path, changes, message
+):
+    path = workflow_writer(
+        tmp_path / message,
+        nodes=[{"id": "review", "prompt": "Review this"}],
+    )
+    _write_assignment(path, **changes)
+
+    with pytest.raises(WorkflowValidationError, match=message):
+        load_workflow(path)
+
+
+@pytest.mark.parametrize(
+    ("nodes", "node_id", "outward", "options", "message"),
+    [
+        ([{"id": "review", "prompt": "Review"}], "missing", True, {}, "unknown node"),
+        ([{"id": "review", "bash": "true"}], "review", True, {}, "prompt node"),
+        (
+            [{"id": "review", "prompt": "Review"}],
+            "review",
+            False,
+            {},
+            "declared outward",
+        ),
+        (
+            [{"id": "review", "prompt": "Review", "context": "shared"}],
+            "review",
+            True,
+            {},
+            "shared or persisted",
+        ),
+        (
+            [{"id": "review", "prompt": "Review"}],
+            "review",
+            True,
+            {"persist_sessions": True},
+            "shared or persisted",
+        ),
+        (
+            [{"id": "review", "prompt": "Review", "persist_session": True}],
+            "review",
+            True,
+            {},
+            "shared or persisted",
+        ),
+    ],
+)
+def test_assignment_rejects_invalid_node_targets(
+    workflow_writer, tmp_path, nodes, node_id, outward, options, message
+):
+    path = workflow_writer(tmp_path / message, nodes=nodes, **options)
+    _write_assignment(path, node_id=node_id)
+    if not outward:
+        policy = yaml.safe_load(path.with_name(f"{path.stem}.hermes.yaml").read_text())
+        policy["outward_action_nodes"] = []
+        path.with_name(f"{path.stem}.hermes.yaml").write_text(
+            yaml.safe_dump(policy), encoding="utf-8"
+        )
+
+    with pytest.raises(WorkflowValidationError, match=message):
+        load_workflow(path)
+
+
+def test_assignment_rejects_loop_group_child(workflow_writer, tmp_path):
+    path = workflow_writer(
+        tmp_path / "loop-child",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "nodes": [{"id": "review", "prompt": "Review"}],
+                    "until": "done",
+                    "max_iterations": 1,
+                },
+            }
+        ],
+    )
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n"
+        "outward_action_nodes: [group/review]\n"
+        "assignments:\n"
+        "  group/review:\n"
+        "    endpoint: hermes://local/security-reviewer\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowValidationError, match="loop child"):
         load_workflow(path)
 
 

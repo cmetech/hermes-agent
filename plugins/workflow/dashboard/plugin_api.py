@@ -190,7 +190,7 @@ class WorkflowPendingInteractionProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[
-        "approval", "workflow_approval", "loop_input",
+        "approval", "workflow_approval", "handoff_input", "loop_input",
         "loop_signal_confirmation", "capability", "reconcile",
     ]
     interaction_id: str | None = Field(None, min_length=1, max_length=128)
@@ -553,7 +553,7 @@ class WorkflowAttentionInteractionProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[
-        "approval", "workflow_approval", "loop_input",
+        "approval", "workflow_approval", "handoff_input", "loop_input",
         "loop_signal_confirmation", "capability", "reconcile", "notification",
     ]
     interaction_id: str | None = Field(
@@ -572,6 +572,32 @@ class WorkflowAttentionInteractionProjection(BaseModel):
     kind: str | None = Field(None, exclude_if=lambda value: value is None)
 
 
+class WorkflowAttentionHandoffCommandsProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    show: str
+    evidence: str
+    reconcile: str
+
+
+class WorkflowAttentionHandoffProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    handoff_id: str
+    generation: StrictInt = Field(..., ge=1)
+    endpoint: str
+    node_id: str
+    phase: Literal[
+        "prepared", "submitted", "active", "needs_input", "cancelling",
+        "indeterminate", "succeeded", "failed", "cancelled",
+    ]
+    age_seconds: StrictInt = Field(..., ge=0)
+    last_successful_observation_at: str | None
+    next_action: Literal["inspect", "reconcile", "cancel", "wait"]
+    failure_code: str
+    commands: WorkflowAttentionHandoffCommandsProjection
+
+
 class WorkflowAttentionItemProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -579,13 +605,14 @@ class WorkflowAttentionItemProjection(BaseModel):
     workflow: str
     node_id: str | None
     kind: Literal[
-        "approval", "workflow_approval", "loop_input",
+        "approval", "workflow_approval", "handoff_input", "loop_input",
         "loop_signal_confirmation", "capability", "reconcile", "notification",
         "failure", "stalled",
     ]
     origin: str
     cause: str
     interaction: WorkflowAttentionInteractionProjection | None
+    handoff: WorkflowAttentionHandoffProjection | None = None
     status: Literal[
         "queued", "running", "waiting_retry", "recovery_pending", "paused",
         "interrupted", "succeeded", "failed", "cancelled", "abandoned",
@@ -1674,6 +1701,7 @@ class WorkflowNotificationInteractionProjection(BaseModel):
     type: Literal[
         "approval",
         "workflow_approval",
+        "handoff_input",
         "loop_input",
         "loop_signal_confirmation",
         "reconcile",
@@ -1736,6 +1764,7 @@ class WorkflowTransitionNotificationPayload(BaseModel):
         "coordinator_stalled",
         "workflow_approval_required",
         "node_approval_required",
+        "handoff_input_required",
         "loop_input_required",
         "loop_signal_confirmation_required",
         "run_paused",
@@ -2306,6 +2335,7 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
         if kind not in {
             "approval",
             "workflow_approval",
+            "handoff_input",
             "loop_input",
             "loop_signal_confirmation",
             "capability",
@@ -2548,6 +2578,11 @@ def attention(
                         "kind": fact["kind"],
                         "notification_id": fact["notification_id"],
                     },
+                    "handoff": (
+                        fact.get("payload", {}).get("handoff")
+                        if isinstance(fact.get("payload"), Mapping)
+                        else None
+                    ),
                     "status": run["status"],
                     "health": run["health"],
                     "next_actions": run["next_actions"],
@@ -2594,9 +2629,17 @@ def attention(
         }
         for item in page
     ]
+    safe_page = sanitize_projection(public_page)
+    for raw, safe in zip(public_page, safe_page, strict=True):
+        raw_handoff = raw.get("handoff")
+        safe_handoff = safe.get("handoff") if isinstance(safe, dict) else None
+        if isinstance(raw_handoff, Mapping) and isinstance(safe_handoff, dict):
+            commands = raw_handoff.get("commands")
+            if isinstance(commands, Mapping):
+                safe_handoff["commands"] = dict(commands)
     return {
         "schema_version": 1,
-        "items": sanitize_projection(public_page),
+        "items": safe_page,
         "next_cursor": next_cursor,
     }
 

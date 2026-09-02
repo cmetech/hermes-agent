@@ -7,11 +7,13 @@ import hashlib
 import json
 import shutil
 
+import pytest
 import yaml
 
 from cron.jobs import create_job, list_jobs
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.compat import assess_compatibility
+from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.showcase import (
     preflight_showcase,
@@ -81,6 +83,62 @@ def test_run_showcase_prepares_admission_while_materialized_bundle_is_alive(
         .joinpath("definition.yaml")
         .is_file()
     )
+
+
+def test_showcase_assignment_cannot_bypass_shared_profile_admission(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    template = tmp_path / "template"
+    workflow = workflow_writer(
+        template / "packages/assigned/workflows",
+        name="assigned-showcase",
+        filename="workflow.yaml",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    workflow.with_name(f"{workflow.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/default\n",
+        encoding="utf-8",
+    )
+    base = showcase_module.load_showcase_catalog()["resilience"]
+    scenario = replace(
+        base,
+        id="assigned-showcase",
+        workflow_path="packages/assigned/workflows/workflow.yaml",
+        package_digest=showcase_module._tree_digest(workflow.parent.parent),
+        capability_claims=(),
+    )
+
+    @contextmanager
+    def assigned_bundle(_explicit=None):
+        yield template
+
+    monkeypatch.setattr(
+        showcase_module,
+        "load_showcase_catalog",
+        lambda: {scenario.id: scenario},
+    )
+    monkeypatch.setattr(showcase_module, "_bundle_path", assigned_bundle)
+    monkeypatch.setattr(
+        showcase_module,
+        "preflight_showcase",
+        lambda *_args, **_kwargs: {"bundle_digest": "b" * 64},
+    )
+    home = tmp_path / "home"
+
+    with pytest.raises(WorkflowValidationError, match="workflow owner"):
+        run_showcase(
+            scenario.id,
+            hermes_home=home,
+            no_wait=True,
+            idempotency_key="assigned-showcase",
+        )
+
+    store = RunStore(home)
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
 
 
 def test_scheduling_requires_confirmation_and_preserves_unrelated_jobs(

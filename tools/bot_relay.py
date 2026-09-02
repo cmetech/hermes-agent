@@ -558,8 +558,10 @@ def _hermes_cli() -> str:
     return "hermes"
 
 
-def local_delivery_command(profile: str, query_file: str) -> list[str]:
-    """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
+def local_delivery_command(
+    profile: str, query_file: str, *, title: str = "Bot Chat"
+) -> list[str]:
+    """argv that delivers into ``profile``'s named chat on THIS gateway."""
     return [
         _hermes_cli(),
         "-p",
@@ -568,7 +570,7 @@ def local_delivery_command(profile: str, query_file: str) -> list[str]:
         "--in",
         "~",
         "-c",
-        "Bot Chat",
+        title,
         "--create-if-missing",
         "-Q",
         "--query-file",

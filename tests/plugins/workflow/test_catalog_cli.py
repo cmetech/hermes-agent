@@ -64,11 +64,13 @@ def test_list_catalog_has_stable_summary_without_bodies(workflow_writer, tmp_pat
         "topology_warnings",
         "requirements",
         "approvals",
+        "assignments",
         "schedules",
         "warnings",
         "next_actions",
     }
     assert entry["name"] == "cataloged"
+    assert entry["assignments"] == {}
     serialized = json.dumps(entry, sort_keys=True)
     assert "SECRET_" not in serialized
 

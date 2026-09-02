@@ -12,7 +12,7 @@ import sqlite3
 from typing import Literal, Mapping
 
 from hermes_cli.plugin_configuration import connector_capability_snapshot
-from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission import RunAdmissionRequest, workflow_profile_for_home
 from plugins.workflow.admission_service import assess_workflow_admission
 from plugins.workflow.coordinator_store import CoordinatorStore
 from plugins.workflow.entitlement import verified_showcase_run_metadata
@@ -491,6 +491,7 @@ def start_api_run(
         )
         prepared = store.prepare_run_snapshot(
             package,
+            initiator_profile=workflow_profile_for_home(home),
             compilation=phase4_compilation,
             values=values or None,
             verified_inputs=verified_inputs or None,

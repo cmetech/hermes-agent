@@ -10,8 +10,13 @@ from types import MappingProxyType
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.api_admission import ApiAdmissionAuthority, start_api_run
+from plugins.workflow.api_admission import (
+    ApiAdmissionAuthority,
+    ApiAdmissionError,
+    start_api_run,
+)
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.runner_binding import (
     assess_package_execution,
     background_execution_context,
@@ -36,6 +41,69 @@ from plugins.workflow.trust import (
     compute_package_digest,
 )
 import yaml
+
+
+def test_api_assignment_cannot_bypass_shared_profile_admission(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workdir = tmp_path / "project"
+    path = workflow_writer(
+        workdir / ".hermes/workflows",
+        name="api-self-assignment",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/default\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(path)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        compute_package_digest(package).sha256,
+        actor="api-assignment-test",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="api-assignment-test",
+            host_kind="web",
+            host_instance_id="api-assignment-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+
+    with pytest.raises(ApiAdmissionError) as caught:
+        start_api_run(
+            store,
+            hermes_home=home,
+            workdir=workdir,
+            user_home=tmp_path,
+            workflow_name=package.definition.name,
+            values={},
+            idempotency_key="api-self-assignment",
+            concurrency_policy="queue",
+            authority=ApiAdmissionAuthority(
+                principal="api-assignment-test",
+                namespace="api-assignment-test",
+                operator_scope=None,
+                source_instance="desktop:api-assignment-test",
+                assurance="local_admin_claim",
+                trigger_source="desktop",
+            ),
+            catalog_source="project",
+        )
+
+    assert caught.value.code == "workflow_invalid_definition"
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
 
 
 def test_api_v4_admission_assesses_child_executable_resources_from_compilation(

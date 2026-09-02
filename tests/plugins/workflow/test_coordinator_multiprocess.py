@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import multiprocessing
 import os
 from pathlib import Path
@@ -10,6 +11,13 @@ import threading
 import time
 
 from hermes_cli.plugin_services import BackgroundServiceContext
+from hermes_cli.handoff import (
+    AgentHandoffService,
+    ChannelObservation,
+    HandoffEndpoint,
+    HandoffSpec,
+    HandoffStore,
+)
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.admission import RunAdmissionRequest
@@ -76,6 +84,76 @@ def _race_retry_wake(home: str, run_id: str, due: str, barrier, results) -> None
         run_id, now=datetime.fromisoformat(due)
     )
     results.put(awakened)
+
+
+class _TerminalHandoffChannel:
+    def __init__(self, results, stop) -> None:
+        self.results = results
+        self.stop = stop
+
+    def observe(self, snapshot, *, budget_seconds: float):
+        self.results.put(
+            (snapshot.handoff_id, snapshot.handoff_key, budget_seconds)
+        )
+        self.stop.set()
+        text = "recovered"
+        return ChannelObservation(
+            phase="succeeded",
+            checkpoint=snapshot.checkpoint or {},
+            terminal_result={
+                "text": text,
+                "sha256": sha256(text.encode()).hexdigest(),
+                "media_type": "text/plain",
+                "size_bytes": len(text),
+            },
+        )
+
+
+def _resume_admitted_handoff(home: str, run_id: str, stop, results) -> None:
+    identity = _identity("replacement-handoff-leader")
+    handoff_store = HandoffStore(Path(home) / "handoffs.db")
+    handoff_service = AgentHandoffService(
+        handoff_store,
+        _TerminalHandoffChannel(results, stop),
+    )
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="replacement-handoff-host",
+        ),
+        hermes_home=Path(home),
+        heartbeat_seconds=0.1,
+        lease_seconds=3.0,
+        sweep_backoff_seconds=(0.02, 0.04, 0.08),
+    )
+
+    def scheduler_factory(store, *, fence):
+        scheduler = RunScheduler(
+            store,
+            execution_fence=fence,
+            handoff_service=handoff_service,
+        )
+        scheduler.submit = lambda *_args, **_kwargs: False
+        return scheduler
+
+    service._identity = lambda: identity
+    service._scheduler = scheduler_factory
+    try:
+        service.run(stop)
+        reopened = RunStore(Path(home))
+        projection = reopened.load_run(run_id)
+        lease = CoordinatorStore(reopened.database).observe(
+            now=datetime.now(timezone.utc)
+        )
+        results.put((
+            "coordinator",
+            stop.is_set(),
+            lease.owner_id if lease is not None else None,
+            lease.epoch if lease is not None else None,
+            projection["nodes"]["review"]["state"],
+        ))
+    finally:
+        handoff_store.close()
 
 
 def _run_blocked_old_epoch(
@@ -558,6 +636,151 @@ def test_due_retry_wake_has_one_multiprocess_winner_and_one_remaining_grant(
     assert grants == [1]
     assert completed["nodes"]["work"]["retry_consumed"] == 2
     assert len(completed["nodes"]["work"]["attempts"]) == 2
+
+
+def test_new_process_leader_reopens_and_resumes_exact_admitted_handoff(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "handoff-takeover-home"
+    path = workflow_writer(
+        tmp_path / "handoff-takeover-package",
+        name="handoff-takeover",
+        nodes=[{"id": "review", "prompt": "review"}],
+    )
+    package = load_workflow(path)
+    store = RunStore(home)
+    coordinator = CoordinatorStore(store.database)
+    original_identity = _identity("crashed-handoff-leader")
+    original = coordinator.try_acquire(
+        original_identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=0.2,
+    )
+    original_fence = ExecutionFence(
+        original_identity.owner_id,
+        original.lease.epoch,
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="api",
+            idempotency_key="handoff-takeover",
+            concurrency_key="handoff-takeover",
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    handoff_store = HandoffStore(home / "handoffs.db")
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="review",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"consumer": "workflow"},
+        required_capabilities=frozenset(),
+    )
+    handoff = handoff_store.create_or_get(
+        "default",
+        f"{admitted.run_id}:review:1",
+        spec,
+        spec.fingerprint,
+    )
+    handoff = handoff_store.bind(
+        handoff.handoff_id,
+        "runs",
+        {"profile": "reviewer", "mechanism": "runs"},
+        {},
+        handoff.state_version,
+    )
+    lease = handoff_store.claim_advance(
+        handoff.handoff_id,
+        "crashed-handoff-advance",
+        now=datetime.now(timezone.utc),
+        lease_seconds=5,
+    )
+    assert lease is not None
+    handoff_store.journal_attempt(lease, "submit")
+    handoff_store.commit_observation(
+        lease,
+        ChannelObservation(
+            phase="active",
+            checkpoint={"run_id": "remote-run-1"},
+            next_advance_at=datetime.now(timezone.utc),
+        ),
+    )
+    handoff_store.release_advance(
+        lease,
+        next_advance_at=datetime.now(timezone.utc),
+    )
+    handoff = handoff_store.get(handoff.handoff_id)
+    claim = store.claim_node(
+        admitted.run_id,
+        "review",
+        "crashed-handoff-worker",
+        execution_fence=original_fence,
+    )
+    assert claim is not None
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id=handoff.handoff_id,
+        generation=1,
+        observed_version=handoff.state_version,
+        observed_phase=handoff.phase,
+        next_observation_at=datetime.now(timezone.utc),
+        deadline_at=None,
+    )
+    handoff_store.close()
+
+    time.sleep(0.25)
+    context = multiprocessing.get_context("spawn")
+    stop = context.Event()
+    results = context.Queue()
+    replacement = context.Process(
+        target=_resume_admitted_handoff,
+        args=(str(home), admitted.run_id, stop, results),
+    )
+    replacement.start()
+    replacement.join(timeout=10)
+    assert replacement.exitcode == 0
+    observed = results.get(timeout=5)
+    assert observed[:2] == (
+        handoff.handoff_id,
+        f"{admitted.run_id}:review:1",
+    )
+    assert 0 < observed[2] <= 2
+    assert results.get(timeout=5) == (
+        "coordinator",
+        True,
+        "replacement-handoff-leader",
+        2,
+        "ready",
+    )
+
+    reopened_handoffs = HandoffStore(home / "handoffs.db")
+    try:
+        assert len(reopened_handoffs.list({}, limit=10, before=None)) == 1
+        resumed = reopened_handoffs.get(handoff.handoff_id)
+    finally:
+        reopened_handoffs.close()
+    assert resumed.phase == "succeeded"
+    projection = RunStore(home).load_run(admitted.run_id)
+    assert projection["nodes"]["review"]["state"] == "ready"
+    assert projection["nodes"]["review"]["handoff"] == {
+        "handoff_id": handoff.handoff_id,
+        "generation": 1,
+        "last_observed_version": resumed.state_version,
+        "last_observed_phase": "succeeded",
+        "next_observation_at": projection["nodes"]["review"]["handoff"][
+            "next_observation_at"
+        ],
+        "deadline_at": None,
+    }
 
 
 def test_foreground_owner_death_with_unresolved_outward_spawn_reconciles(

@@ -54,7 +54,7 @@ from plugins.workflow.compat import (
     assess_compatibility,
     require_runnable,
 )
-from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission import RunAdmissionRequest, workflow_profile_for_home
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     RunExecutionLimits,
@@ -197,6 +197,13 @@ def workflow_trigger_idempotency_key(
     return "cron:" + hashlib.sha256(material).hexdigest()
 
 
+def _assignment_projection(package: WorkflowPackage) -> dict[str, object]:
+    return {
+        str(node_id): dict(assignment)
+        for node_id, assignment in package.sidecar.get("assignments", {}).items()
+    }
+
+
 def _catalog_summary(
     package: WorkflowPackage, report: CompatibilityReport
 ) -> dict[str, object]:
@@ -217,6 +224,7 @@ def _catalog_summary(
         "approvals": [],
         "schedules": [],
         "warnings": [],
+        "assignments": _assignment_projection(package),
         "next_actions": ["show", "doctor"] if report.runnable else ["doctor"],
     }
 
@@ -589,6 +597,7 @@ def show_package(
             node.id for node in package.definition.nodes if node.node_type == "approval"
         ],
         "outward_action_nodes": list(package.sidecar.get("outward_action_nodes", ())),
+        "assignments": _assignment_projection(package),
         "required_tools": sorted(requested_tools),
         "required_skills": sorted(requested_skills),
         "required_mcp": sorted(requested_mcp),
@@ -2353,6 +2362,7 @@ def _cmd_run(
     )
     prepared = store.prepare_run_snapshot(
         package,
+        initiator_profile=workflow_profile_for_home(args.hermes_home),
         compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
         trusted_package_digest=(
