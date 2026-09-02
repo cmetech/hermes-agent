@@ -33,8 +33,19 @@ def _spec(**changes: object) -> HandoffSpec:
 def test_endpoint_parses_only_canonical_local_profile_uri():
     endpoint = _endpoint()
 
+    assert endpoint.kind == "local"
+    assert endpoint.peer is None
     assert endpoint.profile == "reviewer"
     assert endpoint.canonical == "hermes://local/reviewer"
+
+
+def test_endpoint_parses_only_canonical_registered_peer_profile_uri():
+    endpoint = HandoffEndpoint.parse("hermes://peer/review-host/qa_team")
+
+    assert endpoint.kind == "peer"
+    assert endpoint.peer == "review-host"
+    assert endpoint.profile == "qa_team"
+    assert endpoint.canonical == "hermes://peer/review-host/qa_team"
 
 
 @pytest.mark.parametrize("value", [
@@ -53,6 +64,19 @@ def test_endpoint_parses_only_canonical_local_profile_uri():
     "hermes://local/review%00er",
     "hermes://local/Reviewer",
     "hermes://local/reviewer%20",
+    "hermes://peer",
+    "hermes://peer/",
+    "hermes://peer/reviewer/",
+    "hermes://peer/Reviewer/qa",
+    "hermes://peer/reviewer/QA",
+    "hermes://peer/reviewer.example/qa",
+    "hermes://peer/reviewer/qa/extra",
+    "hermes://user@peer/reviewer/qa",
+    "hermes://peer:8080/reviewer/qa",
+    "hermes://peer/reviewer/qa?x=1",
+    "hermes://peer/reviewer/qa#fragment",
+    "hermes://peer/reviewer%2Fqa",
+    f"hermes://peer/{'a' * 65}/qa",
 ])
 def test_endpoint_rejects_every_noncanonical_or_unsafe_form(value: str):
     with pytest.raises(ValueError):
@@ -96,6 +120,26 @@ def test_spec_normalizes_aware_deadline_and_freezes_semantic_values():
 def test_spec_rejects_invalid_task_contract_inputs(changes: dict[str, object]):
     with pytest.raises(ValueError):
         _spec(**changes)
+
+
+def test_spec_accepts_closed_stage_two_capabilities():
+    spec = _spec(
+        required_capabilities={
+            "approval",
+            "cancellation",
+            "follow_up",
+            "steering",
+            "structured_output",
+        }
+    )
+
+    assert spec.required_capabilities == frozenset({
+        "approval",
+        "cancellation",
+        "follow_up",
+        "steering",
+        "structured_output",
+    })
 
 
 def test_spec_reuses_bounded_structured_output_normalization():
@@ -257,3 +301,131 @@ def test_snapshot_and_observation_accept_closed_stage_one_facts_immutably():
 
     assert snapshot.terminal_result["text"] == "answer"
     assert observation.terminal_result["text"] == "answer"
+
+
+def test_snapshot_accepts_closed_peer_binding_and_pending_approval_facts():
+    binding = {
+        "peer": "review-host",
+        "profile": "qa_team",
+        "mechanism": "peer_runs",
+        "capabilities": [
+            "steering",
+            "durable_admission",
+            "approval",
+            "authoritative_status",
+            "cancellation",
+            "follow_up",
+        ],
+        "origin_sha256": "a" * 64,
+        "auth_scope_sha256": "b" * 64,
+    }
+    checkpoint = {
+        "run_id": "run-1",
+        "approval_request_id": "approval-1",
+        "approval_choices": ["deny", "once", "always", "session"],
+    }
+    snapshot = HandoffSnapshot(
+        "id",
+        "scope",
+        "key",
+        _spec(endpoint=HandoffEndpoint.parse("hermes://peer/review-host/qa_team")),
+        "f",
+        "needs_input",
+        1,
+        mechanism="peer_runs",
+        binding=binding,
+        checkpoint=checkpoint,
+    )
+
+    binding["peer"] = "changed"
+    checkpoint["approval_request_id"] = "changed"
+
+    assert snapshot.binding == {
+        "auth_scope_sha256": "b" * 64,
+        "capabilities": (
+            "approval",
+            "authoritative_status",
+            "cancellation",
+            "durable_admission",
+            "follow_up",
+            "steering",
+        ),
+        "mechanism": "peer_runs",
+        "origin_sha256": "a" * 64,
+        "peer": "review-host",
+        "profile": "qa_team",
+    }
+    assert snapshot.checkpoint["approval_request_id"] == "approval-1"
+    assert snapshot.checkpoint["approval_choices"] == (
+        "once",
+        "session",
+        "always",
+        "deny",
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (
+            "binding",
+            {
+                "peer": "Review-Host",
+                "profile": "qa_team",
+                "mechanism": "peer_runs",
+                "capabilities": ["durable_admission", "authoritative_status"],
+                "origin_sha256": "a" * 64,
+                "auth_scope_sha256": "b" * 64,
+            },
+        ),
+        (
+            "binding",
+            {
+                "peer": "review-host",
+                "profile": "qa_team",
+                "mechanism": "peer_runs",
+                "capabilities": ["raw_remote_shell"],
+                "origin_sha256": "a" * 64,
+                "auth_scope_sha256": "b" * 64,
+            },
+        ),
+        (
+            "binding",
+            {
+                "peer": "review-host",
+                "profile": "qa_team",
+                "mechanism": "peer_runs",
+                "capabilities": ["durable_admission", "authoritative_status"],
+                "origin_sha256": "A" * 64,
+                "auth_scope_sha256": "b" * 64,
+            },
+        ),
+        (
+            "checkpoint",
+            {
+                "approval_request_id": "approval-1",
+            },
+        ),
+        (
+            "checkpoint",
+            {
+                "approval_request_id": "approval-1",
+                "approval_choices": ["once", "ask"],
+            },
+        ),
+    ],
+)
+def test_snapshot_rejects_noncontract_peer_facts(
+    field: str, value: dict[str, object]
+):
+    with pytest.raises(ValueError):
+        HandoffSnapshot(
+            "id",
+            "scope",
+            "key",
+            _spec(),
+            "f",
+            "prepared",
+            0,
+            **{field: value},
+        )

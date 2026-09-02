@@ -1,4 +1,4 @@
-"""Consumer-neutral local handoff value objects."""
+"""Consumer-neutral handoff value objects."""
 
 from __future__ import annotations
 
@@ -20,7 +20,26 @@ HANDOFF_PHASES = frozenset({
     "prepared", "submitted", "active", "needs_input", "cancelling",
     "indeterminate", "succeeded", "failed", "cancelled",
 })
-_SUPPORTED_CAPABILITIES = frozenset({"structured_output", "cancellation"})
+_SUPPORTED_CAPABILITIES = frozenset({
+    "approval",
+    "cancellation",
+    "follow_up",
+    "steering",
+    "structured_output",
+})
+_CHANNEL_CAPABILITIES = frozenset({
+    "approval",
+    "authoritative_status",
+    "cancellation",
+    "durable_admission",
+    "follow_up",
+    "steering",
+})
+_REQUIRED_PEER_CAPABILITIES = frozenset({
+    "authoritative_status",
+    "durable_admission",
+})
+_APPROVAL_CHOICES = ("once", "session", "always", "deny")
 _MAX_PROMPT_BYTES = 500_000
 _MAX_ATTRIBUTION_ITEMS = 64
 _MAX_ATTRIBUTION_BYTES = 16_384
@@ -28,14 +47,26 @@ _CREDENTIAL_KEY_PARTS = (
     "api_key", "authorization", "bearer", "credential", "password", "secret", "token",
 )
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_PEER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_CHECKPOINT_IDENTIFIERS = frozenset({"session_id", "run_id", "idempotency_key", "status"})
+_CHECKPOINT_IDENTIFIERS = frozenset({
+    "approval_request_id",
+    "session_id",
+    "run_id",
+    "idempotency_key",
+    "status",
+})
 _CHECKPOINT_SHA256 = frozenset({
     "request_sha256", "process_command_sha256", "receipt_sha256", "output_sha256",
     "stdout_sha256", "stderr_sha256",
 })
 _CHECKPOINT_INTEGERS = frozenset({"process_pid", "receipt_version", "exit_code", "cursor", "version"})
-_CHECKPOINT_KEYS = _CHECKPOINT_IDENTIFIERS | _CHECKPOINT_SHA256 | _CHECKPOINT_INTEGERS | {"process_started_at"}
+_CHECKPOINT_KEYS = (
+    _CHECKPOINT_IDENTIFIERS
+    | _CHECKPOINT_SHA256
+    | _CHECKPOINT_INTEGERS
+    | {"approval_choices", "process_started_at"}
+)
 _MAX_FACT_INTEGER = 2**63 - 1
 
 
@@ -58,10 +89,22 @@ def _safe_identifier(value: object) -> bool:
 def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
     if value is None:
         return None
-    if not isinstance(value, Mapping) or set(value) not in (set(), {"profile", "mechanism"}):
+    if not isinstance(value, Mapping):
         raise ValueError("handoff binding is invalid")
     if not value:
         return MappingProxyType({})
+    keys = set(value)
+    local_keys = {"profile", "mechanism"}
+    peer_keys = {
+        "auth_scope_sha256",
+        "capabilities",
+        "mechanism",
+        "origin_sha256",
+        "peer",
+        "profile",
+    }
+    if keys not in (local_keys, peer_keys):
+        raise ValueError("handoff binding is invalid")
     profile, mechanism = value["profile"], value["mechanism"]
     if not isinstance(profile, str) or not _safe_identifier(mechanism):
         raise ValueError("handoff binding is invalid")
@@ -69,7 +112,36 @@ def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, objec
         validate_profile_name(profile)
     except ValueError as exc:
         raise ValueError("handoff binding is invalid") from exc
-    return MappingProxyType({"profile": profile, "mechanism": mechanism})
+    if keys == local_keys:
+        return MappingProxyType({"profile": profile, "mechanism": mechanism})
+
+    peer = value["peer"]
+    capabilities = value["capabilities"]
+    origin_sha256 = value["origin_sha256"]
+    auth_scope_sha256 = value["auth_scope_sha256"]
+    if (
+        not isinstance(peer, str)
+        or not _PEER_NAME.fullmatch(peer)
+        or mechanism != "peer_runs"
+        or not isinstance(capabilities, list | tuple | set | frozenset)
+        or not capabilities
+        or not all(isinstance(item, str) for item in capabilities)
+        or not frozenset(capabilities) <= _CHANNEL_CAPABILITIES
+        or not _REQUIRED_PEER_CAPABILITIES <= frozenset(capabilities)
+        or not isinstance(origin_sha256, str)
+        or not _SHA256.fullmatch(origin_sha256)
+        or not isinstance(auth_scope_sha256, str)
+        or not _SHA256.fullmatch(auth_scope_sha256)
+    ):
+        raise ValueError("handoff binding is invalid")
+    return _freeze({
+        "peer": peer,
+        "profile": profile,
+        "mechanism": mechanism,
+        "capabilities": sorted(frozenset(capabilities)),
+        "origin_sha256": origin_sha256,
+        "auth_scope_sha256": auth_scope_sha256,
+    })  # type: ignore[return-value]
 
 
 def _normalize_checkpoint(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
@@ -77,6 +149,7 @@ def _normalize_checkpoint(value: Mapping[str, object] | None) -> Mapping[str, ob
         return None
     if not isinstance(value, Mapping) or not set(value) <= _CHECKPOINT_KEYS:
         raise ValueError("handoff checkpoint is invalid")
+    normalized = dict(value)
     for key, item in value.items():
         if key in _CHECKPOINT_IDENTIFIERS and not _safe_identifier(item):
             raise ValueError("handoff checkpoint is invalid")
@@ -90,7 +163,23 @@ def _normalize_checkpoint(value: Mapping[str, object] | None) -> Mapping[str, ob
             isinstance(item, bool) or not isinstance(item, int | float) or not math.isfinite(item) or item < 0
         ):
             raise ValueError("handoff checkpoint is invalid")
-    return _freeze(value)
+    has_approval_id = "approval_request_id" in value
+    has_approval_choices = "approval_choices" in value
+    if has_approval_id != has_approval_choices:
+        raise ValueError("handoff checkpoint is invalid")
+    if has_approval_choices:
+        choices = value["approval_choices"]
+        if (
+            not isinstance(choices, list | tuple | set | frozenset)
+            or not choices
+            or not all(isinstance(item, str) for item in choices)
+            or not frozenset(choices) <= frozenset(_APPROVAL_CHOICES)
+        ):
+            raise ValueError("handoff checkpoint is invalid")
+        normalized["approval_choices"] = [
+            choice for choice in _APPROVAL_CHOICES if choice in choices
+        ]
+    return _freeze(normalized)
 
 
 def _normalize_terminal_result(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
@@ -134,6 +223,11 @@ def _timestamp(value: datetime | None) -> str | None:
 class HandoffEndpoint:
     canonical: str
     profile: str
+    peer: str | None = None
+
+    @property
+    def kind(self) -> Literal["local", "peer"]:
+        return "peer" if self.peer is not None else "local"
 
     @classmethod
     def parse(cls, value: str) -> "HandoffEndpoint":
@@ -143,21 +237,27 @@ class HandoffEndpoint:
             parsed = urlsplit(value)
         except ValueError as exc:
             raise ValueError("handoff endpoint must be canonical") from exc
-        if (
-            parsed.scheme != "hermes"
-            or parsed.netloc != "local"
-            or "?" in value
-            or "#" in value
-            or not parsed.path.startswith("/")
-            or parsed.path.count("/") != 1
-        ):
-            raise ValueError("handoff endpoint must be hermes://local/<profile>")
-        profile = parsed.path[1:]
+        if parsed.scheme != "hermes" or "?" in value or "#" in value:
+            raise ValueError("handoff endpoint must be canonical")
+        parts = parsed.path.split("/")
+        peer = None
+        if parsed.netloc == "local" and len(parts) == 2:
+            profile = parts[1]
+            canonical = f"hermes://local/{profile}"
+        elif parsed.netloc == "peer" and len(parts) == 3:
+            peer, profile = parts[1:]
+            if not _PEER_NAME.fullmatch(peer):
+                raise ValueError("handoff endpoint peer is invalid")
+            canonical = f"hermes://peer/{peer}/{profile}"
+        else:
+            raise ValueError("handoff endpoint must be canonical")
         try:
             validate_profile_name(profile)
         except ValueError as exc:
             raise ValueError("handoff endpoint profile is invalid") from exc
-        return cls(canonical=f"hermes://local/{profile}", profile=profile)
+        if value != canonical:
+            raise ValueError("handoff endpoint must be canonical")
+        return cls(canonical=canonical, profile=profile, peer=peer)
 
 
 @dataclass(frozen=True, slots=True)
