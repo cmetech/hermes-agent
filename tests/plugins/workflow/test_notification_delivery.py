@@ -332,6 +332,57 @@ def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkey
     assert outbox.history(run_id="run-api")[0]["state"] == "delivered"
 
 
+def test_attention_api_includes_safe_handoff_evidence_commands(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    home = tmp_path / "handoff-attention-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = RunStore(home)
+    run_id = _terminal_run(
+        store,
+        tmp_path,
+        workflow_writer,
+        name="handoff-attention-api",
+    )
+    NotificationOutbox(store).record(
+        run_id=run_id,
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=9,
+        payload={
+            "workflow": "handoff-attention-api",
+            "status": "running",
+            "event_type": "handoff_indeterminate",
+            "node_id": "review",
+            "handoff": {
+                "handoff_id": "handoff-api-1",
+                "endpoint": "hermes://local/reviewer",
+                "phase": "indeterminate",
+                "age_seconds": 15,
+                "last_successful_observation_at": "2026-09-01T12:00:00+00:00",
+                "next_action": "reconcile",
+                "failure_code": "cancellation_indeterminate",
+            },
+        },
+    )
+
+    response = TestClient(_app(_module().router, local_admin=True)).get(
+        "/api/plugins/workflow/attention"
+    )
+
+    assert response.status_code == 200
+    item = next(
+        candidate
+        for candidate in response.json()["items"]
+        if candidate.get("handoff", {}).get("handoff_id") == "handoff-api-1"
+    )
+    assert item["handoff"]["commands"] == {
+        "show": "hermes handoff show handoff-api-1",
+        "evidence": "hermes handoff evidence handoff-api-1",
+        "reconcile": "hermes handoff reconcile handoff-api-1",
+    }
+
+
 def test_desktop_projection_failure_retains_fixed_fallback_reason(
     tmp_path, monkeypatch
 ) -> None:

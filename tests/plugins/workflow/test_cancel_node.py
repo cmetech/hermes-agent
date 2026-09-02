@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
+import os
 import sys
 import threading
 import time
@@ -10,10 +11,17 @@ import time
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.handoff import (
+    AdvanceResult,
+    HandoffEndpoint,
+    HandoffSnapshot,
+    HandoffSpec,
+)
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.executors.base import NodeExecutionContext
 from plugins.workflow.executors.cancel import CancelExecutor
-from plugins.workflow.models import WorkflowNode, freeze_value
+from plugins.workflow.models import ExecutionFence, WorkflowNode, freeze_value
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
@@ -41,6 +49,482 @@ def _start(store: RunStore, package, *, key: str = "cancel-test"):
         ),
         immutable_snapshot=prepared,
     )
+
+
+def _wait_on_handoff(
+    store: RunStore,
+    package,
+    *,
+    handoff_id: str = "handoff-cancel",
+    next_observation_at: datetime | None = None,
+    deadline_at: datetime | None = None,
+):
+    admitted = _start(store, package)
+    claim = store.claim_node(admitted.run_id, "start", "handoff-worker")
+    assert claim is not None
+    now = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    next_observation_at = next_observation_at or now
+    deadline_at = deadline_at or now + timedelta(hours=1)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id=handoff_id,
+        generation=1,
+        observed_version=3,
+        observed_phase="active",
+        next_observation_at=next_observation_at,
+        deadline_at=deadline_at,
+    )
+    return admitted.run_id
+
+
+def test_cancel_waiting_handoff_records_one_stable_command_and_waits_for_truth(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="cancel-handoff",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+
+    first = store.cancel_run(run_id)
+    second = RunStore(store.hermes_home).cancel_run(run_id)
+
+    assert first["status"] == second["status"] == "running"
+    assert first["desired_status"] == second["desired_status"] == "cancelled"
+    assert first["cancellation_outcome"] == second["cancellation_outcome"] == (
+        "cancelling"
+    )
+    node = second["nodes"]["start"]
+    assert node["state"] == "waiting_handoff"
+    assert node["handoff_cancel"] == {
+        "command_id": f"workflow-{run_id}-start-1-cancel",
+        "state": "pending",
+    }
+    assert [
+        event["event_type"]
+        for event in store.tail_events(run_id)
+        if event["event_type"] == "handoff_cancelling"
+    ] == ["handoff_cancelling"]
+    event_types = [event["event_type"] for event in store.tail_events(run_id)]
+    assert "handoff_admitted" in event_types
+    assert "handoff_active" in event_types
+
+
+def test_coordinator_records_cancel_command_before_delivering_it(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="deliver-handoff-cancel",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="cancel-coordinator",
+        host_kind="gateway",
+        host_instance_id="cancel-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="delegate",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"consumer": "workflow"},
+        required_capabilities=frozenset(),
+    )
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def command(self, handoff_id, kind, *, command_id, actor):
+            self.calls.append(("command", handoff_id, kind, command_id, actor))
+
+        def advance(self, handoff_id, *, budget_seconds):
+            self.calls.append(("advance", handoff_id))
+            return AdvanceResult(
+                HandoffSnapshot(
+                    handoff_id=handoff_id,
+                    key_scope="default",
+                    handoff_key=f"{run_id}:start:1",
+                    spec=spec,
+                    spec_fingerprint=spec.fingerprint,
+                    phase="cancelling",
+                    state_version=4,
+                    next_advance_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+                ),
+                "cancel",
+                True,
+            )
+
+    service = Service()
+    store.cancel_run(run_id)
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+    )
+    try:
+        scheduler.advance_due_handoffs(
+            run_id,
+            deadline=time.monotonic() + 2,
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    command_id = f"workflow-{run_id}-start-1-cancel"
+    assert service.calls == [
+        ("command", "handoff-cancel", "cancel", command_id, "workflow"),
+        ("advance", "handoff-cancel"),
+    ]
+    assert store.load_run(run_id)["nodes"]["start"]["handoff_cancel"] == {
+        "command_id": command_id,
+        "state": "recorded",
+    }
+
+
+def test_coordinator_delivers_deadline_cancel_before_a_later_poll(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="deadline-before-poll",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    observed = datetime(2026, 9, 1, 14, tzinfo=timezone.utc)
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(
+        store,
+        package,
+        next_observation_at=observed + timedelta(hours=1),
+        deadline_at=observed - timedelta(seconds=1),
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="deadline-coordinator",
+        host_kind="gateway",
+        host_instance_id="deadline-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=observed,
+        lease_seconds=30,
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="delegate",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"consumer": "workflow"},
+        required_capabilities=frozenset(),
+    )
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def command(self, handoff_id, kind, *, command_id, actor):
+            self.calls.append(("command", handoff_id, kind, command_id, actor))
+
+        def advance(self, handoff_id, *, budget_seconds):
+            self.calls.append(("advance", handoff_id))
+            return AdvanceResult(
+                HandoffSnapshot(
+                    handoff_id=handoff_id,
+                    key_scope="default",
+                    handoff_key=f"{run_id}:start:1",
+                    spec=spec,
+                    spec_fingerprint=spec.fingerprint,
+                    phase="cancelling",
+                    state_version=4,
+                    next_advance_at=observed + timedelta(seconds=5),
+                ),
+                "cancel",
+                True,
+            )
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: observed,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=time.monotonic() + 2,
+        ) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    command_id = f"workflow-{run_id}-start-1-deadline-cancel"
+    assert service.calls == [
+        ("command", "handoff-cancel", "cancel", command_id, "workflow"),
+        ("advance", "handoff-cancel"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("phase", "run_status", "node_status"),
+    (("cancelled", "cancelled", "cancelled"), ("failed", "failed", "failed")),
+)
+def test_cancel_handoff_terminal_truth_wins_the_race(
+    tmp_path: Path,
+    workflow_writer,
+    phase: str,
+    run_status: str,
+    node_status: str,
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name=f"handoff-{phase}",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+    store.cancel_run(run_id)
+
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase=phase,
+        next_observation_at=datetime.now(timezone.utc),
+    )
+
+    projection = store.load_run(run_id)
+    assert projection["status"] == run_status
+    assert projection.get("desired_status") is None
+    assert projection["nodes"]["start"]["state"] == node_status
+
+
+def test_cancel_waits_for_authoritative_truth_from_every_handoff(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="cancel-two-handoffs",
+            nodes=[
+                {"id": "start", "prompt": "delegate one"},
+                {"id": "other", "prompt": "delegate two"},
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    admitted = _start(store, package)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    for index, node_id in enumerate(("start", "other"), start=1):
+        claim = store.claim_node(admitted.run_id, node_id, f"worker-{index}")
+        assert claim is not None
+        assert store.begin_handoff_wait(
+            claim,
+            handoff_id=f"handoff-{node_id}",
+            generation=1,
+            observed_version=3,
+            observed_phase="active",
+            next_observation_at=observed,
+            deadline_at=observed + timedelta(hours=1),
+        )
+    store.cancel_run(admitted.run_id)
+
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "start",
+        handoff_id="handoff-start",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="cancelled",
+        next_observation_at=observed,
+    )
+    partial = store.load_run(admitted.run_id)
+    assert partial["status"] == "running"
+    assert partial["desired_status"] == "cancelled"
+    assert partial["nodes"]["start"]["state"] == "cancelled"
+    assert partial["nodes"]["other"]["state"] == "waiting_handoff"
+
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "other",
+        handoff_id="handoff-other",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="cancelled",
+        next_observation_at=observed,
+    )
+    final = store.load_run(admitted.run_id)
+    assert final["status"] == "cancelled"
+    assert final.get("desired_status") is None
+
+
+def test_indeterminate_cancel_stays_nonterminal_and_actionable(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="handoff-indeterminate",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+    store.cancel_run(run_id)
+
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="indeterminate",
+        next_observation_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+
+    projection = store.load_run(run_id)
+    assert projection["status"] == "running"
+    assert projection["desired_status"] == "cancelled"
+    assert projection["nodes"]["start"]["state"] == "waiting_handoff"
+    assert any(
+        event["event_type"] == "handoff_indeterminate"
+        for event in store.tail_events(run_id)
+    )
+
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=4,
+        observed_version=5,
+        observed_phase="cancelling",
+        next_observation_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    assert any(
+        event["event_type"] == "handoff_reconciled"
+        for event in store.tail_events(run_id)
+    )
+
+
+def test_success_before_cancel_is_validated_then_blocks_downstream(
+    tmp_path: Path, workflow_writer
+) -> None:
+    marker = tmp_path / "downstream-must-not-run"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="handoff-success-race",
+            nodes=[
+                {"id": "start", "prompt": "delegate"},
+                {
+                    "id": "after",
+                    "bash": f"touch {marker}",
+                    "depends_on": ["start"],
+                },
+            ],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+    store.cancel_run(run_id)
+    assert store.refresh_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-cancel",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="succeeded",
+        next_observation_at=datetime.now(timezone.utc),
+    )
+
+    claim = store.claim_node(run_id, "start", "validator")
+    assert claim is not None
+    store.mark_node_started(claim)
+    store.complete_node(
+        claim,
+        status="succeeded",
+        metadata={"handoff_id": "handoff-cancel", "validated": True},
+    )
+
+    projection = store.load_run(run_id)
+    assert projection["status"] == "cancelled"
+    assert projection["desired_status"] is None
+    assert projection["nodes"]["start"]["state"] == "succeeded"
+    assert projection["nodes"]["after"]["state"] == "cancelled"
+    assert not marker.exists()
+
+
+def test_handoff_deadline_uses_the_same_idempotent_cancel_intent(
+    tmp_path: Path, workflow_writer
+) -> None:
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "package",
+            name="handoff-deadline",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    store = RunStore(tmp_path / "home")
+    run_id = _wait_on_handoff(store, package)
+
+    first = store.request_handoff_cancel(
+        run_id,
+        "start",
+        reason_code="deadline_exceeded",
+    )
+    second = store.request_handoff_cancel(
+        run_id,
+        "start",
+        reason_code="deadline_exceeded",
+    )
+
+    assert first == second == f"workflow-{run_id}-start-1-deadline-cancel"
+    projection = store.load_run(run_id)
+    assert projection["status"] == "running"
+    assert projection.get("desired_status") is None
+    assert projection["nodes"]["start"]["handoff_cancel"] == {
+        "command_id": first,
+        "state": "pending",
+        "reason_code": "deadline_exceeded",
+    }
+    assert [
+        event["event_type"]
+        for event in store.tail_events(run_id)
+        if event["event_type"] == "handoff_deadline_exceeded"
+    ] == ["handoff_deadline_exceeded"]
 
 
 def test_cancel_executor_returns_typed_reason_without_allocating_process(

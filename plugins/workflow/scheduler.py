@@ -1152,7 +1152,7 @@ class RunScheduler:
         nodes = projection.get("nodes")
         if not isinstance(nodes, Mapping):
             return 0, 0, 0
-        due: list[tuple[str, HandoffWaitProjection]] = []
+        due: list[tuple[str, HandoffWaitProjection, str | None]] = []
         for node_id, node in sorted(nodes.items()):
             if not isinstance(node, Mapping) or node.get("state") != "waiting_handoff":
                 continue
@@ -1160,14 +1160,27 @@ class RunScheduler:
                 wait = HandoffWaitProjection.from_durable_record(node.get("handoff"))
             except ValueError:
                 continue
-            if wait.next_observation_at <= observed:
-                due.append((str(node_id), wait))
+            cancel = node.get("handoff_cancel")
+            command_id = (
+                str(cancel["command_id"])
+                if isinstance(cancel, Mapping)
+                and cancel.get("state") in {"pending", "recorded"}
+                and isinstance(cancel.get("command_id"), str)
+                else None
+            )
+            deadline_due = (
+                command_id is None
+                and wait.deadline_at is not None
+                and wait.deadline_at <= observed
+            )
+            if wait.next_observation_at <= observed or deadline_due:
+                due.append((str(node_id), wait, command_id))
                 if len(due) == max_items:
                     break
 
         attempted = deferred = terminal = 0
         service = self._handoff_service_instance() if due else None
-        for node_id, wait in due:
+        for node_id, wait, cancel_command_id in due:
             if self._shutdown.is_set():
                 break
             remaining = deadline - self._monotonic()
@@ -1180,6 +1193,31 @@ class RunScheduler:
                 break
             attempted += 1
             try:
+                if (
+                    cancel_command_id is None
+                    and wait.deadline_at is not None
+                    and wait.deadline_at <= observed
+                ):
+                    cancel_command_id = self.store.request_handoff_cancel(
+                        run_id,
+                        node_id,
+                        reason_code="deadline_exceeded",
+                    )
+                if cancel_command_id is not None:
+                    service.command(
+                        wait.handoff_id,
+                        "cancel",
+                        command_id=cancel_command_id,
+                        actor="workflow",
+                    )
+                    if not self.store.mark_handoff_cancel_recorded(
+                        run_id,
+                        node_id,
+                        handoff_id=wait.handoff_id,
+                        generation=wait.generation,
+                        command_id=cancel_command_id,
+                    ):
+                        raise RuntimeError("handoff cancel projection conflict")
                 result = service.advance(
                     wait.handoff_id,
                     budget_seconds=remaining,
@@ -5125,7 +5163,21 @@ class RunScheduler:
                 )
             else:
                 self.store.mark_node_started(claim)
-                if node.node_type != "cancel" and self._cancelled(run_id):
+                handoff_resolution = bool(
+                    isinstance(assignment, Mapping)
+                    and isinstance(
+                        self._work_item_state(projection, work_item), Mapping
+                    )
+                    and self._work_item_state(projection, work_item).get(
+                        "handoff_resolution_pending"
+                    )
+                    is True
+                )
+                if (
+                    node.node_type != "cancel"
+                    and self._cancelled(run_id)
+                    and not handoff_resolution
+                ):
                     self._persist_result(
                         claim,
                         node,

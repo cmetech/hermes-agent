@@ -11,7 +11,7 @@ import pytest
 from agent.plugin_agent import PluginAgentRunResult
 from hermes_cli.plugin_services import BackgroundServiceContext
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
-from plugins.workflow.notifications import NotificationOutbox
+from plugins.workflow.notifications import NotificationOutbox, notification_kind
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
@@ -97,6 +97,171 @@ def test_outbox_lease_requires_electron_ack_and_survives_restart(tmp_path):
     assert restarted.ack(notification_id, owner_id="electron-b", now=now) is False
     assert restarted.ack(notification_id, owner_id="electron-a", now=now) is True
     assert restarted.pending_attention(run_id="run-1") == ()
+
+
+def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
+    store = RunStore(tmp_path / "handoff-attention")
+    outbox = NotificationOutbox(store)
+    canary = "Bearer secret prompt body /Users/private/task.txt"
+    payload = {
+        "workflow": "review",
+        "status": "running",
+        "event_type": "handoff_indeterminate",
+        "node_id": "review",
+        "handoff": {
+            "handoff_id": "handoff-1",
+            "endpoint": "hermes://local/reviewer",
+            "phase": "indeterminate",
+            "age_seconds": 90,
+            "last_successful_observation_at": "2026-09-01T12:00:00+00:00",
+            "next_action": "reconcile",
+            "failure_code": "cancellation_indeterminate",
+        },
+        "prompt": canary,
+        "raw_error": canary,
+        "headers": {"Authorization": canary},
+    }
+
+    notification_id = outbox.record(
+        run_id="handoff-run",
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=4,
+        payload=payload,
+    )
+
+    item = outbox.pending_attention(run_id="handoff-run")[0]
+    assert item["notification_id"] == notification_id
+    assert item["payload"]["handoff"] == {
+        "handoff_id": "handoff-1",
+        "endpoint": "hermes://local/reviewer",
+        "node_id": "review",
+        "phase": "indeterminate",
+        "age_seconds": 90,
+        "last_successful_observation_at": "2026-09-01T12:00:00+00:00",
+        "next_action": "reconcile",
+        "failure_code": "cancellation_indeterminate",
+        "commands": {
+            "show": "hermes handoff show handoff-1",
+            "evidence": "hermes handoff evidence handoff-1",
+            "reconcile": "hermes handoff reconcile handoff-1",
+        },
+    }
+    assert canary not in json.dumps(item, sort_keys=True)
+    assert notification_kind("handoff_active", payload) is None
+    assert notification_kind("handoff_indeterminate", payload) == (
+        "reconciliation_required"
+    )
+
+    newer_id = outbox.record(
+        run_id="handoff-run",
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=5,
+        payload={
+            **payload,
+            "handoff": {**payload["handoff"], "handoff_id": "handoff-2"},
+        },
+    )
+    assert outbox.clear_handoff_attention(
+        run_id="handoff-run",
+        node_id="review",
+        handoff_id="handoff-1",
+    ) == 1
+    assert [
+        item["notification_id"]
+        for item in outbox.pending_attention(run_id="handoff-run")
+    ] == [newer_id]
+    assert outbox.history(run_id="handoff-run")[0]["state"] == "pending"
+
+
+def test_journal_reconciliation_clears_deferred_terminal_handoff_attention(
+    tmp_path, workflow_writer
+) -> None:
+    store = RunStore(tmp_path / "handoff-terminal-repair")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "handoff-package",
+            name="handoff-terminal-repair",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="handoff-terminal-repair",
+            concurrency_key=package.definition.name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "start", "handoff-worker")
+    assert claim is not None
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-terminal-repair",
+        generation=1,
+        observed_version=3,
+        observed_phase="active",
+        next_observation_at=observed,
+        deadline_at=observed + timedelta(hours=1),
+    )
+    outbox = NotificationOutbox(store)
+    outbox.record(
+        run_id=admitted.run_id,
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=3,
+        payload={
+            "workflow": package.definition.name,
+            "status": "running",
+            "event_type": "handoff_indeterminate",
+            "node_id": "start",
+            "handoff": {
+                "handoff_id": "handoff-terminal-repair",
+                "endpoint": "hermes://local/reviewer",
+                "phase": "indeterminate",
+                "age_seconds": 1,
+                "last_successful_observation_at": observed.isoformat(),
+                "next_action": "reconcile",
+                "failure_code": "cancellation_indeterminate",
+            },
+        },
+        now=observed,
+    )
+    identity = CoordinatorIdentity(
+        owner_id="terminal-repair-owner",
+        host_kind="web",
+        host_instance_id="terminal-repair-host",
+        pid=1,
+        process_start_time=None,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert leadership.is_leader
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "start",
+        handoff_id="handoff-terminal-repair",
+        generation=1,
+        expected_observed_version=3,
+        observed_version=4,
+        observed_phase="succeeded",
+        next_observation_at=observed,
+        fence=ExecutionFence(identity.owner_id, leadership.lease.epoch),
+    )
+
+    assert len(outbox.pending_attention(run_id=admitted.run_id)) == 1
+    assert outbox.reconcile_run(admitted.run_id) >= 1
+    assert outbox.pending_attention(run_id=admitted.run_id) == ()
 
 
 def test_notification_failures_persist_only_fixed_value_free_diagnostics(tmp_path):

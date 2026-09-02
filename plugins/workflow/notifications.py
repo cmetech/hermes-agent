@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 
+from hermes_cli.handoff import HandoffEndpoint
 from plugins.workflow.actions import WIRE_ACTIONS, available_actions
 from plugins.workflow.evidence import (
     _UnsafeEvidencePath,
@@ -78,6 +79,10 @@ _PUBLIC_NOTIFICATION_EVENT_TYPES = frozenset(
         "loop_input_required",
         "loop_signal_confirmation_required",
         "run_paused",
+        "handoff_deadline_exceeded",
+        "handoff_failed",
+        "handoff_indeterminate",
+        "handoff_terminal",
     }
 )
 _PUBLIC_NOTIFICATION_INTERACTION_TYPES = frozenset(
@@ -139,6 +144,7 @@ _WORKFLOW_PAYLOAD_FIELDS = frozenset(
         "mismatched_fields",
         "state_version",
         "next_actions",
+        "handoff",
     }
 )
 _DELIVERY_PAYLOAD_FIELDS = frozenset(
@@ -155,6 +161,15 @@ _DELIVERY_PAYLOAD_FIELDS = frozenset(
         "dismissed_at",
         "state_version",
         "next_actions",
+    }
+)
+_PUBLIC_HANDOFF_FAILURE_CODES = frozenset(
+    {
+        "cancellation_indeterminate",
+        "handoff_attention_required",
+        "handoff_deadline_exceeded",
+        "handoff_indeterminate",
+        "handoff_remote_failed",
     }
 )
 _RECOVERY_PAYLOAD_FIELDS = frozenset(
@@ -282,7 +297,61 @@ def projected_pending_interaction(
     )
 
 
+def projected_handoff_attention(
+    projection: Mapping[str, object],
+    node_id: object,
+    *,
+    observed_at: datetime,
+) -> dict[str, object] | None:
+    if not isinstance(node_id, str):
+        return None
+    nodes = projection.get("nodes")
+    node = nodes.get(node_id) if isinstance(nodes, Mapping) else None
+    handoff = node.get("handoff") if isinstance(node, Mapping) else None
+    assignments = projection.get("assignments")
+    assignment = (
+        assignments.get(node_id) if isinstance(assignments, Mapping) else None
+    )
+    if not isinstance(handoff, Mapping) or not isinstance(assignment, Mapping):
+        return None
+    try:
+        admitted_at = datetime.fromisoformat(str(node["handoff_admitted_at"]))
+        age_seconds = max(
+            0,
+            int((observed_at.astimezone(timezone.utc) - admitted_at).total_seconds()),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    phase = handoff.get("last_observed_phase")
+    failure_code = (
+        "handoff_deadline_exceeded"
+        if node.get("handoff_deadline_exceeded") is True
+        else {
+            "indeterminate": "handoff_indeterminate",
+            "failed": "handoff_remote_failed",
+        }.get(str(phase), "handoff_attention_required")
+    )
+    return _closed_handoff(
+        {
+            "handoff_id": handoff.get("handoff_id"),
+            "endpoint": assignment.get("endpoint"),
+            "phase": phase,
+            "age_seconds": age_seconds,
+            "last_successful_observation_at": node.get(
+                "handoff_last_successful_observation_at",
+            ),
+            "next_action": "reconcile",
+            "failure_code": failure_code,
+        },
+        node_id=node_id,
+    )
+
+
 def notification_kind(event_type: str, projection: Mapping[str, object]) -> str | None:
+    if event_type in {"handoff_indeterminate", "handoff_deadline_exceeded"}:
+        return "reconciliation_required"
+    if event_type == "handoff_failed":
+        return "failure"
     if event_type in {
         "node_reconciliation_required",
         "run_reconciliation_required",
@@ -400,6 +469,63 @@ def _closed_interaction(value: object) -> dict[str, object] | None:
     return projected
 
 
+def _closed_handoff(
+    value: object,
+    *,
+    node_id: object,
+) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    handoff_id = _logical_identifier(value.get("handoff_id"))
+    node = _public_identifier(node_id)
+    phase = value.get("phase")
+    if handoff_id is None or node is None or phase not in {
+        "prepared",
+        "submitted",
+        "active",
+        "needs_input",
+        "cancelling",
+        "indeterminate",
+        "succeeded",
+        "failed",
+        "cancelled",
+    }:
+        return None
+    try:
+        endpoint = HandoffEndpoint.parse(str(value.get("endpoint"))).canonical
+    except (TypeError, ValueError):
+        return None
+    age_seconds = _bounded_int(value.get("age_seconds"), maximum=31_536_000)
+    raw_observed_at = value.get("last_successful_observation_at")
+    observed_at = (
+        _public_timestamp(raw_observed_at) if raw_observed_at is not None else None
+    )
+    next_action = value.get("next_action")
+    failure_code = value.get("failure_code")
+    if (
+        age_seconds is None
+        or raw_observed_at is not None and observed_at is None
+        or next_action not in {"inspect", "reconcile", "cancel", "wait"}
+        or failure_code not in _PUBLIC_HANDOFF_FAILURE_CODES
+    ):
+        return None
+    return {
+        "handoff_id": handoff_id,
+        "endpoint": endpoint,
+        "node_id": node,
+        "phase": phase,
+        "age_seconds": age_seconds,
+        "last_successful_observation_at": observed_at,
+        "next_action": next_action,
+        "failure_code": failure_code,
+        "commands": {
+            "show": f"hermes handoff show {handoff_id}",
+            "evidence": f"hermes handoff evidence {handoff_id}",
+            "reconcile": f"hermes handoff reconcile {handoff_id}",
+        },
+    }
+
+
 def _workflow_notification_payload(
     payload: Mapping[str, object],
     *,
@@ -423,6 +549,9 @@ def _workflow_notification_payload(
     interaction = _closed_interaction(raw_interaction)
     if interaction is not None:
         projected["interaction"] = interaction
+    handoff = _closed_handoff(payload.get("handoff"), node_id=payload.get("node_id"))
+    if handoff is not None:
+        projected["handoff"] = handoff
     raw_code = payload.get("code")
     last_error = payload.get("last_error")
     if raw_code is None and isinstance(last_error, Mapping):
@@ -946,13 +1075,15 @@ class NotificationOutbox:
             projection = event.get("projection")
             if not isinstance(projection, Mapping):
                 continue
-            kind = notification_kind(str(event.get("event_type") or ""), projection)
-            if kind is None:
+            event_type = str(event.get("event_type") or "")
+            kind = notification_kind(event_type, projection)
+            if kind is None and event_type != "handoff_terminal":
                 continue
             candidates.append(
                 {
                     "transition_key": (
-                        f"{run_id}:{kind}:{int(projection['state_version'])}:desktop"
+                        f"{run_id}:{kind or 'handoff_clear'}:"
+                        f"{int(projection['state_version'])}:desktop"
                     ),
                     "run_id": run_id,
                     "kind": kind,
@@ -979,6 +1110,29 @@ class NotificationOutbox:
             if not isinstance(projection, Mapping) or not isinstance(event, Mapping):
                 continue
             timestamp = datetime.fromisoformat(str(event["timestamp"]))
+            terminal_event = event.get("event_type") in {
+                "handoff_failed",
+                "handoff_terminal",
+            }
+            if terminal_event:
+                node_id = event.get("node_id")
+                payload = event.get("payload")
+                handoff_id = (
+                    payload.get("handoff_id")
+                    if isinstance(payload, Mapping)
+                    else None
+                )
+                if isinstance(node_id, str):
+                    repaired += self.clear_handoff_attention(
+                        run_id=str(candidate["run_id"]),
+                        node_id=node_id,
+                        handoff_id=(
+                            str(handoff_id) if isinstance(handoff_id, str) else None
+                        ),
+                        now=timestamp,
+                    )
+                if event.get("event_type") == "handoff_terminal":
+                    continue
             self.record(
                 run_id=str(candidate["run_id"]),
                 kind=str(candidate["kind"]),
@@ -991,6 +1145,11 @@ class NotificationOutbox:
                     "node_id": event.get("node_id"),
                     "interaction": projected_pending_interaction(projection),
                     "last_error": projection.get("last_error"),
+                    "handoff": projected_handoff_attention(
+                        projection,
+                        event.get("node_id"),
+                        observed_at=timestamp,
+                    ),
                 },
                 delivery_state=(
                     "pending"
@@ -1546,6 +1705,53 @@ class NotificationOutbox:
                 values,
             ).fetchall()
         return tuple(self._public(row) for row in rows)
+
+    def clear_handoff_attention(
+        self,
+        *,
+        run_id: str,
+        node_id: str,
+        handoff_id: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Resolve current attention deliveries for one terminal handoff node."""
+        if _logical_identifier(run_id) is None or _public_identifier(node_id) is None:
+            raise ValueError("run_id and node_id must be bounded identifiers")
+        if handoff_id is not None and _logical_identifier(handoff_id) is None:
+            raise ValueError("handoff_id must be a bounded identifier")
+        timestamp = self._aware(now or datetime.now(timezone.utc)).isoformat()
+        with self.store._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM workflow_notification_outbox WHERE run_id=? "
+                "AND kind IN ('failure','stalled','reconciliation_required') "
+                "AND state IN ('pending','leased','dead')",
+                (run_id,),
+            ).fetchall()
+            ids = []
+            for row in rows:
+                payload, valid = _load_notification_payload(
+                    row["payload_json"],
+                    transition_version=int(row["transition_version"]),
+                )
+                handoff = payload.get("handoff") if valid else None
+                if (
+                    isinstance(handoff, Mapping)
+                    and handoff.get("node_id") == node_id
+                    and (
+                        handoff_id is None
+                        or handoff.get("handoff_id") == handoff_id
+                    )
+                ):
+                    ids.append(str(row["notification_id"]))
+            connection.executemany(
+                "UPDATE workflow_notification_outbox SET state='delivered', "
+                "delivered_at=?, updated_at=?, lease_owner=NULL, lease_expires_at=NULL "
+                "WHERE notification_id=?",
+                ((timestamp, timestamp, notification_id) for notification_id in ids),
+            )
+            connection.commit()
+        return len(ids)
 
     def pending_attention_page(
         self,
