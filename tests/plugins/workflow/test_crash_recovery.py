@@ -3251,3 +3251,122 @@ def test_loop_group_predicate_rejects_superseded_same_owner_fence(
     assert store.record_loop_group_predicate_decision(
         scope, winner, {"kind": "until_bash_success"}
     )
+
+
+def test_healthy_handoff_wait_survives_restart_without_generic_stall(
+    tmp_path, workflow_writer
+) -> None:
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    sample = LeaseClockSample(base, 100.0, "boot-a")
+    home = tmp_path / "handoff-restart-home"
+    store = RunStore(home, lease_clock=lambda: sample)
+    package = load_workflow(
+        workflow_writer(tmp_path / "handoff-restart-package", name="handoff-restart")
+    )
+    admitted = _run(store, package, idempotency_key="handoff-restart")
+    identity = CoordinatorIdentity("handoff-owner", "gateway", "host", 1, None)
+    leadership = CoordinatorStore(store.database, clock=lambda: sample).try_acquire(
+        identity, now=base, lease_seconds=600
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "handoff-worker",
+        now=base,
+        monotonic_now=100.0,
+        execution_fence=fence,
+    )
+    assert claim is not None
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase="active",
+        next_observation_at=base + timedelta(minutes=10),
+        deadline_at=base + timedelta(hours=1),
+        now=sample,
+    )
+
+    restarted = RunStore(home, lease_clock=lambda: sample)
+    recovered = restarted.load_run(admitted.run_id)
+    assert recovered["status"] == "running"
+    assert recovered["nodes"]["start"]["state"] == "waiting_handoff"
+    assert not restarted.refresh_handoff_wait(
+        admitted.run_id,
+        "start",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=1,
+        observed_version=2,
+        observed_phase="active",
+        next_observation_at=base + timedelta(minutes=11),
+        fence=ExecutionFence("stale-owner", fence.owner_epoch),
+        now=sample,
+    )
+    assert restarted.load_run(admitted.run_id) == recovered
+    assert not restarted.record_stall_if_due(
+        admitted.run_id,
+        fence=fence,
+        now=LeaseClockSample(base + timedelta(minutes=5), 400.0, "boot-a"),
+        runnable_stall_seconds=60,
+        semantic_stall_seconds=300,
+    )
+    assert "stall" not in restarted.load_run(admitted.run_id)
+
+
+@pytest.mark.parametrize(
+    ("phase", "next_observation_delta"),
+    [
+        ("indeterminate", timedelta(minutes=10)),
+        ("active", timedelta(seconds=-1)),
+    ],
+)
+def test_unhealthy_handoff_wait_remains_eligible_for_attention(
+    tmp_path, workflow_writer, phase, next_observation_delta
+) -> None:
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    sample = LeaseClockSample(base, 100.0, "boot-a")
+    store = RunStore(tmp_path / "handoff-unhealthy-home", lease_clock=lambda: sample)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "handoff-unhealthy-package", name="handoff-unhealthy"
+        )
+    )
+    admitted = _run(store, package, idempotency_key="handoff-unhealthy")
+    identity = CoordinatorIdentity("handoff-owner", "gateway", "host", 1, None)
+    leadership = CoordinatorStore(store.database, clock=lambda: sample).try_acquire(
+        identity, now=base, lease_seconds=600
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "handoff-worker",
+        now=base,
+        monotonic_now=100.0,
+        execution_fence=fence,
+    )
+    assert claim is not None
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase=phase,
+        next_observation_at=base + next_observation_delta,
+        deadline_at=base + timedelta(hours=1),
+        now=sample,
+    )
+
+    assert store.record_stall_if_due(
+        admitted.run_id,
+        fence=fence,
+        now=LeaseClockSample(base + timedelta(minutes=2), 220.0, "boot-a"),
+        runnable_stall_seconds=60,
+        semantic_stall_seconds=300,
+    )
+    assert store.load_run(admitted.run_id)["stall"]["reason_code"] == (
+        "runnable_progress_stalled"
+    )

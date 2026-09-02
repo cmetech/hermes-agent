@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import StrEnum
 import hashlib
 import hmac
@@ -11,6 +12,8 @@ from pathlib import Path, PurePosixPath
 import re
 from types import MappingProxyType
 from typing import Any, Mapping
+
+from hermes_cli.handoff.models import HANDOFF_PHASES
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +36,82 @@ class ExecutionFence:
             or self.owner_epoch <= 0
         ):
             raise ValueError("owner_epoch must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffWaitProjection:
+    """Minimal durable Workflow view of one agent handoff."""
+
+    handoff_id: str
+    generation: int
+    last_observed_version: int
+    last_observed_phase: str
+    next_observation_at: datetime
+    deadline_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.handoff_id, str)
+            or not self.handoff_id
+            or len(self.handoff_id) > 256
+        ):
+            raise ValueError("handoff_id must be bounded non-empty text")
+        for name in ("generation", "last_observed_version"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.last_observed_phase not in HANDOFF_PHASES:
+            raise ValueError("last_observed_phase is invalid")
+        for name in ("next_observation_at", "deadline_at"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, datetime) or value.utcoffset() is None
+            ):
+                raise ValueError(f"{name} must be timezone-aware")
+            if value is not None:
+                object.__setattr__(self, name, value.astimezone(timezone.utc))
+
+    def durable_record(self) -> dict[str, object]:
+        return {
+            "handoff_id": self.handoff_id,
+            "generation": self.generation,
+            "last_observed_version": self.last_observed_version,
+            "last_observed_phase": self.last_observed_phase,
+            "next_observation_at": self.next_observation_at.isoformat(),
+            "deadline_at": (
+                self.deadline_at.isoformat() if self.deadline_at is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_durable_record(cls, value: object) -> "HandoffWaitProjection":
+        fields = {
+            "handoff_id",
+            "generation",
+            "last_observed_version",
+            "last_observed_phase",
+            "next_observation_at",
+            "deadline_at",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("handoff wait projection is malformed")
+        try:
+            next_observation_at = datetime.fromisoformat(value["next_observation_at"])
+            deadline_at = (
+                datetime.fromisoformat(value["deadline_at"])
+                if value["deadline_at"] is not None
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("handoff wait projection is malformed") from exc
+        return cls(
+            handoff_id=value["handoff_id"],
+            generation=value["generation"],
+            last_observed_version=value["last_observed_version"],
+            last_observed_phase=value["last_observed_phase"],
+            next_observation_at=next_observation_at,
+            deadline_at=deadline_at,
+        )
 
 
 @dataclass(frozen=True, slots=True)

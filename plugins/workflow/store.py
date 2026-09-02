@@ -69,6 +69,7 @@ from plugins.workflow.lease_clock import (
 from plugins.workflow.models import (
     ApprovalDecision,
     ExecutionFence,
+    HandoffWaitProjection,
     LoopGroupChildScope,
     LoopSignalConfirmation,
     RunExecutionLimits,
@@ -575,6 +576,20 @@ def _projection_node_state(
             if isinstance(child, MutableMapping):
                 return child
     return None
+
+
+def _healthy_handoff_wait(node: object, now: datetime) -> bool:
+    if not isinstance(node, Mapping) or node.get("state") != "waiting_handoff":
+        return False
+    try:
+        handoff = HandoffWaitProjection.from_durable_record(node.get("handoff"))
+    except ValueError:
+        return False
+    return (
+        handoff.last_observed_phase != "indeterminate"
+        and handoff.next_observation_at > now
+        and (handoff.deadline_at is None or handoff.deadline_at > now)
+    )
 
 
 def _relative_path_has_owned_prefix(
@@ -1462,6 +1477,7 @@ _NODE_STATES = {
     "ready",
     "claimed",
     "running",
+    "waiting_handoff",
     "waiting_retry",
     "waiting_resolution",
     "paused",
@@ -8410,6 +8426,16 @@ class RunStore:
                 or not isinstance(claim.get("lease_expires_at"), str)
             ):
                 return False
+            handoff = node.get("handoff")
+            if handoff is not None:
+                try:
+                    HandoffWaitProjection.from_durable_record(handoff)
+                except ValueError:
+                    return False
+            if node.get("state") == "waiting_handoff" and (
+                handoff is None or claim is not None
+            ):
+                return False
             if not _valid_loop_group_state(value, node_id, node):
                 return False
             pending_interaction = node.get("pending_interaction")
@@ -10930,6 +10956,21 @@ class RunStore:
                 and node.get("state") in {"ready", "claimed", "running"}
                 for node in node_values
             )
+            waiting_handoffs = [
+                node
+                for node in node_values
+                if isinstance(node, Mapping)
+                and node.get("state") == "waiting_handoff"
+            ]
+            if (
+                not runnable
+                and waiting_handoffs
+                and all(
+                    _healthy_handoff_wait(node, now.utc_now)
+                    for node in waiting_handoffs
+                )
+            ):
+                return False
             reason_code = None
             threshold = 0.0
             prefix = "last_runnable_progress"
@@ -12934,6 +12975,262 @@ class RunStore:
                     claim.attempt_id, connection=connection
                 )
             return True
+
+    def _record_handoff_wait_locked(
+        self,
+        directory: Path,
+        projection: dict[str, object],
+        node: MutableMapping[str, object],
+        claim: NodeClaim,
+        wait: HandoffWaitProjection,
+        event_type: str,
+        fence_connection: sqlite3.Connection | None,
+    ) -> None:
+        node["state"] = "waiting_handoff"
+        node["handoff"] = wait.durable_record()
+        node.pop("claim", None)
+        node["attempts"][-1].update({
+            "state": "waiting_handoff",
+            "released_at": _utc_now(),
+        })
+        self._append_locked(
+            directory,
+            projection,
+            event_type,
+            wait.durable_record(),
+            node_id=claim.node_id,
+            attempt_id=claim.attempt_id,
+            defer_notification=fence_connection is not None,
+            reserve_connection=fence_connection,
+        )
+        with (
+            nullcontext(fence_connection)
+            if fence_connection is not None
+            else self._connect()
+        ) as connection:
+            if fence_connection is None:
+                connection.execute("BEGIN IMMEDIATE")
+            self._sync_integrity_index(
+                connection,
+                projection=projection,
+                journal_sha256=_sha256((directory / "events.jsonl").read_bytes()),
+            )
+            self._release_worker_claim(claim.attempt_id, connection=connection)
+            if fence_connection is None:
+                connection.commit()
+
+    def begin_handoff_wait(
+        self,
+        claim: NodeClaim,
+        *,
+        handoff_id: str,
+        generation: int,
+        observed_version: int,
+        observed_phase: str,
+        next_observation_at: datetime,
+        deadline_at: datetime | None,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Release one exact worker claim into a durable handoff wait."""
+        wait = HandoffWaitProjection(
+            handoff_id,
+            generation,
+            observed_version,
+            observed_phase,
+            next_observation_at,
+            deadline_at,
+        )
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = _claim_node_state(projection, claim)
+                active = node.get("claim")
+                attempt = node.get("attempts", [])[-1]
+                if not _active_claim_matches(active, claim):
+                    return False
+                if (
+                    projection.get("status") != "running"
+                    or attempt.get("attempt_id") != claim.attempt_id
+                    or attempt.get("owner_id") != claim.owner_id
+                    or node.get("handoff") is not None
+                ):
+                    return False
+                self._record_handoff_wait_locked(
+                    directory,
+                    projection,
+                    node,
+                    claim,
+                    wait,
+                    "node_waiting_handoff",
+                    fence_connection,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+
+    def refresh_handoff_wait(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        handoff_id: str,
+        generation: int,
+        expected_observed_version: int,
+        observed_version: int,
+        observed_phase: str,
+        next_observation_at: datetime,
+        fence: ExecutionFence | None = None,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Fold one exact handoff observation and wake terminal work."""
+        directory = self.run_directory(run_id)
+        notify = False
+        try:
+            with workflow_lock(
+                self._run_lock_path(run_id)
+            ), self._execution_fence_transaction(fence, now) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection.get("nodes", {}).get(node_id)
+                if not isinstance(node, MutableMapping):
+                    return False
+                try:
+                    current = HandoffWaitProjection.from_durable_record(
+                        node.get("handoff")
+                    )
+                except ValueError:
+                    return False
+                if (
+                    projection.get("status") != "running"
+                    or node.get("state") != "waiting_handoff"
+                    or current.handoff_id != handoff_id
+                    or current.generation != generation
+                    or current.last_observed_version != expected_observed_version
+                    or observed_version <= expected_observed_version
+                ):
+                    return False
+                updated = HandoffWaitProjection(
+                    handoff_id,
+                    generation,
+                    observed_version,
+                    observed_phase,
+                    next_observation_at,
+                    current.deadline_at,
+                )
+                terminal = observed_phase in {"succeeded", "failed", "cancelled"}
+                node["handoff"] = updated.durable_record()
+                if terminal:
+                    node["state"] = "ready"
+                self._append_locked(
+                    directory,
+                    projection,
+                    "handoff_terminal" if terminal else "handoff_observed",
+                    updated.durable_record(),
+                    node_id=node_id,
+                    defer_notification=fence_connection is not None,
+                    reserve_connection=fence_connection,
+                )
+                with (
+                    nullcontext(fence_connection)
+                    if fence_connection is not None
+                    else self._connect()
+                ) as connection:
+                    if fence_connection is None:
+                        connection.execute("BEGIN IMMEDIATE")
+                    self._sync_integrity_index(
+                        connection,
+                        projection=projection,
+                        journal_sha256=_sha256(
+                            (directory / "events.jsonl").read_bytes()
+                        ),
+                    )
+                    if terminal:
+                        self._record_coordinator_wake(
+                            connection,
+                            run_id=run_id,
+                            reason_code="handoff_terminal",
+                        )
+                        notify = True
+                    if fence_connection is None:
+                        connection.commit()
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+        if notify:
+            self._notify_coordinator()
+        return True
+
+    def retry_handoff_wait(
+        self,
+        claim: NodeClaim,
+        *,
+        expected_handoff_id: str,
+        expected_generation: int,
+        handoff_id: str,
+        observed_version: int,
+        observed_phase: str,
+        next_observation_at: datetime,
+        deadline_at: datetime | None,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Project one policy-authorized retry as the next semantic generation."""
+        wait = HandoffWaitProjection(
+            handoff_id,
+            expected_generation + 1,
+            observed_version,
+            observed_phase,
+            next_observation_at,
+            deadline_at,
+        )
+        if observed_phase in {"indeterminate", "succeeded", "failed", "cancelled"}:
+            return False
+        directory = self.run_directory(claim.run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(claim.run_id)
+            ), self._execution_fence_transaction(
+                claim.execution_fence, now
+            ) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = _claim_node_state(projection, claim)
+                active = node.get("claim")
+                attempt = node.get("attempts", [])[-1]
+                try:
+                    previous = HandoffWaitProjection.from_durable_record(
+                        node.get("handoff")
+                    )
+                except ValueError:
+                    return False
+                if (
+                    projection.get("status") != "running"
+                    or not _active_claim_matches(active, claim)
+                    or attempt.get("attempt_id") != claim.attempt_id
+                    or previous.handoff_id != expected_handoff_id
+                    or previous.generation != expected_generation
+                    or previous.last_observed_phase not in {"failed", "cancelled"}
+                ):
+                    return False
+                self._record_handoff_wait_locked(
+                    directory,
+                    projection,
+                    node,
+                    claim,
+                    wait,
+                    "handoff_retry_waiting",
+                    fence_connection,
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     def mark_node_started(
         self, claim: NodeClaim, *, now: LeaseClockSample | None = None
