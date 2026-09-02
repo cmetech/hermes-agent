@@ -111,6 +111,33 @@ class _PeerHandler(BaseHTTPRequestHandler):
                 run_id = reservation[1]
             self._reply({"run_id": run_id, "status": "started"}, 202)
             return
+        if self.path.endswith("/approval"):
+            run_id = self.path.rsplit("/", 2)[-2]
+            request = json.loads(body)
+            current = type(self).statuses.get(run_id, {})
+            approval = current.get("approval")
+            if (
+                current.get("status") != "waiting_for_approval"
+                or not isinstance(approval, dict)
+                or request.get("request_id") != approval.get("request_id")
+            ):
+                self._reply({"error": {"message": "not pending"}}, 409)
+                return
+            type(self).statuses[run_id] = {"run_id": run_id, "status": "running"}
+            self._reply({
+                "run_id": run_id,
+                "request_id": request["request_id"],
+                "choice": request.get("choice"),
+                "resolved": 1,
+            })
+            return
+        if self.path.endswith("/steer"):
+            run_id = self.path.rsplit("/", 2)[-2]
+            if type(self).statuses.get(run_id, {}).get("status") != "running":
+                self._reply({"error": {"message": "not accepting"}}, 409)
+                return
+            self._reply({"run_id": run_id, "accepted": True})
+            return
         if self.path.endswith("/stop"):
             run_id = self.path.rsplit("/", 2)[-2]
             type(self).statuses[run_id] = {"run_id": run_id, "status": "stopping"}
@@ -374,3 +401,203 @@ def test_bound_scope_change_is_indeterminate_before_network_io(
     with pytest.raises(ChannelIndeterminate):
         channel.observe(submitted, budget_seconds=2)
     assert len(_PeerHandler.requests) == before
+
+
+def _waiting_for_approval(service, created):
+    service.advance(created.handoff_id)
+    submitted = service.advance(created.handoff_id).snapshot
+    run_id = submitted.checkpoint["run_id"]
+    _PeerHandler.statuses[run_id] = {
+        "run_id": run_id,
+        "session_id": "remote-session-1",
+        "status": "waiting_for_approval",
+        "approval": {
+            "request_id": "approval-1",
+            "choices": ["once", "deny"],
+            "command": "Bearer private-command-detail",
+        },
+    }
+    return service.advance(created.handoff_id).snapshot
+
+
+def test_exact_approval_response_uses_sealed_request_and_advertised_choice(
+    tmp_path, peer_server
+):
+    _write_peer(tmp_path, peer_server)
+    service, _channel, created = _service(tmp_path, capabilities={"approval"})
+    waiting = _waiting_for_approval(service, created)
+
+    assert waiting.phase == "needs_input"
+    assert waiting.checkpoint["approval_request_id"] == "approval-1"
+    assert waiting.checkpoint["approval_choices"] == ("once", "deny")
+    assert "private-command" not in json.dumps(dict(waiting.checkpoint))
+    service.command(
+        waiting.handoff_id,
+        "respond",
+        command_id="respond-1",
+        actor="workflow",
+        request_id="approval-1",
+        choice="once",
+    )
+
+    delivered = service.advance(waiting.handoff_id)
+
+    assert delivered.operation == "deliver_command"
+    assert service.store.get_command(waiting.handoff_id, "respond-1").delivery_state == (
+        "delivered"
+    )
+    approval_posts = [
+        request for request in _PeerHandler.requests if request["path"].endswith("/approval")
+    ]
+    assert [request["body"] for request in approval_posts] == [
+        b'{"choice":"once","request_id":"approval-1"}'
+    ]
+
+
+def test_steer_and_correlated_message_share_remote_route_but_not_local_kind(
+    tmp_path, peer_server
+):
+    _write_peer(tmp_path, peer_server)
+    service, _channel, created = _service(tmp_path)
+    service.advance(created.handoff_id)
+    service.advance(created.handoff_id)
+    active = service.advance(created.handoff_id).snapshot
+    service.command(
+        active.handoff_id,
+        "steer",
+        command_id="steer-1",
+        actor="workflow",
+        text="Tighten the conclusion.",
+    )
+    service.advance(active.handoff_id)
+    service.command(
+        active.handoff_id,
+        "message",
+        command_id="message-1",
+        actor="workflow",
+        text="Check the follow-up.",
+        correlation_id="follow-up-1",
+    )
+    service.advance(active.handoff_id)
+
+    steer_posts = [
+        request for request in _PeerHandler.requests if request["path"].endswith("/steer")
+    ]
+    assert [request["body"] for request in steer_posts] == [
+        b'{"input":"Tighten the conclusion."}',
+        b'{"input":"Check the follow-up."}',
+    ]
+    assert service.store.get_command(active.handoff_id, "steer-1").kind == "steer"
+    assert service.store.get_command(active.handoff_id, "message-1").kind == "message"
+
+
+def test_lost_approval_response_reconciles_by_status_without_resending(
+    tmp_path, peer_server, monkeypatch
+):
+    _write_peer(tmp_path, peer_server)
+    service, _channel, created = _service(tmp_path, capabilities={"approval"})
+    waiting = _waiting_for_approval(service, created)
+    service.command(
+        waiting.handoff_id,
+        "respond",
+        command_id="respond-1",
+        actor="workflow",
+        request_id="approval-1",
+        choice="once",
+    )
+    original = runs_module.open_credentialed_url
+    lose_once = True
+
+    def lose_response(request, **kwargs):
+        nonlocal lose_once
+        response = original(request, **kwargs)
+        if lose_once and request.full_url.endswith("/approval"):
+            lose_once = False
+            response.read()
+            response.close()
+            raise TimeoutError("approval response lost")
+        return response
+
+    monkeypatch.setattr(runs_module, "open_credentialed_url", lose_response)
+    service.advance(waiting.handoff_id)
+
+    assert service.store.get_command(waiting.handoff_id, "respond-1").delivery_state == (
+        "delivered"
+    )
+    assert len([r for r in _PeerHandler.requests if r["path"].endswith("/approval")]) == 1
+
+
+@pytest.mark.parametrize("kind", ["steer", "message"])
+def test_lost_guidance_response_is_indeterminate_and_never_resent(
+    tmp_path, peer_server, monkeypatch, kind
+):
+    _write_peer(tmp_path, peer_server)
+    service, _channel, created = _service(tmp_path)
+    service.advance(created.handoff_id)
+    service.advance(created.handoff_id)
+    active = service.advance(created.handoff_id).snapshot
+    kwargs = {"text": "Check this."}
+    if kind == "message":
+        kwargs["correlation_id"] = "follow-up-1"
+    service.command(
+        active.handoff_id,
+        kind,
+        command_id=f"{kind}-1",
+        actor="workflow",
+        **kwargs,
+    )
+    original = runs_module.open_credentialed_url
+    lose_once = True
+
+    def lose_response(request, **request_kwargs):
+        nonlocal lose_once
+        response = original(request, **request_kwargs)
+        if lose_once and request.full_url.endswith("/steer"):
+            lose_once = False
+            response.read()
+            response.close()
+            raise TimeoutError("steer response lost")
+        return response
+
+    monkeypatch.setattr(runs_module, "open_credentialed_url", lose_response)
+    service.advance(active.handoff_id)
+    first_count = len([r for r in _PeerHandler.requests if r["path"].endswith("/steer")])
+    service.advance(active.handoff_id)
+
+    assert service.store.get_command(active.handoff_id, f"{kind}-1").delivery_state == (
+        "indeterminate"
+    )
+    assert len([r for r in _PeerHandler.requests if r["path"].endswith("/steer")]) == first_count
+
+
+def test_restart_with_attempted_response_performs_status_only(
+    tmp_path, peer_server
+):
+    _write_peer(tmp_path, peer_server)
+    service, _channel, created = _service(tmp_path, capabilities={"approval"})
+    waiting = _waiting_for_approval(service, created)
+    service.command(
+        waiting.handoff_id,
+        "respond",
+        command_id="respond-1",
+        actor="workflow",
+        request_id="approval-1",
+        choice="once",
+    )
+    lease = service.store.claim_advance(
+        waiting.handoff_id,
+        "crashed-worker",
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    assert service.store.claim_delivery_command(lease).delivery_state == "pending"
+    service.store.release_advance(lease, next_advance_at=None)
+    before = len([r for r in _PeerHandler.requests if r["path"].endswith("/approval")])
+
+    service.advance(waiting.handoff_id)
+
+    assert len([r for r in _PeerHandler.requests if r["path"].endswith("/approval")]) == before
+    assert service.store.get_command(waiting.handoff_id, "respond-1").delivery_state == (
+        "indeterminate"
+    )

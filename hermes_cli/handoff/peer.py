@@ -20,6 +20,7 @@ from .service import (
     ChannelRetryableFailure,
     EndpointAssessment,
 )
+from .store import CommandRecord
 
 
 _BASE_CAPABILITIES = frozenset({
@@ -27,6 +28,7 @@ _BASE_CAPABILITIES = frozenset({
     "cancellation",
     "durable_admission",
 })
+_APPROVAL_CHOICES = ("once", "session", "always", "deny")
 
 
 def _failure_code(exc: urllib.error.HTTPError) -> str:
@@ -222,11 +224,102 @@ class PeerHermesChannel:
         except (OSError, TimeoutError, ValueError) as exc:
             raise ChannelRetryableFailure() from exc
         try:
-            return observation_from_status(
+            observation = observation_from_status(
                 snapshot, response, cancelling=cancelling
+            )
+            checkpoint = dict(observation.checkpoint)
+            if observation.phase == "needs_input":
+                approval = response.get("approval")
+                if not isinstance(approval, dict):
+                    raise ValueError("Run approval facts are missing")
+                request_id = approval.get("request_id")
+                choices = approval.get("choices")
+                if not isinstance(choices, list | tuple):
+                    raise ValueError("Run approval choices are invalid")
+                normalized = [choice for choice in _APPROVAL_CHOICES if choice in choices]
+                if not isinstance(request_id, str) or not normalized:
+                    raise ValueError("Run approval facts are invalid")
+                checkpoint.update({
+                    "approval_request_id": request_id,
+                    "approval_choices": normalized,
+                })
+            else:
+                checkpoint.pop("approval_request_id", None)
+                checkpoint.pop("approval_choices", None)
+            return ChannelObservation(
+                phase=observation.phase,
+                checkpoint=checkpoint,
+                terminal_result=observation.terminal_result,
+                failure_code=observation.failure_code,
             )
         except (TypeError, UnicodeError, ValueError) as exc:
             raise ChannelIndeterminate() from exc
+
+    def _reconcile_approval(
+        self, client: RunsClient, snapshot: HandoffSnapshot, command: CommandRecord
+    ) -> tuple[str, str | None]:
+        run_id = str((snapshot.checkpoint or {}).get("run_id") or "")
+        try:
+            response = client.status(run_id)
+        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+            return "indeterminate", "approval_response_indeterminate"
+        approval = response.get("approval")
+        still_pending = (
+            response.get("status") == "waiting_for_approval"
+            and isinstance(approval, dict)
+            and approval.get("request_id") == command.payload["request_id"]
+        )
+        return (
+            ("indeterminate", "approval_response_indeterminate")
+            if still_pending
+            else ("delivered", None)
+        )
+
+    def deliver_command(
+        self,
+        snapshot: HandoffSnapshot,
+        command: CommandRecord,
+        *,
+        budget_seconds: float,
+    ) -> tuple[str, str | None]:
+        deadline = RunsDeadline(budget_seconds)
+        client = self._bound_client(snapshot, deadline)
+        run_id = str((snapshot.checkpoint or {}).get("run_id") or "")
+        if not run_id or command.kind not in {"respond", "steer", "message"}:
+            return "indeterminate", "command_delivery_indeterminate"
+
+        if command.delivery_state == "attempted":
+            if command.kind == "respond":
+                return self._reconcile_approval(client, snapshot, command)
+            try:
+                client.status(run_id)
+            except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+                pass
+            return "indeterminate", "guidance_delivery_indeterminate"
+
+        if command.kind == "respond":
+            try:
+                response = client.approve(
+                    run_id,
+                    request_id=str(command.payload["request_id"]),
+                    choice=str(command.payload["choice"]),
+                )
+            except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+                return self._reconcile_approval(client, snapshot, command)
+            if (
+                response.get("request_id") != command.payload["request_id"]
+                or response.get("choice") != command.payload["choice"]
+            ):
+                return self._reconcile_approval(client, snapshot, command)
+            return "delivered", None
+
+        try:
+            response = client.steer(run_id, str(command.payload["text"]))
+        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+            return "indeterminate", "guidance_delivery_indeterminate"
+        if response.get("accepted") is not True:
+            return "indeterminate", "guidance_delivery_indeterminate"
+        return "delivered", None
 
     def reconcile(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float

@@ -344,6 +344,126 @@ def test_command_replay_is_content_bound_and_cancel_is_durable(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("respond", {"actor": "workflow", "request_id": "approval-1", "choice": "once"}),
+        ("steer", {"actor": "workflow", "text": "Tighten the conclusion."}),
+        (
+            "message",
+            {
+                "actor": "workflow",
+                "text": "Please check the follow-up.",
+                "correlation_id": "follow-up-1",
+            },
+        ),
+    ],
+)
+def test_control_command_payloads_are_closed_bounded_and_content_bound(
+    tmp_path, kind, payload
+):
+    store = HandoffStore(tmp_path / "commands.db")
+    snapshot = _create(store)
+
+    first = store.record_command(snapshot.handoff_id, "command-1", kind, payload)
+    replay = store.record_command(snapshot.handoff_id, "command-1", kind, payload)
+
+    assert replay == first
+    assert dict(first.payload) == payload
+    with pytest.raises(HandoffConflict):
+        store.record_command(
+            snapshot.handoff_id,
+            "command-1",
+            kind,
+            {**payload, "actor": "different"},
+        )
+    with pytest.raises(ValueError):
+        store.record_command(
+            snapshot.handoff_id,
+            "unsafe-command",
+            kind,
+            {**payload, "authorization": "Bearer secret"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        ("respond", {"actor": "workflow", "request_id": "approval-1"}),
+        ("respond", {"actor": "workflow", "request_id": "approval-1", "choice": "yes"}),
+        ("steer", {"actor": "workflow", "text": ""}),
+        ("steer", {"actor": "workflow", "text": "x" * 16_385}),
+        ("message", {"actor": "workflow", "text": "follow up"}),
+        (
+            "message",
+            {"actor": "workflow", "text": "follow up", "correlation_id": "https://unsafe.test"},
+        ),
+    ],
+)
+def test_control_command_payloads_reject_missing_invalid_and_oversized_values(
+    tmp_path, kind, payload
+):
+    store = HandoffStore(tmp_path / "invalid-commands.db")
+    snapshot = _create(store)
+
+    with pytest.raises(ValueError):
+        store.record_command(snapshot.handoff_id, "command-1", kind, payload)
+
+
+def test_command_delivery_state_is_cas_protected_and_never_returns_to_pending(
+    tmp_path,
+):
+    store = HandoffStore(tmp_path / "delivery.db")
+    snapshot = _create(store)
+    store.record_command(
+        snapshot.handoff_id,
+        "steer-1",
+        "steer",
+        {"actor": "workflow", "text": "Tighten the conclusion."},
+    )
+    lease = _claim(store, snapshot.handoff_id)
+
+    claimed = store.claim_delivery_command(lease)
+
+    assert claimed is not None
+    assert claimed.delivery_state == "pending"
+    assert store.get_command(snapshot.handoff_id, "steer-1").delivery_state == (
+        "attempted"
+    )
+    delivered = store.complete_delivery_command(
+        lease, "steer-1", "delivered"
+    )
+    assert delivered.delivery_state == "delivered"
+    assert store.complete_delivery_command(lease, "steer-1", "delivered") == delivered
+    with pytest.raises(HandoffStateConflict):
+        store.complete_delivery_command(lease, "steer-1", "indeterminate")
+    with pytest.raises(ValueError):
+        store.complete_delivery_command(lease, "steer-1", "pending")
+
+
+def test_restart_claim_returns_attempted_command_for_read_only_reconciliation(
+    tmp_path,
+):
+    store = HandoffStore(tmp_path / "restart-command.db")
+    snapshot = _create(store)
+    store.record_command(
+        snapshot.handoff_id,
+        "respond-1",
+        "respond",
+        {"actor": "workflow", "request_id": "approval-1", "choice": "once"},
+    )
+    first_lease = _claim(store, snapshot.handoff_id)
+    assert store.claim_delivery_command(first_lease).delivery_state == "pending"
+    store.release_advance(first_lease, next_advance_at=None)
+
+    restarted_lease = _claim(store, snapshot.handoff_id)
+    restarted = store.claim_delivery_command(restarted_lease)
+
+    assert restarted is not None
+    assert restarted.command_id == "respond-1"
+    assert restarted.delivery_state == "attempted"
+
+
 def test_attempt_is_durable_before_io_and_event_data_is_redacted(tmp_path):
     path = tmp_path / "handoffs.db"
     store = HandoffStore(path)

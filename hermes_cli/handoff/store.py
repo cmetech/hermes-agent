@@ -30,7 +30,9 @@ _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 _SEMANTIC_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,511}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_COMMAND_KINDS = frozenset({"cancel", "reconcile"})
+_COMMAND_KINDS = frozenset({"cancel", "message", "reconcile", "respond", "steer"})
+_APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
+_DELIVERY_STATES = frozenset({"delivered", "indeterminate"})
 _ATTEMPT_OPERATIONS = frozenset({"bind", "submit", "reconcile", "observe", "cancel"})
 _SAFE_DATA_KEYS = frozenset({
     "actor",
@@ -252,6 +254,44 @@ def _safe_data(
         safe[key] = item
     _json(safe)
     return _freeze(safe)  # type: ignore[return-value]
+
+
+def _command_payload(
+    kind: str, payload: Mapping[str, object]
+) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("handoff command payload must be a mapping")
+    expected = {
+        "cancel": {"actor"},
+        "reconcile": {"actor"},
+        "respond": {"actor", "request_id", "choice"},
+        "steer": {"actor", "text"},
+        "message": {"actor", "text", "correlation_id"},
+    }[kind]
+    if set(payload) != expected:
+        raise ValueError("handoff command payload fields are invalid")
+    normalized = dict(payload)
+    _identifier(normalized["actor"], "command actor")
+    if kind == "respond":
+        _identifier(normalized["request_id"], "approval request ID")
+        if (
+            not isinstance(normalized["choice"], str)
+            or normalized["choice"] not in _APPROVAL_CHOICES
+        ):
+            raise ValueError("handoff approval choice is invalid")
+    if kind in {"steer", "message"}:
+        text = normalized["text"]
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or len(text.encode("utf-8")) > _MAX_JSON_BYTES
+            or "\0" in text
+        ):
+            raise ValueError("handoff command text is invalid or exceeds its byte limit")
+    if kind == "message":
+        _identifier(normalized["correlation_id"], "correlation ID")
+    _json(normalized)
+    return _freeze(normalized)  # type: ignore[return-value]
 
 
 def _spec_json(spec: HandoffSpec) -> str:
@@ -944,7 +984,7 @@ class HandoffStore:
         command_id = _identifier(command_id, "command ID")
         if kind not in _COMMAND_KINDS:
             raise ValueError("handoff command kind is unsupported")
-        safe_payload = _safe_data(payload, reject_unsafe=True)
+        safe_payload = _command_payload(kind, payload)
         payload_json = _json(safe_payload)
         fingerprint = sha256(
             _json({"kind": kind, "payload": safe_payload}).encode()
@@ -991,7 +1031,10 @@ class HandoffStore:
                 handoff_id,
                 phase_before=row["phase"],
                 phase_after=phase_after,
-                kind="cancel_requested" if kind == "cancel" else "reconcile_requested",
+                kind={
+                    "cancel": "cancel_requested",
+                    "reconcile": "reconcile_requested",
+                }.get(kind, "command_recorded"),
                 actor=str(safe_payload.get("actor", "service")),
                 data={"command_id": command_id, "command_kind": kind},
                 created_at=now,
@@ -1000,6 +1043,116 @@ class HandoffStore:
                 self._conn.execute(
                     "SELECT * FROM handoff_commands WHERE handoff_id=? AND command_id=?",
                     (handoff_id, command_id),
+                ).fetchone()
+            )
+
+    def get_command(self, handoff_id: str, command_id: str) -> CommandRecord:
+        command_id = _identifier(command_id, "command ID")
+        with self._lock:
+            self._row(handoff_id)
+            row = self._conn.execute(
+                "SELECT * FROM handoff_commands WHERE handoff_id=? AND command_id=?",
+                (handoff_id, command_id),
+            ).fetchone()
+            if row is None:
+                raise HandoffNotFound("handoff command not found")
+            return self._command(row)
+
+    def claim_delivery_command(self, lease: AdvanceLease) -> CommandRecord | None:
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            handoff = self._lease_row(lease, now)
+            if handoff["cancel_requested_at"] is not None:
+                return None
+            row = self._conn.execute(
+                """SELECT * FROM handoff_commands
+                   WHERE handoff_id=? AND kind IN ('message', 'respond', 'steer')
+                     AND delivery_state IN ('pending', 'attempted')
+                   ORDER BY CASE delivery_state WHEN 'attempted' THEN 0 ELSE 1 END,
+                            created_at, command_id
+                   LIMIT 1""",
+                (lease.handoff_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            command = self._command(row)
+            if command.delivery_state == "pending":
+                stamp = _timestamp(now)
+                changed = self._conn.execute(
+                    """UPDATE handoff_commands SET delivery_state='attempted', updated_at=?
+                       WHERE handoff_id=? AND command_id=? AND delivery_state='pending'""",
+                    (stamp, lease.handoff_id, command.command_id),
+                ).rowcount
+                if changed != 1:
+                    raise HandoffStateConflict("handoff command claim lost its CAS")
+                self._append_event(
+                    lease.handoff_id,
+                    phase_before=handoff["phase"],
+                    phase_after=handoff["phase"],
+                    kind="command_attempted",
+                    actor=str(command.payload["actor"]),
+                    data={
+                        "command_id": command.command_id,
+                        "command_kind": command.kind,
+                        "status": "attempted",
+                    },
+                    created_at=now,
+                )
+            return command
+
+    def complete_delivery_command(
+        self,
+        lease: AdvanceLease,
+        command_id: str,
+        delivery_state: str,
+        *,
+        failure_code: str | None = None,
+    ) -> CommandRecord:
+        command_id = _identifier(command_id, "command ID")
+        if delivery_state not in _DELIVERY_STATES:
+            raise ValueError("handoff command delivery state is invalid")
+        if failure_code is not None:
+            _identifier(failure_code, "command failure code")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            handoff = self._lease_row(lease, now)
+            row = self._conn.execute(
+                "SELECT * FROM handoff_commands WHERE handoff_id=? AND command_id=?",
+                (lease.handoff_id, command_id),
+            ).fetchone()
+            if row is None:
+                raise HandoffNotFound("handoff command not found")
+            command = self._command(row)
+            if command.delivery_state == delivery_state:
+                return command
+            if command.delivery_state != "attempted":
+                raise HandoffStateConflict(
+                    "handoff command delivery state is immutable"
+                )
+            stamp = _timestamp(now)
+            self._conn.execute(
+                """UPDATE handoff_commands SET delivery_state=?, updated_at=?
+                   WHERE handoff_id=? AND command_id=? AND delivery_state='attempted'""",
+                (delivery_state, stamp, lease.handoff_id, command_id),
+            )
+            self._append_event(
+                lease.handoff_id,
+                phase_before=handoff["phase"],
+                phase_after=handoff["phase"],
+                kind="command_delivery",
+                actor=str(command.payload["actor"]),
+                data={
+                    "command_id": command_id,
+                    "command_kind": command.kind,
+                    "status": delivery_state,
+                    **({"failure_code": failure_code} if failure_code else {}),
+                },
+                created_at=now,
+            )
+            return self._command(
+                self._conn.execute(
+                    "SELECT * FROM handoff_commands WHERE handoff_id=? AND command_id=?",
+                    (lease.handoff_id, command_id),
                 ).fetchone()
             )
 

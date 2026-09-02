@@ -153,7 +153,7 @@ def test_default_service_anchors_cli_spool_to_its_store_home(tmp_path, monkeypat
         handoff_key="review/0",
     )
     monkeypatch.setattr(
-        service.channel,
+        service.channel.local,
         "_assess",
         lambda *_args: (None, "runs_not_durable"),
     )

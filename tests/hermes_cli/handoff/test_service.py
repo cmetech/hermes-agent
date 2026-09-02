@@ -23,7 +23,7 @@ from hermes_cli.handoff.service import (
     EndpointAssessment,
     UnsupportedHandoffCommand,
 )
-from hermes_cli.handoff.store import HandoffStore
+from hermes_cli.handoff.store import HandoffConflict, HandoffStore
 
 
 UTC = timezone.utc
@@ -106,12 +106,73 @@ class FakeChannel:
     def cancel(self, snapshot, *, budget_seconds: float):
         return self._call("cancel", snapshot, budget_seconds)
 
+    def deliver_command(self, snapshot, command, *, budget_seconds: float):
+        assert math.isfinite(budget_seconds) and budget_seconds > 0
+        self.calls.append(("deliver_command", budget_seconds))
+        outcome = self.outcomes.get("deliver_command")
+        if callable(outcome):
+            return outcome(snapshot, command)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome if outcome is not None else ("delivered", None)
+
 
 def _service(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     channel = FakeChannel()
     service = AgentHandoffService(store=store, channel=channel)
     snapshot = service.create(_spec(), "workflow/run-1", handoff_key="node/review")
+    return service, store, channel, snapshot
+
+
+def _peer_service(tmp_path, *, phase="active"):
+    store = HandoffStore(tmp_path / "peer-handoffs.db")
+    channel = FakeChannel()
+    service = AgentHandoffService(store=store, channel=channel)
+    spec = replace(
+        _spec(), endpoint=HandoffEndpoint.parse("hermes://peer/spark/reviewer")
+    )
+    snapshot = service.create(spec, "workflow/run-1", handoff_key="peer/review")
+    snapshot = store.bind(
+        snapshot.handoff_id,
+        "peer_runs",
+        {
+            "peer": "spark",
+            "profile": "reviewer",
+            "mechanism": "peer_runs",
+            "capabilities": [
+                "approval",
+                "authoritative_status",
+                "cancellation",
+                "durable_admission",
+                "follow_up",
+                "steering",
+            ],
+            "origin_sha256": "a" * 64,
+            "auth_scope_sha256": "b" * 64,
+        },
+        {},
+        snapshot.state_version,
+    )
+    lease = store.claim_advance(
+        snapshot.handoff_id,
+        "peer-seed",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    store.journal_attempt(lease, "submit")
+    checkpoint = {"run_id": "run-1", "status": "running"}
+    if phase == "needs_input":
+        checkpoint.update({
+            "approval_request_id": "approval-1",
+            "approval_choices": ["once", "deny"],
+            "status": "waiting_for_approval",
+        })
+    snapshot = store.commit_observation(
+        lease, ChannelObservation(phase=phase, checkpoint=checkpoint)
+    )
+    store.release_advance(lease, next_advance_at=None)
     return service, store, channel, snapshot
 
 
@@ -892,7 +953,7 @@ def test_reconcile_command_makes_an_indeterminate_handoff_due_now(tmp_path):
     assert [name for name, _ in channel.calls] == ["reconcile"]
 
 
-def test_commands_are_idempotent_and_stage_one_rejects_future_kinds(tmp_path):
+def test_control_commands_are_closed_idempotent_and_phase_checked(tmp_path):
     service, _store, _channel, snapshot = _service(tmp_path)
 
     first = service.command(
@@ -912,7 +973,246 @@ def test_commands_are_idempotent_and_stage_one_rejects_future_kinds(tmp_path):
     with pytest.raises(UnsupportedHandoffCommand, match="unsupported"):
         service.command(
             snapshot.handoff_id,
-            "message",
-            command_id="message-1",
+            "future-command",
+            command_id="future-1",
             actor="workflow",
+        )
+    with pytest.raises(ValueError):
+        service.command(
+            snapshot.handoff_id,
+            "steer",
+            command_id="steer-1",
+            actor="workflow",
+            text="not valid for a local handoff",
+        )
+
+
+def test_exact_response_and_distinct_steer_message_payloads_are_recorded(tmp_path):
+    service, store, _channel, waiting = _peer_service(tmp_path, phase="needs_input")
+
+    service.command(
+        waiting.handoff_id,
+        "respond",
+        command_id="respond-1",
+        actor="workflow",
+        request_id="approval-1",
+        choice="once",
+    )
+    assert dict(store.get_command(waiting.handoff_id, "respond-1").payload) == {
+        "actor": "workflow",
+        "choice": "once",
+        "request_id": "approval-1",
+    }
+    with pytest.raises(ValueError):
+        service.command(
+            waiting.handoff_id,
+            "respond",
+            command_id="wrong-request",
+            actor="workflow",
+            request_id="approval-2",
+            choice="once",
+        )
+    with pytest.raises(ValueError):
+        service.command(
+            waiting.handoff_id,
+            "respond",
+            command_id="wrong-choice",
+            actor="workflow",
+            request_id="approval-1",
+            choice="always",
+        )
+
+    active_service, active_store, _channel, active = _peer_service(
+        tmp_path / "active"
+    )
+    active_service.command(
+        active.handoff_id,
+        "steer",
+        command_id="steer-1",
+        actor="workflow",
+        text="Tighten the conclusion.",
+    )
+    active_service.command(
+        active.handoff_id,
+        "message",
+        command_id="message-1",
+        actor="workflow",
+        text="Check the follow-up.",
+        correlation_id="follow-up-1",
+    )
+    assert active_store.get_command(active.handoff_id, "steer-1").kind == "steer"
+    assert active_store.get_command(active.handoff_id, "message-1").kind == "message"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"request_id": "approval-1", "choice": "once", "text": "extra"},
+        {"text": "steer", "correlation_id": "extra"},
+        {"text": "message"},
+    ],
+)
+def test_control_command_rejects_irrelevant_or_missing_arguments(tmp_path, kwargs):
+    service, _store, _channel, snapshot = _peer_service(tmp_path)
+    kind = (
+        "respond"
+        if "request_id" in kwargs
+        else "message"
+        if kwargs.get("text") == "message"
+        else "steer"
+    )
+    with pytest.raises(ValueError):
+        service.command(
+            snapshot.handoff_id,
+            kind,
+            command_id="command-1",
+            actor="workflow",
+            **kwargs,
+        )
+
+
+def test_delivery_attempt_is_durable_before_http_and_success_is_completed(tmp_path):
+    service, store, channel, snapshot = _peer_service(tmp_path)
+    service.command(
+        snapshot.handoff_id,
+        "steer",
+        command_id="steer-1",
+        actor="workflow",
+        text="Tighten the conclusion.",
+    )
+
+    def inspect_attempt(_snapshot, command):
+        assert command.delivery_state == "pending"
+        assert store.get_command(snapshot.handoff_id, command.command_id).delivery_state == (
+            "attempted"
+        )
+        return "delivered", None
+
+    channel.outcomes["deliver_command"] = inspect_attempt
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.operation == "deliver_command"
+    assert store.get_command(snapshot.handoff_id, "steer-1").delivery_state == (
+        "delivered"
+    )
+    evidence = service.evidence(snapshot.handoff_id).events
+    assert [event.kind for event in evidence][-2:] == [
+        "command_attempted",
+        "command_delivery",
+    ]
+    assert "Tighten" not in json.dumps([dict(event.data) for event in evidence])
+
+
+def test_ambiguous_delivery_never_returns_to_pending(tmp_path):
+    service, store, channel, snapshot = _peer_service(tmp_path)
+    service.command(
+        snapshot.handoff_id,
+        "message",
+        command_id="message-1",
+        actor="workflow",
+        text="Check the follow-up.",
+        correlation_id="follow-up-1",
+    )
+    channel.outcomes["deliver_command"] = RuntimeError("response lost")
+
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.operation == "deliver_command"
+    assert store.get_command(snapshot.handoff_id, "message-1").delivery_state == (
+        "indeterminate"
+    )
+    channel.calls.clear()
+    service.advance(snapshot.handoff_id)
+    assert [name for name, _budget in channel.calls] == ["observe"]
+
+
+def test_restart_reconciles_attempted_command_without_reclaiming_it_as_pending(
+    tmp_path,
+):
+    service, store, channel, snapshot = _peer_service(tmp_path, phase="needs_input")
+    service.command(
+        snapshot.handoff_id,
+        "respond",
+        command_id="respond-1",
+        actor="workflow",
+        request_id="approval-1",
+        choice="once",
+    )
+    lease = store.claim_advance(
+        snapshot.handoff_id,
+        "crashed-worker",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    assert store.claim_delivery_command(lease).delivery_state == "pending"
+    store.release_advance(lease, next_advance_at=None)
+
+    seen = []
+
+    def reconcile_only(_snapshot, command):
+        seen.append(command.delivery_state)
+        return "indeterminate", "command_delivery_indeterminate"
+
+    channel.outcomes["deliver_command"] = reconcile_only
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.operation == "deliver_command"
+    assert seen == ["attempted"]
+    assert store.get_command(snapshot.handoff_id, "respond-1").delivery_state == (
+        "indeterminate"
+    )
+
+
+def test_durable_cancellation_preempts_a_pending_control_command(tmp_path):
+    service, store, channel, snapshot = _peer_service(tmp_path)
+    service.command(
+        snapshot.handoff_id,
+        "steer",
+        command_id="steer-1",
+        actor="workflow",
+        text="Tighten the conclusion.",
+    )
+    service.command(
+        snapshot.handoff_id,
+        "cancel",
+        command_id="cancel-1",
+        actor="workflow",
+    )
+
+    result = service.advance(snapshot.handoff_id)
+
+    assert result.operation == "cancel"
+    assert store.get_command(snapshot.handoff_id, "steer-1").delivery_state == "pending"
+    assert [name for name, _budget in channel.calls][-1] == "cancel"
+
+
+def test_delivered_response_replay_stays_idempotent_after_remote_phase_changes(
+    tmp_path,
+):
+    service, store, channel, snapshot = _peer_service(tmp_path, phase="needs_input")
+    arguments = {
+        "command_id": "respond-1",
+        "actor": "workflow",
+        "request_id": "approval-1",
+        "choice": "once",
+    }
+    service.command(snapshot.handoff_id, "respond", **arguments)
+    service.advance(snapshot.handoff_id)
+    channel.outcomes["observe"] = ChannelObservation(
+        phase="active", checkpoint={"run_id": "run-1", "status": "running"}
+    )
+    service.advance(snapshot.handoff_id)
+
+    replay = service.command(snapshot.handoff_id, "respond", **arguments)
+
+    assert replay.phase == "active"
+    assert store.get_command(snapshot.handoff_id, "respond-1").delivery_state == (
+        "delivered"
+    )
+    with pytest.raises(HandoffConflict):
+        service.command(
+            snapshot.handoff_id,
+            "respond",
+            **{**arguments, "choice": "deny"},
         )

@@ -15,6 +15,7 @@ from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot, Handof
 from .store import (
     EvidencePage,
     HandoffConflict,
+    HandoffNotFound,
     HandoffStateConflict,
     HandoffStore,
     StaleAdvanceLease,
@@ -22,7 +23,9 @@ from .store import (
 
 
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
-_OPERATIONS = frozenset({"bind", "submit", "reconcile", "observe", "cancel"})
+_OPERATIONS = frozenset({
+    "bind", "submit", "reconcile", "observe", "cancel", "deliver_command",
+})
 _BIND_RETRYABLE_FAILURES = frozenset({
     "api_server_disabled",
     "api_server_key_missing",
@@ -262,8 +265,49 @@ class AgentHandoffService:
             ):
                 next_advance_at = snapshot.next_advance_at
             else:
-                operation = self._select_operation(snapshot)
-                if operation is not None:
+                command = (
+                    self.store.claim_delivery_command(lease)
+                    if snapshot.cancel_requested_at is None
+                    and snapshot.phase not in _TERMINAL_PHASES
+                    else None
+                )
+                if command is not None:
+                    operation = "deliver_command"
+                    remaining = budget_seconds - (self._clock() - started)
+                    delivery_state = "indeterminate"
+                    failure_code = "command_delivery_indeterminate"
+                    if remaining > 0:
+                        try:
+                            outcome = self.channel.deliver_command(
+                                snapshot, command, budget_seconds=remaining
+                            )
+                            if (
+                                not isinstance(outcome, tuple)
+                                or len(outcome) != 2
+                                or outcome[0] not in {"delivered", "indeterminate"}
+                                or outcome[0] == "delivered"
+                                and outcome[1] is not None
+                                or outcome[1] is not None
+                                and (
+                                    not isinstance(outcome[1], str)
+                                    or not _SAFE_IDENTIFIER.fullmatch(outcome[1])
+                                )
+                            ):
+                                raise ChannelIndeterminate()
+                            delivery_state, failure_code = outcome
+                        except Exception:
+                            pass
+                    self.store.complete_delivery_command(
+                        lease,
+                        command.command_id,
+                        delivery_state,
+                        failure_code=failure_code,
+                    )
+                    folded = True
+                else:
+                    snapshot = self.store.get(handoff_id)
+                    operation = self._select_operation(snapshot)
+                if operation is not None and operation != "deliver_command":
                     journaled = self.store.journal_attempt(lease, operation)
                     remaining = budget_seconds - (self._clock() - started)
                     if remaining > 0:
@@ -486,10 +530,67 @@ class AgentHandoffService:
         *,
         command_id: str,
         actor: str,
+        request_id: str | None = None,
+        choice: str | None = None,
+        text: str | None = None,
+        correlation_id: str | None = None,
     ) -> HandoffSnapshot:
-        if kind not in {"cancel", "reconcile"}:
+        if kind not in {"cancel", "message", "reconcile", "respond", "steer"}:
             raise UnsupportedHandoffCommand(kind)
-        self.store.record_command(handoff_id, command_id, kind, {"actor": actor})
+        values = {
+            "request_id": request_id,
+            "choice": choice,
+            "text": text,
+            "correlation_id": correlation_id,
+        }
+        expected = {
+            "cancel": set(),
+            "reconcile": set(),
+            "respond": {"request_id", "choice"},
+            "steer": {"text"},
+            "message": {"text", "correlation_id"},
+        }[kind]
+        supplied = {name for name, value in values.items() if value is not None}
+        if supplied != expected:
+            raise ValueError("handoff command arguments are invalid")
+
+        payload = {"actor": actor, **{key: values[key] for key in expected}}
+        try:
+            self.store.get_command(handoff_id, command_id)
+        except HandoffNotFound:
+            pass
+        else:
+            self.store.record_command(handoff_id, command_id, kind, payload)
+            return self.store.get(handoff_id)
+
+        snapshot = self.store.get(handoff_id)
+        if kind in {"respond", "steer", "message"}:
+            if (
+                snapshot.mechanism != "peer_runs"
+                or snapshot.cancel_requested_at is not None
+                or snapshot.phase in _TERMINAL_PHASES
+            ):
+                raise ValueError("handoff does not accept peer control commands")
+            required = {
+                "respond": "approval",
+                "steer": "steering",
+                "message": "follow_up",
+            }[kind]
+            if required not in set((snapshot.binding or {}).get("capabilities") or ()):
+                raise ValueError("handoff peer does not advertise this control")
+        if kind == "respond":
+            checkpoint = snapshot.checkpoint or {}
+            if (
+                snapshot.phase != "needs_input"
+                or request_id != checkpoint.get("approval_request_id")
+                or not isinstance(choice, str)
+                or choice not in set(checkpoint.get("approval_choices") or ())
+            ):
+                raise ValueError("handoff approval response is stale or unsupported")
+        if kind in {"steer", "message"} and snapshot.phase != "active":
+            raise ValueError("handoff is not accepting guidance")
+
+        self.store.record_command(handoff_id, command_id, kind, payload)
         return self.store.get(handoff_id)
 
     def get(self, handoff_id: str) -> HandoffSnapshot:
