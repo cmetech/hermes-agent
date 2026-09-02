@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 import logging
 import threading
 from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
 
@@ -21,6 +23,104 @@ from plugins.workflow.schema import load_workflow, parse_workflow_source_bytes
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import WorkflowPackageDigest
+
+
+def _handoff_notification_payload(
+    *,
+    transition_version: int,
+    handoff_id: str = "handoff-legacy",
+    generation: int = 7,
+    failure_code: str = "submission_indeterminate",
+) -> dict[str, object]:
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    return {
+        "payload_type": "workflow_transition",
+        "workflow": "review",
+        "status": "running",
+        "event_type": "handoff_indeterminate",
+        "node_id": "review",
+        "state_version": transition_version,
+        "next_actions": ["status", "events", "reconcile", "cancel"],
+        "handoff": {
+            "handoff_id": handoff_id,
+            "generation": generation,
+            "endpoint": "hermes://local/reviewer",
+            "node_id": "review",
+            "phase": "indeterminate",
+            "age_seconds": transition_version,
+            "last_successful_observation_at": observed.isoformat(),
+            "next_action": "reconcile",
+            "failure_code": failure_code,
+            "commands": {
+                "show": f"hermes handoff show {handoff_id}",
+                "evidence": f"hermes handoff evidence {handoff_id}",
+                "reconcile": f"hermes handoff reconcile {handoff_id}",
+            },
+        },
+    }
+
+
+def _replace_with_legacy_notification_outbox(store: RunStore) -> None:
+    with store._connect() as connection:
+        connection.execute("DROP TABLE workflow_notification_outbox")
+        connection.executescript(
+            """
+            CREATE TABLE workflow_notification_outbox (
+                notification_id TEXT PRIMARY KEY,
+                transition_key TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                transition_version INTEGER NOT NULL,
+                coalesced_count INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at TEXT,
+                dismissed_at TEXT,
+                last_error TEXT
+            );
+            """
+        )
+
+
+def _insert_notification_row(
+    store: RunStore,
+    *,
+    notification_id: str,
+    transition_key: str,
+    transition_version: int,
+    payload: Mapping[str, object],
+    state: str,
+    created_at: datetime,
+    coalesced_count: int = 1,
+) -> None:
+    timestamp = created_at.isoformat()
+    with store._connect() as connection:
+        connection.execute(
+            "INSERT INTO workflow_notification_outbox ("
+            "notification_id, transition_key, run_id, kind, destination, "
+            "transition_version, coalesced_count, payload_json, state, "
+            "created_at, updated_at, available_at) "
+            "VALUES (?, ?, 'legacy-run', 'reconciliation_required', "
+            "'desktop', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                notification_id,
+                transition_key,
+                transition_version,
+                coalesced_count,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                state,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
 
 
 def _terminal_background_failure(tmp_path, workflow_writer, *, name: str):
@@ -449,6 +549,245 @@ def test_notification_schema_migrates_and_indexes_legacy_handoff_identity(
         now=observed + timedelta(seconds=1),
     )
     assert repeated == "legacy-notification"
+
+
+def test_notification_schema_serializes_concurrent_legacy_upgrade(tmp_path) -> None:
+    home = tmp_path / "concurrent-notification-upgrade"
+    store = RunStore(home)
+    _replace_with_legacy_notification_outbox(store)
+    ready = threading.Barrier(12)
+
+    def initialize(_index: int) -> None:
+        ready.wait()
+        NotificationOutbox(store)
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(initialize, index) for index in range(12)]
+        errors = [future.exception() for future in futures]
+
+    assert errors == [None] * 12
+    with store._connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(workflow_notification_outbox)"
+            )
+        }
+    assert {
+        "handoff_node_id",
+        "handoff_id",
+        "handoff_generation",
+    } <= columns
+
+
+def test_handoff_identity_upsert_is_singleton_under_concurrent_writers(
+    tmp_path,
+) -> None:
+    home = tmp_path / "concurrent-handoff-upsert"
+    store = RunStore(home)
+    ready = threading.Barrier(12)
+
+    def record(index: int) -> str:
+        ready.wait()
+        version = index + 1
+        return NotificationOutbox(store).record(
+            run_id="concurrent-run",
+            kind="reconciliation_required",
+            destination="desktop",
+            transition_version=version,
+            payload=_handoff_notification_payload(
+                transition_version=version,
+                handoff_id="handoff-concurrent",
+                generation=3,
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        notification_ids = list(pool.map(record, range(12)))
+
+    assert len(set(notification_ids)) == 1
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_outbox "
+            "WHERE run_id='concurrent-run'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_facts "
+            "WHERE run_id='concurrent-run'"
+        ).fetchone()[0] == 12
+
+
+def test_notification_schema_backfills_null_identity_after_columns_exist(
+    tmp_path,
+) -> None:
+    home = tmp_path / "mixed-version-notification"
+    store = RunStore(home)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    _insert_notification_row(
+        store,
+        notification_id="mixed-version-notification",
+        transition_key="mixed-version-transition",
+        transition_version=3,
+        payload=_handoff_notification_payload(transition_version=3),
+        state="delivered",
+        created_at=observed,
+    )
+
+    NotificationOutbox(RunStore(home))
+
+    with store._connect() as connection:
+        identity = connection.execute(
+            "SELECT handoff_node_id, handoff_id, handoff_generation "
+            "FROM workflow_notification_outbox WHERE notification_id=?",
+            ("mixed-version-notification",),
+        ).fetchone()
+    assert tuple(identity) == ("review", "handoff-legacy", 7)
+
+
+def test_malformed_delivered_legacy_row_cannot_suppress_valid_attention(
+    tmp_path,
+) -> None:
+    home = tmp_path / "malformed-legacy-notification"
+    store = RunStore(home)
+    _replace_with_legacy_notification_outbox(store)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    malformed = {
+        **_handoff_notification_payload(transition_version=1),
+        "unsafe_private_body": "Bearer secret /Users/private/task.txt",
+    }
+    _insert_notification_row(
+        store,
+        notification_id="malformed-delivered",
+        transition_key="malformed-transition",
+        transition_version=1,
+        payload=malformed,
+        state="delivered",
+        created_at=observed,
+    )
+
+    outbox = NotificationOutbox(RunStore(home))
+    valid_id = outbox.record(
+        run_id="legacy-run",
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=2,
+        payload=_handoff_notification_payload(transition_version=2),
+        now=observed + timedelta(seconds=1),
+    )
+
+    assert valid_id != "malformed-delivered"
+    attention = outbox.pending_attention(run_id="legacy-run")
+    assert [item["notification_id"] for item in attention] == [valid_id]
+    assert "unsafe_private_body" not in json.dumps(attention)
+    with store._connect() as connection:
+        malformed_identity = connection.execute(
+            "SELECT handoff_node_id, handoff_id, handoff_generation "
+            "FROM workflow_notification_outbox WHERE notification_id=?",
+            ("malformed-delivered",),
+        ).fetchone()
+    assert tuple(malformed_identity) == (None, None, None)
+
+
+def test_notification_migration_consolidates_duplicate_identity_and_facts(
+    tmp_path,
+) -> None:
+    home = tmp_path / "duplicate-handoff-notification"
+    store = RunStore(home)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    with store._connect() as connection:
+        connection.execute("DROP INDEX workflow_notification_handoff_identity")
+        connection.execute(
+            "CREATE INDEX workflow_notification_handoff_identity "
+            "ON workflow_notification_outbox("
+            "run_id, kind, destination, handoff_node_id, handoff_id, "
+            "handoff_generation) WHERE handoff_node_id IS NOT NULL "
+            "AND handoff_id IS NOT NULL AND handoff_generation IS NOT NULL"
+        )
+    _insert_notification_row(
+        store,
+        notification_id="acknowledged-original",
+        transition_key="duplicate-transition-1",
+        transition_version=1,
+        payload=_handoff_notification_payload(transition_version=1),
+        state="pending",
+        created_at=observed,
+    )
+    _insert_notification_row(
+        store,
+        notification_id="later-duplicate",
+        transition_key="duplicate-transition-2",
+        transition_version=2,
+        payload=_handoff_notification_payload(
+            transition_version=2,
+            failure_code="cancellation_indeterminate",
+        ),
+        state="delivered",
+        created_at=observed + timedelta(seconds=1),
+        coalesced_count=2,
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE workflow_notification_outbox SET handoff_node_id='review', "
+            "handoff_id='handoff-legacy', handoff_generation=7"
+        )
+        connection.executemany(
+            "INSERT INTO workflow_notification_facts ("
+            "transition_key, notification_id, run_id, kind, destination, "
+            "transition_version, payload_json, occurred_at) "
+            "SELECT transition_key, notification_id, run_id, kind, destination, "
+            "transition_version, payload_json, ? "
+            "FROM workflow_notification_outbox WHERE notification_id=?",
+            (
+                (observed.isoformat(), "acknowledged-original"),
+                (
+                    (observed + timedelta(seconds=1)).isoformat(),
+                    "later-duplicate",
+                ),
+            ),
+        )
+
+    outbox = NotificationOutbox(RunStore(home))
+
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT notification_id, transition_key, transition_version, "
+            "coalesced_count, payload_json, state "
+            "FROM workflow_notification_outbox WHERE run_id='legacy-run'"
+        ).fetchall()
+        fact_ids = [
+            row["notification_id"]
+            for row in connection.execute(
+                "SELECT notification_id FROM workflow_notification_facts "
+                "WHERE run_id='legacy-run' ORDER BY transition_version"
+            )
+        ]
+        identity_index = next(
+            row
+            for row in connection.execute(
+                "PRAGMA index_list(workflow_notification_outbox)"
+            )
+            if row["name"] == "workflow_notification_handoff_identity"
+        )
+
+    assert len(rows) == 1
+    assert rows[0]["notification_id"] == "acknowledged-original"
+    assert rows[0]["transition_key"] == "duplicate-transition-2"
+    assert rows[0]["transition_version"] == 2
+    assert rows[0]["coalesced_count"] == 3
+    assert rows[0]["state"] == "delivered"
+    assert json.loads(rows[0]["payload_json"])["handoff"]["failure_code"] == (
+        "cancellation_indeterminate"
+    )
+    assert fact_ids == ["acknowledged-original", "acknowledged-original"]
+    assert identity_index["unique"] == 1
+    assert outbox.pending_attention(run_id="legacy-run") == ()
+
+    NotificationOutbox(RunStore(home))
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM workflow_notification_outbox "
+            "WHERE run_id='legacy-run'"
+        ).fetchone()[0] == 1
 
 
 def test_journal_reconciliation_clears_deferred_terminal_handoff_attention(

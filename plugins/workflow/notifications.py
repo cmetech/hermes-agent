@@ -240,6 +240,245 @@ def _stable_delivery_failure_reason(error: object) -> str:
     return _GENERIC_DELIVERY_FAILURE_REASON
 
 
+def _persisted_handoff_identity(
+    row: sqlite3.Row,
+) -> tuple[tuple[str, str, int], dict[str, object]] | None:
+    transition_version = _bounded_int(
+        row["transition_version"],
+        maximum=1_000_000_000,
+    )
+    if transition_version is None:
+        return None
+    payload, valid = _load_notification_payload(
+        row["payload_json"],
+        transition_version=transition_version,
+    )
+    handoff = payload.get("handoff") if valid else None
+    if not isinstance(handoff, Mapping):
+        return None
+    return (
+        (
+            str(handoff["node_id"]),
+            str(handoff["handoff_id"]),
+            int(handoff["generation"]),
+        ),
+        payload,
+    )
+
+
+def _consolidate_handoff_notifications(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    identity: tuple[str, str, int],
+) -> str:
+    canonical = min(
+        rows,
+        key=lambda row: (str(row["created_at"]), str(row["notification_id"])),
+    )
+    latest = max(
+        rows,
+        key=lambda row: (
+            int(row["transition_version"]),
+            str(row["updated_at"]),
+            str(row["notification_id"]),
+        ),
+    )
+    acknowledged = [row for row in rows if row["state"] == "delivered"]
+    leased = [row for row in rows if row["state"] == "leased"]
+    delivery_authority = max(
+        acknowledged or leased or [canonical],
+        key=lambda row: (str(row["updated_at"]), str(row["notification_id"])),
+    )
+    canonical_id = str(canonical["notification_id"])
+    duplicate_ids = [
+        str(row["notification_id"])
+        for row in rows
+        if row["notification_id"] != canonical_id
+    ]
+    if duplicate_ids:
+        connection.executemany(
+            "UPDATE workflow_notification_facts SET notification_id=? "
+            "WHERE notification_id=?",
+            ((canonical_id, notification_id) for notification_id in duplicate_ids),
+        )
+        connection.executemany(
+            "DELETE FROM workflow_notification_outbox WHERE notification_id=?",
+            ((notification_id,) for notification_id in duplicate_ids),
+        )
+    latest_payload, valid = _load_notification_payload(
+        latest["payload_json"],
+        transition_version=int(latest["transition_version"]),
+    )
+    if not valid:
+        raise sqlite3.IntegrityError("validated handoff payload became invalid")
+    connection.execute(
+        "UPDATE workflow_notification_outbox SET transition_key=?, "
+        "transition_version=?, coalesced_count=?, payload_json=?, updated_at=?, "
+        "state=?, available_at=?, lease_owner=?, lease_expires_at=?, attempts=?, "
+        "delivered_at=?, dismissed_at=?, last_error=?, "
+        "handoff_node_id=?, handoff_id=?, handoff_generation=? "
+        "WHERE notification_id=?",
+        (
+            latest["transition_key"],
+            latest["transition_version"],
+            sum(
+                _bounded_int(row["coalesced_count"], minimum=1) or 1
+                for row in rows
+            ),
+            json.dumps(
+                latest_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+            latest["updated_at"],
+            delivery_authority["state"],
+            delivery_authority["available_at"],
+            delivery_authority["lease_owner"],
+            delivery_authority["lease_expires_at"],
+            delivery_authority["attempts"],
+            delivery_authority["delivered_at"],
+            delivery_authority["dismissed_at"],
+            delivery_authority["last_error"],
+            *identity,
+            canonical_id,
+        ),
+    )
+    return canonical_id
+
+
+def _migrate_notification_handoff_identity(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(workflow_notification_outbox)"
+        )
+    }
+    for name, column_type in (
+        ("handoff_node_id", "TEXT"),
+        ("handoff_id", "TEXT"),
+        ("handoff_generation", "INTEGER"),
+    ):
+        if name not in columns:
+            connection.execute(
+                "ALTER TABLE workflow_notification_outbox "
+                f"ADD COLUMN {name} {column_type}"
+            )
+    index_row = next(
+        (
+            row
+            for row in connection.execute(
+                "PRAGMA index_list(workflow_notification_outbox)"
+            )
+            if row["name"] == "workflow_notification_handoff_identity"
+        ),
+        None,
+    )
+    full_validation = index_row is None or int(index_row["unique"]) != 1
+    if index_row is not None and int(index_row["unique"]) != 1:
+        connection.execute("DROP INDEX workflow_notification_handoff_identity")
+    if full_validation:
+        rows = connection.execute(
+            "SELECT * FROM workflow_notification_outbox"
+        ).fetchall()
+        connection.execute(
+            "UPDATE workflow_notification_outbox SET handoff_node_id=NULL, "
+            "handoff_id=NULL, handoff_generation=NULL"
+        )
+        groups: dict[tuple[str, str, str, str, str, int], list[sqlite3.Row]] = {}
+        for row in rows:
+            validated = _persisted_handoff_identity(row)
+            if validated is None:
+                continue
+            identity, _payload = validated
+            key = (
+                str(row["run_id"]),
+                str(row["kind"]),
+                str(row["destination"]),
+                *identity,
+            )
+            groups.setdefault(key, []).append(row)
+        for key, group in groups.items():
+            _consolidate_handoff_notifications(
+                connection,
+                group,
+                identity=(key[3], key[4], key[5]),
+            )
+    else:
+        rows = connection.execute(
+            "SELECT * FROM workflow_notification_outbox "
+            "WHERE handoff_node_id IS NULL OR handoff_id IS NULL "
+            "OR handoff_generation IS NULL"
+        ).fetchall()
+        for stale_row in rows:
+            current = connection.execute(
+                "SELECT * FROM workflow_notification_outbox "
+                "WHERE notification_id=?",
+                (stale_row["notification_id"],),
+            ).fetchone()
+            if current is None:
+                continue
+            validated = _persisted_handoff_identity(current)
+            if validated is None:
+                if any(
+                    current[field] is not None
+                    for field in (
+                        "handoff_node_id",
+                        "handoff_id",
+                        "handoff_generation",
+                    )
+                ):
+                    connection.execute(
+                        "UPDATE workflow_notification_outbox SET "
+                        "handoff_node_id=NULL, handoff_id=NULL, "
+                        "handoff_generation=NULL WHERE notification_id=?",
+                        (current["notification_id"],),
+                    )
+                continue
+            identity, _payload = validated
+            existing = connection.execute(
+                "SELECT * FROM workflow_notification_outbox "
+                "WHERE run_id=? AND kind=? AND destination=? "
+                "AND handoff_node_id=? AND handoff_id=? "
+                "AND handoff_generation=? AND notification_id<>?",
+                (
+                    current["run_id"],
+                    current["kind"],
+                    current["destination"],
+                    *identity,
+                    current["notification_id"],
+                ),
+            ).fetchone()
+            group = [current]
+            if existing is not None:
+                existing_validation = _persisted_handoff_identity(existing)
+                if existing_validation is None or existing_validation[0] != identity:
+                    connection.execute(
+                        "UPDATE workflow_notification_outbox SET "
+                        "handoff_node_id=NULL, handoff_id=NULL, "
+                        "handoff_generation=NULL WHERE notification_id=?",
+                        (existing["notification_id"],),
+                    )
+                else:
+                    group.append(existing)
+            _consolidate_handoff_notifications(
+                connection,
+                group,
+                identity=identity,
+            )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "workflow_notification_handoff_identity "
+        "ON workflow_notification_outbox("
+        "run_id, kind, destination, handoff_node_id, handoff_id, "
+        "handoff_generation) WHERE handoff_node_id IS NOT NULL "
+        "AND handoff_id IS NOT NULL AND handoff_generation IS NOT NULL"
+    )
+
+
 def install_notification_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -301,57 +540,13 @@ def install_notification_schema(connection: sqlite3.Connection) -> None:
         ) VALUES (1, NULL, NULL);
         """
     )
-    columns = {
-        row["name"]
-        for row in connection.execute(
-            "PRAGMA table_info(workflow_notification_outbox)"
-        )
-    }
-    identity_columns = {
-        "handoff_node_id",
-        "handoff_id",
-        "handoff_generation",
-    }
-    if not identity_columns <= columns:
-        connection.execute("SAVEPOINT workflow_notification_handoff_identity")
-        try:
-            for name, column_type in (
-                ("handoff_node_id", "TEXT"),
-                ("handoff_id", "TEXT"),
-                ("handoff_generation", "INTEGER"),
-            ):
-                if name not in columns:
-                    connection.execute(
-                        "ALTER TABLE workflow_notification_outbox "
-                        f"ADD COLUMN {name} {column_type}"
-                    )
-            connection.execute(
-                "UPDATE workflow_notification_outbox SET "
-                "handoff_node_id=CASE WHEN json_valid(payload_json) THEN "
-                "json_extract(payload_json, '$.handoff.node_id') END, "
-                "handoff_id=CASE WHEN json_valid(payload_json) THEN "
-                "json_extract(payload_json, '$.handoff.handoff_id') END, "
-                "handoff_generation=CASE WHEN json_valid(payload_json) THEN "
-                "json_extract(payload_json, '$.handoff.generation') END"
-            )
-        except sqlite3.Error:
-            connection.execute(
-                "ROLLBACK TO SAVEPOINT workflow_notification_handoff_identity"
-            )
-            connection.execute(
-                "RELEASE SAVEPOINT workflow_notification_handoff_identity"
-            )
-            raise
-        connection.execute(
-            "RELEASE SAVEPOINT workflow_notification_handoff_identity"
-        )
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS workflow_notification_handoff_identity "
-        "ON workflow_notification_outbox("
-        "run_id, kind, destination, handoff_node_id, handoff_id, "
-        "handoff_generation) WHERE handoff_node_id IS NOT NULL "
-        "AND handoff_id IS NOT NULL AND handoff_generation IS NOT NULL"
-    )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate_notification_handoff_identity(connection)
+    except Exception:
+        connection.rollback()
+        raise
+    connection.commit()
 
 
 def projected_pending_interaction(
@@ -855,6 +1050,13 @@ class NotificationOutbox:
         with self.store._connect() as connection:
             install_notification_schema(connection)
 
+    @classmethod
+    def _from_initialized_store(cls, store) -> NotificationOutbox:
+        """Bind a store that already installed the outbox schema at startup."""
+        outbox = cls.__new__(cls)
+        outbox.store = store
+        return outbox
+
     @staticmethod
     def _aware(now: datetime) -> datetime:
         if now.tzinfo is None or now.utcoffset() is None:
@@ -997,9 +1199,7 @@ class NotificationOutbox:
                         now=observed,
                     )
                 return notification_id
-            if safe_kind == "reconciliation_required" and isinstance(
-                handoff, Mapping
-            ):
+            if isinstance(handoff, Mapping):
                 candidate = connection.execute(
                     "SELECT notification_id FROM workflow_notification_outbox "
                     "WHERE run_id=? AND kind=? AND destination=? "
@@ -1011,12 +1211,14 @@ class NotificationOutbox:
                     connection.execute(
                         "UPDATE workflow_notification_outbox SET transition_key=?, "
                         "transition_version=?, coalesced_count=coalesced_count+1, "
-                        "payload_json=?, updated_at=? WHERE notification_id=?",
+                        "payload_json=?, updated_at=?, handoff_node_id=?, "
+                        "handoff_id=?, handoff_generation=? WHERE notification_id=?",
                         (
                             transition_key,
                             transition_version,
                             safe_payload,
                             timestamp,
+                            *handoff_identity,
                             candidate["notification_id"],
                         ),
                     )
@@ -1061,12 +1263,14 @@ class NotificationOutbox:
                     connection.execute(
                         "UPDATE workflow_notification_outbox SET transition_key=?, "
                         "transition_version=?, coalesced_count=coalesced_count+1, "
-                        "payload_json=?, updated_at=? WHERE notification_id=?",
+                        "payload_json=?, updated_at=?, handoff_node_id=?, "
+                        "handoff_id=?, handoff_generation=? WHERE notification_id=?",
                         (
                             transition_key,
                             transition_version,
                             safe_payload,
                             timestamp,
+                            *handoff_identity,
                             candidate["notification_id"],
                         ),
                     )

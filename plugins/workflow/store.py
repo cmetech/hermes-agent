@@ -17803,7 +17803,7 @@ class RunStore:
                 "handoff_failed",
                 "handoff_terminal",
             }:
-                outbox = NotificationOutbox(self)
+                outbox = NotificationOutbox._from_initialized_store(self)
             if (
                 outbox is not None
                 and event_type in {"handoff_failed", "handoff_terminal"}
