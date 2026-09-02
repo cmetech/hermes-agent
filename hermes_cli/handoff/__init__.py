@@ -17,6 +17,7 @@ from .service import (
     HandoffServiceError,
     UnsupportedHandoffCommand,
 )
+from .peer import PeerHermesChannel
 from .store import (
     AdvanceLease,
     CommandRecord,
@@ -52,6 +53,7 @@ __all__ = [
     "HandoffStateConflict",
     "HandoffStore",
     "HandoffStoreError",
+    "PeerHermesChannel",
     "StaleAdvanceLease",
     "UnsupportedHandoffCommand",
 ]

@@ -829,7 +829,7 @@ async def test_cross_origin_redirect_strips_target_authorization(profile_env):
     assert seen == [None]
 
 
-def test_default_service_uses_the_local_runs_channel(profile_env):
+def test_default_service_dispatcher_contains_the_local_runs_channel(profile_env):
     default_home, _target_home = profile_env
     service = AgentHandoffService(store=HandoffStore(default_home / "default.db"))
-    assert isinstance(service.channel, LocalHermesChannel)
+    assert isinstance(service.channel.local, LocalHermesChannel)

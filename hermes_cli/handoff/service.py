@@ -75,6 +75,7 @@ class EndpointAssessment:
     available: bool
     mechanism: str | None = None
     failure_code: str | None = None
+    capabilities: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.endpoint, HandoffEndpoint) or not isinstance(
@@ -86,6 +87,13 @@ class EndpointAssessment:
                 not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value)
             ):
                 raise ValueError("handoff endpoint assessment is invalid")
+        capabilities = frozenset(self.capabilities)
+        if not all(
+            isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value)
+            for value in capabilities
+        ):
+            raise ValueError("handoff endpoint assessment is invalid")
+        object.__setattr__(self, "capabilities", capabilities)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +123,55 @@ def _initiator_scope(initiator: object) -> str:
     return initiator
 
 
+class _BuiltinHandoffChannels:
+    """Fixed local/peer switch; this is intentionally not a channel registry."""
+
+    def __init__(self, source_home) -> None:
+        from .local import LocalHermesChannel
+        from .peer import PeerHermesChannel
+
+        self.local = LocalHermesChannel(source_home)
+        self.peer = PeerHermesChannel(source_home)
+
+    def _channel(self, endpoint: HandoffEndpoint):
+        return self.peer if endpoint.kind == "peer" else self.local
+
+    def validate_endpoint(self, endpoint: HandoffEndpoint, initiator: str):
+        return self._channel(endpoint).validate_endpoint(endpoint, initiator)
+
+    def bind(self, snapshot: HandoffSnapshot, *, budget_seconds: float):
+        return self._channel(snapshot.spec.endpoint).bind(
+            snapshot, budget_seconds=budget_seconds
+        )
+
+    def submit(self, snapshot: HandoffSnapshot, *, budget_seconds: float):
+        return self._channel(snapshot.spec.endpoint).submit(
+            snapshot, budget_seconds=budget_seconds
+        )
+
+    def reconcile(self, snapshot: HandoffSnapshot, *, budget_seconds: float):
+        return self._channel(snapshot.spec.endpoint).reconcile(
+            snapshot, budget_seconds=budget_seconds
+        )
+
+    def observe(self, snapshot: HandoffSnapshot, *, budget_seconds: float):
+        return self._channel(snapshot.spec.endpoint).observe(
+            snapshot, budget_seconds=budget_seconds
+        )
+
+    def cancel(self, snapshot: HandoffSnapshot, *, budget_seconds: float):
+        return self._channel(snapshot.spec.endpoint).cancel(
+            snapshot, budget_seconds=budget_seconds
+        )
+
+    def cleanup_committed(self, snapshot: HandoffSnapshot) -> None:
+        cleanup = getattr(self._channel(snapshot.spec.endpoint), "cleanup_committed", None)
+        if callable(cleanup):
+            cleanup(snapshot)
+
+
 class AgentHandoffService:
-    """Consumer-neutral facade over one durable store and local channel."""
+    """Consumer-neutral facade over one durable store and built-in channels."""
 
     def __init__(
         self,
@@ -127,9 +182,7 @@ class AgentHandoffService:
     ) -> None:
         self.store = store or HandoffStore()
         if channel is None:
-            from .local import LocalHermesChannel
-
-            channel = LocalHermesChannel(self.store.path.parent)
+            channel = _BuiltinHandoffChannels(self.store.path.parent)
         self.channel = channel
         self._clock = clock
 

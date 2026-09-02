@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
@@ -195,6 +196,61 @@ def test_validate_create_and_read_facade_are_consumer_neutral(tmp_path):
     assert service.get(snapshot.handoff_id) == snapshot
     assert service.list({"key_scope": "workflow/run-1"}) == (snapshot,)
     assert service.evidence(snapshot.handoff_id).events[0].kind == "created"
+
+
+def test_default_dispatcher_selects_only_the_endpoint_channel(tmp_path):
+    service = AgentHandoffService(store=HandoffStore(tmp_path / "dispatch.db"))
+    calls = []
+
+    class _Channel:
+        def __init__(self, name):
+            self.name = name
+
+        def validate_endpoint(self, endpoint, _initiator):
+            calls.append((self.name, endpoint.kind, "validate"))
+            return EndpointAssessment(endpoint=endpoint, available=True)
+
+        def bind(self, snapshot, *, budget_seconds):
+            calls.append((self.name, snapshot.spec.endpoint.kind, "bind"))
+            if self.name == "peer":
+                return ChannelObservation(
+                    phase="prepared",
+                    mechanism="peer_runs",
+                    binding={
+                        "peer": "spark",
+                        "profile": "reviewer",
+                        "mechanism": "peer_runs",
+                        "capabilities": [
+                            "authoritative_status",
+                            "cancellation",
+                            "durable_admission",
+                        ],
+                        "origin_sha256": "a" * 64,
+                        "auth_scope_sha256": "b" * 64,
+                    },
+                )
+            return ChannelObservation(
+                phase="prepared",
+                mechanism="runs",
+                binding={"profile": "reviewer", "mechanism": "runs"},
+            )
+
+    service.channel.local = _Channel("local")
+    service.channel.peer = _Channel("peer")
+    local = _spec().endpoint
+    peer = HandoffEndpoint.parse("hermes://peer/spark/reviewer")
+
+    service.validate_endpoint(local, "workflow/run-1")
+    service.validate_endpoint(peer, "workflow/run-1")
+    peer_spec = replace(_spec(), endpoint=peer)
+    created = service.create(peer_spec, "workflow/run-1", handoff_key="peer/review")
+    service.advance(created.handoff_id)
+
+    assert calls == [
+        ("local", "local", "validate"),
+        ("peer", "peer", "validate"),
+        ("peer", "peer", "bind"),
+    ]
 
 
 @pytest.mark.parametrize(
