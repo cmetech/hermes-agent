@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 from agent.structured_output import StructuredOutputStrategy
+from hermes_cli.handoff import AgentHandoffService, HandoffStore
 from hermes_cli.plugin_configuration import connector_capability_snapshot
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.bash_rendering import bash_output_references
@@ -46,6 +47,7 @@ from plugins.workflow.executors.approval import ApprovalExecutor
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
 from plugins.workflow.executors.bash import BashExecutor
 from plugins.workflow.executors.cancel import CancelExecutor
+from plugins.workflow.executors.handoff import HandoffPromptExecutor
 from plugins.workflow.executors.loop import (
     LoopExecutor,
     clean_loop_completion,
@@ -925,6 +927,7 @@ class RunScheduler:
         execution_fence: ExecutionFence | None = None,
         agent_runner=None,
         runner_binding=None,
+        handoff_service: AgentHandoffService | None = None,
         session_registry: NodeSessionRegistry | None = None,
         profile_name: str = "default",
         max_parallel_nodes: int = 4,
@@ -984,6 +987,11 @@ class RunScheduler:
             else None
         )
         self.store = store
+        self._handoff_service = handoff_service
+        self._owns_handoff_service = False
+        from plugins.workflow.admission import workflow_profile_for_home
+
+        self.workflow_profile = workflow_profile_for_home(store.hermes_home)
         self.session_registry = session_registry
         if self.session_registry is None and agent_runner is not None:
             self.session_registry = NodeSessionRegistry(store.hermes_home)
@@ -1076,6 +1084,45 @@ class RunScheduler:
                     deterministic_runner=deterministic_runner,
                 ),
             })
+
+    def _assigned_prompt_executor(
+        self,
+        assignment: Mapping[str, object],
+        projection: Mapping[str, object],
+    ) -> HandoffPromptExecutor:
+        if self._handoff_service is None:
+            self._handoff_service = AgentHandoffService(
+                HandoffStore(self.store.hermes_home / "handoffs.db")
+            )
+            self._owns_handoff_service = True
+        deadline_at = None
+        duration = assignment.get("deadline")
+        if duration is not None:
+            matched = re.fullmatch(
+                r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?",
+                str(duration),
+            )
+            created_at = projection.get("created_at")
+            if matched is None or not isinstance(created_at, str):
+                raise ValueError("assigned prompt deadline is invalid")
+            base = datetime.fromisoformat(created_at)
+            if base.utcoffset() is None:
+                raise ValueError("workflow creation time must be timezone-aware")
+            days, hours, minutes = (
+                int(value or 0) for value in matched.groups()
+            )
+            deadline_at = base + timedelta(
+                days=days,
+                hours=hours,
+                minutes=minutes,
+            )
+        return HandoffPromptExecutor(
+            self._handoff_service,
+            assignment,
+            initiator_profile=self.workflow_profile,
+            deadline_at=deadline_at,
+            utcnow=self._utcnow,
+        )
 
     def _reconcile_session_registry_update(self, run_id: str) -> bool:
         pending = self.store.pending_session_registry_update(run_id)
@@ -4825,7 +4872,17 @@ class RunScheduler:
             if not self._renew_execution_owner(run_id):
                 self.store.release_claim_before_execution(claim)
                 return
-            executor = self.executors.get(node.node_type)
+            assignments = package.sidecar.get("assignments", {})
+            assignment = (
+                assignments.get(work_item.semantic_id)
+                if isinstance(assignments, Mapping)
+                else None
+            )
+            executor = (
+                self._assigned_prompt_executor(assignment, projection)
+                if isinstance(assignment, Mapping)
+                else self.executors.get(node.node_type)
+            )
             if executor is None:
                 result = NodeExecutionResult(
                     "failed",
@@ -5585,6 +5642,67 @@ class RunScheduler:
         execution_semantics: Phase3ExecutionSemantics | None = None,
         outward_action: bool = False,
     ) -> None:
+        if result.status == "waiting_handoff":
+            allowed = {
+                "handoff_id",
+                "handoff_generation",
+                "handoff_observed_version",
+                "handoff_observed_phase",
+                "handoff_next_observation_at",
+                "handoff_deadline_at",
+                "known_no_effect",
+                "provider_attempts",
+                "provider_attempts_exact",
+                "model_calls",
+                "model_calls_exact",
+                "iteration_consumed",
+                "remaining_iterations",
+                "remaining_wall_seconds",
+            }
+            if result.artifacts or result.error_code or set(result.metadata) - allowed:
+                raise RuntimeError("invalid internal handoff wait result")
+            handoff_id = result.metadata.get("handoff_id")
+            generation = result.metadata.get("handoff_generation")
+            observed_version = result.metadata.get("handoff_observed_version")
+            observed_phase = result.metadata.get("handoff_observed_phase")
+            next_raw = result.metadata.get("handoff_next_observation_at")
+            deadline_raw = result.metadata.get("handoff_deadline_at")
+            if (
+                not isinstance(handoff_id, str)
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or isinstance(observed_version, bool)
+                or not isinstance(observed_version, int)
+                or not isinstance(observed_phase, str)
+                or not isinstance(next_raw, str)
+                or deadline_raw is not None
+                and not isinstance(deadline_raw, str)
+            ):
+                raise RuntimeError("invalid internal handoff wait result")
+            try:
+                next_observation_at = datetime.fromisoformat(next_raw)
+                deadline_at = (
+                    datetime.fromisoformat(deadline_raw)
+                    if isinstance(deadline_raw, str)
+                    else None
+                )
+            except ValueError as exc:
+                raise RuntimeError("invalid internal handoff wait result") from exc
+            if next_observation_at.utcoffset() is None or (
+                deadline_at is not None and deadline_at.utcoffset() is None
+            ):
+                raise RuntimeError("invalid internal handoff wait result")
+            if not self.store.persist_handoff_wait_result(
+                claim,
+                handoff_id=handoff_id,
+                generation=generation,
+                observed_version=observed_version,
+                observed_phase=observed_phase,
+                next_observation_at=next_observation_at,
+                deadline_at=deadline_at,
+            ):
+                raise RuntimeError("stale internal handoff wait result")
+            return
         if result.session_recovery_outcome is not None:
             if not self.store.record_persistent_session_recovery_outcome(
                 claim,
@@ -5846,9 +5964,21 @@ class RunScheduler:
                 policy.max_attempts,
                 consumed_before + 1 + provider_attempts,
             )
-        known_no_effect = None
+        observed_handoff_phase = result.metadata.get("handoff_observed_phase")
+        handoff_generation = result.metadata.get("handoff_generation")
+        definitive_handoff = bool(
+            isinstance(result.metadata.get("handoff_id"), str)
+            and isinstance(handoff_generation, int)
+            and not isinstance(handoff_generation, bool)
+            and handoff_generation > 0
+            and observed_handoff_phase in {"succeeded", "failed", "cancelled"}
+        )
+        known_no_effect = True if definitive_handoff else None
         if execution_semantics is not None:
-            known_no_effect = result.metadata.get("known_no_effect") is True
+            known_no_effect = (
+                definitive_handoff
+                or result.metadata.get("known_no_effect") is True
+            )
             if (
                 node.node_type in {"bash", "script"}
                 and retry_grant is not None
@@ -5863,7 +5993,9 @@ class RunScheduler:
             maximum=policy.max_attempts,
             known_no_effect=known_no_effect,
             outward_action=(
-                outward_action if execution_semantics is not None else False
+                outward_action and not definitive_handoff
+                if execution_semantics is not None
+                else False
             ),
         )
         never_retry = {
@@ -6755,6 +6887,8 @@ class RunScheduler:
             except WorkflowLockTimeout:
                 self.store.record_cleanup_failed(run_id, reason="shutdown_lock_timeout")
         self._submission_pool.shutdown(wait=True, cancel_futures=True)
+        if self._owns_handoff_service and self._handoff_service is not None:
+            self._handoff_service.store.close()
 
 
 __all__ = [

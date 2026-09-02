@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import hashlib
 import json
@@ -14,10 +14,13 @@ from types import MappingProxyType
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.handoff import AdvanceResult, HandoffSnapshot
 from hermes_cli.runtime_provider import ExecutionRuntimeCapabilities
 from plugins.workflow import output_resolution
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.execution_semantics import Phase3ExecutionSemantics
+from plugins.workflow.executors.ai import AgentNodeExecutor
 from plugins.workflow.executors.base import NodeExecutionResult
 from plugins.workflow.models import (
     RunExecutionLimits,
@@ -68,6 +71,253 @@ def test_only_one_owner_claims_a_ready_node(tmp_path, workflow_writer):
             )
 
         assert sum(claim is not None for claim in claims) == 1
+
+
+def test_unassigned_prompt_keeps_the_existing_agent_executor(tmp_path):
+    store = RunStore(tmp_path / "unassigned-home")
+    scheduler = RunScheduler(store, agent_runner=object())
+    try:
+        assert isinstance(scheduler.executors["prompt"], AgentNodeExecutor)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+
+def test_internal_handoff_wait_releases_worker_without_consuming_retry(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "handoff-wait-home")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "handoff-wait-package",
+            name="handoff-wait",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="handoff-wait",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="handoff-wait",
+            concurrency_key="handoff-wait",
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "start", "handoff-worker")
+    assert claim is not None
+    scheduler = RunScheduler(store)
+    try:
+        scheduler._persist_result(
+            claim,
+            package.definition.nodes[0],
+            NodeExecutionResult(
+                "waiting_handoff",
+                metadata={
+                    "handoff_id": "handoff-1",
+                    "handoff_generation": 1,
+                    "handoff_observed_version": 3,
+                    "handoff_observed_phase": "active",
+                    "handoff_next_observation_at": "2026-09-01T12:00:05+00:00",
+                    "handoff_deadline_at": "2026-09-01T16:00:00+00:00",
+                    "known_no_effect": True,
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": True,
+                },
+            ),
+            scheduler.profile_execution_limits,
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    projection = store.load_run(admitted.run_id)
+    node = projection["nodes"]["start"]
+    assert projection["status"] == "running"
+    assert node["state"] == "waiting_handoff"
+    assert node.get("retry_consumed", 0) == 0
+    assert node["attempts"][-1]["state"] == "waiting_handoff"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()[0] == 0
+
+
+def test_definitive_handoff_failure_does_not_enter_outward_reconciliation(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "handoff-terminal-home")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "handoff-terminal-package",
+            name="handoff-terminal",
+            nodes=[{"id": "start", "prompt": "delegate"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="handoff-terminal",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="handoff-terminal",
+            concurrency_key="handoff-terminal",
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "start", "handoff-worker")
+    assert claim is not None
+    semantics = Phase3ExecutionSemantics(
+        limits={},
+        nodes={
+            "start": {
+                "retry": {
+                    "explicit": False,
+                    "requested_retries": 1,
+                    "requested_total_attempts": 2,
+                    "effective_total_attempts": 2,
+                    "delay_ms": 1000,
+                    "on_error": "transient",
+                    "capped": False,
+                }
+            }
+        },
+    )
+    scheduler = RunScheduler(store)
+    try:
+        scheduler._persist_result(
+            claim,
+            package.definition.nodes[0],
+            NodeExecutionResult(
+                "failed",
+                error_code="handoff_remote_failed",
+                metadata={
+                    "handoff_id": "handoff-1",
+                    "handoff_generation": 1,
+                    "handoff_observed_phase": "failed",
+                    "provider_attempts": 0,
+                    "provider_attempts_exact": True,
+                },
+            ),
+            scheduler.profile_execution_limits,
+            execution_semantics=semantics,
+            outward_action=True,
+        )
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    projection = store.load_run(admitted.run_id)
+    assert projection["status"] == "failed"
+    assert projection["nodes"]["start"]["state"] == "failed"
+    assert "pending_interaction" not in projection["nodes"]["start"]
+
+
+def test_assigned_prompt_dispatches_as_handoff_and_releases_worker(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow = workflow_writer(
+        tmp_path / "assigned-package",
+        name="assigned",
+        nodes=[{"id": "review", "prompt": "Review this"}],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "outward_action_nodes:\n"
+        "  - review\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/reviewer\n"
+        "    interaction_policy: deny\n"
+        "    deadline: PT4H\n"
+        "    on_deadline: cancel_and_fail\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(package, initiator_profile="default")
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name="assigned",
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="assigned",
+            concurrency_key="assigned",
+        ),
+        immutable_snapshot=prepared,
+    )
+
+    class HandoffService:
+        def __init__(self):
+            self.created = []
+            self.advanced = []
+            self.snapshot = None
+
+        def create(self, spec, initiator, *, handoff_key):
+            self.created.append((spec, initiator, handoff_key))
+            self.snapshot = HandoffSnapshot(
+                handoff_id="handoff-1",
+                key_scope=initiator,
+                handoff_key=handoff_key,
+                spec=spec,
+                spec_fingerprint=spec.fingerprint,
+                phase="prepared",
+                state_version=0,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            return self.snapshot
+
+        def advance(self, handoff_id, *, budget_seconds=2.0):
+            self.advanced.append((handoff_id, budget_seconds))
+            assert self.snapshot is not None
+            self.snapshot = HandoffSnapshot(
+                handoff_id=self.snapshot.handoff_id,
+                key_scope=self.snapshot.key_scope,
+                handoff_key=self.snapshot.handoff_key,
+                spec=self.snapshot.spec,
+                spec_fingerprint=self.snapshot.spec_fingerprint,
+                phase="active",
+                state_version=1,
+                next_advance_at=datetime.now(timezone.utc) + timedelta(seconds=5),
+                created_at=self.snapshot.created_at,
+                updated_at=datetime.now(timezone.utc),
+            )
+            return AdvanceResult(self.snapshot, "submit", True)
+
+    class RunnerTrap:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("assigned prompt used AgentNodeExecutor")
+
+    service = HandoffService()
+    scheduler = RunScheduler(
+        store,
+        agent_runner=RunnerTrap(),
+        handoff_service=service,
+    )
+    try:
+        projection = scheduler.advance(admitted.run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    node = projection["nodes"]["review"]
+    assert node["state"] == "waiting_handoff"
+    assert node.get("retry_consumed", 0) == 0
+    assert service.created[0][1:] == ("default", f"{admitted.run_id}:review:1")
+    assert service.created[0][0].prompt == "Review this"
+    assert service.advanced == [("handoff-1", 2.0)]
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
+            (admitted.run_id,),
+        ).fetchone()[0] == 0
 
 
 def test_only_one_process_claims_a_ready_node(tmp_path, workflow_writer):

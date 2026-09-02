@@ -127,6 +127,145 @@ def _aggregate_usage(
     return aggregate
 
 
+def render_agent_prompt(context: NodeExecutionContext) -> str:
+    """Render one command or prompt node from its authenticated inputs."""
+    node = context.node
+    if node.node_type == "command":
+        template = (
+            ResourceResolver(
+                context.run_directory,
+                sealed_paths=context.sealed_resource_paths,
+                sealed_bytes=context.sealed_resource_bytes,
+            )
+            .command(str(node.value))
+            .body
+        )
+    else:
+        template = str(node.value)
+    variables = context.variable_context
+    if not isinstance(variables, VariableContext):
+        variables = VariableContext(workflow_id=context.run_id)
+    renderer = substitution_renderer(
+        variables,
+        direct_dependencies=node.depends_on,
+        output_resolver=context.output_resolver,
+    )
+    prompt = renderer.render_prompt(template)
+    if node.options.get("skills"):
+        skill_text = ResourceResolver(
+            context.run_directory,
+            sealed_paths=context.sealed_resource_paths,
+            sealed_bytes=context.sealed_resource_bytes,
+        ).text(f"node-skills/{node.id}.md")
+        prompt = f"{skill_text}\n\n{prompt}"
+    return prompt
+
+
+def result_from_external_response(
+    context: NodeExecutionContext,
+    text: str,
+    metadata: Mapping[str, object],
+) -> NodeExecutionResult:
+    """Validate and persist external text exactly like an agent-node response."""
+    shaped = dict(metadata)
+    if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07:
+        try:
+            structured_request = AgentNodeExecutor._structured_request(context)
+        except StructuredOutputSchemaInvalid as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=str(exc),
+                metadata=shaped,
+            )
+        except ValueError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_capability_drift",
+                error_message=str(exc),
+                metadata=shaped,
+            )
+        if structured_request is None:
+            return AgentNodeExecutor._write_archon_output(
+                context,
+                text.encode("utf-8"),
+                shaped,
+                is_structured=False,
+                structured_value=None,
+                schema_fingerprint=None,
+                canonicalization_version=1,
+            )
+        try:
+            validator = require_structured_output_validator(
+                structured_request.schema.canonical_schema
+            )
+            value = parse_validate_canonicalize(
+                text,
+                structured_request,
+                validator=validator,
+            )
+        except StructuredOutputValidatorUnavailable as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_unavailable",
+                error_message=str(exc),
+                metadata=shaped,
+            )
+        except StructuredOutputError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=str(exc),
+                metadata=shaped,
+            )
+        return AgentNodeExecutor._write_archon_output(
+            context,
+            value.canonical_bytes,
+            shaped,
+            is_structured=True,
+            structured_value=value.value,
+            schema_fingerprint=structured_request.schema.schema_fingerprint,
+            canonicalization_version=value.canonicalization_version,
+        )
+
+    schema = context.node.options.get("output_format")
+    extension = ".txt"
+    if schema is not None:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=str(exc),
+            )
+        try:
+            jsonschema = require_structured_output_validator(legacy=True)
+        except StructuredOutputValidatorUnavailable as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_unavailable",
+                error_message=str(exc),
+            )
+        try:
+            jsonschema.validate(value, _thaw(schema))
+        except (jsonschema.SchemaError, jsonschema.ValidationError) as exc:
+            return NodeExecutionResult(
+                "failed",
+                error_code="structured_output_invalid",
+                error_message=exc.message,
+            )
+        extension = ".json"
+
+    attempt = context.effective_attempt_directory
+    attempt.mkdir(parents=True, exist_ok=False)
+    output_path = attempt / f"output{extension}"
+    output_path.write_text(text, encoding="utf-8")
+    artifact = _artifact(output_path, context.run_directory)
+    shaped["output"] = text
+    return NodeExecutionResult("succeeded", (artifact,), metadata=shaped)
+
+
 class AgentNodeExecutor:
     def __init__(
         self,
@@ -946,36 +1085,7 @@ class AgentNodeExecutor:
         )
 
     def _prompt(self, context: NodeExecutionContext) -> str:
-        node = context.node
-        if node.node_type == "command":
-            template = (
-                ResourceResolver(
-                    context.run_directory,
-                    sealed_paths=context.sealed_resource_paths,
-                    sealed_bytes=context.sealed_resource_bytes,
-                )
-                .command(str(node.value))
-                .body
-            )
-        else:
-            template = str(node.value)
-        variables = context.variable_context
-        if not isinstance(variables, VariableContext):
-            variables = VariableContext(workflow_id=context.run_id)
-        renderer = substitution_renderer(
-            variables,
-            direct_dependencies=node.depends_on,
-            output_resolver=context.output_resolver,
-        )
-        prompt = renderer.render_prompt(template)
-        if node.options.get("skills"):
-            skill_text = ResourceResolver(
-                context.run_directory,
-                sealed_paths=context.sealed_resource_paths,
-                sealed_bytes=context.sealed_resource_bytes,
-            ).text(f"node-skills/{node.id}.md")
-            prompt = f"{skill_text}\n\n{prompt}"
-        return prompt
+        return render_agent_prompt(context)
 
     @staticmethod
     def _inline_agents(context: NodeExecutionContext) -> dict[str, dict[str, object]]:
@@ -2344,63 +2454,36 @@ class AgentNodeExecutor:
             )
 
         output = result.final_response
+        external_result = result_from_external_response(
+            context,
+            output,
+            metadata,
+        )
         if context.language_profile is WorkflowLanguageProfile.ARCHON_2026_07:
-            if structured_request is None:
-                archon_result = self._write_archon_output(
-                    context,
-                    output.encode("utf-8"),
-                    metadata,
-                    is_structured=False,
-                    structured_value=None,
-                    schema_fingerprint=None,
-                    canonicalization_version=1,
-                )
-            else:
+            archon_result = external_result
+            if (
+                structured_request is not None
+                and archon_result.error_code == "structured_output_invalid"
+            ):
                 assert structured_counts is not None
-                try:
-                    structured_value = parse_validate_canonicalize(
-                        output,
-                        structured_request,
-                        validator=structured_validator,
-                    )
-                except StructuredOutputValidatorUnavailable as exc:
-                    return NodeExecutionResult(
-                        "failed",
-                        error_code="structured_output_unavailable",
-                        error_message=str(exc),
-                        metadata=metadata,
-                    )
-                except StructuredOutputError as exc:
-                    archon_result = self._repair_or_fail(
-                        context,
-                        agent_runner,
-                        request,
-                        result,
-                        metadata,
-                        structured_request,
-                        structured_validator,
-                        diagnostics=str(exc),
-                        first_provider_attempts=structured_counts[0],
-                        first_model_calls=structured_counts[1],
-                        granted_provider_attempts=granted_provider_attempts,
-                        wall_deadline=wall_deadline,
-                    )
-                else:
-                    archon_result = self._write_archon_output(
-                        context,
-                        structured_value.canonical_bytes,
-                        metadata,
-                        is_structured=True,
-                        structured_value=structured_value.value,
-                        schema_fingerprint=(
-                            structured_request.schema.schema_fingerprint
-                        ),
-                        canonicalization_version=(
-                            structured_value.canonicalization_version
-                        ),
+                archon_result = self._repair_or_fail(
+                    context,
+                    agent_runner,
+                    request,
+                    result,
+                    dict(archon_result.metadata),
+                    structured_request,
+                    structured_validator,
+                    diagnostics=str(archon_result.error_message or "invalid output"),
+                    first_provider_attempts=structured_counts[0],
+                    first_model_calls=structured_counts[1],
+                    granted_provider_attempts=granted_provider_attempts,
+                    wall_deadline=wall_deadline,
                 )
-                if archon_result.status != "succeeded":
-                    return with_recovery_failure(archon_result)
+            if archon_result.status != "succeeded":
+                if archon_result.error_code == "structured_output_unavailable":
+                    return archon_result
+                return with_recovery_failure(archon_result)
             if registry_key is not None and self.session_registry is not None:
                 if strict_v3:
                     if not result.session_id:
@@ -2452,32 +2535,8 @@ class AgentNodeExecutor:
                     warnings.append("newer persistent session retained")
             return archon_result
 
-        schema = node.options.get("output_format")
-        extension = ".txt"
-        if schema is not None:
-            try:
-                value = json.loads(output)
-            except json.JSONDecodeError as exc:
-                return self._failure("structured_output_invalid", str(exc))
-            try:
-                jsonschema = require_structured_output_validator(legacy=True)
-            except StructuredOutputValidatorUnavailable as exc:
-                return self._failure(
-                    "structured_output_unavailable",
-                    str(exc),
-                )
-            try:
-                jsonschema.validate(value, _thaw(schema))
-            except (jsonschema.SchemaError, jsonschema.ValidationError) as exc:
-                return self._failure("structured_output_invalid", exc.message)
-            extension = ".json"
-
-        attempt = context.effective_attempt_directory
-        attempt.mkdir(parents=True, exist_ok=False)
-        output_path = attempt / f"output{extension}"
-        output_path.write_text(output, encoding="utf-8")
-        artifact = _artifact(output_path, context.run_directory)
-        metadata["output"] = output
+        if external_result.status != "succeeded":
+            return external_result
         if registry_key is not None and self.session_registry is not None:
             updated = self.session_registry.compare_and_set(
                 registry_key,
@@ -2487,7 +2546,11 @@ class AgentNodeExecutor:
             )
             if not updated:
                 warnings.append("newer persistent session retained")
-        return NodeExecutionResult("succeeded", (artifact,), metadata=metadata)
+        return external_result
 
 
-__all__ = ["AgentNodeExecutor"]
+__all__ = [
+    "AgentNodeExecutor",
+    "render_agent_prompt",
+    "result_from_external_response",
+]

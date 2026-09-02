@@ -13292,6 +13292,53 @@ class RunStore:
                 return False
             raise
 
+    def persist_handoff_wait_result(
+        self,
+        claim: NodeClaim,
+        *,
+        handoff_id: str,
+        generation: int,
+        observed_version: int,
+        observed_phase: str,
+        next_observation_at: datetime,
+        deadline_at: datetime | None,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Persist one executor wait without charging its worker attempt."""
+        projection = self.load_run(claim.run_id)
+        node = projection.get("nodes", {}).get(claim.node_id)
+        if not isinstance(node, Mapping):
+            return False
+        raw = node.get("handoff")
+        if raw is None:
+            return self.begin_handoff_wait(
+                claim,
+                handoff_id=handoff_id,
+                generation=generation,
+                observed_version=observed_version,
+                observed_phase=observed_phase,
+                next_observation_at=next_observation_at,
+                deadline_at=deadline_at,
+                now=now,
+            )
+        try:
+            current = HandoffWaitProjection.from_durable_record(raw)
+        except ValueError:
+            return False
+        if generation != current.generation + 1:
+            return False
+        return self.retry_handoff_wait(
+            claim,
+            expected_handoff_id=current.handoff_id,
+            expected_generation=current.generation,
+            handoff_id=handoff_id,
+            observed_version=observed_version,
+            observed_phase=observed_phase,
+            next_observation_at=next_observation_at,
+            deadline_at=deadline_at,
+            now=now,
+        )
+
     def mark_node_started(
         self, claim: NodeClaim, *, now: LeaseClockSample | None = None
     ) -> None:
