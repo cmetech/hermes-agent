@@ -10,7 +10,10 @@ import threading
 
 import pytest
 
+import plugins.workflow.admission as workflow_admission
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.cli import build_catalog, show_package
+from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.schema import load_workflow
@@ -37,6 +40,135 @@ def _request(snapshot, *, key="delivery-1", policy="queue", name="demo"):
         idempotency_key=key,
         concurrency_key=name,
         concurrency_policy=policy,
+    )
+
+
+def _assigned_package(workflow_writer, root, *, endpoint="hermes://local/reviewer"):
+    path = workflow_writer(
+        root,
+        name="assigned",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        f"    endpoint: {endpoint}\n",
+        encoding="utf-8",
+    )
+    return load_workflow(path)
+
+
+def test_assignment_admission_rejects_missing_self_and_unavailable_profiles(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = _assigned_package(workflow_writer, tmp_path / "missing")
+
+    with pytest.raises(WorkflowValidationError, match="target profile does not exist"):
+        workflow_admission.validate_assignment_admission(
+            package, initiator_profile="default"
+        )
+
+    self_package = _assigned_package(
+        workflow_writer,
+        tmp_path / "self",
+        endpoint="hermes://local/default",
+    )
+    with pytest.raises(WorkflowValidationError, match="must differ"):
+        workflow_admission.validate_assignment_admission(
+            self_package, initiator_profile="default"
+        )
+
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+
+    class UnavailableChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return type(
+                "Assessment",
+                (),
+                {
+                    "available": False,
+                    "failure_code": "local_cli_lock_unavailable",
+                    "mechanism": None,
+                },
+            )()
+
+        def create(self, *_args, **_kwargs):
+            raise AssertionError("admission must not create a handoff")
+
+        submit = create
+
+    with pytest.raises(WorkflowValidationError, match="local_cli_lock_unavailable"):
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=UnavailableChannel(),
+        )
+
+    assert os.environ["HERMES_HOME"] == str(home)
+
+
+def test_assignment_admission_returns_available_mechanism_without_dispatch(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    monkeypatch.setattr("hermes_cli.profiles.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = _assigned_package(workflow_writer, tmp_path / "available")
+
+    class AvailableChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return type(
+                "Assessment",
+                (),
+                {
+                    "available": True,
+                    "failure_code": None,
+                    "mechanism": "local_cli",
+                },
+            )()
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=AvailableChannel(),
+    ) == {"review": "local_cli"}
+
+
+def test_assignment_is_sealed_in_snapshot_run_catalog_and_inspection(
+    tmp_path, workflow_writer
+):
+    store = RunStore(tmp_path / "home")
+    package = _assigned_package(workflow_writer, tmp_path / "sealed")
+
+    snapshot = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        _request(snapshot, key="assigned", name="assigned"),
+        immutable_snapshot=snapshot,
+    )
+    run = store.load_run(admitted.run_id)
+    expected = {
+        "review": {
+            "endpoint": "hermes://local/reviewer",
+            "interaction_policy": "deny",
+            "on_deadline": "cancel_and_fail",
+        }
+    }
+
+    assert snapshot.assignments == expected
+    assert run["assignments"] == expected
+    assert build_catalog([package])[0]["assignments"] == expected
+    assert (
+        show_package(
+            package,
+            compatibility_report=assess_compatibility(package),
+        )["assignments"]
+        == expected
     )
 
 

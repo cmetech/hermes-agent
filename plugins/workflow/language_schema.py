@@ -1124,6 +1124,7 @@ def _widget_for(scope: str, yaml_name: str, shape: str) -> str:
         "loop_group_payload",
         "approval_payload",
         "approval_reject",
+        "assignments",
     }:
         return "object"
     if shape == "any":
@@ -1372,6 +1373,7 @@ def _example_for(yaml_name: str, shape: str) -> object:
         },
         "string_list": ["value"],
         "mapping": {"key": "value"},
+        "assignments": {"review": {"endpoint": "hermes://local/security-reviewer"}},
         "worktree": {"enabled": True},
         "effort": "medium",
         "thinking": "adaptive",
@@ -1992,6 +1994,7 @@ _SIDECAR_FIELDS = tuple(
         ("retention", "object", "mapping"),
         ("tags", "array", "string_list"),
         ("outward_action_nodes", "array", "string_list"),
+        ("assignments", "object", "assignments"),
         ("outward_action_policy", "string", "nonempty_string"),
         ("execution_environment", "string", "execution_environment"),
         ("overlap_policy", "string", "overlap_policy"),
@@ -2404,6 +2407,40 @@ def _schema_for_shape(
         return {"type": "array", "items": {"type": "string", "minLength": 1}}
     if shape == "mapping":
         return {"type": "object"}
+    if shape == "assignments":
+        return {
+            "type": "object",
+            "maxProperties": 512,
+            "propertyNames": {
+                "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?:/[A-Za-z_][A-Za-z0-9_-]*)?$"
+            },
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "endpoint": {
+                        "type": "string",
+                        "pattern": "^hermes://local/[a-z0-9][a-z0-9_-]{0,63}$",
+                    },
+                    "interaction_policy": {
+                        "type": "string",
+                        "const": "deny",
+                        "default": "deny",
+                    },
+                    "deadline": {
+                        "type": "string",
+                        "maxLength": 16,
+                        "pattern": "^P(?:(?:0|[1-9][0-9]?)D)?(?:T(?:(?:0|[1-9][0-9]?)H)?(?:(?:0|[1-9][0-9]?)M)?)?$",
+                    },
+                    "on_deadline": {
+                        "type": "string",
+                        "const": "cancel_and_fail",
+                        "default": "cancel_and_fail",
+                    },
+                },
+                "required": ["endpoint"],
+                "additionalProperties": False,
+            },
+        }
     if shape == "worktree":
         return {
             "type": "object",

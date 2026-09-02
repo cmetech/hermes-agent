@@ -6904,6 +6904,12 @@ class RunStore:
                 snapshot_format_version=snapshot_format_version,
                 dependency_manifest_digest=dependency_manifest_digest,
                 provider_resolution_sha256=provider_resolution_sha256,
+                assignments={
+                    str(node_id): dict(assignment)
+                    for node_id, assignment in package.sidecar.get(
+                        "assignments", {}
+                    ).items()
+                },
             )
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -7141,6 +7147,10 @@ class RunStore:
             snapshot.snapshot_format_version,
             snapshot.dependency_manifest_digest,
             snapshot.provider_resolution_sha256,
+            {
+                str(node_id): dict(assignment)
+                for node_id, assignment in snapshot.assignments.items()
+            },
         )
 
     @staticmethod
@@ -7665,6 +7675,10 @@ class RunStore:
             "foreground_heartbeat_monotonic": foreground_heartbeat_monotonic,
             "foreground_lease_seconds": foreground_lease_seconds,
             "outward_action_nodes": list(snapshot.outward_action_nodes),
+            "assignments": {
+                str(node_id): dict(assignment)
+                for node_id, assignment in snapshot.assignments.items()
+            },
             "language": (
                 dict(snapshot.language) if snapshot.language is not None else None
             ),

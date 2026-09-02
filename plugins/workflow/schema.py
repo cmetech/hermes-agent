@@ -155,6 +155,18 @@ _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 _LITERAL_INCLUDE_NAME = re.compile(r"^[^\s/\\:$?#{}`()]+$")
+_ASSIGNMENT_DEADLINE = re.compile(
+    r"^P(?:(?P<days>0|[1-9][0-9]?)D)?"
+    r"(?:T(?:(?P<hours>0|[1-9][0-9]?)H)?"
+    r"(?:(?P<minutes>0|[1-9][0-9]?)M)?)?$"
+)
+_ASSIGNMENT_FIELDS = frozenset({
+    "endpoint",
+    "interaction_policy",
+    "deadline",
+    "on_deadline",
+})
+_ASSIGNMENT_MAX_SECONDS = 30 * 24 * 60 * 60
 
 
 def _issue(
@@ -2454,6 +2466,88 @@ def _parse_sidecar(
             "invalid_sidecar",
             "outward_action_nodes must be a list of node identifiers",
         )
+    assignments = sidecar.get("assignments", {})
+    if not isinstance(assignments, Mapping) or len(assignments) > 512:
+        _fail(
+            "sidecar.assignments",
+            "invalid_assignment",
+            "assignments must be a bounded mapping",
+        )
+    normalized_assignments: dict[str, dict[str, object]] = {}
+    from hermes_cli.handoff import HandoffEndpoint
+
+    for node_id, raw_assignment in assignments.items():
+        path = f"sidecar.assignments.{node_id}"
+        if not isinstance(node_id, str) or not node_id:
+            _fail(path, "invalid_assignment", "assignment node id must be text")
+        assignment = _mapping(raw_assignment, path)
+        unknown_assignment = sorted(set(assignment) - _ASSIGNMENT_FIELDS)
+        if unknown_assignment:
+            _fail(
+                path,
+                "unknown_assignment_field",
+                f"assignment has unknown assignment field: {unknown_assignment[0]}",
+            )
+        if "endpoint" not in assignment:
+            _fail(path, "invalid_assignment", "assignment endpoint is required")
+        try:
+            endpoint = HandoffEndpoint.parse(assignment["endpoint"])
+        except (TypeError, ValueError) as exc:
+            _fail(
+                f"{path}.endpoint",
+                "invalid_assignment_endpoint",
+                f"assignment endpoint must be a canonical local endpoint: {exc}",
+            )
+        if assignment["endpoint"] != endpoint.canonical:
+            _fail(
+                f"{path}.endpoint",
+                "invalid_assignment_endpoint",
+                "assignment endpoint must use its canonical local form",
+            )
+        interaction_policy = assignment.get("interaction_policy", "deny")
+        if interaction_policy != "deny":
+            _fail(
+                f"{path}.interaction_policy",
+                "invalid_assignment_policy",
+                "assignment interaction_policy must be deny",
+            )
+        on_deadline = assignment.get("on_deadline", "cancel_and_fail")
+        if on_deadline != "cancel_and_fail":
+            _fail(
+                f"{path}.on_deadline",
+                "invalid_assignment_policy",
+                "assignment on_deadline must be cancel_and_fail",
+            )
+        normalized: dict[str, object] = {
+            "endpoint": endpoint.canonical,
+            "interaction_policy": "deny",
+            "on_deadline": "cancel_and_fail",
+        }
+        if "deadline" in assignment:
+            deadline = assignment["deadline"]
+            match = (
+                _ASSIGNMENT_DEADLINE.fullmatch(deadline)
+                if isinstance(deadline, str)
+                else None
+            )
+            seconds = 0
+            if match is not None:
+                seconds = (
+                    int(match.group("days") or 0) * 24 * 60 * 60
+                    + int(match.group("hours") or 0) * 60 * 60
+                    + int(match.group("minutes") or 0) * 60
+                )
+            if seconds <= 0 or seconds > _ASSIGNMENT_MAX_SECONDS:
+                _fail(
+                    f"{path}.deadline",
+                    "invalid_assignment_deadline",
+                    "assignment deadline must be a positive bounded ISO-8601 day/time duration",
+                )
+            normalized["deadline"] = deadline
+        normalized_assignments[node_id] = normalized
+    if "assignments" in sidecar:
+        sidecar = dict(sidecar)
+        sidecar["assignments"] = normalized_assignments
     if "required_secrets" in sidecar:
         secrets = sidecar["required_secrets"]
         if not isinstance(secrets, list) or any(
@@ -2494,7 +2588,7 @@ def _parse_sidecar(
 
 
 def _validate_sidecar_node_references(
-    sidecar: Mapping[str, Any], node_ids: frozenset[str]
+    sidecar: Mapping[str, Any], node_ids: frozenset[str], definition: WorkflowDefinition
 ) -> None:
     for node_id in sidecar.get("outward_action_nodes", ()):
         if node_id not in node_ids:
@@ -2502,6 +2596,41 @@ def _validate_sidecar_node_references(
                 "sidecar.outward_action_nodes",
                 "unknown_sidecar_node",
                 f"outward_action_nodes references unknown node: {node_id}",
+            )
+    outward = frozenset(
+        str(node_id) for node_id in sidecar.get("outward_action_nodes", ())
+    )
+    scoped_nodes = {
+        scoped.semantic_id: scoped for scoped in iter_scoped_workflow_nodes(definition)
+    }
+    for node_id in sidecar.get("assignments", {}):
+        path = f"sidecar.assignments.{node_id}"
+        if node_id not in node_ids or node_id not in scoped_nodes:
+            _fail(
+                path,
+                "unknown_sidecar_node",
+                f"assignment references unknown node: {node_id}",
+            )
+        scoped = scoped_nodes[node_id]
+        if scoped.group_id is not None:
+            _fail(path, "invalid_assignment_node", "assignment cannot target a loop child")
+        if scoped.node.node_type != "prompt":
+            _fail(path, "invalid_assignment_node", "assignment must target a prompt node")
+        if node_id not in outward:
+            _fail(
+                path,
+                "invalid_assignment_node",
+                "assigned node must be declared outward",
+            )
+        if (
+            scoped.node.options.get("context") == "shared"
+            or definition.options.get("persist_sessions") is True
+            or scoped.node.options.get("persist_session") is True
+        ):
+            _fail(
+                path,
+                "invalid_assignment_node",
+                "assignment cannot target a shared or persisted producer",
             )
 
 
@@ -2946,7 +3075,7 @@ def _compile_workflow_source_document(
             selected_normalizer_version,
         )
     )
-    _validate_sidecar_node_references(sidecar, node_ids)
+    _validate_sidecar_node_references(sidecar, node_ids, definition)
     try:
         normalized = normalize_workflow(
             definition,

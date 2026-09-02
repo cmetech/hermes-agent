@@ -6,7 +6,59 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping
 
+from plugins.workflow.models import (
+    ValidationIssue,
+    WorkflowPackage,
+    WorkflowValidationError,
+)
 from plugins.workflow.provenance import TriggerProvenance, TriggerSource
+
+
+def validate_assignment_admission(
+    package: WorkflowPackage,
+    *,
+    initiator_profile: str,
+    channel=None,
+) -> dict[str, str]:
+    """Validate local assignment reachability without creating a handoff."""
+    from hermes_cli.handoff import HandoffEndpoint
+    from hermes_cli.handoff.local import LocalHermesChannel
+    from hermes_cli.profiles import normalize_profile_name, profile_exists
+
+    owner = normalize_profile_name(initiator_profile)
+    mechanisms: dict[str, str] = {}
+    selected_channel = channel if channel is not None else LocalHermesChannel()
+    for node_id, assignment in package.sidecar.get("assignments", {}).items():
+        endpoint = HandoffEndpoint.parse(assignment["endpoint"])
+        path = f"sidecar.assignments.{node_id}.endpoint"
+        if endpoint.profile == owner:
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=path,
+                    code="assignment_self_target",
+                    message="assignment target profile must differ from workflow owner",
+                )
+            )
+        if not profile_exists(endpoint.profile):
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=path,
+                    code="assignment_profile_missing",
+                    message=f"assignment target profile does not exist: {endpoint.profile}",
+                )
+            )
+        assessment = selected_channel.validate_endpoint(endpoint, owner)
+        if not assessment.available or assessment.mechanism is None:
+            failure = assessment.failure_code or "endpoint_unavailable"
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=path,
+                    code="assignment_mechanism_unavailable",
+                    message=f"assignment has no available local mechanism: {failure}",
+                )
+            )
+        mechanisms[str(node_id)] = assessment.mechanism
+    return mechanisms
 
 
 @dataclass(frozen=True)
@@ -62,10 +114,13 @@ class PreparedRunSnapshot:
     snapshot_format_version: int = 1
     dependency_manifest_digest: str | None = None
     provider_resolution_sha256: str | None = None
+    assignments: Mapping[str, Mapping[str, object]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.input_digests is None:
             object.__setattr__(self, "input_digests", {})
+        if self.assignments is None:
+            object.__setattr__(self, "assignments", {})
 
 
 class RunAdmissionController:

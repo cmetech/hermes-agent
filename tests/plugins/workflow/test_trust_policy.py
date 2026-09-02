@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import stat
@@ -527,3 +528,64 @@ def test_risk_summary_is_redacted_and_untrusted_local_execution_fails_closed(
         },
     )
     assert requirement.mode == "isolated_backend_required"
+
+
+def test_assignment_is_disclosed_and_changes_invalidate_prior_trust(
+    workflow_writer, tmp_path
+):
+    path = workflow_writer(
+        tmp_path / "assigned",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    sidecar = path.with_name(f"{path.stem}.hermes.yaml")
+    sidecar.write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/security-reviewer\n"
+        "    interaction_policy: deny\n"
+        "    deadline: PT4H\n"
+        "    on_deadline: cancel_and_fail\n",
+        encoding="utf-8",
+    )
+    first = load_workflow(path)
+    first_digest = compute_package_digest(first)
+    first_risk = build_risk_summary(first, assess_compatibility(first))
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.trust(
+        first_digest.sha256,
+        actor="operator",
+        risk_digest=first_risk.risk_digest,
+    )
+
+    disclosed = first_risk.to_dict()["assignments"]
+    assert disclosed == (
+        {
+            "node_id": "review",
+            "endpoint": "hermes://local/security-reviewer",
+            "target_profile": "security-reviewer",
+            "mode": "task",
+            "interaction_policy": "deny",
+            "deadline": "PT4H",
+            "on_deadline": "cancel_and_fail",
+            "possible_mechanisms": (
+                ("runs",) if os.name == "nt" else ("runs", "local_cli")
+            ),
+        },
+    )
+    assert "credential" not in json.dumps(disclosed).lower()
+
+    sidecar.write_text(
+        sidecar.read_text(encoding="utf-8").replace("PT4H", "PT5H"),
+        encoding="utf-8",
+    )
+    changed = load_workflow(path)
+    changed_digest = compute_package_digest(changed)
+    changed_risk = build_risk_summary(changed, assess_compatibility(changed))
+
+    assert changed_digest != first_digest
+    assert changed_risk.risk_digest != first_risk.risk_digest
+    assert (
+        store.check(changed_digest.sha256, risk_digest=changed_risk.risk_digest)
+        == "untrusted"
+    )
