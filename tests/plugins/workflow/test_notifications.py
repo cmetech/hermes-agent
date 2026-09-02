@@ -99,6 +99,9 @@ def _insert_notification_row(
     state: str,
     created_at: datetime,
     coalesced_count: int = 1,
+    lease_owner: str | None = None,
+    lease_expires_at: datetime | None = None,
+    delivered_at: datetime | None = None,
 ) -> None:
     timestamp = created_at.isoformat()
     with store._connect() as connection:
@@ -106,9 +109,10 @@ def _insert_notification_row(
             "INSERT INTO workflow_notification_outbox ("
             "notification_id, transition_key, run_id, kind, destination, "
             "transition_version, coalesced_count, payload_json, state, "
-            "created_at, updated_at, available_at) "
+            "created_at, updated_at, available_at, lease_owner, "
+            "lease_expires_at, delivered_at) "
             "VALUES (?, ?, 'legacy-run', 'reconciliation_required', "
-            "'desktop', ?, ?, ?, ?, ?, ?, ?)",
+            "'desktop', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 notification_id,
                 transition_key,
@@ -119,6 +123,9 @@ def _insert_notification_row(
                 timestamp,
                 timestamp,
                 timestamp,
+                lease_owner,
+                lease_expires_at.isoformat() if lease_expires_at else None,
+                delivered_at.isoformat() if delivered_at else None,
             ),
         )
 
@@ -709,8 +716,10 @@ def test_notification_migration_consolidates_duplicate_identity_and_facts(
         transition_key="duplicate-transition-1",
         transition_version=1,
         payload=_handoff_notification_payload(transition_version=1),
-        state="pending",
+        state="leased",
         created_at=observed,
+        lease_owner="stale-client",
+        lease_expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
     )
     _insert_notification_row(
         store,
@@ -724,6 +733,7 @@ def test_notification_migration_consolidates_duplicate_identity_and_facts(
         state="delivered",
         created_at=observed + timedelta(seconds=1),
         coalesced_count=2,
+        delivered_at=observed + timedelta(seconds=1),
     )
     with store._connect() as connection:
         connection.execute(
@@ -770,7 +780,7 @@ def test_notification_migration_consolidates_duplicate_identity_and_facts(
         )
 
     assert len(rows) == 1
-    assert rows[0]["notification_id"] == "acknowledged-original"
+    assert rows[0]["notification_id"] == "later-duplicate"
     assert rows[0]["transition_key"] == "duplicate-transition-2"
     assert rows[0]["transition_version"] == 2
     assert rows[0]["coalesced_count"] == 3
@@ -778,7 +788,7 @@ def test_notification_migration_consolidates_duplicate_identity_and_facts(
     assert json.loads(rows[0]["payload_json"])["handoff"]["failure_code"] == (
         "cancellation_indeterminate"
     )
-    assert fact_ids == ["acknowledged-original", "acknowledged-original"]
+    assert fact_ids == ["later-duplicate", "later-duplicate"]
     assert identity_index["unique"] == 1
     assert outbox.pending_attention(run_id="legacy-run") == ()
 
@@ -788,6 +798,154 @@ def test_notification_migration_consolidates_duplicate_identity_and_facts(
             "SELECT COUNT(*) FROM workflow_notification_outbox "
             "WHERE run_id='legacy-run'"
         ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("completion", "expected_state"),
+    (("ack", "delivered"), ("fail", "pending")),
+)
+def test_notification_migration_preserves_active_lease_id_for_client_completion(
+    tmp_path,
+    completion: str,
+    expected_state: str,
+) -> None:
+    home = tmp_path / f"active-lease-{completion}"
+    store = RunStore(home)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    with store._connect() as connection:
+        connection.execute("DROP INDEX workflow_notification_handoff_identity")
+        connection.execute(
+            "CREATE INDEX workflow_notification_handoff_identity "
+            "ON workflow_notification_outbox("
+            "run_id, kind, destination, handoff_node_id, handoff_id, "
+            "handoff_generation) WHERE handoff_node_id IS NOT NULL "
+            "AND handoff_id IS NOT NULL AND handoff_generation IS NOT NULL"
+        )
+    _insert_notification_row(
+        store,
+        notification_id="earlier-pending",
+        transition_key="active-lease-transition-1",
+        transition_version=1,
+        payload=_handoff_notification_payload(transition_version=1),
+        state="pending",
+        created_at=observed,
+    )
+    _insert_notification_row(
+        store,
+        notification_id="client-issued-lease",
+        transition_key="active-lease-transition-2",
+        transition_version=2,
+        payload=_handoff_notification_payload(transition_version=2),
+        state="leased",
+        created_at=observed + timedelta(seconds=1),
+        lease_owner="desktop-client",
+        lease_expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE workflow_notification_outbox SET handoff_node_id='review', "
+            "handoff_id='handoff-legacy', handoff_generation=7"
+        )
+        connection.executemany(
+            "INSERT INTO workflow_notification_facts ("
+            "transition_key, notification_id, run_id, kind, destination, "
+            "transition_version, payload_json, occurred_at) "
+            "SELECT transition_key, notification_id, run_id, kind, destination, "
+            "transition_version, payload_json, ? "
+            "FROM workflow_notification_outbox WHERE notification_id=?",
+            (
+                (observed.isoformat(), "earlier-pending"),
+                (
+                    (observed + timedelta(seconds=1)).isoformat(),
+                    "client-issued-lease",
+                ),
+            ),
+        )
+
+    outbox = NotificationOutbox(RunStore(home))
+
+    if completion == "ack":
+        completed = outbox.ack(
+            "client-issued-lease",
+            owner_id="desktop-client",
+            now=observed + timedelta(seconds=2),
+        )
+    else:
+        completed = outbox.fail(
+            "client-issued-lease",
+            owner_id="desktop-client",
+            error="retryable_delivery_failure",
+            now=observed + timedelta(seconds=2),
+        )
+
+    assert completed is True
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT notification_id, state FROM workflow_notification_outbox "
+            "WHERE run_id='legacy-run'"
+        ).fetchall()
+        fact_ids = [
+            row["notification_id"]
+            for row in connection.execute(
+                "SELECT notification_id FROM workflow_notification_facts "
+                "WHERE run_id='legacy-run' ORDER BY transition_version"
+            )
+        ]
+    assert [(row["notification_id"], row["state"]) for row in rows] == [
+        ("client-issued-lease", expected_state)
+    ]
+    assert fact_ids == ["client-issued-lease", "client-issued-lease"]
+
+
+def test_notification_migration_expired_lease_does_not_outrank_earliest_row(
+    tmp_path,
+) -> None:
+    home = tmp_path / "expired-lease"
+    store = RunStore(home)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    with store._connect() as connection:
+        connection.execute("DROP INDEX workflow_notification_handoff_identity")
+        connection.execute(
+            "CREATE INDEX workflow_notification_handoff_identity "
+            "ON workflow_notification_outbox("
+            "run_id, kind, destination, handoff_node_id, handoff_id, "
+            "handoff_generation) WHERE handoff_node_id IS NOT NULL "
+            "AND handoff_id IS NOT NULL AND handoff_generation IS NOT NULL"
+        )
+    _insert_notification_row(
+        store,
+        notification_id="earliest-pending",
+        transition_key="expired-lease-transition-1",
+        transition_version=1,
+        payload=_handoff_notification_payload(transition_version=1),
+        state="pending",
+        created_at=observed,
+    )
+    _insert_notification_row(
+        store,
+        notification_id="expired-lease",
+        transition_key="expired-lease-transition-2",
+        transition_version=2,
+        payload=_handoff_notification_payload(transition_version=2),
+        state="leased",
+        created_at=observed + timedelta(seconds=1),
+        lease_owner="gone-client",
+        lease_expires_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+    )
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE workflow_notification_outbox SET handoff_node_id='review', "
+            "handoff_id='handoff-legacy', handoff_generation=7"
+        )
+
+    NotificationOutbox(RunStore(home))
+
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT notification_id, state FROM workflow_notification_outbox "
+            "WHERE run_id='legacy-run'"
+        ).fetchone()
+    assert tuple(row) == ("earliest-pending", "pending")
 
 
 def test_journal_reconciliation_clears_deferred_terminal_handoff_attention(

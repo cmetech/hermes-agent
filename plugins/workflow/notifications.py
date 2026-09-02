@@ -266,13 +266,28 @@ def _persisted_handoff_identity(
     )
 
 
+def _notification_lease_is_active(
+    row: sqlite3.Row,
+    *,
+    observed_at: datetime,
+) -> bool:
+    if row["state"] != "leased":
+        return False
+    lease_expires_at = _public_timestamp(row["lease_expires_at"])
+    return (
+        lease_expires_at is not None
+        and datetime.fromisoformat(lease_expires_at) > observed_at
+    )
+
+
 def _consolidate_handoff_notifications(
     connection: sqlite3.Connection,
     rows: list[sqlite3.Row],
     *,
     identity: tuple[str, str, int],
+    observed_at: datetime,
 ) -> str:
-    canonical = min(
+    earliest = min(
         rows,
         key=lambda row: (str(row["created_at"]), str(row["notification_id"])),
     )
@@ -284,10 +299,14 @@ def _consolidate_handoff_notifications(
             str(row["notification_id"]),
         ),
     )
-    acknowledged = [row for row in rows if row["state"] == "delivered"]
-    leased = [row for row in rows if row["state"] == "leased"]
-    delivery_authority = max(
-        acknowledged or leased or [canonical],
+    delivered = [row for row in rows if row["state"] == "delivered"]
+    active_leases = [
+        row
+        for row in rows
+        if _notification_lease_is_active(row, observed_at=observed_at)
+    ]
+    canonical = max(
+        delivered or active_leases or [earliest],
         key=lambda row: (str(row["updated_at"]), str(row["notification_id"])),
     )
     canonical_id = str(canonical["notification_id"])
@@ -333,14 +352,14 @@ def _consolidate_handoff_notifications(
                 allow_nan=False,
             ),
             latest["updated_at"],
-            delivery_authority["state"],
-            delivery_authority["available_at"],
-            delivery_authority["lease_owner"],
-            delivery_authority["lease_expires_at"],
-            delivery_authority["attempts"],
-            delivery_authority["delivered_at"],
-            delivery_authority["dismissed_at"],
-            delivery_authority["last_error"],
+            canonical["state"],
+            canonical["available_at"],
+            canonical["lease_owner"],
+            canonical["lease_expires_at"],
+            canonical["attempts"],
+            canonical["delivered_at"],
+            canonical["dismissed_at"],
+            canonical["last_error"],
             *identity,
             canonical_id,
         ),
@@ -351,6 +370,7 @@ def _consolidate_handoff_notifications(
 def _migrate_notification_handoff_identity(
     connection: sqlite3.Connection,
 ) -> None:
+    observed_at = datetime.now(timezone.utc)
     columns = {
         row["name"]
         for row in connection.execute(
@@ -406,6 +426,7 @@ def _migrate_notification_handoff_identity(
                 connection,
                 group,
                 identity=(key[3], key[4], key[5]),
+                observed_at=observed_at,
             )
     else:
         rows = connection.execute(
@@ -468,6 +489,7 @@ def _migrate_notification_handoff_identity(
                 connection,
                 group,
                 identity=identity,
+                observed_at=observed_at,
             )
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS "
