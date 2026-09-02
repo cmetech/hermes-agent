@@ -42,6 +42,7 @@ from plugins.workflow.admission import (
     RunAdmissionRequest,
     RunAdmissionResult,
     validate_assignment_admission,
+    workflow_profile_for_home,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.language import (
@@ -6439,6 +6440,7 @@ class RunStore:
         connector_capabilities: object | None = None,
     ) -> PreparedRunSnapshot:
         if package.sidecar.get("assignments"):
+            owner = workflow_profile_for_home(self.hermes_home)
             if initiator_profile is None:
                 raise WorkflowValidationError(
                     ValidationIssue(
@@ -6447,9 +6449,20 @@ class RunStore:
                         message="assignment admission requires an explicit initiator profile",
                     )
                 )
+            if initiator_profile != owner:
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path="sidecar.assignments",
+                        code="assignment_initiator_profile_mismatch",
+                        message=(
+                            "assignment initiator profile does not match the "
+                            "profile-scoped run store"
+                        ),
+                    )
+                )
             validate_assignment_admission(
                 package,
-                initiator_profile=initiator_profile,
+                initiator_profile=owner,
             )
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):

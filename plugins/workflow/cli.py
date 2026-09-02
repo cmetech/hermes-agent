@@ -54,7 +54,7 @@ from plugins.workflow.compat import (
     assess_compatibility,
     require_runnable,
 )
-from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission import RunAdmissionRequest, workflow_profile_for_home
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     RunExecutionLimits,
@@ -2362,7 +2362,7 @@ def _cmd_run(
     )
     prepared = store.prepare_run_snapshot(
         package,
-        initiator_profile=profile_name,
+        initiator_profile=workflow_profile_for_home(args.hermes_home),
         compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
         trusted_package_digest=(
@@ -2823,7 +2823,7 @@ def _cmd_reset_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_showcase(args: argparse.Namespace, *, profile_name: str) -> int:
+def _cmd_showcase(args: argparse.Namespace) -> int:
     from plugins.workflow.showcase import (
         build_showcase_report,
         cleanup_showcases,
@@ -2865,7 +2865,6 @@ def _cmd_showcase(args: argparse.Namespace, *, profile_name: str) -> int:
         payload = run_showcase(
             args.showcase_id,
             hermes_home=args.hermes_home,
-            initiator_profile=profile_name,
             symptom=args.symptom,
             confirmation_token=args.confirmation_token,
             schedule_at=args.schedule_at,
@@ -2989,7 +2988,7 @@ def workflow_command(
         if action == "reset-sessions":
             return _cmd_reset_sessions(args)
         if action == "showcase":
-            return _cmd_showcase(args, profile_name=profile_name)
+            return _cmd_showcase(args)
         print(f"Unknown workflow action: {action}", file=sys.stderr)
         return 2
     except WorkflowCommandError as exc:

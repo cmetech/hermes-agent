@@ -1165,7 +1165,7 @@ def run_showcase(
     confirmation_token: str | None = None, schedule_at: str | None = None,
     no_wait: bool = False, idempotency_key: str | None = None,
     trigger_source: str = "cli", source_instance: str | None = None,
-    claimed_actor: str | None = None, initiator_profile: str | None = None,
+    claimed_actor: str | None = None,
 ) -> dict[str, object]:
     scenario = load_showcase_catalog().get(showcase_id)
     if scenario is None:
@@ -1234,9 +1234,7 @@ def run_showcase(
                 inputs = {"evidence": fixture}
             prepared = store.prepare_run_snapshot(
                 package,
-                initiator_profile=(
-                    initiator_profile or workflow_profile_for_home(home)
-                ),
+                initiator_profile=workflow_profile_for_home(home),
                 compilation=(
                     compilation
                     if supports_phase4_semantics(

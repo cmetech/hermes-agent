@@ -168,6 +168,50 @@ def test_assignment_snapshot_requires_explicit_profile_before_staging(
     assert list(store.runs_root.rglob("run.json")) == []
 
 
+@pytest.mark.parametrize(
+    ("home_profile", "claimed_profile"),
+    [
+        ("default", "reviewer"),
+        ("reviewer", "default"),
+    ],
+)
+def test_assignment_snapshot_rejects_profile_mismatch_before_endpoint_preview(
+    tmp_path, workflow_writer, monkeypatch, home_profile, claimed_profile
+):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    home = root
+    if home_profile != "default":
+        home = root / "profiles" / home_profile
+        home.mkdir(parents=True)
+    store = RunStore(home)
+    package = _assigned_package(
+        workflow_writer,
+        tmp_path / f"mislabeled-{home_profile}",
+        endpoint=f"hermes://local/{home_profile}",
+    )
+    previews = []
+
+    def preview(*args, **kwargs):
+        previews.append((args, kwargs))
+        raise AssertionError("profile mismatch must fail before endpoint preview")
+
+    monkeypatch.setattr(
+        "hermes_cli.handoff.local.LocalHermesChannel.validate_endpoint",
+        preview,
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    with pytest.raises(WorkflowValidationError) as caught:
+        store.prepare_run_snapshot(package, initiator_profile=claimed_profile)
+
+    assert caught.value.issues[0].code == "assignment_initiator_profile_mismatch"
+    assert previews == []
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
+
+
 def test_assignment_is_sealed_in_snapshot_run_catalog_and_inspection(
     tmp_path, workflow_writer, monkeypatch
 ):
