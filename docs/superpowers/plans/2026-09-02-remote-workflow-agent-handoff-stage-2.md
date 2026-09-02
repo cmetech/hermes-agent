@@ -1015,6 +1015,61 @@ defect, do not edit that production file under Task 10. Stop, identify the exact
 owning seam, amend this plan with a narrow RED/GREEN remediation task and exact
 owned paths, then resume this acceptance task.
 
+## Task 10A: Route peer commands through the built-in handoff switch
+
+**Live defect found by Task 10:** The real authenticated approval/restart case
+records the exact Workflow response, but `_BuiltinHandoffChannels` delegates
+only lifecycle operations. Its missing `deliver_command` delegation raises
+before the peer channel can send any HTTP request, so the service conservatively
+journals the command as `indeterminate` and the remote Run remains durably
+`waiting_for_approval`.
+
+**Owns:**
+
+- `hermes_cli/handoff/service.py`
+- `tests/hermes_cli/handoff/test_service.py`
+
+**Consumes:** The existing fixed local/peer switch, peer command journal, and
+peer channel's `deliver_command` implementation.
+
+**Produces:** One fixed-switch delegation method. It does not add a registry,
+change command semantics, or weaken ambiguity handling.
+
+### RED
+
+Add `test_builtin_channel_switch_delegates_peer_command_delivery`. Use the
+existing fixed-switch test seam and prove a peer command reaches the selected
+peer channel with the exact snapshot, command, and budget.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/hermes_cli/handoff/test_service.py \
+  -k builtin_channel_switch_delegates_peer_command_delivery -q
+```
+
+### GREEN and commit
+
+Delegate `deliver_command` through the same endpoint-kind selection already
+used by lifecycle calls. Then run the service file and the real approval
+acceptance case.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/hermes_cli/handoff/test_service.py -q
+
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_remote_handoff_e2e.py \
+  -k approval_pause_restart_and_response -q
+```
+
+Stage exactly the two owned files and commit:
+
+```bash
+git add hermes_cli/handoff/service.py tests/hermes_cli/handoff/test_service.py
+git diff --cached --check
+git commit -m "fix(handoff): route peer control through builtin channel"
+```
+
 ### GREEN
 
 Do not introduce test-only production hooks. Run the complete Stage 2 focused
