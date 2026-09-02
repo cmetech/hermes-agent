@@ -5,6 +5,7 @@ import json
 import shlex
 import sys
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1085,6 +1086,100 @@ def test_authenticated_gateway_command_starts_real_background_run(
     assert run["provenance"]["assurance"] == "verified_adapter"
     assert run["provenance"]["actor_id"] == invocation.principal
     assert run["provenance"]["return_route"] == "opaque-capability"
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_choice"),
+    [("approve", "once"), ("reject", "deny")],
+)
+def test_gateway_reuses_review_commands_for_handoff_input(
+    tmp_path,
+    workflow_writer,
+    action,
+    expected_choice,
+) -> None:
+    home = tmp_path / f"gateway-handoff-input-{action}"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / f"gateway-handoff-input-package-{action}",
+            name=f"gateway-handoff-input-{action}",
+            nodes=[{"id": "review", "prompt": "Review remotely"}],
+        )
+    )
+    store = RunStore(home)
+    prepared = replace(
+        store.prepare_run_snapshot(package),
+        assignments={
+            "review": {
+                "endpoint": "hermes://peer/office/reviewer",
+                "interaction_policy": "pause",
+                "on_deadline": "cancel_and_fail",
+            }
+        },
+    )
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="chat",
+            idempotency_key=f"gateway-handoff-input-{action}",
+            concurrency_key=f"gateway-handoff-input-{action}",
+            operator_scope=invocation.operator_scope,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "review", "gateway-test-worker")
+    assert claim is not None
+    now = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase="active",
+        next_observation_at=now,
+        deadline_at=now + timedelta(hours=1),
+    )
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "review",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=1,
+        observed_version=2,
+        observed_phase="needs_input",
+        next_observation_at=now + timedelta(seconds=5),
+        approval_request_id="remote-approval-1",
+        approval_choices=("once", "deny"),
+    )
+    paused = store.load_run(admitted.run_id)
+    interaction_id = paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"{action} {admitted.run_id} --interaction-id {interaction_id} "
+            f"--expected-version {paused['state_version']}",
+            invocation,
+            hermes_home=home,
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["action"] == action
+    assert store.load_run(admitted.run_id)["nodes"]["review"]["handoff_response"][
+        "choice"
+    ] == expected_choice
 
 
 def test_gateway_assignment_cannot_bypass_shared_profile_admission(

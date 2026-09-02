@@ -85,12 +85,14 @@ _PUBLIC_HEALTH = frozenset({
 _PUBLIC_INTERACTION_TYPES = frozenset({
     "approval",
     "workflow_approval",
+    "handoff_input",
     "loop_input",
     "loop_signal_confirmation",
     "capability",
     "reconcile",
 })
 _PUBLIC_INTERACTION_EVENT_TYPES = frozenset({
+    "handoff_input_required",
     "loop_input_provided",
     "loop_signal_confirmation_required",
     "loop_signal_accepted",

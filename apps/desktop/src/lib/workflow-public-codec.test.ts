@@ -491,4 +491,55 @@ describe('workflow public codecs', () => {
       })
     ).toBeNull()
   })
+
+  it('accepts only the closed handoff input projection', () => {
+    const interaction = {
+      interaction_id: 'a'.repeat(64),
+      node_id: 'work',
+      type: 'handoff_input'
+    }
+    const attentionItem = {
+      cause: 'handoff_input',
+      health: 'user_wait',
+      interaction,
+      kind: 'handoff_input',
+      next_actions: ['status', 'events', 'approve', 'reject', 'cancel'],
+      node_id: 'work',
+      origin: 'desktop',
+      run_id: 'run-1',
+      state_version: 2,
+      status: 'paused',
+      updated_at: '2026-09-02T12:00:00Z',
+      workflow: 'portable'
+    }
+
+    expect(
+      decodeWorkflowRun({
+        ...run,
+        next_actions: attentionItem.next_actions,
+        pending_interaction: interaction,
+        status: 'paused'
+      })
+    ).not.toBeNull()
+    expect(
+      decodeWorkflowAttentionPage({ items: [attentionItem], next_cursor: null, schema_version: 1 })
+    ).not.toBeNull()
+    expect(
+      decodeWorkflowAttentionPage({
+        items: [
+          {
+            ...attentionItem,
+            interaction: {
+              ...interaction,
+              remote_request_id: 'remote-approval-1',
+              remote_choices: ['once', 'deny'],
+              prompt: 'Bearer private prompt'
+            }
+          }
+        ],
+        next_cursor: null,
+        schema_version: 1
+      })
+    ).toBeNull()
+  })
 })

@@ -76,6 +76,7 @@ _PUBLIC_NOTIFICATION_EVENT_TYPES = frozenset(
         "coordinator_stalled",
         "workflow_approval_required",
         "node_approval_required",
+        "handoff_input_required",
         "loop_input_required",
         "loop_signal_confirmation_required",
         "run_paused",
@@ -90,6 +91,7 @@ _PUBLIC_NOTIFICATION_INTERACTION_TYPES = frozenset(
     {
         "approval",
         "workflow_approval",
+        "handoff_input",
         "loop_input",
         "loop_signal_confirmation",
         "reconcile",
@@ -706,7 +708,11 @@ def notification_kind(
         return "retry"
     if event_type in {"run_stalled", "coordinator_stalled"}:
         return "stalled"
-    if event_type in {"workflow_approval_required", "node_approval_required"}:
+    if event_type in {
+        "workflow_approval_required",
+        "node_approval_required",
+        "handoff_input_required",
+    }:
         return "approval_required"
     if event_type in {"loop_input_required"}:
         return "input_required"
@@ -715,7 +721,7 @@ def notification_kind(
     if event_type == "run_paused":
         pending = projected_pending_interaction(projection)
         pending_type = pending.get("type") if isinstance(pending, Mapping) else None
-        if pending_type in {"approval", "workflow_approval"}:
+        if pending_type in {"approval", "workflow_approval", "handoff_input"}:
             return "approval_required"
         if pending_type == "loop_input":
             return "input_required"

@@ -190,7 +190,7 @@ class WorkflowPendingInteractionProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[
-        "approval", "workflow_approval", "loop_input",
+        "approval", "workflow_approval", "handoff_input", "loop_input",
         "loop_signal_confirmation", "capability", "reconcile",
     ]
     interaction_id: str | None = Field(None, min_length=1, max_length=128)
@@ -553,7 +553,7 @@ class WorkflowAttentionInteractionProjection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[
-        "approval", "workflow_approval", "loop_input",
+        "approval", "workflow_approval", "handoff_input", "loop_input",
         "loop_signal_confirmation", "capability", "reconcile", "notification",
     ]
     interaction_id: str | None = Field(
@@ -605,7 +605,7 @@ class WorkflowAttentionItemProjection(BaseModel):
     workflow: str
     node_id: str | None
     kind: Literal[
-        "approval", "workflow_approval", "loop_input",
+        "approval", "workflow_approval", "handoff_input", "loop_input",
         "loop_signal_confirmation", "capability", "reconcile", "notification",
         "failure", "stalled",
     ]
@@ -1701,6 +1701,7 @@ class WorkflowNotificationInteractionProjection(BaseModel):
     type: Literal[
         "approval",
         "workflow_approval",
+        "handoff_input",
         "loop_input",
         "loop_signal_confirmation",
         "reconcile",
@@ -1763,6 +1764,7 @@ class WorkflowTransitionNotificationPayload(BaseModel):
         "coordinator_stalled",
         "workflow_approval_required",
         "node_approval_required",
+        "handoff_input_required",
         "loop_input_required",
         "loop_signal_confirmation_required",
         "run_paused",
@@ -2333,6 +2335,7 @@ def _run_attention_items(run: Mapping[str, object]) -> list[dict[str, object]]:
         if kind not in {
             "approval",
             "workflow_approval",
+            "handoff_input",
             "loop_input",
             "loop_signal_confirmation",
             "capability",

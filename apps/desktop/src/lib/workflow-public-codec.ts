@@ -113,6 +113,7 @@ const NODE_STATES = new Set([
 const INTERACTION_TYPES = new Set([
   'approval',
   'capability',
+  'handoff_input',
   'loop_input',
   'loop_signal_confirmation',
   'reconcile',

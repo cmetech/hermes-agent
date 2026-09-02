@@ -55,7 +55,7 @@ def available_actions(
         str(pending_interaction.get("type")) if pending_interaction else None
     )
     if status == "paused":
-        if interaction_type in {"approval", "workflow_approval"}:
+        if interaction_type in {"approval", "workflow_approval", "handoff_input"}:
             actions.extend(("approve", "reject", "cancel"))
         elif interaction_type == "loop_signal_confirmation":
             try:

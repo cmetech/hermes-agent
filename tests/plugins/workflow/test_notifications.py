@@ -206,6 +206,59 @@ def test_outbox_lease_requires_electron_ack_and_survives_restart(tmp_path):
     assert restarted.pending_attention(run_id="run-1") == ()
 
 
+def test_handoff_input_notification_is_closed_deduplicated_and_restart_safe(
+    tmp_path,
+) -> None:
+    home = tmp_path / "handoff-input-notification"
+    projection = {
+        "workflow": "review",
+        "status": "paused",
+        "pending_interaction": {
+            "type": "handoff_input",
+            "interaction_id": "a" * 64,
+            "node_id": "review",
+            "remote_request_id": "remote-approval-1",
+            "remote_choices": ["once", "deny"],
+            "prompt": "Bearer secret prompt /Users/private/result.txt",
+        },
+    }
+    kind = notification_kind("handoff_input_required", projection, node_id="review")
+
+    assert kind == "approval_required"
+    outbox = NotificationOutbox(RunStore(home))
+    payload = {
+        **projection,
+        "event_type": "handoff_input_required",
+        "node_id": "review",
+        "interaction": projection["pending_interaction"],
+    }
+    first = outbox.record(
+        run_id="handoff-input-run",
+        kind=kind,
+        destination="desktop",
+        transition_version=4,
+        payload=payload,
+    )
+    duplicate = outbox.record(
+        run_id="handoff-input-run",
+        kind=kind,
+        destination="desktop",
+        transition_version=4,
+        payload=payload,
+    )
+
+    assert duplicate == first
+    restarted = NotificationOutbox(RunStore(home))
+    item = restarted.pending_attention(run_id="handoff-input-run")[0]
+    assert item["payload"]["event_type"] == "handoff_input_required"
+    assert item["payload"]["node_id"] == "review"
+    assert item["payload"]["interaction"] == {
+        "type": "handoff_input",
+        "interaction_id": "a" * 64,
+    }
+    assert "remote-approval-1" not in json.dumps(item, sort_keys=True)
+
+
 def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
     store = RunStore(tmp_path / "handoff-attention")
     outbox = NotificationOutbox(store)

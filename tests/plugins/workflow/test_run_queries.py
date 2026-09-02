@@ -4,6 +4,7 @@ import pytest
 
 from plugins.workflow.actions import MUTATION_ACTIONS, available_actions, mutation_is_valid
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.sanitize import public_pending_interaction
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.scheduler import RunScheduler
 from plugins.workflow.store import RunStore
@@ -155,6 +156,12 @@ def test_conversation_scope_filters_lists_and_explicit_run_ids(
         ),
         (
             "paused",
+            {"type": "handoff_input"},
+            "user_wait",
+            {"approve", "reject", "cancel"},
+        ),
+        (
+            "paused",
             {"type": "loop_input"},
             "user_wait",
             {"provide-input", "cancel"},
@@ -214,6 +221,33 @@ def test_action_table_advertises_exactly_valid_mutations(
             health=health,
         )
     } == expected
+
+
+def test_handoff_input_public_projection_is_closed() -> None:
+    canary = "Bearer secret prompt /Users/private/result.txt"
+
+    projected = public_pending_interaction(
+        {
+            "type": "handoff_input",
+            "interaction_id": "a" * 64,
+            "node_id": "review",
+            "remote_request_id": "remote-approval-1",
+            "remote_choices": ["once", "deny"],
+            "description": canary,
+            "command": canary,
+            "prompt": canary,
+            "result": canary,
+            "url": "https://peer.invalid/private",
+            "credentials": canary,
+            "unknown": canary,
+        }
+    )
+
+    assert projected == {
+        "type": "handoff_input",
+        "interaction_id": "a" * 64,
+        "node_id": "review",
+    }
 
 
 def test_archived_terminal_run_advertises_restore_only() -> None:
