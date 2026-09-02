@@ -1273,7 +1273,7 @@ class NotificationOutbox:
                             now=observed,
                         )
                     return notification_id
-            if safe_kind in COALESCED_KINDS:
+            if safe_kind in COALESCED_KINDS and not isinstance(handoff, Mapping):
                 window = (observed - timedelta(seconds=60)).isoformat()
                 candidate = connection.execute(
                     "SELECT notification_id FROM workflow_notification_outbox "

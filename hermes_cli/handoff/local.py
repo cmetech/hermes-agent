@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from agent.deadline import kill_process_tree
 from agent.secret_scope import build_profile_secret_scope
 from gateway.config import Platform, load_gateway_config
 from gateway.platforms.api_server import DEFAULT_HOST, DEFAULT_PORT
@@ -50,7 +51,7 @@ _READ_CHUNK_BYTES = 64 * 1024
 _VALIDATE_BUDGET_SECONDS = 2.0
 MAX_CLI_OUTPUT_BYTES = 500_000
 _CLI_TIMEOUT_SECONDS = 600
-_CLI_RECEIPT_VERSION = 2
+_CLI_RECEIPT_VERSION = 3
 _HANDOFF_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 _AUTHORITATIVE_RUNS_FAILURES = frozenset({
     "api_server_disabled",
@@ -91,8 +92,8 @@ def _local_cli_failure(
     return None
 
 
-def _cli_paths(handoff_id: str) -> _CLIPaths:
-    with _open_cli_dir(handoff_id) as (paths, _directory_fd):
+def _cli_paths(source_home: Path, handoff_id: str) -> _CLIPaths:
+    with _open_cli_dir(source_home, handoff_id) as (paths, _directory_fd):
         return paths
 
 
@@ -113,10 +114,10 @@ def _verify_owner_dir_fd(fd: int) -> None:
 
 
 @contextmanager
-def _open_cli_dir(handoff_id: str):
+def _open_cli_dir(source_home: Path, handoff_id: str):
     if not isinstance(handoff_id, str) or not _HANDOFF_ID.fullmatch(handoff_id):
         raise ValueError("handoff id is invalid")
-    spool = get_hermes_home() / "handoffs"
+    spool = source_home / "handoffs"
     root = spool / handoff_id
     spool.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
@@ -149,6 +150,46 @@ def _open_cli_dir(handoff_id: str):
             )
         finally:
             os.close(directory_fd)
+    finally:
+        os.close(spool_fd)
+
+
+def _remove_cli_spool(source_home: Path, handoff_id: str) -> None:
+    if not isinstance(handoff_id, str) or not _HANDOFF_ID.fullmatch(handoff_id):
+        raise ValueError("handoff id is invalid")
+    spool = source_home / "handoffs"
+    try:
+        spool_fd = os.open(spool, _path_flags(directory=True))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ValueError("handoff spool directory is unsafe") from exc
+    try:
+        _verify_owner_dir_fd(spool_fd)
+        try:
+            directory_fd = os.open(
+                handoff_id, _path_flags(directory=True), dir_fd=spool_fd
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ValueError("handoff spool directory is unsafe") from exc
+        try:
+            _verify_owner_dir_fd(directory_fd)
+            for name in ("prompt.txt", "stdout.txt", "stderr.txt", "receipt.json"):
+                _verify_owner_file_at(directory_fd, name)
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            os.rmdir(handoff_id, dir_fd=spool_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(spool_fd)
     finally:
         os.close(spool_fd)
 
@@ -301,7 +342,9 @@ def _drain_pipe(stream, output: _BoundedOutput) -> None:
 
 
 def _collect_process_output(
-    process, *, timeout_seconds: float
+    process,
+    *,
+    timeout_seconds: float,
 ) -> tuple[int, bytes, bytes, bool]:
     stdout = _BoundedOutput()
     stderr = _BoundedOutput()
@@ -319,10 +362,18 @@ def _collect_process_output(
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            process.kill()
-        except (AttributeError, OSError, ProcessLookupError, PermissionError):
-            pass
+    if timed_out:
+        pid = getattr(process, "pid", None)
+        terminated = (
+            kill_process_tree(pid)
+            if isinstance(pid, int) and not isinstance(pid, bool)
+            else False
+        )
+        if not terminated:
+            try:
+                process.kill()
+            except (AttributeError, OSError, ProcessLookupError, PermissionError):
+                pass
         try:
             process.wait(timeout=1)
         except (subprocess.TimeoutExpired, OSError):
@@ -356,15 +407,22 @@ def _command_sha256(argv: list[str]) -> str:
 
 def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
     validate_profile_name(profile)
-    with _open_cli_dir(handoff_id) as (_paths, directory_fd):
+    source_home = get_hermes_home().expanduser().resolve()
+    with _open_cli_dir(source_home, handoff_id) as (_paths, directory_fd):
         for name in ("stdout.txt", "stderr.txt", "receipt.json"):
             _verify_owner_file_at(directory_fd, name)
+        try:
+            os.unlink("stderr.txt", dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
         prompt_fd = _open_owner_file_at(directory_fd, "prompt.txt", required=True)
         assert prompt_fd is not None
         try:
             prompt = _read_bounded_fd(prompt_fd)
             request_sha256 = sha256(prompt).hexdigest()
             os.lseek(prompt_fd, 0, os.SEEK_SET)
+            os.unlink("prompt.txt", dir_fd=directory_fd)
+            os.fsync(directory_fd)
             argv = local_delivery_command(
                 profile,
                 f"/dev/fd/{prompt_fd}",
@@ -380,7 +438,8 @@ def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
                         pass_fds=(prompt_fd,),
                     )
                     returncode, stdout, stderr, timed_out = _collect_process_output(
-                        process, timeout_seconds=_CLI_TIMEOUT_SECONDS
+                        process,
+                        timeout_seconds=_CLI_TIMEOUT_SECONDS,
                     )
                 if timed_out:
                     outcome = "timeout"
@@ -399,7 +458,6 @@ def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
         finally:
             os.close(prompt_fd)
         _atomic_bytes_at(directory_fd, "stdout.txt", stdout)
-        _atomic_bytes_at(directory_fd, "stderr.txt", stderr)
         _atomic_json_at(directory_fd, "receipt.json", {
             "version": _CLI_RECEIPT_VERSION,
             "handoff_id": handoff_id,
@@ -541,6 +599,32 @@ def _checkpoint(snapshot: HandoffSnapshot, **changes: object) -> dict[str, objec
 
 class LocalHermesChannel:
     """Duck-typed handoff channel backed by the local multiplex API server."""
+
+    def __init__(self, source_home: Path | str | None = None) -> None:
+        self._source_home = Path(
+            source_home if source_home is not None else get_hermes_home()
+        ).expanduser().resolve()
+        self._cli_trees: dict[str, ManagedProcessTree] = {}
+        self._cli_trees_lock = threading.Lock()
+
+    def _take_cli_tree(self, handoff_id: str) -> ManagedProcessTree | None:
+        with self._cli_trees_lock:
+            return self._cli_trees.pop(handoff_id, None)
+
+    def cleanup_committed(self, snapshot: HandoffSnapshot) -> None:
+        """Remove transient CLI bytes after their durable fact is committed."""
+        if snapshot.mechanism != "local_cli":
+            return
+        checkpoint = snapshot.checkpoint or {}
+        if (
+            snapshot.phase not in {"succeeded", "failed", "cancelled", "indeterminate"}
+            and "receipt_sha256" not in checkpoint
+        ):
+            return
+        tree = self._take_cli_tree(snapshot.handoff_id)
+        if tree is not None:
+            tree.terminate("handoff observation committed")
+        _remove_cli_spool(self._source_home, snapshot.handoff_id)
 
     def _connection(self, profile: str) -> tuple[_Connection | None, str | None]:
         default_home = get_profile_dir("default")
@@ -712,10 +796,11 @@ class LocalHermesChannel:
             checkpoint={"session_id": session_id},
         )
 
-    @staticmethod
-    def _bind_cli(snapshot: HandoffSnapshot) -> ChannelObservation:
+    def _bind_cli(self, snapshot: HandoffSnapshot) -> ChannelObservation:
         prompt = snapshot.spec.prompt.encode("utf-8")
-        with _open_cli_dir(snapshot.handoff_id) as (_paths, directory_fd):
+        with _open_cli_dir(
+            self._source_home, snapshot.handoff_id
+        ) as (_paths, directory_fd):
             _atomic_bytes_at(directory_fd, "prompt.txt", prompt)
         return ChannelObservation(
             phase="prepared",
@@ -778,10 +863,13 @@ class LocalHermesChannel:
             return False
         return False
 
-    @staticmethod
-    def _receipt_observation(snapshot: HandoffSnapshot) -> ChannelObservation | None:
+    def _receipt_observation(
+        self, snapshot: HandoffSnapshot
+    ) -> ChannelObservation | None:
         try:
-            with _open_cli_dir(snapshot.handoff_id) as (_paths, directory_fd):
+            with _open_cli_dir(
+                self._source_home, snapshot.handoff_id
+            ) as (_paths, directory_fd):
                 raw_receipt = _read_bounded_at(directory_fd, "receipt.json")
                 receipt = json.loads(raw_receipt)
                 if not isinstance(receipt, dict) or set(receipt) != {
@@ -791,7 +879,6 @@ class LocalHermesChannel:
                 }:
                     return None
                 stdout = _read_bounded_at(directory_fd, "stdout.txt")
-                stderr = _read_bounded_at(directory_fd, "stderr.txt")
             if (
                 receipt["version"] != _CLI_RECEIPT_VERSION
                 or receipt["handoff_id"] != snapshot.handoff_id
@@ -799,9 +886,13 @@ class LocalHermesChannel:
                 or receipt["request_sha256"]
                 != (snapshot.checkpoint or {}).get("request_sha256")
                 or receipt["stdout_size"] != len(stdout)
-                or receipt["stderr_size"] != len(stderr)
                 or receipt["stdout_sha256"] != sha256(stdout).hexdigest()
-                or receipt["stderr_sha256"] != sha256(stderr).hexdigest()
+                or isinstance(receipt["stderr_size"], bool)
+                or not isinstance(receipt["stderr_size"], int)
+                or not 0 <= receipt["stderr_size"] <= MAX_CLI_OUTPUT_BYTES
+                or not isinstance(receipt["stderr_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", receipt["stderr_sha256"])
+                is None
                 or receipt["outcome"] not in {
                     "completed", "timeout", "wrapper_error"
                 }
@@ -856,7 +947,9 @@ class LocalHermesChannel:
         )
 
     def _submit_cli(self, snapshot: HandoffSnapshot) -> ChannelObservation:
-        with _open_cli_dir(snapshot.handoff_id) as (_paths, directory_fd):
+        with _open_cli_dir(
+            self._source_home, snapshot.handoff_id
+        ) as (_paths, directory_fd):
             prompt = _read_bounded_at(directory_fd, "prompt.txt")
         if sha256(prompt).hexdigest() != (snapshot.checkpoint or {}).get(
             "request_sha256"
@@ -869,11 +962,14 @@ class LocalHermesChannel:
             argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env={**os.environ, "HERMES_HOME": str(self._source_home)},
         )
         identity = tree.identity
         if identity.start_time is None or identity.group_id != identity.pid:
             ManagedProcessTree.terminate_existing(identity)
             raise ChannelIndeterminate("local_cli_identity_unavailable")
+        with self._cli_trees_lock:
+            self._cli_trees[snapshot.handoff_id] = tree
         return ChannelObservation(
             phase="submitted",
             checkpoint=_checkpoint(
@@ -888,6 +984,13 @@ class LocalHermesChannel:
     def _observe_cli(
         self, snapshot: HandoffSnapshot, *, cancelling: bool = False
     ) -> ChannelObservation:
+        checkpoint = snapshot.checkpoint or {}
+        if snapshot.phase == "indeterminate" and "receipt_sha256" in checkpoint:
+            return ChannelObservation(
+                phase="indeterminate",
+                checkpoint=checkpoint,
+                failure_code=snapshot.failure_code,
+            )
         receipt = self._receipt_observation(snapshot)
         if receipt is not None:
             return receipt
@@ -1081,7 +1184,17 @@ class LocalHermesChannel:
                     checkpoint=snapshot.checkpoint or {},
                     failure_code="cancellation_indeterminate",
                 )
-            if ManagedProcessTree.terminate_existing(identity):
+            tree = self._take_cli_tree(snapshot.handoff_id)
+            terminated = False
+            if tree is not None:
+                try:
+                    tree.terminate("handoff cancelled")
+                    terminated = tree.reaped and not tree.tree_active()
+                except RuntimeError:
+                    terminated = False
+            else:
+                terminated = ManagedProcessTree.terminate_existing(identity)
+            if terminated:
                 receipt = self._receipt_observation(snapshot)
                 if receipt is not None:
                     return receipt

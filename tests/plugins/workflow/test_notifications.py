@@ -285,6 +285,59 @@ def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
     assert outbox.history(run_id="handoff-run")[0]["state"] == "pending"
 
 
+def test_distinct_handoff_failures_remain_independently_actionable(tmp_path) -> None:
+    outbox = NotificationOutbox(RunStore(tmp_path / "distinct-handoff-failures"))
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+
+    def record(version: int, handoff_id: str) -> str:
+        payload = _handoff_notification_payload(
+            transition_version=version,
+            handoff_id=handoff_id,
+            generation=1,
+            failure_code="remote_failed",
+        )
+        payload["event_type"] = "handoff_failed"
+        payload["handoff"] = {
+            **payload["handoff"],
+            "phase": "failed",
+            "next_action": "inspect",
+        }
+        return outbox.record(
+            run_id="two-failed-handoffs",
+            kind="failure",
+            destination="desktop",
+            transition_version=version,
+            payload=payload,
+            now=observed + timedelta(seconds=version),
+        )
+
+    first = record(1, "handoff-first")
+    second = record(2, "handoff-second")
+
+    assert first != second
+    assert [
+        item["payload"]["handoff"]["handoff_id"]
+        for item in outbox.pending_attention(run_id="two-failed-handoffs")
+    ] == ["handoff-first", "handoff-second"]
+    assert outbox.clear_handoff_attention(
+        run_id="two-failed-handoffs",
+        node_id="review",
+        handoff_id="handoff-first",
+        generation=1,
+    ) == 1
+    assert [
+        item["notification_id"]
+        for item in outbox.pending_attention(run_id="two-failed-handoffs")
+    ] == [second]
+    assert outbox.clear_handoff_attention(
+        run_id="two-failed-handoffs",
+        node_id="review",
+        handoff_id="handoff-second",
+        generation=1,
+    ) == 1
+    assert outbox.pending_attention(run_id="two-failed-handoffs") == ()
+
+
 def test_same_phase_handoff_observation_only_notifies_when_indeterminate() -> None:
     projection = {
         "nodes": {

@@ -84,6 +84,7 @@ def _waiting_handoff_run(
     now: datetime,
     fence: ExecutionFence,
     handoffs: tuple[tuple[str, datetime], ...],
+    deadlines: dict[str, datetime] | None = None,
 ) -> str:
     package = load_workflow(
         workflow_writer(
@@ -126,7 +127,9 @@ def _waiting_handoff_run(
             observed_version=index,
             observed_phase="active",
             next_observation_at=due_at,
-            deadline_at=now + timedelta(hours=1),
+            deadline_at=(deadlines or {}).get(
+                node_id, now + timedelta(hours=1)
+            ),
             now=LeaseClockSample(now, 100.0, "boot-a"),
         )
     return admitted.run_id
@@ -1542,6 +1545,129 @@ def test_broken_handoff_page_is_deferred_so_next_page_runs_next_cycle(
         "handoff_advance_exception"
     }
     assert "raw-secret" not in str(deferred)
+
+
+def test_handoff_pages_prioritize_cancel_and_deadline_without_starving_tail(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    wall_now = [now]
+    monotonic_now = [100.0]
+    clock = _LeaseClock(LeaseClockSample(now, monotonic_now[0], "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("handoff-fair-page")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    normal_ids = tuple(f"normal-{index:02d}" for index in range(21))
+    all_ids = normal_ids + ("zz-cancel", "zz-expired")
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=tuple(
+            (
+                node_id,
+                now - timedelta(minutes=1) if node_id == "normal-20" else now,
+            )
+            for node_id in all_ids
+        ),
+        deadlines={
+            "zz-cancel": now - timedelta(seconds=2),
+            "zz-expired": now - timedelta(seconds=1),
+        },
+    )
+    cancel_command_id = store.request_handoff_cancel(
+        run_id,
+        "zz-cancel",
+        reason_code="deadline_exceeded",
+        fence=fence,
+    )
+    assert cancel_command_id is not None
+
+    class Service:
+        def __init__(self) -> None:
+            self.advance_calls: list[str] = []
+            self.command_calls: list[tuple[str, str]] = []
+
+        def command(self, handoff_id, kind, *, command_id, actor):
+            assert kind == "cancel"
+            assert actor == "workflow"
+            self.command_calls.append((handoff_id, command_id))
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            assert budget_seconds > 0
+            self.advance_calls.append(handoff_id)
+            terminal = handoff_id in {
+                "handoff-zz-cancel",
+                "handoff-zz-expired",
+            }
+            return AdvanceResult(
+                _handoff_snapshot(
+                    handoff_id,
+                    phase="cancelled" if terminal else "active",
+                    version=100 + len(self.advance_calls),
+                    next_advance_at=(
+                        None
+                        if terminal
+                        else wall_now[0] + timedelta(seconds=5)
+                    ),
+                ),
+                "observe",
+                True,
+            )
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: wall_now[0],
+        monotonic=lambda: monotonic_now[0],
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=monotonic_now[0] + 1,
+            max_items=20,
+        ) == (20, 0, 2)
+        wall_now[0] += timedelta(seconds=5)
+        monotonic_now[0] += 5
+        clock.sample = LeaseClockSample(
+            wall_now[0], monotonic_now[0], "boot-a"
+        )
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=monotonic_now[0] + 1,
+            max_items=20,
+        ) == (20, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.advance_calls[:4] == [
+        "handoff-zz-cancel",
+        "handoff-zz-expired",
+        "handoff-normal-20",
+        "handoff-normal-00",
+    ]
+    assert service.advance_calls[20:23] == [
+        "handoff-normal-17",
+        "handoff-normal-18",
+        "handoff-normal-19",
+    ]
+    assert set(service.advance_calls[:23]) == {
+        f"handoff-{node_id}" for node_id in all_ids
+    }
+    assert len(service.advance_calls[:23]) == len(set(service.advance_calls[:23]))
+    assert service.command_calls == [
+        ("handoff-zz-cancel", cancel_command_id),
+        (
+            "handoff-zz-expired",
+            f"workflow-{run_id}-zz-expired-1-deadline-cancel",
+        ),
+    ]
 
 
 def test_handoff_sweep_stops_external_io_after_mid_batch_fence_loss(

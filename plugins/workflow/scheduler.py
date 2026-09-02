@@ -1179,8 +1179,19 @@ class RunScheduler:
                 or command_id is not None
             ):
                 due.append((str(node_id), wait, command_id))
-                if len(due) == max_items:
-                    break
+        due.sort(
+            key=lambda candidate: (
+                0
+                if candidate[2] is not None
+                else 1
+                if candidate[1].deadline_at is not None
+                and candidate[1].deadline_at <= observed
+                else 2,
+                candidate[1].next_observation_at,
+                candidate[0],
+            )
+        )
+        due = due[:max_items]
 
         attempted = deferred = terminal = 0
         service = self._handoff_service_instance() if due else None

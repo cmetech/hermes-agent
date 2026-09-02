@@ -7,15 +7,25 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_cli.handoff.local as local_module
 from hermes_cli.handoff.local import LocalHermesChannel
-from hermes_cli.handoff.models import HandoffEndpoint, HandoffSnapshot, HandoffSpec
-from tools.managed_process import ProcessIdentity
+from hermes_cli.handoff.models import (
+    ChannelObservation,
+    HandoffEndpoint,
+    HandoffSnapshot,
+    HandoffSpec,
+)
+from hermes_cli.handoff.service import AgentHandoffService
+from hermes_cli.handoff.store import HandoffStore
+from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
 def _snapshot(tmp_path: Path, monkeypatch, *, phase="prepared", checkpoint=None):
@@ -66,9 +76,10 @@ def _bound(tmp_path, monkeypatch):
 def _write_receipt(
     snapshot, *, stdout=b"done", stderr=b"", exit_code=0, outcome="completed"
 ):
-    paths = local_module._cli_paths(snapshot.handoff_id)
+    paths = local_module._cli_paths(
+        Path(os.environ["HERMES_HOME"]), snapshot.handoff_id
+    )
     local_module._atomic_bytes(paths.stdout, stdout)
-    local_module._atomic_bytes(paths.stderr, stderr)
     receipt = {
         "version": local_module._CLI_RECEIPT_VERSION,
         "handoff_id": snapshot.handoff_id,
@@ -117,6 +128,52 @@ def test_bind_uses_cli_only_after_authoritative_runs_unavailability(tmp_path, mo
     assert set(bound.checkpoint) == {"request_sha256"}
 
 
+def test_default_service_anchors_cli_spool_to_its_store_home(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    source_home = root / "profiles" / "initiator"
+    ambient_home = root / "profiles" / "ambient"
+    for path in (source_home, ambient_home, root / "profiles" / "reviewer"):
+        path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    store = HandoffStore(source_home / "handoffs.db")
+    service = AgentHandoffService(store)
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="profile-local prompt",
+        output_schema=None,
+        deadline_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        attribution={},
+        required_capabilities=frozenset(),
+    )
+    snapshot = service.create(
+        spec,
+        "workflow/source-run",
+        handoff_key="review/0",
+    )
+    monkeypatch.setattr(
+        service.channel,
+        "_assess",
+        lambda *_args: (None, "runs_not_durable"),
+    )
+
+    bound = service.advance(snapshot.handoff_id).snapshot
+
+    assert (source_home / "handoffs" / snapshot.handoff_id / "prompt.txt").is_file()
+    assert not (ambient_home / "handoffs" / snapshot.handoff_id).exists()
+
+    identity = ProcessIdentity(pid=4321, start_time=9876, group_id=4321)
+
+    def spawn(_argv, **kwargs):
+        assert kwargs["env"]["HERMES_HOME"] == str(source_home.resolve())
+        return SimpleNamespace(identity=identity)
+
+    monkeypatch.setattr(local_module.ManagedProcessTree, "spawn", spawn)
+    submitted = service.advance(bound.handoff_id).snapshot
+    assert submitted.checkpoint["process_pid"] == identity.pid
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX wrapper and flock contract")
 def test_wrapper_keeps_prompt_out_of_argv_holds_profile_lock_and_bounds_output(
     tmp_path, monkeypatch
@@ -147,6 +204,8 @@ def test_wrapper_keeps_prompt_out_of_argv_holds_profile_lock_and_bounds_output(
         assert snapshot.spec.prompt not in "\0".join(argv)
         assert Path(argv[argv.index("--query-file") + 1]).read_text() == snapshot.spec.prompt
         assert kwargs["pass_fds"]
+        assert "start_new_session" not in kwargs
+        assert "process_group" not in kwargs
         return _Process()
 
     monkeypatch.setattr(
@@ -172,20 +231,24 @@ def test_wrapper_refuses_symlinked_handoff_spool(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     with pytest.raises(ValueError, match="unsafe"):
-        local_module._cli_paths("handoff-1")
+        local_module._cli_paths(home, "handoff-1")
     assert list(outside.iterdir()) == []
 
 
 def test_pinned_spool_directory_survives_path_replacement(tmp_path, monkeypatch):
     _channel, snapshot = _bound(tmp_path, monkeypatch)
-    paths = local_module._cli_paths(snapshot.handoff_id)
+    paths = local_module._cli_paths(
+        Path(os.environ["HERMES_HOME"]), snapshot.handoff_id
+    )
     displaced = paths.root.with_name("displaced")
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "prompt.txt").write_text("attacker replacement", encoding="utf-8")
     (outside / "prompt.txt").chmod(0o600)
 
-    with local_module._open_cli_dir(snapshot.handoff_id) as (_paths, directory_fd):
+    with local_module._open_cli_dir(
+        Path(os.environ["HERMES_HOME"]), snapshot.handoff_id
+    ) as (_paths, directory_fd):
         paths.root.rename(displaced)
         paths.root.symlink_to(outside, target_is_directory=True)
         assert (
@@ -217,6 +280,68 @@ def test_output_collectors_discard_bytes_above_the_bound():
     assert len(stderr) == local_module.MAX_CLI_OUTPUT_BYTES
 
 
+def _assert_wrapper_timeout_terminates_the_destination_process_group(tmp_path):
+    descendant_pid = tmp_path / "descendant.pid"
+    script = (
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(descendant_pid)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while not descendant_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pid = int(descendant_pid.read_text(encoding="utf-8"))
+        assert os.getpgid(process.pid) == os.getpgrp()
+        assert os.getpgid(child_pid) == os.getpgrp()
+
+        _returncode, _stdout, _stderr, timed_out = (
+            local_module._collect_process_output(
+                process,
+                timeout_seconds=0.05,
+            )
+        )
+
+        assert timed_out is True
+        deadline = time.monotonic() + 3
+        while _pid_is_live(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not _pid_is_live(child_pid)
+    finally:
+        if process.poll() is None:
+            local_module.kill_process_tree(process.pid)
+            process.wait(timeout=3)
+        if child_pid is not None and _pid_is_live(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.macos_only
+def test_macos_wrapper_timeout_terminates_the_destination_process_group(tmp_path):
+    _assert_wrapper_timeout_terminates_the_destination_process_group(tmp_path)
+
+
+@pytest.mark.linux_only
+def test_linux_wrapper_timeout_terminates_the_destination_process_group(tmp_path):
+    _assert_wrapper_timeout_terminates_the_destination_process_group(tmp_path)
+
+
+def _pid_is_live(pid: int) -> bool:
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
 def test_signal_exit_cannot_be_recorded_as_success(tmp_path, monkeypatch):
     channel, snapshot = _bound(tmp_path, monkeypatch)
     process = SimpleNamespace(
@@ -238,13 +363,44 @@ def test_signal_exit_cannot_be_recorded_as_success(tmp_path, monkeypatch):
     assert observed.checkpoint["exit_code"] == 137
 
 
+def test_wrapper_unlinks_prompt_and_never_persists_raw_stderr(
+    tmp_path, monkeypatch
+):
+    _channel, snapshot = _bound(tmp_path, monkeypatch)
+    secret_error = b"Authorization: Bearer provider-secret"
+    process = SimpleNamespace(
+        returncode=1,
+        stdout=io.BytesIO(),
+        stderr=io.BytesIO(secret_error),
+        wait=lambda timeout: 1,
+    )
+    monkeypatch.setattr(local_module.subprocess, "Popen", lambda *_a, **_k: process)
+
+    assert local_module._run_cli_wrapper(snapshot.handoff_id, "reviewer") == 1
+
+    paths = local_module._cli_paths(
+        Path(os.environ["HERMES_HOME"]), snapshot.handoff_id
+    )
+    receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+    assert not paths.prompt.exists()
+    assert not paths.stderr.exists()
+    assert secret_error.decode() not in json.dumps(receipt)
+    assert receipt["stderr_size"] == len(secret_error)
+    assert receipt["stderr_sha256"] == sha256(secret_error).hexdigest()
+
+
 def test_submit_returns_process_identity_without_absolute_paths(tmp_path, monkeypatch):
     channel, snapshot = _bound(tmp_path, monkeypatch)
     identity = ProcessIdentity(pid=4321, start_time=9876, group_id=4321)
+
+    def spawn(argv, **kwargs):
+        assert kwargs["env"]["HERMES_HOME"] == os.environ["HERMES_HOME"]
+        return SimpleNamespace(identity=identity)
+
     monkeypatch.setattr(
         local_module.ManagedProcessTree,
         "spawn",
-        lambda argv, **kwargs: SimpleNamespace(identity=identity),
+        spawn,
     )
     observation = channel.submit(snapshot, budget_seconds=1)
 
@@ -276,6 +432,68 @@ def test_receipt_is_observed_after_initiator_restart_before_process_identity(
     assert observed.phase == "succeeded"
     assert observed.terminal_result["text"] == "durable reply"
     assert {"receipt_sha256", "stdout_sha256", "stderr_sha256", "exit_code"} <= set(observed.checkpoint)
+
+
+def test_service_cleans_cli_spool_only_after_receipt_is_durable(
+    tmp_path, monkeypatch
+):
+    seed = _snapshot(tmp_path, monkeypatch)
+    source_home = Path(os.environ["HERMES_HOME"])
+    store = HandoffStore(source_home / "handoffs.db")
+    channel = LocalHermesChannel(source_home)
+    service = AgentHandoffService(store, channel)
+    created = service.create(
+        seed.spec,
+        seed.key_scope,
+        handoff_key=seed.handoff_key,
+    )
+    monkeypatch.setattr(
+        channel,
+        "_assess",
+        lambda *_args: (None, "runs_not_durable"),
+    )
+    bound = service.advance(created.handoff_id).snapshot
+    monkeypatch.setattr(
+        channel,
+        "_submit_cli",
+        lambda snapshot: ChannelObservation(
+            phase="submitted",
+            checkpoint={
+                **snapshot.checkpoint,
+                "process_pid": 999999,
+                "process_started_at": 1,
+                "process_command_sha256": "a" * 64,
+                "status": "running",
+            },
+        ),
+    )
+    submitted = service.advance(bound.handoff_id).snapshot
+    paths, _receipt = _write_receipt(
+        submitted,
+        stdout=b"durable reply",
+        stderr=b"provider-secret",
+    )
+    original_commit = store.commit_observation
+
+    def commit_observation(lease, observation):
+        committed = original_commit(lease, observation)
+        if (observation.checkpoint or {}).get("receipt_sha256"):
+            assert paths.stdout.exists()
+            assert paths.receipt.exists()
+        return committed
+
+    monkeypatch.setattr(store, "commit_observation", commit_observation)
+
+    terminal = service.advance(submitted.handoff_id).snapshot
+
+    assert terminal.phase == "succeeded"
+    assert terminal.terminal_result["text"] == "durable reply"
+    assert not paths.root.exists()
+    evidence = json.dumps(
+        [dict(event.data) for event in service.evidence(terminal.handoff_id).events]
+    )
+    assert "durable reply" not in evidence
+    assert "provider-secret" not in evidence
 
 
 def test_tampered_receipt_and_reused_or_dead_pid_are_indeterminate(tmp_path, monkeypatch):
@@ -355,11 +573,38 @@ def test_timeout_receipt_is_indeterminate(tmp_path, monkeypatch):
     local_module._run_cli_wrapper(snapshot.handoff_id, "reviewer")
     timeout = channel.observe(snapshot, budget_seconds=1)
     receipt = json.loads(
-        local_module._cli_paths(snapshot.handoff_id).receipt.read_text()
+        local_module._cli_paths(
+            Path(os.environ["HERMES_HOME"]), snapshot.handoff_id
+        ).receipt.read_text()
     )
     assert receipt["outcome"] == "timeout"
     assert timeout.phase == "indeterminate"
     assert timeout.failure_code == "local_cli_timeout"
+
+
+def test_committed_cli_receipt_fact_survives_spool_cleanup(tmp_path, monkeypatch):
+    channel, snapshot = _bound(tmp_path, monkeypatch)
+    checkpoint = {
+        **snapshot.checkpoint,
+        "receipt_version": local_module._CLI_RECEIPT_VERSION,
+        "receipt_sha256": "a" * 64,
+        "stdout_sha256": sha256(b"").hexdigest(),
+        "stderr_sha256": sha256(b"provider-secret").hexdigest(),
+        "exit_code": 124,
+        "status": "timeout",
+    }
+    committed = replace(
+        snapshot,
+        phase="indeterminate",
+        checkpoint=checkpoint,
+        failure_code="local_cli_timeout",
+    )
+
+    observed = channel.reconcile(committed, budget_seconds=1)
+
+    assert observed.phase == "indeterminate"
+    assert observed.checkpoint == checkpoint
+    assert observed.failure_code == "local_cli_timeout"
 
 
 def test_cancel_requires_proven_identity_disappearance_after_terminate_true(
@@ -385,6 +630,94 @@ def test_cancel_requires_proven_identity_disappearance_after_terminate_true(
     assert channel.cancel(submitted, budget_seconds=1).phase == "cancelling"
     monkeypatch.setattr(channel, "_identity_is_gone", lambda identity: True)
     assert channel.cancel(submitted, budget_seconds=1).phase == "cancelled"
+
+
+def _assert_source_cancel_terminates_descendants_and_reaps_its_wrapper(
+    tmp_path, monkeypatch
+):
+    channel, snapshot = _bound(tmp_path, monkeypatch)
+    inner_pid_file = tmp_path / "cancel-inner.pid"
+    grandchild_pid_file = tmp_path / "cancel-grandchild.pid"
+    inner_script = (
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n"
+    )
+    script = (
+        "import pathlib, subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {inner_script!r}, sys.argv[2]])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_wrapper_argv",
+        lambda *_args: [
+            sys.executable,
+            "-c",
+            script,
+            str(inner_pid_file),
+            str(grandchild_pid_file),
+        ],
+    )
+    observation = channel.submit(snapshot, budget_seconds=1)
+    submitted = replace(
+        snapshot,
+        phase="cancelling",
+        checkpoint=observation.checkpoint,
+    )
+    wrapper_pid = observation.checkpoint["process_pid"]
+    inner_pid = None
+    grandchild_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        while (
+            not inner_pid_file.exists() or not grandchild_pid_file.exists()
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        inner_pid = int(inner_pid_file.read_text(encoding="utf-8"))
+        grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8"))
+        wrapper_group = os.getpgid(wrapper_pid)
+        assert os.getpgid(inner_pid) == wrapper_group
+        assert os.getpgid(grandchild_pid) == wrapper_group
+
+        cancelled = channel.cancel(submitted, budget_seconds=1)
+
+        assert cancelled.phase == "cancelled"
+        assert not _pid_is_live(inner_pid)
+        assert not _pid_is_live(grandchild_pid)
+        with pytest.raises(ChildProcessError):
+            os.waitpid(wrapper_pid, os.WNOHANG)
+    finally:
+        identity = channel._process_identity(submitted)
+        if identity is not None:
+            ManagedProcessTree.terminate_existing(identity)
+        try:
+            os.waitpid(wrapper_pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        for pid in (inner_pid, grandchild_pid):
+            if pid is not None and _pid_is_live(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.macos_only
+def test_macos_source_cancel_terminates_descendants_and_reaps_its_wrapper(
+    tmp_path, monkeypatch
+):
+    _assert_source_cancel_terminates_descendants_and_reaps_its_wrapper(
+        tmp_path, monkeypatch
+    )
+
+
+@pytest.mark.linux_only
+def test_linux_source_cancel_terminates_descendants_and_reaps_its_wrapper(
+    tmp_path, monkeypatch
+):
+    _assert_source_cancel_terminates_descendants_and_reaps_its_wrapper(
+        tmp_path, monkeypatch
+    )
 
 
 def test_identity_disappearance_requires_recorded_process_group_to_be_absent(

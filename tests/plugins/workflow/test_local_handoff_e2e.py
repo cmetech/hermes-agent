@@ -1112,7 +1112,7 @@ def _assert_real_posix_cli_receipt(
     assert submitted.phase in {"submitted", "active", "succeeded"}
     assert completed.phase == "succeeded", completed
     assert "CLI receipt approved" in completed.terminal_result["text"]
-    assert completed.checkpoint["receipt_version"] == 2
+    assert completed.checkpoint["receipt_version"] == 3
     assert completed.checkpoint["exit_code"] == 0
     assert {event.kind for event in evidence.events} >= {
         "created",

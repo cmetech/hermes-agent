@@ -129,7 +129,7 @@ class AgentHandoffService:
         if channel is None:
             from .local import LocalHermesChannel
 
-            channel = LocalHermesChannel()
+            channel = LocalHermesChannel(self.store.path.parent)
         self.channel = channel
         self._clock = clock
 
@@ -244,7 +244,14 @@ class AgentHandoffService:
                 self.store.release_advance(lease, next_advance_at=next_advance_at)
             except StaleAdvanceLease:
                 pass
-        return AdvanceResult(self.store.get(handoff_id), operation, folded)
+        snapshot = self.store.get(handoff_id)
+        cleanup = getattr(self.channel, "cleanup_committed", None)
+        if callable(cleanup):
+            try:
+                cleanup(snapshot)
+            except (OSError, RuntimeError, ValueError):
+                pass
+        return AdvanceResult(snapshot, operation, folded)
 
     def _select_operation(self, snapshot: HandoffSnapshot) -> str | None:
         if snapshot.phase in _TERMINAL_PHASES:

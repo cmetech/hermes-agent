@@ -7,10 +7,13 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
 import plugins.workflow.admission as workflow_admission
+from hermes_cli.handoff import EndpointAssessment
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import build_catalog, show_package
 from plugins.workflow.compat import assess_compatibility
@@ -138,6 +141,92 @@ def test_assignment_admission_returns_available_mechanism_without_dispatch(
         initiator_profile="default",
         channel=AvailableChannel(),
     ) == {"review": "local_cli"}
+
+
+def test_assignment_admission_probes_one_canonical_endpoint_once(monkeypatch):
+    endpoint = "hermes://local/reviewer"
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                f"review-{index:03d}": {"endpoint": endpoint}
+                for index in range(512)
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    class SlowChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls += 1
+            time.sleep(0.002)
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = SlowChannel()
+    started = time.monotonic()
+    mechanisms = workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=channel,
+    )
+    elapsed = time.monotonic() - started
+
+    assert channel.calls == 1
+    assert mechanisms == {
+        f"review-{index:03d}": "local_cli" for index in range(512)
+    }
+    assert elapsed < 2.0
+
+
+def test_assignment_admission_bounds_distinct_endpoint_probes(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                f"review-{index}": {
+                    "endpoint": f"hermes://local/reviewer-{index}"
+                }
+                for index in range(4)
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+    monkeypatch.setattr(
+        workflow_admission,
+        "_ASSIGNMENT_ADMISSION_BUDGET_SECONDS",
+        0.03,
+        raising=False,
+    )
+    release_probe = threading.Event()
+
+    class SlowChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls += 1
+            assert release_probe.wait(timeout=2)
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = SlowChannel()
+    started = time.monotonic()
+    try:
+        with pytest.raises(WorkflowValidationError) as caught:
+            workflow_admission.validate_assignment_admission(
+                package,
+                initiator_profile="default",
+                channel=channel,
+            )
+    finally:
+        release_probe.set()
+    elapsed = time.monotonic() - started
+
+    assert caught.value.issues[0].path == "sidecar.assignments.review-0.endpoint"
+    assert caught.value.issues[0].code == "assignment_mechanism_unavailable"
+    assert "admission_budget_exhausted" in caught.value.issues[0].message
+    assert channel.calls == 1
+    assert elapsed < 2.0
 
 
 def test_assignment_owner_is_derived_from_explicit_anchored_profile_home(tmp_path):

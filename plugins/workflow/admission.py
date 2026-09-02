@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Literal, Mapping
 
 from plugins.workflow.models import (
@@ -12,6 +17,9 @@ from plugins.workflow.models import (
     WorkflowValidationError,
 )
 from plugins.workflow.provenance import TriggerProvenance, TriggerSource
+
+
+_ASSIGNMENT_ADMISSION_BUDGET_SECONDS = 2.0
 
 
 def workflow_profile_for_home(hermes_home: str | Path) -> str:
@@ -34,43 +42,69 @@ def validate_assignment_admission(
     channel=None,
 ) -> dict[str, str]:
     """Validate local assignment reachability without creating a handoff."""
-    from hermes_cli.handoff import HandoffEndpoint
+    from hermes_cli.handoff import EndpointAssessment, HandoffEndpoint
     from hermes_cli.handoff.local import LocalHermesChannel
     from hermes_cli.profiles import normalize_profile_name, profile_exists
 
     owner = normalize_profile_name(initiator_profile)
     mechanisms: dict[str, str] = {}
     selected_channel = channel if channel is not None else LocalHermesChannel()
-    for node_id, assignment in package.sidecar.get("assignments", {}).items():
-        endpoint = HandoffEndpoint.parse(assignment["endpoint"])
-        path = f"sidecar.assignments.{node_id}.endpoint"
-        if endpoint.profile == owner:
-            raise WorkflowValidationError(
-                ValidationIssue(
-                    path=path,
-                    code="assignment_self_target",
-                    message="assignment target profile must differ from workflow owner",
+    assessments: dict[str, EndpointAssessment] = {}
+    deadline = monotonic() + _ASSIGNMENT_ADMISSION_BUDGET_SECONDS
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="workflow-admission")
+    try:
+        for node_id, assignment in package.sidecar.get("assignments", {}).items():
+            endpoint = HandoffEndpoint.parse(assignment["endpoint"])
+            path = f"sidecar.assignments.{node_id}.endpoint"
+            if endpoint.profile == owner:
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=path,
+                        code="assignment_self_target",
+                        message="assignment target profile must differ from workflow owner",
+                    )
                 )
-            )
-        if not profile_exists(endpoint.profile):
-            raise WorkflowValidationError(
-                ValidationIssue(
-                    path=path,
-                    code="assignment_profile_missing",
-                    message=f"assignment target profile does not exist: {endpoint.profile}",
+            if not profile_exists(endpoint.profile):
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=path,
+                        code="assignment_profile_missing",
+                        message=f"assignment target profile does not exist: {endpoint.profile}",
+                    )
                 )
-            )
-        assessment = selected_channel.validate_endpoint(endpoint, owner)
-        if not assessment.available or assessment.mechanism is None:
-            failure = assessment.failure_code or "endpoint_unavailable"
-            raise WorkflowValidationError(
-                ValidationIssue(
-                    path=path,
-                    code="assignment_mechanism_unavailable",
-                    message=f"assignment has no available local mechanism: {failure}",
+            assessment = assessments.get(endpoint.canonical)
+            if assessment is None:
+                remaining = deadline - monotonic()
+                try:
+                    if remaining <= 0:
+                        raise FutureTimeoutError
+                    assessment = pool.submit(
+                        selected_channel.validate_endpoint, endpoint, owner
+                    ).result(timeout=remaining)
+                except FutureTimeoutError:
+                    raise WorkflowValidationError(
+                        ValidationIssue(
+                            path=path,
+                            code="assignment_mechanism_unavailable",
+                            message=(
+                                "assignment has no available local mechanism: "
+                                "admission_budget_exhausted"
+                            ),
+                        )
+                    ) from None
+                assessments[endpoint.canonical] = assessment
+            if not assessment.available or assessment.mechanism is None:
+                failure = assessment.failure_code or "endpoint_unavailable"
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=path,
+                        code="assignment_mechanism_unavailable",
+                        message=f"assignment has no available local mechanism: {failure}",
+                    )
                 )
-            )
-        mechanisms[str(node_id)] = assessment.mechanism
+            mechanisms[str(node_id)] = assessment.mechanism
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return mechanisms
 
 
