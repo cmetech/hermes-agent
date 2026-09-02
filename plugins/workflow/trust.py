@@ -295,6 +295,18 @@ class WorkflowIgnoredChildPolicy:
 
 
 @dataclass(frozen=True)
+class WorkflowAssignmentRisk:
+    node_id: str
+    endpoint: str
+    target_profile: str
+    mode: Literal["task"]
+    interaction_policy: Literal["pause", "deny", "auto_cancel"]
+    deadline: str | None
+    on_deadline: Literal["cancel_and_fail"]
+    possible_mechanisms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class WorkflowRiskSummary:
     package_digest: str
     risk_digest: str
@@ -304,6 +316,7 @@ class WorkflowRiskSummary:
     local_mcp_servers: tuple[str, ...]
     providers: tuple[str, ...]
     outward_action_nodes: tuple[str, ...]
+    assignments: tuple[WorkflowAssignmentRisk, ...]
     required_secret_names: tuple[str, ...]
     execution_environment: Literal["trusted_local", "isolated_backend_required"]
     origin_risks: tuple[WorkflowOriginRisk, ...] = ()
@@ -646,6 +659,32 @@ def build_risk_summary(
         })
     )
     outward = _tuple_strings(package.sidecar.get("outward_action_nodes"))
+    from hermes_cli.handoff import HandoffEndpoint
+
+    assignments = tuple(
+        WorkflowAssignmentRisk(
+            node_id=str(node_id),
+            endpoint=(endpoint := HandoffEndpoint.parse(assignment["endpoint"])).canonical,
+            target_profile=endpoint.profile,
+            mode="task",
+            interaction_policy=assignment.get("interaction_policy", "deny"),
+            deadline=(
+                str(assignment["deadline"])
+                if assignment.get("deadline") is not None
+                else None
+            ),
+            on_deadline="cancel_and_fail",
+            possible_mechanisms=(
+                ("peer_runs",)
+                if endpoint.kind == "peer"
+                else (("runs",) if os.name == "nt" else ("runs", "local_cli"))
+            ),
+        )
+        for node_id, assignment in sorted(
+            package.sidecar.get("assignments", {}).items()
+        )
+        if isinstance(assignment, Mapping)
+    )
     secrets = _tuple_strings(package.sidecar.get("required_secrets"))
     environment_value = package.sidecar.get("execution_environment", "trusted_local")
     environment: Literal["trusted_local", "isolated_backend_required"] = (
@@ -755,6 +794,10 @@ def build_risk_summary(
     }
     if provider_authority_digest is not None:
         risk_fields["provider_authority_digest"] = provider_authority_digest
+    if assignments:
+        risk_fields["assignments"] = tuple(
+            asdict(assignment) for assignment in assignments
+        )
     if compilation is not None:
         risk_fields["origin_risks"] = tuple(
             asdict(origin_risk) for origin_risk in origin_risks
@@ -777,6 +820,7 @@ def build_risk_summary(
     ).hexdigest()
     return WorkflowRiskSummary(
         risk_digest=risk_digest,
+        assignments=assignments,
         origin_risks=origin_risks,
         ignored_child_policies=ignored_child_policies,
         **{
@@ -786,6 +830,7 @@ def build_risk_summary(
                 "compatibility",
                 "blocking_findings",
                 "language_identity",
+                "assignments",
                 "origin_risks",
                 "ignored_child_policies",
                 "provider_authority_digest",

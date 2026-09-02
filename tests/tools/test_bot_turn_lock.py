@@ -262,6 +262,20 @@ def test_local_delivery_command_never_reenters_the_lock():
     assert not any("bot_mode_dm" in part for part in argv)
 
 
+def test_local_delivery_command_title_override_preserves_default_argv():
+    default = bot_relay.local_delivery_command("ops", "/tmp/q.txt")
+    handoff = bot_relay.local_delivery_command(
+        "ops", "/tmp/q.txt", title="Handoff: handoff-1"
+    )
+
+    assert default[default.index("-c") + 1] == "Bot Chat"
+    assert handoff == [
+        *default[: default.index("-c") + 1],
+        "Handoff: handoff-1",
+        *default[default.index("-c") + 2 :],
+    ]
+
+
 def test_relay_deliver_returns_target_busy_error(tmp_path, monkeypatch):
     import tui_gateway.server as srv
 

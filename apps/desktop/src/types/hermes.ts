@@ -389,7 +389,14 @@ export interface WorkflowPendingInteraction {
   iteration?: null | number
   max_iterations?: null | number
   node_id?: null | string
-  type: 'approval' | 'capability' | 'loop_input' | 'loop_signal_confirmation' | 'reconcile' | 'workflow_approval'
+  type:
+    | 'approval'
+    | 'capability'
+    | 'handoff_input'
+    | 'loop_input'
+    | 'loop_signal_confirmation'
+    | 'reconcile'
+    | 'workflow_approval'
 }
 
 export interface WorkflowRetryProjection {
@@ -546,7 +553,7 @@ export interface WorkflowNotificationInteraction {
   interaction_id?: string
   iteration?: number
   max_iterations?: number
-  type: 'approval' | 'loop_input' | 'loop_signal_confirmation' | 'reconcile' | 'workflow_approval'
+  type: 'approval' | 'handoff_input' | 'loop_input' | 'loop_signal_confirmation' | 'reconcile' | 'workflow_approval'
 }
 
 export interface WorkflowTransitionNotificationPayload {
@@ -562,6 +569,7 @@ export interface WorkflowTransitionNotificationPayload {
     | 'cancel_reconciliation_required'
     | 'cleanup_failed'
     | 'coordinator_stalled'
+    | 'handoff_input_required'
     | 'loop_input_required'
     | 'loop_signal_confirmation_required'
     | 'node_approval_required'
@@ -852,6 +860,7 @@ export interface WorkflowAttentionItem {
     | 'approval'
     | 'capability'
     | 'failure'
+    | 'handoff_input'
     | 'loop_input'
     | 'loop_signal_confirmation'
     | 'notification'

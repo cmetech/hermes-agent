@@ -63,6 +63,26 @@ describe('workflowBoardModel', () => {
     expect(card.ariaDescription).toContain('verified_adapter')
   })
 
+  it('routes remote handoff input through the existing attention review surface', () => {
+    const model = workflowBoardModel([
+      {
+        ...run('paused'),
+        current_nodes: ['review'],
+        next_actions: ['status', 'events', 'approve', 'reject', 'cancel'],
+        pending_interaction: {
+          interaction_id: 'a'.repeat(64),
+          node_id: 'review',
+          type: 'handoff_input'
+        }
+      }
+    ])
+
+    const attention = model.columns.find(column => column.id === 'attention')!
+    expect(attention.cards).toHaveLength(1)
+    expect(attention.cards[0]!.exactState).toBe('paused')
+    expect(attention.cards[0]!.health).toBe('attention')
+  })
+
   it('uses the localized scheduled state in both visible and accessible card copy', () => {
     const model = workflowBoardModel(
       [

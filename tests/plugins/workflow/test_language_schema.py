@@ -65,6 +65,41 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
     )
 
 
+def test_sidecar_assignment_schema_is_closed_and_bounded():
+    schema = sidecar_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+    assignments = schema["properties"]["assignments"]
+    assignment = assignments["additionalProperties"]
+    valid = {
+        "outward_action_nodes": ["security-review"],
+        "assignments": {
+            "security-review": {
+                "endpoint": "hermes://local/security-reviewer",
+                "interaction_policy": "deny",
+                "deadline": "PT4H",
+                "on_deadline": "cancel_and_fail",
+            }
+        },
+    }
+
+    assert set(assignment["properties"]) == {
+        "endpoint",
+        "interaction_policy",
+        "deadline",
+        "on_deadline",
+    }
+    assert assignment["required"] == ["endpoint"]
+    assert assignment["additionalProperties"] is False
+    assert assignment["properties"]["interaction_policy"]["enum"] == [
+        "pause",
+        "deny",
+        "auto_cancel",
+    ]
+    assert not list(Draft202012Validator(schema).iter_errors(valid))
+    invalid = json.loads(json.dumps(valid))
+    invalid["assignments"]["security-review"]["credential"] = "secret"
+    assert list(Draft202012Validator(schema).iter_errors(invalid))
+
+
 def test_explicit_v6_contract_derives_bounded_loop_group_surface():
     profile = WorkflowLanguageProfile.ARCHON_2026_07
     contract = workflow_authoring_contract(profile, normalizer_version=6)

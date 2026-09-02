@@ -4160,6 +4160,120 @@ def test_attention_includes_real_workflow_approval_interactions(tmp_path, monkey
     ]
 
 
+@pytest.mark.parametrize(
+    ("action", "expected_choice"),
+    [("approve", "once"), ("reject", "deny")],
+)
+def test_attention_routes_handoff_input_through_existing_review_actions(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    action,
+    expected_choice,
+) -> None:
+    home = tmp_path / f"home-handoff-input-{action}"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / f"package-handoff-input-{action}",
+            name=f"handoff-input-{action}",
+            nodes=[{"id": "review", "prompt": "Review remotely"}],
+        )
+    )
+    store = RunStore(home)
+    prepared = replace(
+        store.prepare_run_snapshot(package),
+        assignments={
+            "review": {
+                "endpoint": "hermes://peer/office/reviewer",
+                "interaction_policy": "pause",
+                "on_deadline": "cancel_and_fail",
+            }
+        },
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="desktop",
+            idempotency_key=f"handoff-input-{action}",
+            concurrency_key=f"handoff-input-{action}",
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "review", "desktop-test-worker")
+    assert claim is not None
+    now = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase="active",
+        next_observation_at=now,
+        deadline_at=now + timedelta(hours=1),
+    )
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "review",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=1,
+        observed_version=2,
+        observed_phase="needs_input",
+        next_observation_at=now + timedelta(seconds=5),
+        approval_request_id="remote-approval-1",
+        approval_choices=("once", "deny"),
+    )
+    paused = store.load_run(admitted.run_id)
+    interaction_id = paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+    client = TestClient(_app(_router()))
+
+    attention = client.get("/api/plugins/workflow/attention")
+    assert attention.status_code == 200
+    item = next(
+        candidate
+        for candidate in attention.json()["items"]
+        if candidate["run_id"] == admitted.run_id
+    )
+    assert item["interaction"] == {
+        "type": "handoff_input",
+        "interaction_id": interaction_id,
+        "node_id": "review",
+    }
+    assert item["next_actions"] == [
+        "status",
+        "events",
+        "approve",
+        "reject",
+        "cancel",
+    ]
+    missing = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/{action}",
+        json={"expected_version": paused["state_version"]},
+    )
+    assert missing.status_code == 409
+    assert missing.json()["detail"]["code"] == "interaction_id_required"
+
+    response = client.post(
+        f"/api/plugins/workflow/runs/{admitted.run_id}/{action}",
+        json={
+            "expected_version": paused["state_version"],
+            "interaction_id": interaction_id,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert response.json()["pending_interaction"] is None
+    assert store.load_run(admitted.run_id)["nodes"]["review"]["handoff_response"][
+        "choice"
+    ] == expected_choice
+
+
 def test_desktop_rejects_laptop_showcase_without_real_ai_under_offline_mode(
     tmp_path, monkeypatch
 ) -> None:

@@ -51,6 +51,31 @@ BASH_SPILL_MAX_FILES = 64
 BASH_SPILL_MAX_VALUE_BYTES = 500_000
 WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES = 2_000_000
 BASH_SPILL_MAX_TOTAL_BYTES = WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
+ASSIGNMENT_ENDPOINT_PATTERN = (
+    r"^hermes://(?:local|peer/[a-z0-9][a-z0-9_-]{0,63})/"
+    r"(?!hermes$|root$|sudo$|test$|tmp$)[a-z0-9][a-z0-9_-]{0,63}$"
+)
+ASSIGNMENT_INTERACTION_POLICIES = ("pause", "deny", "auto_cancel")
+ASSIGNMENT_FORBIDDEN_ENDPOINTS = (
+    "hermes://local/hermes",
+    "hermes://local/root",
+    "hermes://local/sudo",
+    "hermes://local/test",
+    "hermes://local/tmp",
+)
+ASSIGNMENT_DEADLINE_PATTERN = (
+    r"^P(?:"
+    r"(?:[1-9]|[12][0-9]|30)D|"
+    r"(?:[1-9]|[12][0-9])DT(?:"
+    r"(?:[1-9]|1[0-9]|2[0-3])H(?:(?:[1-9]|[1-5][0-9])M)?|"
+    r"(?:[1-9]|[1-5][0-9])M)|"
+    r"T(?:"
+    r"(?:[1-9]|1[0-9]|2[0-3])H(?:(?:[1-9]|[1-5][0-9])M)?|"
+    r"(?:[1-9]|[1-5][0-9])M)"
+    r")$"
+)
+_ASSIGNMENT_ENDPOINT = re.compile(ASSIGNMENT_ENDPOINT_PATTERN)
+_ASSIGNMENT_DEADLINE = re.compile(ASSIGNMENT_DEADLINE_PATTERN)
 ARCHON_V3_CONDITION_TYPED_OPERAND_MODES = MappingProxyType({
     "quoted_equality": "exact_string_only",
     "unquoted_decimal_equality": "canonical_finite_number_only",
@@ -113,6 +138,20 @@ ECMASCRIPT_WHEN_EXPRESSION_PATTERN = (
     rf"^\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN}"
     rf"(?:\s*(?:&&|\|\|)\s*{ECMASCRIPT_WHEN_CLAUSE_PATTERN})*\s*$"
 )
+
+
+def assignment_endpoint_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(_ASSIGNMENT_ENDPOINT.fullmatch(value))
+        and value not in ASSIGNMENT_FORBIDDEN_ENDPOINTS
+    )
+
+
+def parse_assignment_deadline(value: object) -> str:
+    if not isinstance(value, str) or _ASSIGNMENT_DEADLINE.fullmatch(value) is None:
+        raise ValueError("assignment deadline is outside the supported subset")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1124,6 +1163,7 @@ def _widget_for(scope: str, yaml_name: str, shape: str) -> str:
         "loop_group_payload",
         "approval_payload",
         "approval_reject",
+        "assignments",
     }:
         return "object"
     if shape == "any":
@@ -1372,6 +1412,7 @@ def _example_for(yaml_name: str, shape: str) -> object:
         },
         "string_list": ["value"],
         "mapping": {"key": "value"},
+        "assignments": {"review": {"endpoint": "hermes://local/security-reviewer"}},
         "worktree": {"enabled": True},
         "effort": "medium",
         "thinking": "adaptive",
@@ -1992,6 +2033,7 @@ _SIDECAR_FIELDS = tuple(
         ("retention", "object", "mapping"),
         ("tags", "array", "string_list"),
         ("outward_action_nodes", "array", "string_list"),
+        ("assignments", "object", "assignments"),
         ("outward_action_policy", "string", "nonempty_string"),
         ("execution_environment", "string", "execution_environment"),
         ("overlap_policy", "string", "overlap_policy"),
@@ -2404,6 +2446,41 @@ def _schema_for_shape(
         return {"type": "array", "items": {"type": "string", "minLength": 1}}
     if shape == "mapping":
         return {"type": "object"}
+    if shape == "assignments":
+        return {
+            "type": "object",
+            "maxProperties": 512,
+            "propertyNames": {
+                "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?:/[A-Za-z_][A-Za-z0-9_-]*)?$"
+            },
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "endpoint": {
+                        "type": "string",
+                        "pattern": ASSIGNMENT_ENDPOINT_PATTERN,
+                        "not": {"enum": list(ASSIGNMENT_FORBIDDEN_ENDPOINTS)},
+                    },
+                    "interaction_policy": {
+                        "type": "string",
+                        "enum": list(ASSIGNMENT_INTERACTION_POLICIES),
+                        "default": "deny",
+                    },
+                    "deadline": {
+                        "type": "string",
+                        "maxLength": 16,
+                        "pattern": ASSIGNMENT_DEADLINE_PATTERN,
+                    },
+                    "on_deadline": {
+                        "type": "string",
+                        "const": "cancel_and_fail",
+                        "default": "cancel_and_fail",
+                    },
+                },
+                "required": ["endpoint"],
+                "additionalProperties": False,
+            },
+        }
     if shape == "worktree":
         return {
             "type": "object",

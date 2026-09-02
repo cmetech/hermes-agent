@@ -24,7 +24,7 @@ import yaml
 
 from cron.jobs import create_job, list_jobs, use_cron_store
 from hermes_cli.plugin_configuration import connector_capability_snapshot
-from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission import RunAdmissionRequest, workflow_profile_for_home
 from plugins.workflow.admission_service import assess_production_workflow_admission
 from plugins.workflow.cli import _input_requirements, _runtime_config, _scheduler
 from plugins.workflow.compilation import (
@@ -1234,6 +1234,7 @@ def run_showcase(
                 inputs = {"evidence": fixture}
             prepared = store.prepare_run_snapshot(
                 package,
+                initiator_profile=workflow_profile_for_home(home),
                 compilation=(
                     compilation
                     if supports_phase4_semantics(

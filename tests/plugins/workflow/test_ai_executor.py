@@ -216,6 +216,30 @@ def _install_jsonschema_with_missing_constructor_dependency(monkeypatch) -> None
     monkeypatch.setitem(sys.modules, "jsonschema", partial)
 
 
+def test_prompt_rendering_and_legacy_result_shape_are_stable(tmp_path):
+    runner = FakeAgentRunner('{"answer":"ok"}')
+    node = _node(
+        "characterize",
+        "Review $ARGUMENTS",
+        output_format={
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        },
+    )
+
+    result = AgentNodeExecutor(runner).execute(_context(tmp_path, node))
+
+    assert runner.requests[0].prompt == "Review evidence"
+    assert result.status == "succeeded"
+    assert result.error_code is None
+    assert result.metadata["output"] == '{"answer":"ok"}'
+    assert result.artifacts[0].media_type == "application/json"
+    assert (tmp_path / "run" / result.artifacts[0].relative_path).read_bytes() == (
+        b'{"answer":"ok"}'
+    )
+
+
 def test_fresh_prompt_uses_host_runner_and_validates_structured_output(tmp_path):
     runner = FakeAgentRunner('{"answer":"ok","count":2}')
     node = _node(

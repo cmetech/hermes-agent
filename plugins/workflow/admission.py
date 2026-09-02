@@ -4,9 +4,144 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import BoundedSemaphore
+from time import monotonic
 from typing import Literal, Mapping
 
+from agent.deadline import run_bounded_sync
+from plugins.workflow.models import (
+    ValidationIssue,
+    WorkflowPackage,
+    WorkflowValidationError,
+)
 from plugins.workflow.provenance import TriggerProvenance, TriggerSource
+
+
+_ASSIGNMENT_ADMISSION_BUDGET_SECONDS = 2.0
+_assignment_probe_slot = BoundedSemaphore(1)
+
+
+def workflow_profile_for_home(hermes_home: str | Path) -> str:
+    """Derive the workflow owner from one explicit profile-scoped home."""
+    from hermes_constants import named_profile_home
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    profile_home = named_profile_home(Path(hermes_home).resolve())
+    if profile_home is None:
+        return "default"
+    profile = normalize_profile_name(profile_home.name)
+    validate_profile_name(profile)
+    return profile
+
+
+def validate_assignment_admission(
+    package: WorkflowPackage,
+    *,
+    initiator_profile: str,
+    channel=None,
+) -> dict[str, str]:
+    """Validate assignment reachability without creating a handoff."""
+    from hermes_cli.handoff import EndpointAssessment, HandoffEndpoint
+    from hermes_cli.handoff.service import _BuiltinHandoffChannels
+    from hermes_constants import get_hermes_home
+    from hermes_cli.profiles import normalize_profile_name, profile_exists
+    from plugins.workflow.schema import ASSIGNMENT_POLICY_CAPABILITIES
+
+    owner = normalize_profile_name(initiator_profile)
+    mechanisms: dict[str, str] = {}
+    selected_channel = (
+        channel
+        if channel is not None
+        else _BuiltinHandoffChannels(get_hermes_home())
+    )
+    assessments: dict[str, EndpointAssessment] = {}
+    deadline = monotonic() + _ASSIGNMENT_ADMISSION_BUDGET_SECONDS
+    for node_id, assignment in package.sidecar.get("assignments", {}).items():
+        endpoint = HandoffEndpoint.parse(assignment["endpoint"])
+        path = f"sidecar.assignments.{node_id}.endpoint"
+        if endpoint.kind == "local" and endpoint.profile == owner:
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=path,
+                    code="assignment_self_target",
+                    message="assignment target profile must differ from workflow owner",
+                )
+            )
+        if endpoint.kind == "local" and not profile_exists(endpoint.profile):
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=path,
+                    code="assignment_profile_missing",
+                    message=f"assignment target profile does not exist: {endpoint.profile}",
+                )
+            )
+        assessment = assessments.get(endpoint.canonical)
+        if assessment is None:
+            remaining = deadline - monotonic()
+            acquired = remaining > 0 and _assignment_probe_slot.acquire(
+                timeout=remaining
+            )
+            remaining = deadline - monotonic()
+            if not acquired or remaining <= 0:
+                if acquired:
+                    _assignment_probe_slot.release()
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=path,
+                        code="assignment_mechanism_unavailable",
+                        message=(
+                            "assignment has no available local mechanism: "
+                            "admission_budget_exhausted"
+                        ),
+                    )
+                )
+
+            def _probe_endpoint():
+                try:
+                    return selected_channel.validate_endpoint(endpoint, owner)
+                finally:
+                    _assignment_probe_slot.release()
+
+            result = run_bounded_sync(
+                _probe_endpoint,
+                remaining,
+                label="workflow-assignment-admission",
+            )
+            if result.timed_out:
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path=path,
+                        code="assignment_mechanism_unavailable",
+                        message=(
+                            "assignment has no available local mechanism: "
+                            "admission_budget_exhausted"
+                        ),
+                    )
+                )
+            assessment = result.value
+            assessments[endpoint.canonical] = assessment
+        if not assessment.available or assessment.mechanism is None:
+            failure = assessment.failure_code or "endpoint_unavailable"
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=path,
+                    code="assignment_mechanism_unavailable",
+                    message=f"assignment has no available local mechanism: {failure}",
+                )
+            )
+        required = ASSIGNMENT_POLICY_CAPABILITIES[
+            assignment.get("interaction_policy", "deny")
+        ]
+        if endpoint.kind == "peer" and not required <= assessment.capabilities:
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=f"sidecar.assignments.{node_id}.interaction_policy",
+                    code="assignment_capability_mismatch",
+                    message="assignment peer does not advertise required policy capabilities",
+                )
+            )
+        mechanisms[str(node_id)] = assessment.mechanism
+    return mechanisms
 
 
 @dataclass(frozen=True)
@@ -62,10 +197,13 @@ class PreparedRunSnapshot:
     snapshot_format_version: int = 1
     dependency_manifest_digest: str | None = None
     provider_resolution_sha256: str | None = None
+    assignments: Mapping[str, Mapping[str, object]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.input_digests is None:
             object.__setattr__(self, "input_digests", {})
+        if self.assignments is None:
+            object.__setattr__(self, "assignments", {})
 
 
 class RunAdmissionController:

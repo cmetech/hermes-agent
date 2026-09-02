@@ -434,23 +434,48 @@ class WorkflowCoordinatorService:
                 if (
                     not scheduled_not_due
                     and before.get("execution_mode") == "background"
-                    and before.get("status") in {"queued", "running", "waiting_retry"}
-                ):
-                    stalled = run_store.record_stall_if_due(
-                        run_id,
-                        fence=fence,
-                        now=self._lease_clock(),
-                        runnable_stall_seconds=self.runnable_stall_seconds,
-                        semantic_stall_seconds=self.semantic_stall_seconds,
+                    and (
+                        before.get("status") in {"queued", "running", "waiting_retry"}
+                        or (
+                            before.get("status") == "paused"
+                            and run_id in periodic_by_run
+                        )
                     )
-                    submitted = scheduler.submit(run_id, fence)
-                    run_actionable = run_actionable or stalled or submitted
-                    if submitted:
-                        outcome = "submitted"
-                    elif stalled:
-                        outcome = "stalled"
-                    elif outcome != "foreground_adopted":
-                        outcome = "already_submitted"
+                ):
+                    attempted_handoffs, deferred_handoffs, terminal_handoffs = (
+                        scheduler.advance_due_handoffs(
+                            run_id,
+                            deadline=deadline,
+                            max_items=20,
+                        )
+                    )
+                    run_actionable = run_actionable or attempted_handoffs > 0
+                    if (
+                        before.get("status") != "paused"
+                        and self._monotonic() < deadline
+                    ):
+                        stalled = run_store.record_stall_if_due(
+                            run_id,
+                            fence=fence,
+                            now=self._lease_clock(),
+                            runnable_stall_seconds=self.runnable_stall_seconds,
+                            semantic_stall_seconds=self.semantic_stall_seconds,
+                        )
+                        submitted = bool(
+                            (not attempted_handoffs or terminal_handoffs)
+                            and scheduler.submit(run_id, fence)
+                        )
+                        run_actionable = run_actionable or stalled or submitted
+                        if submitted:
+                            outcome = "submitted"
+                        elif stalled:
+                            outcome = "stalled"
+                        elif deferred_handoffs:
+                            outcome = "handoff_deferred"
+                        elif attempted_handoffs:
+                            outcome = "handoff_advanced"
+                        elif outcome != "foreground_adopted":
+                            outcome = "already_submitted"
             except KeyError:
                 outcome = "run_missing"
             except RuntimeError as exc:
@@ -500,6 +525,8 @@ class WorkflowCoordinatorService:
                 processed_page = False
                 break
             processed_periodic_cursor = (str(row["created_at"]), run_id)
+        if processed_page:
+            processed_periodic_cursor = _page_cursor
         scheduled_processed = True
         scheduled_cursor = self._scheduled_sweep_cursor
         for row in scheduled_continuation:
@@ -626,19 +653,19 @@ class WorkflowCoordinatorService:
                 if woke and future is None:
                     next_sweep = min(next_sweep, self._monotonic())
         finally:
-            scheduler.shutdown(
-                deadline_seconds=min(8.0, scheduler.shutdown_deadline_seconds)
-            )
-            if future is not None:
-                try:
-                    future.result(timeout=8.0)
-                except Exception:
-                    logger.exception("Workflow coordinator sweep did not stop cleanly")
             # Do not let run() report quiescence while its sweep still owns a
             # scheduler or node workers. If an executor ignores bounded
             # cancellation, the generic host must observe stop_timeout rather
             # than overlap a replacement generation.
             pool.shutdown(wait=True, cancel_futures=True)
+            if future is not None:
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("Workflow coordinator sweep did not stop cleanly")
+            scheduler.shutdown(
+                deadline_seconds=min(8.0, scheduler.shutdown_deadline_seconds)
+            )
         return leadership_current
 
     def run(self, stop_event: threading.Event) -> None:

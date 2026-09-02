@@ -5,12 +5,19 @@ import json
 import shlex
 import sys
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from hermes_cli.handoff import (
+    AdvanceResult,
+    HandoffEndpoint,
+    HandoffSnapshot,
+    HandoffSpec,
+)
 from hermes_cli.dashboard_auth.base import TokenPrincipal
 from hermes_cli.plugin_invocation import DeliveryReceipt, PluginInvocationContext
 
@@ -20,6 +27,7 @@ from plugins.workflow.coordinator import WorkflowCoordinatorService
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.provenance import TriggerProvenance
 from plugins.workflow.scheduler import RunScheduler
+from plugins.workflow.models import ExecutionFence
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import RunStore
 from plugins.workflow.compat import assess_compatibility
@@ -330,6 +338,209 @@ def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkey
     )
     assert ack.status_code == 200
     assert outbox.history(run_id="run-api")[0]["state"] == "delivered"
+
+
+@pytest.mark.parametrize(
+    (
+        "initial_failure_code",
+        "observed_failure_code",
+        "expected_failure_code",
+    ),
+    (
+        (
+            "submission_indeterminate",
+            "cancellation_indeterminate",
+            "cancellation_indeterminate",
+        ),
+        (
+            "submission_indeterminate",
+            "Bearer secret prompt body /Users/private/task.txt",
+            "submission_indeterminate",
+        ),
+    ),
+)
+def test_same_phase_indeterminate_updates_direct_and_repaired_attention_api(
+    tmp_path,
+    monkeypatch,
+    workflow_writer,
+    initial_failure_code,
+    observed_failure_code,
+    expected_failure_code,
+) -> None:
+    home = tmp_path / "handoff-attention-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    store = RunStore(home)
+    workflow_path = workflow_writer(
+        tmp_path / "handoff-attention-api",
+        name="handoff-attention-api",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/reviewer\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    prepared = store.prepare_run_snapshot(package, initiator_profile="default")
+    observed = datetime.now(timezone.utc)
+    identity = CoordinatorIdentity(
+        owner_id="handoff-attention-coordinator",
+        host_kind="web",
+        host_instance_id="handoff-attention-host",
+        pid=1,
+        process_start_time=None,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=observed,
+        lease_seconds=60,
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key="handoff-attention-api",
+            concurrency_key=package.definition.name,
+            execution_mode="background",
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None, admitted
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "review",
+        "handoff-worker",
+        execution_fence=fence,
+    )
+    assert claim is not None
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-api-1",
+        generation=1,
+        observed_version=3,
+        observed_phase="active",
+        next_observation_at=observed,
+        deadline_at=observed + timedelta(hours=1),
+    )
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="Review",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"consumer": "workflow"},
+        required_capabilities=frozenset(),
+    )
+
+    class Service:
+        def advance(self, handoff_id, *, budget_seconds):
+            return AdvanceResult(
+                HandoffSnapshot(
+                    handoff_id=handoff_id,
+                    key_scope="default",
+                    handoff_key=f"{admitted.run_id}:review:1",
+                    spec=spec,
+                    spec_fingerprint=spec.fingerprint,
+                    phase="indeterminate",
+                    state_version=4,
+                    failure_code=initial_failure_code,
+                    next_advance_at=observed + timedelta(seconds=5),
+                ),
+                "reconcile",
+                True,
+            )
+
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=Service(),
+        utcnow=lambda: observed,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            admitted.run_id,
+            deadline=10**9,
+        ) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+    outbox = NotificationOutbox(store)
+    assert outbox.reconcile_run(admitted.run_id) >= 1
+    initial_attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert len(initial_attention) == 1
+    notification_id = initial_attention[0]["notification_id"]
+    assert initial_attention[0]["payload"]["handoff"]["failure_code"] == (
+        "submission_indeterminate"
+    )
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "review",
+        handoff_id="handoff-api-1",
+        generation=1,
+        expected_observed_version=4,
+        observed_version=5,
+        observed_phase="indeterminate",
+        next_observation_at=observed + timedelta(seconds=10),
+        observed_failure_code=observed_failure_code,
+    )
+    direct_attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert len(direct_attention) == 1
+    assert direct_attention[0]["notification_id"] == notification_id
+    assert direct_attention[0]["payload"]["handoff"]["failure_code"] == (
+        expected_failure_code
+    )
+    if observed_failure_code != expected_failure_code:
+        assert str(observed_failure_code) not in json.dumps(direct_attention)
+
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?",
+            (admitted.run_id,),
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?",
+            (admitted.run_id,),
+        )
+    assert outbox.reconcile_run(admitted.run_id) >= 2
+    repaired_attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert len(repaired_attention) == 1
+    assert repaired_attention[0]["payload"]["handoff"]["failure_code"] == (
+        expected_failure_code
+    )
+    if observed_failure_code != expected_failure_code:
+        assert str(observed_failure_code) not in json.dumps(repaired_attention)
+
+    response = TestClient(_app(_module().router, local_admin=True)).get(
+        "/api/plugins/workflow/attention"
+    )
+
+    assert response.status_code == 200
+    item = next(
+        candidate
+        for candidate in response.json()["items"]
+        if candidate.get("handoff", {}).get("handoff_id") == "handoff-api-1"
+    )
+    assert item["handoff"]["commands"] == {
+        "show": "hermes handoff show handoff-api-1",
+        "evidence": "hermes handoff evidence handoff-api-1",
+        "reconcile": "hermes handoff reconcile handoff-api-1",
+    }
+    assert item["handoff"]["failure_code"] == expected_failure_code
+    if observed_failure_code != expected_failure_code:
+        assert str(observed_failure_code) not in response.text
 
 
 def test_desktop_projection_failure_retains_fixed_fallback_reason(
@@ -875,6 +1086,160 @@ def test_authenticated_gateway_command_starts_real_background_run(
     assert run["provenance"]["assurance"] == "verified_adapter"
     assert run["provenance"]["actor_id"] == invocation.principal
     assert run["provenance"]["return_route"] == "opaque-capability"
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_choice"),
+    [("approve", "once"), ("reject", "deny")],
+)
+def test_gateway_reuses_review_commands_for_handoff_input(
+    tmp_path,
+    workflow_writer,
+    action,
+    expected_choice,
+) -> None:
+    home = tmp_path / f"gateway-handoff-input-{action}"
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / f"gateway-handoff-input-package-{action}",
+            name=f"gateway-handoff-input-{action}",
+            nodes=[{"id": "review", "prompt": "Review remotely"}],
+        )
+    )
+    store = RunStore(home)
+    prepared = replace(
+        store.prepare_run_snapshot(package),
+        assignments={
+            "review": {
+                "endpoint": "hermes://peer/office/reviewer",
+                "interaction_policy": "pause",
+                "on_deadline": "cancel_and_fail",
+            }
+        },
+    )
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=package.definition.name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="chat",
+            idempotency_key=f"gateway-handoff-input-{action}",
+            concurrency_key=f"gateway-handoff-input-{action}",
+            operator_scope=invocation.operator_scope,
+        ),
+        immutable_snapshot=prepared,
+    )
+    claim = store.claim_node(admitted.run_id, "review", "gateway-test-worker")
+    assert claim is not None
+    now = datetime(2026, 9, 2, 12, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase="active",
+        next_observation_at=now,
+        deadline_at=now + timedelta(hours=1),
+    )
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "review",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=1,
+        observed_version=2,
+        observed_phase="needs_input",
+        next_observation_at=now + timedelta(seconds=5),
+        approval_request_id="remote-approval-1",
+        approval_choices=("once", "deny"),
+    )
+    paused = store.load_run(admitted.run_id)
+    interaction_id = paused["nodes"]["review"]["pending_interaction"][
+        "interaction_id"
+    ]
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"{action} {admitted.run_id} --interaction-id {interaction_id} "
+            f"--expected-version {paused['state_version']}",
+            invocation,
+            hermes_home=home,
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["result"]["action"] == action
+    assert store.load_run(admitted.run_id)["nodes"]["review"]["handoff_response"][
+        "choice"
+    ] == expected_choice
+
+
+def test_gateway_assignment_cannot_bypass_shared_profile_admission(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workflow_path = workflow_writer(
+        tmp_path / "package",
+        name="gateway-self-assignment",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/default\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-assignment-test",
+            host_kind="gateway",
+            host_instance_id="gateway-assignment-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"run {shlex.quote(str(workflow_path))} "
+            "--idempotency-key self-assignment",
+            invocation,
+            hermes_home=home,
+            workdir=tmp_path,
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"] == "workflow_operation_failed"
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
 
 
 def test_authenticated_gateway_explicit_phase4_run_seals_profile_include(

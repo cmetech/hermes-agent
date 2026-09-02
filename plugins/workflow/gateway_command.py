@@ -11,7 +11,7 @@ import shlex
 
 from hermes_cli.plugin_configuration import connector_capability_snapshot
 from hermes_cli.plugin_invocation import PluginInvocationContext
-from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.admission import RunAdmissionRequest, workflow_profile_for_home
 from plugins.workflow.compat import (
     WorkflowCompatibilityBlockedError,
     assess_compatibility,
@@ -150,6 +150,7 @@ def _start_gateway_run(args, invocation, *, hermes_home: Path, workdir: Path):
         raise RuntimeError("background execution requires a healthy coordinator")
     prepared = store.prepare_run_snapshot(
         package,
+        initiator_profile=workflow_profile_for_home(hermes_home),
         compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
         trusted_package_digest=(
