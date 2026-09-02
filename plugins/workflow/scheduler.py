@@ -25,7 +25,7 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 from agent.structured_output import StructuredOutputStrategy
-from hermes_cli.handoff import AgentHandoffService, HandoffStore
+from hermes_cli.handoff import HANDOFF_PHASES, AgentHandoffService, HandoffStore
 from hermes_cli.plugin_configuration import connector_capability_snapshot
 from hermes_cli.runtime_provider import StructuredOutputCapabilityDecision
 from plugins.workflow.bash_rendering import bash_output_references
@@ -1138,27 +1138,20 @@ class RunScheduler:
         *,
         deadline: float,
         max_items: int = 20,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """Advance one bounded page of due handoffs under the coordinator fence."""
         if not 1 <= max_items <= 100:
             raise ValueError("max_items must be between 1 and 100")
         if self._shutdown.is_set() or self.execution_fence is None:
-            return 0, 0
-        try:
-            with self.store._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                self.store.assert_execution_fence(connection, self.execution_fence)
-                connection.commit()
-        except RuntimeError as exc:
-            if "execution fence" in str(exc):
-                return 0, 0
-            raise
+            return 0, 0, 0
+        if not self._execution_fence_is_current():
+            return 0, 0, 0
 
         observed = self._utcnow().astimezone(timezone.utc)
         projection = self.store.load_run(run_id)
         nodes = projection.get("nodes")
         if not isinstance(nodes, Mapping):
-            return 0, 0
+            return 0, 0, 0
         due: list[tuple[str, HandoffWaitProjection]] = []
         for node_id, node in sorted(nodes.items()):
             if not isinstance(node, Mapping) or node.get("state") != "waiting_handoff":
@@ -1172,7 +1165,7 @@ class RunScheduler:
                 if len(due) == max_items:
                     break
 
-        advanced = terminal = 0
+        attempted = deferred = terminal = 0
         service = self._handoff_service_instance() if due else None
         for node_id, wait in due:
             if self._shutdown.is_set():
@@ -1180,30 +1173,96 @@ class RunScheduler:
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 break
+            if not self._execution_fence_is_current():
+                break
+            attempted += 1
             try:
                 result = service.advance(
                     wait.handoff_id,
                     budget_seconds=remaining,
                 )
-            except Exception as exc:
+            except Exception:
                 logger.warning(
-                    "Workflow handoff advance failed for %s: %s",
-                    wait.handoff_id,
-                    type(exc).__name__,
-                )
-                continue
-            snapshot = result.snapshot
-            if snapshot.handoff_id != wait.handoff_id:
-                logger.warning(
-                    "Workflow handoff advance returned mismatched identity for %s",
+                    "Workflow handoff advance deferred for %s: "
+                    "handoff_advance_exception",
                     wait.handoff_id,
                 )
+                if self._defer_handoff_advance(
+                    run_id,
+                    node_id,
+                    wait,
+                    observed=observed,
+                    error_code="handoff_advance_exception",
+                ):
+                    deferred += 1
+                elif not self._execution_fence_is_current():
+                    break
                 continue
-            is_terminal = snapshot.phase in {"succeeded", "failed", "cancelled"}
+            try:
+                snapshot = result.snapshot
+                returned_id = snapshot.handoff_id
+                returned_version = snapshot.state_version
+                returned_phase = snapshot.phase
+                next_advance_at = snapshot.next_advance_at
+            except Exception:
+                logger.warning(
+                    "Workflow handoff advance deferred for %s: "
+                    "handoff_protocol_violation",
+                    wait.handoff_id,
+                )
+                if self._defer_handoff_advance(
+                    run_id,
+                    node_id,
+                    wait,
+                    observed=observed,
+                    error_code="handoff_protocol_violation",
+                ):
+                    deferred += 1
+                elif not self._execution_fence_is_current():
+                    break
+                continue
+            if returned_id != wait.handoff_id:
+                error_code = "handoff_identity_mismatch"
+            elif (
+                isinstance(returned_version, bool)
+                or not isinstance(returned_version, int)
+                or returned_version <= wait.last_observed_version
+            ):
+                error_code = "handoff_stale_observation"
+            elif returned_phase not in HANDOFF_PHASES:
+                error_code = "handoff_protocol_violation"
+            elif (
+                next_advance_at is not None
+                and (
+                    not isinstance(next_advance_at, datetime)
+                    or next_advance_at.utcoffset() is None
+                )
+            ):
+                error_code = "handoff_protocol_violation"
+            else:
+                error_code = None
+            if error_code is not None:
+                logger.warning(
+                    "Workflow handoff advance deferred for %s: %s",
+                    wait.handoff_id,
+                    error_code,
+                )
+                if self._defer_handoff_advance(
+                    run_id,
+                    node_id,
+                    wait,
+                    observed=observed,
+                    error_code=error_code,
+                ):
+                    deferred += 1
+                elif not self._execution_fence_is_current():
+                    break
+                continue
+            is_terminal = returned_phase in {"succeeded", "failed", "cancelled"}
             next_observation_at = (
                 observed
                 if is_terminal
-                else snapshot.next_advance_at or observed + timedelta(seconds=5)
+                else next_advance_at or observed + timedelta(seconds=5)
             )
             if self.store.refresh_handoff_wait(
                 run_id,
@@ -1211,15 +1270,89 @@ class RunScheduler:
                 handoff_id=wait.handoff_id,
                 generation=wait.generation,
                 expected_observed_version=wait.last_observed_version,
-                observed_version=snapshot.state_version,
-                observed_phase=snapshot.phase,
+                observed_version=returned_version,
+                observed_phase=returned_phase,
                 next_observation_at=next_observation_at,
                 fence=self.execution_fence,
                 now=self.store._lease_clock(),
             ):
-                advanced += 1
                 terminal += int(is_terminal)
-        return advanced, terminal
+                continue
+            if not self._execution_fence_is_current():
+                break
+            if self._defer_handoff_advance(
+                run_id,
+                node_id,
+                wait,
+                observed=observed,
+                error_code="handoff_projection_conflict",
+            ):
+                deferred += 1
+            elif not self._execution_fence_is_current():
+                break
+        return attempted, deferred, terminal
+
+    def _execution_fence_is_current(self) -> bool:
+        fence = self.execution_fence
+        if fence is None:
+            return False
+        try:
+            with self.store._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self.store.assert_execution_fence(connection, fence)
+                connection.commit()
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
+        return True
+
+    def _defer_handoff_advance(
+        self,
+        run_id: str,
+        node_id: str,
+        wait: HandoffWaitProjection,
+        *,
+        observed: datetime,
+        error_code: str,
+    ) -> bool:
+        fence = self.execution_fence
+        if fence is None:
+            return False
+        next_observation_at = observed + timedelta(seconds=5)
+
+        def defer(candidate: HandoffWaitProjection) -> bool:
+            return self.store.defer_handoff_wait(
+                run_id,
+                node_id,
+                handoff_id=candidate.handoff_id,
+                generation=candidate.generation,
+                expected_observed_version=candidate.last_observed_version,
+                expected_observed_phase=candidate.last_observed_phase,
+                next_observation_at=next_observation_at,
+                error_code=error_code,
+                fence=fence,
+                now=self.store._lease_clock(),
+            )
+
+        if defer(wait):
+            return True
+        if not self._execution_fence_is_current():
+            return False
+        projection = self.store.load_run(run_id)
+        node = projection.get("nodes", {}).get(node_id)
+        if not isinstance(node, Mapping) or node.get("state") != "waiting_handoff":
+            return False
+        try:
+            current = HandoffWaitProjection.from_durable_record(node.get("handoff"))
+        except ValueError:
+            return False
+        if (
+            current.handoff_id != wait.handoff_id
+            or current.generation != wait.generation
+        ):
+            return False
+        return defer(current)
 
     def _reconcile_session_registry_update(self, run_id: str) -> bool:
         pending = self.store.pending_session_registry_update(run_id)

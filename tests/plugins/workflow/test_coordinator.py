@@ -1322,7 +1322,7 @@ def test_due_handoff_sweep_projects_exact_versions_and_wakes_only_terminal(
         monotonic=monotonic,
     )
     try:
-        advanced, terminal = scheduler.advance_due_handoffs(
+        attempted, deferred, terminal = scheduler.advance_due_handoffs(
             run_id,
             deadline=101.0,
             max_items=10,
@@ -1330,7 +1330,8 @@ def test_due_handoff_sweep_projects_exact_versions_and_wakes_only_terminal(
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
-    assert advanced == 2
+    assert attempted == 2
+    assert deferred == 0
     assert terminal == 1
     assert [call[0] for call in service.calls] == [
         "handoff-active",
@@ -1428,7 +1429,7 @@ def test_handoff_sweep_is_bounded_isolates_safe_failures_and_honors_shutdown(
     shut_down = False
     try:
         with caplog.at_level("WARNING"):
-            advanced, terminal = scheduler.advance_due_handoffs(
+            attempted, deferred, terminal = scheduler.advance_due_handoffs(
                 run_id,
                 deadline=101.0,
                 max_items=3,
@@ -1439,18 +1440,19 @@ def test_handoff_sweep_is_bounded_isolates_safe_failures_and_honors_shutdown(
             run_id,
             deadline=101.0,
             max_items=3,
-        ) == (0, 0)
+        ) == (0, 0, 0)
     finally:
         if not shut_down:
             scheduler.shutdown(deadline_seconds=2)
 
-    assert (advanced, terminal) == (2, 0)
+    assert (attempted, deferred, terminal) == (3, 1, 0)
     assert service.calls == [
         "handoff-adapter",
         "handoff-explodes",
         "handoff-healthy",
     ]
-    assert "RuntimeError" in caplog.text
+    assert "handoff_advance_exception" in caplog.text
+    assert "RuntimeError" not in caplog.text
     assert "raw-secret" not in caplog.text
     projection = store.load_run(run_id)
     assert projection["nodes"]["adapter"]["handoff"] == {
@@ -1461,9 +1463,234 @@ def test_handoff_sweep_is_bounded_isolates_safe_failures_and_honors_shutdown(
         "next_observation_at": (now + timedelta(seconds=5)).isoformat(),
         "deadline_at": (now + timedelta(hours=1)).isoformat(),
     }
-    assert projection["nodes"]["explodes"]["handoff"]["last_observed_version"] == 2
+    assert projection["nodes"]["explodes"]["handoff"] == {
+        "handoff_id": "handoff-explodes",
+        "generation": 1,
+        "last_observed_version": 2,
+        "last_observed_phase": "active",
+        "next_observation_at": (now + timedelta(seconds=5)).isoformat(),
+        "deadline_at": (now + timedelta(hours=1)).isoformat(),
+    }
     assert projection["nodes"]["healthy"]["handoff"]["last_observed_version"] == 30
     assert projection["nodes"]["later-page"]["handoff"]["last_observed_version"] == 4
+
+
+def test_broken_handoff_page_is_deferred_so_next_page_runs_next_cycle(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("handoff-page")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    node_ids = tuple(f"broken-{index:02d}" for index in range(21))
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=tuple((node_id, now) for node_id in node_ids),
+    )
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            self.calls.append(handoff_id)
+            raise RuntimeError("Bearer raw-secret unsafe-body")
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+            max_items=20,
+        ) == (20, 20, 0)
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+            max_items=20,
+        ) == (1, 1, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls == [f"handoff-{node_id}" for node_id in node_ids]
+    projection = store.load_run(run_id)
+    assert all(
+        projection["nodes"][node_id]["handoff"]["next_observation_at"]
+        == (now + timedelta(seconds=5)).isoformat()
+        for node_id in node_ids
+    )
+    deferred = [
+        event
+        for event in store.tail_events(run_id)
+        if event["event_type"] == "handoff_advance_deferred"
+    ]
+    assert len(deferred) == 21
+    assert {event["payload"]["error_code"] for event in deferred} == {
+        "handoff_advance_exception"
+    }
+    assert "raw-secret" not in str(deferred)
+
+
+def test_handoff_sweep_stops_external_io_after_mid_batch_fence_loss(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("first-handoff-leader")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=(("first", now), ("second", now)),
+    )
+    before = store.load_run(run_id)
+
+    class Service:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            self.calls.append(handoff_id)
+            coordinator.release(
+                identity,
+                epoch=leadership.lease.epoch,
+                now=now,
+            )
+            replacement = coordinator.try_acquire(
+                _identity("replacement-handoff-leader"),
+                now=now,
+                lease_seconds=30,
+            )
+            assert replacement.is_leader
+            return AdvanceResult(
+                _handoff_snapshot(
+                    handoff_id,
+                    phase="active",
+                    version=10,
+                    next_advance_at=now + timedelta(seconds=5),
+                ),
+                "observe",
+                True,
+            )
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+            max_items=2,
+        ) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls == ["handoff-first"]
+    assert store.load_run(run_id) == before
+
+
+@pytest.mark.parametrize(
+    ("failure", "error_code"),
+    [
+        ("identity", "handoff_identity_mismatch"),
+        ("protocol", "handoff_protocol_violation"),
+        ("stale", "handoff_stale_observation"),
+        ("cas", "handoff_projection_conflict"),
+    ],
+)
+def test_handoff_contradictions_and_current_fence_cas_rejection_are_deferred(
+    tmp_path,
+    workflow_writer,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    error_code: str,
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity(f"handoff-{failure}")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=(("start", now),),
+    )
+
+    class Service:
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            snapshot = MagicMock()
+            snapshot.handoff_id = (
+                "contradictory-handoff" if failure == "identity" else handoff_id
+            )
+            snapshot.state_version = 1 if failure == "stale" else 10
+            snapshot.phase = (
+                "Bearer raw-secret unsafe-body"
+                if failure == "protocol"
+                else "active"
+            )
+            snapshot.next_advance_at = now + timedelta(seconds=1)
+            return MagicMock(snapshot=snapshot)
+
+    if failure == "cas":
+        monkeypatch.setattr(store, "refresh_handoff_wait", lambda *_a, **_k: False)
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=Service(),
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+            max_items=1,
+        ) == (1, 1, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    projection = store.load_run(run_id)
+    assert projection["nodes"]["start"]["handoff"] == {
+        "handoff_id": "handoff-start",
+        "generation": 1,
+        "last_observed_version": 1,
+        "last_observed_phase": "active",
+        "next_observation_at": (now + timedelta(seconds=5)).isoformat(),
+        "deadline_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    event = store.tail_events(run_id)[-1]
+    assert event["event_type"] == "handoff_advance_deferred"
+    assert event["payload"]["error_code"] == error_code
+    assert "raw-secret" not in str(event)
 
 
 def test_stale_coordinator_cannot_advance_or_project_handoff(
@@ -1498,7 +1725,7 @@ def test_stale_coordinator_cannot_advance_or_project_handoff(
             run_id,
             deadline=101.0,
             max_items=1,
-        ) == (0, 0)
+        ) == (0, 0, 0)
     finally:
         scheduler.shutdown(deadline_seconds=2)
 
@@ -1579,7 +1806,7 @@ def test_idle_backoff_uses_actionable_work_not_rows_seen(
         immutable_snapshot=prepared,
     )
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (0, 0)
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = False
     service = _service(
         tmp_path,
@@ -1619,7 +1846,7 @@ def test_elected_cycle_advances_handoffs_inside_shared_budget(
         handoffs=(("start", now),),
     )
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (1, 0)
+    scheduler.advance_due_handoffs.return_value = (1, 1, 0)
     scheduler.submit.return_value = False
     service = WorkflowCoordinatorService(
         BackgroundServiceContext(
@@ -1647,6 +1874,100 @@ def test_elected_cycle_advances_handoffs_inside_shared_budget(
         max_items=20,
     )
     scheduler.submit.assert_not_called()
+
+
+def test_leader_shutdown_waits_for_slow_sweep_before_closing_scheduler_store(
+    tmp_path, workflow_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("slow-sweep-leader")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=(("slow", now),),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class Scheduler:
+        shutdown_deadline_seconds = 1.0
+
+        def advance_due_handoffs(self, *_args, **_kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return 1, 1, 0
+
+        def submit(self, *_args, **_kwargs):
+            return False
+
+        def shutdown(self, *, deadline_seconds: float) -> None:
+            closed.set()
+
+    real_pool = coordinator_module.ThreadPoolExecutor
+
+    class _ImmediateTimeoutFuture:
+        def __init__(self, future) -> None:
+            self.future = future
+
+        def done(self) -> bool:
+            return self.future.done()
+
+        def result(self, timeout=None):
+            if timeout is not None and not self.future.done():
+                raise TimeoutError
+            return self.future.result(timeout=timeout)
+
+    class _ImmediateTimeoutPool:
+        def __init__(self, *args, **kwargs) -> None:
+            self.pool = real_pool(*args, **kwargs)
+
+        def submit(self, *args, **kwargs):
+            return _ImmediateTimeoutFuture(self.pool.submit(*args, **kwargs))
+
+        def shutdown(self, *args, **kwargs) -> None:
+            self.pool.shutdown(*args, **kwargs)
+
+    service = _service(
+        tmp_path / "home",
+        host_kind="gateway",
+        host_instance_id="slow-sweep-leader",
+    )
+    scheduler = Scheduler()
+    monkeypatch.setattr(coordinator_module, "ThreadPoolExecutor", _ImmediateTimeoutPool)
+    monkeypatch.setattr(service, "_scheduler", lambda *_args, **_kwargs: scheduler)
+    stop = threading.Event()
+    leader = threading.Thread(
+        target=service._lead,
+        kwargs={
+            "stop_event": stop,
+            "run_store": store,
+            "coordinator_store": coordinator,
+            "identity": identity,
+            "epoch": leadership.lease.epoch,
+        },
+    )
+    leader.start()
+    try:
+        assert entered.wait(timeout=2)
+        stop.set()
+        coordinator.notify_local()
+        time.sleep(0.05)
+        assert not closed.is_set()
+    finally:
+        release.set()
+        leader.join(timeout=5)
+
+    assert not leader.is_alive()
+    assert closed.is_set()
 
 
 def test_repair_lock_timeout_does_not_block_delivery_or_scheduling(
@@ -1746,7 +2067,7 @@ def test_repair_lock_timeout_does_not_block_delivery_or_scheduling(
         delivery_port=Port(),
     )
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (0, 0)
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     try:
         actionable, _cursor, _progress = service._sweep_once(
@@ -1819,7 +2140,7 @@ def test_sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget(
         monotonic=monotonic,
     )
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (0, 0)
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = False
 
     _actionable, cursor, _progress = service._sweep_once(
@@ -1898,7 +2219,7 @@ def test_scheduled_due_pages_advance_past_a_stably_lane_blocked_first_page(
         monotonic=lambda: 0.0,
     )
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (0, 0)
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.side_effect = lambda run_id, _fence: run_id == independent
 
     _first_actionable, cursor, _first_progress = service._sweep_once(
@@ -1990,7 +2311,7 @@ def test_scheduled_due_prefix_is_resampled_during_a_sustained_forward_stream(
         monotonic=lambda: clock.sample.monotonic_now,
     )
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (0, 0)
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.side_effect = lambda run_id, _fence: run_id == target
 
     _actionable, periodic_cursor, _progress = service._sweep_once(
@@ -2080,7 +2401,7 @@ def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
     service._scheduled_sweep_queue_sequence_fence = 1
     service._repair_revalidation_cursor = 99
     leadership_scheduler = MagicMock()
-    leadership_scheduler.advance_due_handoffs.return_value = (0, 0)
+    leadership_scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     leadership_scheduler.shutdown_deadline_seconds = 1.0
     monkeypatch.setattr(service, "_scheduler", lambda *_args, **_kwargs: leadership_scheduler)
     stopped = threading.Event()
@@ -2099,7 +2420,7 @@ def test_new_leadership_term_restarts_scheduled_paging_at_page_one(
     assert service._repair_revalidation_cursor is None
 
     scheduler = MagicMock()
-    scheduler.advance_due_handoffs.return_value = (0, 0)
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = False
     service._sweep_once(store, coordinator, identity, leadership.lease.epoch, scheduler)
     assert scheduler.submit.call_args_list[0].args[0] == run_ids[0]

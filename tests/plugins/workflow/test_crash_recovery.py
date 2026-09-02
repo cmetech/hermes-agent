@@ -3416,7 +3416,7 @@ def test_reopened_scheduler_advances_existing_handoff_without_new_generation(
             admitted.run_id,
             deadline=102.0,
             max_items=1,
-        ) == (1, 0)
+        ) == (1, 0, 0)
     finally:
         scheduler.shutdown(deadline_seconds=2)
 

@@ -10,10 +10,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
-from plugins.workflow.models import HandoffWaitProjection
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
+from plugins.workflow.models import ExecutionFence, HandoffWaitProjection
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
 from plugins.workflow.trust import WorkflowResourceReadBudget
+from tools.managed_process import ProcessIdentity
 
 
 def test_store_connection_context_closes_the_database_handle(tmp_path) -> None:
@@ -567,6 +569,109 @@ def test_handoff_observation_refresh_and_terminal_wake_are_fenced(
     assert terminal["status"] == "running"
     assert terminal["nodes"]["start"]["state"] == "ready"
     assert terminal["nodes"]["start"]["handoff"]["generation"] == 1
+
+
+def test_handoff_wait_deferral_is_exact_fenced_and_safe(
+    tmp_path, workflow_writer
+) -> None:
+    store, run_id = _start_handoff_store_run(
+        tmp_path, workflow_writer, name="handoff-deferral"
+    )
+    claim = store.claim_node(run_id, "start", "handoff-worker")
+    assert claim is not None
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=3,
+        observed_phase="active",
+        next_observation_at=base,
+        deadline_at=base + timedelta(hours=1),
+    )
+    process = ProcessIdentity.capture(os.getpid())
+    identity = CoordinatorIdentity(
+        owner_id="handoff-deferral-leader",
+        host_kind="gateway",
+        host_instance_id="handoff-deferral-host",
+        pid=process.pid,
+        process_start_time=process.start_time,
+    )
+    leadership = CoordinatorStore(store.database).try_acquire(
+        identity,
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    next_at = base + timedelta(seconds=5)
+
+    assert store.defer_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=3,
+        expected_observed_phase="active",
+        next_observation_at=next_at,
+        error_code="handoff_advance_exception",
+        fence=fence,
+    )
+    deferred = store.load_run(run_id)["nodes"]["start"]
+    assert deferred["state"] == "waiting_handoff"
+    assert deferred["handoff"] == {
+        "handoff_id": "handoff-1",
+        "generation": 1,
+        "last_observed_version": 3,
+        "last_observed_phase": "active",
+        "next_observation_at": next_at.isoformat(),
+        "deadline_at": (base + timedelta(hours=1)).isoformat(),
+    }
+    event = store.tail_events(run_id)[-1]
+    assert event["event_type"] == "handoff_advance_deferred"
+    assert event["payload"] == {
+        "error_code": "handoff_advance_exception",
+        "next_observation_at": next_at.isoformat(),
+    }
+
+    before = store.load_run(run_id)
+    before_events = store.tail_events(run_id)
+    with pytest.raises(ValueError, match="requires an execution fence"):
+        store.defer_handoff_wait(
+            run_id,
+            "start",
+            handoff_id="handoff-1",
+            generation=1,
+            expected_observed_version=3,
+            expected_observed_phase="active",
+            next_observation_at=next_at + timedelta(seconds=5),
+            error_code="handoff_projection_conflict",
+            fence=None,
+        )
+    assert not store.defer_handoff_wait(
+        run_id,
+        "start",
+        handoff_id="handoff-1",
+        generation=1,
+        expected_observed_version=4,
+        expected_observed_phase="active",
+        next_observation_at=next_at + timedelta(seconds=5),
+        error_code="handoff_projection_conflict",
+        fence=fence,
+    )
+    with pytest.raises(ValueError, match="error_code is invalid"):
+        store.defer_handoff_wait(
+            run_id,
+            "start",
+            handoff_id="handoff-1",
+            generation=1,
+            expected_observed_version=3,
+            expected_observed_phase="active",
+            next_observation_at=next_at + timedelta(seconds=5),
+            error_code="Bearer raw-secret unsafe-body",
+            fence=fence,
+        )
+    assert store.load_run(run_id) == before
+    assert store.tail_events(run_id) == before_events
 
 
 def test_handoff_retry_requires_definitive_observation_and_new_generation(

@@ -87,11 +87,15 @@ def _race_retry_wake(home: str, run_id: str, due: str, barrier, results) -> None
 
 
 class _TerminalHandoffChannel:
-    def __init__(self, results) -> None:
+    def __init__(self, results, stop) -> None:
         self.results = results
+        self.stop = stop
 
     def observe(self, snapshot, *, budget_seconds: float):
-        self.results.put((snapshot.handoff_id, snapshot.handoff_key))
+        self.results.put(
+            (snapshot.handoff_id, snapshot.handoff_key, budget_seconds)
+        )
+        self.stop.set()
         text = "recovered"
         return ChannelObservation(
             phase="succeeded",
@@ -105,38 +109,50 @@ class _TerminalHandoffChannel:
         )
 
 
-def _resume_admitted_handoff(home: str, run_id: str, results) -> None:
-    store = RunStore(Path(home))
-    coordinator = CoordinatorStore(store.database)
+def _resume_admitted_handoff(home: str, run_id: str, stop, results) -> None:
     identity = _identity("replacement-handoff-leader")
-    leadership = coordinator.try_acquire(
-        identity,
-        now=datetime.now(timezone.utc),
-        lease_seconds=30,
-    )
-    if not leadership.is_leader:
-        results.put(("not_leader", leadership.lease.epoch))
-        return
-    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
     handoff_store = HandoffStore(Path(home) / "handoffs.db")
-    service = AgentHandoffService(
+    handoff_service = AgentHandoffService(
         handoff_store,
-        _TerminalHandoffChannel(results),
+        _TerminalHandoffChannel(results, stop),
     )
-    scheduler = RunScheduler(
-        store,
-        execution_fence=fence,
-        handoff_service=service,
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="replacement-handoff-host",
+        ),
+        hermes_home=Path(home),
+        heartbeat_seconds=0.1,
+        lease_seconds=3.0,
+        sweep_backoff_seconds=(0.02, 0.04, 0.08),
     )
-    try:
-        advanced = scheduler.advance_due_handoffs(
-            run_id,
-            deadline=time.monotonic() + 2,
-            max_items=1,
+
+    def scheduler_factory(store, *, fence):
+        scheduler = RunScheduler(
+            store,
+            execution_fence=fence,
+            handoff_service=handoff_service,
         )
-        results.put(("advanced", *advanced, leadership.lease.epoch))
+        scheduler.submit = lambda *_args, **_kwargs: False
+        return scheduler
+
+    service._identity = lambda: identity
+    service._scheduler = scheduler_factory
+    try:
+        service.run(stop)
+        reopened = RunStore(Path(home))
+        projection = reopened.load_run(run_id)
+        lease = CoordinatorStore(reopened.database).observe(
+            now=datetime.now(timezone.utc)
+        )
+        results.put((
+            "coordinator",
+            stop.is_set(),
+            lease.owner_id if lease is not None else None,
+            lease.epoch if lease is not None else None,
+            projection["nodes"]["review"]["state"],
+        ))
     finally:
-        scheduler.shutdown(deadline_seconds=2)
         handoff_store.close()
 
 
@@ -723,19 +739,28 @@ def test_new_process_leader_reopens_and_resumes_exact_admitted_handoff(
 
     time.sleep(0.25)
     context = multiprocessing.get_context("spawn")
+    stop = context.Event()
     results = context.Queue()
     replacement = context.Process(
         target=_resume_admitted_handoff,
-        args=(str(home), admitted.run_id, results),
+        args=(str(home), admitted.run_id, stop, results),
     )
     replacement.start()
     replacement.join(timeout=10)
     assert replacement.exitcode == 0
-    assert results.get(timeout=5) == (
+    observed = results.get(timeout=5)
+    assert observed[:2] == (
         handoff.handoff_id,
         f"{admitted.run_id}:review:1",
     )
-    assert results.get(timeout=5) == ("advanced", 1, 1, 2)
+    assert 0 < observed[2] <= 2
+    assert results.get(timeout=5) == (
+        "coordinator",
+        True,
+        "replacement-handoff-leader",
+        2,
+        "ready",
+    )
 
     reopened_handoffs = HandoffStore(home / "handoffs.db")
     try:

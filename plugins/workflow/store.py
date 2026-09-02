@@ -196,6 +196,14 @@ _EXECUTION_AUTHORITY_FIELDS = frozenset({
     "remaining_wall_seconds",
 })
 
+_HANDOFF_ADVANCE_DEFERRAL_CODES = frozenset({
+    "handoff_advance_exception",
+    "handoff_identity_mismatch",
+    "handoff_projection_conflict",
+    "handoff_protocol_violation",
+    "handoff_stale_observation",
+})
+
 
 def _validated_execution_authority(value: object) -> dict[str, object]:
     """Return one exact v1 execution-authority projection or reject it."""
@@ -13212,6 +13220,85 @@ class RunStore:
         if notify:
             self._notify_coordinator()
         return True
+
+    def defer_handoff_wait(
+        self,
+        run_id: str,
+        node_id: str,
+        *,
+        handoff_id: str,
+        generation: int,
+        expected_observed_version: int,
+        expected_observed_phase: str,
+        next_observation_at: datetime,
+        error_code: str,
+        fence: ExecutionFence,
+        now: LeaseClockSample | None = None,
+    ) -> bool:
+        """Fenced CAS that backs off one unchanged handoff observation."""
+        if not isinstance(fence, ExecutionFence):
+            raise ValueError("handoff deferral requires an execution fence")
+        if error_code not in _HANDOFF_ADVANCE_DEFERRAL_CODES:
+            raise ValueError("handoff deferral error_code is invalid")
+        directory = self.run_directory(run_id)
+        try:
+            with workflow_lock(
+                self._run_lock_path(run_id)
+            ), self._execution_fence_transaction(fence, now) as fence_connection:
+                projection = json.loads((directory / "run.json").read_text())
+                node = projection.get("nodes", {}).get(node_id)
+                if not isinstance(node, MutableMapping):
+                    return False
+                try:
+                    current = HandoffWaitProjection.from_durable_record(
+                        node.get("handoff")
+                    )
+                except ValueError:
+                    return False
+                if (
+                    projection.get("status") != "running"
+                    or node.get("state") != "waiting_handoff"
+                    or current.handoff_id != handoff_id
+                    or current.generation != generation
+                    or current.last_observed_version != expected_observed_version
+                    or current.last_observed_phase != expected_observed_phase
+                ):
+                    return False
+                updated = HandoffWaitProjection(
+                    current.handoff_id,
+                    current.generation,
+                    current.last_observed_version,
+                    current.last_observed_phase,
+                    next_observation_at,
+                    current.deadline_at,
+                )
+                node["handoff"] = updated.durable_record()
+                self._append_locked(
+                    directory,
+                    projection,
+                    "handoff_advance_deferred",
+                    {
+                        "error_code": error_code,
+                        "next_observation_at": (
+                            updated.next_observation_at.isoformat()
+                        ),
+                    },
+                    node_id=node_id,
+                    defer_notification=True,
+                    reserve_connection=fence_connection,
+                )
+                self._sync_integrity_index(
+                    fence_connection,
+                    projection=projection,
+                    journal_sha256=_sha256(
+                        (directory / "events.jsonl").read_bytes()
+                    ),
+                )
+                return True
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return False
+            raise
 
     @staticmethod
     def _handoff_retry_is_authorized(
