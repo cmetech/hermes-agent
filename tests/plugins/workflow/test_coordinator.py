@@ -1670,6 +1670,82 @@ def test_handoff_pages_prioritize_cancel_and_deadline_without_starving_tail(
     ]
 
 
+def test_persistent_cancellation_page_cannot_starve_deadline_or_observation(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("handoff-persistent-cancel-page")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=30)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    cancel_ids = tuple(f"cancel-{index:02d}" for index in range(20))
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package",
+        now=now,
+        fence=fence,
+        handoffs=tuple(
+            (node_id, now)
+            for node_id in cancel_ids + ("zz-expired", "zz-observation")
+        ),
+        deadlines={"zz-expired": now - timedelta(seconds=1)},
+    )
+    for node_id in cancel_ids:
+        assert store.request_handoff_cancel(
+            run_id,
+            node_id,
+            reason_code="deadline_exceeded",
+            fence=fence,
+        ) is not None
+
+    class Service:
+        def __init__(self) -> None:
+            self.advance_calls: list[str] = []
+
+        def command(self, handoff_id, kind, *, command_id, actor):
+            assert kind == "cancel"
+            assert command_id
+            assert actor == "workflow"
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            assert budget_seconds > 0
+            self.advance_calls.append(handoff_id)
+            cancelling = handoff_id != "handoff-zz-observation"
+            return AdvanceResult(
+                _handoff_snapshot(
+                    handoff_id,
+                    phase="cancelling" if cancelling else "active",
+                    version=100 + len(self.advance_calls),
+                    next_advance_at=now + timedelta(seconds=5),
+                ),
+                "cancel" if cancelling else "observe",
+                True,
+            )
+
+    service = Service()
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            run_id,
+            deadline=101.0,
+            max_items=20,
+        ) == (20, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert "handoff-zz-expired" in service.advance_calls
+    assert "handoff-zz-observation" in service.advance_calls
+
+
 def test_handoff_sweep_stops_external_io_after_mid_batch_fence_loss(
     tmp_path, workflow_writer
 ) -> None:

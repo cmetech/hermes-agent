@@ -1179,18 +1179,41 @@ class RunScheduler:
                 or command_id is not None
             ):
                 due.append((str(node_id), wait, command_id))
-        due.sort(
-            key=lambda candidate: (
+        def priority(
+            candidate: tuple[str, HandoffWaitProjection, str | None],
+        ) -> int:
+            return (
                 0
                 if candidate[2] is not None
                 else 1
                 if candidate[1].deadline_at is not None
                 and candidate[1].deadline_at <= observed
-                else 2,
+                else 2
+            )
+
+        due.sort(
+            key=lambda candidate: (
+                priority(candidate),
                 candidate[1].next_observation_at,
                 candidate[0],
             )
         )
+        reserved = [
+            next(candidate for candidate in due if priority(candidate) == value)
+            for value in range(3)
+            if any(priority(candidate) == value for candidate in due)
+        ]
+        if len(due) > max_items and len(reserved) <= max_items:
+            due = reserved + [candidate for candidate in due if candidate not in reserved][
+                : max_items - len(reserved)
+            ]
+            due.sort(
+                key=lambda candidate: (
+                    priority(candidate),
+                    candidate[1].next_observation_at,
+                    candidate[0],
+                )
+            )
         due = due[:max_items]
 
         attempted = deferred = terminal = 0
