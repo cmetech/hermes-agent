@@ -17793,7 +17793,11 @@ class RunStore:
                 projected_pending_interaction,
             )
 
-            kind = notification_kind(event_type, projection)
+            kind = notification_kind(
+                event_type,
+                projection,
+                node_id=node_id,
+            )
             outbox = None
             if kind is not None or event_type in {
                 "handoff_failed",

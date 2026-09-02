@@ -82,6 +82,7 @@ _PUBLIC_NOTIFICATION_EVENT_TYPES = frozenset(
         "handoff_deadline_exceeded",
         "handoff_failed",
         "handoff_indeterminate",
+        "handoff_observed",
         "handoff_terminal",
     }
 )
@@ -260,7 +261,10 @@ def install_notification_schema(connection: sqlite3.Connection) -> None:
             attempts INTEGER NOT NULL DEFAULT 0,
             delivered_at TEXT,
             dismissed_at TEXT,
-            last_error TEXT
+            last_error TEXT,
+            handoff_node_id TEXT,
+            handoff_id TEXT,
+            handoff_generation INTEGER
         );
         CREATE INDEX IF NOT EXISTS workflow_notification_delivery
         ON workflow_notification_outbox(destination, state, available_at);
@@ -296,6 +300,57 @@ def install_notification_schema(connection: sqlite3.Connection) -> None:
             singleton, cursor_created_at, cursor_run_id
         ) VALUES (1, NULL, NULL);
         """
+    )
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(workflow_notification_outbox)"
+        )
+    }
+    identity_columns = {
+        "handoff_node_id",
+        "handoff_id",
+        "handoff_generation",
+    }
+    if not identity_columns <= columns:
+        connection.execute("SAVEPOINT workflow_notification_handoff_identity")
+        try:
+            for name, column_type in (
+                ("handoff_node_id", "TEXT"),
+                ("handoff_id", "TEXT"),
+                ("handoff_generation", "INTEGER"),
+            ):
+                if name not in columns:
+                    connection.execute(
+                        "ALTER TABLE workflow_notification_outbox "
+                        f"ADD COLUMN {name} {column_type}"
+                    )
+            connection.execute(
+                "UPDATE workflow_notification_outbox SET "
+                "handoff_node_id=CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.handoff.node_id') END, "
+                "handoff_id=CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.handoff.handoff_id') END, "
+                "handoff_generation=CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.handoff.generation') END"
+            )
+        except sqlite3.Error:
+            connection.execute(
+                "ROLLBACK TO SAVEPOINT workflow_notification_handoff_identity"
+            )
+            connection.execute(
+                "RELEASE SAVEPOINT workflow_notification_handoff_identity"
+            )
+            raise
+        connection.execute(
+            "RELEASE SAVEPOINT workflow_notification_handoff_identity"
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS workflow_notification_handoff_identity "
+        "ON workflow_notification_outbox("
+        "run_id, kind, destination, handoff_node_id, handoff_id, "
+        "handoff_generation) WHERE handoff_node_id IS NOT NULL "
+        "AND handoff_id IS NOT NULL AND handoff_generation IS NOT NULL"
     )
 
 
@@ -398,7 +453,22 @@ def public_handoff_failure_code(
     return None
 
 
-def notification_kind(event_type: str, projection: Mapping[str, object]) -> str | None:
+def notification_kind(
+    event_type: str,
+    projection: Mapping[str, object],
+    *,
+    node_id: object = None,
+) -> str | None:
+    if event_type == "handoff_observed":
+        nodes = projection.get("nodes")
+        node = nodes.get(node_id) if isinstance(nodes, Mapping) else None
+        handoff = node.get("handoff") if isinstance(node, Mapping) else None
+        return (
+            "reconciliation_required"
+            if isinstance(handoff, Mapping)
+            and handoff.get("last_observed_phase") == "indeterminate"
+            else None
+        )
     if event_type in {"handoff_indeterminate", "handoff_deadline_exceeded"}:
         return "reconciliation_required"
     if event_type == "handoff_failed":
@@ -891,6 +961,16 @@ class NotificationOutbox:
             separators=(",", ":"),
             allow_nan=False,
         )
+        handoff = projected_payload.get("handoff")
+        handoff_identity = (
+            (
+                handoff.get("node_id"),
+                handoff.get("handoff_id"),
+                handoff.get("generation"),
+            )
+            if isinstance(handoff, Mapping)
+            else (None, None, None)
+        )
         gateway_destination = self._gateway_destination(
             run_id,
             source_destination=destination,
@@ -917,41 +997,16 @@ class NotificationOutbox:
                         now=observed,
                     )
                 return notification_id
-            handoff = projected_payload.get("handoff")
             if safe_kind == "reconciliation_required" and isinstance(
                 handoff, Mapping
             ):
-                identity = (
-                    handoff.get("node_id"),
-                    handoff.get("handoff_id"),
-                    handoff.get("generation"),
-                )
-                rows = connection.execute(
-                    "SELECT * FROM workflow_notification_outbox "
+                candidate = connection.execute(
+                    "SELECT notification_id FROM workflow_notification_outbox "
                     "WHERE run_id=? AND kind=? AND destination=? "
-                    "ORDER BY updated_at DESC LIMIT 200",
-                    (run_id, safe_kind, destination),
-                ).fetchall()
-                candidate = next(
-                    (
-                        row
-                        for row in rows
-                        if (
-                            (decoded := _load_notification_payload(
-                                row["payload_json"],
-                                transition_version=int(row["transition_version"]),
-                            ))[1]
-                            and isinstance(decoded[0].get("handoff"), Mapping)
-                            and (
-                                decoded[0]["handoff"].get("node_id"),
-                                decoded[0]["handoff"].get("handoff_id"),
-                                decoded[0]["handoff"].get("generation"),
-                            )
-                            == identity
-                        )
-                    ),
-                    None,
-                )
+                    "AND handoff_node_id=? AND handoff_id=? "
+                    "AND handoff_generation=? ORDER BY updated_at DESC LIMIT 1",
+                    (run_id, safe_kind, destination, *handoff_identity),
+                ).fetchone()
                 if candidate is not None:
                     connection.execute(
                         "UPDATE workflow_notification_outbox SET transition_key=?, "
@@ -1049,7 +1104,8 @@ class NotificationOutbox:
                 "INSERT INTO workflow_notification_outbox ("
                 "notification_id, transition_key, run_id, kind, destination, "
                 "transition_version, payload_json, state, created_at, updated_at, "
-                "available_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "available_at, handoff_node_id, handoff_id, handoff_generation) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     notification_id,
                     transition_key,
@@ -1062,6 +1118,7 @@ class NotificationOutbox:
                     timestamp,
                     timestamp,
                     timestamp,
+                    *handoff_identity,
                 ),
             )
             connection.execute(
@@ -1206,7 +1263,11 @@ class NotificationOutbox:
             if not isinstance(projection, Mapping):
                 continue
             event_type = str(event.get("event_type") or "")
-            kind = notification_kind(event_type, projection)
+            kind = notification_kind(
+                event_type,
+                projection,
+                node_id=event.get("node_id"),
+            )
             if kind is None and event_type != "handoff_terminal":
                 continue
             candidates.append(

@@ -178,6 +178,32 @@ def test_handoff_attention_payload_is_actionable_and_closed(tmp_path) -> None:
     assert outbox.history(run_id="handoff-run")[0]["state"] == "pending"
 
 
+def test_same_phase_handoff_observation_only_notifies_when_indeterminate() -> None:
+    projection = {
+        "nodes": {
+            "review": {
+                "handoff": {
+                    "last_observed_phase": "active",
+                },
+            },
+        },
+    }
+
+    assert notification_kind(
+        "handoff_observed",
+        projection,
+        node_id="review",
+    ) is None
+    projection["nodes"]["review"]["handoff"]["last_observed_phase"] = (
+        "indeterminate"
+    )
+    assert notification_kind(
+        "handoff_observed",
+        projection,
+        node_id="review",
+    ) == "reconciliation_required"
+
+
 def test_handoff_reconciliation_coalesces_by_exact_generation_after_ack(
     tmp_path,
 ) -> None:
@@ -232,6 +258,197 @@ def test_handoff_reconciliation_coalesces_by_exact_generation_after_ack(
         item["notification_id"]
         for item in outbox.pending_attention(run_id="handoff-coalesce-run")
     ] == [newer_generation]
+
+
+def test_handoff_reconciliation_identity_survives_more_than_512_newer_rows(
+    tmp_path,
+) -> None:
+    home = tmp_path / "handoff-coalescing-index"
+    outbox = NotificationOutbox(RunStore(home))
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+
+    def record(version: int, handoff_id: str) -> str:
+        return outbox.record(
+            run_id="handoff-index-run",
+            kind="reconciliation_required",
+            destination="desktop",
+            transition_version=version,
+            payload={
+                "workflow": "review",
+                "status": "running",
+                "event_type": "handoff_indeterminate",
+                "node_id": "review",
+                "handoff": {
+                    "handoff_id": handoff_id,
+                    "generation": 1,
+                    "endpoint": "hermes://local/reviewer",
+                    "phase": "indeterminate",
+                    "age_seconds": version,
+                    "last_successful_observation_at": observed.isoformat(),
+                    "next_action": "reconcile",
+                    "failure_code": "submission_indeterminate",
+                },
+            },
+            now=observed + timedelta(seconds=version),
+        )
+
+    first = record(1, "handoff-original")
+    leased = outbox.lease(
+        destination="desktop",
+        owner_id="electron",
+        now=observed + timedelta(seconds=1),
+        lease_seconds=30,
+    )
+    assert [item["notification_id"] for item in leased] == [first]
+    assert outbox.ack(first, owner_id="electron", now=observed)
+    for version in range(2, 515):
+        record(version, f"handoff-intervening-{version}")
+
+    repeated = NotificationOutbox(RunStore(home)).record(
+        run_id="handoff-index-run",
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=515,
+        payload={
+            "workflow": "review",
+            "status": "running",
+            "event_type": "handoff_observed",
+            "node_id": "review",
+            "handoff": {
+                "handoff_id": "handoff-original",
+                "generation": 1,
+                "endpoint": "hermes://local/reviewer",
+                "phase": "indeterminate",
+                "age_seconds": 515,
+                "last_successful_observation_at": observed.isoformat(),
+                "next_action": "reconcile",
+                "failure_code": "cancellation_indeterminate",
+            },
+        },
+        now=observed + timedelta(seconds=515),
+    )
+
+    assert repeated == first
+
+
+def test_notification_schema_migrates_and_indexes_legacy_handoff_identity(
+    tmp_path,
+) -> None:
+    home = tmp_path / "legacy-handoff-notifications"
+    store = RunStore(home)
+    observed = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    legacy_payload = json.dumps(
+        {
+            "payload_type": "workflow_transition",
+            "workflow": "review",
+            "status": "running",
+            "event_type": "handoff_indeterminate",
+            "node_id": "review",
+            "state_version": 1,
+            "next_actions": ["status", "events", "reconcile", "cancel"],
+            "handoff": {
+                "handoff_id": "handoff-legacy",
+                "generation": 7,
+                "endpoint": "hermes://local/reviewer",
+                "node_id": "review",
+                "phase": "indeterminate",
+                "age_seconds": 1,
+                "last_successful_observation_at": observed.isoformat(),
+                "next_action": "reconcile",
+                "failure_code": "submission_indeterminate",
+                "commands": {
+                    "show": "hermes handoff show handoff-legacy",
+                    "evidence": "hermes handoff evidence handoff-legacy",
+                    "reconcile": "hermes handoff reconcile handoff-legacy",
+                },
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with store._connect() as connection:
+        connection.execute("DROP TABLE workflow_notification_outbox")
+        connection.executescript(
+            """
+            CREATE TABLE workflow_notification_outbox (
+                notification_id TEXT PRIMARY KEY,
+                transition_key TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                transition_version INTEGER NOT NULL,
+                coalesced_count INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                available_at TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at TEXT,
+                dismissed_at TEXT,
+                last_error TEXT
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO workflow_notification_outbox ("
+            "notification_id, transition_key, run_id, kind, destination, "
+            "transition_version, payload_json, state, created_at, updated_at, "
+            "available_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-notification",
+                "legacy-transition",
+                "legacy-run",
+                "reconciliation_required",
+                "desktop",
+                1,
+                legacy_payload,
+                "delivered",
+                observed.isoformat(),
+                observed.isoformat(),
+                observed.isoformat(),
+            ),
+        )
+
+    store = RunStore(home)
+    NotificationOutbox(store)
+    with store._connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(workflow_notification_outbox)"
+            )
+        }
+        indexes = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_list(workflow_notification_outbox)"
+            )
+        }
+        identity = connection.execute(
+            "SELECT handoff_node_id, handoff_id, handoff_generation "
+            "FROM workflow_notification_outbox WHERE notification_id=?",
+            ("legacy-notification",),
+        ).fetchone()
+
+    assert {
+        "handoff_node_id",
+        "handoff_id",
+        "handoff_generation",
+    } <= columns
+    assert "workflow_notification_handoff_identity" in indexes
+    assert tuple(identity) == ("review", "handoff-legacy", 7)
+    repeated = NotificationOutbox(RunStore(home)).record(
+        run_id="legacy-run",
+        kind="reconciliation_required",
+        destination="desktop",
+        transition_version=2,
+        payload=json.loads(legacy_payload),
+        now=observed + timedelta(seconds=1),
+    )
+    assert repeated == "legacy-notification"
 
 
 def test_journal_reconciliation_clears_deferred_terminal_handoff_attention(

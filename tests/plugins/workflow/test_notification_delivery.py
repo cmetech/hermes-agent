@@ -340,17 +340,30 @@ def test_desktop_delivery_is_leased_until_explicit_electron_ack(tmp_path, monkey
 
 
 @pytest.mark.parametrize(
-    ("remote_failure_code", "expected_failure_code"),
     (
-        ("cancellation_indeterminate", "cancellation_indeterminate"),
-        ("provider_specific_failure", "submission_indeterminate"),
+        "initial_failure_code",
+        "observed_failure_code",
+        "expected_failure_code",
+    ),
+    (
+        (
+            "submission_indeterminate",
+            "cancellation_indeterminate",
+            "cancellation_indeterminate",
+        ),
+        (
+            "submission_indeterminate",
+            "Bearer secret prompt body /Users/private/task.txt",
+            "submission_indeterminate",
+        ),
     ),
 )
-def test_attention_api_includes_safe_handoff_evidence_commands(
+def test_same_phase_indeterminate_updates_direct_and_repaired_attention_api(
     tmp_path,
     monkeypatch,
     workflow_writer,
-    remote_failure_code,
+    initial_failure_code,
+    observed_failure_code,
     expected_failure_code,
 ) -> None:
     home = tmp_path / "handoff-attention-home"
@@ -443,7 +456,7 @@ def test_attention_api_includes_safe_handoff_evidence_commands(
                     spec_fingerprint=spec.fingerprint,
                     phase="indeterminate",
                     state_version=4,
-                    failure_code=remote_failure_code,
+                    failure_code=initial_failure_code,
                     next_advance_at=observed + timedelta(seconds=5),
                 ),
                 "reconcile",
@@ -463,7 +476,51 @@ def test_attention_api_includes_safe_handoff_evidence_commands(
         ) == (1, 0, 0)
     finally:
         scheduler.shutdown(deadline_seconds=2)
-    assert NotificationOutbox(store).reconcile_run(admitted.run_id) >= 1
+    outbox = NotificationOutbox(store)
+    assert outbox.reconcile_run(admitted.run_id) >= 1
+    initial_attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert len(initial_attention) == 1
+    notification_id = initial_attention[0]["notification_id"]
+    assert initial_attention[0]["payload"]["handoff"]["failure_code"] == (
+        "submission_indeterminate"
+    )
+    assert store.refresh_handoff_wait(
+        admitted.run_id,
+        "review",
+        handoff_id="handoff-api-1",
+        generation=1,
+        expected_observed_version=4,
+        observed_version=5,
+        observed_phase="indeterminate",
+        next_observation_at=observed + timedelta(seconds=10),
+        observed_failure_code=observed_failure_code,
+    )
+    direct_attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert len(direct_attention) == 1
+    assert direct_attention[0]["notification_id"] == notification_id
+    assert direct_attention[0]["payload"]["handoff"]["failure_code"] == (
+        expected_failure_code
+    )
+    if observed_failure_code != expected_failure_code:
+        assert str(observed_failure_code) not in json.dumps(direct_attention)
+
+    with store._connect() as connection:
+        connection.execute(
+            "DELETE FROM workflow_notification_facts WHERE run_id=?",
+            (admitted.run_id,),
+        )
+        connection.execute(
+            "DELETE FROM workflow_notification_outbox WHERE run_id=?",
+            (admitted.run_id,),
+        )
+    assert outbox.reconcile_run(admitted.run_id) >= 2
+    repaired_attention = outbox.pending_attention(run_id=admitted.run_id)
+    assert len(repaired_attention) == 1
+    assert repaired_attention[0]["payload"]["handoff"]["failure_code"] == (
+        expected_failure_code
+    )
+    if observed_failure_code != expected_failure_code:
+        assert str(observed_failure_code) not in json.dumps(repaired_attention)
 
     response = TestClient(_app(_module().router, local_admin=True)).get(
         "/api/plugins/workflow/attention"
@@ -481,6 +538,8 @@ def test_attention_api_includes_safe_handoff_evidence_commands(
         "reconcile": "hermes handoff reconcile handoff-api-1",
     }
     assert item["handoff"]["failure_code"] == expected_failure_code
+    if observed_failure_code != expected_failure_code:
+        assert str(observed_failure_code) not in response.text
 
 
 def test_desktop_projection_failure_retains_fixed_fallback_reason(
