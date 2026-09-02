@@ -21,11 +21,13 @@ stage_2:
   - 7ed39a6c5213339cbf53d44ff30524dcf8ba22ee fix(workflow): enforce paused handoff deadlines
   - 470e79d81e2d8aa1bc156912c46f5ae46cce084a test(handoff): prove authenticated remote workflow path
   - 81f390fd9b9d4df08ee4a2bc393305f2eddbbf7b test(handoff): accept additive installed commands
+  - a837368e855c6687cd108c6ab85a64338ebc452b fix(workflow): preserve filtered handoff sweep progress
   planning_commits:
   - 3b1100ad998a7904dbb3fc01388af6a4c9992a4b docs(plan): prepare remote agent handoff stage 2
   - f4a078ab73a13b547f0e0d3e6ec1ad7d5df38867 docs(plan): add peer command routing remediation
   - 56a4132cc6c2045bc5709d094a3a8a3a155fcde2 docs(plan): add paused handoff deadline remediation
   - 831899f1222693c5ccca9680d677d5cdb918bfcc docs(plan): add installed command remediation
+  - 9679986d806771c734740289ea65e9a53a3915f9 docs(plan): add filtered handoff cursor remediation
   owned_paths:
   - apps/desktop/src/app/workflows/adapter.test.ts
   - apps/desktop/src/lib/workflow-public-codec.test.ts
@@ -93,10 +95,21 @@ stage_2:
     durable once/deny responses; arbitrary remote questions remain deferred
   - a lost non-idempotent control response remains indeterminate and is never
     blindly replayed, while a lost submit response reconciles with the same key
+  - a fully processed coordinator page advances across filtered future input
+    waits, while a partial page never skips an unprocessed actionable run
   intentional_exclusions:
   - Bot Mode, Desktop chat migration, message_agent, and peer DM changes
   - durable Bot return delivery, generic channels, repository channels, and A2A
   - Windows CLI locking, relay retirement, and interactive CLI fallback
+  adversarial_review:
+    verdict: no_unresolved_stage_2_correctness_or_security_findings
+    confirmed_and_remediated:
+    - filtered paused rows could prevent the ordinary coordinator keyset cursor
+      from reaching later runs; the raw-page cursor now advances only after all
+      returned actionable rows were processed
+    inherited_diagnostics:
+    - whole-Workflow parallel load remains timing- and lifecycle-sensitive on
+      macOS, while every failed or crashed file passes in isolation
 ownership:
   handoff_service: hermes_cli/handoff
   workflow_consumer: plugins/workflow
@@ -169,6 +182,16 @@ verification:
   host: darwin
   commands:
   - command: >-
+      scripts/run_tests.sh tests/plugins/workflow/test_coordinator.py
+      tests/plugins/workflow/test_performance_bounds.py -k
+      'filtered_periodic_page_advances_raw_cursor or
+      overdue_handoff_input_pause_remains_coordinator_actionable or
+      sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget or
+      coordinator_cursor_reaches_run_201_with_bounded_keyset_pages' -q
+    environment:
+      HERMES_TEST_FILE_RETRIES: "0"
+    result: 4 passed, 0 failed
+  - command: >-
       scripts/run_tests.sh tests/hermes_cli/handoff/test_models.py
       tests/hermes_cli/handoff/test_store.py
       tests/hermes_cli/handoff/test_service.py
@@ -204,7 +227,7 @@ verification:
       tests/plugins/workflow/test_remote_handoff_e2e.py -q
     environment:
       HERMES_TEST_FILE_RETRIES: "0"
-    result: 1824 passed, 0 failed, 6 host-specific skips
+    result: 1825 passed, 0 failed, 6 host-specific skips
   - command: >-
       for run in 1 2 3 4 5 6 7; do scripts/run_tests.sh
       tests/plugins/workflow/test_remote_handoff_e2e.py -k
@@ -250,7 +273,7 @@ verification:
       tests/plugins/workflow/test_installed_distribution_e2e.py -q
     environment:
       HERMES_TEST_FILE_RETRIES: "0"
-    result: 1827 passed, 0 failed, 6 host-specific skips
+    result: 1828 passed, 0 failed, 6 host-specific skips
   - command: >-
       cd apps/desktop && npm run test:ui --
       src/lib/workflow-public-codec.test.ts
@@ -261,14 +284,38 @@ verification:
   - command: scripts/run_tests.sh tests/plugins/workflow -q
     environment:
       HERMES_TEST_FILE_RETRIES: "0"
-    result: 132 files, 5969 passed, 2 failed, 5 host-specific skips, 1 bus error
+    result: 132 files, 5962 passed, 4 failed, 5 host-specific skips, 2 bus errors
     note: >-
-      Under whole-suite parallel load, the unchanged coordinator cursor bound
-      and hard-maximum recovery assertions failed; each passed immediately in
-      isolation (1 of 1). An unchanged middleware E2E process bus-errored on
-      macOS while inherited web-server threads were initializing SQLite; its
-      seven tests passed in isolation. The failing test files and every source
-      file in the bus-error stack are unchanged from 96840791410c4723d3c4e9de7235afdafc723f81.
+      Under whole-suite parallel load, four unchanged tests failed: a 0.2-second
+      coordinator fence expired during setup, the cursor bound repeated work,
+      desktop WAL bytes changed under background activity, and the hard-maximum
+      loop stopped at iteration 92. Each passed immediately in isolation (1 of
+      1). Two unchanged middleware E2E processes bus-errored on macOS while
+      inherited web-server threads were initializing SQLite; their files passed
+      in isolation (7 of 7 and 6 of 6). All six failing test files and the
+      lifecycle files in the bus-error stacks are unchanged from
+      96840791410c4723d3c4e9de7235afdafc723f81; the implicated Workflow schema
+      initialization and fence-rejection lines also predate that merge base.
+  - command: >-
+      scripts/run_tests.sh tests/plugins/workflow/test_coordinator_multiprocess.py
+      -k new_process_leader_reopens_and_resumes_exact_admitted_handoff -q;
+      scripts/run_tests.sh tests/plugins/workflow/test_workflow_language_desktop_e2e.py
+      -k language_status_crosses_real_desktop_middleware_without_mutation -q;
+      scripts/run_tests.sh tests/plugins/workflow/test_performance_bounds.py
+      -k coordinator_cursor_reaches_run_201_with_bounded_keyset_pages -q;
+      scripts/run_tests.sh tests/plugins/workflow/test_phase6_interactions_recovery.py
+      -k hard_maximum_fails_without_a_dead_interaction -q
+    environment:
+      HERMES_TEST_FILE_RETRIES: "0"
+    result: 4 of 4 isolated diagnostic cases passed, 0 failed
+  - command: >-
+      scripts/run_tests.sh
+      tests/plugins/workflow/test_ai_extensions_middleware_e2e.py -q;
+      scripts/run_tests.sh
+      tests/plugins/workflow/test_scheduling_middleware_e2e.py -q
+    environment:
+      HERMES_TEST_FILE_RETRIES: "0"
+    result: 13 passed, 0 failed in isolation (7 plus 6)
   host_coverage:
   - authenticated peer HTTP, lost-response, restart, approval, control,
     cancellation-race, deadline, and installed-wheel cases ran locally
@@ -409,6 +456,7 @@ upstream_changes:
   - interaction policy is admitted against peer capabilities before submission and unsupported required behavior fails closed
   - advertised remote approval input pauses as one durable bounded handoff_input and uses the existing Needs Attention response surface
   - overdue paused handoff_input runs remain coordinator-actionable only for handoff deadline maintenance
+  - fully processed ordinary keyset pages advance past filtered handoff input waits without weakening partial-page no-skip behavior
   - exact response steer follow-up stop interrupted and cancellation race outcomes remain restart-recoverable and destination-authoritative
   tests:
   - tests/plugins/workflow/test_admission.py
