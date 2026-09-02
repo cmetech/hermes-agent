@@ -6,8 +6,12 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -60,6 +64,50 @@ def _assigned_package(workflow_writer, root, *, endpoint="hermes://local/reviewe
         encoding="utf-8",
     )
     return load_workflow(path)
+
+
+def _run_never_returning_admission_child(body: str, *, timeout: float = 2.0):
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import plugins.workflow.admission as admission
+        from plugins.workflow.models import WorkflowValidationError
+
+        package = SimpleNamespace(
+            sidecar={
+                "assignments": {
+                    "review": {"endpoint": "hermes://local/reviewer"},
+                }
+            }
+        )
+
+        class NeverReturningChannel:
+            def __init__(self):
+                self.calls = 0
+                self.release = threading.Event()
+
+            def validate_endpoint(self, endpoint, initiator):
+                self.calls += 1
+                self.release.wait()
+
+        admission._ASSIGNMENT_ADMISSION_BUDGET_SECONDS = 0.03
+        channel = NeverReturningChannel()
+        """
+    )
+    script += textwrap.dedent(body)
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.fspath(Path(__file__).resolve().parents[3]),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 def test_assignment_admission_rejects_missing_self_and_unavailable_profiles(
@@ -180,6 +228,38 @@ def test_assignment_admission_probes_one_canonical_endpoint_once(monkeypatch):
     assert elapsed < 2.0
 
 
+def test_assignment_admission_releases_probe_slot_after_success(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review-a": {"endpoint": "hermes://local/reviewer-a"},
+                "review-b": {"endpoint": "hermes://local/reviewer-b"},
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    class AvailableChannel:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls.append(parsed.canonical)
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = AvailableChannel()
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=channel,
+    ) == {"review-a": "local_cli", "review-b": "local_cli"}
+    assert channel.calls == [
+        "hermes://local/reviewer-a",
+        "hermes://local/reviewer-b",
+    ]
+
+
 def test_assignment_admission_bounds_distinct_endpoint_probes(monkeypatch):
     package = SimpleNamespace(
         sidecar={
@@ -220,6 +300,8 @@ def test_assignment_admission_bounds_distinct_endpoint_probes(monkeypatch):
             )
     finally:
         release_probe.set()
+        assert workflow_admission._assignment_probe_slot.acquire(timeout=2)
+        workflow_admission._assignment_probe_slot.release()
     elapsed = time.monotonic() - started
 
     assert caught.value.issues[0].path == "sidecar.assignments.review-0.endpoint"
@@ -227,6 +309,58 @@ def test_assignment_admission_bounds_distinct_endpoint_probes(monkeypatch):
     assert "admission_budget_exhausted" in caught.value.issues[0].message
     assert channel.calls == 1
     assert elapsed < 2.0
+
+
+def test_assignment_admission_timeout_does_not_block_interpreter_shutdown():
+    completed = _run_never_returning_admission_child(
+        """
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            try:
+                admission.validate_assignment_admission(
+                    package,
+                    initiator_profile="default",
+                    channel=channel,
+                )
+            except WorkflowValidationError as exc:
+                issue = exc.issues[0]
+                print(
+                    json.dumps({"code": issue.code, "message": issue.message}),
+                    flush=True,
+                )
+        """
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["code"] == "assignment_mechanism_unavailable"
+    assert "admission_budget_exhausted" in result["message"]
+
+
+def test_assignment_admission_repeated_timeouts_keep_one_probe_worker():
+    completed = _run_never_returning_admission_child(
+        """
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            for _ in range(3):
+                try:
+                    admission.validate_assignment_admission(
+                        package,
+                        initiator_profile="default",
+                        channel=channel,
+                    )
+                except WorkflowValidationError:
+                    pass
+
+        workers = sum(
+            thread.name.startswith(("workflow-admission", "deadline-workflow"))
+            for thread in threading.enumerate()
+        )
+        print(json.dumps({"calls": channel.calls, "workers": workers}), flush=True)
+        os._exit(0)
+        """
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"calls": 1, "workers": 1}
 
 
 def test_assignment_owner_is_derived_from_explicit_anchored_profile_home(tmp_path):
