@@ -833,6 +833,18 @@ print(json.dumps({
     assert isinstance(envelope["result"], list)
     assert home.is_dir()
 
+    handoff_help = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "handoff", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert handoff_help.returncode == 0, handoff_help.stderr
+    assert "usage: hermes handoff" in handoff_help.stdout
+    assert "{list,show,evidence,reconcile,cancel,advance}" in handoff_help.stdout
+
     schema_command = subprocess.run(
         [
             sys.executable,

@@ -2,7 +2,8 @@
 
 **Date:** 2026-09-01
 
-**Verdict:** Ready to implement as a bounded local-Workflow vertical slice.
+**Verdict:** Stage 1 implemented and verified as a bounded local-Workflow
+vertical slice; Stages 2–5 remain deferred.
 
 **Design authority:**
 [`2026-09-01-shared-agent-handoff-facade-workflow-bot-mode-consolidated.md`](../proposals/2026-09-01-shared-agent-handoff-facade-workflow-bot-mode-consolidated.md)
@@ -199,7 +200,7 @@ task blindly.
 | Session pollution | Use one deterministic task session per handoff; expose it in evidence. Defer hiding until the product requires it. |
 | Windows unsafe fallback | Disable CLI fallback on Windows until the Stage 5 lock is implemented; Runs remains available. |
 
-## Verification performed
+## Pre-implementation verification performed
 
 The following live suites passed on 2026-09-01:
 
@@ -218,9 +219,82 @@ tests/plugins/workflow/test_language_schema.py
 Result: **944 passed, 0 failed, 1 platform skip**. The skip is Windows-only and
 runs in the Windows CI lane.
 
+## Post-implementation verification (2026-09-02)
+
+Stage 1 now crosses the real local boundary with two temporary profiles and
+their real homes, SQLite state, API-server multiplex middleware, profile-secret
+scope, Runs routing, and HTTP. The only substituted boundary is deterministic
+provider inference. The proof does not mock the handoff service, Runs,
+coordinator, or durable stores.
+
+The real-path suite verifies assignment admission/trust, an idempotency-keyed
+destination Run, a released Workflow worker while its run stays active,
+a destination held active across elected-coordinator replacement, one result
+observed and structurally validated by the successor, duplicate suppression,
+a separate active destination stopped through truthful cancellation, a
+naturally expired deadline advanced by the real scheduler/coordinator path,
+interrupted/deadline Needs Attention and redacted evidence, and unchanged
+ordinary prompt and Bot Mode contracts. A separate POSIX subprocess verifies
+a real CLI task receipt and dedicated `Handoff: <handoff_id>` session. On the
+Darwin verification host, the Linux and Windows cases were skipped; this
+assessment does not claim they ran locally. The Windows case runs on its host
+lane and requires the Stage 1 fallback-unavailable result.
+
+The exact Stage 1 focused gate passed:
+
+```text
+scripts/run_tests.sh \
+  tests/hermes_cli/handoff \
+  tests/hermes_cli/test_handoff_cmd.py \
+  tests/hermes_cli/test_peer_cmd.py \
+  tests/hermes_cli/test_plugin_background_services.py \
+  tests/tools/test_bot_turn_lock.py \
+  tests/tools/test_bot_relay_windows_paths.py \
+  tests/tools/test_bot_mode_dm.py \
+  tests/gateway/test_api_server_run_idempotency.py \
+  tests/gateway/test_api_server_runs.py \
+  tests/plugins/workflow/test_local_handoff_e2e.py \
+  tests/plugins/workflow/test_coordinator.py \
+  tests/plugins/workflow/test_coordinator_multiprocess.py \
+  tests/plugins/workflow/test_schema.py \
+  tests/plugins/workflow/test_language_schema.py \
+  tests/plugins/workflow/test_notifications.py \
+  --file-retries 0 -q
+
+1269 passed, 0 failed, 4 host-specific skips
+```
+
+Additional fresh verification:
+
+```text
+scripts/run_tests.sh tests/plugins/workflow/test_local_handoff_e2e.py \
+  --file-retries 0 -q
+6 passed, 0 failed, 2 host-specific skips
+
+scripts/run_tests.sh \
+  tests/plugins/workflow/test_installed_distribution_e2e.py \
+  --file-retries 0 -m integration \
+  -k extracted_wheel_registers_workflow_cli_from_a_clean_home -q
+1 passed, 0 failed, 5 deselected
+
+scripts/run_tests.sh tests/plugins/workflow -q
+131 files; 5916 passed, 0 failed, 5 host-specific skips
+```
+
+The integration-marked installed-wheel smoke was selected explicitly; the
+default non-integration selection does not count as that proof. The broad run
+exited zero after five first-attempt flakes passed on automatic retry,
+including a Darwin parallel SQLite/native bus crash and unrelated
+timing-sensitive Workflow tests. The corrected local and installed cases
+passed independently with file retries disabled. No production integration
+correction was required by the end-to-end proof. Compatibility-only test
+fixtures were updated to project the intentional redacted `assignments: {}`
+field and to give pre-Stage-1 coordinator scheduler stubs the neutral
+`advance_due_handoffs()` result.
+
 ## Implementation gate
 
-Stage 1 is ready when implemented in the order defined by the companion plan.
-It is complete only after real two-profile tests prove keyed Runs, CLI fallback,
-restart recovery, cancellation, output validation, evidence inspection, and
-Needs Attention without changing Bot Mode behavior or adding a model tool.
+Stage 1 is complete. Real two-profile tests prove keyed Runs held across
+restart, active cancellation convergence, scheduler-driven deadline handling,
+POSIX CLI fallback, output validation, evidence inspection, and Needs Attention
+without changing Bot Mode behavior or adding a model tool.

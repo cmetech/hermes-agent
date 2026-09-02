@@ -1,0 +1,278 @@
+schema_version: 1
+feature: agent-handoff
+# Stage 1 is the bounded local-Workflow slice. The handoff service remains
+# consumer-neutral; Workflow owns only its assignment and wait projection.
+ownership:
+  handoff_service: hermes_cli/handoff
+  workflow_consumer: plugins/workflow
+  local_cli_serialization: tools/bot_relay.py
+  model_tool_surface: unchanged
+configuration:
+  user_visible:
+  - workflow companion sidecars may declare prompt-node assignments with a
+    canonical hermes://local/<profile> endpoint, interaction policy, deadline,
+    and deadline action
+  - operators inspect profile-local state with hermes handoff list, show,
+    evidence, and reconcile
+  credentials:
+  - loopback Runs uses only the destination profile's API_SERVER_KEY through
+    the existing API-server profile scope
+  - no new user-facing environment variable or credential store is introduced
+  transport:
+  - local Runs requires an enabled multiplexed loopback API server advertising
+    durable keyed Runs; POSIX may use the bounded noninteractive CLI fallback
+storage:
+  handoff_database: ${HERMES_HOME}/handoffs.db
+  workflow_database: ${HERMES_HOME}/workflows/admission.sqlite3
+  destination_run_database: <destination-profile-home>/state.db
+  destination_profile_homes:
+    default: <default-hermes-home>
+    named: <default-hermes-home>/profiles/<profile>
+  cli_receipts: ${HERMES_HOME}/handoffs/<handoff_id>/
+upstream_touchpoints:
+- gateway/platforms/api_server.py native and profile-prefixed route mounting,
+  profile secret scope, capabilities, and Runs routes
+- gateway/platforms/api_server_runs.py durable keyed admission, status,
+  interruption, and stop behavior
+- gateway/platforms/api_server_run_idempotency.py profile-and-credential-scoped
+  idempotency reservations
+- tools/bot_relay.py destination-profile cross-process turn lock
+- hermes_cli/main.py top-level CLI registration
+- plugins/workflow coordinator election, scheduler, store, sidecar schema,
+  trust summary, dashboard projection, notification journal, and attention
+rollback:
+  procedure:
+  - stop Workflow coordinator hosts before reverting so no new handoff advances
+    begin during rollback
+  - revert the Stage 1 commits as one dependency-ordered series, removing the
+    assignments language only after waiting_handoff runs have settled
+  - preserve handoffs.db, Workflow evidence, and destination Run state until
+    operators have reconciled every nonterminal handoff
+  - ordinary unassigned prompt nodes and Bot Mode remain the fallback behavior;
+    never reinterpret an admitted handoff as a Bot Chat send
+  data_compatibility: Stage 1 SQLite migrations are additive; rollback must not
+    delete profile-local evidence or receipts automatically
+deferred_stages:
+  stage_2: remote hermes://peer routing, interaction, steer/follow-up, and stop
+  stage_3: Bot Mode and Desktop migration plus durable return delivery
+  stage_4: separately distributed GitLab+ICM plugin and channel registration
+  stage_5: Windows destination lock, operational hardening, and retirement review
+verification:
+  date: 2026-09-02
+  host: darwin
+  commands:
+  - command: >-
+      scripts/run_tests.sh tests/hermes_cli/handoff
+      tests/hermes_cli/test_handoff_cmd.py tests/hermes_cli/test_peer_cmd.py
+      tests/hermes_cli/test_plugin_background_services.py
+      tests/tools/test_bot_turn_lock.py
+      tests/tools/test_bot_relay_windows_paths.py
+      tests/tools/test_bot_mode_dm.py
+      tests/gateway/test_api_server_run_idempotency.py
+      tests/gateway/test_api_server_runs.py
+      tests/plugins/workflow/test_local_handoff_e2e.py
+      tests/plugins/workflow/test_coordinator.py
+      tests/plugins/workflow/test_coordinator_multiprocess.py
+      tests/plugins/workflow/test_schema.py
+      tests/plugins/workflow/test_language_schema.py
+      tests/plugins/workflow/test_notifications.py --file-retries 0 -q
+    result: 1269 passed, 0 failed, 4 host-specific skips
+  - command: >-
+      scripts/run_tests.sh
+      tests/plugins/workflow/test_local_handoff_e2e.py --file-retries 0 -q
+    result: 6 passed, 0 failed, 2 host-specific skips
+  - command: >-
+      scripts/run_tests.sh
+      tests/plugins/workflow/test_installed_distribution_e2e.py
+      --file-retries 0 -m integration
+      -k extracted_wheel_registers_workflow_cli_from_a_clean_home -q
+    result: 1 passed, 0 failed, 5 deselected
+  - command: scripts/run_tests.sh tests/plugins/workflow -q
+    result: 131 files, 5916 passed, 0 failed, 5 host-specific skips
+  host_coverage:
+  - the macOS POSIX receipt case ran locally
+  - Linux and Windows host-marked cases were skipped locally and remain on
+    their platform lanes
+
+upstream_changes:
+- id: durable-agent-handoff-service
+  change_class: capability-generic
+  owner: downstream-agent-handoff
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/handoff/__init__.py
+  - hermes_cli/handoff/cli.py
+  - hermes_cli/handoff/local.py
+  - hermes_cli/handoff/models.py
+  - hermes_cli/handoff/service.py
+  - hermes_cli/handoff/store.py
+  - hermes_cli/main.py
+  - tools/bot_relay.py
+  owned_symbols:
+  - HandoffEndpoint
+  - HandoffSpec
+  - HandoffStore
+  - AgentHandoffService
+  - LocalHermesChannel
+  - cmd_handoff
+  - build_handoff_parser
+  owned_invariants:
+  - one stable consumer key maps to one immutable handoff specification and conflicting reuse fails closed
+  - the initiating profile owns the durable lifecycle ledger while the destination profile owns its Run and credentials
+  - binding fixes one endpoint and mechanism before submission and uncertain admission reconciles without blind duplicate execution
+  - cancellation records durable intent but terminal truth continues to follow the destination observation
+  - evidence is bounded and redacted and never persists API keys authorization headers or raw secret-bearing failures
+  - the CLI fallback is noninteractive receipt-based and destination-lock serialized on POSIX and unavailable on Windows
+  tests:
+  - tests/hermes_cli/handoff/test_models.py
+  - tests/hermes_cli/handoff/test_store.py
+  - tests/hermes_cli/handoff/test_service.py
+  - tests/hermes_cli/handoff/test_local_runs.py
+  - tests/hermes_cli/handoff/test_local_cli.py
+  - tests/hermes_cli/test_handoff_cmd.py
+  - tests/hermes_cli/test_peer_cmd.py
+  - tests/tools/test_bot_turn_lock.py
+  - tests/tools/test_bot_relay_windows_paths.py
+  - tests/gateway/test_api_server_run_idempotency.py
+  - tests/gateway/test_api_server_runs.py
+  expected_commit_subject: 'feat(handoff): define local task contract'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Preserve the consumer-neutral service and profile-local
+    ledger while adapting to upstream API-server and CLI changes. Reuse the
+    native/profile Runs routes and their idempotency store; never fork those
+    authorities. Keep destination credentials inside the routed profile scope,
+    persist submit intent before I/O, reconcile indeterminate outcomes, and
+    keep the CLI fallback disabled on Windows until the destination lock has a
+    real cross-process implementation. Rerun the handoff, Runs, peer, Bot-lock,
+    and real two-profile suites after overlap.
+  removal_condition: >-
+    Remove when upstream provides an equivalent consumer-neutral, profile-local
+    durable handoff lifecycle with immutable binding, keyed local Runs,
+    convergent cancellation and reconciliation, bounded redacted evidence, and
+    a safe noninteractive destination-serialized local fallback.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
+
+- id: workflow-assigned-prompt-handoffs
+  change_class: workflow-runtime
+  owner: downstream-workflow-orchestration
+  overlap_policy: any_owned_file
+  files:
+  - plugins/workflow/admission.py
+  - plugins/workflow/api_admission.py
+  - plugins/workflow/cli.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/executors/__init__.py
+  - plugins/workflow/executors/ai.py
+  - plugins/workflow/executors/handoff.py
+  - plugins/workflow/gateway_command.py
+  - plugins/workflow/language_schema.py
+  - plugins/workflow/models.py
+  - plugins/workflow/notifications.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/showcase.py
+  - plugins/workflow/store.py
+  - plugins/workflow/trust.py
+  owned_symbols:
+  - HandoffWaitProjection
+  - HandoffPromptExecutor
+  - RunScheduler.advance_due_handoffs
+  - RunStore.begin_handoff_wait
+  - RunStore.request_handoff_cancel
+  - WorkflowCoordinatorService
+  - projected_handoff_attention
+  - public_handoff_failure_code
+  owned_invariants:
+  - only explicitly assigned prompt nodes become handoffs and unassigned prompt execution remains unchanged
+  - assignments participate in schema admission trust summaries snapshots and public redacted catalog projections
+  - waiting_handoff releases worker capacity while the owning Workflow run remains active and restart-recoverable
+  - coordinator advancement is elected fenced bounded and idempotently projects one terminal destination result
+  - structured output is validated by the same prompt executor helpers used for same-profile execution
+  - deadline uncertainty interruption and terminal failure project actionable journal-backed Needs Attention records
+  - Stage 1 does not change message_agent schema Bot Chat naming relay resolution or fire-and-forget behavior
+  tests:
+  - tests/plugins/workflow/test_admission.py
+  - tests/plugins/workflow/test_ai_executor.py
+  - tests/plugins/workflow/test_api_runtime.py
+  - tests/plugins/workflow/test_cancel_node.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_coordinator_multiprocess.py
+  - tests/plugins/workflow/test_crash_recovery.py
+  - tests/plugins/workflow/test_handoff_executor.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_notifications.py
+  - tests/plugins/workflow/test_scheduler.py
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_showcase_schedule_e2e.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_trust_policy.py
+  expected_commit_subject: 'feat(workflow): execute assigned prompts as handoffs'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Keep assignments in the companion sidecar and out of the
+    portable workflow document. Preserve admission and trust parity across CLI,
+    API, gateway, dashboard, catalog, and snapshot paths. A healthy handoff wait
+    remains a running Workflow with released worker capacity; the elected
+    coordinator alone advances it and the store compare-and-sets terminal
+    projection. Keep Needs Attention journal-derived and keep Bot Mode outside
+    this consumer adapter.
+  removal_condition: >-
+    Remove when upstream provides equivalent assignment admission, durable
+    worker-releasing handoff waits, fenced restart recovery, cancellation truth,
+    shared structured-output validation, and journal-derived actionable
+    attention without changing ordinary prompt or Bot Mode behavior.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
+
+- id: local-agent-handoff-end-to-end-proof
+  change_class: test-infrastructure
+  owner: downstream-agent-handoff
+  overlap_policy: any_owned_file
+  files:
+  - tests/plugins/workflow/test_local_handoff_e2e.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_catalog_cli.py
+  - tests/plugins/workflow/test_performance_bounds.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  owned_symbols:
+  - test_assigned_workflow_crosses_real_profile_and_resumes_after_restart
+  - test_active_destination_cancellation_converges_through_real_stop
+  - test_destination_interruption_is_actionable_and_redacted
+  - test_expired_deadline_drives_real_cancel_and_actionable_attention
+  - test_unassigned_workflow_and_bot_mode_contracts_remain_separate
+  - test_macos_cli_fallback_writes_a_real_dedicated_receipt
+  - test_linux_cli_fallback_writes_a_real_dedicated_receipt
+  - test_windows_host_reports_cli_fallback_unavailable
+  - test_extracted_wheel_registers_workflow_cli_from_a_clean_home
+  owned_invariants:
+  - real-path coverage uses two temporary profile homes real SQLite stores actual API routing and HTTP and replaces only provider inference
+  - no test mocks the handoff service Runs profile secret scope coordinator or durable stores
+  - restart proof holds one real keyed destination Run active across coordinator replacement then validates its structured result without duplicate execution
+  - cancellation proof stops a separate active destination Run and follows destination observation to authoritative terminal convergence
+  - deadline proof advances the injected wall clock after normal submission and uses the real coordinator scheduler path to expire and cancel the destination
+  - the integration-marked installed wheel smoke exposes hermes handoff help through the production CLI module
+  - POSIX receipt execution is host-specific and Windows unavailability is asserted only on a real Windows host
+  tests:
+  - tests/plugins/workflow/test_local_handoff_e2e.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_catalog_cli.py
+  - tests/plugins/workflow/test_performance_bounds.py
+  - tests/plugins/workflow/test_scheduled_runs.py
+  expected_commit_subject: 'test(workflow): prove local agent handoffs end to end'
+  upstream_candidate: true
+  merge_guidance: >-
+    Preserve the real boundaries. Provider inference may remain deterministic,
+    but do not replace the handoff service, API route/multiplex middleware,
+    Runs durability, profile secret scope, Workflow coordinator, or SQLite
+    stores with mocks. Run POSIX receipt proof on its actual host and leave the
+    Windows fallback assertion to the Windows lane; never claim host-skipped
+    coverage was executed locally.
+  removal_condition: >-
+    Remove only with equivalent installed-distribution and real two-profile
+    end-to-end proof of admission, keyed destination execution, restart,
+    duplicate suppression, cancellation truth, structured output, attention,
+    evidence redaction, ordinary prompts, Bot Mode isolation, and host-specific
+    CLI fallback behavior.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

@@ -1014,6 +1014,7 @@ def test_coordinator_cursor_reaches_run_201_with_bounded_keyset_pages(
     assert not any("TEMP B-TREE" in detail for detail in query_plan)
 
     scheduler = MagicMock()
+    scheduler.advance_due_handoffs.return_value = (0, 0, 0)
     scheduler.submit.return_value = True
     service = WorkflowCoordinatorService(
         BackgroundServiceContext(

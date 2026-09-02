@@ -1,6 +1,7 @@
 # Shared Agent Handoff Facade for Workflows and Bot Mode
 
-**Status:** Accepted implementation baseline; implementation not started
+**Status:** Accepted implementation baseline; Stage 1 implemented and verified;
+Stages 2–5 deferred
 
 **Date:** 2026-09-01
 
@@ -34,8 +35,8 @@ After reading this proposal, an engineer should be able to:
 6. extend the design to GitLab+ICM without putting GitLab types or credentials
    in Hermes core.
 
-This is a solution proposal, not an implementation plan or a claim that the
-feature already exists.
+This remains the design authority rather than an implementation plan. Stage 1
+now exists; the later stages remain accepted design, not implemented behavior.
 
 Implementation artifacts:
 
@@ -139,7 +140,8 @@ Several details in the source reports must not be copied into implementation:
 The exact upstream v0.21.0 release (`v2026.8.31`) is now an ancestor of
 `base`. The real merge commit is `59de9bfea2`, and the post-merge report records
 the canonical, Desktop, branding, and customization-ledger verification. The
-shared Agent Handoff Service described here does not yet exist.
+Stage 1 shared Agent Handoff Service and local Workflow consumer now exist;
+remote peers, Bot/Desktop migration, and external channels remain deferred.
 
 The merged fork already provides the transport and host pieces the service
 should reuse:
@@ -1586,7 +1588,7 @@ interfaces.
   verification recorded in the v0.21.0 post-merge report.
 - Advanced all customization manifests to the exact v0.21.0 baseline.
 
-### Stage 1 — local Workflow handoff
+### Stage 1 — local Workflow handoff (implemented 2026-09-02)
 
 - Add the minimum service, SQLite store, event ledger, and built-in Hermes
   local adapter.
@@ -1599,6 +1601,70 @@ interfaces.
 
 This proves the core semantics against the primary local use case before
 adding a second consumer.
+
+Implementation evidence:
+
+- Two temporary profiles use their real profile homes, profile-secret scope,
+  SQLite stores, multiplex middleware, API-server Runs routes, and HTTP. Only
+  provider inference is deterministic. The proof covers admission and trust,
+  stable keyed destination execution, released Workflow worker capacity,
+  a destination Run held active across elected-coordinator replacement,
+  successor-observed structured-output validation, duplicate suppression, a
+  separate active destination stopped through truthful cancellation,
+  scheduler-driven deadline expiry, interruption attention, and bounded
+  redacted evidence.
+- A separate real POSIX process runs the installed `hermes` CLI, writes and
+  verifies its dedicated receipt, and creates `Handoff: <handoff_id>` without
+  touching canonical Bot Chat. The Linux and Windows host-specific cases were
+  skipped on the Darwin verification host; Windows asserts that CLI fallback
+  is unavailable until Stage 5 supplies the cross-process lock.
+- Ordinary unassigned prompt execution and the model-visible `message_agent`
+  schema, canonical Bot Chat title, and fire-and-forget behavior remain
+  unchanged.
+
+Fresh verification commands and results:
+
+```text
+scripts/run_tests.sh \
+  tests/hermes_cli/handoff \
+  tests/hermes_cli/test_handoff_cmd.py \
+  tests/hermes_cli/test_peer_cmd.py \
+  tests/hermes_cli/test_plugin_background_services.py \
+  tests/tools/test_bot_turn_lock.py \
+  tests/tools/test_bot_relay_windows_paths.py \
+  tests/tools/test_bot_mode_dm.py \
+  tests/gateway/test_api_server_run_idempotency.py \
+  tests/gateway/test_api_server_runs.py \
+  tests/plugins/workflow/test_local_handoff_e2e.py \
+  tests/plugins/workflow/test_coordinator.py \
+  tests/plugins/workflow/test_coordinator_multiprocess.py \
+  tests/plugins/workflow/test_schema.py \
+  tests/plugins/workflow/test_language_schema.py \
+  tests/plugins/workflow/test_notifications.py \
+  --file-retries 0 -q
+1269 passed, 0 failed, 4 host-specific skips
+
+scripts/run_tests.sh tests/plugins/workflow/test_local_handoff_e2e.py \
+  --file-retries 0 -q
+6 passed, 0 failed, 2 host-specific skips
+
+scripts/run_tests.sh \
+  tests/plugins/workflow/test_installed_distribution_e2e.py \
+  --file-retries 0 -m integration \
+  -k extracted_wheel_registers_workflow_cli_from_a_clean_home -q
+1 passed, 0 failed, 5 deselected
+
+scripts/run_tests.sh tests/plugins/workflow -q
+131 files; 5916 passed, 0 failed, 5 host-specific skips
+```
+
+The installed wheel smoke retains its integration marker and was forced into
+this verification run explicitly; the default non-integration selection does
+not count as its evidence. The full Workflow run exited successfully after
+five first-attempt flakes passed on harness retry, including unrelated
+timing-sensitive files and a Darwin parallel SQLite/native bus crash. The
+corrected local and installed-distribution cases passed independently with
+file retries disabled.
 
 ### Stage 2 — remote Hermes
 
