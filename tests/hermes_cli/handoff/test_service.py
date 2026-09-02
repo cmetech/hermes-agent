@@ -314,6 +314,32 @@ def test_default_dispatcher_selects_only_the_endpoint_channel(tmp_path):
     ]
 
 
+def test_builtin_channel_switch_delegates_peer_command_delivery(tmp_path):
+    service = AgentHandoffService(store=HandoffStore(tmp_path / "commands.db"))
+    calls = []
+
+    class _Channel:
+        def __init__(self, name):
+            self.name = name
+
+        def deliver_command(self, snapshot, command, *, budget_seconds):
+            calls.append((self.name, snapshot, command, budget_seconds))
+            return "delivered", None
+
+    service.channel.local = _Channel("local")
+    service.channel.peer = _Channel("peer")
+    spec = replace(
+        _spec(), endpoint=HandoffEndpoint.parse("hermes://peer/spark/reviewer")
+    )
+    snapshot = service.create(spec, "workflow/run-1", handoff_key="peer/command")
+    command = object()
+
+    assert service.channel.deliver_command(
+        snapshot, command, budget_seconds=0.75
+    ) == ("delivered", None)
+    assert calls == [("peer", snapshot, command, 0.75)]
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [

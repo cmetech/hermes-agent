@@ -167,6 +167,11 @@ class _BuiltinHandoffChannels:
             snapshot, budget_seconds=budget_seconds
         )
 
+    def deliver_command(self, snapshot, command, *, budget_seconds: float):
+        return self._channel(snapshot.spec.endpoint).deliver_command(
+            snapshot, command, budget_seconds=budget_seconds
+        )
+
     def cleanup_committed(self, snapshot: HandoffSnapshot) -> None:
         cleanup = getattr(self._channel(snapshot.spec.endpoint), "cleanup_committed", None)
         if callable(cleanup):
