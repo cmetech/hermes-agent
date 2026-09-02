@@ -21,6 +21,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 import hermes_cli.handoff.local as local_module
+import hermes_cli.handoff.runs as runs_module
 from hermes_cli.handoff.local import LocalHermesChannel
 from hermes_cli.handoff.models import HandoffEndpoint, HandoffSpec
 from hermes_cli.handoff.service import AgentHandoffService, ChannelDefinitelyNotAccepted
@@ -298,7 +299,7 @@ async def test_lost_submit_response_replays_exact_body_and_key(
     async with _gateway(profile_env) as (adapter, _server):
         service, created = _service(default_home)
         await asyncio.to_thread(service.advance, created.handoff_id)
-        original = local_module.open_credentialed_url
+        original = runs_module.open_credentialed_url
         lose_once = True
 
         def lose_response(request, **kwargs):
@@ -311,7 +312,7 @@ async def test_lost_submit_response_replays_exact_body_and_key(
                 raise TimeoutError("response lost after acceptance")
             return response
 
-        monkeypatch.setattr(local_module, "open_credentialed_url", lose_response)
+        monkeypatch.setattr(runs_module, "open_credentialed_url", lose_response)
         ambiguous = (
             await asyncio.to_thread(service.advance, created.handoff_id)
         ).snapshot
@@ -697,7 +698,7 @@ def test_slow_drip_response_cannot_exceed_total_operation_budget(
             return next(self._chunks, b"")
 
     monkeypatch.setattr(
-        local_module,
+        runs_module,
         "open_credentialed_url",
         lambda *_args, **_kwargs: _SlowDrip(),
     )
@@ -726,7 +727,7 @@ async def test_response_reads_are_bounded_and_http_details_are_redacted(
 
         class _Oversized:
             def __init__(self):
-                self.remaining = local_module.MAX_RESPONSE_BYTES + 1
+                self.remaining = runs_module.MAX_RESPONSE_BYTES + 1
 
             def __enter__(self):
                 return self
@@ -735,7 +736,7 @@ async def test_response_reads_are_bounded_and_http_details_are_redacted(
                 return None
 
             def read(self, size):
-                assert size == local_module.MAX_RESPONSE_BYTES + 1
+                assert size == runs_module.MAX_RESPONSE_BYTES + 1
                 return b"x" * size
 
             def read1(self, size):
@@ -746,7 +747,7 @@ async def test_response_reads_are_bounded_and_http_details_are_redacted(
                 return b"x" * count
 
         monkeypatch.setattr(
-            local_module, "open_credentialed_url", lambda *_a, **_kw: _Oversized()
+            runs_module, "open_credentialed_url", lambda *_a, **_kw: _Oversized()
         )
         result = (await asyncio.to_thread(service.advance, created.handoff_id)).snapshot
         assert result.phase == "indeterminate"
@@ -771,7 +772,7 @@ async def test_http_error_body_is_never_persisted(profile_env, monkeypatch):
             None,
         )
         monkeypatch.setattr(
-            local_module,
+            runs_module,
             "open_credentialed_url",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
         )

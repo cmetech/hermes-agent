@@ -17,10 +17,8 @@ import stat
 import subprocess
 import sys
 import threading
-from time import monotonic
 import urllib.error
 import urllib.parse
-import urllib.request
 
 from agent.deadline import kill_process_tree
 from agent.secret_scope import build_profile_secret_scope
@@ -28,7 +26,6 @@ from gateway.config import Platform, load_gateway_config
 from gateway.platforms.api_server import DEFAULT_HOST, DEFAULT_PORT
 from hermes_cli.auth import has_usable_secret
 from hermes_cli.profiles import get_profile_dir, profiles_to_serve, validate_profile_name
-from hermes_cli.urllib_security import open_credentialed_url
 from hermes_constants import (
     get_hermes_home,
     reset_hermes_home_override,
@@ -39,6 +36,14 @@ from tools.environments.local import hermes_subprocess_env
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot
+from .runs import (
+    MAX_RESPONSE_BYTES,
+    RunsClient,
+    RunsConnection,
+    RunsDeadline,
+    observation_from_status,
+    terminal_result,
+)
 from .service import (
     ChannelDefinitelyNotAccepted,
     ChannelIndeterminate,
@@ -47,7 +52,6 @@ from .service import (
 )
 
 
-MAX_RESPONSE_BYTES = 600_000
 _READ_CHUNK_BYTES = 64 * 1024
 _VALIDATE_BUDGET_SECONDS = 2.0
 MAX_CLI_OUTPUT_BYTES = 500_000
@@ -66,12 +70,6 @@ _AUTHORITATIVE_RUNS_FAILURES = frozenset({
     "http_405",
 })
 _INTERACTIVE_CAPABILITIES = frozenset({"approval", "interactive", "needs_input"})
-
-
-@dataclass(frozen=True, slots=True)
-class _Connection:
-    base_url: str
-    key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,15 +472,8 @@ def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
         return exit_code
 
 
-class _Deadline:
-    def __init__(self, seconds: float) -> None:
-        self._at = monotonic() + seconds
-
-    def remaining(self) -> float:
-        remaining = self._at - monotonic()
-        if remaining <= 0:
-            raise TimeoutError("handoff operation budget expired")
-        return remaining
+_Connection = RunsConnection
+_Deadline = RunsDeadline
 
 
 def _listener_url(host: object, port: object) -> str | None:
@@ -517,79 +508,6 @@ def _listener_url(host: object, port: object) -> str | None:
 
 def _failure_code(exc: urllib.error.HTTPError) -> str:
     return f"http_{int(exc.code)}"
-
-
-def _direct_local_opener(redirect_handler):
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}),
-        redirect_handler,
-    )
-    opener.addheaders = []
-    return opener
-
-
-def _read_response(response, deadline: _Deadline) -> bytes:
-    read = getattr(response, "read1", None) or response.read
-    chunks = []
-    total = 0
-    while True:
-        remaining = deadline.remaining()
-        sock = getattr(
-            getattr(getattr(response, "fp", None), "raw", None), "_sock", None
-        )
-        if sock is not None:
-            try:
-                sock.settimeout(remaining)
-            except (OSError, ValueError):
-                pass
-        chunk = read(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - total))
-        deadline.remaining()
-        if not chunk:
-            return b"".join(chunks)
-        total += len(chunk)
-        if total > MAX_RESPONSE_BYTES:
-            raise ValueError("handoff response exceeds byte limit")
-        chunks.append(chunk)
-
-
-def _request_json(
-    connection: _Connection,
-    path: str,
-    deadline: _Deadline,
-    *,
-    method: str = "GET",
-    body: dict[str, object] | None = None,
-    headers: dict[str, str] | None = None,
-) -> dict[str, object]:
-    data = None
-    if body is not None:
-        data = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    request_headers = {
-        "Authorization": f"Bearer {connection.key}",
-        "Content-Type": "application/json",
-        "User-Agent": "hermes-local-handoff",
-    }
-    if headers:
-        request_headers.update(headers)
-    request = urllib.request.Request(
-        f"{connection.base_url}{path}",
-        data=data,
-        method=method,
-        headers=request_headers,
-    )
-    with open_credentialed_url(
-        request,
-        timeout=deadline.remaining(),
-        opener_factory=_direct_local_opener,
-    ) as response:
-        raw = _read_response(response, deadline)
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise ValueError("handoff endpoint returned invalid JSON") from exc
-    if not isinstance(value, dict):
-        raise ValueError("handoff endpoint returned non-object JSON")
-    return value
 
 
 def _checkpoint(snapshot: HandoffSnapshot, **changes: object) -> dict[str, object]:
@@ -693,7 +611,9 @@ class LocalHermesChannel:
         if connection is None:
             return None, failure
         try:
-            capabilities = _request_json(connection, "/v1/capabilities", deadline)
+            capabilities = RunsClient(connection, deadline).request_json(
+                "/v1/capabilities"
+            )
         except urllib.error.HTTPError as exc:
             return None, _failure_code(exc)
         except (OSError, TimeoutError, ValueError):
@@ -732,7 +652,9 @@ class LocalHermesChannel:
             "title": title,
             "include_hidden": 1,
         })
-        listing = _request_json(connection, f"/api/sessions?{query}", deadline)
+        listing = RunsClient(connection, deadline).request_json(
+            f"/api/sessions?{query}"
+        )
         rows = listing.get("data")
         if not isinstance(rows, list):
             raise ValueError("handoff session listing is invalid")
@@ -750,10 +672,8 @@ class LocalHermesChannel:
         if existing:
             return existing
         try:
-            created = _request_json(
-                connection,
+            created = RunsClient(connection, deadline).request_json(
                 "/api/sessions",
-                deadline,
                 method="POST",
                 body={"title": title, "source": "handoff"},
             )
@@ -948,7 +868,7 @@ class LocalHermesChannel:
         return ChannelObservation(
             phase="succeeded",
             checkpoint=checkpoint,
-            terminal_result=LocalHermesChannel._terminal_result(text),
+            terminal_result=terminal_result(text),
         )
 
     def _submit_cli(self, snapshot: HandoffSnapshot) -> ChannelObservation:
@@ -1030,16 +950,11 @@ class LocalHermesChannel:
         session_id = str((snapshot.checkpoint or {}).get("session_id") or "")
         if not session_id:
             raise ChannelIndeterminate("session_missing")
-        idempotency_key = f"handoff-{snapshot.handoff_id}"
-        body = {"input": snapshot.spec.prompt, "session_id": session_id}
         try:
-            response = _request_json(
-                connection,
-                "/v1/runs",
-                deadline,
-                method="POST",
-                body=body,
-                headers={"Idempotency-Key": idempotency_key},
+            response = RunsClient(connection, deadline).submit(
+                handoff_id=snapshot.handoff_id,
+                prompt=snapshot.spec.prompt,
+                session_id=session_id,
             )
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
@@ -1058,7 +973,7 @@ class LocalHermesChannel:
                 snapshot,
                 session_id=session_id,
                 run_id=run_id,
-                idempotency_key=idempotency_key,
+                idempotency_key=response["idempotency_key"],
                 status=str(response.get("status") or "queued"),
             ),
         )
@@ -1069,23 +984,6 @@ class LocalHermesChannel:
         if snapshot.mechanism == "local_cli":
             return self._submit_cli(snapshot)
         return self._submit(snapshot, _Deadline(budget_seconds))
-
-    @staticmethod
-    def _terminal_result(output: object) -> dict[str, object]:
-        text = (
-            output
-            if isinstance(output, str)
-            else json.dumps(output, sort_keys=True, separators=(",", ":"))
-        )
-        encoded = text.encode("utf-8")
-        return {
-            "text": text,
-            "sha256": sha256(encoded).hexdigest(),
-            "media_type": "text/plain"
-            if isinstance(output, str)
-            else "application/json",
-            "size_bytes": len(encoded),
-        }
 
     def _observe(
         self,
@@ -1099,11 +997,7 @@ class LocalHermesChannel:
         if not run_id:
             raise ChannelIndeterminate()
         try:
-            response = _request_json(
-                connection,
-                f"/v1/runs/{urllib.parse.quote(run_id, safe='')}",
-                deadline,
-            )
+            response = RunsClient(connection, deadline).status(run_id)
         except urllib.error.HTTPError as exc:
             if exc.code >= 500:
                 raise ChannelRetryableFailure() from exc
@@ -1111,43 +1005,12 @@ class LocalHermesChannel:
         except (OSError, TimeoutError, ValueError) as exc:
             raise ChannelRetryableFailure() from exc
 
-        status = str(response.get("status") or "unknown")
-        checkpoint = _checkpoint(snapshot, run_id=run_id, status=status)
-        if status == "completed":
-            try:
-                result = self._terminal_result(response.get("output", ""))
-                return ChannelObservation(
-                    phase="succeeded", checkpoint=checkpoint, terminal_result=result
-                )
-            except (TypeError, UnicodeError, ValueError) as exc:
-                raise ChannelIndeterminate() from exc
-        if status == "failed":
-            return ChannelObservation(
-                phase="failed", checkpoint=checkpoint, failure_code="remote_failed"
+        try:
+            return observation_from_status(
+                snapshot, response, cancelling=cancelling
             )
-        if status == "cancelled":
-            return ChannelObservation(phase="cancelled", checkpoint=checkpoint)
-        if status == "interrupted":
-            return ChannelObservation(
-                phase="indeterminate",
-                checkpoint=checkpoint,
-                failure_code="run_interrupted",
-            )
-        if cancelling or status == "stopping":
-            return ChannelObservation(phase="cancelling", checkpoint=checkpoint)
-        phase = {
-            "queued": "submitted",
-            "started": "submitted",
-            "running": "active",
-            "waiting_for_approval": "needs_input",
-        }.get(status)
-        if phase is None:
-            return ChannelObservation(
-                phase="indeterminate",
-                checkpoint=checkpoint,
-                failure_code="run_status_unknown",
-            )
-        return ChannelObservation(phase=phase, checkpoint=checkpoint)
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise ChannelIndeterminate() from exc
 
     def reconcile(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
@@ -1225,13 +1088,7 @@ class LocalHermesChannel:
         if not run_id:
             raise ChannelIndeterminate()
         try:
-            _request_json(
-                connection,
-                f"/v1/runs/{urllib.parse.quote(run_id, safe='')}/stop",
-                deadline,
-                method="POST",
-                body={},
-            )
+            RunsClient(connection, deadline).stop(run_id)
         except urllib.error.HTTPError as exc:
             raise ChannelIndeterminate() from exc
         except (OSError, TimeoutError, ValueError) as exc:
