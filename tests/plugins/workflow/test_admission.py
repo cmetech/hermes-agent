@@ -260,6 +260,111 @@ def test_assignment_admission_releases_probe_slot_after_success(monkeypatch):
     ]
 
 
+def test_assignment_admission_waits_for_healthy_concurrent_probe(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {"endpoint": "hermes://local/reviewer"},
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+    first_probe_started = threading.Event()
+    release_first_probe = threading.Event()
+    second_admission_started = threading.Event()
+    activity_lock = threading.Lock()
+
+    class PausedChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.active = 0
+            self.max_active = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            with activity_lock:
+                self.calls += 1
+                call_number = self.calls
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                if call_number == 1:
+                    first_probe_started.set()
+                    assert release_first_probe.wait(timeout=2)
+                return EndpointAssessment(parsed, True, "local_cli")
+            finally:
+                with activity_lock:
+                    self.active -= 1
+
+    channel = PausedChannel()
+
+    def admit():
+        return workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=channel,
+        )
+
+    def admit_second():
+        second_admission_started.set()
+        return admit()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(admit)
+        assert first_probe_started.wait(timeout=2)
+        second = pool.submit(admit_second)
+        assert second_admission_started.wait(timeout=2)
+        try:
+            time.sleep(0.05)
+            assert not second.done()
+        finally:
+            release_first_probe.set()
+
+        assert first.result(timeout=2) == {"review": "local_cli"}
+        assert second.result(timeout=2) == {"review": "local_cli"}
+
+    assert channel.calls == 2
+    assert channel.max_active == 1
+
+
+def test_assignment_admission_releases_probe_slot_after_validator_exception(
+    monkeypatch,
+):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {"endpoint": "hermes://local/reviewer"},
+            }
+        }
+    )
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _profile: True)
+
+    class FailingOnceChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_endpoint(self, parsed, initiator):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("validator failed")
+            return EndpointAssessment(parsed, True, "local_cli")
+
+    channel = FailingOnceChannel()
+
+    with pytest.raises(RuntimeError, match="validator failed"):
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=channel,
+        )
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=channel,
+    ) == {"review": "local_cli"}
+    assert channel.calls == 2
+
+
 def test_assignment_admission_bounds_distinct_endpoint_probes(monkeypatch):
     package = SimpleNamespace(
         sidecar={

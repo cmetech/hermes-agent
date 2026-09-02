@@ -72,7 +72,13 @@ def validate_assignment_admission(
         assessment = assessments.get(endpoint.canonical)
         if assessment is None:
             remaining = deadline - monotonic()
-            if remaining <= 0 or not _assignment_probe_slot.acquire(blocking=False):
+            acquired = remaining > 0 and _assignment_probe_slot.acquire(
+                timeout=remaining
+            )
+            remaining = deadline - monotonic()
+            if not acquired or remaining <= 0:
+                if acquired:
+                    _assignment_probe_slot.release()
                 raise WorkflowValidationError(
                     ValidationIssue(
                         path=path,
