@@ -11,6 +11,7 @@ from enum import Enum
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -70,6 +71,7 @@ from plugins.workflow.lease_clock import LeaseClockSample
 from plugins.workflow.models import (
     DeadlineBudget,
     ExecutionFence,
+    HandoffWaitProjection,
     LoopGroupChildScope,
     LoopSignalConfirmation,
     RetryLedgerGrant,
@@ -140,6 +142,7 @@ _CLAUSE = re.compile(
     re.UNICODE,
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+logger = logging.getLogger(__name__)
 
 
 class LoopInputIntegrityError(ValueError):
@@ -1090,13 +1093,7 @@ class RunScheduler:
         assignment: Mapping[str, object],
         projection: Mapping[str, object],
     ) -> HandoffPromptExecutor:
-        with self._activity:
-            if self._handoff_service is None:
-                self._handoff_service = AgentHandoffService(
-                    HandoffStore(self.store.hermes_home / "handoffs.db")
-                )
-                self._owns_handoff_service = True
-            service = self._handoff_service
+        service = self._handoff_service_instance()
         deadline_at = None
         duration = assignment.get("deadline")
         if duration is not None:
@@ -1125,6 +1122,104 @@ class RunScheduler:
             deadline_at=deadline_at,
             utcnow=self._utcnow,
         )
+
+    def _handoff_service_instance(self) -> AgentHandoffService:
+        with self._activity:
+            if self._handoff_service is None:
+                self._handoff_service = AgentHandoffService(
+                    HandoffStore(self.store.hermes_home / "handoffs.db")
+                )
+                self._owns_handoff_service = True
+            return self._handoff_service
+
+    def advance_due_handoffs(
+        self,
+        run_id: str,
+        *,
+        deadline: float,
+        max_items: int = 20,
+    ) -> tuple[int, int]:
+        """Advance one bounded page of due handoffs under the coordinator fence."""
+        if not 1 <= max_items <= 100:
+            raise ValueError("max_items must be between 1 and 100")
+        if self._shutdown.is_set() or self.execution_fence is None:
+            return 0, 0
+        try:
+            with self.store._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self.store.assert_execution_fence(connection, self.execution_fence)
+                connection.commit()
+        except RuntimeError as exc:
+            if "execution fence" in str(exc):
+                return 0, 0
+            raise
+
+        observed = self._utcnow().astimezone(timezone.utc)
+        projection = self.store.load_run(run_id)
+        nodes = projection.get("nodes")
+        if not isinstance(nodes, Mapping):
+            return 0, 0
+        due: list[tuple[str, HandoffWaitProjection]] = []
+        for node_id, node in sorted(nodes.items()):
+            if not isinstance(node, Mapping) or node.get("state") != "waiting_handoff":
+                continue
+            try:
+                wait = HandoffWaitProjection.from_durable_record(node.get("handoff"))
+            except ValueError:
+                continue
+            if wait.next_observation_at <= observed:
+                due.append((str(node_id), wait))
+                if len(due) == max_items:
+                    break
+
+        advanced = terminal = 0
+        service = self._handoff_service_instance() if due else None
+        for node_id, wait in due:
+            if self._shutdown.is_set():
+                break
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
+            try:
+                result = service.advance(
+                    wait.handoff_id,
+                    budget_seconds=remaining,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Workflow handoff advance failed for %s: %s",
+                    wait.handoff_id,
+                    type(exc).__name__,
+                )
+                continue
+            snapshot = result.snapshot
+            if snapshot.handoff_id != wait.handoff_id:
+                logger.warning(
+                    "Workflow handoff advance returned mismatched identity for %s",
+                    wait.handoff_id,
+                )
+                continue
+            is_terminal = snapshot.phase in {"succeeded", "failed", "cancelled"}
+            next_observation_at = (
+                observed
+                if is_terminal
+                else snapshot.next_advance_at or observed + timedelta(seconds=5)
+            )
+            if self.store.refresh_handoff_wait(
+                run_id,
+                node_id,
+                handoff_id=wait.handoff_id,
+                generation=wait.generation,
+                expected_observed_version=wait.last_observed_version,
+                observed_version=snapshot.state_version,
+                observed_phase=snapshot.phase,
+                next_observation_at=next_observation_at,
+                fence=self.execution_fence,
+                now=self.store._lease_clock(),
+            ):
+                advanced += 1
+                terminal += int(is_terminal)
+        return advanced, terminal
 
     def _reconcile_session_registry_update(self, run_id: str) -> bool:
         pending = self.store.pending_session_registry_update(run_id)

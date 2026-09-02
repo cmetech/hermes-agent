@@ -10,6 +10,12 @@ import threading
 import pytest
 
 from agent.plugin_agent import PluginAgentRunResult
+from hermes_cli.handoff import (
+    AdvanceResult,
+    HandoffEndpoint,
+    HandoffSnapshot,
+    HandoffSpec,
+)
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
@@ -3318,6 +3324,109 @@ def test_healthy_handoff_wait_survives_restart_without_generic_stall(
         semantic_stall_seconds=300,
     )
     assert "stall" not in restarted.load_run(admitted.run_id)
+
+
+def test_reopened_scheduler_advances_existing_handoff_without_new_generation(
+    tmp_path, workflow_writer
+) -> None:
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    sample = LeaseClockSample(base, 100.0, "boot-a")
+    home = tmp_path / "handoff-coordinator-reopen-home"
+    store = RunStore(home, lease_clock=lambda: sample)
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / "handoff-coordinator-reopen-package",
+            name="handoff-coordinator-reopen",
+            nodes=[{"id": "start", "prompt": "delegate this task"}],
+        )
+    )
+    admitted = _run(
+        store,
+        package,
+        idempotency_key="handoff-coordinator-reopen",
+    )
+    identity = CoordinatorIdentity("handoff-owner", "gateway", "host", 1, None)
+    leadership = CoordinatorStore(store.database, clock=lambda: sample).try_acquire(
+        identity,
+        now=base,
+        lease_seconds=600,
+    )
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    claim = store.claim_node(
+        admitted.run_id,
+        "start",
+        "handoff-worker",
+        now=base,
+        monotonic_now=100.0,
+        execution_fence=fence,
+    )
+    assert claim is not None
+    assert store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-existing",
+        generation=4,
+        observed_version=7,
+        observed_phase="active",
+        next_observation_at=base,
+        deadline_at=None,
+        now=sample,
+    )
+
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="delegate this task",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"consumer": "workflow"},
+        required_capabilities=frozenset(),
+    )
+
+    class ReopenedService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            self.calls.append(handoff_id)
+            return AdvanceResult(
+                HandoffSnapshot(
+                    handoff_id=handoff_id,
+                    key_scope="default",
+                    handoff_key=f"{admitted.run_id}:start:4",
+                    spec=spec,
+                    spec_fingerprint=spec.fingerprint,
+                    phase="active",
+                    state_version=8,
+                    next_advance_at=base + timedelta(seconds=5),
+                ),
+                "observe",
+                True,
+            )
+
+    service = ReopenedService()
+    scheduler = RunScheduler(
+        RunStore(home, lease_clock=lambda: sample),
+        execution_fence=fence,
+        handoff_service=service,
+        utcnow=lambda: base,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(
+            admitted.run_id,
+            deadline=102.0,
+            max_items=1,
+        ) == (1, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert service.calls == ["handoff-existing"]
+    handoff = RunStore(home, lease_clock=lambda: sample).load_run(
+        admitted.run_id
+    )["nodes"]["start"]["handoff"]
+    assert handoff["handoff_id"] == "handoff-existing"
+    assert handoff["generation"] == 4
+    assert handoff["last_observed_version"] == 8
 
 
 @pytest.mark.parametrize(
