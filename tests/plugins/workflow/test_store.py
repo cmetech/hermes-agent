@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from plugins.workflow.admission import RunAdmissionRequest
+from plugins.workflow.models import HandoffWaitProjection
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.store import InputSnapshotError, RunStore, StorageQuotaError
 from plugins.workflow.trust import WorkflowResourceReadBudget
@@ -315,6 +316,32 @@ def _start_package_failure_store_run(tmp_path, workflow_writer, *, name):
     return store, admitted.run_id
 
 
+def _start_handoff_store_run(tmp_path, workflow_writer, *, name):
+    store = RunStore(tmp_path / f"home-{name}")
+    package = load_workflow(
+        workflow_writer(
+            tmp_path / f"package-{name}",
+            name=name,
+            nodes=[{"id": "start", "prompt": "delegate this task"}],
+        )
+    )
+    prepared = store.prepare_run_snapshot(package)
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    assert admitted.run_id is not None
+    return store, admitted.run_id
+
+
 def test_package_validation_failure_rejects_stale_projection_state(
     tmp_path, workflow_writer
 ):
@@ -400,7 +427,7 @@ def test_snapshot_refuses_low_disk_and_per_run_quota(
 def test_handoff_wait_releases_claim_and_keeps_run_running(
     tmp_path, workflow_writer
 ) -> None:
-    store, run_id = _start_package_failure_store_run(
+    store, run_id = _start_handoff_store_run(
         tmp_path, workflow_writer, name="handoff-wait"
     )
     claim = store.claim_node(run_id, "start", "handoff-worker")
@@ -441,7 +468,7 @@ def test_handoff_wait_releases_claim_and_keeps_run_running(
 def test_handoff_wait_projection_is_idempotent_and_rejects_stale_claim(
     tmp_path, workflow_writer
 ) -> None:
-    store, run_id = _start_package_failure_store_run(
+    store, run_id = _start_handoff_store_run(
         tmp_path, workflow_writer, name="handoff-wait-cas"
     )
     claim = store.claim_node(run_id, "start", "handoff-worker")
@@ -476,7 +503,7 @@ def test_handoff_wait_projection_is_idempotent_and_rejects_stale_claim(
 def test_handoff_observation_refresh_and_terminal_wake_are_fenced(
     tmp_path, workflow_writer
 ) -> None:
-    store, run_id = _start_package_failure_store_run(
+    store, run_id = _start_handoff_store_run(
         tmp_path, workflow_writer, name="handoff-observation"
     )
     claim = store.claim_node(run_id, "start", "handoff-worker")
@@ -545,7 +572,7 @@ def test_handoff_observation_refresh_and_terminal_wake_are_fenced(
 def test_handoff_retry_requires_definitive_observation_and_new_generation(
     tmp_path, workflow_writer
 ) -> None:
-    store, run_id = _start_package_failure_store_run(
+    store, run_id = _start_handoff_store_run(
         tmp_path, workflow_writer, name="handoff-retry"
     )
     first = store.claim_node(run_id, "start", "handoff-worker-1")
@@ -573,9 +600,10 @@ def test_handoff_retry_requires_definitive_observation_and_new_generation(
     retry_claim = store.claim_node(run_id, "start", "handoff-worker-2")
     assert retry_claim is not None
 
+    before = store.load_run(run_id)
     assert not store.retry_handoff_wait(
         retry_claim,
-        expected_handoff_id="wrong-handoff",
+        expected_handoff_id="handoff-1",
         expected_generation=1,
         handoff_id="handoff-2",
         observed_version=1,
@@ -583,8 +611,18 @@ def test_handoff_retry_requires_definitive_observation_and_new_generation(
         next_observation_at=base + timedelta(minutes=3),
         deadline_at=base + timedelta(hours=2),
     )
-    assert store.retry_handoff_wait(
+    assert store.load_run(run_id) == before
+    store.schedule_retry(
         retry_claim,
+        next_attempt_at=base,
+        error_code="handoff_remote_failed",
+        consumed_attempts=1,
+    )
+    assert store.wake_due_retries(run_id, now=base) == ("start",)
+    authorized = store.claim_node(run_id, "start", "handoff-worker-3")
+    assert authorized is not None
+    assert store.retry_handoff_wait(
+        authorized,
         expected_handoff_id="handoff-1",
         expected_generation=1,
         handoff_id="handoff-2",
@@ -597,3 +635,118 @@ def test_handoff_retry_requires_definitive_observation_and_new_generation(
     assert node["state"] == "waiting_handoff"
     assert node["handoff"]["handoff_id"] == "handoff-2"
     assert node["handoff"]["generation"] == 2
+    duplicate = store.claim_node(run_id, "start", "duplicate-retry")
+    assert duplicate is None
+
+
+def test_handoff_waits_reject_non_prompt_nodes(tmp_path, workflow_writer) -> None:
+    store, run_id = _start_package_failure_store_run(
+        tmp_path, workflow_writer, name="handoff-non-prompt"
+    )
+    claim = store.claim_node(run_id, "start", "non-prompt-worker")
+    assert claim is not None
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    kwargs = {
+        "handoff_id": "handoff-1",
+        "generation": 1,
+        "observed_version": 1,
+        "observed_phase": "active",
+        "next_observation_at": base + timedelta(minutes=1),
+        "deadline_at": base + timedelta(hours=1),
+    }
+    assert not store.begin_handoff_wait(claim, **kwargs)
+    assert store.release_claim_before_execution(claim)
+    projection = store.load_run(run_id)
+    nodes = {key: dict(value) for key, value in projection["nodes"].items()}
+    nodes["start"]["handoff"] = HandoffWaitProjection(
+        "handoff-1",
+        1,
+        2,
+        "failed",
+        base + timedelta(minutes=2),
+        base + timedelta(hours=1),
+    ).durable_record()
+    nodes["start"]["attempts"][-1]["state"] = "waiting_handoff"
+    store.append_event(
+        run_id,
+        "fault_injected_handoff",
+        projection_updates={"nodes": nodes},
+    )
+    retry_claim = store.claim_node(run_id, "start", "non-prompt-retry")
+    assert retry_claim is not None
+    store.schedule_retry(
+        retry_claim,
+        next_attempt_at=base,
+        error_code="handoff_remote_failed",
+        consumed_attempts=1,
+    )
+    assert store.wake_due_retries(run_id, now=base) == ("start",)
+    authorized = store.claim_node(run_id, "start", "non-prompt-authorized-retry")
+    assert authorized is not None
+    assert not store.retry_handoff_wait(
+        authorized,
+        expected_handoff_id="handoff-1",
+        expected_generation=1,
+        handoff_id="handoff-2",
+        observed_version=1,
+        observed_phase="prepared",
+        next_observation_at=base + timedelta(minutes=3),
+        deadline_at=base + timedelta(hours=2),
+    )
+
+
+@pytest.mark.parametrize("phase", ["succeeded", "failed", "cancelled"])
+def test_begin_handoff_wait_rejects_terminal_projection(
+    tmp_path, workflow_writer, phase
+) -> None:
+    store, run_id = _start_handoff_store_run(
+        tmp_path, workflow_writer, name=f"terminal-handoff-{phase}"
+    )
+    claim = store.claim_node(run_id, "start", "handoff-worker")
+    assert claim is not None
+    before = store.load_run(run_id)
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+
+    assert not store.begin_handoff_wait(
+        claim,
+        handoff_id="handoff-1",
+        generation=1,
+        observed_version=1,
+        observed_phase=phase,
+        next_observation_at=base + timedelta(minutes=1),
+        deadline_at=base + timedelta(hours=1),
+    )
+    assert store.load_run(run_id) == before
+
+
+def test_handoff_wait_projection_rejects_malformed_phase_and_observation_time() -> None:
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    record = HandoffWaitProjection(
+        "handoff-1", 1, 1, "active", base, base + timedelta(hours=1)
+    ).durable_record()
+
+    for invalid in (None, ["active"]):
+        malformed = {**record, "last_observed_phase": invalid}
+        with pytest.raises(ValueError, match="last_observed_phase"):
+            HandoffWaitProjection.from_durable_record(malformed)
+    for invalid in (None, datetime(2026, 9, 1, 12, 0)):
+        malformed = {**record, "next_observation_at": invalid}
+        with pytest.raises(ValueError, match="next_observation_at|malformed"):
+            HandoffWaitProjection.from_durable_record(malformed)
+    missing = dict(record)
+    missing.pop("next_observation_at")
+    with pytest.raises(ValueError, match="malformed"):
+        HandoffWaitProjection.from_durable_record(missing)
+    with pytest.raises(ValueError, match="next_observation_at"):
+        HandoffWaitProjection("handoff-1", 1, 1, "active", None, None)
+
+    eastern = timezone(timedelta(hours=-4))
+    normalized = HandoffWaitProjection(
+        "handoff-1",
+        1,
+        1,
+        "active",
+        datetime(2026, 9, 1, 8, 0, tzinfo=eastern),
+        None,
+    )
+    assert normalized.next_observation_at == base

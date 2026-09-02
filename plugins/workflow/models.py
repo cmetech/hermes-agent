@@ -60,16 +60,30 @@ class HandoffWaitProjection:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.last_observed_phase not in HANDOFF_PHASES:
+        if (
+            not isinstance(self.last_observed_phase, str)
+            or self.last_observed_phase not in HANDOFF_PHASES
+        ):
             raise ValueError("last_observed_phase is invalid")
-        for name in ("next_observation_at", "deadline_at"):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, datetime) or value.utcoffset() is None
+        if (
+            not isinstance(self.next_observation_at, datetime)
+            or self.next_observation_at.utcoffset() is None
+        ):
+            raise ValueError("next_observation_at must be timezone-aware")
+        object.__setattr__(
+            self,
+            "next_observation_at",
+            self.next_observation_at.astimezone(timezone.utc),
+        )
+        if self.deadline_at is not None:
+            if (
+                not isinstance(self.deadline_at, datetime)
+                or self.deadline_at.utcoffset() is None
             ):
-                raise ValueError(f"{name} must be timezone-aware")
-            if value is not None:
-                object.__setattr__(self, name, value.astimezone(timezone.utc))
+                raise ValueError("deadline_at must be timezone-aware")
+            object.__setattr__(
+                self, "deadline_at", self.deadline_at.astimezone(timezone.utc)
+            )
 
     def durable_record(self) -> dict[str, object]:
         return {

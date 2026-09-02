@@ -592,6 +592,59 @@ def _healthy_handoff_wait(node: object, now: datetime) -> bool:
     )
 
 
+def _healthy_handoff_is_only_blocker(
+    nodes: object, now: datetime
+) -> bool:
+    if not isinstance(nodes, Mapping):
+        return False
+    healthy = {
+        node_id
+        for node_id, node in nodes.items()
+        if _healthy_handoff_wait(node, now)
+    }
+    if not healthy:
+        return False
+
+    memo: dict[object, bool] = {}
+
+    def waits_on_handoff(node_id: object, visiting: frozenset[object]) -> bool:
+        if node_id in healthy:
+            return True
+        if node_id in memo:
+            return memo[node_id]
+        node = nodes.get(node_id)
+        if (
+            node_id in visiting
+            or not isinstance(node, Mapping)
+            or node.get("state") != "pending"
+        ):
+            return False
+        dependencies = node.get("depends_on")
+        if not isinstance(dependencies, list | tuple):
+            return False
+        blockers = [
+            dependency
+            for dependency in dependencies
+            if not isinstance(nodes.get(dependency), Mapping)
+            or nodes[dependency].get("state") not in {"succeeded", "skipped"}
+        ]
+        result = bool(blockers) and all(
+            waits_on_handoff(dependency, visiting | {node_id})
+            for dependency in blockers
+        )
+        memo[node_id] = result
+        return result
+
+    return all(
+        isinstance(node, Mapping)
+        and (
+            node.get("state") in {"succeeded", "skipped"}
+            or waits_on_handoff(node_id, frozenset())
+        )
+        for node_id, node in nodes.items()
+    )
+
+
 def _relative_path_has_owned_prefix(
     relative: PurePosixPath,
     owned_prefixes: Iterable[tuple[str, ...]],
@@ -10945,7 +10998,8 @@ class RunStore:
                 projection.get("stall"), Mapping
             ):
                 return False
-            node_values = list(projection.get("nodes", {}).values())
+            nodes = projection.get("nodes", {})
+            node_values = list(nodes.values())
             active = any(
                 isinstance(node, Mapping)
                 and node.get("state") in {"claimed", "running"}
@@ -10956,19 +11010,8 @@ class RunStore:
                 and node.get("state") in {"ready", "claimed", "running"}
                 for node in node_values
             )
-            waiting_handoffs = [
-                node
-                for node in node_values
-                if isinstance(node, Mapping)
-                and node.get("state") == "waiting_handoff"
-            ]
-            if (
-                not runnable
-                and waiting_handoffs
-                and all(
-                    _healthy_handoff_wait(node, now.utc_now)
-                    for node in waiting_handoffs
-                )
+            if not runnable and _healthy_handoff_is_only_blocker(
+                nodes, now.utc_now
             ):
                 return False
             reason_code = None
@@ -13040,6 +13083,8 @@ class RunStore:
             next_observation_at,
             deadline_at,
         )
+        if observed_phase in {"succeeded", "failed", "cancelled"}:
+            return False
         directory = self.run_directory(claim.run_id)
         try:
             with workflow_lock(
@@ -13055,6 +13100,7 @@ class RunStore:
                     return False
                 if (
                     projection.get("status") != "running"
+                    or node.get("type") != "prompt"
                     or attempt.get("attempt_id") != claim.attempt_id
                     or attempt.get("owner_id") != claim.owner_id
                     or node.get("handoff") is not None
@@ -13202,6 +13248,7 @@ class RunStore:
                 node = _claim_node_state(projection, claim)
                 active = node.get("claim")
                 attempt = node.get("attempts", [])[-1]
+                attempts = node.get("attempts")
                 try:
                     previous = HandoffWaitProjection.from_durable_record(
                         node.get("handoff")
@@ -13210,11 +13257,24 @@ class RunStore:
                     return False
                 if (
                     projection.get("status") != "running"
+                    or node.get("type") != "prompt"
                     or not _active_claim_matches(active, claim)
                     or attempt.get("attempt_id") != claim.attempt_id
                     or previous.handoff_id != expected_handoff_id
                     or previous.generation != expected_generation
                     or previous.last_observed_phase not in {"failed", "cancelled"}
+                    or not isinstance(attempts, list)
+                    or len(attempts) < 3
+                    or not isinstance(attempts[-2], Mapping)
+                    or attempts[-2].get("state") != "failed"
+                    or not any(
+                        isinstance(candidate, Mapping)
+                        and candidate.get("state") == "waiting_handoff"
+                        for candidate in attempts[:-2]
+                    )
+                    or isinstance(node.get("retry_consumed"), bool)
+                    or not isinstance(node.get("retry_consumed"), int)
+                    or node["retry_consumed"] < 1
                 ):
                     return False
                 self._record_handoff_wait_locked(
