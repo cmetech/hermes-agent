@@ -1,7 +1,102 @@
 schema_version: 1
 feature: agent-handoff
-# Stage 1 is the bounded local-Workflow slice. The handoff service remains
-# consumer-neutral; Workflow owns only its assignment and wait projection.
+# Stages 1 and 2 provide local and authenticated peer Workflow handoffs. The
+# handoff service remains consumer-neutral; Workflow owns only its assignment,
+# wait, and interaction projections.
+delivered_stages:
+- stage_1_local_workflow_handoffs
+- stage_2_remote_workflow_handoffs
+stage_2:
+  implementation_commits:
+  - b022c6d703b0c7494f1ba0157d23bb337e355da2 feat(handoff): define strict peer endpoint contract
+  - cfb65730ab4121f3547a71de2eff41a4a960f6e5 refactor(peer): expose profile-scoped registry resolution
+  - bee9837f3e4b8e84a72bc146c8c707285f2db1b4 refactor(handoff): share bounded Runs transport
+  - a38e1a842827464643cc07fa34fb76f1f403f71b feat(handoff): execute tasks through registered peers
+  - cef79a20f5d5741373229c852fb434ab6515c909 feat(handoff): journal peer control commands
+  - 6500aa479585547dd69201acd920d08177c36309 feat(handoff): expose peer control commands
+  - 7cd301c2de820673ab572e2ee1e36dd281009f0b feat(workflow): negotiate remote handoff policy
+  - 06e033aa741744997678a61f969943eec4815250 feat(workflow): pause remote handoffs for input
+  - 0340f51da35e22f1c231984ab06ab98b4eaf0e35 feat(workflow): surface remote handoff input
+  - 571c385b330c5d669c9b06a92687be882d33425c fix(handoff): route peer control through builtin channel
+  - 7ed39a6c5213339cbf53d44ff30524dcf8ba22ee fix(workflow): enforce paused handoff deadlines
+  - 470e79d81e2d8aa1bc156912c46f5ae46cce084a test(handoff): prove authenticated remote workflow path
+  - 81f390fd9b9d4df08ee4a2bc393305f2eddbbf7b test(handoff): accept additive installed commands
+  planning_commits:
+  - 3b1100ad998a7904dbb3fc01388af6a4c9992a4b docs(plan): prepare remote agent handoff stage 2
+  - f4a078ab73a13b547f0e0d3e6ec1ad7d5df38867 docs(plan): add peer command routing remediation
+  - 56a4132cc6c2045bc5709d094a3a8a3a155fcde2 docs(plan): add paused handoff deadline remediation
+  - 831899f1222693c5ccca9680d677d5cdb918bfcc docs(plan): add installed command remediation
+  owned_paths:
+  - apps/desktop/src/app/workflows/adapter.test.ts
+  - apps/desktop/src/lib/workflow-public-codec.test.ts
+  - apps/desktop/src/lib/workflow-public-codec.ts
+  - apps/desktop/src/types/hermes.ts
+  - docs/assessments/2026-09-02-agent-handoff-stage-2-implementation-readiness.md
+  - docs/superpowers/plans/2026-09-02-remote-workflow-agent-handoff-stage-2.md
+  - hermes_cli/handoff/__init__.py
+  - hermes_cli/handoff/cli.py
+  - hermes_cli/handoff/local.py
+  - hermes_cli/handoff/models.py
+  - hermes_cli/handoff/peer.py
+  - hermes_cli/handoff/runs.py
+  - hermes_cli/handoff/service.py
+  - hermes_cli/handoff/store.py
+  - hermes_cli/peers.py
+  - hermes_cli/subcommands/peer.py
+  - plugins/workflow/actions.py
+  - plugins/workflow/admission.py
+  - plugins/workflow/coordinator.py
+  - plugins/workflow/dashboard/plugin_api.py
+  - plugins/workflow/executors/handoff.py
+  - plugins/workflow/language_schema.py
+  - plugins/workflow/models.py
+  - plugins/workflow/notifications.py
+  - plugins/workflow/sanitize.py
+  - plugins/workflow/scheduler.py
+  - plugins/workflow/schema.py
+  - plugins/workflow/store.py
+  - plugins/workflow/trust.py
+  - tests/hermes_cli/handoff/test_local_cli.py
+  - tests/hermes_cli/handoff/test_local_runs.py
+  - tests/hermes_cli/handoff/test_models.py
+  - tests/hermes_cli/handoff/test_peer_e2e.py
+  - tests/hermes_cli/handoff/test_peer.py
+  - tests/hermes_cli/handoff/test_runs_client.py
+  - tests/hermes_cli/handoff/test_service.py
+  - tests/hermes_cli/handoff/test_store.py
+  - tests/hermes_cli/test_handoff_cmd.py
+  - tests/hermes_cli/test_peers.py
+  - tests/plugins/workflow/test_admission.py
+  - tests/plugins/workflow/test_approval_races.py
+  - tests/plugins/workflow/test_cancel_node.py
+  - tests/plugins/workflow/test_coordinator.py
+  - tests/plugins/workflow/test_desktop_api.py
+  - tests/plugins/workflow/test_handoff_executor.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_notification_delivery.py
+  - tests/plugins/workflow/test_notifications.py
+  - tests/plugins/workflow/test_remote_handoff_e2e.py
+  - tests/plugins/workflow/test_run_queries.py
+  - tests/plugins/workflow/test_schema.py
+  - tests/plugins/workflow/test_store.py
+  - tests/plugins/workflow/test_trust_policy.py
+  protocol_clarifications:
+  - a peer endpoint is only hermes://peer/<configured-peer>/<profile>; it never
+    carries a URL, host, port, credential, userinfo, query, or fragment
+  - peer credentials are resolved lazily from the initiating profile; one peer
+    entry currently supplies one key for its advertised profile routes
+  - an authenticated wrong or unavailable destination profile is safely exposed
+    as endpoint_unavailable rather than promising a profile-specific public code
+  - authoritative convergence polls status by Run ID; events are optional only
+  - interactive Workflow input is limited to advertised approval choices and
+    durable once/deny responses; arbitrary remote questions remain deferred
+  - a lost non-idempotent control response remains indeterminate and is never
+    blindly replayed, while a lost submit response reconciles with the same key
+  intentional_exclusions:
+  - Bot Mode, Desktop chat migration, message_agent, and peer DM changes
+  - durable Bot return delivery, generic channels, repository channels, and A2A
+  - Windows CLI locking, relay retirement, and interactive CLI fallback
 ownership:
   handoff_service: hermes_cli/handoff
   workflow_consumer: plugins/workflow
@@ -10,17 +105,21 @@ ownership:
 configuration:
   user_visible:
   - workflow companion sidecars may declare prompt-node assignments with a
-    canonical hermes://local/<profile> endpoint, interaction policy, deadline,
-    and deadline action
+    canonical hermes://local/<profile> or hermes://peer/<peer>/<profile>
+    endpoint, interaction policy, deadline, and deadline action
   - operators inspect profile-local state with hermes handoff list, show,
-    evidence, and reconcile
+    evidence, reconcile, cancel, respond, steer, and message
   credentials:
   - loopback Runs uses only the destination profile's API_SERVER_KEY through
     the existing API-server profile scope
   - no new user-facing environment variable or credential store is introduced
+  - remote Runs resolves the configured peer key only from the initiating
+    profile and never persists credentials or raw authorization material
   transport:
   - local Runs requires an enabled multiplexed loopback API server advertising
     durable keyed Runs; POSIX may use the bounded noninteractive CLI fallback
+  - remote Runs uses the existing peer registry, redirect-safe direct HTTP,
+    profile-prefixed Runs routes, and a stable bounded idempotency key
 storage:
   handoff_database: ${HERMES_HOME}/handoffs.db
   workflow_database: ${HERMES_HOME}/workflows/admission.sqlite3
@@ -38,6 +137,10 @@ upstream_touchpoints:
   interruption, and stop behavior
 - gateway/platforms/api_server_run_idempotency.py profile-and-credential-scoped
   idempotency reservations
+- hermes_cli/peers.py and hermes_cli/subcommands/peer.py configured peer
+  resolution, authentication, redirect safety, and Runs command authorities
+- hermes_cli/handoff/peer.py and hermes_cli/handoff/runs.py consumer-neutral
+  peer channel and shared bounded Runs transport
 - tools/bot_relay.py destination-profile cross-process turn lock
 - hermes_cli/main.py top-level CLI registration
 - plugins/workflow coordinator election, scheduler, store, sidecar schema,
@@ -46,16 +149,18 @@ rollback:
   procedure:
   - stop Workflow coordinator hosts before reverting so no new handoff advances
     begin during rollback
+  - revert the Stage 2 commits before Stage 1 as dependency-ordered series,
+    removing remote assignments only after remote waits have settled
   - revert the Stage 1 commits as one dependency-ordered series, removing the
     assignments language only after waiting_handoff runs have settled
   - preserve handoffs.db, Workflow evidence, and destination Run state until
     operators have reconciled every nonterminal handoff
   - ordinary unassigned prompt nodes and Bot Mode remain the fallback behavior;
     never reinterpret an admitted handoff as a Bot Chat send
-  data_compatibility: Stage 1 SQLite migrations are additive; rollback must not
-    delete profile-local evidence or receipts automatically
+  data_compatibility: Stage 1 and Stage 2 SQLite migrations are additive;
+    rollback must not delete profile-local evidence, remote references, command
+    journals, or receipts automatically
 deferred_stages:
-  stage_2: remote hermes://peer routing, interaction, steer/follow-up, and stop
   stage_3: Bot Mode and Desktop migration plus durable return delivery
   stage_4: separately distributed GitLab+ICM plugin and channel registration
   stage_5: Windows destination lock, operational hardening, and retirement review
@@ -64,29 +169,49 @@ verification:
   host: darwin
   commands:
   - command: >-
-      scripts/run_tests.sh tests/hermes_cli/handoff
-      tests/hermes_cli/test_handoff_cmd.py tests/hermes_cli/test_peer_cmd.py
-      tests/hermes_cli/test_plugin_background_services.py
-      tests/tools/test_bot_turn_lock.py
-      tests/tools/test_bot_relay_windows_paths.py
-      tests/tools/test_bot_mode_dm.py
+      scripts/run_tests.sh tests/hermes_cli/handoff/test_models.py
+      tests/hermes_cli/handoff/test_store.py
+      tests/hermes_cli/handoff/test_service.py
+      tests/hermes_cli/handoff/test_local_runs.py
+      tests/hermes_cli/handoff/test_local_cli.py
+      tests/hermes_cli/handoff/test_runs_client.py
+      tests/hermes_cli/handoff/test_peer.py
+      tests/hermes_cli/handoff/test_peer_e2e.py
+      tests/hermes_cli/test_peers.py tests/hermes_cli/test_peer_cmd.py
+      tests/hermes_cli/test_urllib_security.py
       tests/gateway/test_api_server_run_idempotency.py
       tests/gateway/test_api_server_runs.py
-      tests/plugins/workflow/test_local_handoff_e2e.py
-      tests/plugins/workflow/test_coordinator.py
-      tests/plugins/workflow/test_coordinator_multiprocess.py
+      tests/gateway/test_api_server_multiplex_secret_scope.py
+      tests/gateway/test_api_server_profile_prefix_misdelivery.py
+      tests/gateway/test_session_api.py tests/gateway/test_peer_dm_hidden_e2e.py
       tests/plugins/workflow/test_schema.py
       tests/plugins/workflow/test_language_schema.py
-      tests/plugins/workflow/test_notifications.py -q
+      tests/plugins/workflow/test_trust_policy.py
+      tests/plugins/workflow/test_admission.py
+      tests/plugins/workflow/test_handoff_executor.py
+      tests/plugins/workflow/test_store.py
+      tests/plugins/workflow/test_coordinator.py
+      tests/plugins/workflow/test_coordinator_multiprocess.py
+      tests/plugins/workflow/test_approval_races.py
+      tests/plugins/workflow/test_cancel_node.py
+      tests/plugins/workflow/test_crash_recovery.py
+      tests/plugins/workflow/test_deadlines.py
+      tests/plugins/workflow/test_run_queries.py
+      tests/plugins/workflow/test_notifications.py
+      tests/plugins/workflow/test_notification_delivery.py
+      tests/plugins/workflow/test_desktop_api.py
+      tests/plugins/workflow/test_local_handoff_e2e.py
+      tests/plugins/workflow/test_remote_handoff_e2e.py -q
     environment:
       HERMES_TEST_FILE_RETRIES: "0"
-    result: 1277 passed, 0 failed, 6 host-specific skips
+    result: 1824 passed, 0 failed, 6 host-specific skips
   - command: >-
-      scripts/run_tests.sh
-      tests/plugins/workflow/test_local_handoff_e2e.py -q
+      for run in 1 2 3 4 5 6 7; do scripts/run_tests.sh
+      tests/plugins/workflow/test_remote_handoff_e2e.py -k
+      stop_interrupted_and_cancellation_races -q || exit 1; done
     environment:
       HERMES_TEST_FILE_RETRIES: "0"
-    result: 6 passed, 0 failed, 2 host-specific skips
+    result: 7 of 7 runs passed, 1 selected test per run, 0 failed
   - command: >-
       scripts/run_tests.sh
       tests/plugins/workflow/test_installed_distribution_e2e.py
@@ -95,22 +220,58 @@ verification:
     environment:
       HERMES_TEST_FILE_RETRIES: "0"
     result: 1 passed, 0 failed, 5 deselected
-  - command: scripts/run_tests.sh tests/plugins/workflow -q
-    result: 131 files, 5925 passed, 0 failed, 5 host-specific skips
-    note: >-
-      Two existing timing-sensitive cases passed on harness retry: the
-      coordinator cursor performance bound and hard-maximum recovery.
   - command: >-
-      scripts/run_tests.sh tests/gateway/test_api_server_run_idempotency.py
-      tests/gateway/test_api_server_runs.py tests/hermes_cli/test_peer_cmd.py
-      tests/tools/test_bot_turn_lock.py tests/tools/test_bot_mode_dm.py
-      tests/hermes_cli/test_plugin_background_services.py
-      tests/plugins/workflow/test_coordinator.py
+      scripts/run_tests.sh tests/hermes_cli/handoff
+      tests/hermes_cli/test_peers.py tests/hermes_cli/test_peer_cmd.py
+      tests/hermes_cli/test_urllib_security.py
+      tests/gateway/test_api_server_run_idempotency.py
+      tests/gateway/test_api_server_runs.py
+      tests/gateway/test_api_server_multiplex_secret_scope.py
+      tests/gateway/test_api_server_profile_prefix_misdelivery.py
+      tests/gateway/test_session_api.py tests/gateway/test_peer_dm_hidden_e2e.py
       tests/plugins/workflow/test_schema.py
-      tests/plugins/workflow/test_language_schema.py -q
-    result: 991 passed, 0 failed, 1 host-specific skip
+      tests/plugins/workflow/test_language_schema.py
+      tests/plugins/workflow/test_trust_policy.py
+      tests/plugins/workflow/test_admission.py
+      tests/plugins/workflow/test_handoff_executor.py
+      tests/plugins/workflow/test_store.py
+      tests/plugins/workflow/test_coordinator.py
+      tests/plugins/workflow/test_coordinator_multiprocess.py
+      tests/plugins/workflow/test_approval_races.py
+      tests/plugins/workflow/test_cancel_node.py
+      tests/plugins/workflow/test_crash_recovery.py
+      tests/plugins/workflow/test_deadlines.py
+      tests/plugins/workflow/test_run_queries.py
+      tests/plugins/workflow/test_notifications.py
+      tests/plugins/workflow/test_notification_delivery.py
+      tests/plugins/workflow/test_desktop_api.py
+      tests/plugins/workflow/test_local_handoff_e2e.py
+      tests/plugins/workflow/test_remote_handoff_e2e.py
+      tests/plugins/workflow/test_installed_distribution_e2e.py -q
+    environment:
+      HERMES_TEST_FILE_RETRIES: "0"
+    result: 1827 passed, 0 failed, 6 host-specific skips
+  - command: >-
+      cd apps/desktop && npm run test:ui --
+      src/lib/workflow-public-codec.test.ts
+      src/app/workflows/adapter.test.ts
+    result: 2 files, 16 passed, 0 failed
+  - command: cd apps/desktop && npm run typecheck
+    result: passed
+  - command: scripts/run_tests.sh tests/plugins/workflow -q
+    environment:
+      HERMES_TEST_FILE_RETRIES: "0"
+    result: 132 files, 5969 passed, 2 failed, 5 host-specific skips, 1 bus error
+    note: >-
+      Under whole-suite parallel load, the unchanged coordinator cursor bound
+      and hard-maximum recovery assertions failed; each passed immediately in
+      isolation (1 of 1). An unchanged middleware E2E process bus-errored on
+      macOS while inherited web-server threads were initializing SQLite; its
+      seven tests passed in isolation. The failing test files and every source
+      file in the bus-error stack are unchanged from 96840791410c4723d3c4e9de7235afdafc723f81.
   host_coverage:
-  - the macOS POSIX receipt case ran locally
+  - authenticated peer HTTP, lost-response, restart, approval, control,
+    cancellation-race, deadline, and installed-wheel cases ran locally
   - Linux and Windows host-marked cases were skipped locally and remain on
     their platform lanes
 
@@ -124,9 +285,13 @@ upstream_changes:
   - hermes_cli/handoff/cli.py
   - hermes_cli/handoff/local.py
   - hermes_cli/handoff/models.py
+  - hermes_cli/handoff/peer.py
+  - hermes_cli/handoff/runs.py
   - hermes_cli/handoff/service.py
   - hermes_cli/handoff/store.py
   - hermes_cli/main.py
+  - hermes_cli/peers.py
+  - hermes_cli/subcommands/peer.py
   - tools/bot_relay.py
   owned_symbols:
   - HandoffEndpoint
@@ -134,6 +299,11 @@ upstream_changes:
   - HandoffStore
   - AgentHandoffService
   - LocalHermesChannel
+  - PeerHermesChannel
+  - RunsClient
+  - RunsDeadline
+  - ResolvedPeer
+  - resolve_peer
   - cmd_handoff
   - build_handoff_parser
   owned_invariants:
@@ -147,14 +317,23 @@ upstream_changes:
   - scheduler admission selects cancellations, expired deadlines, and oldest due observations before applying its bounded page
   - bounded local admission is process-singleflight so timed-out worker threads cannot accumulate while concurrent callers share one aggregate budget
   - each handoff failure notification has an exact durable identity and never coalesces unrelated handoffs
+  - peer endpoints are strict registry references and never accept raw network or credential material
+  - every remote Workflow admission uses one stable bounded idempotency key and reconciles ambiguity with the identical request
+  - peer credentials resolve lazily from the initiating profile and are neither persisted nor forwarded across an unsafe redirect or ambient proxy
+  - peer control intent is journaled before I/O and an ambiguous non-idempotent response is never replayed blindly
   tests:
   - tests/hermes_cli/handoff/test_models.py
   - tests/hermes_cli/handoff/test_store.py
   - tests/hermes_cli/handoff/test_service.py
   - tests/hermes_cli/handoff/test_local_runs.py
   - tests/hermes_cli/handoff/test_local_cli.py
+  - tests/hermes_cli/handoff/test_peer.py
+  - tests/hermes_cli/handoff/test_peer_e2e.py
+  - tests/hermes_cli/handoff/test_runs_client.py
   - tests/hermes_cli/test_handoff_cmd.py
+  - tests/hermes_cli/test_peers.py
   - tests/hermes_cli/test_peer_cmd.py
+  - tests/hermes_cli/test_urllib_security.py
   - tests/tools/test_bot_turn_lock.py
   - tests/tools/test_bot_relay_windows_paths.py
   - tests/gateway/test_api_server_run_idempotency.py
@@ -167,6 +346,10 @@ upstream_changes:
     native/profile Runs routes and their idempotency store; never fork those
     authorities. Keep destination credentials inside the routed profile scope,
     persist submit intent before I/O, reconcile indeterminate outcomes, and
+    preserve direct proxy bypass plus cross-origin authorization stripping.
+    Reuse the configured peer registry and shared Runs transport rather than
+    calling the peer CLI or copying its reservation logic. Keep command
+    ambiguity non-replayable and polling by Run ID sufficient for correctness.
     keep the CLI fallback disabled on Windows until the destination lock has a
     real cross-process implementation. Rerun the handoff, Runs, peer, Bot-lock,
     and real two-profile suites after overlap.
@@ -182,6 +365,10 @@ upstream_changes:
   owner: downstream-workflow-orchestration
   overlap_policy: any_owned_file
   files:
+  - apps/desktop/src/app/workflows/adapter.ts
+  - apps/desktop/src/lib/workflow-public-codec.ts
+  - apps/desktop/src/types/hermes.ts
+  - plugins/workflow/actions.py
   - plugins/workflow/admission.py
   - plugins/workflow/api_admission.py
   - plugins/workflow/cli.py
@@ -194,6 +381,7 @@ upstream_changes:
   - plugins/workflow/language_schema.py
   - plugins/workflow/models.py
   - plugins/workflow/notifications.py
+  - plugins/workflow/sanitize.py
   - plugins/workflow/scheduler.py
   - plugins/workflow/schema.py
   - plugins/workflow/showcase.py
@@ -201,6 +389,8 @@ upstream_changes:
   - plugins/workflow/trust.py
   owned_symbols:
   - HandoffWaitProjection
+  - HandoffInputProjection
+  - HandoffResponseIntent
   - HandoffPromptExecutor
   - RunScheduler.advance_due_handoffs
   - RunStore.begin_handoff_wait
@@ -216,6 +406,10 @@ upstream_changes:
   - structured output is validated by the same prompt executor helpers used for same-profile execution
   - deadline uncertainty interruption and terminal failure project actionable journal-backed Needs Attention records
   - Stage 1 does not change message_agent schema Bot Chat naming relay resolution or fire-and-forget behavior
+  - interaction policy is admitted against peer capabilities before submission and unsupported required behavior fails closed
+  - advertised remote approval input pauses as one durable bounded handoff_input and uses the existing Needs Attention response surface
+  - overdue paused handoff_input runs remain coordinator-actionable only for handoff deadline maintenance
+  - exact response steer follow-up stop interrupted and cancellation race outcomes remain restart-recoverable and destination-authoritative
   tests:
   - tests/plugins/workflow/test_admission.py
   - tests/plugins/workflow/test_ai_executor.py
@@ -226,6 +420,7 @@ upstream_changes:
   - tests/plugins/workflow/test_crash_recovery.py
   - tests/plugins/workflow/test_handoff_executor.py
   - tests/plugins/workflow/test_language_schema.py
+  - tests/plugins/workflow/test_remote_handoff_e2e.py
   - tests/plugins/workflow/test_notification_delivery.py
   - tests/plugins/workflow/test_notifications.py
   - tests/plugins/workflow/test_scheduler.py
@@ -241,8 +436,9 @@ upstream_changes:
     API, gateway, dashboard, catalog, and snapshot paths. A healthy handoff wait
     remains a running Workflow with released worker capacity; the elected
     coordinator alone advances it and the store compare-and-sets terminal
-    projection. Keep Needs Attention journal-derived and keep Bot Mode outside
-    this consumer adapter.
+    projection. Preserve paused handoff_input deadlines, journal exact responses
+    before delivery, and keep Needs Attention journal-derived. Keep Bot Mode
+    and peer DM outside this consumer adapter.
   removal_condition: >-
     Remove when upstream provides equivalent assignment admission, durable
     worker-releasing handoff waits, fenced restart recovery, cancellation truth,
@@ -250,12 +446,14 @@ upstream_changes:
     attention without changing ordinary prompt or Bot Mode behavior.
   last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 
-- id: local-agent-handoff-end-to-end-proof
+- id: agent-handoff-end-to-end-proof
   change_class: test-infrastructure
   owner: downstream-agent-handoff
   overlap_policy: any_owned_file
   files:
+  - tests/hermes_cli/handoff/test_peer_e2e.py
   - tests/plugins/workflow/test_local_handoff_e2e.py
+  - tests/plugins/workflow/test_remote_handoff_e2e.py
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   - tests/plugins/workflow/test_catalog_cli.py
   - tests/plugins/workflow/test_performance_bounds.py
@@ -270,6 +468,17 @@ upstream_changes:
   - test_linux_cli_fallback_writes_a_real_dedicated_receipt
   - test_windows_host_reports_cli_fallback_unavailable
   - test_extracted_wheel_registers_workflow_cli_from_a_clean_home
+  - test_remote_workflow_handoff_uses_destination_profile_and_credentials
+  - test_remote_handoff_lost_submit_response_recovers_same_key_once
+  - test_remote_handoff_duplicate_key_replays_and_conflict_rejects
+  - test_remote_handoff_destination_restart_reports_interrupted
+  - test_remote_handoff_capability_mismatch_fails_before_submit
+  - test_remote_handoff_redirect_and_proxy_boundaries
+  - test_remote_handoff_registry_and_credential_isolation
+  - test_remote_handoff_approval_pause_restart_and_response
+  - test_remote_handoff_follow_up_steer_and_lost_response
+  - test_remote_handoff_stop_interrupted_and_cancellation_races
+  - test_remote_handoff_restart_cuts_are_convergent
   owned_invariants:
   - real-path coverage uses two temporary profile homes real SQLite stores actual API routing and HTTP and replaces only provider inference
   - no test mocks the handoff service Runs profile secret scope coordinator or durable stores
@@ -278,13 +487,18 @@ upstream_changes:
   - deadline proof advances the injected wall clock after normal submission and uses the real coordinator scheduler path to expire and cancel the destination
   - the integration-marked installed wheel smoke exposes hermes handoff help through the production CLI module
   - POSIX receipt execution is host-specific and Windows unavailability is asserted only on a real Windows host
+  - real authenticated peer proof uses separate initiating and destination homes profile keys gateways HTTP Runs stores and Workflow fencing
+  - failure injection proves lost submit response duplicate and conflicting keys destination restart unsafe redirect proxy isolation and credential rotation
+  - restart cuts cover pre-bind submit journal keyed reservation Run ID interaction and response-command persistence boundaries
   tests:
+  - tests/hermes_cli/handoff/test_peer_e2e.py
   - tests/plugins/workflow/test_local_handoff_e2e.py
+  - tests/plugins/workflow/test_remote_handoff_e2e.py
   - tests/plugins/workflow/test_installed_distribution_e2e.py
   - tests/plugins/workflow/test_catalog_cli.py
   - tests/plugins/workflow/test_performance_bounds.py
   - tests/plugins/workflow/test_scheduled_runs.py
-  expected_commit_subject: 'test(workflow): prove local agent handoffs end to end'
+  expected_commit_subject: 'test(handoff): prove authenticated remote workflow path'
   upstream_candidate: true
   merge_guidance: >-
     Preserve the real boundaries. Provider inference may remain deterministic,
@@ -292,7 +506,8 @@ upstream_changes:
     Runs durability, profile secret scope, Workflow coordinator, or SQLite
     stores with mocks. Run POSIX receipt proof on its actual host and leave the
     Windows fallback assertion to the Windows lane; never claim host-skipped
-    coverage was executed locally.
+    coverage was executed locally. Preserve authenticated peer failure
+    injection and every durable restart cut when adapting gateway fixtures.
   removal_condition: >-
     Remove only with equivalent installed-distribution and real two-profile
     end-to-end proof of admission, keyed destination execution, restart,
