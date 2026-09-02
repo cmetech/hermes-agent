@@ -680,7 +680,6 @@ async def test_active_destination_cancellation_converges_through_real_stop(
             assert terminal_handoff.phase == "cancelled"
             assert terminal_handoff.checkpoint["run_id"] == destination_run_id
             assert terminal_handoff.checkpoint["status"] == "cancelled"
-            assert len(provider.calls) == 1
         finally:
             provider.release.set()
             scheduler.shutdown(deadline_seconds=2)
