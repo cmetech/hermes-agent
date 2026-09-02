@@ -41,6 +41,7 @@ from plugins.workflow.admission import (
     PreparedRunSnapshot,
     RunAdmissionRequest,
     RunAdmissionResult,
+    validate_assignment_admission,
 )
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.language import (
@@ -75,6 +76,8 @@ from plugins.workflow.models import (
     WorkflowConnectorCapabilities,
     WorkflowNode,
     WorkflowPackage,
+    WorkflowValidationError,
+    ValidationIssue,
 )
 from plugins.workflow.provenance import (
     TriggerProvenance,
@@ -6424,6 +6427,7 @@ class RunStore:
         self,
         package: WorkflowPackage,
         *,
+        initiator_profile: str | None = None,
         inputs: Mapping[str, str | Path] | None = None,
         values: Mapping[str, str] | None = None,
         verified_inputs: Mapping[str, tuple[bytes, str]] | None = None,
@@ -6434,6 +6438,19 @@ class RunStore:
         provider_authority: "WorkflowProviderAuthority | None" = None,
         connector_capabilities: object | None = None,
     ) -> PreparedRunSnapshot:
+        if package.sidecar.get("assignments"):
+            if initiator_profile is None:
+                raise WorkflowValidationError(
+                    ValidationIssue(
+                        path="sidecar.assignments",
+                        code="assignment_initiator_profile_required",
+                        message="assignment admission requires an explicit initiator profile",
+                    )
+                )
+            validate_assignment_admission(
+                package,
+                initiator_profile=initiator_profile,
+            )
         self._ensure_free_disk()
         with workflow_lock(self.admission_lock):
             staging = Path(tempfile.mkdtemp(prefix="run-", dir=self.staging_root))

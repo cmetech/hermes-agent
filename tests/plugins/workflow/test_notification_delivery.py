@@ -877,6 +877,66 @@ def test_authenticated_gateway_command_starts_real_background_run(
     assert run["provenance"]["return_route"] == "opaque-capability"
 
 
+def test_gateway_assignment_cannot_bypass_shared_profile_admission(
+    tmp_path, workflow_writer
+) -> None:
+    home = tmp_path / "home"
+    workflow_path = workflow_writer(
+        tmp_path / "package",
+        name="gateway-self-assignment",
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/default\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow_path)
+    digest = compute_package_digest(package)
+    risk = build_risk_summary(package, assess_compatibility(package))
+    WorkflowTrustStore(home).trust(
+        digest.sha256,
+        actor="test-operator",
+        risk_digest=risk.risk_digest,
+    )
+    store = RunStore(home)
+    assert CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="gateway-assignment-test",
+            host_kind="gateway",
+            host_instance_id="gateway-assignment-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    ).is_leader
+    invocation = PluginInvocationContext(
+        boundary="gateway",
+        principal="gateway:telegram:user-1",
+        operator_scope="gateway:default:telegram:chat-1:user-1",
+        assurance="verified_adapter",
+        return_route_capability="opaque-capability",
+    )
+
+    response = json.loads(
+        workflow_gateway_command(
+            f"run {shlex.quote(str(workflow_path))} "
+            "--idempotency-key self-assignment",
+            invocation,
+            hermes_home=home,
+            workdir=tmp_path,
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"] == "workflow_operation_failed"
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
+
+
 def test_authenticated_gateway_explicit_phase4_run_seals_profile_include(
     tmp_path, monkeypatch, workflow_writer
 ) -> None:

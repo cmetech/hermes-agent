@@ -14,6 +14,19 @@ from plugins.workflow.models import (
 from plugins.workflow.provenance import TriggerProvenance, TriggerSource
 
 
+def workflow_profile_for_home(hermes_home: str | Path) -> str:
+    """Derive the workflow owner from one explicit profile-scoped home."""
+    from hermes_constants import named_profile_home
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    profile_home = named_profile_home(Path(hermes_home).resolve())
+    if profile_home is None:
+        return "default"
+    profile = normalize_profile_name(profile_home.name)
+    validate_profile_name(profile)
+    return profile
+
+
 def validate_assignment_admission(
     package: WorkflowPackage,
     *,

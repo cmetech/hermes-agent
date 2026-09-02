@@ -40,6 +40,8 @@ from plugins.workflow.language import (
     supports_phase6_semantics,
 )
 from plugins.workflow.language_schema import (
+    assignment_endpoint_is_valid,
+    parse_assignment_deadline,
     EXECUTABLE_NODE_TYPES,
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
@@ -155,18 +157,12 @@ _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
 _INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 _LITERAL_INCLUDE_NAME = re.compile(r"^[^\s/\\:$?#{}`()]+$")
-_ASSIGNMENT_DEADLINE = re.compile(
-    r"^P(?:(?P<days>0|[1-9][0-9]?)D)?"
-    r"(?:T(?:(?P<hours>0|[1-9][0-9]?)H)?"
-    r"(?:(?P<minutes>0|[1-9][0-9]?)M)?)?$"
-)
 _ASSIGNMENT_FIELDS = frozenset({
     "endpoint",
     "interaction_policy",
     "deadline",
     "on_deadline",
 })
-_ASSIGNMENT_MAX_SECONDS = 30 * 24 * 60 * 60
 
 
 def _issue(
@@ -2490,6 +2486,12 @@ def _parse_sidecar(
             )
         if "endpoint" not in assignment:
             _fail(path, "invalid_assignment", "assignment endpoint is required")
+        if not assignment_endpoint_is_valid(assignment["endpoint"]):
+            _fail(
+                f"{path}.endpoint",
+                "invalid_assignment_endpoint",
+                "assignment endpoint must be a canonical local endpoint",
+            )
         try:
             endpoint = HandoffEndpoint.parse(assignment["endpoint"])
         except (TypeError, ValueError) as exc:
@@ -2524,20 +2526,9 @@ def _parse_sidecar(
             "on_deadline": "cancel_and_fail",
         }
         if "deadline" in assignment:
-            deadline = assignment["deadline"]
-            match = (
-                _ASSIGNMENT_DEADLINE.fullmatch(deadline)
-                if isinstance(deadline, str)
-                else None
-            )
-            seconds = 0
-            if match is not None:
-                seconds = (
-                    int(match.group("days") or 0) * 24 * 60 * 60
-                    + int(match.group("hours") or 0) * 60 * 60
-                    + int(match.group("minutes") or 0) * 60
-                )
-            if seconds <= 0 or seconds > _ASSIGNMENT_MAX_SECONDS:
+            try:
+                deadline = parse_assignment_deadline(assignment["deadline"])
+            except ValueError:
                 _fail(
                     f"{path}.deadline",
                     "invalid_assignment_deadline",

@@ -54,10 +54,7 @@ from plugins.workflow.compat import (
     assess_compatibility,
     require_runnable,
 )
-from plugins.workflow.admission import (
-    RunAdmissionRequest,
-    validate_assignment_admission,
-)
+from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.discovery import discover_workflows
 from plugins.workflow.models import (
     RunExecutionLimits,
@@ -2329,7 +2326,6 @@ def _cmd_run(
         compatibility = assessment.compatibility
         risk = assessment.risk
     require_runnable(compatibility)
-    validate_assignment_admission(package, initiator_profile=profile_name)
     if (
         WorkflowTrustStore(args.hermes_home).check(
             digest.sha256, risk_digest=risk.risk_digest
@@ -2366,6 +2362,7 @@ def _cmd_run(
     )
     prepared = store.prepare_run_snapshot(
         package,
+        initiator_profile=profile_name,
         compilation=_admission_compilation(compilation),
         values={"arguments": args.arguments} if args.arguments else None,
         trusted_package_digest=(
@@ -2826,7 +2823,7 @@ def _cmd_reset_sessions(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_showcase(args: argparse.Namespace) -> int:
+def _cmd_showcase(args: argparse.Namespace, *, profile_name: str) -> int:
     from plugins.workflow.showcase import (
         build_showcase_report,
         cleanup_showcases,
@@ -2868,6 +2865,7 @@ def _cmd_showcase(args: argparse.Namespace) -> int:
         payload = run_showcase(
             args.showcase_id,
             hermes_home=args.hermes_home,
+            initiator_profile=profile_name,
             symptom=args.symptom,
             confirmation_token=args.confirmation_token,
             schedule_at=args.schedule_at,
@@ -2991,7 +2989,7 @@ def workflow_command(
         if action == "reset-sessions":
             return _cmd_reset_sessions(args)
         if action == "showcase":
-            return _cmd_showcase(args)
+            return _cmd_showcase(args, profile_name=profile_name)
         print(f"Unknown workflow action: {action}", file=sys.stderr)
         return 2
     except WorkflowCommandError as exc:

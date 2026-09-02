@@ -140,13 +140,46 @@ def test_assignment_admission_returns_available_mechanism_without_dispatch(
     ) == {"review": "local_cli"}
 
 
-def test_assignment_is_sealed_in_snapshot_run_catalog_and_inspection(
+def test_assignment_owner_is_derived_from_explicit_anchored_profile_home(tmp_path):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    named = root / "profiles" / "reviewer"
+    named.mkdir(parents=True)
+
+    assert workflow_admission.workflow_profile_for_home(root) == "default"
+    assert workflow_admission.workflow_profile_for_home(named) == "reviewer"
+
+
+def test_assignment_snapshot_requires_explicit_profile_before_staging(
     tmp_path, workflow_writer
 ):
     store = RunStore(tmp_path / "home")
+    package = _assigned_package(
+        workflow_writer,
+        tmp_path / "explicit-owner",
+        endpoint="hermes://local/default",
+    )
+
+    with pytest.raises(WorkflowValidationError, match="initiator profile"):
+        store.prepare_run_snapshot(package)
+
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.runs_root.rglob("run.json")) == []
+
+
+def test_assignment_is_sealed_in_snapshot_run_catalog_and_inspection(
+    tmp_path, workflow_writer, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        "plugins.workflow.store.validate_assignment_admission",
+        lambda *_args, **_kwargs: {"review": "local_cli"},
+    )
+    store = RunStore(home)
     package = _assigned_package(workflow_writer, tmp_path / "sealed")
 
-    snapshot = store.prepare_run_snapshot(package)
+    snapshot = store.prepare_run_snapshot(package, initiator_profile="default")
     admitted = store.start_run(
         _request(snapshot, key="assigned", name="assigned"),
         immutable_snapshot=snapshot,
