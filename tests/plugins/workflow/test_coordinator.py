@@ -1471,6 +1471,110 @@ def test_handoff_response_is_journaled_before_advance_and_survives_restart_cut(
     assert response["state"] == "recorded"
 
 
+def test_overdue_handoff_input_pause_remains_coordinator_actionable(
+    tmp_path, workflow_writer
+) -> None:
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    overdue = now + timedelta(minutes=2)
+    clock = _LeaseClock(LeaseClockSample(now, 100.0, "boot-a"))
+    store = RunStore(tmp_path / "home", lease_clock=clock)
+    coordinator = CoordinatorStore(store.database, clock=clock)
+    identity = _identity("paused-handoff-deadline")
+    leadership = coordinator.try_acquire(identity, now=now, lease_seconds=300)
+    fence = ExecutionFence(identity.owner_id, leadership.lease.epoch)
+    run_id = _waiting_handoff_run(
+        store,
+        workflow_writer,
+        tmp_path / "package-paused-deadline",
+        now=now,
+        fence=fence,
+        handoffs=(("review", now),),
+        deadlines={"review": now + timedelta(minutes=1)},
+        interaction_policies={"review": "pause"},
+    )
+
+    class NeedsInputService:
+        def advance(self, handoff_id: str, *, budget_seconds: float):
+            return AdvanceResult(
+                _handoff_snapshot(
+                    handoff_id,
+                    phase="needs_input",
+                    version=2,
+                    next_advance_at=now + timedelta(seconds=5),
+                    checkpoint={
+                        "approval_request_id": "approval-1",
+                        "approval_choices": ["once", "deny"],
+                    },
+                ),
+                "observe",
+                True,
+            )
+
+    scheduler = RunScheduler(
+        store,
+        execution_fence=fence,
+        handoff_service=NeedsInputService(),
+        utcnow=lambda: now,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert scheduler.advance_due_handoffs(run_id, deadline=101.0) == (1, 0, 0)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+    assert store.load_run(run_id)["status"] == "paused"
+    before_due, _cursor, _exhausted = store.coordinator_candidates(
+        after=None,
+        now=now,
+    )
+    assert run_id not in {str(row["run_id"]) for row in before_due}
+
+    for wake in coordinator.pending_wakes(
+        identity,
+        epoch=leadership.lease.epoch,
+        now=now,
+    ):
+        assert coordinator.complete_wake(
+            wake.generation,
+            identity,
+            epoch=leadership.lease.epoch,
+            now=now,
+            outcome="test_setup",
+        )
+
+    due, _cursor, _exhausted = store.coordinator_candidates(
+        after=None,
+        now=overdue,
+    )
+    assert [str(row["run_id"]) for row in due] == [run_id]
+
+    maintenance = MagicMock()
+    maintenance.advance_due_handoffs.return_value = (1, 0, 0)
+    service = WorkflowCoordinatorService(
+        BackgroundServiceContext(
+            host_kind="gateway",
+            host_instance_id="paused-handoff-deadline",
+        ),
+        hermes_home=tmp_path / "home",
+        utcnow=lambda: overdue,
+        monotonic=lambda: 100.0,
+    )
+    actionable, _cursor, _progress = service._sweep_once(
+        store,
+        coordinator,
+        identity,
+        leadership.lease.epoch,
+        maintenance,
+    )
+
+    assert actionable
+    maintenance.advance_due_handoffs.assert_called_once_with(
+        run_id,
+        deadline=102.0,
+        max_items=20,
+    )
+    maintenance.submit.assert_not_called()
+
+
 def test_handoff_sweep_is_bounded_isolates_safe_failures_and_honors_shutdown(
     tmp_path, workflow_writer, caplog
 ) -> None:

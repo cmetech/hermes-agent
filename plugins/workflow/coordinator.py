@@ -434,7 +434,13 @@ class WorkflowCoordinatorService:
                 if (
                     not scheduled_not_due
                     and before.get("execution_mode") == "background"
-                    and before.get("status") in {"queued", "running", "waiting_retry"}
+                    and (
+                        before.get("status") in {"queued", "running", "waiting_retry"}
+                        or (
+                            before.get("status") == "paused"
+                            and run_id in periodic_by_run
+                        )
+                    )
                 ):
                     attempted_handoffs, deferred_handoffs, terminal_handoffs = (
                         scheduler.advance_due_handoffs(
@@ -444,7 +450,10 @@ class WorkflowCoordinatorService:
                         )
                     )
                     run_actionable = run_actionable or attempted_handoffs > 0
-                    if self._monotonic() < deadline:
+                    if (
+                        before.get("status") != "paused"
+                        and self._monotonic() < deadline
+                    ):
                         stalled = run_store.record_stall_if_due(
                             run_id,
                             fence=fence,

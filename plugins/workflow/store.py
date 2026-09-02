@@ -602,6 +602,24 @@ def _healthy_handoff_wait(node: object, now: datetime) -> bool:
     )
 
 
+def _overdue_handoff_input(projection: Mapping[str, object], now: datetime) -> bool:
+    for _node_id, node in _iter_projection_node_states(projection):
+        pending = node.get("pending_interaction")
+        if (
+            node.get("state") != "paused"
+            or not isinstance(pending, Mapping)
+            or pending.get("type") != "handoff_input"
+        ):
+            continue
+        try:
+            handoff = HandoffWaitProjection.from_durable_record(node.get("handoff"))
+        except ValueError:
+            continue
+        if handoff.deadline_at is not None and handoff.deadline_at <= now:
+            return True
+    return False
+
+
 def _healthy_handoff_is_only_blocker(
     nodes: object, now: datetime
 ) -> bool:
@@ -9530,7 +9548,7 @@ class RunStore:
 
         clauses = [
             "admission_state='published'",
-            "status IN ('queued','running','waiting_retry')",
+            "status IN ('queued','running','waiting_retry','paused')",
             "execution_mode IN ('background','foreground')",
             "(status<>'queued' OR scheduled_at IS NULL)",
             _RUN_SCOPED_REPAIR_EXCLUSION_SQL,
@@ -9557,6 +9575,10 @@ class RunStore:
         raw_page = rows[:limit]
         page = []
         for row in raw_page:
+            if row["status"] == "paused":
+                projection = self._load_run_metadata(str(row["run_id"]))
+                if not _overdue_handoff_input(projection, now):
+                    continue
             if row["status"] == "running":
                 projection = self._load_run_metadata(str(row["run_id"]))
                 recovery_due_at = projection.get("next_registry_update_at")
