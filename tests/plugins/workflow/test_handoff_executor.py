@@ -134,12 +134,17 @@ class FakeService:
         return self.snapshot
 
 
-def _executor(service: FakeService) -> HandoffPromptExecutor:
+def _executor(
+    service: FakeService,
+    *,
+    interaction_policy: str = "deny",
+    endpoint: str = "hermes://local/reviewer",
+) -> HandoffPromptExecutor:
     return HandoffPromptExecutor(
         service,
         {
-            "endpoint": "hermes://local/reviewer",
-            "interaction_policy": "deny",
+            "endpoint": endpoint,
+            "interaction_policy": interaction_policy,
             "on_deadline": "cancel_and_fail",
         },
         initiator_profile="default",
@@ -190,6 +195,48 @@ def test_first_dispatch_uses_stable_semantic_key_and_one_bounded_advance(tmp_pat
         "provider_attempts": 0,
         "provider_attempts_exact": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("interaction_policy", "expected_capabilities"),
+    [
+        ("pause", {"approval", "cancellation"}),
+        ("deny", {"cancellation"}),
+        ("auto_cancel", {"cancellation"}),
+    ],
+)
+def test_peer_policy_sets_exact_immutable_spec_capabilities(
+    tmp_path, interaction_policy, expected_capabilities
+):
+    service = FakeService(_snapshot("active"))
+
+    result = _executor(
+        service,
+        interaction_policy=interaction_policy,
+        endpoint="hermes://peer/office/reviewer",
+    ).execute(_context(tmp_path))
+
+    spec, initiator, handoff_key = service.create_calls[0]
+    assert result.status == "waiting_handoff"
+    assert spec.endpoint.canonical == "hermes://peer/office/reviewer"
+    assert spec.prompt == "Review evidence"
+    assert spec.required_capabilities == frozenset(expected_capabilities)
+    assert (initiator, handoff_key) == ("default", "run-1:review:1")
+
+
+def test_structured_output_is_not_a_required_peer_capability(tmp_path):
+    schema = {"type": "object", "required": ["answer"]}
+    service = FakeService(_snapshot("active", output_schema=schema))
+
+    _executor(
+        service,
+        endpoint="hermes://peer/office/reviewer",
+    ).execute(_context(tmp_path, node=_node(output_format=schema)))
+
+    assert service.create_calls[0][0].required_capabilities == frozenset({
+        "cancellation",
+        "structured_output",
+    })
 
 
 def test_create_replay_uses_one_durable_handoff_and_one_channel_step_per_turn(

@@ -40,20 +40,26 @@ def validate_assignment_admission(
     initiator_profile: str,
     channel=None,
 ) -> dict[str, str]:
-    """Validate local assignment reachability without creating a handoff."""
+    """Validate assignment reachability without creating a handoff."""
     from hermes_cli.handoff import EndpointAssessment, HandoffEndpoint
-    from hermes_cli.handoff.local import LocalHermesChannel
+    from hermes_cli.handoff.service import _BuiltinHandoffChannels
+    from hermes_constants import get_hermes_home
     from hermes_cli.profiles import normalize_profile_name, profile_exists
+    from plugins.workflow.schema import ASSIGNMENT_POLICY_CAPABILITIES
 
     owner = normalize_profile_name(initiator_profile)
     mechanisms: dict[str, str] = {}
-    selected_channel = channel if channel is not None else LocalHermesChannel()
+    selected_channel = (
+        channel
+        if channel is not None
+        else _BuiltinHandoffChannels(get_hermes_home())
+    )
     assessments: dict[str, EndpointAssessment] = {}
     deadline = monotonic() + _ASSIGNMENT_ADMISSION_BUDGET_SECONDS
     for node_id, assignment in package.sidecar.get("assignments", {}).items():
         endpoint = HandoffEndpoint.parse(assignment["endpoint"])
         path = f"sidecar.assignments.{node_id}.endpoint"
-        if endpoint.profile == owner:
+        if endpoint.kind == "local" and endpoint.profile == owner:
             raise WorkflowValidationError(
                 ValidationIssue(
                     path=path,
@@ -61,7 +67,7 @@ def validate_assignment_admission(
                     message="assignment target profile must differ from workflow owner",
                 )
             )
-        if not profile_exists(endpoint.profile):
+        if endpoint.kind == "local" and not profile_exists(endpoint.profile):
             raise WorkflowValidationError(
                 ValidationIssue(
                     path=path,
@@ -121,6 +127,17 @@ def validate_assignment_admission(
                     path=path,
                     code="assignment_mechanism_unavailable",
                     message=f"assignment has no available local mechanism: {failure}",
+                )
+            )
+        required = ASSIGNMENT_POLICY_CAPABILITIES[
+            assignment.get("interaction_policy", "deny")
+        ]
+        if endpoint.kind == "peer" and not required <= assessment.capabilities:
+            raise WorkflowValidationError(
+                ValidationIssue(
+                    path=f"sidecar.assignments.{node_id}.interaction_policy",
+                    code="assignment_capability_mismatch",
+                    message="assignment peer does not advertise required policy capabilities",
                 )
             )
         mechanisms[str(node_id)] = assessment.mechanism

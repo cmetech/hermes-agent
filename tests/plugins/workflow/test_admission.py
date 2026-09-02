@@ -191,6 +191,115 @@ def test_assignment_admission_returns_available_mechanism_without_dispatch(
     ) == {"review": "local_cli"}
 
 
+def test_peer_assignment_does_not_use_local_profile_checks(monkeypatch):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {
+                    "endpoint": "hermes://peer/office/default",
+                    "interaction_policy": "deny",
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda _profile: (_ for _ in ()).throw(
+            AssertionError("peer profiles are not local filesystem profiles")
+        ),
+    )
+
+    class PeerChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return EndpointAssessment(
+                endpoint,
+                True,
+                "peer_runs",
+                capabilities=frozenset({
+                    "authoritative_status",
+                    "durable_admission",
+                    "cancellation",
+                }),
+            )
+
+    assert workflow_admission.validate_assignment_admission(
+        package,
+        initiator_profile="default",
+        channel=PeerChannel(),
+    ) == {"review": "peer_runs"}
+
+
+@pytest.mark.parametrize(
+    ("policy", "capabilities"),
+    [
+        ("pause", {"authoritative_status", "durable_admission", "cancellation"}),
+        ("deny", {"authoritative_status", "durable_admission"}),
+        ("auto_cancel", {"authoritative_status", "durable_admission"}),
+    ],
+)
+def test_peer_assignment_rejects_policy_capability_mismatch(policy, capabilities):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {
+                    "endpoint": "hermes://peer/office/reviewer",
+                    "interaction_policy": policy,
+                }
+            }
+        }
+    )
+
+    class PeerChannel:
+        def validate_endpoint(self, endpoint, initiator):
+            return EndpointAssessment(
+                endpoint,
+                True,
+                "peer_runs",
+                capabilities=frozenset(capabilities),
+            )
+
+    with pytest.raises(WorkflowValidationError) as caught:
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=PeerChannel(),
+        )
+
+    assert caught.value.issues[0].code == "assignment_capability_mismatch"
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ["peer_not_found", "peer_auth_unavailable", "peer_profile_not_found", "runs_not_durable"],
+)
+def test_peer_assignment_registry_and_runs_failures_stop_admission(failure_code):
+    package = SimpleNamespace(
+        sidecar={
+            "assignments": {
+                "review": {"endpoint": "hermes://peer/office/reviewer"}
+            }
+        }
+    )
+
+    class UnavailablePeer:
+        def validate_endpoint(self, endpoint, initiator):
+            return EndpointAssessment(
+                endpoint,
+                False,
+                failure_code=failure_code,
+            )
+
+        def create(self, *_args, **_kwargs):
+            raise AssertionError("admission must not create a Workflow handoff")
+
+    with pytest.raises(WorkflowValidationError, match=failure_code):
+        workflow_admission.validate_assignment_admission(
+            package,
+            initiator_profile="default",
+            channel=UnavailablePeer(),
+        )
+
+
 def test_assignment_admission_probes_one_canonical_endpoint_once(monkeypatch):
     endpoint = "hermes://local/reviewer"
     package = SimpleNamespace(

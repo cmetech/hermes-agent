@@ -300,7 +300,7 @@ class WorkflowAssignmentRisk:
     endpoint: str
     target_profile: str
     mode: Literal["task"]
-    interaction_policy: Literal["deny"]
+    interaction_policy: Literal["pause", "deny", "auto_cancel"]
     deadline: str | None
     on_deadline: Literal["cancel_and_fail"]
     possible_mechanisms: tuple[str, ...]
@@ -667,7 +667,7 @@ def build_risk_summary(
             endpoint=(endpoint := HandoffEndpoint.parse(assignment["endpoint"])).canonical,
             target_profile=endpoint.profile,
             mode="task",
-            interaction_policy="deny",
+            interaction_policy=assignment.get("interaction_policy", "deny"),
             deadline=(
                 str(assignment["deadline"])
                 if assignment.get("deadline") is not None
@@ -675,7 +675,9 @@ def build_risk_summary(
             ),
             on_deadline="cancel_and_fail",
             possible_mechanisms=(
-                ("runs",) if os.name == "nt" else ("runs", "local_cli")
+                ("peer_runs",)
+                if endpoint.kind == "peer"
+                else (("runs",) if os.name == "nt" else ("runs", "local_cli"))
             ),
         )
         for node_id, assignment in sorted(

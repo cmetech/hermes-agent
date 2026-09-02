@@ -51,7 +51,11 @@ BASH_SPILL_MAX_FILES = 64
 BASH_SPILL_MAX_VALUE_BYTES = 500_000
 WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES = 2_000_000
 BASH_SPILL_MAX_TOTAL_BYTES = WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
-ASSIGNMENT_ENDPOINT_PATTERN = r"^hermes://local/[a-z0-9][a-z0-9_-]{0,63}$"
+ASSIGNMENT_ENDPOINT_PATTERN = (
+    r"^hermes://(?:local|peer/[a-z0-9][a-z0-9_-]{0,63})/"
+    r"(?!hermes$|root$|sudo$|test$|tmp$)[a-z0-9][a-z0-9_-]{0,63}$"
+)
+ASSIGNMENT_INTERACTION_POLICIES = ("pause", "deny", "auto_cancel")
 ASSIGNMENT_FORBIDDEN_ENDPOINTS = (
     "hermes://local/hermes",
     "hermes://local/root",
@@ -2459,7 +2463,7 @@ def _schema_for_shape(
                     },
                     "interaction_policy": {
                         "type": "string",
-                        "const": "deny",
+                        "enum": list(ASSIGNMENT_INTERACTION_POLICIES),
                         "default": "deny",
                     },
                     "deadline": {

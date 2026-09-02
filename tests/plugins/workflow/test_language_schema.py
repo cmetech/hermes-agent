@@ -89,6 +89,11 @@ def test_sidecar_assignment_schema_is_closed_and_bounded():
     }
     assert assignment["required"] == ["endpoint"]
     assert assignment["additionalProperties"] is False
+    assert assignment["properties"]["interaction_policy"]["enum"] == [
+        "pause",
+        "deny",
+        "auto_cancel",
+    ]
     assert not list(Draft202012Validator(schema).iter_errors(valid))
     invalid = json.loads(json.dumps(valid))
     invalid["assignments"]["security-review"]["credential"] = "secret"

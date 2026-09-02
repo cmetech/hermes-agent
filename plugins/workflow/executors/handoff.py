@@ -20,6 +20,7 @@ from plugins.workflow.executors.ai import (
     result_from_external_response,
 )
 from plugins.workflow.executors.base import NodeExecutionContext, NodeExecutionResult
+from plugins.workflow.schema import ASSIGNMENT_POLICY_CAPABILITIES
 
 
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
@@ -49,12 +50,14 @@ class HandoffPromptExecutor:
         deadline_at: datetime | None,
         utcnow: Callable[[], datetime] = _utc_now,
     ) -> None:
-        if assignment.get("interaction_policy") != "deny":
-            raise ValueError("assigned prompt interaction policy must be deny")
+        interaction_policy = assignment.get("interaction_policy", "deny")
+        if interaction_policy not in ASSIGNMENT_POLICY_CAPABILITIES:
+            raise ValueError("assigned prompt interaction policy is invalid")
         if assignment.get("on_deadline") != "cancel_and_fail":
             raise ValueError("assigned prompt deadline policy is invalid")
         self.service = service
         self.endpoint = HandoffEndpoint.parse(assignment.get("endpoint"))
+        self.interaction_policy = interaction_policy
         self.initiator_profile = initiator_profile
         self.deadline_at = deadline_at
         self._utcnow = utcnow
@@ -102,7 +105,7 @@ class HandoffPromptExecutor:
             if context.structured_output is not None
             else _thaw(context.node.options.get("output_format"))
         )
-        capabilities = {"cancellation"}
+        capabilities = set(ASSIGNMENT_POLICY_CAPABILITIES[self.interaction_policy])
         if schema is not None:
             capabilities.add("structured_output")
         return HandoffSpec(

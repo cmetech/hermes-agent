@@ -40,6 +40,7 @@ from plugins.workflow.language import (
     supports_phase6_semantics,
 )
 from plugins.workflow.language_schema import (
+    ASSIGNMENT_INTERACTION_POLICIES,
     assignment_endpoint_is_valid,
     parse_assignment_deadline,
     EXECUTABLE_NODE_TYPES,
@@ -163,6 +164,11 @@ _ASSIGNMENT_FIELDS = frozenset({
     "deadline",
     "on_deadline",
 })
+ASSIGNMENT_POLICY_CAPABILITIES = {
+    "pause": frozenset({"approval", "cancellation"}),
+    "deny": frozenset({"cancellation"}),
+    "auto_cancel": frozenset({"cancellation"}),
+}
 
 
 def _issue(
@@ -2490,7 +2496,7 @@ def _parse_sidecar(
             _fail(
                 f"{path}.endpoint",
                 "invalid_assignment_endpoint",
-                "assignment endpoint must be a canonical local endpoint",
+                "assignment endpoint must be a canonical handoff endpoint",
             )
         try:
             endpoint = HandoffEndpoint.parse(assignment["endpoint"])
@@ -2498,20 +2504,20 @@ def _parse_sidecar(
             _fail(
                 f"{path}.endpoint",
                 "invalid_assignment_endpoint",
-                f"assignment endpoint must be a canonical local endpoint: {exc}",
+                f"assignment endpoint must be a canonical handoff endpoint: {exc}",
             )
         if assignment["endpoint"] != endpoint.canonical:
             _fail(
                 f"{path}.endpoint",
                 "invalid_assignment_endpoint",
-                "assignment endpoint must use its canonical local form",
+                "assignment endpoint must use its canonical handoff form",
             )
         interaction_policy = assignment.get("interaction_policy", "deny")
-        if interaction_policy != "deny":
+        if interaction_policy not in ASSIGNMENT_INTERACTION_POLICIES:
             _fail(
                 f"{path}.interaction_policy",
                 "invalid_assignment_policy",
-                "assignment interaction_policy must be deny",
+                "assignment interaction_policy must be pause, deny, or auto_cancel",
             )
         on_deadline = assignment.get("on_deadline", "cancel_and_fail")
         if on_deadline != "cancel_and_fail":
@@ -2522,7 +2528,7 @@ def _parse_sidecar(
             )
         normalized: dict[str, object] = {
             "endpoint": endpoint.canonical,
-            "interaction_policy": "deny",
+            "interaction_policy": interaction_policy,
             "on_deadline": "cancel_and_fail",
         }
         if "deadline" in assignment:

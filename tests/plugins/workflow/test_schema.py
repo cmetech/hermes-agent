@@ -470,6 +470,10 @@ def test_assignment_accepts_one_closed_local_prompt_contract(workflow_writer, tm
     [
         ("hermes://local/reviewer", True),
         ("hermes://local/default", True),
+        ("hermes://peer/office/reviewer", True),
+        ("hermes://peer/office/default", True),
+        ("hermes://peer/Office/reviewer", False),
+        ("hermes://peer/office/root", False),
         ("hermes://local/root", False),
         ("hermes://local/hermes", False),
         ("HERMES://local/reviewer", False),
@@ -489,6 +493,51 @@ def test_assignment_endpoint_generated_schema_and_runtime_are_strictly_equivalen
     )
     path = workflow_writer(
         tmp_path / endpoint.replace("://", "-").replace("/", "-"),
+        nodes=[{"id": "review", "prompt": "Review"}],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        yaml.safe_dump(sidecar), encoding="utf-8"
+    )
+    try:
+        load_workflow(path)
+    except WorkflowValidationError:
+        runtime_accepted = False
+    else:
+        runtime_accepted = True
+
+    assert (schema_accepted, runtime_accepted) == (accepted, accepted)
+
+
+@pytest.mark.parametrize(
+    ("policy", "accepted"),
+    [
+        ("pause", True),
+        ("deny", True),
+        ("auto_cancel", True),
+        ("ask", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_assignment_interaction_policy_schema_and_runtime_are_equivalent(
+    workflow_writer, tmp_path, policy, accepted
+):
+    sidecar = {
+        "outward_action_nodes": ["review"],
+        "assignments": {
+            "review": {
+                "endpoint": "hermes://peer/office/reviewer",
+                "interaction_policy": policy,
+            }
+        },
+    }
+    schema_accepted = not list(
+        Draft202012Validator(
+            sidecar_json_schema(WorkflowLanguageProfile.HERMES_LEGACY)
+        ).iter_errors(sidecar)
+    )
+    path = workflow_writer(
+        tmp_path / f"policy-{policy or 'empty'}",
         nodes=[{"id": "review", "prompt": "Review"}],
     )
     path.with_name(f"{path.stem}.hermes.yaml").write_text(
@@ -555,8 +604,8 @@ def test_assignment_deadline_generated_schema_and_runtime_are_strictly_equivalen
     ("changes", "message"),
     [
         ({"credential": "secret"}, "unknown assignment field"),
-        ({"endpoint": "https://example.test/agent"}, "local endpoint"),
-        ({"endpoint": "HERMES://local/security-reviewer"}, "canonical local endpoint"),
+        ({"endpoint": "https://example.test/agent"}, "handoff endpoint"),
+        ({"endpoint": "HERMES://local/security-reviewer"}, "canonical handoff endpoint"),
         ({"interaction_policy": "ask"}, "interaction_policy"),
         ({"on_deadline": "keep_waiting"}, "on_deadline"),
         ({"deadline": "P31D"}, "deadline"),

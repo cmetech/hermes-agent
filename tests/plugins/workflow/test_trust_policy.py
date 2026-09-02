@@ -530,8 +530,9 @@ def test_risk_summary_is_redacted_and_untrusted_local_execution_fails_closed(
     assert requirement.mode == "isolated_backend_required"
 
 
+@pytest.mark.parametrize("interaction_policy", ["pause", "deny", "auto_cancel"])
 def test_assignment_is_disclosed_and_changes_invalidate_prior_trust(
-    workflow_writer, tmp_path
+    workflow_writer, tmp_path, interaction_policy
 ):
     path = workflow_writer(
         tmp_path / "assigned",
@@ -543,7 +544,7 @@ def test_assignment_is_disclosed_and_changes_invalidate_prior_trust(
         "assignments:\n"
         "  review:\n"
         "    endpoint: hermes://local/security-reviewer\n"
-        "    interaction_policy: deny\n"
+        f"    interaction_policy: {interaction_policy}\n"
         "    deadline: PT4H\n"
         "    on_deadline: cancel_and_fail\n",
         encoding="utf-8",
@@ -565,7 +566,7 @@ def test_assignment_is_disclosed_and_changes_invalidate_prior_trust(
             "endpoint": "hermes://local/security-reviewer",
             "target_profile": "security-reviewer",
             "mode": "task",
-            "interaction_policy": "deny",
+            "interaction_policy": interaction_policy,
             "deadline": "PT4H",
             "on_deadline": "cancel_and_fail",
             "possible_mechanisms": (
