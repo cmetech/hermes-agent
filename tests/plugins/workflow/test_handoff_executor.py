@@ -278,6 +278,22 @@ def test_terminal_success_reuses_ordinary_structured_output_validation(tmp_path)
     assert output.read_bytes() == b'{"answer":"ok"}'
 
 
+def test_terminal_result_on_first_advance_is_returned_as_internal_wait(tmp_path):
+    schema = {"type": "object", "required": ["answer"]}
+    service = FakeService(
+        _snapshot("succeeded", text='{"answer":"ok"}', output_schema=schema)
+    )
+
+    result = _executor(service).execute(
+        _context(tmp_path, node=_node(output_format=schema))
+    )
+
+    assert result.status == "waiting_handoff"
+    assert result.metadata["handoff_observed_phase"] == "succeeded"
+    assert result.metadata["handoff_generation"] == 1
+    assert not list((tmp_path / "run").glob("nodes/**/output.json"))
+
+
 def test_archon_terminal_success_produces_the_canonical_primary_output(tmp_path):
     schema = {
         "type": "object",
@@ -387,4 +403,31 @@ def test_definitive_retry_uses_the_next_semantic_generation(tmp_path):
 
     assert result.status == "waiting_handoff"
     assert service.create_calls[0][2] == "run-1:review:2"
+    assert result.metadata["handoff_generation"] == 2
+
+
+def test_local_acceptance_failure_after_remote_success_starts_next_generation(
+    tmp_path,
+):
+    snapshot = replace(
+        _snapshot("active", handoff_id="handoff-2"),
+        handoff_key="run-1:review:2",
+    )
+    service = FakeService(snapshot)
+    state = _wait_state("succeeded")
+    state["retry_consumed"] = 1
+    state["attempts"] = [
+        {"attempt_id": "attempt-1", "state": "waiting_handoff"},
+        {
+            "attempt_id": "attempt-2",
+            "state": "failed",
+            "error_code": "structured_output_invalid",
+        },
+    ]
+
+    result = _executor(service).execute(_context(tmp_path, node_state=state))
+
+    assert result.status == "waiting_handoff"
+    assert [call[2] for call in service.create_calls] == ["run-1:review:2"]
+    assert service.get_calls == []
     assert result.metadata["handoff_generation"] == 2

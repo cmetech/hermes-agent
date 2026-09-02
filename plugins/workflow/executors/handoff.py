@@ -71,7 +71,7 @@ class HandoffPromptExecutor:
     ) -> bool:
         attempts = context.node_state.get("attempts")
         return bool(
-            prior.get("last_observed_phase") in {"failed", "cancelled"}
+            prior.get("last_observed_phase") in _TERMINAL_PHASES
             and isinstance(context.node_state.get("retry_consumed"), int)
             and not isinstance(context.node_state.get("retry_consumed"), bool)
             and int(context.node_state["retry_consumed"]) >= 1
@@ -123,7 +123,7 @@ class HandoffPromptExecutor:
     def _load_or_create(
         self,
         context: NodeExecutionContext,
-    ) -> tuple[HandoffSnapshot, int]:
+    ) -> tuple[HandoffSnapshot, int, bool]:
         prior = self._prior_handoff(context)
         retry = prior is not None and self._retry_authorized(context, prior)
         if prior is not None and not retry:
@@ -143,7 +143,7 @@ class HandoffPromptExecutor:
                 or snapshot.spec.endpoint != self.endpoint
             ):
                 raise ValueError("workflow handoff identity is mismatched")
-            return snapshot, generation
+            return snapshot, generation, False
 
         generation = int(prior["generation"]) + 1 if retry else 1
         snapshot = self.service.create(
@@ -156,7 +156,7 @@ class HandoffPromptExecutor:
             handoff_key=self._semantic_key(context, generation),
         )
         advanced = self.service.advance(snapshot.handoff_id, budget_seconds=2.0)
-        return advanced.snapshot, generation
+        return advanced.snapshot, generation, True
 
     def _metadata(
         self,
@@ -175,6 +175,31 @@ class HandoffPromptExecutor:
             "provider_attempts_exact": True,
         }
 
+    def _waiting_result(
+        self,
+        snapshot: HandoffSnapshot,
+        generation: int,
+    ) -> NodeExecutionResult:
+        next_observation = snapshot.next_advance_at or self._utcnow()
+        return NodeExecutionResult(
+            "waiting_handoff",
+            metadata={
+                "handoff_id": snapshot.handoff_id,
+                "handoff_generation": generation,
+                "handoff_observed_version": snapshot.state_version,
+                "handoff_observed_phase": snapshot.phase,
+                "handoff_next_observation_at": next_observation.isoformat(),
+                "handoff_deadline_at": (
+                    snapshot.spec.deadline_at.isoformat()
+                    if snapshot.spec.deadline_at is not None
+                    else None
+                ),
+                "known_no_effect": True,
+                "provider_attempts": 0,
+                "provider_attempts_exact": True,
+            },
+        )
+
     def execute(self, context: NodeExecutionContext) -> NodeExecutionResult:
         if context.node.node_type != "prompt":
             return NodeExecutionResult(
@@ -183,7 +208,7 @@ class HandoffPromptExecutor:
                 error_message="only prompt nodes may be assigned",
             )
         try:
-            snapshot, generation = self._load_or_create(context)
+            snapshot, generation, created = self._load_or_create(context)
         except HandoffNotFound:
             return NodeExecutionResult(
                 "failed",
@@ -196,6 +221,9 @@ class HandoffPromptExecutor:
                 error_code="handoff_identity_mismatch",
                 error_message=str(exc),
             )
+
+        if created:
+            return self._waiting_result(snapshot, generation)
 
         metadata = self._metadata(snapshot, generation)
         if snapshot.phase == "succeeded":
@@ -223,26 +251,7 @@ class HandoffPromptExecutor:
             )
         if snapshot.phase in _TERMINAL_PHASES:
             raise AssertionError("unhandled terminal handoff phase")
-
-        next_observation = snapshot.next_advance_at or self._utcnow()
-        return NodeExecutionResult(
-            "waiting_handoff",
-            metadata={
-                "handoff_id": snapshot.handoff_id,
-                "handoff_generation": generation,
-                "handoff_observed_version": snapshot.state_version,
-                "handoff_observed_phase": snapshot.phase,
-                "handoff_next_observation_at": next_observation.isoformat(),
-                "handoff_deadline_at": (
-                    snapshot.spec.deadline_at.isoformat()
-                    if snapshot.spec.deadline_at is not None
-                    else None
-                ),
-                "known_no_effect": True,
-                "provider_attempts": 0,
-                "provider_attempts_exact": True,
-            },
-        )
+        return self._waiting_result(snapshot, generation)
 
 
 __all__ = ["HandoffPromptExecutor"]

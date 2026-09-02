@@ -1090,11 +1090,13 @@ class RunScheduler:
         assignment: Mapping[str, object],
         projection: Mapping[str, object],
     ) -> HandoffPromptExecutor:
-        if self._handoff_service is None:
-            self._handoff_service = AgentHandoffService(
-                HandoffStore(self.store.hermes_home / "handoffs.db")
-            )
-            self._owns_handoff_service = True
+        with self._activity:
+            if self._handoff_service is None:
+                self._handoff_service = AgentHandoffService(
+                    HandoffStore(self.store.hermes_home / "handoffs.db")
+                )
+                self._owns_handoff_service = True
+            service = self._handoff_service
         deadline_at = None
         duration = assignment.get("deadline")
         if duration is not None:
@@ -1117,7 +1119,7 @@ class RunScheduler:
                 minutes=minutes,
             )
         return HandoffPromptExecutor(
-            self._handoff_service,
+            service,
             assignment,
             initiator_profile=self.workflow_profile,
             deadline_at=deadline_at,
@@ -5973,7 +5975,7 @@ class RunScheduler:
             and handoff_generation > 0
             and observed_handoff_phase in {"succeeded", "failed", "cancelled"}
         )
-        known_no_effect = True if definitive_handoff else None
+        known_no_effect = None
         if execution_semantics is not None:
             known_no_effect = (
                 definitive_handoff
@@ -6887,8 +6889,13 @@ class RunScheduler:
             except WorkflowLockTimeout:
                 self.store.record_cleanup_failed(run_id, reason="shutdown_lock_timeout")
         self._submission_pool.shutdown(wait=True, cancel_futures=True)
-        if self._owns_handoff_service and self._handoff_service is not None:
-            self._handoff_service.store.close()
+        with self._activity:
+            owned_handoff_service = (
+                self._handoff_service if self._owns_handoff_service else None
+            )
+            self._owns_handoff_service = False
+        if owned_handoff_service is not None:
+            owned_handoff_service.store.close()
 
 
 __all__ = [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import errno
 import hashlib
@@ -9,6 +10,7 @@ import json
 import multiprocessing
 import sys
 import threading
+import time
 from types import MappingProxyType
 
 import pytest
@@ -32,6 +34,7 @@ from plugins.workflow.runner_binding import (
     RunnerCapabilities,
     execution_capability_context,
 )
+import plugins.workflow.scheduler as scheduler_module
 from plugins.workflow.scheduler import RunScheduler, evaluate_condition
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import ArtifactRef, NodeClaim, RunStore
@@ -42,6 +45,137 @@ def _claim_process(home, run_id, owner, start, output):
     store = RunStore(home)
     start.wait()
     output.put(store.claim_node(run_id, "start", owner) is not None)
+
+
+class _ScriptedHandoffService:
+    def __init__(self, outcomes: dict[int, str]) -> None:
+        self.outcomes = outcomes
+        self.create_keys: list[str] = []
+        self.advance_calls: list[str] = []
+        self.get_calls: list[str] = []
+        self.snapshots: dict[str, HandoffSnapshot] = {}
+
+    @staticmethod
+    def _terminal_result(text: str) -> dict[str, object]:
+        encoded = text.encode()
+        return {
+            "text": text,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "media_type": "text/plain",
+            "size_bytes": len(encoded),
+        }
+
+    def create(self, spec, initiator, *, handoff_key):
+        self.create_keys.append(handoff_key)
+        generation = int(handoff_key.rsplit(":", 1)[1])
+        handoff_id = f"handoff-{generation}"
+        snapshot = HandoffSnapshot(
+            handoff_id=handoff_id,
+            key_scope=initiator,
+            handoff_key=handoff_key,
+            spec=spec,
+            spec_fingerprint=spec.fingerprint,
+            phase="prepared",
+            state_version=0,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.snapshots[handoff_id] = snapshot
+        return snapshot
+
+    def advance(self, handoff_id, *, budget_seconds=2.0):
+        self.advance_calls.append(handoff_id)
+        snapshot = self.snapshots[handoff_id]
+        generation = int(snapshot.handoff_key.rsplit(":", 1)[1])
+        outcome = self.outcomes[generation]
+        terminal_result = (
+            self._terminal_result("not-json")
+            if outcome == "succeeded_invalid"
+            else None
+        )
+        snapshot = replace(
+            snapshot,
+            phase=("succeeded" if outcome == "succeeded_invalid" else outcome),
+            state_version=snapshot.state_version + 1,
+            next_advance_at=(
+                None
+                if outcome == "succeeded_invalid"
+                else datetime.now(timezone.utc) + timedelta(seconds=5)
+            ),
+            terminal_result=terminal_result,
+            failure_code=(
+                "observation_indeterminate" if outcome == "indeterminate" else None
+            ),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.snapshots[handoff_id] = snapshot
+        return AdvanceResult(snapshot, "submit", True)
+
+    def get(self, handoff_id):
+        self.get_calls.append(handoff_id)
+        return self.snapshots[handoff_id]
+
+    def succeed_invalid(self, generation: int) -> HandoffSnapshot:
+        handoff_id = f"handoff-{generation}"
+        snapshot = self.snapshots[handoff_id]
+        snapshot = replace(
+            snapshot,
+            phase="succeeded",
+            state_version=snapshot.state_version + 1,
+            next_advance_at=None,
+            terminal_result=self._terminal_result("not-json"),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.snapshots[handoff_id] = snapshot
+        return snapshot
+
+
+def _start_assigned_retry_run(tmp_path, workflow_writer, monkeypatch, *, name):
+    home = tmp_path / f"{name}-home"
+    (home / "profiles" / "reviewer").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    workflow = workflow_writer(
+        tmp_path / f"{name}-package",
+        name=name,
+        nodes=[
+            {
+                "id": "review",
+                "prompt": "Review this",
+                "output_format": {"type": "object", "required": ["answer"]},
+                "retry": {
+                    "max_attempts": 2,
+                    "on_error": "all",
+                    "delay_ms": 1000,
+                },
+            }
+        ],
+    )
+    workflow.with_name("example.hermes.yaml").write_text(
+        "outward_action_nodes: [review]\n"
+        "assignments:\n"
+        "  review:\n"
+        "    endpoint: hermes://local/reviewer\n"
+        "    interaction_policy: deny\n"
+        "    deadline: PT4H\n"
+        "    on_deadline: cancel_and_fail\n",
+        encoding="utf-8",
+    )
+    package = load_workflow(workflow)
+    store = RunStore(home)
+    prepared = store.prepare_run_snapshot(package, initiator_profile="default")
+    admitted = store.start_run(
+        RunAdmissionRequest(
+            workflow_name=name,
+            definition_digest=prepared.definition_digest,
+            policy_digest=prepared.policy_digest,
+            input_manifest_digest=prepared.input_manifest_digest,
+            trigger_source="cli",
+            idempotency_key=name,
+            concurrency_key=name,
+        ),
+        immutable_snapshot=prepared,
+    )
+    return store, package, admitted.run_id
 
 
 def test_only_one_owner_claims_a_ready_node(tmp_path, workflow_writer):
@@ -318,6 +452,199 @@ def test_assigned_prompt_dispatches_as_handoff_and_releases_worker(
             "SELECT COUNT(*) FROM worker_claims WHERE run_id=?",
             (admitted.run_id,),
         ).fetchone()[0] == 0
+
+
+def test_invalid_handoff_output_retry_starts_one_new_generation(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store, _package, run_id = _start_assigned_retry_run(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+        name="assigned-invalid-retry",
+    )
+    now = [datetime.now(timezone.utc)]
+    service = _ScriptedHandoffService({1: "active", 2: "active"})
+    scheduler = RunScheduler(
+        store,
+        handoff_service=service,
+        utcnow=lambda: now[0],
+        jitter=lambda: 0.0,
+    )
+    try:
+        waiting = scheduler.advance(run_id, max_nodes=1)
+        first = waiting["nodes"]["review"]["handoff"]
+        terminal = service.succeed_invalid(1)
+        assert store.refresh_handoff_wait(
+            run_id,
+            "review",
+            handoff_id="handoff-1",
+            generation=1,
+            expected_observed_version=first["last_observed_version"],
+            observed_version=terminal.state_version,
+            observed_phase="succeeded",
+            next_observation_at=now[0],
+        )
+
+        retrying = scheduler.advance(run_id, max_nodes=1)
+        retry_at = datetime.fromisoformat(
+            retrying["nodes"]["review"]["next_attempt_at"]
+        )
+        now[0] = retry_at + timedelta(milliseconds=1)
+        retried = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert retried["nodes"]["review"]["state"] == "waiting_handoff"
+    assert retried["nodes"]["review"]["handoff"]["generation"] == 2
+    assert service.create_keys == [
+        f"{run_id}:review:1",
+        f"{run_id}:review:2",
+    ]
+    assert service.get_calls == ["handoff-1"]
+    assert service.advance_calls == ["handoff-1", "handoff-2"]
+
+
+def test_terminal_first_advance_is_persisted_before_invalid_output_retry(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store, _package, run_id = _start_assigned_retry_run(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+        name="assigned-terminal-first",
+    )
+    now = [datetime.now(timezone.utc)]
+    service = _ScriptedHandoffService({1: "succeeded_invalid", 2: "active"})
+    scheduler = RunScheduler(
+        store,
+        handoff_service=service,
+        utcnow=lambda: now[0],
+        jitter=lambda: 0.0,
+    )
+    try:
+        dispatched = scheduler.advance(run_id, max_nodes=1)
+        assert dispatched["nodes"]["review"]["state"] == "ready"
+        assert dispatched["nodes"]["review"]["handoff"] == {
+            "handoff_id": "handoff-1",
+            "generation": 1,
+            "last_observed_version": 1,
+            "last_observed_phase": "succeeded",
+            "next_observation_at": now[0].isoformat(),
+            "deadline_at": dispatched["nodes"]["review"]["handoff"][
+                "deadline_at"
+            ],
+        }
+
+        retrying = scheduler.advance(run_id, max_nodes=1)
+        retry_at = datetime.fromisoformat(
+            retrying["nodes"]["review"]["next_attempt_at"]
+        )
+        now[0] = retry_at + timedelta(milliseconds=1)
+        retried = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert retried["nodes"]["review"]["state"] == "waiting_handoff"
+    assert retried["nodes"]["review"]["handoff"]["generation"] == 2
+    assert service.create_keys == [
+        f"{run_id}:review:1",
+        f"{run_id}:review:2",
+    ]
+    assert service.get_calls == ["handoff-1"]
+    assert service.advance_calls == ["handoff-1", "handoff-2"]
+
+
+def test_indeterminate_handoff_never_recreates_or_resubmits(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store, _package, run_id = _start_assigned_retry_run(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+        name="assigned-indeterminate",
+    )
+    service = _ScriptedHandoffService({1: "indeterminate"})
+    scheduler = RunScheduler(store, handoff_service=service)
+    try:
+        waiting = scheduler.advance(run_id, max_nodes=1)
+        unchanged = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert waiting["nodes"]["review"]["state"] == "waiting_handoff"
+    assert unchanged["nodes"]["review"]["state"] == "waiting_handoff"
+    assert service.create_keys == [f"{run_id}:review:1"]
+    assert service.advance_calls == ["handoff-1"]
+    assert service.get_calls == []
+
+
+def test_concurrent_first_assignments_share_one_owned_handoff_service(
+    tmp_path, monkeypatch
+):
+    stores = []
+    services = []
+
+    class OwnedStore:
+        def __init__(self, path):
+            self.path = path
+            self.close_count = 0
+            stores.append(self)
+            time.sleep(0.05)
+
+        def close(self):
+            self.close_count += 1
+
+    class OwnedService:
+        def __init__(self, store):
+            self.store = store
+            services.append(self)
+
+    monkeypatch.setattr(scheduler_module, "HandoffStore", OwnedStore)
+    monkeypatch.setattr(scheduler_module, "AgentHandoffService", OwnedService)
+    scheduler = RunScheduler(RunStore(tmp_path / "concurrent-service-home"))
+    assignment = {
+        "endpoint": "hermes://local/reviewer",
+        "interaction_policy": "deny",
+        "on_deadline": "cancel_and_fail",
+    }
+    barrier = threading.Barrier(8)
+
+    def construct(_index):
+        barrier.wait()
+        return scheduler._assigned_prompt_executor(assignment, {})
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            executors = list(pool.map(construct, range(8)))
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    assert len(stores) == len(services) == 1
+    assert {id(executor.service) for executor in executors} == {id(services[0])}
+    assert stores[0].close_count == 1
+
+
+def test_injected_handoff_service_remains_caller_owned(tmp_path):
+    class InjectedStore:
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    class InjectedService:
+        def __init__(self):
+            self.store = InjectedStore()
+
+    service = InjectedService()
+    scheduler = RunScheduler(
+        RunStore(tmp_path / "injected-service-home"),
+        handoff_service=service,
+    )
+    scheduler.shutdown(deadline_seconds=2)
+
+    assert service.store.close_count == 0
 
 
 def test_only_one_process_claims_a_ready_node(tmp_path, workflow_writer):
