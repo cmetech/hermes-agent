@@ -1070,6 +1070,67 @@ git diff --cached --check
 git commit -m "fix(handoff): route peer control through builtin channel"
 ```
 
+## Task 10B: Keep overdue remote-input pauses coordinator-actionable
+
+**Live defect found by Task 10:** A remote handoff can pause a Workflow with a
+durable `handoff_input`, but `RunStore.coordinator_candidates()` indexes only
+queued, running, and retry-waiting runs. The scheduler already handles paused
+handoff deadlines correctly; the coordinator never gives it the overdue run.
+
+**Owns:**
+
+- `plugins/workflow/store.py`
+- `plugins/workflow/coordinator.py`
+- `tests/plugins/workflow/test_coordinator.py`
+
+**Consumes:** The existing paused `handoff_input` projection, durable handoff
+deadline, coordinator keyset scan, and `RunScheduler.advance_due_handoffs()`
+deadline/cancel path.
+
+**Produces:** Only overdue remote-input pauses enter the ordinary coordinator
+scan. Other paused interactions and remote-input pauses before their deadline
+remain dormant. The coordinator advances the overdue handoff without treating
+the paused Workflow as ordinary runnable work.
+
+### RED
+
+Add `test_overdue_handoff_input_pause_remains_coordinator_actionable`. Prove
+that an ordinary pause and a not-yet-due `handoff_input` are excluded, while an
+overdue `handoff_input` is selected and passed only to
+`advance_due_handoffs()`.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_coordinator.py \
+  -k overdue_handoff_input_pause_remains_coordinator_actionable -q
+```
+
+### GREEN and commit
+
+Extend the existing candidate scan with the narrow paused/deadline predicate
+and allow the coordinator to run only handoff maintenance for that paused
+candidate. Do not add a second timer, queue, or supervisor.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_coordinator.py \
+  -k 'overdue_handoff_input_pause_remains_coordinator_actionable or handoff' -q
+
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_remote_handoff_e2e.py \
+  -k stop_interrupted_and_cancellation_races -q
+```
+
+Stage exactly the three owned files and commit:
+
+```bash
+git add plugins/workflow/store.py \
+  plugins/workflow/coordinator.py \
+  tests/plugins/workflow/test_coordinator.py
+git diff --cached --check
+git commit -m "fix(workflow): enforce paused handoff deadlines"
+```
+
 ### GREEN
 
 Do not introduce test-only production hooks. Run the complete Stage 2 focused
