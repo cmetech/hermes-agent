@@ -5703,7 +5703,19 @@ class RunScheduler:
                 next_observation_at=next_observation_at,
                 deadline_at=deadline_at,
             ):
-                raise RuntimeError("stale internal handoff wait result")
+                if not self._renew_execution_owner(claim.run_id):
+                    raise RuntimeError(
+                        "execution fence lost while persisting handoff wait"
+                    )
+                projection = self.store.load_run(claim.run_id)
+                active = self._claim_state(projection, claim).get("claim")
+                if not (
+                    isinstance(active, Mapping)
+                    and active.get("attempt_id") == claim.attempt_id
+                    and active.get("owner_id") == claim.owner_id
+                ):
+                    raise RuntimeError("stale node completion")
+                raise RuntimeError("internal handoff wait persistence failed")
             return
         if result.session_recovery_outcome is not None:
             if not self.store.record_persistent_session_recovery_outcome(

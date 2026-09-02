@@ -13366,7 +13366,7 @@ class RunStore:
             next_observation_at,
             deadline_at,
         )
-        if observed_phase in {"indeterminate", "succeeded", "failed", "cancelled"}:
+        if observed_phase in {"succeeded", "failed", "cancelled"}:
             return False
         directory = self.run_directory(claim.run_id)
         try:

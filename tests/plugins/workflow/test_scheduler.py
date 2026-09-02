@@ -579,6 +579,87 @@ def test_indeterminate_handoff_never_recreates_or_resubmits(
     assert service.get_calls == []
 
 
+def test_authorized_retry_can_persist_indeterminate_next_generation(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store, _package, run_id = _start_assigned_retry_run(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+        name="assigned-retry-indeterminate",
+    )
+    now = [datetime.now(timezone.utc)]
+    service = _ScriptedHandoffService({1: "active", 2: "indeterminate"})
+    scheduler = RunScheduler(
+        store,
+        handoff_service=service,
+        utcnow=lambda: now[0],
+        jitter=lambda: 0.0,
+    )
+    try:
+        waiting = scheduler.advance(run_id, max_nodes=1)
+        first = waiting["nodes"]["review"]["handoff"]
+        terminal = service.succeed_invalid(1)
+        assert store.refresh_handoff_wait(
+            run_id,
+            "review",
+            handoff_id="handoff-1",
+            generation=1,
+            expected_observed_version=first["last_observed_version"],
+            observed_version=terminal.state_version,
+            observed_phase="succeeded",
+            next_observation_at=now[0],
+        )
+        retrying = scheduler.advance(run_id, max_nodes=1)
+        retry_at = datetime.fromisoformat(
+            retrying["nodes"]["review"]["next_attempt_at"]
+        )
+        now[0] = retry_at + timedelta(milliseconds=1)
+
+        retried = scheduler.advance(run_id, max_nodes=1)
+        unchanged = scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+    handoff = retried["nodes"]["review"]["handoff"]
+    assert retried["status"] == unchanged["status"] == "running"
+    assert retried["nodes"]["review"]["state"] == "waiting_handoff"
+    assert unchanged["nodes"]["review"]["state"] == "waiting_handoff"
+    assert handoff["handoff_id"] == "handoff-2"
+    assert handoff["generation"] == 2
+    assert handoff["last_observed_version"] == 1
+    assert handoff["last_observed_phase"] == "indeterminate"
+    assert service.create_keys == [
+        f"{run_id}:review:1",
+        f"{run_id}:review:2",
+    ]
+    assert service.advance_calls == ["handoff-1", "handoff-2"]
+    assert service.get_calls == ["handoff-1"]
+
+
+def test_current_handoff_claim_does_not_hide_persistence_failure_as_stale(
+    tmp_path, workflow_writer, monkeypatch
+):
+    store, _package, run_id = _start_assigned_retry_run(
+        tmp_path,
+        workflow_writer,
+        monkeypatch,
+        name="assigned-persistence-failure",
+    )
+    service = _ScriptedHandoffService({1: "active"})
+    monkeypatch.setattr(
+        store,
+        "persist_handoff_wait_result",
+        lambda *_args, **_kwargs: False,
+    )
+    scheduler = RunScheduler(store, handoff_service=service)
+    try:
+        with pytest.raises(RuntimeError, match="handoff wait persistence failed"):
+            scheduler.advance(run_id, max_nodes=1)
+    finally:
+        scheduler.shutdown(deadline_seconds=2)
+
+
 def test_concurrent_first_assignments_share_one_owned_handoff_service(
     tmp_path, monkeypatch
 ):
