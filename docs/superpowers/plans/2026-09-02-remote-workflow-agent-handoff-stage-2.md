@@ -1370,6 +1370,53 @@ findings with fresh RED/GREEN tests and one atomic commit per independent fix.
 Rerun Task 10's focused/stress gates and Task 11's installed-distribution gate
 after the final remediation commit.
 
+## Task 12: Preserve coordinator progress across filtered handoff pages
+
+**Confirmed adversarial-review finding:** `coordinator_candidates()` advances its
+raw keyset cursor past rows filtered from the actionable page, but `_sweep_once()`
+reconstructs progress only from returned actionable rows. A full page of
+non-overdue paused handoffs therefore leaves the coordinator cursor unchanged
+and can starve later active or overdue handoffs indefinitely.
+
+**Owns:**
+
+- `plugins/workflow/coordinator.py`
+- `tests/plugins/workflow/test_coordinator.py`
+
+**Produces:** Cursor progress through a fully processed raw page without
+skipping an actionable row when the sweep budget stops partway through.
+
+### RED
+
+Add one coordinator regression test with 100 filtered rows followed by an
+actionable row. Prove the first sweep advances to the store-provided raw-page
+cursor and the second sweep reaches the later row.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_coordinator.py \
+  -k filtered_periodic_page_advances_raw_cursor -q
+```
+
+### GREEN and commit
+
+When every returned periodic candidate was processed, preserve the store's page
+cursor. Continue using the last processed actionable row when the time budget
+stops partway through the page.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_coordinator.py \
+  tests/plugins/workflow/test_performance_bounds.py \
+  -k 'filtered_periodic_page_advances_raw_cursor or overdue_handoff_input_pause_remains_coordinator_actionable or sweep_cursor_never_skips_page_prefix_when_wake_consumes_budget or coordinator_cursor_reaches_run_201_with_bounded_keyset_pages' \
+  -q
+
+git add plugins/workflow/coordinator.py \
+  tests/plugins/workflow/test_coordinator.py
+git diff --cached --check
+git commit -m "fix(workflow): preserve filtered handoff sweep progress"
+```
+
 ## Completion checklist
 
 - [ ] Tasks 1-9 recorded a genuine RED failure before their production changes.
