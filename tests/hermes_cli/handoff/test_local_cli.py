@@ -414,6 +414,28 @@ def test_submit_returns_process_identity_without_absolute_paths(tmp_path, monkey
     assert str(tmp_path) not in json.dumps(dict(observation.checkpoint))
 
 
+def test_submit_strips_initiator_credentials_from_wrapper_environment(
+    tmp_path, monkeypatch
+):
+    channel, snapshot = _bound(tmp_path, monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "source-provider-canary")
+    monkeypatch.setenv("API_SERVER_KEY", "source-api-canary")
+    identity = ProcessIdentity(pid=4321, start_time=9876, group_id=4321)
+    captured = {}
+
+    def spawn(_argv, **kwargs):
+        captured.update(kwargs["env"])
+        return SimpleNamespace(identity=identity)
+
+    monkeypatch.setattr(local_module.ManagedProcessTree, "spawn", spawn)
+
+    channel.submit(snapshot, budget_seconds=1)
+
+    assert captured["HERMES_HOME"] == os.environ["HERMES_HOME"]
+    assert "OPENAI_API_KEY" not in captured
+    assert "API_SERVER_KEY" not in captured
+
+
 def test_receipt_is_observed_after_initiator_restart_before_process_identity(
     tmp_path, monkeypatch
 ):
@@ -494,6 +516,32 @@ def test_service_cleans_cli_spool_only_after_receipt_is_durable(
     )
     assert "durable reply" not in evidence
     assert "provider-secret" not in evidence
+
+
+def test_cleanup_preserves_spool_until_lost_process_group_is_quiescent(
+    tmp_path, monkeypatch
+):
+    channel, snapshot = _bound(tmp_path, monkeypatch)
+    committed = replace(
+        snapshot,
+        phase="indeterminate",
+        checkpoint={
+            **snapshot.checkpoint,
+            "process_pid": 123,
+            "process_started_at": 456,
+            "process_command_sha256": "a" * 64,
+            "status": "running",
+        },
+        failure_code="local_cli_process_lost",
+    )
+    paths = local_module._cli_paths(
+        Path(os.environ["HERMES_HOME"]), committed.handoff_id
+    )
+    monkeypatch.setattr(channel, "_identity_is_gone", lambda _identity: False)
+
+    channel.cleanup_committed(committed)
+
+    assert paths.prompt.exists()
 
 
 def test_tampered_receipt_and_reused_or_dead_pid_are_indeterminate(tmp_path, monkeypatch):
@@ -716,6 +764,99 @@ def test_linux_source_cancel_terminates_descendants_and_reaps_its_wrapper(
     tmp_path, monkeypatch
 ):
     _assert_source_cancel_terminates_descendants_and_reaps_its_wrapper(
+        tmp_path, monkeypatch
+    )
+
+
+def _assert_restart_reconcile_terminates_descendants_after_wrapper_exit(
+    tmp_path, monkeypatch
+):
+    seed = _snapshot(tmp_path, monkeypatch)
+    source_home = Path(os.environ["HERMES_HOME"])
+    first_store = HandoffStore(source_home / "handoffs.db")
+    first_channel = LocalHermesChannel(source_home)
+    first_service = AgentHandoffService(first_store, first_channel)
+    created = first_service.create(
+        seed.spec,
+        seed.key_scope,
+        handoff_key=seed.handoff_key,
+    )
+    monkeypatch.setattr(
+        first_channel,
+        "_assess",
+        lambda *_args: (None, "runs_not_durable"),
+    )
+    bound = first_service.advance(created.handoff_id).snapshot
+    child_pid_file = tmp_path / "restart-child.pid"
+    script = (
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_wrapper_argv",
+        lambda *_args: [sys.executable, "-c", script, str(child_pid_file)],
+    )
+    submitted = first_service.advance(bound.handoff_id).snapshot
+    wrapper_pid = submitted.checkpoint["process_pid"]
+    detached_tree = first_channel._take_cli_tree(submitted.handoff_id)
+    assert detached_tree is not None
+    child_pid = None
+    second_store = None
+    try:
+        deadline = time.monotonic() + 5
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        assert os.getpgid(child_pid) == wrapper_pid
+
+        os.kill(wrapper_pid, signal.SIGKILL)
+        os.waitpid(wrapper_pid, 0)
+        assert _pid_is_live(child_pid)
+        first_store.close()
+
+        second_store = HandoffStore(source_home / "handoffs.db")
+        restarted = AgentHandoffService(
+            second_store,
+            LocalHermesChannel(source_home),
+        )
+        reconciled = restarted.advance(submitted.handoff_id).snapshot
+
+        assert reconciled.phase == "indeterminate"
+        deadline = time.monotonic() + 3
+        while _pid_is_live(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not _pid_is_live(child_pid)
+    finally:
+        if second_store is not None:
+            second_store.close()
+        else:
+            first_store.close()
+        if child_pid is not None and _pid_is_live(child_pid):
+            try:
+                os.killpg(wrapper_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
+def test_macos_restart_reconcile_terminates_descendants_after_wrapper_exit(
+    tmp_path, monkeypatch
+):
+    _assert_restart_reconcile_terminates_descendants_after_wrapper_exit(
+        tmp_path, monkeypatch
+    )
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_linux_restart_reconcile_terminates_descendants_after_wrapper_exit(
+    tmp_path, monkeypatch
+):
+    _assert_restart_reconcile_terminates_descendants_after_wrapper_exit(
         tmp_path, monkeypatch
     )
 

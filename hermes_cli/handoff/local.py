@@ -35,6 +35,7 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from tools.bot_relay import acquire_turn_lock, local_delivery_command
+from tools.environments.local import hermes_subprocess_env
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot
@@ -621,6 +622,10 @@ class LocalHermesChannel:
             and "receipt_sha256" not in checkpoint
         ):
             return
+        if snapshot.phase == "indeterminate" and "receipt_sha256" not in checkpoint:
+            identity = self._process_identity(snapshot)
+            if identity is not None and not self._identity_is_gone(identity):
+                return
         tree = self._take_cli_tree(snapshot.handoff_id)
         if tree is not None:
             tree.terminate("handoff observation committed")
@@ -962,7 +967,10 @@ class LocalHermesChannel:
             argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env={**os.environ, "HERMES_HOME": str(self._source_home)},
+            env={
+                **hermes_subprocess_env(inherit_credentials=False),
+                "HERMES_HOME": str(self._source_home),
+            },
         )
         identity = tree.identity
         if identity.start_time is None or identity.group_id != identity.pid:
@@ -1000,6 +1008,8 @@ class LocalHermesChannel:
                 phase="cancelling" if cancelling else "active",
                 checkpoint=_checkpoint(snapshot, status="running"),
             )
+        if identity is not None:
+            ManagedProcessTree.terminate_orphaned_posix_group(identity)
         return ChannelObservation(
             phase="indeterminate",
             checkpoint=snapshot.checkpoint or {},

@@ -1501,6 +1501,22 @@ def test_posix_group_permission_failure_is_not_reported_as_cleaned(monkeypatch) 
     assert tree._terminate_owned_posix_group() is False
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")
+@pytest.mark.parametrize("group_id", (None, 0, -1))
+def test_orphaned_posix_group_rejects_invalid_group_ids(monkeypatch, group_id) -> None:
+    calls = []
+    monkeypatch.setattr(
+        ManagedProcessTree,
+        "_terminate_posix_group",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or True,
+    )
+
+    assert not ManagedProcessTree.terminate_orphaned_posix_group(
+        ProcessIdentity(pid=43210, start_time=101, group_id=group_id)
+    )
+    assert calls == []
+
+
 def test_windows_legacy_tree_taskkill_is_not_proof_of_quiescence(monkeypatch) -> None:
     import tools.managed_process as managed
 

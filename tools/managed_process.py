@@ -1231,6 +1231,21 @@ class ManagedProcessTree:
         if group_id is None or group_id <= 0 or group_id == os.getpgrp():
             return True
 
+        return self._terminate_posix_group(
+            group_id,
+            term_grace_seconds=self.policy.term_grace_seconds,
+            kill_grace_seconds=self.policy.kill_grace_seconds,
+        )
+
+    @staticmethod
+    def _terminate_posix_group(
+        group_id: int,
+        *,
+        term_grace_seconds: float,
+        kill_grace_seconds: float,
+    ) -> bool:
+        """Terminate one known-owned POSIX group and prove it quiescent."""
+
         def group_alive() -> bool:
             try:
                 os.killpg(group_id, 0)  # windows-footgun: ok - POSIX-only method
@@ -1250,7 +1265,7 @@ class ManagedProcessTree:
             return True
         except PermissionError:
             return False
-        deadline = time.monotonic() + self.policy.term_grace_seconds
+        deadline = time.monotonic() + term_grace_seconds
         while group_alive() and time.monotonic() < deadline:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         if group_alive():
@@ -1260,10 +1275,39 @@ class ManagedProcessTree:
                 return True
             except PermissionError:
                 return False
-            deadline = time.monotonic() + self.policy.kill_grace_seconds
+            deadline = time.monotonic() + kill_grace_seconds
             while group_alive() and time.monotonic() < deadline:
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         return not group_alive()
+
+    @classmethod
+    def terminate_orphaned_posix_group(
+        cls,
+        identity: ProcessIdentity,
+        *,
+        term_grace_seconds: float = 2.0,
+        kill_grace_seconds: float = 1.0,
+    ) -> bool:
+        """Terminate a recorded POSIX group only after its leader is absent."""
+        if (
+            _IS_WINDOWS
+            or identity.group_id is None
+            or identity.group_id <= 0
+            or identity.group_id == os.getpgrp()
+        ):
+            return False
+        try:
+            from gateway.status import _pid_exists
+
+            if _pid_exists(identity.pid):
+                return False
+        except Exception:
+            return False
+        return cls._terminate_posix_group(
+            identity.group_id,
+            term_grace_seconds=term_grace_seconds,
+            kill_grace_seconds=kill_grace_seconds,
+        )
 
     def close(self) -> int | None:
         return self.terminate("owner close")
