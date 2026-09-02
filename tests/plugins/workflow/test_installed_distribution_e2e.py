@@ -843,7 +843,18 @@ print(json.dumps({
     )
     assert handoff_help.returncode == 0, handoff_help.stderr
     assert "usage: hermes handoff" in handoff_help.stdout
-    assert "{list,show,evidence,reconcile,cancel,advance}" in handoff_help.stdout
+    choices = handoff_help.stdout.split("{", 1)[1].split("}", 1)[0].split(",")
+    assert {
+        "list",
+        "show",
+        "evidence",
+        "reconcile",
+        "cancel",
+        "respond",
+        "steer",
+        "message",
+        "advance",
+    } <= set(choices)
 
     schema_command = subprocess.run(
         [
