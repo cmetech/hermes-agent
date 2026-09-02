@@ -112,7 +112,7 @@ def cmd_handoff(args) -> int:
     action = getattr(args, "handoff_action", None)
     json_output = bool(getattr(args, "json", False))
     command_id = None
-    if action in {"reconcile", "cancel"}:
+    if action in {"reconcile", "cancel", "respond", "steer", "message"}:
         command_id = getattr(args, "command_id", None) or f"operator-{uuid4().hex}"
 
     service = None
@@ -168,19 +168,32 @@ def cmd_handoff(args) -> int:
                 print(f"has_more: {str(page.has_more).lower()}")
             return 0
 
-        if action in {"reconcile", "cancel"}:
-            snapshot = service.command(
+        if action in {"reconcile", "cancel", "respond", "steer", "message"}:
+            text = getattr(args, "text", None)
+            service.command(
                 args.handoff_id,
                 action,
                 command_id=command_id,
                 actor="operator",
+                request_id=getattr(args, "request_id", None),
+                choice=getattr(args, "choice", None),
+                text=" ".join(text) if isinstance(text, list) else text,
+                correlation_id=getattr(args, "correlation_id", None),
             )
-            payload = {"command_id": command_id, **_summary(snapshot)}
+            command = service.store.get_command(args.handoff_id, command_id)
+            payload = {
+                "command_id": command_id,
+                "command_kind": command.kind,
+                "delivery_state": command.delivery_state,
+                "failure_code": None,
+            }
             if json_output:
                 print(json.dumps(payload, sort_keys=True))
             else:
                 print(f"command_id: {command_id}")
-                _print_snapshot(snapshot)
+                print(f"command_kind: {command.kind}")
+                print(f"delivery_state: {command.delivery_state}")
+                print("failure_code: -")
             return 0
 
         if action == "advance":
@@ -257,6 +270,32 @@ def build_handoff_parser(subparsers) -> None:
         command_parser.add_argument("handoff_id")
         command_parser.add_argument("--command-id")
         command_parser.add_argument("--json", action="store_true")
+
+    respond_parser = actions.add_parser(
+        "respond", help="Respond to an exact pending peer approval"
+    )
+    respond_parser.add_argument("handoff_id")
+    respond_parser.add_argument("--request-id", required=True)
+    respond_parser.add_argument(
+        "--choice", required=True, choices=("once", "session", "always", "deny")
+    )
+    respond_parser.add_argument("--command-id")
+    respond_parser.add_argument("--json", action="store_true")
+
+    steer_parser = actions.add_parser("steer", help="Steer an active peer Run")
+    steer_parser.add_argument("handoff_id")
+    steer_parser.add_argument("text", nargs="+")
+    steer_parser.add_argument("--command-id")
+    steer_parser.add_argument("--json", action="store_true")
+
+    message_parser = actions.add_parser(
+        "message", help="Send a correlated follow-up to an active peer Run"
+    )
+    message_parser.add_argument("handoff_id")
+    message_parser.add_argument("text", nargs="+")
+    message_parser.add_argument("--correlation-id", required=True)
+    message_parser.add_argument("--command-id")
+    message_parser.add_argument("--json", action="store_true")
 
     advance_parser = actions.add_parser(
         "advance", help="Perform one bounded convergence step"

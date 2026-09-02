@@ -48,18 +48,106 @@ def _create(home: Path, key: str, *, prompt: str | None = None):
         return store.create_or_get("workflow", key, spec, spec.fingerprint)
 
 
+def _create_peer(home: Path, key: str, *, phase: str):
+    home.mkdir(parents=True, exist_ok=True)
+    spec = HandoffSpec(
+        mode="task",
+        endpoint=HandoffEndpoint.parse("hermes://peer/spark/reviewer"),
+        prompt="private remote prompt",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"workflow_run": "run-1"},
+        required_capabilities=frozenset(),
+    )
+    with HandoffStore(home / "handoffs.db") as store:
+        snapshot = store.create_or_get("workflow", key, spec, spec.fingerprint)
+        snapshot = store.bind(
+            snapshot.handoff_id,
+            "peer_runs",
+            {
+                "peer": "spark",
+                "profile": "reviewer",
+                "mechanism": "peer_runs",
+                "capabilities": [
+                    "approval",
+                    "authoritative_status",
+                    "cancellation",
+                    "durable_admission",
+                    "follow_up",
+                    "steering",
+                ],
+                "origin_sha256": "a" * 64,
+                "auth_scope_sha256": "b" * 64,
+            },
+            {},
+            snapshot.state_version,
+        )
+        lease = store.claim_advance(
+            snapshot.handoff_id,
+            "test-worker",
+            now=datetime.now(timezone.utc),
+            lease_seconds=10,
+        )
+        assert lease is not None
+        store.journal_attempt(lease, "submit")
+        checkpoint = {"run_id": "run-1", "status": "running"}
+        if phase == "needs_input":
+            checkpoint.update({
+                "approval_request_id": "approval-1",
+                "approval_choices": ["once", "deny"],
+                "status": "waiting_for_approval",
+            })
+        snapshot = store.commit_observation(
+            lease, ChannelObservation(phase=phase, checkpoint=checkpoint)
+        )
+        store.release_advance(lease, next_advance_at=None)
+        return snapshot
+
+
 def _run(argv: list[str]) -> tuple[int, argparse.Namespace]:
     args = _parser().parse_args(argv)
     return int(args.func(args) or 0), args
 
 
-def test_parser_accepts_every_stage_one_operator_command():
+def test_parser_accepts_every_operator_command():
     cases = {
         ("list", "--phase", "active", "--limit", "7", "--json"): "list",
         ("show", "handoff-1", "--json"): "show",
         ("evidence", "handoff-1", "--after", "4", "--limit", "8", "--json"): "evidence",
         ("reconcile", "handoff-1", "--command-id", "cmd-1", "--json"): "reconcile",
         ("cancel", "handoff-1", "--command-id", "cmd-2", "--json"): "cancel",
+        (
+            "respond",
+            "handoff-1",
+            "--request-id",
+            "approval-1",
+            "--choice",
+            "once",
+            "--command-id",
+            "cmd-3",
+            "--json",
+        ): "respond",
+        (
+            "steer",
+            "handoff-1",
+            "tighten",
+            "the",
+            "ending",
+            "--command-id",
+            "cmd-4",
+            "--json",
+        ): "steer",
+        (
+            "message",
+            "handoff-1",
+            "check",
+            "again",
+            "--correlation-id",
+            "follow-up-1",
+            "--command-id",
+            "cmd-5",
+            "--json",
+        ): "message",
         ("advance", "handoff-1", "--budget-seconds", "0.5", "--json"): "advance",
     }
 
@@ -299,6 +387,160 @@ def test_mutation_generates_and_reports_command_id(monkeypatch, tmp_path, capsys
 
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["command_id"].startswith("operator-")
+
+
+def test_respond_records_exact_private_request_without_printing_it(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    snapshot = _create_peer(tmp_path, "respond", phase="needs_input")
+
+    rc, _ = _run([
+        "handoff",
+        "respond",
+        snapshot.handoff_id,
+        "--request-id",
+        "approval-1",
+        "--choice",
+        "once",
+        "--command-id",
+        "respond-1",
+        "--json",
+    ])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload == {
+        "command_id": "respond-1",
+        "command_kind": "respond",
+        "delivery_state": "pending",
+        "failure_code": None,
+    }
+    assert "approval-1" not in output
+    with HandoffStore(tmp_path / "handoffs.db") as store:
+        assert dict(store.get_command(snapshot.handoff_id, "respond-1").payload) == {
+            "actor": "operator",
+            "choice": "once",
+            "request_id": "approval-1",
+        }
+
+
+@pytest.mark.parametrize(
+    ("action", "extra", "expected_payload"),
+    [
+        (
+            "steer",
+            [],
+            {"actor": "operator", "text": "Tighten the ending."},
+        ),
+        (
+            "message",
+            ["--correlation-id", "follow-up-1"],
+            {
+                "actor": "operator",
+                "correlation_id": "follow-up-1",
+                "text": "Tighten the ending.",
+            },
+        ),
+    ],
+)
+def test_guidance_commands_record_distinct_bounded_payloads_without_echoing_text(
+    action, extra, expected_payload, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    snapshot = _create_peer(tmp_path, action, phase="active")
+    command_id = f"{action}-1"
+
+    rc, _ = _run([
+        "handoff",
+        action,
+        snapshot.handoff_id,
+        "Tighten",
+        "the",
+        "ending.",
+        *extra,
+        "--command-id",
+        command_id,
+        "--json",
+    ])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "Tighten" not in output
+    assert "follow-up-1" not in output
+    assert json.loads(output)["command_kind"] == action
+    with HandoffStore(tmp_path / "handoffs.db") as store:
+        command = store.get_command(snapshot.handoff_id, command_id)
+    assert command.kind == action
+    assert dict(command.payload) == expected_payload
+
+
+def test_control_command_replay_is_idempotent_and_conflict_is_closed(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    snapshot = _create_peer(tmp_path, "replay", phase="active")
+    base = [
+        "handoff",
+        "steer",
+        snapshot.handoff_id,
+        "first",
+        "--command-id",
+        "steer-1",
+        "--json",
+    ]
+    assert _run(base)[0] == 0
+    capsys.readouterr()
+    assert _run(base)[0] == 0
+    capsys.readouterr()
+    changed = [*base]
+    changed[3] = "changed"
+    assert _run(changed)[0] == 1
+    assert "handoff_conflict" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["handoff", "respond", "missing", "--request-id", "approval-1", "--choice", "once"],
+        ["handoff", "steer", "missing", "text"],
+        ["handoff", "message", "missing", "text", "--correlation-id", "follow-up-1"],
+    ],
+)
+def test_control_commands_reject_unknown_handoff_before_recording(
+    argv, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert _run(argv)[0] == 1
+    assert "handoff_not_found" in capsys.readouterr().err
+
+
+def test_control_commands_reject_local_fallback_wrong_phase_and_oversized_text(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    local = _create(tmp_path, "local")
+    active = _create_peer(tmp_path, "active-control", phase="active")
+    waiting = _create_peer(tmp_path, "waiting-control", phase="needs_input")
+
+    cases = [
+        ["handoff", "steer", local.handoff_id, "text"],
+        [
+            "handoff",
+            "respond",
+            active.handoff_id,
+            "--request-id",
+            "approval-1",
+            "--choice",
+            "once",
+        ],
+        ["handoff", "steer", waiting.handoff_id, "text"],
+        ["handoff", "steer", active.handoff_id, "x" * 16_385],
+    ]
+    for argv in cases:
+        assert _run(argv)[0] == 2
+        assert "invalid_argument" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
