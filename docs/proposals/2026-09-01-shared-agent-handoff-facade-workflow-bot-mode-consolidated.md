@@ -1625,7 +1625,7 @@ Implementation evidence:
 Fresh verification commands and results:
 
 ```text
-scripts/run_tests.sh \
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/hermes_cli/handoff \
   tests/hermes_cli/test_handoff_cmd.py \
   tests/hermes_cli/test_peer_cmd.py \
@@ -1640,31 +1640,32 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_coordinator_multiprocess.py \
   tests/plugins/workflow/test_schema.py \
   tests/plugins/workflow/test_language_schema.py \
-  tests/plugins/workflow/test_notifications.py \
-  --file-retries 0 -q
-1269 passed, 0 failed, 4 host-specific skips
+  tests/plugins/workflow/test_notifications.py -q
+1277 passed, 0 failed, 6 host-specific skips
 
-scripts/run_tests.sh tests/plugins/workflow/test_local_handoff_e2e.py \
-  --file-retries 0 -q
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_local_handoff_e2e.py -q
 6 passed, 0 failed, 2 host-specific skips
 
-scripts/run_tests.sh \
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_installed_distribution_e2e.py \
-  --file-retries 0 -m integration \
-  -k extracted_wheel_registers_workflow_cli_from_a_clean_home -q
+  -m integration -k \
+  extracted_wheel_registers_workflow_cli_from_a_clean_home -q
 1 passed, 0 failed, 5 deselected
 
 scripts/run_tests.sh tests/plugins/workflow -q
-131 files; 5916 passed, 0 failed, 5 host-specific skips
+131 files; 5925 passed, 0 failed, 5 host-specific skips
 ```
 
 The installed wheel smoke retains its integration marker and was forced into
 this verification run explicitly; the default non-integration selection does
-not count as its evidence. The full Workflow run exited successfully after
-five first-attempt flakes passed on harness retry, including unrelated
-timing-sensitive files and a Darwin parallel SQLite/native bus crash. The
-corrected local and installed-distribution cases passed independently with
-file retries disabled.
+not count as its evidence. The full Workflow run exited successfully after two
+existing timing-sensitive cases passed on harness retry: the coordinator cursor
+performance bound and the hard-maximum recovery case. The focused, local, and
+installed-distribution cases passed independently with file retries disabled.
+Final adversarial review closed the remaining liveness and safety gaps around
+scheduler fairness, process-tree cleanup and transient CLI spools, exact
+notification identity, and bounded serialized admission.
 
 ### Stage 2 — remote Hermes
 

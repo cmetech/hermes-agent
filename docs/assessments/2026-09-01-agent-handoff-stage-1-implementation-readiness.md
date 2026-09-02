@@ -243,7 +243,7 @@ lane and requires the Stage 1 fallback-unavailable result.
 The exact Stage 1 focused gate passed:
 
 ```text
-scripts/run_tests.sh \
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/hermes_cli/handoff \
   tests/hermes_cli/test_handoff_cmd.py \
   tests/hermes_cli/test_peer_cmd.py \
@@ -258,39 +258,51 @@ scripts/run_tests.sh \
   tests/plugins/workflow/test_coordinator_multiprocess.py \
   tests/plugins/workflow/test_schema.py \
   tests/plugins/workflow/test_language_schema.py \
-  tests/plugins/workflow/test_notifications.py \
-  --file-retries 0 -q
+  tests/plugins/workflow/test_notifications.py -q
 
-1269 passed, 0 failed, 4 host-specific skips
+1277 passed, 0 failed, 6 host-specific skips
 ```
 
 Additional fresh verification:
 
 ```text
-scripts/run_tests.sh tests/plugins/workflow/test_local_handoff_e2e.py \
-  --file-retries 0 -q
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_local_handoff_e2e.py -q
 6 passed, 0 failed, 2 host-specific skips
 
-scripts/run_tests.sh \
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/plugins/workflow/test_installed_distribution_e2e.py \
-  --file-retries 0 -m integration \
-  -k extracted_wheel_registers_workflow_cli_from_a_clean_home -q
+  -m integration -k \
+  extracted_wheel_registers_workflow_cli_from_a_clean_home -q
 1 passed, 0 failed, 5 deselected
 
 scripts/run_tests.sh tests/plugins/workflow -q
-131 files; 5916 passed, 0 failed, 5 host-specific skips
+131 files; 5925 passed, 0 failed, 5 host-specific skips
+
+scripts/run_tests.sh \
+  tests/gateway/test_api_server_run_idempotency.py \
+  tests/gateway/test_api_server_runs.py \
+  tests/hermes_cli/test_peer_cmd.py \
+  tests/tools/test_bot_turn_lock.py \
+  tests/tools/test_bot_mode_dm.py \
+  tests/hermes_cli/test_plugin_background_services.py \
+  tests/plugins/workflow/test_coordinator.py \
+  tests/plugins/workflow/test_schema.py \
+  tests/plugins/workflow/test_language_schema.py -q
+991 passed, 0 failed, 1 host-specific skip
 ```
 
 The integration-marked installed-wheel smoke was selected explicitly; the
 default non-integration selection does not count as that proof. The broad run
-exited zero after five first-attempt flakes passed on automatic retry,
-including a Darwin parallel SQLite/native bus crash and unrelated
-timing-sensitive Workflow tests. The corrected local and installed cases
-passed independently with file retries disabled. No production integration
-correction was required by the end-to-end proof. Compatibility-only test
-fixtures were updated to project the intentional redacted `assignments: {}`
-field and to give pre-Stage-1 coordinator scheduler stubs the neutral
-`advance_due_handoffs()` result.
+exited zero after two existing timing-sensitive tests passed on automatic
+retry: the coordinator cursor performance bound and the hard-maximum recovery
+case. The focused gate, local case, and installed case passed with file retries
+disabled. Final adversarial review also closed the liveness and safety gaps it
+found: scheduler fairness before the bounded page, process-tree cleanup and
+transient CLI spools, exact notification identity, aggregate admission bounds,
+and serialized bounded admission. Compatibility-only test fixtures project the
+intentional redacted `assignments: {}` field and give pre-Stage-1 coordinator
+scheduler stubs the neutral `advance_due_handoffs()` result.
 
 ## Implementation gate
 
