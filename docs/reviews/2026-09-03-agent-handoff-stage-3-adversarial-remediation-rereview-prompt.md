@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `62bd97a2c2f935c6be9a5149338b3502e744d9ff`
-- Remediated tree: `1dc438731fcd8ad9aeb56b47685741bd0ddc41b1`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..62bd97a2c2f935c6be9a5149338b3502e744d9ff`
-- Range commits: 14
-- Range paths: 14
-- Range diff: `+1188/-29`; 602 inserted lines are review prompts, not
+- Remediated candidate: `f711df25a91f360281d8d27e51163bdd6cae0bb2`
+- Remediated tree: `9eaa8dd91a93778c941418b6d6560f01d7e5edf1`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..f711df25a91f360281d8d27e51163bdd6cae0bb2`
+- Range commits: 17
+- Range paths: 16
+- Range diff: `+1356/-30`; 613 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -48,7 +48,10 @@ claim could cross the adapter boundary after supersession occurred during an
 awaited target check. The final remediation adds a v2-to-v3 durable dispatch
 reservation: supersession and dispatch are ordered by SQLite, a newer delivery
 waits for an earlier reserved dispatch to settle, and an abandoned reservation
-yields to the newer return after lease expiry.
+yields to the newer return after lease expiry. A later pass proved that the
+messaging gateway used this reservation but the Desktop/TUI dispatcher did not.
+The current candidate applies the same shared reservation immediately before
+both gateway and Desktop/TUI model dispatch.
 
 Prove or falsify all of the following:
 
@@ -57,7 +60,7 @@ Prove or falsify all of the following:
   model wake;
 - the older row remains queryable and its delivery truth is not rewritten;
 - if supersession wins before dispatch reservation, the older claimed delivery
-  is fenced before adapter/model submission;
+  is fenced before adapter/model submission on both initiating host kinds;
 - if dispatch reservation wins first, the older return settles before the
   newer delivery becomes due, then the newer return remains deliverable;
 - an abandoned reserved dispatch reconciles through transcript receipt and
@@ -81,9 +84,10 @@ genuinely missing file and a valid `{}` mapping.
 
 Prove or falsify all of the following:
 
-- syntactically malformed, non-mapping, and unreadable config fail before local, peer,
-  bare-peer, or relay fallback and before any handoff, subprocess, peer DM,
-  relay, warning-backup, or other transport side effect;
+- syntactically malformed, non-mapping, unreadable, and unavailable existing
+  config (including a broken symlink) fail before local, peer, bare-peer, or
+  relay fallback and before any handoff, subprocess, peer DM, relay,
+  warning-backup, or other transport side effect;
 - missing config and valid minimal config retain the documented empty-directory
   compatibility behavior;
 - valid semantic directory errors still fail closed;
