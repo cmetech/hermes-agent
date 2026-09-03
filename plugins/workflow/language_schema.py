@@ -98,7 +98,7 @@ CONTRACT_MAX_BYTES = 288_000
 CONTRACT_RESERVED_GROWTH_BYTES = 4_000
 CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
     "definition_schema": 160_000,
-    "node_kinds": 70_000,
+    "node_kinds": 72_000,
     "compatibility_codes": 19_000,
 })
 _NO_DEFAULT = object()
@@ -3335,6 +3335,7 @@ def _phase6_scoped_semantic_descriptors(
             "id": "scoped-output-reference-v1",
             "current_scope": {
                 "applies_to": ["nodes[].loop_group.nodes[]"],
+                "producer_scope": "body-sibling",
                 "requires_direct_dependency": True,
             },
             "outer_scope": {
@@ -3343,6 +3344,7 @@ def _phase6_scoped_semantic_descriptors(
                     "nodes[].loop_group.until_bash",
                     "nodes[].loop_group.gate_message",
                 ],
+                "producer_scope": "outer-node",
                 "requires_group_dependency": True,
             },
             "previous_iteration": {
@@ -3350,68 +3352,49 @@ def _phase6_scoped_semantic_descriptors(
                     "nodes[].loop_group.nodes[]",
                     "nodes[].loop_group.until_bash",
                 ],
+                "producer_scope": "body-node",
                 "prefix": "$LOOP_PREV.",
                 "requires_direct_dependency": False,
             },
             "group_until_bash": {
                 "field_path": ["loop_group", "until_bash"],
-                "current_scope": {"allows_all_body_nodes": True},
-                "visibility_validation_code": (
-                    "output_reference_not_declared_dependency"
-                ),
-                "structured_output_validation_code": "loop_group_scope_invalid",
+                "current_scope": "all-body-nodes",
             },
             "companion_node_paths": {
                 "format": "group/child",
-                "separator": "/",
                 "field_paths": ["sidecar.outward_action_nodes[]"],
             },
             "validation_codes": {
-                "body_visibility": validation_codes["visibility"],
-                "group_control_visibility": (
-                    "output_reference_not_declared_dependency"
-                ),
-                "group_control_structured_output": validation_codes["visibility"],
+                "body": validation_codes["visibility"],
+                "group_until_bash": {
+                    "visibility": "output_reference_not_declared_dependency",
+                    "structured_output": validation_codes["visibility"],
+                },
             },
         },
         {
             "id": "loop-group-work-product-v1",
             "limit": LOOP_GROUP_WORK_LIMIT,
+            "expression_format": "prefix-v1",
             "accumulators": {
-                "executions": {
-                    "operator": "multiply",
-                    "operands": [
-                        {"reference": "group_iterations"},
-                        {
-                            "operator": "sum",
-                            "over": "body_nodes",
-                            "term": {"reference": "ordinary_loop_multiplier"},
-                        },
+                "executions": [
+                    "*",
+                    "group_iterations",
+                    ["sum", "body_nodes", "ordinary_loop_multiplier"],
+                ],
+                "attempts": [
+                    "*",
+                    "group_iterations",
+                    [
+                        "sum",
+                        "body_nodes",
+                        [
+                            "*",
+                            "ordinary_loop_multiplier",
+                            ["+", "selected_retries", 1],
+                        ],
                     ],
-                },
-                "attempts": {
-                    "operator": "multiply",
-                    "operands": [
-                        {"reference": "group_iterations"},
-                        {
-                            "operator": "sum",
-                            "over": "body_nodes",
-                            "term": {
-                                "operator": "multiply",
-                                "operands": [
-                                    {"reference": "ordinary_loop_multiplier"},
-                                    {
-                                        "operator": "add",
-                                        "operands": [
-                                            {"reference": "selected_retries"},
-                                            {"constant": 1},
-                                        ],
-                                    },
-                                ],
-                            },
-                        },
-                    ],
-                },
+                ],
             },
             "group_iterations_path": ["loop_group", "max_iterations"],
             "ordinary_loop_multiplier_path": ["loop", "max_iterations"],
@@ -3432,55 +3415,39 @@ def _phase6_scoped_semantic_descriptors(
                 LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS
             ),
             "ordinary_loop_multiplier": {
-                "strategy": "first-match",
-                "branches": [
+                "first_match": [
                     {
-                        "when": {"node_kind": "loop"},
-                        "value": {
-                            "field_path": ["loop", "max_iterations"],
-                            "default": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
-                        },
+                        "node_kind": "loop",
+                        "field_path": ["loop", "max_iterations"],
+                        "default": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
                     },
                     {
-                        "when": {"otherwise": True},
-                        "value": {
-                            "constant": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
-                        },
+                        "constant": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
                     },
                 ],
             },
-            "retry_selection": {
-                "strategy": "first-match",
-                "branches": [
+            "selected_retries": {
+                "first_match": [
                     {
-                        "when": {
-                            "mapping_at": ["approval", "on_reject"],
-                        },
-                        "value": {
-                            "field_path": [
-                                "approval",
-                                "on_reject",
-                                "max_attempts",
-                            ],
-                            "default": LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
-                        },
+                        "mapping_at": ["approval", "on_reject"],
+                        "field_path": [
+                            "approval",
+                            "on_reject",
+                            "max_attempts",
+                        ],
+                        "default": LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
                     },
                     {
-                        "when": {"mapping_at": ["retry"]},
-                        "value": {
-                            "field_path": ["retry", "max_attempts"],
-                            "default": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
-                        },
+                        "mapping_at": ["retry"],
+                        "field_path": ["retry", "max_attempts"],
+                        "default": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
                     },
                     {
-                        "when": {"node_kind_in": ["command", "prompt"]},
-                        "value": {
-                            "constant": LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
-                        },
+                        "node_kind_in": ["command", "prompt"],
+                        "constant": LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES,
                     },
                     {
-                        "when": {"otherwise": True},
-                        "value": {"constant": LOOP_GROUP_OTHER_DEFAULT_RETRIES},
+                        "constant": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
                     },
                 ],
             },
@@ -3804,37 +3771,16 @@ def contract_documentation(
         [
             {
                 "id": "durable-loop-groups",
-                "title": "Durable bounded loop groups",
-                "description": "One immutable nested body with bounded iterations.",
-                "field_paths": [
-                    f"nodes[].loop_group.{spec.yaml_name}"
-                    for spec in _specs("loop_group")
+                "semantic_rule_ids": [
+                    "scoped-dag-topology-v1",
+                    "scoped-output-reference-v1",
+                    "loop-group-work-product-v1",
                 ],
-                "applicability": applicability,
-                "parameters": {
-                    "body_depth": 1,
-                    "body_nodes": {"minimum": 1, "maximum": 512},
-                    "body_edges": {"maximum": LOOP_GROUP_MAX_EDGES},
-                    "max_iterations": {"minimum": 1, "maximum": 100},
-                    "primary_sink": "first_terminal_in_definition_order",
-                    "group_fields": sorted(LOOP_GROUP_FIELDS),
-                    "reference_scopes": {
-                        "current_body": "direct_sibling_dependency",
-                        "outer": "direct_group_dependency",
-                        "previous_body": "immediately_previous_iteration",
-                    },
-                    "effective_interactive_requires": [
-                        "workflow.interactive",
-                        "loop_group.interactive",
-                    ],
-                    "rejected": [
-                        "include",
-                        "nested_loop_group",
-                        "runtime_workflow",
-                        "group_retry",
-                        "returns",
-                    ],
-                },
+                "effective_interactive_requires": [
+                    "workflow.interactive",
+                    "loop_group.interactive",
+                ],
+                "additional_rejected_field": "returns",
             }
         ]
         if phase6

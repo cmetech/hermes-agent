@@ -194,6 +194,7 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     references = rules["scoped-output-reference-v1"]
     assert references["current_scope"] == {
         "applies_to": ["nodes[].loop_group.nodes[]"],
+        "producer_scope": "body-sibling",
         "requires_direct_dependency": True,
     }
     assert references["outer_scope"] == {
@@ -202,67 +203,56 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
             "nodes[].loop_group.until_bash",
             "nodes[].loop_group.gate_message",
         ],
+        "producer_scope": "outer-node",
         "requires_group_dependency": True,
     }
-    assert references["previous_iteration"]["prefix"] == "$LOOP_PREV."
-    assert references["previous_iteration"]["applies_to"] == [
-        "nodes[].loop_group.nodes[]",
-        "nodes[].loop_group.until_bash",
-    ]
+    assert references["previous_iteration"] == {
+        "applies_to": [
+            "nodes[].loop_group.nodes[]",
+            "nodes[].loop_group.until_bash",
+        ],
+        "producer_scope": "body-node",
+        "prefix": "$LOOP_PREV.",
+        "requires_direct_dependency": False,
+    }
     assert references["group_until_bash"] == {
         "field_path": ["loop_group", "until_bash"],
-        "current_scope": {"allows_all_body_nodes": True},
-        "visibility_validation_code": "output_reference_not_declared_dependency",
-        "structured_output_validation_code": "loop_group_scope_invalid",
+        "current_scope": "all-body-nodes",
     }
     assert references["companion_node_paths"] == {
         "format": "group/child",
-        "separator": "/",
         "field_paths": ["sidecar.outward_action_nodes[]"],
     }
     assert references["validation_codes"] == {
-        "body_visibility": "loop_group_scope_invalid",
-        "group_control_visibility": "output_reference_not_declared_dependency",
-        "group_control_structured_output": "loop_group_scope_invalid",
+        "body": "loop_group_scope_invalid",
+        "group_until_bash": {
+            "visibility": "output_reference_not_declared_dependency",
+            "structured_output": "loop_group_scope_invalid",
+        },
     }
 
     work = rules["loop-group-work-product-v1"]
     assert work["limit"] == 4096
+    assert work["expression_format"] == "prefix-v1"
     assert work["accumulators"] == {
-        "executions": {
-            "operator": "multiply",
-            "operands": [
-                {"reference": "group_iterations"},
-                {
-                    "operator": "sum",
-                    "over": "body_nodes",
-                    "term": {"reference": "ordinary_loop_multiplier"},
-                },
+        "executions": [
+            "*",
+            "group_iterations",
+            ["sum", "body_nodes", "ordinary_loop_multiplier"],
+        ],
+        "attempts": [
+            "*",
+            "group_iterations",
+            [
+                "sum",
+                "body_nodes",
+                [
+                    "*",
+                    "ordinary_loop_multiplier",
+                    ["+", "selected_retries", 1],
+                ],
             ],
-        },
-        "attempts": {
-            "operator": "multiply",
-            "operands": [
-                {"reference": "group_iterations"},
-                {
-                    "operator": "sum",
-                    "over": "body_nodes",
-                    "term": {
-                        "operator": "multiply",
-                        "operands": [
-                            {"reference": "ordinary_loop_multiplier"},
-                            {
-                                "operator": "add",
-                                "operands": [
-                                    {"reference": "selected_retries"},
-                                    {"constant": 1},
-                                ],
-                            },
-                        ],
-                    },
-                },
-            ],
-        },
+        ],
     }
     assert work["group_iterations_path"] == ["loop_group", "max_iterations"]
     assert work["ordinary_loop_multiplier_path"] == ["loop", "max_iterations"]
@@ -277,41 +267,51 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     assert work["other_default_retries"] == 0
     assert work["approval_default_max_attempts"] == 3
     assert work["ordinary_loop_multiplier"] == {
-        "strategy": "first-match",
-        "branches": [
+        "first_match": [
             {
-                "when": {"node_kind": "loop"},
-                "value": {
-                    "field_path": ["loop", "max_iterations"],
-                    "default": 1,
-                },
+                "node_kind": "loop",
+                "field_path": ["loop", "max_iterations"],
+                "default": 1,
             },
-            {"when": {"otherwise": True}, "value": {"constant": 1}},
+            {"constant": 1},
         ],
     }
-    assert work["retry_selection"] == {
-        "strategy": "first-match",
-        "branches": [
+    assert work["selected_retries"] == {
+        "first_match": [
             {
-                "when": {"mapping_at": ["approval", "on_reject"]},
-                "value": {
-                    "field_path": ["approval", "on_reject", "max_attempts"],
-                    "default": 3,
-                },
+                "mapping_at": ["approval", "on_reject"],
+                "field_path": ["approval", "on_reject", "max_attempts"],
+                "default": 3,
             },
             {
-                "when": {"mapping_at": ["retry"]},
-                "value": {
-                    "field_path": ["retry", "max_attempts"],
-                    "default": 0,
-                },
+                "mapping_at": ["retry"],
+                "field_path": ["retry", "max_attempts"],
+                "default": 0,
             },
             {
-                "when": {"node_kind_in": ["command", "prompt"]},
-                "value": {"constant": 2},
+                "node_kind_in": ["command", "prompt"],
+                "constant": 2,
             },
-            {"when": {"otherwise": True}, "value": {"constant": 0}},
+            {"constant": 0},
         ],
+    }
+    loop_group_topic = next(
+        topic
+        for topic in contract["documentation"]["topics"]
+        if topic["id"] == "durable-loop-groups"
+    )
+    assert loop_group_topic == {
+        "id": "durable-loop-groups",
+        "semantic_rule_ids": [
+            "scoped-dag-topology-v1",
+            "scoped-output-reference-v1",
+            "loop-group-work-product-v1",
+        ],
+        "effective_interactive_requires": [
+            "workflow.interactive",
+            "loop_group.interactive",
+        ],
+        "additional_rejected_field": "returns",
     }
     assert json.loads(json.dumps(rules, sort_keys=True)) == rules
 
@@ -882,7 +882,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
         "reserved_growth_bytes": 4_000,
         "section_max_bytes": {
             "definition_schema": 160_000,
-            "node_kinds": 70_000,
+            "node_kinds": 72_000,
             "compatibility_codes": 19_000,
         },
     }

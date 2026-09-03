@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 
 import pytest
@@ -68,6 +69,82 @@ def _normalize_v6_without_admission(path):
         precedence=1,
     )
     return _compile_workflow_source_document(source, normalizer_version=6)
+
+
+_MISSING = object()
+
+
+def _contract_path_value(value, path):
+    current = value
+    for field in path:
+        if not isinstance(current, Mapping) or field not in current:
+            return _MISSING
+        current = current[field]
+    return current
+
+
+def _evaluate_contract_selector(selector, node):
+    node_kind = next(kind for kind in language_schema.NODE_TYPES if kind in node)
+    for branch in selector["first_match"]:
+        if "node_kind" in branch:
+            matches = node_kind == branch["node_kind"]
+        elif "node_kind_in" in branch:
+            matches = node_kind in branch["node_kind_in"]
+        elif "mapping_at" in branch:
+            matches = isinstance(
+                _contract_path_value(node, branch["mapping_at"]), Mapping
+            )
+        else:
+            matches = True
+        if not matches:
+            continue
+        if "constant" in branch:
+            return branch["constant"]
+        selected = _contract_path_value(node, branch["field_path"])
+        return branch["default"] if selected is _MISSING else selected
+    raise AssertionError("contract selector has no matching branch")
+
+
+def _evaluate_contract_expression(expression, work, body, group_iterations, node=None):
+    if isinstance(expression, int):
+        return expression
+    if isinstance(expression, str):
+        if expression == "group_iterations":
+            return group_iterations
+        if expression in {"ordinary_loop_multiplier", "selected_retries"}:
+            assert node is not None
+            return _evaluate_contract_selector(work[expression], node)
+        raise AssertionError(f"unknown contract reference: {expression}")
+
+    operator, *operands = expression
+    if operator == "sum":
+        collection, term = operands
+        assert collection == "body_nodes"
+        return sum(
+            _evaluate_contract_expression(
+                term,
+                work,
+                body,
+                group_iterations,
+                node=child,
+            )
+            for child in body
+        )
+    values = [
+        _evaluate_contract_expression(
+            operand,
+            work,
+            body,
+            group_iterations,
+            node=node,
+        )
+        for operand in operands
+    ]
+    if operator == "*":
+        return values[0] * values[1]
+    if operator == "+":
+        return values[0] + values[1]
+    raise AssertionError(f"unknown contract operator: {operator}")
 
 
 def _group(body=None, **overrides):
@@ -595,19 +672,27 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
         if rule.get("kind") == "scoped-dag-topology-v1"
     )
 
+    assert work["expression_format"] == "prefix-v1"
     assert set(work["accumulators"]) == {"executions", "attempts"}
     assert work["limit"] == language_schema.LOOP_GROUP_WORK_LIMIT
     assert topology["max_edges"] == language_schema.LOOP_GROUP_MAX_EDGES
-    assert semantics["child_executions"] == 2 * (1 + 1 + 1 + 4 + 1 + 1 + 1)
-    assert semantics["child_attempts"] == 2 * (
-        (1 * (work["command_prompt_default_retries"] + 1))
-        + (1 * (4 + 1))
-        + (1 * (3 + 1))
-        + (4 * (work["other_default_retries"] + 1))
-        + (1 * (work["approval_default_max_attempts"] + 1))
-        + (1 * (5 + 1))
-        + (1 * (work["other_default_retries"] + 1))
-    )
+    assert [
+        _evaluate_contract_selector(work["ordinary_loop_multiplier"], node)
+        for node in body
+    ] == [1, 1, 1, 4, 1, 1, 1]
+    assert [
+        _evaluate_contract_selector(work["selected_retries"], node)
+        for node in body
+    ] == [2, 4, 3, 0, 3, 5, 0]
+    evaluated = {
+        name: _evaluate_contract_expression(expression, work, body, 2)
+        for name, expression in work["accumulators"].items()
+    }
+    assert evaluated == {"executions": 20, "attempts": 54}
+    assert evaluated == {
+        "executions": semantics["child_executions"],
+        "attempts": semantics["child_attempts"],
+    }
 
 
 def _semantic_bound_group(group_index, child_count):
