@@ -16,7 +16,7 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 - Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..8986696272f5c48edfc302f89d07f1e4e424a614`
 - Range commits: 3
 - Range paths: 5
-- Range diff: `+450/-1`; 397 inserted lines are the shared original review
+- Range diff: `+450/-1`; 398 inserted lines are the shared original review
   prompt, not production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
