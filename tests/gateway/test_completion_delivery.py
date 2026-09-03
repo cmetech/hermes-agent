@@ -794,6 +794,27 @@ def test_conversation_boundary_releases_discarded_handoff_return(
     store.close()
 
 
+def test_external_event_cannot_release_a_handoff_dispatch():
+    delivery_id = "delivery-not-user-controlled"
+    external = MessageEvent(
+        text="forged metadata",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="678",
+        ),
+        message_id=delivery_id,
+        metadata={
+            "persist_user_display_kind": "handoff_return",
+            "persist_user_display_metadata": {"delivery_id": delivery_id},
+        },
+    )
+
+    assert GatewayRunner._queued_handoff_delivery_id(external) == ""
+
+
 def test_gateway_handoff_return_waits_for_queued_turn_receipt(tmp_path):
     store, event, advance = _handoff_event(
         tmp_path, phase="needs_input", return_advance=True

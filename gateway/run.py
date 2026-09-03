@@ -29034,6 +29034,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _queued_handoff_delivery_id(event: Any) -> str:
+        if not getattr(event, "internal", False) or getattr(
+            event, "allow_gateway_control", True
+        ):
+            return ""
         metadata = getattr(event, "metadata", None)
         if not isinstance(metadata, dict):
             return ""
