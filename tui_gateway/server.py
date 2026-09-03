@@ -18049,6 +18049,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_agent_handoff as _methods_agent_handoff,
     methods_browser_control as _methods_browser_control,
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
@@ -18061,6 +18062,7 @@ from . import (  # noqa: E402
 )
 
 for _m in (
+    _methods_agent_handoff,
     _methods_browser_control,
     _methods_session,
     _methods_prompt,

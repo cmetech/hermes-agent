@@ -1181,6 +1181,20 @@ def test_dispatch_runs_short_handlers_inline(server):
     assert resp == {"jsonrpc": "2.0", "id": "r1", "result": {"pong": True}}
 
 
+def test_agent_handoff_and_session_transfer_rpc_namespaces_coexist(server):
+    assert {
+        "agent_handoff.create",
+        "agent_handoff.get",
+        "agent_handoff.list",
+        "agent_handoff.evidence",
+        "agent_handoff.command",
+        "agent_handoff.directory",
+        "handoff.request",
+        "handoff.state",
+        "handoff.fail",
+    } <= server._methods.keys()
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
