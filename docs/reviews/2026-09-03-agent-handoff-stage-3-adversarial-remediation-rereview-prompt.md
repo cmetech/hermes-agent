@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `9c31748e833d5df41be1ed76bbfc71a191125ef3`
-- Remediated tree: `176160b0cb99fae7b9a7f1458993a1a5dad46bd6`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..9c31748e833d5df41be1ed76bbfc71a191125ef3`
-- Range commits: 12
-- Range paths: 12
-- Range diff: `+837/-13`; 598 inserted lines are review prompts, not
+- Remediated candidate: `62bd97a2c2f935c6be9a5149338b3502e744d9ff`
+- Remediated tree: `1dc438731fcd8ad9aeb56b47685741bd0ddc41b1`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..62bd97a2c2f935c6be9a5149338b3502e744d9ff`
+- Range commits: 14
+- Range paths: 14
+- Range diff: `+1188/-29`; 602 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -42,7 +42,13 @@ The original candidate retained both a pending `needs_input` wake and a later
 terminal wake. Both delivery IDs loaded the current terminal snapshot and
 started two identical model turns. The remediation atomically acknowledges
 older unacknowledged delivery projections when a newer attention event commits,
-while retaining the old source event and delivery row as evidence.
+while retaining the old source event and delivery row as evidence. A later
+convergence pass proved that a gateway which had already validated the older
+claim could cross the adapter boundary after supersession occurred during an
+awaited target check. The final remediation adds a v2-to-v3 durable dispatch
+reservation: supersession and dispatch are ordered by SQLite, a newer delivery
+waits for an earlier reserved dispatch to settle, and an abandoned reservation
+yields to the newer return after lease expiry.
 
 Prove or falsify all of the following:
 
@@ -50,7 +56,12 @@ Prove or falsify all of the following:
   yields one due delivery, one current Needs Attention row, and one terminal
   model wake;
 - the older row remains queryable and its delivery truth is not rewritten;
-- an older claimed delivery is fenced if a newer attention event supersedes it;
+- if supersession wins before dispatch reservation, the older claimed delivery
+  is fenced before adapter/model submission;
+- if dispatch reservation wins first, the older return settles before the
+  newer delivery becomes due, then the newer return remains deliverable;
+- an abandoned reserved dispatch reconciles through transcript receipt and
+  lease-expiry recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
 - acknowledgement, failed wake, attention-only policy, restart recovery,
   host/profile filtering, attempt limits, and one-delivery transcript replay
