@@ -3660,7 +3660,8 @@ def read_user_config_raw(
     pattern this replaces, so migrated sites keep their exact failure
     behavior):
 
-      * missing file → ``{}``
+      * missing file → ``{}``; an existing broken symlink raises when
+        ``require_mapping=True``
       * unparseable YAML / other I/O errors → raises (callers that want
         fail-open already wrap in try/except; callers with last-known-good
         or warn semantics rely on the exception)
@@ -3676,6 +3677,13 @@ def read_user_config_raw(
         with open(config_path, encoding="utf-8") as f:
             data = fast_safe_load(f)
     except FileNotFoundError:
+        if require_mapping:
+            try:
+                config_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("config path is unavailable") from None
         return {}
     if data is None:
         if require_mapping:

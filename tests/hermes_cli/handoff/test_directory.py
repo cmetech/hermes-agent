@@ -64,6 +64,18 @@ def test_malformed_config_fails_closed_before_legacy_resolution(tmp_path, raw):
     assert list(tmp_path.glob("config.yaml.corrupt.*.bak")) == []
 
 
+def test_broken_config_symlink_fails_closed_before_legacy_resolution(tmp_path):
+    (tmp_path / "profiles" / "reviewer").mkdir(parents=True)
+    config_path = tmp_path / "config.yaml"
+    try:
+        config_path.symlink_to(tmp_path / "unavailable-config.yaml")
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        resolve_agent_target("reviewer", initiating_home=tmp_path, relay_roster=[])
+
+
 def test_valid_directory_exposes_name_default_and_canonical_endpoints(tmp_path):
     (tmp_path / "profiles" / "reviewer").mkdir(parents=True)
     _write_config(
