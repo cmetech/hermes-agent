@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `907b47b6ae91bc1ac48ed750bffa1c927a7ab0de`
-- Remediated tree: `78635dd906ea44922a6717c80bf38724b0de1e56`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..907b47b6ae91bc1ac48ed750bffa1c927a7ab0de`
-- Range commits: 41
-- Range paths: 21
-- Range diff: `+2637/-88`; 755 inserted lines are review prompts, not
+- Remediated candidate: `5af122a0fd72196f0331e8d51fff07a5bc94263d`
+- Remediated tree: `76c403556a0dae87488c32b6cfe623587035e05f`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..5af122a0fd72196f0331e8d51fff07a5bc94263d`
+- Range commits: 43
+- Range paths: 22
+- Range diff: `+2810/-98`; 764 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -120,6 +120,20 @@ could strand a handoff return in FIFO overflow when an ordinary event occupied
 the adapter head. The current candidate clears and reconciles the complete
 runner-owned overflow at the same interruption boundary.
 
+A final Codex pass then proved that Desktop/TUI kept the ordinary 30-second
+delivery lease for the entire asynchronous model turn. A legitimate
+multi-minute turn could therefore rotate through eight ordinary claims, fail
+with `delivery_attempts_exhausted`, and leave its eventual transcript receipt
+unable to settle through the stale original lease. The current candidate moves
+an admitted Desktop/TUI turn into the existing durable receipt-pending state,
+retains one process-local delivery identity while the turn is live, and treats
+same-process reclaims as receipt checks instead of new model admissions. The
+terminal callback retires only the process-local identity; the supervisor's
+current receipt claim completes the durable row once the delivery ID is
+visible. A true process restart has no matching live identity and releases the
+receipt reservation for normal keyed retry. A clock-controlled store
+regression crosses ten lease rotations while attempts remain at one.
+
 Prove or falsify all of the following:
 
 - `needs_input -> active -> succeeded`, with the host absent until terminal,
@@ -138,6 +152,11 @@ Prove or falsify all of the following:
   consuming an attempt;
 - true process restart releases both the receipt reservation and the temporary
   identity installed by the recovering process, permitting its later retry;
+- a Desktop/TUI return whose model turn outlives more than eight ordinary lease
+  intervals remains receipt-pending with one attempt, cannot start a duplicate
+  turn during same-process claim rotation, completes through a current claim
+  after transcript persistence, and releases for keyed retry after a true
+  process restart;
 - a full busy FIFO reports backpressure rather than adapter acceptance during
   both ordinary busy handling and the live restart-drain window, consumes no
   delivery attempt, and permits the current or a newer superseding return to
