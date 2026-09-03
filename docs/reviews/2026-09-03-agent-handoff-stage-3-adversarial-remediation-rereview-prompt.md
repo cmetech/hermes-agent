@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `5af122a0fd72196f0331e8d51fff07a5bc94263d`
-- Remediated tree: `76c403556a0dae87488c32b6cfe623587035e05f`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..5af122a0fd72196f0331e8d51fff07a5bc94263d`
-- Range commits: 43
+- Remediated candidate: `7520760ff03f8c6b355b250cca51b741b8f56539`
+- Remediated tree: `854382759c79fec11087b9057bd9b7b35fdc62bc`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..7520760ff03f8c6b355b250cca51b741b8f56539`
+- Range commits: 45
 - Range paths: 22
-- Range diff: `+2810/-98`; 764 inserted lines are review prompts, not
+- Range diff: `+2832/-98`; 783 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -134,6 +134,14 @@ visible. A true process restart has no matching live identity and releases the
 receipt reservation for normal keyed retry. A clock-controlled store
 regression crosses ten lease rotations while attempts remain at one.
 
+Both independent reviewers then proved that the persisted-receipt completion
+path returned success without starting a model turn or releasing the poller's
+`session["running"]` claim. Every later user prompt and return could remain
+queued behind a nonexistent turn. The current candidate clears that no-turn
+session claim under the existing history lock when it completes the current
+durable receipt. The regression now begins with the exact poller-owned
+`running=True` state and proves receipt completion returns the session to idle.
+
 Prove or falsify all of the following:
 
 - `needs_input -> active -> succeeded`, with the host absent until terminal,
@@ -157,6 +165,9 @@ Prove or falsify all of the following:
   turn during same-process claim rotation, completes through a current claim
   after transcript persistence, and releases for keyed retry after a true
   process restart;
+- persisted Desktop/TUI receipt reconciliation releases the poller's session
+  claim even though it starts no model turn, so later user prompts and terminal
+  returns are not stranded behind a false busy state;
 - a full busy FIFO reports backpressure rather than adapter acceptance during
   both ordinary busy handling and the live restart-drain window, consumes no
   delivery attempt, and permits the current or a newer superseding return to
