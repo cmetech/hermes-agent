@@ -110,9 +110,16 @@ def _read_response(response, deadline: RunsDeadline) -> bytes:
 class RunsClient:
     """One-operation client for an already resolved Hermes API base URL."""
 
-    def __init__(self, connection: RunsConnection, deadline: RunsDeadline) -> None:
+    def __init__(
+        self,
+        connection: RunsConnection,
+        deadline: RunsDeadline,
+        *,
+        preserve_ambient_handlers: bool = False,
+    ) -> None:
         self.connection = connection
         self.deadline = deadline
+        self._opener_factory = None if preserve_ambient_handlers else _direct_opener
 
     def request_json(
         self,
@@ -142,7 +149,7 @@ class RunsClient:
         with open_credentialed_url(
             request,
             timeout=self.deadline.remaining(),
-            opener_factory=_direct_opener,
+            opener_factory=self._opener_factory,
         ) as response:
             raw = _read_response(response, self.deadline)
         try:

@@ -130,6 +130,14 @@ def _base_url(peer: dict, profile: str | None) -> str:
     return peer_base_url(peer, profile)
 
 
+def _peer_client(base: str, key: str, timeout: int) -> RunsClient:
+    return RunsClient(
+        RunsConnection(base, key),
+        RunsDeadline(timeout),
+        preserve_ambient_handlers=True,
+    )
+
+
 def _find_bot_chat(base: str, key: str) -> str | None:
     """The remote canonical Bot Chat's session id, or None.
 
@@ -141,15 +149,13 @@ def _find_bot_chat(base: str, key: str) -> str | None:
     return the ordinary visible listing, so this single request degrades
     to exactly the previous behavior against them.
     """
-    return RunsClient(
-        RunsConnection(base, key), RunsDeadline(LIST_TIMEOUT_S)
-    ).find_session(BOT_CHAT_TITLE)
+    return _peer_client(base, key, LIST_TIMEOUT_S).find_session(BOT_CHAT_TITLE)
 
 
 def _ensure_bot_chat(base: str, key: str) -> str:
     try:
         return ensure_peer_bot_chat(
-            RunsClient(RunsConnection(base, key), RunsDeadline(LIST_TIMEOUT_S))
+            _peer_client(base, key, LIST_TIMEOUT_S)
         )
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
@@ -383,7 +389,7 @@ def cmd_peer(args) -> int:
         try:
             session_id = _ensure_bot_chat(base, key)
             result = peer_dm_request(
-                RunsClient(RunsConnection(base, key), RunsDeadline(DM_TIMEOUT_S)),
+                _peer_client(base, key, DM_TIMEOUT_S),
                 message,
                 session_id=session_id,
             )
