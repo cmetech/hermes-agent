@@ -473,7 +473,7 @@ def test_handoff_follow_up_verifies_owner_target_and_uses_tool_call_id(
         "message",
         {
             "command_id": "call-follow-up",
-            "actor": "bot/default/sess-1",
+            "actor": "bot",
             "text": "check this",
             "correlation_id": "call-follow-up",
         },
@@ -521,7 +521,7 @@ def test_exact_pending_approval_choice_becomes_correlated_response(
         "respond",
         {
             "command_id": "call-answer",
-            "actor": "bot/default/sess-1",
+            "actor": "bot",
             "request_id": "approval-1",
             "choice": "once",
         },

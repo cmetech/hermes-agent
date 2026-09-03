@@ -487,7 +487,8 @@ def _handoff_delivery(
     session_id = str(getattr(agent, "session_id", "") or "")
     session_key = str(getattr(agent, "_gateway_session_key", "") or "")
     operation_id = _operation_id(agent, tool_call_id, endpoint.canonical)
-    actor = f"bot/{profile}/{session_id}"
+    initiator = f"bot/{profile}/{session_id}"
+    actor = "bot"
     service = None
     try:
         service = _handoff_service(home)
@@ -568,7 +569,7 @@ def _handoff_delivery(
                     required_capabilities=target.required_capabilities,
                     return_route=route,
                 ),
-                actor,
+                initiator,
                 handoff_key=operation_id,
             )
         snapshot = service.advance(handoff_id or snapshot.handoff_id, budget_seconds=2.0).snapshot
