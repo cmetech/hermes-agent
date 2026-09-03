@@ -27745,6 +27745,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if injection_result is not True:
                 return injection_result
             if event_claim is not None:
+                accepted_pending_persistence = True
                 try:
                     persisted = await self.async_session_store.has_platform_message_id(
                         target_session_id, str(evt.get("delivery_id") or "")
@@ -27752,7 +27753,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     return False
                 if not persisted:
-                    accepted_pending_persistence = True
                     return False
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it

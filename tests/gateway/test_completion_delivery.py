@@ -350,8 +350,13 @@ def test_gateway_handoff_return_releases_when_acceptance_is_not_persisted(tmp_pa
     store.close()
 
 
+@pytest.mark.parametrize(
+    "post_acceptance_receipt",
+    [False, RuntimeError("receipt unavailable")],
+    ids=["not-yet-persisted", "receipt-read-failed"],
+)
 def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
-    tmp_path,
+    tmp_path, post_acceptance_receipt,
 ):
     store, event = _handoff_event(tmp_path)
     source = SessionSource(
@@ -371,7 +376,7 @@ def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
     runner._async_session_store = SimpleNamespace(
         _store=runner.session_store,
         has_platform_message_id=AsyncMock(
-            side_effect=[False, False, False, True]
+            side_effect=[False, post_acceptance_receipt, False, True]
         ),
     )
 
