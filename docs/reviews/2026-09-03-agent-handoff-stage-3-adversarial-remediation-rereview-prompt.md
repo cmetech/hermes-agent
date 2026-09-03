@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `2234ab62f8fb86bd9025d774f540529addaa9a1a`
-- Remediated tree: `39c4cc222964861e0360f4a5867a23444c09cc0a`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..2234ab62f8fb86bd9025d774f540529addaa9a1a`
-- Range commits: 19
+- Remediated candidate: `83da57266745e74e3bdda6b25765cc8b76e51a53`
+- Remediated tree: `862cb257b8209b5abfdada5b16400ba2164b816c`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..83da57266745e74e3bdda6b25765cc8b76e51a53`
+- Range commits: 21
 - Range paths: 16
-- Range diff: `+1398/-31`; 617 inserted lines are review prompts, not
+- Range diff: `+1704/-57`; 621 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -57,6 +57,19 @@ return created later. Terminal settlement now clears the active reservation;
 new attention can acknowledge already-settled rows, and only an earlier pending
 reservation can hold back a newer return.
 
+A final convergence pass then proved that gateway adapter acceptance is not
+turn admission: a busy adapter queued the older return, the immediate
+transcript receipt was absent, and normal claim release cleared the reservation
+and consumed another attempt on every suppressed replay. That allowed a newer
+terminal return to cross the adapter boundary and could exhaust the older
+return after only one actual submission. The current candidate marks handoff
+returns as non-control internal events so the established identity-preserving
+FIFO handles busy sessions. After adapter acceptance, it durably retains the
+dispatch reservation in a receipt-pending state. Same-host transcript probes do
+not consume attempts or admit newer returns; a visible delivery ID completes
+the row without another model turn, while a changed host owner follows restart
+recovery instead of trusting lost process memory.
+
 Prove or falsify all of the following:
 
 - `needs_input -> active -> succeeded`, with the host absent until terminal,
@@ -67,6 +80,9 @@ Prove or falsify all of the following:
   is fenced before adapter/model submission on both initiating host kinds;
 - if dispatch reservation wins first, the older return settles before the
   newer delivery becomes due, then the newer return remains deliverable;
+- adapter queue acceptance without a transcript receipt retains the reservation
+  and stable delivery identity, does not merge distinct handoff return texts,
+  and does not consume additional delivery attempts while polling;
 - an abandoned reserved dispatch reconciles through transcript receipt and
   lease-expiry recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
@@ -108,12 +124,22 @@ inject the same delivery again. The first remediation retained the identity
 when a receipt read returned false; the first convergence pass proved that a
 receipt-read exception still released it. The final remediation marks the
 accepted interval before attempting that read, while releasing the durable
-claim for later receipt reconciliation.
+claim for later receipt reconciliation. A later convergence pass proved that
+release was still wrong when a busy adapter had only queued the turn: it
+cleared the dispatch reservation, enabled a newer return, and burned the retry
+budget while the in-process guard suppressed duplicate submission. The current
+candidate retains the durable reservation across this accepted-but-unpersisted
+interval and uses receipt-only same-host retries that do not increment attempts.
+Distinct handoff returns use the gateway's existing non-control internal FIFO,
+not generic pending-text merging.
 
 Prove or falsify all of the following:
 
 - an adapter-accepted delivery absent from the transcript cannot be injected a
   second time in the same gateway process;
+- a busy adapter's queue acceptance cannot release the durable dispatch
+  reservation, unblock a newer return, merge two delivery identities, or
+  consume the attempt budget while waiting for persistence;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
