@@ -11942,6 +11942,7 @@ def _handoff_return_persisted(session: dict, evt: dict) -> bool:
 
 def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
     from tools.async_delegation import (
+        begin_handoff_return_delivery,
         claim_event_delivery,
         complete_event_delivery,
         release_event_delivery,
@@ -11958,6 +11959,12 @@ def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
     if _handoff_return_persisted(session, evt):
         complete_event_delivery(evt, claim)
         return True
+    if not begin_handoff_return_delivery(claim):
+        try:
+            release_event_delivery(evt, claim)
+        except Exception:
+            logger.debug("could not release superseded handoff return", exc_info=True)
+        return False
     _emit("status.update", sid, {"kind": "process", "text": text})
 
     settled = False
