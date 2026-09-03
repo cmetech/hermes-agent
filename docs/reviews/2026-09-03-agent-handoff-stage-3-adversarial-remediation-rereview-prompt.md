@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `d09c9aff098e83c2e62d40b87338ecf4eee45700`
-- Remediated tree: `f8186d0e14c2af8abffe208471f2175961ebbeec`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..d09c9aff098e83c2e62d40b87338ecf4eee45700`
-- Range commits: 37
+- Remediated candidate: `c3e7de1817b7ea0e8ab3ed8023f26b1f43934f95`
+- Remediated tree: `2c6873a4b0501d2fe7dbdb1e5ce6944214e86ccf`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..c3e7de1817b7ea0e8ab3ed8023f26b1f43934f95`
+- Range commits: 39
 - Range paths: 21
-- Range diff: `+2545/-87`; 738 inserted lines are review prompts, not
+- Range diff: `+2608/-88`; 742 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -110,7 +110,12 @@ that exact queued event. That release requires the trusted internal,
 non-control event markers plus matching bounded delivery metadata; an external
 message cannot forge metadata to release another return. It does not use an
 elapsed-time receipt budget, which could duplicate a legitimate return waiting
-behind a long-running turn.
+behind a long-running turn. A final Claude pass then found that the shared busy
+`/stop`, `/new`, and `/reset` interruption helper popped the adapter head before
+the conversation-boundary funnel could see it. The current candidate routes
+that exact discarded event through the same authenticated abandonment helper at
+the shared pop site, covering all three commands without changing ordinary
+queued-message cleanup.
 
 Prove or falsify all of the following:
 
@@ -140,6 +145,8 @@ Prove or falsify all of the following:
   count into the actual recursive agent turn so ordinary FIFO completion
   creates the authoritative transcript receipt;
 - stale-lock healing preserves the queued event for the replacement owner;
+- busy `/stop`, `/new`, and `/reset` release the exact queued handoff return's
+  reservation and process identity when they intentionally discard it;
 - gateway draining rejects new handoff admission, while a return accepted
   before draining or a true conversation boundary releases only that discarded
   event's keyed dispatch reservation and process identity, and only trusted
@@ -213,7 +220,11 @@ candidate closes those concrete drop sites without a speculative timer: drain
 admission reports backpressure, stale-lock healing keeps its pending event,
 queued recursion propagates the stable receipt identity, and known boundary or
 drain discard atomically clears the matching durable dispatch reservation so a
-normal keyed retry or a newer terminal return can proceed.
+normal keyed retry or a newer terminal return can proceed. The next Claude pass
+proved that the busy command interruption helper discarded the adapter head
+before `/new` or `/reset` reached the boundary funnel, while `/stop` never
+reached that funnel. The current candidate sends the event returned by that
+single shared pop through the already authenticated abandonment helper.
 
 Prove or falsify all of the following:
 
@@ -235,6 +246,8 @@ Prove or falsify all of the following:
   metadata needed for transcript reconciliation;
 - stale-lock repair cannot discard an accepted return, and a known boundary or
   drain discard cannot leave its receipt reservation or process identity live;
+- busy `/stop`, `/new`, and `/reset` cannot discard an accepted queued return
+  while leaving its receipt reservation or process identity live;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
