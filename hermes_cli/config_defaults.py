@@ -2935,6 +2935,9 @@ DEFAULT_CONFIG = {
         "done_sub_retention_days": 30,
     },
 
+    # Profile-scoped friendly names for canonical shared-agent destinations.
+    "handoff": {"agents": {}},
+
     # Bot Mode cross-connection relay (tools/bot_relay.py). Envelopes queued
     # by message_agent for agents on other connections wait in an on-disk
     # outbox until the Desktop drains them.
