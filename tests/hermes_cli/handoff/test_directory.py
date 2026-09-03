@@ -49,7 +49,9 @@ def test_default_config_has_an_empty_agent_directory():
     assert DEFAULT_CONFIG["handoff"] == {"agents": {}}
 
 
-@pytest.mark.parametrize("raw", ["handoff: [\n", "[]\n", "true\n", "invalid\n"])
+@pytest.mark.parametrize(
+    "raw", ["handoff: [\n", "[]\n", "true\n", "invalid\n", "null\n", ""]
+)
 def test_malformed_config_fails_closed_before_legacy_resolution(tmp_path, raw):
     (tmp_path / "profiles" / "reviewer").mkdir(parents=True)
     config_path = tmp_path / "config.yaml"

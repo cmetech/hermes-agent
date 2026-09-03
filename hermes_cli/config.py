@@ -3678,6 +3678,8 @@ def read_user_config_raw(
     except FileNotFoundError:
         return {}
     if data is None:
+        if require_mapping:
+            raise ValueError("config root must be a mapping")
         data = {}
     if require_mapping and not isinstance(data, dict):
         raise ValueError("config root must be a mapping")
