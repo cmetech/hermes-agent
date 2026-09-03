@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `ff05217f576411946777b82b71600caa4d0437f1`
-- Remediated tree: `e9eeaba5fa9760e7f9590dbdeb4b497fddb8b576`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..ff05217f576411946777b82b71600caa4d0437f1`
-- Range commits: 29
+- Remediated candidate: `951fc20680613e95c7d78c443f976c4ccfd1cfe1`
+- Remediated tree: `c63ba55819875ddc789d339a7abdd844e275be4c`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..951fc20680613e95c7d78c443f976c4ccfd1cfe1`
+- Range commits: 31
 - Range paths: 18
-- Range diff: `+2112/-71`; 686 inserted lines are review prompts, not
+- Range diff: `+2135/-84`; 698 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -90,7 +90,12 @@ override bypassed the shared busy-session handler for these synthetic returns,
 overwriting an older pending return while still reporting acceptance. The
 current candidate delegates non-control internal events to the base adapter so
 the same runner-owned FIFO and backpressure contract applies; ordinary Raft
-wake hints retain their existing shortcut.
+wake hints retain their existing shortcut. The next independent pass proved
+that the earlier restart-draining branch ignored FIFO rejection and reported a
+dropped return as queued before reaching the observable internal-event branch.
+The current candidate routes non-control internal events through the FIFO
+before restart-drain messaging, so both busy states share one acceptance and
+backpressure result.
 
 Prove or falsify all of the following:
 
@@ -110,8 +115,9 @@ Prove or falsify all of the following:
   consuming an attempt;
 - true process restart releases both the receipt reservation and the temporary
   identity installed by the recovering process, permitting its later retry;
-- a full busy FIFO reports backpressure rather than adapter acceptance, consumes
-  no delivery attempt, and permits the current or a newer superseding return to
+- a full busy FIFO reports backpressure rather than adapter acceptance during
+  both ordinary busy handling and the live restart-drain window, consumes no
+  delivery attempt, and permits the current or a newer superseding return to
   run exactly once after capacity is available;
 - the bundled Raft adapter cannot bypass that FIFO/backpressure boundary or
   overwrite an older queued handoff return;
@@ -175,6 +181,9 @@ boundary. That path clears the durable reservation without consuming an
 attempt; only actual FIFO admission enters receipt-pending reconciliation. The
 bundled Raft adapter now forwards non-control internal returns through this
 base-adapter boundary instead of applying its wake-only pending-slot shortcut.
+Non-control internal events now reach that boundary before the generic
+restart-draining response branch, which previously ignored FIFO rejection and
+misclassified a dropped return as adapter-accepted.
 
 Prove or falsify all of the following:
 
@@ -187,8 +196,9 @@ Prove or falsify all of the following:
   process cannot cause reinjection or clear the accepted dispatch reservation;
 - a true process restart can release the stale reservation and subsequently
   retry in the same new gateway process without self-suppression;
-- a full busy FIFO cannot masquerade as acceptance, retain an impossible
-  receipt reservation, exhaust attempts, or block a newer terminal return;
+- a full busy FIFO cannot masquerade as acceptance during ordinary busy handling
+  or restart draining, retain an impossible receipt reservation, exhaust
+  attempts, or block a newer terminal return;
 - a bundled adapter override cannot replace a queued return or skip the shared
   backpressure signal while reporting acceptance;
 - once the delivery ID is visible in the persisted transcript, replay completes
