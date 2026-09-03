@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `c3e7de1817b7ea0e8ab3ed8023f26b1f43934f95`
-- Remediated tree: `2c6873a4b0501d2fe7dbdb1e5ce6944214e86ccf`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..c3e7de1817b7ea0e8ab3ed8023f26b1f43934f95`
-- Range commits: 39
+- Remediated candidate: `907b47b6ae91bc1ac48ed750bffa1c927a7ab0de`
+- Remediated tree: `78635dd906ea44922a6717c80bf38724b0de1e56`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..907b47b6ae91bc1ac48ed750bffa1c927a7ab0de`
+- Range commits: 41
 - Range paths: 21
-- Range diff: `+2608/-88`; 742 inserted lines are review prompts, not
+- Range diff: `+2637/-88`; 755 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -115,7 +115,10 @@ behind a long-running turn. A final Claude pass then found that the shared busy
 the conversation-boundary funnel could see it. The current candidate routes
 that exact discarded event through the same authenticated abandonment helper at
 the shared pop site, covering all three commands without changing ordinary
-queued-message cleanup.
+queued-message cleanup. A controller RED then proved the same `/stop` path
+could strand a handoff return in FIFO overflow when an ordinary event occupied
+the adapter head. The current candidate clears and reconciles the complete
+runner-owned overflow at the same interruption boundary.
 
 Prove or falsify all of the following:
 
@@ -146,7 +149,8 @@ Prove or falsify all of the following:
   creates the authoritative transcript receipt;
 - stale-lock healing preserves the queued event for the replacement owner;
 - busy `/stop`, `/new`, and `/reset` release the exact queued handoff return's
-  reservation and process identity when they intentionally discard it;
+  reservation and process identity from both the adapter head and FIFO overflow
+  when they intentionally discard it;
 - gateway draining rejects new handoff admission, while a return accepted
   before draining or a true conversation boundary releases only that discarded
   event's keyed dispatch reservation and process identity, and only trusted
@@ -225,6 +229,10 @@ proved that the busy command interruption helper discarded the adapter head
 before `/new` or `/reset` reached the boundary funnel, while `/stop` never
 reached that funnel. The current candidate sends the event returned by that
 single shared pop through the already authenticated abandonment helper.
+The controller then reproduced the sibling overflow case: `/stop` reconciled
+the adapter head but left a receipt-pending return in the runner-owned FIFO
+tail. The current candidate authenticates and abandons every overflow event at
+that same interrupt boundary before clearing the list.
 
 Prove or falsify all of the following:
 
@@ -247,7 +255,8 @@ Prove or falsify all of the following:
 - stale-lock repair cannot discard an accepted return, and a known boundary or
   drain discard cannot leave its receipt reservation or process identity live;
 - busy `/stop`, `/new`, and `/reset` cannot discard an accepted queued return
-  while leaving its receipt reservation or process identity live;
+  from either the adapter head or FIFO overflow while leaving its receipt
+  reservation or process identity live;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
