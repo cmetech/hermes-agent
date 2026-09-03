@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `951fc20680613e95c7d78c443f976c4ccfd1cfe1`
-- Remediated tree: `c63ba55819875ddc789d339a7abdd844e275be4c`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..951fc20680613e95c7d78c443f976c4ccfd1cfe1`
-- Range commits: 31
-- Range paths: 18
-- Range diff: `+2135/-84`; 698 inserted lines are review prompts, not
+- Remediated candidate: `02d655c9cde51dd66bb12f91c38131d7d5431e75`
+- Remediated tree: `e915e8fa5a4101d7f45e289ea33d81f530bce5b1`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..02d655c9cde51dd66bb12f91c38131d7d5431e75`
+- Range commits: 33
+- Range paths: 21
+- Range diff: `+2488/-87`; 708 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -95,7 +95,19 @@ that the earlier restart-draining branch ignored FIFO rejection and reported a
 dropped return as queued before reaching the observable internal-event branch.
 The current candidate routes non-control internal events through the FIFO
 before restart-drain messaging, so both busy states share one acceptance and
-backpressure result.
+backpressure result. A fresh Claude pass then proved that an admitted return
+could still be discarded before persistence by stale-lock healing, a true
+conversation boundary, or the pending-turn drain during shutdown. The durable
+receipt reservation and process identity then stayed live indefinitely,
+blocking a newer terminal return. It also exposed that the recursive queued
+turn did not carry the delivery ID or display metadata into agent persistence,
+so even an ordinary successful drain could never create the receipt. The
+current candidate preserves pending work during stale-lock healing, rejects
+handoff admission while draining, carries the stable delivery ID and bounded
+handoff metadata through the recursive turn, and explicitly releases the keyed
+dispatch reservation when a conversation boundary or drain knowingly discards
+that exact queued event. It does not use an elapsed-time receipt budget, which
+could duplicate a legitimate return waiting behind a long-running turn.
 
 Prove or falsify all of the following:
 
@@ -121,6 +133,13 @@ Prove or falsify all of the following:
   run exactly once after capacity is available;
 - the bundled Raft adapter cannot bypass that FIFO/backpressure boundary or
   overwrite an older queued handoff return;
+- a queued handoff return carries its delivery ID, display metadata, and hop
+  count into the actual recursive agent turn so ordinary FIFO completion
+  creates the authoritative transcript receipt;
+- stale-lock healing preserves the queued event for the replacement owner;
+- gateway draining rejects new handoff admission, while a return accepted
+  before draining or a true conversation boundary releases only that discarded
+  event's keyed dispatch reservation and process identity;
 - an abandoned reserved dispatch reconciles through transcript receipt and
   restart/lease recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
@@ -183,7 +202,14 @@ bundled Raft adapter now forwards non-control internal returns through this
 base-adapter boundary instead of applying its wake-only pending-slot shortcut.
 Non-control internal events now reach that boundary before the generic
 restart-draining response branch, which previously ignored FIFO rejection and
-misclassified a dropped return as adapter-accepted.
+misclassified a dropped return as adapter-accepted. A later review proved that
+post-acceptance loss could still leave receipt-pending state unbounded and that
+the recursive queued turn omitted the delivery receipt metadata. The current
+candidate closes those concrete drop sites without a speculative timer: drain
+admission reports backpressure, stale-lock healing keeps its pending event,
+queued recursion propagates the stable receipt identity, and known boundary or
+drain discard atomically clears the matching durable dispatch reservation so a
+normal keyed retry or a newer terminal return can proceed.
 
 Prove or falsify all of the following:
 
@@ -201,6 +227,10 @@ Prove or falsify all of the following:
   attempts, or block a newer terminal return;
 - a bundled adapter override cannot replace a queued return or skip the shared
   backpressure signal while reporting acceptance;
+- queued-turn persistence receives the stable delivery ID and bounded display
+  metadata needed for transcript reconciliation;
+- stale-lock repair cannot discard an accepted return, and a known boundary or
+  drain discard cannot leave its receipt reservation or process identity live;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
