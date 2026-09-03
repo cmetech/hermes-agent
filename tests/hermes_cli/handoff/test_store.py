@@ -34,6 +34,27 @@ def _spec(prompt: str = "Review this change.") -> HandoffSpec:
     )
 
 
+def _conversation_spec() -> HandoffSpec:
+    return HandoffSpec(
+        mode="conversation",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="Can you review the release?",
+        output_schema=None,
+        deadline_at=datetime(2026, 9, 2, tzinfo=UTC),
+        attribution={"sender": "default"},
+        required_capabilities=frozenset({"follow_up"}),
+        return_route={
+            "kind": "bot",
+            "profile": "default",
+            "session_id": "20260902_120000_abc123",
+            "session_key": "agent:default:telegram:dm:42",
+            "tool_call_id": "call_message_1",
+            "delivery_policy": "wake",
+            "hop_count": 0,
+        },
+    )
+
+
 def _create(store: HandoffStore, key: str = "node/review"):
     spec = _spec()
     return store.create_or_get("workflow/run-1", key, spec, spec.fingerprint)
@@ -76,6 +97,34 @@ def test_create_replays_equivalent_spec_and_rejects_conflicting_key_reuse(tmp_pa
         store.create_or_get(
             "workflow/run-1", "node/review", changed, changed.fingerprint
         )
+
+
+def test_conversation_spec_and_return_route_round_trip(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    spec = _conversation_spec()
+
+    created = store.create_or_get(
+        "bot/default/session-1", "call-1", spec, spec.fingerprint
+    )
+    loaded = store.get(created.handoff_id)
+
+    assert loaded.spec == spec
+    assert loaded.spec.return_route == spec.return_route
+
+
+def test_task_spec_serialization_omits_absent_return_route(tmp_path):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    created = _create(store)
+
+    with sqlite3.connect(path) as conn:
+        raw = conn.execute(
+            "SELECT spec_json FROM handoffs WHERE handoff_id=?",
+            (created.handoff_id,),
+        ).fetchone()[0]
+
+    assert "return_route" not in json.loads(raw)
+    assert store.get(created.handoff_id).spec.fingerprint == _spec().fingerprint
 
 
 def test_concurrent_creators_converge_on_one_handoff(tmp_path):

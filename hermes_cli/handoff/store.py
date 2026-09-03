@@ -295,18 +295,18 @@ def _command_payload(
 
 
 def _spec_json(spec: HandoffSpec) -> str:
-    return _json(
-        {
-            "mode": spec.mode,
-            "endpoint": spec.endpoint.canonical,
-            "prompt": spec.prompt,
-            "output_schema": spec.output_schema,
-            "deadline_at": _timestamp(spec.deadline_at),
-            "attribution": spec.attribution,
-            "required_capabilities": sorted(spec.required_capabilities),
-        },
-        max_bytes=3_200_000,
-    )
+    payload = {
+        "mode": spec.mode,
+        "endpoint": spec.endpoint.canonical,
+        "prompt": spec.prompt,
+        "output_schema": spec.output_schema,
+        "deadline_at": _timestamp(spec.deadline_at),
+        "attribution": spec.attribution,
+        "required_capabilities": sorted(spec.required_capabilities),
+    }
+    if spec.return_route is not None:
+        payload["return_route"] = spec.return_route
+    return _json(payload, max_bytes=3_200_000)
 
 
 def _spec_from_json(value: str) -> HandoffSpec:
@@ -320,6 +320,7 @@ def _spec_from_json(value: str) -> HandoffSpec:
         deadline_at=deadline,
         attribution=raw["attribution"],
         required_capabilities=frozenset(raw["required_capabilities"]),
+        return_route=raw.get("return_route"),
     )
 
 

@@ -47,8 +47,10 @@ _CREDENTIAL_KEY_PARTS = (
     "api_key", "authorization", "bearer", "credential", "password", "secret", "token",
 )
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_SAFE_SESSION_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,511}$")
 _PEER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DELIVERY_POLICIES = frozenset({"attention", "wake"})
 _CHECKPOINT_IDENTIFIERS = frozenset({
     "approval_request_id",
     "session_id",
@@ -84,6 +86,62 @@ def _freeze(value: object) -> object:
 
 def _safe_identifier(value: object) -> bool:
     return isinstance(value, str) and bool(_SAFE_IDENTIFIER.fullmatch(value))
+
+
+def _normalize_return_route(
+    value: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("handoff return route is invalid")
+    kind = value.get("kind")
+    if kind == "bot":
+        required = {
+            "kind",
+            "profile",
+            "session_id",
+            "tool_call_id",
+            "delivery_policy",
+            "hop_count",
+        }
+        keys = set(value)
+        if keys not in (required, required | {"session_key"}):
+            raise ValueError("handoff return route is invalid")
+        session_key = value.get("session_key")
+        if session_key is not None and (
+            not isinstance(session_key, str)
+            or not _SAFE_SESSION_KEY.fullmatch(session_key)
+        ):
+            raise ValueError("handoff return route is invalid")
+        if not _safe_identifier(value.get("session_id")) or not _safe_identifier(
+            value.get("tool_call_id")
+        ):
+            raise ValueError("handoff return route is invalid")
+        if value.get("delivery_policy") not in _DELIVERY_POLICIES:
+            raise ValueError("handoff return route is invalid")
+        hop_count = value.get("hop_count")
+        if (
+            isinstance(hop_count, bool)
+            or not isinstance(hop_count, int)
+            or not 0 <= hop_count <= 1
+        ):
+            raise ValueError("handoff return route is invalid")
+    elif kind == "operator":
+        if set(value) != {"kind", "profile", "inbox_id"} or not _safe_identifier(
+            value.get("inbox_id")
+        ):
+            raise ValueError("handoff return route is invalid")
+    else:
+        raise ValueError("handoff return route is invalid")
+    profile = value.get("profile")
+    if not isinstance(profile, str):
+        raise ValueError("handoff return route is invalid")
+    try:
+        validate_profile_name(profile)
+    except ValueError as exc:
+        raise ValueError("handoff return route is invalid") from exc
+    return _freeze(value)  # type: ignore[return-value]
 
 
 def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, object] | None:
@@ -262,17 +320,18 @@ class HandoffEndpoint:
 
 @dataclass(frozen=True, slots=True)
 class HandoffSpec:
-    mode: Literal["task"]
+    mode: Literal["task", "conversation"]
     endpoint: HandoffEndpoint
     prompt: str
     output_schema: Mapping[str, object] | None
     deadline_at: datetime | None
     attribution: Mapping[str, str]
     required_capabilities: frozenset[str]
+    return_route: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
-        if self.mode != "task":
-            raise ValueError("handoff mode must be task")
+        if self.mode not in {"task", "conversation"}:
+            raise ValueError("handoff mode is invalid")
         if not isinstance(self.endpoint, HandoffEndpoint):
             raise ValueError("handoff endpoint is invalid")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
@@ -281,6 +340,10 @@ class HandoffSpec:
             raise ValueError("handoff prompt exceeds byte limit")
         schema = None
         if self.output_schema is not None:
+            if self.mode == "conversation":
+                raise ValueError(
+                    "conversation handoff cannot require structured output"
+                )
             schema = normalize_schema(self.output_schema).canonical_schema
         if not isinstance(self.attribution, Mapping) or len(self.attribution) > _MAX_ATTRIBUTION_ITEMS:
             raise ValueError("handoff attribution is invalid")
@@ -307,14 +370,18 @@ class HandoffSpec:
         capabilities = frozenset(self.required_capabilities)
         if not capabilities <= _SUPPORTED_CAPABILITIES:
             raise ValueError("handoff requires unsupported capabilities")
+        return_route = _normalize_return_route(self.return_route)
+        if self.mode == "task" and return_route is not None:
+            raise ValueError("task handoff cannot have a return route")
         object.__setattr__(self, "output_schema", schema)
         object.__setattr__(self, "deadline_at", _aware_utc(self.deadline_at, "deadline"))
         object.__setattr__(self, "attribution", _freeze(attribution))
         object.__setattr__(self, "required_capabilities", capabilities)
+        object.__setattr__(self, "return_route", return_route)
 
     @property
     def fingerprint_input(self) -> bytes:
-        return canonical_json_bytes({
+        payload = {
             "mode": self.mode,
             "endpoint": self.endpoint.canonical,
             "prompt": self.prompt,
@@ -322,7 +389,10 @@ class HandoffSpec:
             "deadline_at": _timestamp(self.deadline_at),
             "attribution": self.attribution,
             "required_capabilities": sorted(self.required_capabilities),
-        }, max_bytes=3_200_000)
+        }
+        if self.return_route is not None:
+            payload["return_route"] = self.return_route
+        return canonical_json_bytes(payload, max_bytes=3_200_000)
 
     @property
     def fingerprint(self) -> str:
