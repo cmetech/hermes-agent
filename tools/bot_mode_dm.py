@@ -41,6 +41,8 @@ the same wake shape every Bot Mode agent already knows.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Mapping
+from hashlib import sha256
 import json
 import logging
 import os
@@ -70,6 +72,8 @@ _DM_STALE_SECONDS = 24 * 60 * 60
 
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_TERMINAL_HANDOFF_PHASES = frozenset({"succeeded", "failed", "cancelled"})
 
 
 def message_agent_tool_schema() -> dict:
@@ -108,7 +112,9 @@ def message_agent_tool_schema() -> dict:
                         "description": (
                             "Who to message: a teammate profile name from your roster "
                             "('researcher', 'hermes' for the default agent), or "
-                            "'<peer>' / '<peer>/<agent>' for a registered peer gateway."
+                            "'<peer>' / '<peer>/<agent>' for a registered peer gateway. "
+                            "For durable controls, use 'hermes://local/<profile>' or "
+                            "'hermes://peer/<peer>/<profile>'."
                         ),
                     },
                     "message": {
@@ -117,6 +123,13 @@ def message_agent_tool_schema() -> dict:
                             "The message YOU composed for that agent (max "
                             f"{MESSAGE_MAX_CHARS} chars). Do not include the "
                             "'Message from …' prefix — it is added automatically."
+                        ),
+                    },
+                    "handoff_id": {
+                        "type": "string",
+                        "description": (
+                            "Existing handoff to continue or answer. Omit for a new "
+                            "message."
                         ),
                     },
                 },
@@ -241,6 +254,8 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
 def message_agent_tool(
     target: str = "",
     message: str = "",
+    handoff_id: str = "",
+    tool_call_id: str = "",
     task_id: Optional[str] = None,
     agent: Any = None,
 ) -> str:
@@ -290,6 +305,52 @@ def message_agent_tool(
 
     sender_handle = _handle(me)
     prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
+
+    try:
+        from hermes_cli.handoff.directory import (
+            AmbiguousAgentTarget,
+            resolve_agent_target,
+        )
+
+        resolved_target = resolve_agent_target(
+            raw_target, initiating_home=home
+        )
+    except AmbiguousAgentTarget as exc:
+        return _err(
+            "Target is ambiguous; use one of: " + ", ".join(exc.choices) + "."
+        )
+    except (LookupError, ValueError):
+        resolved_target = None
+
+    if resolved_target is not None and resolved_target.endpoint is not None:
+        if (
+            resolved_target.endpoint.kind == "local"
+            and resolved_target.endpoint.profile == me
+        ):
+            relayed = _try_relay_delivery(
+                root,
+                raw_target,
+                body,
+                me,
+                sender_handle,
+                task_id=task_id,
+                agent=agent,
+            )
+            if relayed is not None:
+                return relayed
+            return _err("You can't message yourself. Pick a teammate from the roster.")
+        return _handoff_delivery(
+            home=Path(home),
+            profile=me,
+            sender_handle=sender_handle,
+            target=resolved_target,
+            body=body,
+            handoff_id=str(handoff_id or "").strip(),
+            tool_call_id=tool_call_id,
+            agent=agent,
+        )
+    if "://" in raw_target:
+        return _err("Invalid canonical handoff target.")
 
     # ── peer target: '<peer>/<agent>' or a bare registered peer name ──
     peer_match = _PEER_TARGET_RE.match(raw_target)
@@ -378,6 +439,151 @@ def message_agent_tool(
         task_id=task_id,
         agent=agent,
     )
+
+
+def _handoff_service(home: Path):
+    from hermes_cli.handoff.service import AgentHandoffService
+    from hermes_cli.handoff.store import HandoffStore
+
+    return AgentHandoffService(store=HandoffStore(home / "handoffs.db"))
+
+
+def _operation_id(agent: Any, tool_call_id: str, target: str) -> str:
+    supplied = str(tool_call_id or "").strip()
+    if _SAFE_ID_RE.fullmatch(supplied):
+        return supplied
+    session_id = str(getattr(agent, "session_id", "") or "")
+    turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+    value = "\0".join((session_id, turn_id, supplied, target)).encode("utf-8")
+    return f"call-{sha256(value).hexdigest()}"
+
+
+def _handoff_wake_enabled(home: Path) -> bool:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly(config_path=home / "config.yaml") or {}
+        bot_mode = config.get("bot_mode")
+        return not isinstance(bot_mode, Mapping) or bot_mode.get(
+            "handoff_return_wake", True
+        ) is not False
+    except Exception:
+        return True
+
+
+def _handoff_delivery(
+    *,
+    home: Path,
+    profile: str,
+    sender_handle: str,
+    target,
+    body: str,
+    handoff_id: str,
+    tool_call_id: str,
+    agent: Any,
+) -> str:
+    endpoint = target.endpoint
+    assert endpoint is not None
+    session_id = str(getattr(agent, "session_id", "") or "")
+    session_key = str(getattr(agent, "_gateway_session_key", "") or "")
+    operation_id = _operation_id(agent, tool_call_id, endpoint.canonical)
+    actor = f"bot/{profile}/{session_id}"
+    service = None
+    try:
+        service = _handoff_service(home)
+        if handoff_id:
+            if not _SAFE_ID_RE.fullmatch(handoff_id):
+                raise ValueError("handoff id is invalid")
+            snapshot = service.get(handoff_id)
+            route = snapshot.spec.return_route
+            if (
+                snapshot.spec.mode != "conversation"
+                or snapshot.spec.endpoint.canonical != endpoint.canonical
+                or not isinstance(route, Mapping)
+                or route.get("kind") != "bot"
+                or route.get("profile") != profile
+                or route.get("session_id") != session_id
+                or (
+                    route.get("session_key") is not None
+                    and route.get("session_key") != session_key
+                )
+                or snapshot.phase in _TERMINAL_HANDOFF_PHASES
+            ):
+                raise ValueError("handoff is not owned by this Bot session")
+            if snapshot.phase == "needs_input":
+                request_id = (snapshot.checkpoint or {}).get(
+                    "approval_request_id"
+                )
+                choices = tuple(
+                    (snapshot.checkpoint or {}).get("approval_choices") or ()
+                )
+                choice = body.casefold()
+                if not isinstance(request_id, str) or choice not in choices:
+                    raise ValueError("handoff approval answer is ambiguous")
+                service.command(
+                    handoff_id,
+                    "respond",
+                    command_id=operation_id,
+                    actor=actor,
+                    request_id=request_id,
+                    choice=choice,
+                )
+            else:
+                service.command(
+                    handoff_id,
+                    "message",
+                    command_id=operation_id,
+                    actor=actor,
+                    text=body,
+                    correlation_id=operation_id,
+                )
+        else:
+            from hermes_cli.handoff.models import HandoffSpec
+
+            route = {
+                "kind": "bot",
+                "profile": profile,
+                "session_id": session_id,
+                "tool_call_id": operation_id,
+                "delivery_policy": (
+                    "wake" if _handoff_wake_enabled(home) else "attention"
+                ),
+                "hop_count": min(
+                    max(int(getattr(agent, "_handoff_return_hop_count", 0)), 0),
+                    1,
+                ),
+            }
+            if session_key:
+                route["session_key"] = session_key
+            snapshot = service.create(
+                HandoffSpec(
+                    mode="conversation",
+                    endpoint=endpoint,
+                    prompt=(
+                        f"Message from 🤖 {sender_handle} (@{sender_handle}): {body}"
+                    ),
+                    output_schema=None,
+                    deadline_at=None,
+                    attribution={"profile": profile, "handle": sender_handle},
+                    required_capabilities=target.required_capabilities,
+                    return_route=route,
+                ),
+                actor,
+                handoff_key=operation_id,
+            )
+        snapshot = service.advance(handoff_id or snapshot.handoff_id, budget_seconds=2.0).snapshot
+        return json.dumps({
+            "status": snapshot.phase,
+            "to": endpoint.canonical,
+            "handoff_id": snapshot.handoff_id,
+            "detail": "Message accepted for asynchronous handoff; finish your turn.",
+        })
+    except Exception:
+        logger.error("message_agent handoff could not be started", exc_info=True)
+        return _err(f"Delivery to {endpoint.canonical} could not be started.")
+    finally:
+        if service is not None:
+            service.store.close()
 
 
 def _try_relay_delivery(

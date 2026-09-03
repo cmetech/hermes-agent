@@ -2122,6 +2122,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return _message_agent_tool(
                     target=next_args.get("target", ""),
                     message=next_args.get("message", ""),
+                    handoff_id=next_args.get("handoff_id", ""),
+                    tool_call_id=tool_call_id,
                     task_id=effective_task_id,
                     agent=agent,
                 )
