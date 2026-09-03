@@ -494,11 +494,13 @@ def test_handoff_return_replay_acknowledges_without_running_model(monkeypatch):
     session = _session(
         agent=types.SimpleNamespace(session_id="session-key", _session_db=db),
         profile_home=None,
+        running=True,
     )
 
     assert server._dispatch_handoff_return("sid", session, event) is True
 
     assert completed == ["done"]
+    assert session["running"] is False
 
 
 def test_handoff_return_superseded_during_receipt_check_never_starts_model(

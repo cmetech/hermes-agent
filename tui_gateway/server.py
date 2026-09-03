@@ -11964,6 +11964,7 @@ def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
         with session["history_lock"]:
             if session.get("_handoff_return_inflight") == delivery_id:
                 session.pop("_handoff_return_inflight", None)
+            session["running"] = False
         return True
     receipt_recovery = handoff_return_receipt_pending(claim)
     with session["history_lock"]:
