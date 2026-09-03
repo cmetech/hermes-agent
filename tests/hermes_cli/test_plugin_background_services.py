@@ -175,6 +175,10 @@ def test_registration_is_attributed_filtered_and_duplicate_safe() -> None:
         context.register_background_service("Not Valid", factory, hosts={"web"})
     with pytest.raises(ValueError, match="unknown background service host"):
         context.register_background_service("unknown-host", factory, hosts={"cron"})
+    with pytest.raises(ValueError, match="core background service name is reserved"):
+        _context(manager, key="core").register_background_service(
+            "agent_handoff", factory, hosts={"web"}
+        )
 
     gateway = manager.start_background_services("gateway")
     assert gateway.snapshot() == ()
@@ -189,6 +193,42 @@ def test_registration_is_attributed_filtered_and_duplicate_safe() -> None:
     assert snapshot.host_kind == "web"
     assert snapshot.lifecycle in {"constructing", "running"}
     assert web.shutdown(timeout=1)
+
+
+def test_core_handoff_service_is_host_owned_once_and_survives_reload(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_cli.handoff.supervisor as supervisor_module
+
+    created = []
+
+    def factory(context, *, source_home):
+        service = _BlockingService(threading.Event(), threading.Event())
+        created.append((context.host_kind, source_home, service))
+        return service
+
+    monkeypatch.setattr(supervisor_module, "create_agent_handoff_supervisor", factory)
+    manager = PluginManager(scope_key=str(tmp_path))
+    assert manager._background_services == {}
+    assert not (tmp_path / "handoffs.db").exists()
+    manager._discovered = True
+
+    first = manager.start_background_services("web")
+    _wait_until(lambda: len(created) == 1 and created[0][2].entered.is_set())
+    assert [item.qualified_name for item in first.snapshot()] == [
+        "core:agent_handoff"
+    ]
+    assert manager._background_services == {}
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", lambda: None)
+    replacements = manager.reload_background_services(timeout=1)
+
+    assert first.is_quiescent
+    _wait_until(lambda: len(created) == 2 and created[1][2].entered.is_set())
+    assert [item.qualified_name for item in replacements[0].snapshot()] == [
+        "core:agent_handoff"
+    ]
+    assert replacements[0].shutdown(timeout=1)
 
 
 def test_failed_plugin_registration_rolls_back_only_its_services(monkeypatch) -> None:

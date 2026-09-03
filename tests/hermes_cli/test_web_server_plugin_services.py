@@ -90,7 +90,9 @@ def test_web_lifespan_hosts_services_between_discovery_and_resource_teardown(
         assert entered.wait(timeout=1)
         host = web_server.app.state.plugin_background_services
         assert host.host_kind == "web"
-        assert host.snapshot()[0].lifecycle == "running"
+        snapshots = {item.qualified_name: item for item in host.snapshot()}
+        assert set(snapshots) == {"core:agent_handoff", "web-test:lifecycle"}
+        assert snapshots["web-test:lifecycle"].lifecycle == "running"
         response = client.get(
             "/api/status",
             headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
@@ -119,8 +121,17 @@ def test_web_readiness_survives_service_factory_failure(monkeypatch) -> None:
 
     with TestClient(web_server.app) as client:
         host = web_server.app.state.plugin_background_services
-        _wait_until(lambda: host.snapshot()[0].lifecycle == "failed")
-        snapshot = host.snapshot()[0]
+        _wait_until(
+            lambda: {
+                item.qualified_name: item.lifecycle for item in host.snapshot()
+            }.get("web-test:broken")
+            == "failed"
+        )
+        snapshot = next(
+            item
+            for item in host.snapshot()
+            if item.qualified_name == "web-test:broken"
+        )
         assert snapshot.failure_code == "factory_failed"
         response = client.get(
             "/api/status",

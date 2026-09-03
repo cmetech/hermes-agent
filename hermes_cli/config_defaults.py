@@ -2942,6 +2942,9 @@ DEFAULT_CONFIG = {
     # by message_agent for agents on other connections wait in an on-disk
     # outbox until the Desktop drains them.
     "bot_mode": {
+        # Handoff returns stay durable; when true, long-lived hosts may also
+        # wake the owning Bot Chat once (the automatic hop limit is fixed).
+        "handoff_return_wake": True,
         # Drain-time TTL (seconds): an envelope older than this is NOT
         # delivered when the Desktop finally drains the outbox — the sender
         # gets an error reply (reason 'queued_expired') instead, so a DM
