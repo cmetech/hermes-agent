@@ -51,6 +51,12 @@ BASH_SPILL_MAX_FILES = 64
 BASH_SPILL_MAX_VALUE_BYTES = 500_000
 WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES = 2_000_000
 BASH_SPILL_MAX_TOTAL_BYTES = WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
+LOOP_GROUP_MAX_EDGES = 4_096
+LOOP_GROUP_WORK_LIMIT = 4_096
+LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER = 1
+LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES = 2
+LOOP_GROUP_OTHER_DEFAULT_RETRIES = 0
+LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS = 3
 ASSIGNMENT_ENDPOINT_PATTERN = (
     r"^hermes://(?:local|peer/[a-z0-9][a-z0-9_-]{0,63})/"
     r"(?!hermes$|root$|sudo$|test$|tmp$)[a-z0-9][a-z0-9_-]{0,63}$"
@@ -92,7 +98,7 @@ CONTRACT_MAX_BYTES = 288_000
 CONTRACT_RESERVED_GROWTH_BYTES = 4_000
 CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
     "definition_schema": 160_000,
-    "node_kinds": 72_000,
+    "node_kinds": 70_000,
     "compatibility_codes": 19_000,
 })
 _NO_DEFAULT = object()
@@ -152,6 +158,43 @@ def parse_assignment_deadline(value: object) -> str:
     if not isinstance(value, str) or _ASSIGNMENT_DEADLINE.fullmatch(value) is None:
         raise ValueError("assignment deadline is outside the supported subset")
     return value
+
+
+def loop_group_node_work_factors(
+    node_type: str,
+    value: object,
+    options: Mapping[str, object],
+) -> tuple[object, object]:
+    """Return the per-node multiplier and selected retry count used by v6."""
+    multiplier = (
+        value.get(
+            "max_iterations",
+            LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
+        )
+        if node_type == "loop" and isinstance(value, Mapping)
+        else LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+    )
+    retry = options.get("retry")
+    approval_rework = (
+        value.get("on_reject")
+        if node_type == "approval" and isinstance(value, Mapping)
+        else None
+    )
+    if isinstance(approval_rework, Mapping):
+        retries = approval_rework.get(
+            "max_attempts",
+            LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
+        )
+    elif isinstance(retry, Mapping):
+        retries = retry.get(
+            "max_attempts",
+            LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+        )
+    elif node_type in {"command", "prompt"}:
+        retries = LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
+    else:
+        retries = LOOP_GROUP_OTHER_DEFAULT_RETRIES
+    return multiplier, retries
 
 
 @dataclass(frozen=True, slots=True)
@@ -3282,7 +3325,7 @@ def _phase6_scoped_semantic_descriptors(
             "min_nodes": body_schema["minItems"],
             "max_depth": 1,
             "max_nodes": body_schema["maxItems"],
-            "max_edges": 4_096,
+            "max_edges": LOOP_GROUP_MAX_EDGES,
             "min_iterations": iteration_schema["minimum"],
             "max_iterations": iteration_schema["maximum"],
             "primary_sink": "first-terminal-in-definition-order",
@@ -3291,32 +3334,85 @@ def _phase6_scoped_semantic_descriptors(
         {
             "id": "scoped-output-reference-v1",
             "current_scope": {
-                "producer_scope": "body-sibling",
+                "applies_to": ["nodes[].loop_group.nodes[]"],
                 "requires_direct_dependency": True,
             },
             "outer_scope": {
-                "producer_scope": "outer-node",
+                "applies_to": [
+                    "nodes[].loop_group.nodes[]",
+                    "nodes[].loop_group.until_bash",
+                    "nodes[].loop_group.gate_message",
+                ],
                 "requires_group_dependency": True,
             },
             "previous_iteration": {
-                "producer_scope": "body-node",
+                "applies_to": [
+                    "nodes[].loop_group.nodes[]",
+                    "nodes[].loop_group.until_bash",
+                ],
                 "prefix": "$LOOP_PREV.",
                 "requires_direct_dependency": False,
+            },
+            "group_until_bash": {
+                "field_path": ["loop_group", "until_bash"],
+                "current_scope": {"allows_all_body_nodes": True},
+                "visibility_validation_code": (
+                    "output_reference_not_declared_dependency"
+                ),
+                "structured_output_validation_code": "loop_group_scope_invalid",
             },
             "companion_node_paths": {
                 "format": "group/child",
                 "separator": "/",
-                "field_paths": [
-                    "sidecar.outward_action_nodes[]",
-                    "sidecar.assignments.*",
-                ],
+                "field_paths": ["sidecar.outward_action_nodes[]"],
             },
-            "validation_code": validation_codes["visibility"],
+            "validation_codes": {
+                "body_visibility": validation_codes["visibility"],
+                "group_control_visibility": (
+                    "output_reference_not_declared_dependency"
+                ),
+                "group_control_structured_output": validation_codes["visibility"],
+            },
         },
         {
             "id": "loop-group-work-product-v1",
-            "limit": 4_096,
-            "accumulators": ["executions", "attempts"],
+            "limit": LOOP_GROUP_WORK_LIMIT,
+            "accumulators": {
+                "executions": {
+                    "operator": "multiply",
+                    "operands": [
+                        {"reference": "group_iterations"},
+                        {
+                            "operator": "sum",
+                            "over": "body_nodes",
+                            "term": {"reference": "ordinary_loop_multiplier"},
+                        },
+                    ],
+                },
+                "attempts": {
+                    "operator": "multiply",
+                    "operands": [
+                        {"reference": "group_iterations"},
+                        {
+                            "operator": "sum",
+                            "over": "body_nodes",
+                            "term": {
+                                "operator": "multiply",
+                                "operands": [
+                                    {"reference": "ordinary_loop_multiplier"},
+                                    {
+                                        "operator": "add",
+                                        "operands": [
+                                            {"reference": "selected_retries"},
+                                            {"constant": 1},
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            },
             "group_iterations_path": ["loop_group", "max_iterations"],
             "ordinary_loop_multiplier_path": ["loop", "max_iterations"],
             "retry_max_attempts_path": ["retry", "max_attempts"],
@@ -3325,12 +3421,69 @@ def _phase6_scoped_semantic_descriptors(
                 "on_reject",
                 "max_attempts",
             ],
-            "ordinary_loop_default_multiplier": 1,
-            "command_prompt_default_retries": 2,
-            "other_default_retries": 0,
-            "approval_default_max_attempts": 3,
-            "attempt_multiplier": "retries-plus-initial-attempt",
-            "group_multiplier": "group-iterations",
+            "ordinary_loop_default_multiplier": (
+                LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+            ),
+            "command_prompt_default_retries": (
+                LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
+            ),
+            "other_default_retries": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+            "approval_default_max_attempts": (
+                LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS
+            ),
+            "ordinary_loop_multiplier": {
+                "strategy": "first-match",
+                "branches": [
+                    {
+                        "when": {"node_kind": "loop"},
+                        "value": {
+                            "field_path": ["loop", "max_iterations"],
+                            "default": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
+                        },
+                    },
+                    {
+                        "when": {"otherwise": True},
+                        "value": {
+                            "constant": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+                        },
+                    },
+                ],
+            },
+            "retry_selection": {
+                "strategy": "first-match",
+                "branches": [
+                    {
+                        "when": {
+                            "mapping_at": ["approval", "on_reject"],
+                        },
+                        "value": {
+                            "field_path": [
+                                "approval",
+                                "on_reject",
+                                "max_attempts",
+                            ],
+                            "default": LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
+                        },
+                    },
+                    {
+                        "when": {"mapping_at": ["retry"]},
+                        "value": {
+                            "field_path": ["retry", "max_attempts"],
+                            "default": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+                        },
+                    },
+                    {
+                        "when": {"node_kind_in": ["command", "prompt"]},
+                        "value": {
+                            "constant": LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
+                        },
+                    },
+                    {
+                        "when": {"otherwise": True},
+                        "value": {"constant": LOOP_GROUP_OTHER_DEFAULT_RETRIES},
+                    },
+                ],
+            },
             "validation_code": validation_codes["work_product"],
         },
     ]
@@ -3661,7 +3814,7 @@ def contract_documentation(
                 "parameters": {
                     "body_depth": 1,
                     "body_nodes": {"minimum": 1, "maximum": 512},
-                    "body_edges": {"maximum": 4_096},
+                    "body_edges": {"maximum": LOOP_GROUP_MAX_EDGES},
                     "max_iterations": {"minimum": 1, "maximum": 100},
                     "primary_sink": "first_terminal_in_definition_order",
                     "group_fields": sorted(LOOP_GROUP_FIELDS),

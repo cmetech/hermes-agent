@@ -44,6 +44,8 @@ from plugins.workflow.language_schema import (
     assignment_endpoint_is_valid,
     parse_assignment_deadline,
     EXECUTABLE_NODE_TYPES,
+    LOOP_GROUP_MAX_EDGES,
+    LOOP_GROUP_WORK_LIMIT,
     MAX_WORKFLOW_DOCUMENT_BYTES,
     NODE_TYPES,
     SOURCE_NODE_TYPES,
@@ -65,6 +67,7 @@ from plugins.workflow.language_schema import (
     iter_loop_previous_output_references,
     iter_output_references,
     loop_field_names,
+    loop_group_node_work_factors,
     loop_group_field_names,
     retry_field_names,
     sidecar_field_names,
@@ -753,9 +756,6 @@ def _loop_group_failure(
     return WorkflowValidationError(_issue(path, code, message, line=line))
 
 
-_LOOP_GROUP_WORK_LIMIT = 4096
-
-
 def _checked_work_product(left: int, right: int) -> int:
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value < 0
@@ -771,23 +771,11 @@ def _loop_group_work_bounds(
     executions = 0
     attempts = 0
     for node in nodes:
-        multiplier = (
-            node.value.get("max_iterations", 1)
-            if node.node_type == "loop" and isinstance(node.value, Mapping)
-            else 1
+        multiplier, retries = loop_group_node_work_factors(
+            node.node_type,
+            node.value,
+            node.options,
         )
-        retry = node.options.get("retry")
-        approval_rework = (
-            node.value.get("on_reject")
-            if node.node_type == "approval" and isinstance(node.value, Mapping)
-            else None
-        )
-        if isinstance(approval_rework, Mapping):
-            retries = approval_rework.get("max_attempts", 3)
-        elif isinstance(retry, Mapping):
-            retries = retry.get("max_attempts", 0)
-        else:
-            retries = 2 if node.node_type in {"command", "prompt"} else 0
         executions += multiplier
         attempts += multiplier * (int(retries) + 1)
     return (
@@ -817,7 +805,7 @@ def _loop_group_capacity_bounds(
     )
     execution_limits = RunExecutionLimits()
     journal_unit = TerminalJournalReserve.for_projection(
-        4096
+        LOOP_GROUP_WORK_LIMIT
     ).terminal_reserve_bytes
 
     provider_routes = 0
@@ -826,23 +814,18 @@ def _loop_group_capacity_bounds(
     artifact_executions = 0
     process_executions = 0
     for node in nodes:
-        multiplier = (
-            int(node.value.get("max_iterations", 1))
-            if node.node_type == "loop" and isinstance(node.value, Mapping)
-            else 1
+        raw_multiplier, raw_retries = loop_group_node_work_factors(
+            node.node_type,
+            node.value,
+            node.options,
         )
-        retry = node.options.get("retry")
+        multiplier = int(raw_multiplier)
         approval_rework = (
             node.value.get("on_reject")
             if node.node_type == "approval" and isinstance(node.value, Mapping)
             else None
         )
-        if isinstance(approval_rework, Mapping):
-            retries = int(approval_rework.get("max_attempts", 3))
-        elif isinstance(retry, Mapping):
-            retries = int(retry.get("max_attempts", 0))
-        else:
-            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        retries = int(raw_retries)
         executions = _checked_work_product(max_iterations, multiplier)
         attempts = _checked_work_product(executions, retries + 1)
         is_approval_rework = isinstance(approval_rework, Mapping)
@@ -1180,22 +1163,22 @@ def _normalize_loop_group(
             )
         by_id[child.id] = child
     edge_count = sum(len(set(child.depends_on)) for child in normalized)
-    if edge_count > 4096:
+    if edge_count > LOOP_GROUP_MAX_EDGES:
         raise _loop_group_failure(
             f"{group_path}.nodes",
             "loop_group_product_limit",
-            f"{group_path}.nodes exceeds the 4096-edge limit",
+            f"{group_path}.nodes exceeds the {LOOP_GROUP_MAX_EDGES}-edge limit",
         )
     child_executions, child_attempts = _loop_group_work_bounds(
         tuple(normalized), iterations
     )
-    if max(child_executions, child_attempts) > _LOOP_GROUP_WORK_LIMIT:
+    if max(child_executions, child_attempts) > LOOP_GROUP_WORK_LIMIT:
         raise _loop_group_failure(
             group_path,
             "loop_group_product_limit",
             f"loop_group {node.get('id')} work bound "
             f"{max(child_executions, child_attempts)} exceeds ceiling "
-            f"{_LOOP_GROUP_WORK_LIMIT}",
+            f"{LOOP_GROUP_WORK_LIMIT}",
         )
     for child in normalized:
         if any(dependency not in by_id for dependency in child.depends_on):

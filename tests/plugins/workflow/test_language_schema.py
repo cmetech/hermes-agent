@@ -192,21 +192,78 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     }
 
     references = rules["scoped-output-reference-v1"]
-    assert references["current_scope"]["requires_direct_dependency"] is True
-    assert references["outer_scope"]["requires_group_dependency"] is True
+    assert references["current_scope"] == {
+        "applies_to": ["nodes[].loop_group.nodes[]"],
+        "requires_direct_dependency": True,
+    }
+    assert references["outer_scope"] == {
+        "applies_to": [
+            "nodes[].loop_group.nodes[]",
+            "nodes[].loop_group.until_bash",
+            "nodes[].loop_group.gate_message",
+        ],
+        "requires_group_dependency": True,
+    }
     assert references["previous_iteration"]["prefix"] == "$LOOP_PREV."
+    assert references["previous_iteration"]["applies_to"] == [
+        "nodes[].loop_group.nodes[]",
+        "nodes[].loop_group.until_bash",
+    ]
+    assert references["group_until_bash"] == {
+        "field_path": ["loop_group", "until_bash"],
+        "current_scope": {"allows_all_body_nodes": True},
+        "visibility_validation_code": "output_reference_not_declared_dependency",
+        "structured_output_validation_code": "loop_group_scope_invalid",
+    }
     assert references["companion_node_paths"] == {
         "format": "group/child",
         "separator": "/",
-        "field_paths": [
-            "sidecar.outward_action_nodes[]",
-            "sidecar.assignments.*",
-        ],
+        "field_paths": ["sidecar.outward_action_nodes[]"],
+    }
+    assert references["validation_codes"] == {
+        "body_visibility": "loop_group_scope_invalid",
+        "group_control_visibility": "output_reference_not_declared_dependency",
+        "group_control_structured_output": "loop_group_scope_invalid",
     }
 
     work = rules["loop-group-work-product-v1"]
     assert work["limit"] == 4096
-    assert work["accumulators"] == ["executions", "attempts"]
+    assert work["accumulators"] == {
+        "executions": {
+            "operator": "multiply",
+            "operands": [
+                {"reference": "group_iterations"},
+                {
+                    "operator": "sum",
+                    "over": "body_nodes",
+                    "term": {"reference": "ordinary_loop_multiplier"},
+                },
+            ],
+        },
+        "attempts": {
+            "operator": "multiply",
+            "operands": [
+                {"reference": "group_iterations"},
+                {
+                    "operator": "sum",
+                    "over": "body_nodes",
+                    "term": {
+                        "operator": "multiply",
+                        "operands": [
+                            {"reference": "ordinary_loop_multiplier"},
+                            {
+                                "operator": "add",
+                                "operands": [
+                                    {"reference": "selected_retries"},
+                                    {"constant": 1},
+                                ],
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+    }
     assert work["group_iterations_path"] == ["loop_group", "max_iterations"]
     assert work["ordinary_loop_multiplier_path"] == ["loop", "max_iterations"]
     assert work["retry_max_attempts_path"] == ["retry", "max_attempts"]
@@ -219,6 +276,43 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     assert work["command_prompt_default_retries"] == 2
     assert work["other_default_retries"] == 0
     assert work["approval_default_max_attempts"] == 3
+    assert work["ordinary_loop_multiplier"] == {
+        "strategy": "first-match",
+        "branches": [
+            {
+                "when": {"node_kind": "loop"},
+                "value": {
+                    "field_path": ["loop", "max_iterations"],
+                    "default": 1,
+                },
+            },
+            {"when": {"otherwise": True}, "value": {"constant": 1}},
+        ],
+    }
+    assert work["retry_selection"] == {
+        "strategy": "first-match",
+        "branches": [
+            {
+                "when": {"mapping_at": ["approval", "on_reject"]},
+                "value": {
+                    "field_path": ["approval", "on_reject", "max_attempts"],
+                    "default": 3,
+                },
+            },
+            {
+                "when": {"mapping_at": ["retry"]},
+                "value": {
+                    "field_path": ["retry", "max_attempts"],
+                    "default": 0,
+                },
+            },
+            {
+                "when": {"node_kind_in": ["command", "prompt"]},
+                "value": {"constant": 2},
+            },
+            {"when": {"otherwise": True}, "value": {"constant": 0}},
+        ],
+    }
     assert json.loads(json.dumps(rules, sort_keys=True)) == rules
 
 
@@ -788,7 +882,7 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
         "reserved_growth_bytes": 4_000,
         "section_max_bytes": {
             "definition_schema": 160_000,
-            "node_kinds": 72_000,
+            "node_kinds": 70_000,
             "compatibility_codes": 19_000,
         },
     }

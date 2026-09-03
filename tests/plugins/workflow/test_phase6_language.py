@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 import plugins.workflow.language as workflow_language
+import plugins.workflow.language_schema as language_schema
 from plugins.workflow.language import supports_phase6_semantics
 from plugins.workflow.language import (
     make_language_snapshot,
@@ -20,7 +21,6 @@ from plugins.workflow.models import (
     WorkflowValidationError,
 )
 from plugins.workflow.schema import (
-    _LOOP_GROUP_WORK_LIMIT,
     _compile_workflow_source_document,
     load_workflow,
     load_workflow_snapshot,
@@ -543,7 +543,12 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
 ):
     body = [
         {"id": "command", "command": "run"},
-        {"id": "bash", "bash": "true"},
+        {
+            "id": "prompt",
+            "prompt": "run",
+            "retry": {"max_attempts": 4},
+        },
+        {"id": "bash", "bash": "true", "retry": {"max_attempts": 3}},
         {
             "id": "loop",
             "loop": {
@@ -559,6 +564,14 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
                 "on_reject": {"prompt": "Revise"},
             },
         },
+        {
+            "id": "approval-explicit",
+            "approval": {
+                "message": "Continue?",
+                "on_reject": {"prompt": "Revise", "max_attempts": 5},
+            },
+        },
+        {"id": "cancel", "cancel": "stop"},
     ]
     path = workflow_writer(
         tmp_path,
@@ -576,15 +589,24 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
         for rule in contract["semantic_rules"]
         if rule.get("kind") == "loop-group-work-product-v1"
     )
+    topology = next(
+        rule
+        for rule in contract["semantic_rules"]
+        if rule.get("kind") == "scoped-dag-topology-v1"
+    )
 
-    assert work["accumulators"] == ["executions", "attempts"]
-    assert work["limit"] == _LOOP_GROUP_WORK_LIMIT
-    assert semantics["child_executions"] == 2 * (1 + 1 + 4 + 1)
+    assert set(work["accumulators"]) == {"executions", "attempts"}
+    assert work["limit"] == language_schema.LOOP_GROUP_WORK_LIMIT
+    assert topology["max_edges"] == language_schema.LOOP_GROUP_MAX_EDGES
+    assert semantics["child_executions"] == 2 * (1 + 1 + 1 + 4 + 1 + 1 + 1)
     assert semantics["child_attempts"] == 2 * (
         (1 * (work["command_prompt_default_retries"] + 1))
-        + (1 * (work["other_default_retries"] + 1))
+        + (1 * (4 + 1))
+        + (1 * (3 + 1))
         + (4 * (work["other_default_retries"] + 1))
         + (1 * (work["approval_default_max_attempts"] + 1))
+        + (1 * (5 + 1))
+        + (1 * (work["other_default_retries"] + 1))
     )
 
 
