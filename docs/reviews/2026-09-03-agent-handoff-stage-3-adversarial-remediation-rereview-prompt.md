@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `db5da1c2ab6251d02e5d56dac1ea88816787e50e`
-- Remediated tree: `12a694a88a95ad3ad9efea440db6b8961077e940`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..db5da1c2ab6251d02e5d56dac1ea88816787e50e`
-- Range commits: 25
+- Remediated candidate: `c8ed1474fde94b83929ab420b98ec7f9326d37ad`
+- Remediated tree: `212a311c7e3f2ebc51828f4e1480792168ca5463`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..c8ed1474fde94b83929ab420b98ec7f9326d37ad`
+- Range commits: 27
 - Range paths: 16
-- Range diff: `+1859/-57`; 663 inserted lines are review prompts, not
+- Range diff: `+2046/-69`; 672 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -78,7 +78,13 @@ for durable transcript reconciliation and normal keyed retry. A final
 controller regression proved that this restart-only release left the temporary
 identity which the new process had just installed, suppressing that process's
 later retry. The current candidate removes the temporary identity before the
-restart reconciliation return.
+restart reconciliation return. An independent pass also proved that a full
+32-event busy FIFO logged and dropped a handoff return while still reporting
+adapter acceptance, leaving a receipt reservation whose receipt could never
+appear. The current candidate makes FIFO admission observable to the handoff
+producer. Capacity rejection releases the reservation and process identity,
+restores the claim attempt, records bounded backpressure, and retries after
+capacity is available; it does not weaken the queue cap.
 
 Prove or falsify all of the following:
 
@@ -98,6 +104,9 @@ Prove or falsify all of the following:
   consuming an attempt;
 - true process restart releases both the receipt reservation and the temporary
   identity installed by the recovering process, permitting its later retry;
+- a full busy FIFO reports backpressure rather than adapter acceptance, consumes
+  no delivery attempt, and permits the current or a newer superseding return to
+  run exactly once after capacity is available;
 - an abandoned reserved dispatch reconciles through transcript receipt and
   restart/lease recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
@@ -153,6 +162,9 @@ restart has no matching in-memory identity, so it releases and reconciles the
 stale receipt reservation before retry instead of trusting vanished process
 state. That restart-only path also removes the temporary identity installed by
 the new process before returning, so it cannot suppress its own later retry.
+The internal FIFO now also reports capacity rejection across the adapter
+boundary. That path clears the durable reservation without consuming an
+attempt; only actual FIFO admission enters receipt-pending reconciliation.
 
 Prove or falsify all of the following:
 
@@ -165,6 +177,8 @@ Prove or falsify all of the following:
   process cannot cause reinjection or clear the accepted dispatch reservation;
 - a true process restart can release the stale reservation and subsequently
   retry in the same new gateway process without self-suppression;
+- a full busy FIFO cannot masquerade as acceptance, retain an impossible
+  receipt reservation, exhaust attempts, or block a newer terminal return;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
