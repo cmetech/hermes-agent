@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `7c02e8af587e594fe36d4ecb7072b1b1dcb1fc3a`
-- Remediated tree: `9a0c8c2320d567a625f62f7384b818fa35baceb3`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..7c02e8af587e594fe36d4ecb7072b1b1dcb1fc3a`
-- Range commits: 6
-- Range paths: 7
-- Range diff: `+602/-4`; 540 inserted lines are review prompts, not
+- Remediated candidate: `fcbe98ad8702026711a78815205ceca6e7883b36`
+- Remediated tree: `5891c227fbee0599ba4c1d510537f874668722d5`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..fcbe98ad8702026711a78815205ceca6e7883b36`
+- Range commits: 9
+- Range paths: 12
+- Range diff: `+770/-13`; 540 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -78,6 +78,50 @@ Prove or falsify all of the following:
 - Bot and Desktop callers map the closed resolver error without leaking raw
   YAML, paths, credentials, or peer URLs.
 
+### HOFF-G01 — accepted gateway return could be republished before persistence
+
+The original candidate removed a delivery identity from the in-process guard
+after the adapter accepted it but before the synthetic turn was visible in the
+session transcript. A second queue/restart-scan publication could therefore
+inject the same delivery again. The remediation retains the identity in the
+bounded in-process guard during this pending-persistence interval, while
+releasing the durable claim for later receipt reconciliation.
+
+Prove or falsify all of the following:
+
+- an adapter-accepted delivery absent from the transcript cannot be injected a
+  second time in the same gateway process;
+- once the delivery ID is visible in the persisted transcript, replay completes
+  and acknowledges durable delivery without another model turn;
+- adapter rejection, exceptions before acceptance, stale claims, gateway
+  shutdown, and ordinary successful persistence do not leak the in-process
+  identity or permanently suppress retry;
+- process restart still relies on the durable claim/transcript receipt rather
+  than in-memory state; and
+- the bounded delivered-ID retention and session/profile ownership checks stay
+  intact.
+
+### HOFF-P01 — legacy peer DM stopped preserving ambient transport handlers
+
+The original candidate reused the Workflow Runs client for legacy peer-DM
+session lookup and chat, which forced the Workflow-only proxy-free opener.
+Stage 2 explicitly keeps the peer CLI's installed proxy, cookie, TLS, and
+instrumentation policy while requiring Workflow handoffs to bypass proxies.
+The remediation gives the Runs client a closed opt-in used only by legacy peer
+CLI calls; handoff clients remain proxy-free by default.
+
+Prove or falsify all of the following:
+
+- `hermes peer dm` session lookup/create and chat preserve the installed opener
+  policy and still strip credentials on unsafe redirects;
+- legacy peer run session lookup preserves the same policy as its other CLI
+  requests;
+- local and peer Workflow/Bot controlled handoffs still bypass ambient proxies;
+- the peer CLI keeps its legacy environment credential fallback while handoff
+  resolution remains profile-scoped and isolated; and
+- timeout, response bounds, validation, hidden Bot Chat compatibility, and
+  profile-specific routes remain unchanged.
+
 ## Binding clarification for the disputed model-contract report
 
 The original shared prompt over-constrained invariant 1. The accepted Stage 3
@@ -91,6 +135,16 @@ The live production constructors in `tools/bot_mode_dm.py` and
 closed host-derived Bot/operator route. Report a defect only if a realistic
 production caller can violate that accepted consumer boundary; do not promote
 the prompt's stronger wording over the accepted plan.
+
+## Binding clarification for the Windows compatibility report
+
+Native Windows locking for the local CLI compatibility transport is explicitly
+deferred to Stage 5. Stage 3 intentionally retains the Stage 1 POSIX-only
+destination lock and fails closed with `local_cli_lock_unavailable` when that
+lock cannot be provided. Do not recommend an unlocked Windows send or expand
+this review into the deferred lock implementation. Report a defect only if the
+candidate regresses an already-supported platform or bypasses the fail-closed
+boundary.
 
 ## Required verification
 
@@ -110,6 +164,10 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
   tests/hermes_cli/handoff/test_supervisor.py \
   tests/hermes_cli/handoff/test_bot_conversation_e2e.py \
   tests/hermes_cli/handoff/test_bot_return_recovery_e2e.py \
+  tests/hermes_cli/handoff/test_runs_client.py \
+  tests/hermes_cli/handoff/test_peer.py \
+  tests/hermes_cli/test_peer_cmd.py \
+  tests/hermes_cli/test_peers.py \
   tests/gateway/test_completion_delivery.py \
   tests/tui_gateway/test_agent_handoff_methods.py \
   tests/test_tui_gateway_queue_on_busy.py \
