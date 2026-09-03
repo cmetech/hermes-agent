@@ -29243,7 +29243,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            discarded = adapter.get_pending_message(session_key)
+            if discarded is not None:
+                self._abandon_queued_handoff_return(discarded)
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:

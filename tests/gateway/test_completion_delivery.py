@@ -815,6 +815,62 @@ def test_external_event_cannot_release_a_handoff_dispatch():
     assert GatewayRunner._queued_handoff_delivery_id(external) == ""
 
 
+@pytest.mark.asyncio
+async def test_busy_stop_releases_discarded_handoff_return(tmp_path):
+    store, event = _handoff_event(
+        tmp_path,
+        phase="needs_input",
+        session_key="agent:main:telegram:dm:12345",
+    )
+    adapter = _BusyAdapter()
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    runner = _runner(adapter)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._is_user_authorized = lambda _source: True
+    runner._effective_busy_input_mode = lambda _source: "queue"
+    runner._draining = False
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        has_platform_message_id=AsyncMock(return_value=False),
+    )
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = event["session_key"]
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._heal_stale_session_lock = lambda _session_key: None
+
+    assert await runner._deliver_completion_notification(None, event) is False
+    assert store.get_delivery(event["delivery_id"]).failure_code == (
+        "delivery_receipt_pending"
+    )
+
+    source = adapter._pending_messages[session_key].source
+    runner._peek_session_state = lambda _session_key: None
+    runner._invalidate_session_run_generation = lambda *_args, **_kwargs: 1
+    runner._thread_metadata_for_source = lambda _source: {}
+    runner._release_running_agent_state = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    adapter.interrupt_session_activity = AsyncMock()
+
+    await runner._busy_stop_command(
+        MessageEvent(text="/stop", message_type=MessageType.TEXT, source=source),
+        session_key,
+        source,
+    )
+
+    assert store.get_delivery(event["delivery_id"]).failure_code == (
+        "delivery_retryable"
+    )
+    assert (
+        runner._completion_delivery_identity(event)
+        not in runner._completion_deliveries_inflight
+    )
+    store.close()
+
+
 def test_gateway_handoff_return_waits_for_queued_turn_receipt(tmp_path):
     store, event, advance = _handoff_event(
         tmp_path, phase="needs_input", return_advance=True
