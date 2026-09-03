@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `c8ed1474fde94b83929ab420b98ec7f9326d37ad`
-- Remediated tree: `212a311c7e3f2ebc51828f4e1480792168ca5463`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..c8ed1474fde94b83929ab420b98ec7f9326d37ad`
-- Range commits: 27
-- Range paths: 16
-- Range diff: `+2046/-69`; 672 inserted lines are review prompts, not
+- Remediated candidate: `ff05217f576411946777b82b71600caa4d0437f1`
+- Remediated tree: `e9eeaba5fa9760e7f9590dbdeb4b497fddb8b576`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..ff05217f576411946777b82b71600caa4d0437f1`
+- Range commits: 29
+- Range paths: 18
+- Range diff: `+2112/-71`; 686 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -84,7 +84,13 @@ adapter acceptance, leaving a receipt reservation whose receipt could never
 appear. The current candidate makes FIFO admission observable to the handoff
 producer. Capacity rejection releases the reservation and process identity,
 restores the claim attempt, records bounded backpressure, and retries after
-capacity is available; it does not weaken the queue cap.
+capacity is available; it does not weaken the queue cap. The next independent
+pass proved that the bundled Raft adapter's wake-specific `handle_message()`
+override bypassed the shared busy-session handler for these synthetic returns,
+overwriting an older pending return while still reporting acceptance. The
+current candidate delegates non-control internal events to the base adapter so
+the same runner-owned FIFO and backpressure contract applies; ordinary Raft
+wake hints retain their existing shortcut.
 
 Prove or falsify all of the following:
 
@@ -107,6 +113,8 @@ Prove or falsify all of the following:
 - a full busy FIFO reports backpressure rather than adapter acceptance, consumes
   no delivery attempt, and permits the current or a newer superseding return to
   run exactly once after capacity is available;
+- the bundled Raft adapter cannot bypass that FIFO/backpressure boundary or
+  overwrite an older queued handoff return;
 - an abandoned reserved dispatch reconciles through transcript receipt and
   restart/lease recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
@@ -164,7 +172,9 @@ state. That restart-only path also removes the temporary identity installed by
 the new process before returning, so it cannot suppress its own later retry.
 The internal FIFO now also reports capacity rejection across the adapter
 boundary. That path clears the durable reservation without consuming an
-attempt; only actual FIFO admission enters receipt-pending reconciliation.
+attempt; only actual FIFO admission enters receipt-pending reconciliation. The
+bundled Raft adapter now forwards non-control internal returns through this
+base-adapter boundary instead of applying its wake-only pending-slot shortcut.
 
 Prove or falsify all of the following:
 
@@ -179,6 +189,8 @@ Prove or falsify all of the following:
   retry in the same new gateway process without self-suppression;
 - a full busy FIFO cannot masquerade as acceptance, retain an impossible
   receipt reservation, exhaust attempts, or block a newer terminal return;
+- a bundled adapter override cannot replace a queued return or skip the shared
+  backpressure signal while reporting acceptance;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
