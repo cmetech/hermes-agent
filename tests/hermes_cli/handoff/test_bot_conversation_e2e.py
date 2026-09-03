@@ -27,6 +27,7 @@ class _BotCaller:
         self._session_title_hint = None
         self._bot_mode_protocol = True
         self._gateway_session_key = "agent:default:telegram:dm:42"
+        self._handoff_return_host_kind = "gateway"
         self._current_turn_id = "turn-1"
         self.session_id = "bot-session-1"
 
@@ -158,6 +159,7 @@ async def test_canonical_bot_handoff_uses_real_profile_runs_and_stable_admission
         )
         assert completed.spec.return_route == {
             "kind": "bot",
+            "host_kind": "gateway",
             "profile": "default",
             "session_id": "bot-session-1",
             "session_key": "agent:default:telegram:dm:42",

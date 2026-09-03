@@ -35,7 +35,7 @@ class _FakeStore:
             )
         return tuple(matching[start : start + limit])
 
-    def due_deliveries(self, *, now, limit):
+    def due_deliveries(self, *, now, limit, host_kind=None):
         return ()
 
     def close(self):
@@ -60,7 +60,9 @@ def _snapshot(name: str):
     )
 
 
-def _conversation_store(path, *, profile="default", hop_count=0, text="done"):
+def _conversation_store(
+    path, *, profile="default", host_kind="gateway", hop_count=0, text="done"
+):
     store = HandoffStore(path)
     spec = HandoffSpec(
         mode="conversation",
@@ -72,6 +74,7 @@ def _conversation_store(path, *, profile="default", hop_count=0, text="done"):
         required_capabilities=frozenset(),
         return_route={
             "kind": "bot",
+            "host_kind": host_kind,
             "profile": profile,
             "session_id": "session-1",
             "session_key": f"agent:{profile}:telegram:dm:42",
@@ -255,6 +258,7 @@ def test_delivery_is_claimed_before_bounded_event_publication(tmp_path):
     event = events.get_nowait()
     assert event == {
         "type": "handoff_return",
+        "host_kind": "gateway",
         "delivery_id": delivery.delivery_id,
         "handoff_id": handoff_id,
         "event_sequence": delivery.event_sequence,
@@ -279,6 +283,40 @@ def test_delivery_is_claimed_before_bounded_event_publication(tmp_path):
     assert secret not in json.dumps(event)
     assert len(json.dumps(event).encode()) < 4096
     assert supervisor.health().message == ""
+    store.close()
+
+
+def test_only_the_initiating_host_claims_a_durable_return(tmp_path):
+    store, _handoff_id, delivery = _conversation_store(
+        tmp_path / "handoffs.db", host_kind="web"
+    )
+    service = SimpleNamespace(store=store, advance=lambda *_args, **_kwargs: None)
+    gateway_events = queue.Queue()
+    gateway = AgentHandoffSupervisor(
+        [("default", tmp_path)],
+        owner="gateway-host",
+        host_kind="gateway",
+        completion_queue=gateway_events,
+        service_factory=lambda _home: service,
+    )
+
+    gateway.tick()
+
+    assert gateway_events.empty()
+    assert store.get_delivery(delivery.delivery_id).attempts == 0
+
+    web_events = queue.Queue()
+    web = AgentHandoffSupervisor(
+        [("default", tmp_path)],
+        owner="web-host",
+        host_kind="web",
+        completion_queue=web_events,
+        service_factory=lambda _home: service,
+    )
+    web.tick()
+
+    assert web_events.get_nowait()["delivery_id"] == delivery.delivery_id
+    assert store.get_delivery(delivery.delivery_id).attempts == 1
     store.close()
 
 
@@ -410,6 +448,7 @@ def test_failed_delivery_claims_are_still_bounded_per_tick(tmp_path, monkeypatch
                     event_sequence=index,
                     route={
                         "kind": "bot",
+                        "host_kind": "gateway",
                         "profile": profile,
                         "session_id": "session-1",
                         "tool_call_id": "call-1",
@@ -419,7 +458,8 @@ def test_failed_delivery_claims_are_still_bounded_per_tick(tmp_path, monkeypatch
                 for index in range(3)
             ]
 
-        def due_deliveries(self, *, now, limit):
+        def due_deliveries(self, *, now, limit, host_kind=None):
+            assert host_kind == "gateway"
             return tuple(self.deliveries[:limit])
 
         def claim_delivery(self, delivery_id, owner, *, now, lease_seconds):

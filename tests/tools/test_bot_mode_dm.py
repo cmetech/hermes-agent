@@ -70,6 +70,7 @@ class _FakeAgent:
         self.tools: list = []
         self.valid_tool_names: set = set()
         self._gateway_session_key = "agent:default:telegram:dm:42"
+        self._handoff_return_host_kind = "gateway"
         self._current_turn_id = "turn-1"
 
 
@@ -335,6 +336,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert '$(and this is not shell)' in spec.prompt
     assert spec.return_route == {
         "kind": "bot",
+        "host_kind": "gateway",
         "profile": "default",
         "session_id": "sess-1",
         "session_key": "agent:default:telegram:dm:42",
@@ -465,6 +467,7 @@ def test_handoff_follow_up_verifies_owner_target_and_uses_tool_call_id(
     agent = _FakeAgent(home)
     route = {
         "kind": "bot",
+        "host_kind": "gateway",
         "profile": "default",
         "session_id": "sess-1",
         "session_key": "agent:default:telegram:dm:42",
@@ -520,6 +523,7 @@ def test_exact_pending_approval_choice_becomes_correlated_response(
             endpoint=SimpleNamespace(canonical="hermes://local/researcher"),
             return_route={
                 "kind": "bot",
+                "host_kind": "gateway",
                 "profile": "default",
                 "session_id": "sess-1",
                 "session_key": "agent:default:telegram:dm:42",
@@ -599,7 +603,10 @@ def test_unsafe_canonical_target_error_does_not_echo_authority(tmp_path):
     assert "secret" not in result
 
 
-@pytest.mark.parametrize("change", ["profile", "session_id", "session_key", "target", "terminal"])
+@pytest.mark.parametrize(
+    "change",
+    ["host_kind", "profile", "session_id", "session_key", "target", "terminal"],
+)
 def test_handoff_follow_up_rejects_foreign_or_terminal_rows(
     tmp_path, monkeypatch, change
 ):
@@ -607,6 +614,7 @@ def test_handoff_follow_up_rejects_foreign_or_terminal_rows(
     agent = _FakeAgent(home)
     route = {
         "kind": "bot",
+        "host_kind": "gateway",
         "profile": "default",
         "session_id": "sess-1",
         "session_key": "agent:default:telegram:dm:42",

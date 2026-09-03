@@ -13228,6 +13228,7 @@ def _run_prompt_submit(
             from tools.async_delegation import handoff_return_context
 
             agent._gateway_session_key = session.get("session_key") or ""
+            agent._handoff_return_host_kind = "web"
             try:
                 with handoff_return_context(agent, handoff_return_hop_count):
                     result = agent.run_conversation(run_message, **run_kwargs)

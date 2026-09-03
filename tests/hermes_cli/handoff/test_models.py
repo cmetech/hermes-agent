@@ -33,6 +33,7 @@ def _spec(**changes: object) -> HandoffSpec:
 def _bot_route(**changes: object) -> dict[str, object]:
     route: dict[str, object] = {
         "kind": "bot",
+        "host_kind": "gateway",
         "profile": "default",
         "session_id": "20260902_120000_abc123",
         "session_key": "agent:default:telegram:dm:42",
@@ -196,6 +197,7 @@ def test_conversation_spec_accepts_closed_bot_and_operator_return_routes():
     [
         {"output_schema": {"type": "string"}},
         {"return_route": _bot_route(kind="workflow")},
+        {"return_route": _bot_route(host_kind="desktop")},
         {"return_route": _bot_route(profile="Default")},
         {"return_route": _bot_route(session_id="https://unsafe.test")},
         {"return_route": _bot_route(session_key="/Users/example/.hermes")},
@@ -234,6 +236,7 @@ def test_conversation_fingerprint_includes_normalized_return_route():
             "session_key": "agent:default:telegram:dm:42",
             "session_id": "20260902_120000_abc123",
             "profile": "default",
+            "host_kind": "gateway",
             "kind": "bot",
         }
     )

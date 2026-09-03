@@ -262,6 +262,7 @@ async def test_remote_bot_conversation_uses_authenticated_profile_bot_chat(
             required_capabilities=frozenset({"cancellation", "follow_up"}),
             return_route={
                 "kind": "bot",
+                "host_kind": "gateway",
                 "profile": "default",
                 "session_id": "bot-session-1",
                 "session_key": "agent:default:telegram:dm:42",

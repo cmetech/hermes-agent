@@ -99,6 +99,7 @@ def _normalize_return_route(
     if kind == "bot":
         required = {
             "kind",
+            "host_kind",
             "profile",
             "session_id",
             "tool_call_id",
@@ -107,6 +108,8 @@ def _normalize_return_route(
         }
         keys = set(value)
         if keys not in (required, required | {"session_key"}):
+            raise ValueError("handoff return route is invalid")
+        if value.get("host_kind") not in {"gateway", "web"}:
             raise ValueError("handoff return route is invalid")
         session_key = value.get("session_key")
         if session_key is not None and (

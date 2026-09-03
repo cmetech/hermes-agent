@@ -45,6 +45,7 @@ def _conversation_spec() -> HandoffSpec:
         required_capabilities=frozenset({"follow_up"}),
         return_route={
             "kind": "bot",
+            "host_kind": "gateway",
             "profile": "default",
             "session_id": "20260902_120000_abc123",
             "session_key": "agent:default:telegram:dm:42",

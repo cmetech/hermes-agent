@@ -1300,7 +1300,7 @@ class HandoffStore:
             ).fetchone() is not None
 
     def due_deliveries(
-        self, *, now: datetime, limit: int
+        self, *, now: datetime, limit: int, host_kind: str | None = None
     ) -> tuple[DeliveryRecord, ...]:
         now = _aware_utc(now, "delivery due time")
         if (
@@ -1309,17 +1309,22 @@ class HandoffStore:
             or not 1 <= limit <= 200
         ):
             raise ValueError("handoff delivery limit must be between 1 and 200")
+        if host_kind is not None and host_kind not in {"gateway", "web"}:
+            raise ValueError("handoff delivery host kind is invalid")
         stamp = _timestamp(now)
         with self._lock:
-            rows = self._conn.execute(
-                """SELECT * FROM handoff_deliveries
+            query = """SELECT * FROM handoff_deliveries
                    WHERE method='wake' AND state='pending'
                      AND acknowledged_at IS NULL
                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-                     AND (lease_owner IS NULL OR lease_expires_at<=?)
-                   ORDER BY next_attempt_at, created_at, delivery_id LIMIT ?""",
-                (stamp, stamp, limit),
-            ).fetchall()
+                     AND (lease_owner IS NULL OR lease_expires_at<=?)"""
+            params: list[object] = [stamp, stamp]
+            if host_kind is not None:
+                query += " AND json_extract(route_json, '$.host_kind')=?"
+                params.append(host_kind)
+            query += " ORDER BY next_attempt_at, created_at, delivery_id LIMIT ?"
+            params.append(limit)
+            rows = self._conn.execute(query, params).fetchall()
             return tuple(self._delivery(row) for row in rows)
 
     def claim_delivery(

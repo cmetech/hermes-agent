@@ -6998,6 +6998,7 @@ class TurnRunner:
             from tools.async_delegation import handoff_return_context
 
             agent._gateway_session_key = ctx.session_key or ""
+            agent._handoff_return_host_kind = "gateway"
             with handoff_return_context(agent, _return_hop):
                 result = agent.run_conversation(
                     _api_run_message, **_conversation_kwargs

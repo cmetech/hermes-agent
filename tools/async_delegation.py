@@ -496,7 +496,9 @@ class _HandoffReturnClaim:
     key: tuple[str, str, str, int]
 
 
-def _claim_handoff_return(evt: Dict[str, Any]) -> Optional[_HandoffReturnClaim]:
+def _claim_handoff_return(
+    evt: Dict[str, Any], consumer: str
+) -> Optional[_HandoffReturnClaim]:
     """Open and validate the supervisor's profile-local delivery lease."""
     store = None
     try:
@@ -509,11 +511,16 @@ def _claim_handoff_return(evt: Dict[str, Any]) -> Optional[_HandoffReturnClaim]:
         hop_count = evt.get("hop_count")
         event_sequence = evt.get("event_sequence")
         event_keys = {
-            "type", "delivery_id", "handoff_id", "event_sequence", "profile",
-            "session_id", "tool_call_id", "hop_count", "delivery_claim",
+            "type", "host_kind", "delivery_id", "handoff_id", "event_sequence",
+            "profile", "session_id", "tool_call_id", "hop_count",
+            "delivery_claim",
         }
+        consumer_host = "gateway" if consumer.startswith("gateway") else (
+            "web" if consumer.startswith("tui") else ""
+        )
         if (
             not profile
+            or evt.get("host_kind") != consumer_host
             or not isinstance(claim, dict)
             or set(claim) != {"owner", "epoch", "expires_at"}
             or frozenset(evt) not in {
@@ -554,6 +561,7 @@ def _claim_handoff_return(evt: Dict[str, Any]) -> Optional[_HandoffReturnClaim]:
         snapshot = store.get(str(evt.get("handoff_id") or ""))
         route = delivery.route
         expected = {
+            "host_kind": consumer_host,
             "profile": profile,
             "session_id": str(evt.get("session_id") or ""),
             "tool_call_id": str(evt.get("tool_call_id") or ""),
@@ -612,7 +620,7 @@ def handoff_return_context(agent: object, hop_count: Optional[int]):
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[Any]:
     """Claim a durable completion event; ordinary events need no token."""
     if evt.get("type") == "handoff_return":
-        return _claim_handoff_return(evt)
+        return _claim_handoff_return(evt, consumer)
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")

@@ -492,6 +492,7 @@ def _handoff_delivery(
     assert endpoint is not None
     session_id = str(getattr(agent, "session_id", "") or "")
     session_key = str(getattr(agent, "_gateway_session_key", "") or "")
+    host_kind = str(getattr(agent, "_handoff_return_host_kind", "") or "")
     operation_id = _operation_id(agent, tool_call_id, endpoint.canonical)
     initiator = f"bot/{profile}/{session_id}"
     actor = "bot"
@@ -508,6 +509,7 @@ def _handoff_delivery(
                 or snapshot.spec.endpoint.canonical != endpoint.canonical
                 or not isinstance(route, Mapping)
                 or route.get("kind") != "bot"
+                or route.get("host_kind") != host_kind
                 or route.get("profile") != profile
                 or route.get("session_id") != session_id
                 or (
@@ -549,6 +551,7 @@ def _handoff_delivery(
 
             route = {
                 "kind": "bot",
+                "host_kind": host_kind,
                 "profile": profile,
                 "session_id": session_id,
                 "tool_call_id": operation_id,

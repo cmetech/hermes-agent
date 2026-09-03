@@ -39,6 +39,7 @@ def _finish_conversation(home, *, policy: str = "wake", hop_count: int = 0):
         required_capabilities=frozenset(),
         return_route={
             "kind": "bot",
+            "host_kind": "gateway",
             "profile": "default",
             "session_id": "bot-session-1",
             "session_key": "agent:default:telegram:dm:42",
@@ -206,6 +207,7 @@ def test_cancellation_race_emits_one_authoritative_return(_profile_home):
         required_capabilities=frozenset(),
         return_route={
             "kind": "bot",
+            "host_kind": "gateway",
             "profile": "default",
             "session_id": "bot-session-1",
             "tool_call_id": "call-race",

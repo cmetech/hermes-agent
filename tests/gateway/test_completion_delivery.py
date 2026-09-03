@@ -92,7 +92,9 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
-def _handoff_event(home, *, text="done", phase="succeeded"):
+def _handoff_event(
+    home, *, text="done", phase="succeeded", host_kind="gateway"
+):
     store = HandoffStore(home / "handoffs.db")
     spec = HandoffSpec(
         mode="conversation",
@@ -104,6 +106,7 @@ def _handoff_event(home, *, text="done", phase="succeeded"):
         required_capabilities=frozenset(),
         return_route={
             "kind": "bot",
+            "host_kind": host_kind,
             "profile": "default",
             "session_id": "session-1",
             "session_key": "agent:main:telegram:dm:12345:678",
@@ -163,6 +166,7 @@ def _handoff_event(home, *, text="done", phase="succeeded"):
     assert lease is not None
     return store, {
         "type": "handoff_return",
+        "host_kind": host_kind,
         "delivery_id": delivery.delivery_id,
         "handoff_id": snapshot.handoff_id,
         "event_sequence": delivery.event_sequence,
@@ -228,6 +232,18 @@ def test_handoff_return_duplicate_queue_event_has_one_live_consumer(tmp_path):
 
     assert claim
     assert claim_event_delivery(dict(event), "gateway-2") is None
+    release_event_delivery(event, claim)
+    store.close()
+
+
+def test_handoff_return_can_only_be_claimed_by_its_surface_host(tmp_path):
+    from tools.async_delegation import claim_event_delivery, release_event_delivery
+
+    store, event = _handoff_event(tmp_path, host_kind="web")
+
+    assert claim_event_delivery(event, "gateway") is None
+    claim = claim_event_delivery(event, "tui-poller")
+    assert claim is not None
     release_event_delivery(event, claim)
     store.close()
 

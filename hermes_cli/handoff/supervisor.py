@@ -127,10 +127,14 @@ class AgentHandoffSupervisor:
         profile_homes: Iterable[tuple[str, Path | str]],
         *,
         owner: str,
+        host_kind: str = "gateway",
         completion_queue,
         service_factory: Callable[[Path], object] = _default_service,
     ) -> None:
+        if host_kind not in {"gateway", "web"}:
+            raise ValueError("handoff supervisor host kind is invalid")
         self._owner = f"{owner}-handoff"[:255]
+        self._host_kind = host_kind
         self._queue = completion_queue
         self._profiles = tuple(
             _ProfileRuntime(profile, home, service_factory(home))
@@ -219,6 +223,7 @@ class AgentHandoffSupervisor:
         if (
             not isinstance(route, Mapping)
             or route.get("kind") != "bot"
+            or route.get("host_kind") != self._host_kind
             or route.get("profile") != runtime.profile
         ):
             runtime.service.store.fail_delivery(
@@ -232,6 +237,7 @@ class AgentHandoffSupervisor:
             return None
         event = {
             "type": "handoff_return",
+            "host_kind": self._host_kind,
             "delivery_id": delivery.delivery_id,
             "handoff_id": delivery.handoff_id,
             "event_sequence": delivery.event_sequence,
@@ -251,7 +257,13 @@ class AgentHandoffSupervisor:
 
     def _publish(self, profiles: tuple[_ProfileRuntime, ...], now: datetime) -> int:
         due = [
-            list(runtime.service.store.due_deliveries(now=now, limit=_DELIVERY_BATCH))
+            list(
+                runtime.service.store.due_deliveries(
+                    now=now,
+                    limit=_DELIVERY_BATCH,
+                    host_kind=self._host_kind,
+                )
+            )
             for runtime in profiles
         ]
         handled = failures = 0
@@ -326,6 +338,7 @@ def create_agent_handoff_supervisor(
     return AgentHandoffSupervisor(
         _served_profile_homes(home, context.host_kind),
         owner=context.host_instance_id,
+        host_kind=context.host_kind,
         completion_queue=process_registry.completion_queue,
     )
 
