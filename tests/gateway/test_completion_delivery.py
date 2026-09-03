@@ -392,7 +392,7 @@ def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
     pending = store.get_delivery(event["delivery_id"])
     replay_lease = store.claim_delivery(
         pending.delivery_id,
-        "supervisor-2",
+        event["delivery_claim"]["owner"],
         now=pending.next_attempt_at,
         lease_seconds=30,
     )
@@ -413,7 +413,7 @@ def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
     pending = store.get_delivery(event["delivery_id"])
     final_lease = store.claim_delivery(
         pending.delivery_id,
-        "supervisor-3",
+        event["delivery_claim"]["owner"],
         now=pending.next_attempt_at,
         lease_seconds=30,
     )
@@ -433,6 +433,101 @@ def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
         runner._completion_delivery_identity(event)
         not in runner._completion_deliveries_inflight
     )
+    store.close()
+
+
+def test_gateway_handoff_return_waits_for_queued_turn_receipt(tmp_path):
+    store, event, advance = _handoff_event(
+        tmp_path, phase="needs_input", return_advance=True
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="678",
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={
+        event["session_key"]: SimpleNamespace(origin=source),
+    })
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+    receipt = AsyncMock(return_value=False)
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        has_platform_message_id=receipt,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, event)
+    ) is False
+    submitted = adapter.handle_message.await_args.args[0]
+    assert submitted.allow_gateway_control is False
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded",
+            terminal_result={
+                "text": "terminal result",
+                "sha256": sha256(b"terminal result").hexdigest(),
+                "media_type": "text/plain",
+                "size_bytes": len(b"terminal result"),
+            },
+        ),
+    )
+
+    pending = store.get_delivery(event["delivery_id"])
+    assert pending.acknowledged_at is None
+    for _ in range(10):
+        lease = store.claim_delivery(
+            pending.delivery_id,
+            event["delivery_claim"]["owner"],
+            now=pending.next_attempt_at,
+            lease_seconds=30,
+        )
+        assert lease is not None
+        replay = {
+            **event,
+            "delivery_claim": {
+                "owner": lease.owner,
+                "epoch": lease.epoch,
+                "expires_at": lease.expires_at.isoformat(),
+            },
+        }
+        assert asyncio.run(
+            runner._deliver_completion_notification(None, replay)
+        ) is None
+        pending = store.get_delivery(event["delivery_id"])
+        assert pending.state == "pending"
+        assert pending.attempts == 1
+
+    receipt.return_value = True
+    receipt_lease = store.claim_delivery(
+        pending.delivery_id,
+        event["delivery_claim"]["owner"],
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert receipt_lease is not None
+    replay["delivery_claim"] = {
+        "owner": receipt_lease.owner,
+        "epoch": receipt_lease.epoch,
+        "expires_at": receipt_lease.expires_at.isoformat(),
+    }
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, replay)
+    ) is True
+    adapter.handle_message.assert_awaited_once()
+    old = store.get_delivery(event["delivery_id"])
+    assert old.state == "delivered"
+    assert old.acknowledged_at is not None
+    due = store.due_deliveries(now=datetime.now(UTC), limit=10)
+    assert len(due) == 1
+    assert due[0].event_sequence > old.event_sequence
     store.close()
 
 

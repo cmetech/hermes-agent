@@ -385,6 +385,90 @@ def test_abandoned_dispatch_yields_to_newer_delivery_after_lease_expiry(tmp_path
     assert due[0].event_sequence > first.event_sequence
 
 
+def test_receipt_pending_dispatch_stays_ordered_for_the_same_host(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, advance = _prepare_conversation(store)
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    delivery_lease = store.claim_delivery(
+        first.delivery_id,
+        "gateway-process",
+        now=first.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert delivery_lease is not None
+    store.begin_delivery_dispatch(delivery_lease)
+    pending = store.defer_delivery_receipt(
+        delivery_lease,
+        next_attempt_at=datetime.now(UTC) + timedelta(seconds=2),
+    )
+
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("terminal result")
+        ),
+    )
+
+    assert store.get_delivery(first.delivery_id).acknowledged_at is None
+    assert [
+        item.delivery_id
+        for item in store.due_deliveries(now=pending.next_attempt_at, limit=10)
+    ] == [first.delivery_id]
+    receipt_lease = store.claim_delivery(
+        first.delivery_id,
+        "gateway-process",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert receipt_lease is not None
+    assert store.get_delivery(first.delivery_id).attempts == 1
+    settled = store.complete_delivery(receipt_lease)
+    assert settled.state == "delivered"
+    assert settled.acknowledged_at is not None
+    due = store.due_deliveries(now=datetime.now(UTC), limit=10)
+    assert len(due) == 1
+    assert due[0].event_sequence > first.event_sequence
+
+
+def test_receipt_pending_dispatch_yields_to_a_restarted_host(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, advance = _prepare_conversation(store)
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    delivery_lease = store.claim_delivery(
+        first.delivery_id,
+        "gateway-before-restart",
+        now=first.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert delivery_lease is not None
+    store.begin_delivery_dispatch(delivery_lease)
+    pending = store.defer_delivery_receipt(
+        delivery_lease,
+        next_attempt_at=datetime.now(UTC) + timedelta(seconds=2),
+    )
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("terminal result")
+        ),
+    )
+
+    assert store.claim_delivery(
+        first.delivery_id,
+        "gateway-after-restart",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    ) is None
+    assert store.get_delivery(first.delivery_id).acknowledged_at is not None
+    due = store.due_deliveries(now=pending.next_attempt_at, limit=10)
+    assert len(due) == 1
+    assert due[0].event_sequence > first.event_sequence
+
+
 def test_completed_dispatch_does_not_block_a_later_terminal_return(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot, advance = _prepare_conversation(store)

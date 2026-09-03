@@ -27,6 +27,7 @@ from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot, Handof
 _SCHEMA_VERSION = 3
 _MAX_JSON_BYTES = 16_384
 _MAX_DELIVERY_ATTEMPTS = 8
+_DELIVERY_RECEIPT_PENDING = "delivery_receipt_pending"
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
 _ATTENTION_PHASES = frozenset({
     "needs_input", "indeterminate", "succeeded", "failed", "cancelled",
@@ -1375,6 +1376,14 @@ class HandoffStore:
             existing_expiry = (
                 None if row is None else _parse_timestamp(row["lease_expires_at"])
             )
+            receipt_pending = bool(
+                row is not None
+                and row["failure_code"] == _DELIVERY_RECEIPT_PENDING
+                and row["dispatch_started_at"] is not None
+            )
+            same_receipt_owner = bool(
+                receipt_pending and row["lease_owner"] == owner
+            )
             if (
                 row is not None
                 and row["state"] == "pending"
@@ -1386,27 +1395,57 @@ class HandoffStore:
                     or existing_expiry <= now
                 )
                 and self._has_newer_delivery(row)
+                and not same_receipt_owner
             ):
                 self._acknowledge_superseded_delivery(row, now)
                 return None
-            changed = self._conn.execute(
-                """UPDATE handoff_deliveries
-                   SET lease_owner=?, lease_epoch=lease_epoch+1,
-                       lease_expires_at=?, attempts=attempts+1, updated_at=?
-                   WHERE delivery_id=? AND method='wake' AND state='pending'
-                     AND acknowledged_at IS NULL AND attempts<?
-                     AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-                     AND (lease_owner IS NULL OR lease_expires_at<=?)""",
-                (
-                    owner,
-                    _timestamp(expires_at),
-                    stamp,
-                    delivery_id,
-                    _MAX_DELIVERY_ATTEMPTS,
-                    stamp,
-                    stamp,
-                ),
-            ).rowcount
+            if receipt_pending and not same_receipt_owner:
+                self._conn.execute(
+                    """UPDATE handoff_deliveries
+                       SET lease_owner=NULL, lease_expires_at=NULL,
+                           dispatch_started_at=NULL, failure_code=NULL,
+                           updated_at=? WHERE delivery_id=?""",
+                    (stamp, delivery_id),
+                )
+            if same_receipt_owner:
+                changed = self._conn.execute(
+                    """UPDATE handoff_deliveries
+                       SET lease_epoch=lease_epoch+1, lease_expires_at=?,
+                           updated_at=?
+                       WHERE delivery_id=? AND method='wake' AND state='pending'
+                         AND acknowledged_at IS NULL AND lease_owner=?
+                         AND failure_code=?
+                         AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                         AND lease_expires_at<=?""",
+                    (
+                        _timestamp(expires_at),
+                        stamp,
+                        delivery_id,
+                        owner,
+                        _DELIVERY_RECEIPT_PENDING,
+                        stamp,
+                        stamp,
+                    ),
+                ).rowcount
+            else:
+                changed = self._conn.execute(
+                    """UPDATE handoff_deliveries
+                       SET lease_owner=?, lease_epoch=lease_epoch+1,
+                           lease_expires_at=?, attempts=attempts+1, updated_at=?
+                       WHERE delivery_id=? AND method='wake' AND state='pending'
+                         AND acknowledged_at IS NULL AND attempts<?
+                         AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                         AND (lease_owner IS NULL OR lease_expires_at<=?)""",
+                    (
+                        owner,
+                        _timestamp(expires_at),
+                        stamp,
+                        delivery_id,
+                        _MAX_DELIVERY_ATTEMPTS,
+                        stamp,
+                        stamp,
+                    ),
+                ).rowcount
             if changed != 1:
                 self._conn.execute(
                     """UPDATE handoff_deliveries
@@ -1506,6 +1545,33 @@ class HandoffStore:
                     state,
                     _timestamp(next_attempt_at) if state == "pending" else None,
                     failure_code,
+                    _timestamp(now),
+                    lease.delivery_id,
+                ),
+            )
+            return self.get_delivery(lease.delivery_id)
+
+    def defer_delivery_receipt(
+        self, lease: DeliveryLease, *, next_attempt_at: datetime
+    ) -> DeliveryRecord:
+        """Keep an accepted dispatch reserved while its transcript receipt lands."""
+        next_attempt_at = _aware_utc(next_attempt_at, "next delivery attempt")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            row = self._delivery_lease_row(lease, now)
+            if row["dispatch_started_at"] is None:
+                raise HandoffStateConflict(
+                    "handoff delivery has no active dispatch reservation"
+                )
+            retry_at = _timestamp(next_attempt_at)
+            self._conn.execute(
+                """UPDATE handoff_deliveries
+                   SET next_attempt_at=?, lease_expires_at=?, failure_code=?,
+                       updated_at=? WHERE delivery_id=?""",
+                (
+                    retry_at,
+                    retry_at,
+                    _DELIVERY_RECEIPT_PENDING,
                     _timestamp(now),
                     lease.delivery_id,
                 ),

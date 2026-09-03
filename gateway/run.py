@@ -27464,6 +27464,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).strip()
                 or None,
                 metadata=metadata,
+                allow_gateway_control=evt.get("type") != "handoff_return",
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -27597,6 +27598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 begin_handoff_return_delivery,
                 claim_event_delivery,
                 complete_event_delivery,
+                defer_event_delivery_receipt,
                 release_event_delivery,
             )
 
@@ -27629,6 +27631,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     target_session_id, str(evt.get("delivery_id") or "")
                 )
             except Exception:
+                with self._completion_delivery_lock:
+                    receipt_pending = identity in self._completion_deliveries_inflight
+                if receipt_pending:
+                    defer_event_delivery_receipt(evt, event_claim)
+                    return None
                 release_event_delivery(evt, event_claim)
                 return False
             if already_persisted:
@@ -27731,14 +27738,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return False
         if identity is not None:
             with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    if event_claim is not None:
+                duplicate_inflight = identity in self._completion_deliveries_inflight
+                duplicate_delivered = identity in self._completion_deliveries_delivered
+                if not duplicate_inflight and not duplicate_delivered:
+                    self._completion_deliveries_inflight.add(identity)
+            if duplicate_inflight or duplicate_delivered:
+                if event_claim is not None:
+                    if duplicate_inflight and evt.get("type") == "handoff_return":
+                        defer_event_delivery_receipt(evt, event_claim)
+                    else:
                         release_event_delivery(evt, event_claim)
-                    return None
-                self._completion_deliveries_inflight.add(identity)
+                return None
 
         accepted = accepted_pending_persistence = False
         try:
@@ -27810,7 +27820,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Could not release durable completion claim", exc_info=True)
             if event_claim is not None:
                 try:
-                    release_event_delivery(evt, event_claim)
+                    if accepted_pending_persistence:
+                        defer_event_delivery_receipt(evt, event_claim)
+                    else:
+                        release_event_delivery(evt, event_claim)
                 except Exception:
                     logger.debug("Could not release durable handoff return", exc_info=True)
 

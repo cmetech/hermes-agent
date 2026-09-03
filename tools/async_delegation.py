@@ -748,6 +748,24 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: Any) -> None:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def defer_event_delivery_receipt(evt: Dict[str, Any], claim_id: Any) -> None:
+    """Retain an accepted handoff dispatch until its transcript receipt exists."""
+    if not (
+        evt.get("type") == "handoff_return"
+        and isinstance(claim_id, _HandoffReturnClaim)
+    ):
+        return
+    try:
+        claim_id.store.defer_delivery_receipt(
+            claim_id.lease,
+            next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=2),
+        )
+    finally:
+        claim_id.store.close()
+        with _handoff_claims_lock:
+            _handoff_claims.discard(claim_id.key)
+
+
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
