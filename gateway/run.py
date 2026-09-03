@@ -29247,6 +29247,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if discarded is not None:
                 self._abandon_queued_handoff_return(discarded)
         if _iac_state is not None:
+            for discarded in _iac_state.conversation.queued_events:
+                self._abandon_queued_handoff_return(discarded)
+            _iac_state.conversation.queued_events.clear()
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
             self._release_running_agent_state(session_key)

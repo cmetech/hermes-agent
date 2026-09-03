@@ -816,7 +816,10 @@ def test_external_event_cannot_release_a_handoff_dispatch():
 
 
 @pytest.mark.asyncio
-async def test_busy_stop_releases_discarded_handoff_return(tmp_path):
+@pytest.mark.parametrize("queue_location", ["head", "overflow"])
+async def test_busy_stop_releases_discarded_handoff_return(
+    tmp_path, queue_location,
+):
     store, event = _handoff_event(
         tmp_path,
         phase="needs_input",
@@ -839,6 +842,17 @@ async def test_busy_stop_releases_discarded_handoff_return(tmp_path):
     )
     adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
     session_key = event["session_key"]
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+    )
+    if queue_location == "overflow":
+        adapter._pending_messages[session_key] = MessageEvent(
+            text="ordinary queued message",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
     adapter._active_sessions[session_key] = asyncio.Event()
     adapter._heal_stale_session_lock = lambda _session_key: None
 
@@ -847,8 +861,6 @@ async def test_busy_stop_releases_discarded_handoff_return(tmp_path):
         "delivery_receipt_pending"
     )
 
-    source = adapter._pending_messages[session_key].source
-    runner._peek_session_state = lambda _session_key: None
     runner._invalidate_session_run_generation = lambda *_args, **_kwargs: 1
     runner._thread_metadata_for_source = lambda _source: {}
     runner._release_running_agent_state = MagicMock()
@@ -868,6 +880,7 @@ async def test_busy_stop_releases_discarded_handoff_return(tmp_path):
         runner._completion_delivery_identity(event)
         not in runner._completion_deliveries_inflight
     )
+    assert runner._session_state(session_key).conversation.queued_events == []
     store.close()
 
 
