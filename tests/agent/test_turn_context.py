@@ -214,6 +214,19 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_optional_persisted_message_id_is_stamped_only_on_the_current_user_turn():
+    agent = _FakeAgent()
+
+    ctx = _build(agent, persist_user_message_id="delivery-1")
+
+    assert ctx.messages[-1]["message_id"] == "delivery-1"
+    assert all(
+        "message_id" not in message
+        for message in ctx.messages[:-1]
+        if isinstance(message, dict)
+    )
+
+
 def test_preflight_timeout_stops_turn_before_provider_boundary():
     """An unchanged oversized payload must not escape turn construction."""
     agent = _FakeAgent()

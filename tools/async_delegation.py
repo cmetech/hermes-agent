@@ -44,6 +44,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -89,6 +91,8 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+_handoff_claims_lock = threading.Lock()
+_handoff_claims: set[tuple[str, str, str, int]] = set()
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -484,8 +488,131 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events need no token."""
+@dataclass(slots=True)
+class _HandoffReturnClaim:
+    store: Any
+    lease: Any
+    snapshot: Any
+    key: tuple[str, str, str, int]
+
+
+def _claim_handoff_return(evt: Dict[str, Any]) -> Optional[_HandoffReturnClaim]:
+    """Open and validate the supervisor's profile-local delivery lease."""
+    store = None
+    try:
+        from hermes_cli.handoff.store import DeliveryLease, HandoffStore
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        profile = str(evt.get("profile") or "")
+        claim = evt.get("delivery_claim")
+        epoch = claim.get("epoch") if isinstance(claim, dict) else None
+        hop_count = evt.get("hop_count")
+        event_sequence = evt.get("event_sequence")
+        event_keys = {
+            "type", "delivery_id", "handoff_id", "event_sequence", "profile",
+            "session_id", "tool_call_id", "hop_count", "delivery_claim",
+        }
+        if (
+            not profile
+            or not isinstance(claim, dict)
+            or set(claim) != {"owner", "epoch", "expires_at"}
+            or frozenset(evt) not in {
+                frozenset(event_keys), frozenset(event_keys | {"session_key"})
+            }
+            or not profile_exists(profile)
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or isinstance(hop_count, bool)
+            or not isinstance(hop_count, int)
+            or isinstance(event_sequence, bool)
+            or not isinstance(event_sequence, int)
+        ):
+            return None
+        key = (
+            profile,
+            str(evt.get("delivery_id") or ""),
+            str(claim.get("owner") or ""),
+            epoch,
+        )
+        with _handoff_claims_lock:
+            if key in _handoff_claims:
+                return None
+            _handoff_claims.add(key)
+        expires_at = datetime.fromisoformat(str(claim.get("expires_at") or ""))
+        if expires_at.utcoffset() is None:
+            raise ValueError("handoff delivery lease expiry is invalid")
+        lease = DeliveryLease(
+            delivery_id=str(evt.get("delivery_id") or ""),
+            owner=str(claim.get("owner") or ""),
+            epoch=epoch,
+            expires_at=expires_at.astimezone(timezone.utc),
+        )
+        store = HandoffStore(get_profile_dir(profile) / "handoffs.db")
+        with store._lock:  # noqa: SLF001 - validate a lease claimed by the supervisor
+            store._delivery_lease_row(lease, datetime.now(timezone.utc))  # noqa: SLF001
+        delivery = store.get_delivery(lease.delivery_id)
+        snapshot = store.get(str(evt.get("handoff_id") or ""))
+        route = delivery.route
+        expected = {
+            "profile": profile,
+            "session_id": str(evt.get("session_id") or ""),
+            "tool_call_id": str(evt.get("tool_call_id") or ""),
+            "hop_count": evt.get("hop_count"),
+        }
+        if (
+            delivery.handoff_id != snapshot.handoff_id
+            or delivery.event_sequence != evt.get("event_sequence")
+            or delivery.method != "wake"
+            or delivery.state != "pending"
+            or route.get("kind") != "bot"
+            or route.get("delivery_policy") != "wake"
+            or any(route.get(key) != value for key, value in expected.items())
+            or route.get("session_key") != evt.get("session_key")
+        ):
+            store.close()
+            with _handoff_claims_lock:
+                _handoff_claims.discard(key)
+            return None
+        return _HandoffReturnClaim(store, lease, snapshot, key)
+    except Exception:
+        if store is not None:
+            store.close()
+        if "key" in locals():
+            with _handoff_claims_lock:
+                _handoff_claims.discard(key)
+        return None
+
+
+def claimed_handoff_snapshot(claim: object):
+    """Return private handoff state only for a validated live claim."""
+    return claim.snapshot if isinstance(claim, _HandoffReturnClaim) else None
+
+
+@contextmanager
+def handoff_return_context(agent: object, hop_count: Optional[int]):
+    """Install host-only hop state for exactly one synthetic return turn."""
+    if hop_count is None:
+        yield
+        return
+    missing = object()
+    previous = getattr(agent, "_handoff_return_hop_count", missing)
+    agent._handoff_return_hop_count = min(max(int(hop_count), 0), 1)
+    try:
+        yield
+    finally:
+        if previous is missing:
+            try:
+                del agent._handoff_return_hop_count
+            except AttributeError:
+                pass
+        else:
+            agent._handoff_return_hop_count = previous
+
+
+def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[Any]:
+    """Claim a durable completion event; ordinary events need no token."""
+    if evt.get("type") == "handoff_return":
+        return _claim_handoff_return(evt)
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
@@ -568,12 +695,36 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def complete_event_delivery(evt: Dict[str, Any], claim_id: Any) -> None:
+    if evt.get("type") == "handoff_return" and isinstance(
+        claim_id, _HandoffReturnClaim
+    ):
+        try:
+            claim_id.store.complete_delivery(claim_id.lease)
+        finally:
+            claim_id.store.close()
+            with _handoff_claims_lock:
+                _handoff_claims.discard(claim_id.key)
+        return
     if claim_id and evt.get("type") == "async_delegation":
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def release_event_delivery(evt: Dict[str, Any], claim_id: Any) -> None:
+    if evt.get("type") == "handoff_return" and isinstance(
+        claim_id, _HandoffReturnClaim
+    ):
+        try:
+            claim_id.store.release_delivery(
+                claim_id.lease,
+                next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=2),
+                failure_code="delivery_retryable",
+            )
+        finally:
+            claim_id.store.close()
+            with _handoff_claims_lock:
+                _handoff_claims.discard(claim_id.key)
+        return
     if claim_id and evt.get("type") == "async_delegation":
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
