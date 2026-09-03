@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `fcbe98ad8702026711a78815205ceca6e7883b36`
-- Remediated tree: `5891c227fbee0599ba4c1d510537f874668722d5`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..fcbe98ad8702026711a78815205ceca6e7883b36`
-- Range commits: 9
+- Remediated candidate: `9c31748e833d5df41be1ed76bbfc71a191125ef3`
+- Remediated tree: `176160b0cb99fae7b9a7f1458993a1a5dad46bd6`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..9c31748e833d5df41be1ed76bbfc71a191125ef3`
+- Range commits: 12
 - Range paths: 12
-- Range diff: `+770/-13`; 540 inserted lines are review prompts, not
+- Range diff: `+837/-13`; 598 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -62,9 +62,11 @@ Prove or falsify all of the following:
 
 The original candidate used the merged/LKG config loader, so syntactically
 malformed YAML looked like an empty directory and could select a colliding
-local compatibility target. The remediation validates the initiating
-profile's raw file before directory or compatibility resolution and maps read
-or parse failure to the resolver's closed `ValueError` contract.
+local compatibility target. The first remediation validated the initiating
+profile's raw file before resolution; the first convergence pass then proved
+that YAML null/empty documents were normalized before strict root validation.
+The final remediation rejects those existing documents while preserving a
+genuinely missing file and a valid `{}` mapping.
 
 Prove or falsify all of the following:
 
@@ -83,9 +85,11 @@ Prove or falsify all of the following:
 The original candidate removed a delivery identity from the in-process guard
 after the adapter accepted it but before the synthetic turn was visible in the
 session transcript. A second queue/restart-scan publication could therefore
-inject the same delivery again. The remediation retains the identity in the
-bounded in-process guard during this pending-persistence interval, while
-releasing the durable claim for later receipt reconciliation.
+inject the same delivery again. The first remediation retained the identity
+when a receipt read returned false; the first convergence pass proved that a
+receipt-read exception still released it. The final remediation marks the
+accepted interval before attempting that read, while releasing the durable
+claim for later receipt reconciliation.
 
 Prove or falsify all of the following:
 
@@ -193,8 +197,8 @@ Return:
 1. reviewer, exact model/version, date, scope verification;
 2. `PASS` or `BLOCK` verdict;
 3. findings with complete proof, if any;
-4. a bullet-by-bullet disposition for both remediated findings and the binding
-   clarification;
+4. a bullet-by-bullet disposition for all remediated findings and both binding
+   clarifications;
 5. exact commands and results;
 6. residual platform/dependency limits; and
 7. final detached clean-worktree proof.
