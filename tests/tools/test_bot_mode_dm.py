@@ -460,6 +460,70 @@ def test_explicit_canonical_target_requires_controlled_runs(tmp_path, monkeypatc
     assert spec.required_capabilities == frozenset({"cancellation", "follow_up"})
 
 
+@pytest.mark.parametrize("target", ["hermes://local/researcher", "reviewer"])
+def test_classic_cli_bot_chat_rejects_targets_that_need_a_return_host(
+    tmp_path, monkeypatch, target
+):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    home.joinpath("config.yaml").write_text(
+        "handoff:\n"
+        "  agents:\n"
+        "    reviewer:\n"
+        "      default: hermes://local/researcher\n"
+        "      endpoints:\n"
+        "      - hermes://local/researcher\n",
+        encoding="utf-8",
+    )
+    agent = _FakeAgent(home)
+    del agent._handoff_return_host_kind
+    del agent._gateway_session_key
+    service = _fake_handoff_service(monkeypatch)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target=target, message="review this", agent=agent)
+    )
+
+    assert result["error"] == (
+        "Durable agent handoffs require a running Gateway or Desktop Bot Chat; "
+        "this classic CLI Bot Chat can use only a friendly local teammate name."
+    )
+    assert service.calls == []
+
+
+def test_classic_cli_bot_chat_keeps_friendly_local_background_delivery(
+    tmp_path, monkeypatch
+):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+    del agent._handoff_return_host_kind
+    del agent._gateway_session_key
+    service = _fake_handoff_service(monkeypatch)
+    calls = _capture_spawn(monkeypatch)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="researcher", message="review this", agent=agent
+        )
+    )
+
+    assert result["status"] == "sent"
+    assert service.calls == []
+    mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    assert mode == "query-file"
+    assert transport_argv == [
+        "hermes",
+        "-p",
+        "researcher",
+        "chat",
+        "--in",
+        "~",
+        "-c",
+        "Bot Chat",
+        "--create-if-missing",
+        "-Q",
+    ]
+
+
 def test_handoff_follow_up_verifies_owner_target_and_uses_tool_call_id(
     tmp_path, monkeypatch
 ):

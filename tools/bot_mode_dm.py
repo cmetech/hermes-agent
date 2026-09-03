@@ -326,6 +326,22 @@ def message_agent_tool(
         and resolved_target.endpoint is not None
         and resolved_target.source != "legacy_peer"
     ):
+        return_host = str(
+            getattr(agent, "_handoff_return_host_kind", "") or ""
+        )
+        if return_host not in {"gateway", "web"}:
+            if resolved_target.source in {"explicit", "directory"}:
+                return _err(
+                    "Durable agent handoffs require a running Gateway or Desktop "
+                    "Bot Chat; this classic CLI Bot Chat can use only a friendly "
+                    "local teammate name."
+                )
+            resolved_target = None
+    if (
+        resolved_target is not None
+        and resolved_target.endpoint is not None
+        and resolved_target.source != "legacy_peer"
+    ):
         if (
             resolved_target.endpoint.kind == "local"
             and resolved_target.endpoint.profile == me
