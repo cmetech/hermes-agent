@@ -548,7 +548,10 @@ def test_gateway_handoff_return_process_restart_retries_after_receipt_recovery(
     store.close()
 
 
-def test_gateway_handoff_return_retries_after_busy_fifo_capacity(tmp_path):
+@pytest.mark.parametrize("draining", [False, True], ids=["busy", "restart-drain"])
+def test_gateway_handoff_return_retries_after_busy_fifo_capacity(
+    tmp_path, draining
+):
     store, event, advance = _handoff_event(
         tmp_path,
         phase="needs_input",
@@ -562,7 +565,7 @@ def test_gateway_handoff_return_retries_after_busy_fifo_capacity(tmp_path):
     runner._resolve_profile_home_for_source = lambda _source: tmp_path
     runner._is_user_authorized = lambda _source: True
     runner._effective_busy_input_mode = lambda _source: "queue"
-    runner._draining = False
+    runner._draining = draining
     runner._session_db = SimpleNamespace(
         get_session=AsyncMock(return_value={"ended_at": None}),
         get_compression_tip=AsyncMock(return_value=None),

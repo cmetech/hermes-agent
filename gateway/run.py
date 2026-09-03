@@ -10978,6 +10978,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         effective_mode = self._effective_busy_input_mode(event.source)
 
+        # Internal synthetic events must always use the observable FIFO path,
+        # including while the gateway is draining. Otherwise a full queue can
+        # be reported as accepted even though no future transcript receipt can
+        # exist for the dropped event.
+        if getattr(event, "internal", False) and not event.allow_gateway_control:
+            if not self._queue_or_replace_pending_event(session_key, event):
+                setattr(event, "_gateway_queue_backpressure", True)
+            return True
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
@@ -11086,21 +11095,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Plugin events carry untrusted
-        # payload text, so queue those through the gateway FIFO to keep their
-        # security metadata separate from pending user input.
-        if getattr(event, "internal", False) and not event.allow_gateway_control:
-            if not self._queue_or_replace_pending_event(session_key, event):
-                setattr(event, "_gateway_queue_backpressure", True)
-            return True
+        # Internal control events still bypass ordinary busy text handling.
         if getattr(event, "internal", False):
             return False
 
