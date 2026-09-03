@@ -621,6 +621,7 @@ def test_gateway_handoff_return_retries_after_busy_fifo_capacity(
 
     adapter._pending_messages.clear()
     runner._session_state(session_key).conversation.queued_events.clear()
+    runner._draining = False
     terminal = store.attention(event["handoff_id"], limit=1)[0]
     terminal_lease = store.claim_delivery(
         terminal.delivery_id,
@@ -667,6 +668,129 @@ def test_gateway_handoff_return_retries_after_busy_fifo_capacity(
     ) is True
     handler.assert_awaited_once()
     assert store.get_delivery(terminal.delivery_id).state == "delivered"
+    store.close()
+
+
+def test_gateway_handoff_return_retries_during_gateway_drain(tmp_path):
+    store, event = _handoff_event(
+        tmp_path,
+        phase="needs_input",
+        session_key="agent:main:telegram:dm:12345",
+    )
+    adapter = _BusyAdapter()
+    handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(handler)
+    runner = _runner(adapter)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._is_user_authorized = lambda _source: True
+    runner._effective_busy_input_mode = lambda _source: "queue"
+    runner._draining = True
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        has_platform_message_id=AsyncMock(return_value=False),
+    )
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = event["session_key"]
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._heal_stale_session_lock = lambda _session_key: None
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, event)
+    ) is False
+    delivery = store.get_delivery(event["delivery_id"])
+    assert delivery.attempts == 0
+    assert delivery.failure_code == "delivery_backpressure"
+    assert adapter.get_pending_message(session_key) is None
+    handler.assert_not_awaited()
+    store.close()
+
+
+@pytest.mark.parametrize("queue_location", ["head", "overflow"])
+def test_conversation_boundary_releases_discarded_handoff_return(
+    tmp_path, queue_location,
+):
+    store, event, advance = _handoff_event(
+        tmp_path,
+        phase="needs_input",
+        return_advance=True,
+        session_key="agent:main:telegram:dm:12345",
+    )
+    adapter = _BusyAdapter()
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    runner = _runner(adapter)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._is_user_authorized = lambda _source: True
+    runner._effective_busy_input_mode = lambda _source: "queue"
+    runner._draining = False
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        has_platform_message_id=AsyncMock(return_value=False),
+    )
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = event["session_key"]
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._heal_stale_session_lock = lambda _session_key: None
+    if queue_location == "overflow":
+        adapter._pending_messages[session_key] = MessageEvent(
+            text="ordinary queued message",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="12345",
+                chat_type="dm",
+                user_id="678",
+            ),
+        )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, event)
+    ) is False
+    assert store.get_delivery(event["delivery_id"]).failure_code == (
+        "delivery_receipt_pending"
+    )
+
+    runner._clear_conversation_scope(session_key, reason="test-boundary")
+
+    discarded = store.get_delivery(event["delivery_id"])
+    assert discarded.failure_code == "delivery_retryable"
+    assert (
+        runner._completion_delivery_identity(event)
+        not in runner._completion_deliveries_inflight
+    )
+    assert all(
+        queued.message_id != event["delivery_id"]
+        for queued in runner._session_state(session_key).conversation.queued_events
+    )
+    if queue_location == "head":
+        assert adapter.get_pending_message(session_key) is None
+
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded",
+            terminal_result={
+                "text": "terminal result",
+                "sha256": sha256(b"terminal result").hexdigest(),
+                "media_type": "text/plain",
+                "size_bytes": len(b"terminal result"),
+            },
+        ),
+    )
+    assert store.get_delivery(event["delivery_id"]).acknowledged_at is not None
+    terminal = store.attention(event["handoff_id"], limit=1)[0]
+    assert terminal.event_sequence > event["event_sequence"]
+    assert store.due_deliveries(
+        now=datetime.now(UTC), limit=10, host_kind="gateway"
+    ) == (terminal,)
     store.close()
 
 

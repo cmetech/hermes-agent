@@ -955,6 +955,21 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class QueuedMetadataAgent:
+    calls = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, **kwargs):
+        type(self).calls.append((message, kwargs))
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -998,6 +1013,7 @@ async def _run_with_agent(
     *,
     session_id,
     pending_text=None,
+    pending_event=None,
     config_data=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
@@ -1038,7 +1054,9 @@ async def _run_with_agent(
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
-    if pending_text is not None:
+    if pending_event is not None:
+        adapter._pending_messages[session_key] = pending_event
+    elif pending_text is not None:
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
@@ -1379,6 +1397,54 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+@pytest.mark.asyncio
+async def test_queued_handoff_return_carries_durable_receipt_metadata(
+    monkeypatch, tmp_path,
+):
+    QueuedMetadataAgent.calls = []
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    delivery_id = "delivery-queued-return"
+    pending_event = MessageEvent(
+        text="handoff finished",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        message_id=delivery_id,
+        metadata={
+            "persist_user_display_kind": "handoff_return",
+            "persist_user_display_metadata": {
+                "delivery_id": delivery_id,
+                "handoff_id": "handoff-1",
+            },
+            "handoff_return_hop_count": 1,
+        },
+        allow_gateway_control=False,
+    )
+
+    await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedMetadataAgent,
+        session_id="sess-queued-handoff",
+        pending_event=pending_event,
+    )
+
+    assert len(QueuedMetadataAgent.calls) == 2
+    _, followup_kwargs = QueuedMetadataAgent.calls[1]
+    assert followup_kwargs["persist_user_message_id"] == delivery_id
+    assert followup_kwargs["persist_user_display_kind"] == "handoff_return"
+    assert followup_kwargs["persist_user_display_metadata"] == {
+        "delivery_id": delivery_id,
+        "handoff_id": "handoff-1",
+    }
+    assert followup_kwargs["handoff_return_hop_count"] == 1
 
 
 @pytest.mark.asyncio

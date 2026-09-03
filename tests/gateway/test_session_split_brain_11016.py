@@ -210,6 +210,24 @@ class TestStaleSessionLockSelfHeal:
             "stale lock trapped a normal message — split-brain not healed"
         )
 
+    @pytest.mark.asyncio
+    async def test_stale_lock_heal_preserves_queued_follow_up(self):
+        adapter = _make_adapter()
+        sk = _session_key()
+        queued = _make_event("queued handoff return")
+
+        async def _done():
+            return None
+
+        done_task = asyncio.create_task(_done())
+        await done_task
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._session_tasks[sk] = done_task
+        adapter._pending_messages[sk] = queued
+
+        assert adapter._heal_stale_session_lock(sk) is True
+        assert adapter.get_pending_message(sk) is queued
+
 
     @pytest.mark.asyncio
     async def test_cleanup_releases_and_deletes_when_guard_matches(self):
@@ -295,4 +313,3 @@ class TestOldTaskCannotClobberNewerGuard:
         # Now the command itself releases using the matching guard.
         adapter._release_session_guard(sk, guard=new_guard)
         assert sk not in adapter._active_sessions
-

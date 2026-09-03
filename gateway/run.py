@@ -10979,11 +10979,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         effective_mode = self._effective_busy_input_mode(event.source)
 
         # Internal synthetic events must always use the observable FIFO path,
-        # including while the gateway is draining. Otherwise a full queue can
-        # be reported as accepted even though no future transcript receipt can
-        # exist for the dropped event.
+        # and must report backpressure while draining. Otherwise an accepted
+        # handoff return can be discarded before its transcript receipt exists.
         if getattr(event, "internal", False) and not event.allow_gateway_control:
-            if not self._queue_or_replace_pending_event(session_key, event):
+            if self._draining or not self._queue_or_replace_pending_event(
+                session_key, event
+            ):
                 setattr(event, "_gateway_queue_backpressure", True)
             return True
 
@@ -27468,6 +27469,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=metadata,
                 allow_gateway_control=evt.get("type") != "handoff_return",
             )
+            if evt.get("type") == "handoff_return" and self._draining:
+                return _HANDOFF_QUEUE_BACKPRESSURE
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -28992,10 +28995,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
+        # A handoff return accepted into the busy FIFO owns a durable dispatch
+        # reservation until its synthetic user row is persisted. A true
+        # conversation boundary discards that queued turn, so release the
+        # reservation explicitly instead of leaving an impossible receipt
+        # pending forever. Ordinary queued user messages retain the existing
+        # boundary behavior.
+        for adapter in self._iter_gateway_adapters():
+            pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(pending, dict):
+                continue
+            queued = pending.get(session_key)
+            if self._queued_handoff_delivery_id(queued):
+                pending.pop(session_key, None)
+                self._abandon_queued_handoff_return(queued)
         # Structural clear: every conversation-scoped field resets in one
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
         if state is not None:
+            queued_events = state.conversation.queued_events
+            for queued in queued_events if isinstance(queued_events, list) else ():
+                if self._queued_handoff_delivery_id(queued):
+                    self._abandon_queued_handoff_return(queued)
             state.conversation.clear()
         # Legacy plain-dict stores still registered in
         # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
@@ -29010,6 +29031,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
         )
+
+    @staticmethod
+    def _queued_handoff_delivery_id(event: Any) -> str:
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ""
+        if metadata.get("persist_user_display_kind") != "handoff_return":
+            return ""
+        delivery_id = str(getattr(event, "message_id", None) or "").strip()
+        display_metadata = metadata.get("persist_user_display_metadata")
+        if not isinstance(display_metadata, dict):
+            return ""
+        recorded_id = str(display_metadata.get("delivery_id", "")).strip()
+        return delivery_id if delivery_id and recorded_id == delivery_id else ""
+
+    def _abandon_queued_handoff_return(self, event: Any) -> bool:
+        delivery_id = self._queued_handoff_delivery_id(event)
+        source = getattr(event, "source", None)
+        if not delivery_id or source is None:
+            return False
+        identity = ("handoff_return", delivery_id, "")
+        lock = getattr(self, "_completion_delivery_lock", None)
+        inflight = getattr(self, "_completion_deliveries_inflight", None)
+        if lock is not None and inflight is not None:
+            with lock:
+                inflight.discard(identity)
+        try:
+            from hermes_cli.handoff.store import HandoffStore
+
+            home = self._resolve_profile_home_for_source(source)
+            with HandoffStore(Path(home) / "handoffs.db") as store:
+                store.abandon_delivery_dispatch(
+                    delivery_id,
+                    next_attempt_at=datetime.now(timezone.utc)
+                    + timedelta(seconds=2),
+                )
+            return True
+        except Exception:
+            logger.warning(
+                "Could not release discarded handoff return %s",
+                delivery_id,
+                exc_info=True,
+            )
+            return False
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear per-session control state that must not survive a boundary switch."""
@@ -31900,6 +31965,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key or "?",
                     self._status_action_label(),
                 )
+                if pending_event is not None:
+                    self._abandon_queued_handoff_return(pending_event)
                 pending_event = None
                 pending = None
 
@@ -32035,6 +32102,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_persist_user_display_kind = None
+                next_persist_user_display_metadata = None
+                next_persist_user_message_id = None
+                next_handoff_return_hop_count = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -32067,6 +32138,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_metadata = getattr(pending_event, "metadata", None) or {}
+                    next_persist_user_display_kind = next_metadata.get(
+                        "persist_user_display_kind"
+                    ) or (
+                        "internal_notification"
+                        if getattr(pending_event, "internal", False)
+                        else None
+                    )
+                    next_persist_user_display_metadata = next_metadata.get(
+                        "persist_user_display_metadata"
+                    )
+                    next_persist_user_message_id = (
+                        str(pending_event.message_id)
+                        if next_persist_user_display_kind == "handoff_return"
+                        and pending_event.message_id
+                        else None
+                    )
+                    next_handoff_return_hop_count = next_metadata.get(
+                        "handoff_return_hop_count"
+                    )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -32121,6 +32212,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_display_kind=next_persist_user_display_kind,
+                    persist_user_display_metadata=next_persist_user_display_metadata,
+                    persist_user_message_id=next_persist_user_message_id,
+                    handoff_return_hop_count=next_handoff_return_hop_count,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

@@ -1578,6 +1578,42 @@ class HandoffStore:
             )
             return self.get_delivery(lease.delivery_id)
 
+    def abandon_delivery_dispatch(
+        self, delivery_id: str, *, next_attempt_at: datetime
+    ) -> DeliveryRecord:
+        """Release a dispatch whose accepted in-memory turn was discarded."""
+        delivery_id = _identifier(delivery_id, "delivery ID")
+        next_attempt_at = _aware_utc(next_attempt_at, "next delivery attempt")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            row = self._conn.execute(
+                "SELECT * FROM handoff_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                raise HandoffNotFound("handoff delivery not found")
+            if (
+                row["state"] == "pending"
+                and row["acknowledged_at"] is None
+                and row["dispatch_started_at"] is not None
+            ):
+                if self._has_newer_delivery(row):
+                    self._acknowledge_superseded_delivery(row, now)
+                else:
+                    self._conn.execute(
+                        """UPDATE handoff_deliveries
+                           SET next_attempt_at=?, lease_owner=NULL,
+                               lease_expires_at=NULL, dispatch_started_at=NULL,
+                               failure_code='delivery_retryable', updated_at=?
+                           WHERE delivery_id=?""",
+                        (
+                            _timestamp(next_attempt_at),
+                            _timestamp(now),
+                            delivery_id,
+                        ),
+                    )
+            return self.get_delivery(delivery_id)
+
     def complete_delivery(self, lease: DeliveryLease) -> DeliveryRecord:
         with self._lock, write_txn(self._conn):
             now = _utc_now()
