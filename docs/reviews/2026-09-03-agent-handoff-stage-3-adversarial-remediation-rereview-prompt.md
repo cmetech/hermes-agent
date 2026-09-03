@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `ad4c53bac83effda0a70b3caebd0c999fb664439`
-- Remediated tree: `192e496d5746e17845a4d0ca51c977525ef42862`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..ad4c53bac83effda0a70b3caebd0c999fb664439`
-- Range commits: 35
+- Remediated candidate: `d09c9aff098e83c2e62d40b87338ecf4eee45700`
+- Remediated tree: `f8186d0e14c2af8abffe208471f2175961ebbeec`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..d09c9aff098e83c2e62d40b87338ecf4eee45700`
+- Range commits: 37
 - Range paths: 21
-- Range diff: `+2520/-87`; 738 inserted lines are review prompts, not
+- Range diff: `+2545/-87`; 738 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -106,8 +106,11 @@ current candidate preserves pending work during stale-lock healing, rejects
 handoff admission while draining, carries the stable delivery ID and bounded
 handoff metadata through the recursive turn, and explicitly releases the keyed
 dispatch reservation when a conversation boundary or drain knowingly discards
-that exact queued event. It does not use an elapsed-time receipt budget, which
-could duplicate a legitimate return waiting behind a long-running turn.
+that exact queued event. That release requires the trusted internal,
+non-control event markers plus matching bounded delivery metadata; an external
+message cannot forge metadata to release another return. It does not use an
+elapsed-time receipt budget, which could duplicate a legitimate return waiting
+behind a long-running turn.
 
 Prove or falsify all of the following:
 
@@ -139,7 +142,8 @@ Prove or falsify all of the following:
 - stale-lock healing preserves the queued event for the replacement owner;
 - gateway draining rejects new handoff admission, while a return accepted
   before draining or a true conversation boundary releases only that discarded
-  event's keyed dispatch reservation and process identity;
+  event's keyed dispatch reservation and process identity, and only trusted
+  internal non-control metadata can authorize that release;
 - an abandoned reserved dispatch reconciles through transcript receipt and
   restart/lease recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
