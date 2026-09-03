@@ -1,4 +1,4 @@
-# Agent Handoff Stage 3 Adversarial Review
+# Agent Handoff Stage 3 Preliminary Controller Review
 
 **Date:** 2026-09-02
 
@@ -16,13 +16,16 @@ and
 
 ## Verdict
 
-**Ready for maintainer review.** Independent adversarial re-review found no
-remaining Critical or Important correctness, security, durability, or
-compatibility findings after remediation.
+**Historical preliminary review only.** This controller-led pass was not the
+independent Claude-and-Codex gate. The authoritative Stage 3 adversarial result
+is the later
+[`2026-09-03-agent-handoff-stage-3-adversarial-review-reconciliation.md`](2026-09-03-agent-handoff-stage-3-adversarial-review-reconciliation.md),
+which records the shared prompt, independent reports, remediation, and final
+convergence verdict.
 
 ## Review method
 
-The review traced the live Bot target resolver, local CLI and peer-DM
+This preliminary review traced the live Bot target resolver, local CLI and peer-DM
 compatibility paths, local and peer Runs channels, shared store/service and
 supervisor, gateway and TUI completion consumers, Desktop RPC and UI, Workflow
 remote handoff tests, packaging, and host lifecycle. It treated the durable
@@ -30,10 +33,11 @@ ledger as authoritative, the in-process completion queue as acceleration only,
 and the established peer registry/authentication/redirect-safe Runs transport
 as fixed security boundaries.
 
-The first adversarial pass found two Critical, five Important, and one Minor
+The controller pass found two Critical, five Important, and one Minor
 issue. Two follow-up passes found classic-CLI surface and correlation gaps. Each
-behavior change was made test-first and committed separately, and the final
-pass closed every Critical and Important finding.
+behavior change was made test-first and committed separately. That pass closed
+its own Critical and Important findings; the later independent gate found and
+remediated the additional races recorded in the reconciliation.
 
 ## Findings and dispositions
 
