@@ -962,7 +962,9 @@ class QueuedMetadataAgent:
         self.tools = []
 
     def run_conversation(self, message, **kwargs):
-        type(self).calls.append((message, kwargs))
+        type(self).calls.append(
+            (message, kwargs, getattr(self, "_handoff_return_hop_count", None))
+        )
         return {
             "final_response": "done",
             "messages": [],
@@ -1437,14 +1439,14 @@ async def test_queued_handoff_return_carries_durable_receipt_metadata(
     )
 
     assert len(QueuedMetadataAgent.calls) == 2
-    _, followup_kwargs = QueuedMetadataAgent.calls[1]
+    _, followup_kwargs, hop_count = QueuedMetadataAgent.calls[1]
     assert followup_kwargs["persist_user_message_id"] == delivery_id
     assert followup_kwargs["persist_user_display_kind"] == "handoff_return"
     assert followup_kwargs["persist_user_display_metadata"] == {
         "delivery_id": delivery_id,
         "handoff_id": "handoff-1",
     }
-    assert followup_kwargs["handoff_return_hop_count"] == 1
+    assert hop_count == 1
 
 
 @pytest.mark.asyncio
