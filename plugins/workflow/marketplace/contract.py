@@ -211,10 +211,37 @@ def _byte_boundary(
     }
 
 
-def _item_boundary(
+def _package_boundary(
     name: str,
     *,
     limit_name: str,
+    observed: int,
+    limit: int,
+    diagnostic_code: str,
+    files: list[dict[str, object]] | None = None,
+    generated_files: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    accepted = observed <= limit
+    return {
+        "name": name,
+        "limit": limit_name,
+        "recipe": {
+            "kind": "packageFiles",
+            "files": files or [],
+            "generatedFiles": generated_files or [],
+        },
+        "expected": {
+            "accepted": accepted,
+            "diagnosticCode": None if accepted else diagnostic_code,
+            "limit": limit,
+            "observed": observed,
+        },
+    }
+
+
+def _catalog_boundary(
+    name: str,
+    *,
     count: int,
     limit: int,
     diagnostic_code: str,
@@ -222,12 +249,23 @@ def _item_boundary(
     accepted = count <= limit
     return {
         "name": name,
-        "limit": limit_name,
+        "limit": "max_catalog_entries",
         "recipe": {
-            "kind": "items",
-            "encoding": "utf-8",
-            "repeat": "",
+            "kind": "marketplaceIndex",
+            "schemaVersion": 1,
             "count": count,
+            "entryTemplate": {
+                "id": "p{index:04d}",
+                "version": "1.0.0",
+                "displayName": "P",
+                "description": "P",
+                "license": "MIT",
+                "publisher": "p",
+                "tags": ["p"],
+                "packagePath": "packages/p{index:04d}",
+                "contractVersion": 1,
+                "packageDigest": "a" * 64,
+            },
         },
         "expected": {
             "accepted": accepted,
@@ -436,51 +474,113 @@ def _contract_vectors() -> dict[str, object]:
             },
         ],
         "boundaryVectors": [
-            _item_boundary(
+            _package_boundary(
                 "file_count_exact",
                 limit_name="max_files",
-                count=PACKAGE_MAX_FILES,
+                observed=PACKAGE_MAX_FILES,
                 limit=PACKAGE_MAX_FILES,
                 diagnostic_code="package_file_count_limit",
+                generated_files=[
+                    {
+                        "pathTemplate": "fixtures/file-{index:04d}.bin",
+                        "startIndex": 0,
+                        "count": PACKAGE_MAX_FILES,
+                        "content": _content_recipe(b""),
+                    }
+                ],
             ),
-            _item_boundary(
+            _package_boundary(
                 "file_count_over",
                 limit_name="max_files",
-                count=PACKAGE_MAX_FILES + 1,
+                observed=PACKAGE_MAX_FILES + 1,
                 limit=PACKAGE_MAX_FILES,
                 diagnostic_code="package_file_count_limit",
+                generated_files=[
+                    {
+                        "pathTemplate": "fixtures/file-{index:04d}.bin",
+                        "startIndex": 0,
+                        "count": PACKAGE_MAX_FILES + 1,
+                        "content": _content_recipe(b""),
+                    }
+                ],
             ),
-            _byte_boundary(
+            _package_boundary(
                 "file_bytes_exact",
                 limit_name="max_file_bytes",
-                repeat="a",
-                count=PACKAGE_MAX_FILE_BYTES,
+                observed=PACKAGE_MAX_FILE_BYTES,
                 limit=PACKAGE_MAX_FILE_BYTES,
                 diagnostic_code="package_file_size_limit",
+                files=[
+                    {
+                        "path": "fixtures/boundary.bin",
+                        "content": {
+                            "encoding": "utf-8",
+                            "repeat": "a",
+                            "count": PACKAGE_MAX_FILE_BYTES,
+                        },
+                    }
+                ],
             ),
-            _byte_boundary(
+            _package_boundary(
                 "file_bytes_over",
                 limit_name="max_file_bytes",
-                repeat="a",
-                count=PACKAGE_MAX_FILE_BYTES + 1,
+                observed=PACKAGE_MAX_FILE_BYTES + 1,
                 limit=PACKAGE_MAX_FILE_BYTES,
                 diagnostic_code="package_file_size_limit",
+                files=[
+                    {
+                        "path": "fixtures/boundary.bin",
+                        "content": {
+                            "encoding": "utf-8",
+                            "repeat": "a",
+                            "count": PACKAGE_MAX_FILE_BYTES + 1,
+                        },
+                    }
+                ],
             ),
-            _byte_boundary(
+            _package_boundary(
                 "total_bytes_exact",
                 limit_name="max_total_bytes",
-                repeat="z",
-                count=PACKAGE_MAX_TOTAL_BYTES,
+                observed=PACKAGE_MAX_TOTAL_BYTES,
                 limit=PACKAGE_MAX_TOTAL_BYTES,
                 diagnostic_code="package_total_size_limit",
+                generated_files=[
+                    {
+                        "pathTemplate": "fixtures/chunk-{index:02d}.bin",
+                        "startIndex": 0,
+                        "count": 8,
+                        "content": {
+                            "encoding": "utf-8",
+                            "repeat": "z",
+                            "count": PACKAGE_MAX_FILE_BYTES,
+                        },
+                    }
+                ],
             ),
-            _byte_boundary(
+            _package_boundary(
                 "total_bytes_over",
                 limit_name="max_total_bytes",
-                repeat="z",
-                count=PACKAGE_MAX_TOTAL_BYTES + 1,
+                observed=PACKAGE_MAX_TOTAL_BYTES + 1,
                 limit=PACKAGE_MAX_TOTAL_BYTES,
                 diagnostic_code="package_total_size_limit",
+                files=[
+                    {
+                        "path": "fixtures/overflow.bin",
+                        "content": _content_recipe(b"x", text="x"),
+                    }
+                ],
+                generated_files=[
+                    {
+                        "pathTemplate": "fixtures/chunk-{index:02d}.bin",
+                        "startIndex": 0,
+                        "count": 8,
+                        "content": {
+                            "encoding": "utf-8",
+                            "repeat": "z",
+                            "count": PACKAGE_MAX_FILE_BYTES,
+                        },
+                    }
+                ],
             ),
             _byte_boundary(
                 "index_bytes_exact",
@@ -498,16 +598,14 @@ def _contract_vectors() -> dict[str, object]:
                 limit=_MARKETPLACE_INDEX_MAX_BYTES,
                 diagnostic_code="package_index_size_limit",
             ),
-            _item_boundary(
+            _catalog_boundary(
                 "catalog_entries_exact",
-                limit_name="max_catalog_entries",
                 count=_MARKETPLACE_CATALOG_MAX_ENTRIES,
                 limit=_MARKETPLACE_CATALOG_MAX_ENTRIES,
                 diagnostic_code="package_catalog_entry_limit",
             ),
-            _item_boundary(
+            _catalog_boundary(
                 "catalog_entries_over",
-                limit_name="max_catalog_entries",
                 count=_MARKETPLACE_CATALOG_MAX_ENTRIES + 1,
                 limit=_MARKETPLACE_CATALOG_MAX_ENTRIES,
                 diagnostic_code="package_catalog_entry_limit",

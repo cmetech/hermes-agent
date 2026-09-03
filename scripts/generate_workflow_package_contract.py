@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import stat
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +34,29 @@ def _parser() -> argparse.ArgumentParser:
 
 def _write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        try:
+            artifact_mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            artifact_mode = 0o644
+        os.fchmod(descriptor, artifact_mode)
+        temporary_file = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with temporary_file:
+            temporary_file.write(content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        temporary_path.replace(path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
 
 
 def _check(path: Path, expected: bytes) -> bool:

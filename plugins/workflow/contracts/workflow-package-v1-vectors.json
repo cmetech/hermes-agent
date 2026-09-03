@@ -10,10 +10,19 @@
       "limit": "max_files",
       "name": "file_count_exact",
       "recipe": {
-        "count": 512,
-        "encoding": "utf-8",
-        "kind": "items",
-        "repeat": ""
+        "files": [],
+        "generatedFiles": [
+          {
+            "content": {
+              "encoding": "base64",
+              "value": ""
+            },
+            "count": 512,
+            "pathTemplate": "fixtures/file-{index:04d}.bin",
+            "startIndex": 0
+          }
+        ],
+        "kind": "packageFiles"
       }
     },
     {
@@ -26,10 +35,19 @@
       "limit": "max_files",
       "name": "file_count_over",
       "recipe": {
-        "count": 513,
-        "encoding": "utf-8",
-        "kind": "items",
-        "repeat": ""
+        "files": [],
+        "generatedFiles": [
+          {
+            "content": {
+              "encoding": "base64",
+              "value": ""
+            },
+            "count": 513,
+            "pathTemplate": "fixtures/file-{index:04d}.bin",
+            "startIndex": 0
+          }
+        ],
+        "kind": "packageFiles"
       }
     },
     {
@@ -37,16 +55,23 @@
         "accepted": true,
         "diagnosticCode": null,
         "limit": 1048576,
-        "observed": 1048576,
-        "sha256": "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360"
+        "observed": 1048576
       },
       "limit": "max_file_bytes",
       "name": "file_bytes_exact",
       "recipe": {
-        "count": 1048576,
-        "encoding": "utf-8",
-        "kind": "bytes",
-        "repeat": "a"
+        "files": [
+          {
+            "content": {
+              "count": 1048576,
+              "encoding": "utf-8",
+              "repeat": "a"
+            },
+            "path": "fixtures/boundary.bin"
+          }
+        ],
+        "generatedFiles": [],
+        "kind": "packageFiles"
       }
     },
     {
@@ -54,16 +79,23 @@
         "accepted": false,
         "diagnosticCode": "package_file_size_limit",
         "limit": 1048576,
-        "observed": 1048577,
-        "sha256": "4a3f0c0c213adea174f9a3d4c13177315b588bdb2e9c1012d3d0bf0453ca0f6a"
+        "observed": 1048577
       },
       "limit": "max_file_bytes",
       "name": "file_bytes_over",
       "recipe": {
-        "count": 1048577,
-        "encoding": "utf-8",
-        "kind": "bytes",
-        "repeat": "a"
+        "files": [
+          {
+            "content": {
+              "count": 1048577,
+              "encoding": "utf-8",
+              "repeat": "a"
+            },
+            "path": "fixtures/boundary.bin"
+          }
+        ],
+        "generatedFiles": [],
+        "kind": "packageFiles"
       }
     },
     {
@@ -71,16 +103,25 @@
         "accepted": true,
         "diagnosticCode": null,
         "limit": 8388608,
-        "observed": 8388608,
-        "sha256": "9f5bc72de6f6780c7ff33ab7f43e17badeb87155dc19363de9a9f037c8128c45"
+        "observed": 8388608
       },
       "limit": "max_total_bytes",
       "name": "total_bytes_exact",
       "recipe": {
-        "count": 8388608,
-        "encoding": "utf-8",
-        "kind": "bytes",
-        "repeat": "z"
+        "files": [],
+        "generatedFiles": [
+          {
+            "content": {
+              "count": 1048576,
+              "encoding": "utf-8",
+              "repeat": "z"
+            },
+            "count": 8,
+            "pathTemplate": "fixtures/chunk-{index:02d}.bin",
+            "startIndex": 0
+          }
+        ],
+        "kind": "packageFiles"
       }
     },
     {
@@ -88,16 +129,33 @@
         "accepted": false,
         "diagnosticCode": "package_total_size_limit",
         "limit": 8388608,
-        "observed": 8388609,
-        "sha256": "7caf91be0551de5b45bfbed32570c8cedf17763fce3cb9c9057cf29fede3eb35"
+        "observed": 8388609
       },
       "limit": "max_total_bytes",
       "name": "total_bytes_over",
       "recipe": {
-        "count": 8388609,
-        "encoding": "utf-8",
-        "kind": "bytes",
-        "repeat": "z"
+        "files": [
+          {
+            "content": {
+              "encoding": "utf-8",
+              "value": "x"
+            },
+            "path": "fixtures/overflow.bin"
+          }
+        ],
+        "generatedFiles": [
+          {
+            "content": {
+              "count": 1048576,
+              "encoding": "utf-8",
+              "repeat": "z"
+            },
+            "count": 8,
+            "pathTemplate": "fixtures/chunk-{index:02d}.bin",
+            "startIndex": 0
+          }
+        ],
+        "kind": "packageFiles"
       }
     },
     {
@@ -145,9 +203,22 @@
       "name": "catalog_entries_exact",
       "recipe": {
         "count": 4096,
-        "encoding": "utf-8",
-        "kind": "items",
-        "repeat": ""
+        "entryTemplate": {
+          "contractVersion": 1,
+          "description": "P",
+          "displayName": "P",
+          "id": "p{index:04d}",
+          "license": "MIT",
+          "packageDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "packagePath": "packages/p{index:04d}",
+          "publisher": "p",
+          "tags": [
+            "p"
+          ],
+          "version": "1.0.0"
+        },
+        "kind": "marketplaceIndex",
+        "schemaVersion": 1
       }
     },
     {
@@ -161,9 +232,22 @@
       "name": "catalog_entries_over",
       "recipe": {
         "count": 4097,
-        "encoding": "utf-8",
-        "kind": "items",
-        "repeat": ""
+        "entryTemplate": {
+          "contractVersion": 1,
+          "description": "P",
+          "displayName": "P",
+          "id": "p{index:04d}",
+          "license": "MIT",
+          "packageDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "packagePath": "packages/p{index:04d}",
+          "publisher": "p",
+          "tags": [
+            "p"
+          ],
+          "version": "1.0.0"
+        },
+        "kind": "marketplaceIndex",
+        "schemaVersion": 1
       }
     }
   ],

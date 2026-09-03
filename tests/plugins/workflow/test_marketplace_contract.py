@@ -8,11 +8,13 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 import pytest
 from pydantic import ValidationError
+from scripts import generate_workflow_package_contract as contract_generator
 
 from plugins.workflow.marketplace.contract import (
     CONTRACT_PATH,
@@ -25,7 +27,10 @@ from plugins.workflow.marketplace.contract import (
 )
 from plugins.workflow.marketplace.models import (
     InstallRequest,
+    InstalledPackageProvenance,
     PackageReviewAssessment,
+    WorkflowMarketplaceSource,
+    WorkflowPackageDigestRecord,
     WorkflowPackageDigests,
     WorkflowPackageIndex,
     WorkflowPackageManifest,
@@ -65,7 +70,7 @@ def valid_manifest() -> dict[str, object]:
     }
 
 
-def valid_index() -> dict[str, object]:
+def valid_index() -> dict[str, Any]:
     return {
         "schemaVersion": 1,
         "packages": [
@@ -101,7 +106,25 @@ def valid_digests() -> dict[str, object]:
     }
 
 
-def _materialize(recipe: dict[str, object]) -> bytes:
+def valid_provenance() -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "identity": {"sourceKey": "company", "packageId": "laptop-support"},
+        "sourceName": "company",
+        "repositoryUrl": "https://example.com/company/workflows.git",
+        "configuredRef": "main",
+        "resolvedCommit": "a" * 40,
+        "packagePath": "packages/laptop-support",
+        "packageVersion": "1.2.3",
+        "contractVersion": 1,
+        "distributionDigest": SHA256_A,
+        "installedAt": "2026-09-03T12:00:00Z",
+        "actor": "test",
+        "workflowPaths": ["workflows/laptop-diagnostic.yaml"],
+    }
+
+
+def _materialize(recipe: dict[str, Any]) -> bytes:
     encoding = recipe["encoding"]
     if encoding == "base64":
         return base64.b64decode(str(recipe["value"]), validate=True)
@@ -111,6 +134,31 @@ def _materialize(recipe: dict[str, object]) -> bytes:
             value = str(recipe["repeat"]) * int(recipe["count"])
         return value.encode("utf-8")
     raise AssertionError(f"unsupported test recipe encoding: {encoding}")
+
+
+def _materialize_package(recipe: dict[str, Any]) -> list[tuple[str, bytes]]:
+    assert recipe["kind"] == "packageFiles"
+    files: list[tuple[str, bytes]] = []
+    for item in recipe["files"]:
+        files.append((item["path"], _materialize(item["content"])))
+    for group in recipe["generatedFiles"]:
+        for index in range(group["startIndex"], group["startIndex"] + group["count"]):
+            files.append((
+                group["pathTemplate"].format(index=index),
+                _materialize(group["content"]),
+            ))
+    return files
+
+
+def _materialize_catalog(recipe: dict[str, Any]) -> dict[str, Any]:
+    assert recipe["kind"] == "marketplaceIndex"
+    entries = []
+    for index in range(recipe["count"]):
+        entries.append({
+            key: value.format(index=index) if isinstance(value, str) else value
+            for key, value in recipe["entryTemplate"].items()
+        })
+    return {"schemaVersion": recipe["schemaVersion"], "packages": entries}
 
 
 def _composite_digest(files: list[tuple[str, bytes]]) -> str:
@@ -207,6 +255,16 @@ def test_package_manifest_rejects_unsupported_schema_version() -> None:
         WorkflowPackageManifest.model_validate({**valid_manifest(), "schemaVersion": 2})
 
 
+def test_public_manifest_rejects_internal_snake_case_field_names() -> None:
+    manifest = valid_manifest()
+    manifest["schema_version"] = manifest.pop("schemaVersion")
+    manifest["display_name"] = manifest.pop("displayName")
+    manifest["external_requirements"] = manifest.pop("externalRequirements")
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        WorkflowPackageManifest.model_validate(manifest)
+
+
 @pytest.mark.parametrize(
     "workflows",
     [
@@ -270,6 +328,68 @@ def test_digest_records_reject_malformed_or_ambiguous_content(mutate) -> None:
         WorkflowPackageDigests.model_validate(value)
 
 
+def test_package_paths_reject_non_nfc_text() -> None:
+    manifest = valid_manifest()
+    manifest["workflows"] = [{"definition": "workflows/cafe\u0301.yaml"}]
+
+    with pytest.raises(ValidationError, match="NFC"):
+        WorkflowPackageManifest.model_validate(manifest)
+
+
+def test_package_manifest_rejects_casefold_member_collisions() -> None:
+    manifest = valid_manifest()
+    manifest["workflows"] = [
+        {"definition": "workflows/Report.yaml"},
+        {"definition": "workflows/report.yaml"},
+    ]
+
+    with pytest.raises(ValidationError, match="alias"):
+        WorkflowPackageManifest.model_validate(manifest)
+
+
+def test_package_digests_reject_casefold_path_collisions() -> None:
+    digests = valid_digests()
+    digests["files"] = [
+        {"path": "workflows/Report.yaml", "size": 1, "sha256": SHA256_A},
+        {"path": "workflows/report.yaml", "size": 1, "sha256": SHA256_B},
+    ]
+
+    with pytest.raises(ValidationError, match="unique"):
+        WorkflowPackageDigests.model_validate(digests)
+
+
+def test_marketplace_index_rejects_casefold_and_nested_package_roots() -> None:
+    first = valid_index()["packages"][0]
+    case_collision = {
+        "schemaVersion": 1,
+        "packages": [
+            {**first, "id": "first", "packagePath": "packages/Example"},
+            {**first, "id": "second", "packagePath": "packages/example"},
+        ],
+    }
+    nested = {
+        "schemaVersion": 1,
+        "packages": [
+            {**first, "id": "first", "packagePath": "packages/example"},
+            {**first, "id": "second", "packagePath": "packages/example/child"},
+        ],
+    }
+
+    with pytest.raises(ValidationError, match="unique"):
+        WorkflowPackageIndex.model_validate(case_collision)
+    with pytest.raises(ValidationError, match="nested"):
+        WorkflowPackageIndex.model_validate(nested)
+
+    siblings = {
+        "schemaVersion": 1,
+        "packages": [
+            {**first, "id": "first", "packagePath": "packages/example"},
+            {**first, "id": "second", "packagePath": "packages/example-child"},
+        ],
+    }
+    assert len(WorkflowPackageIndex.model_validate(siblings).packages) == 2
+
+
 def test_marketplace_public_review_and_request_models_are_strict() -> None:
     assessment = PackageReviewAssessment.model_validate({
         "packageDigest": SHA256_A,
@@ -286,6 +406,38 @@ def test_marketplace_public_review_and_request_models_are_strict() -> None:
             "identifier": "company/laptop-support",
             "accessToken": "must-not-cross-the-boundary",
         })
+
+
+@pytest.mark.parametrize(
+    "repository_url",
+    [
+        "https://token@example.com/company/workflows.git",
+        "https://example.com/company/workflows.git?access_token=secret",
+        "https://example.com/company/workflows.git?apiKey=secret",
+    ],
+)
+@pytest.mark.parametrize("model_name", ["source", "direct_install", "provenance"])
+def test_persistable_repository_identities_reject_embedded_credentials(
+    repository_url: str,
+    model_name: str,
+) -> None:
+    if model_name == "source":
+        model = WorkflowMarketplaceSource
+        value = {
+            "name": "company",
+            "repositoryUrl": repository_url,
+            "ref": "main",
+            "enabled": True,
+        }
+    elif model_name == "direct_install":
+        model = InstallRequest
+        value = {"identifier": repository_url, "ref": "main"}
+    else:
+        model = InstalledPackageProvenance
+        value = {**valid_provenance(), "repositoryUrl": repository_url}
+
+    with pytest.raises(ValidationError, match="credentials"):
+        model.model_validate(value)
 
 
 def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
@@ -372,8 +524,53 @@ def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
             content = _materialize(recipe)
             assert len(content) == vector["expected"]["observed"]
             assert hashlib.sha256(content).hexdigest() == vector["expected"]["sha256"]
+        elif recipe["kind"] == "packageFiles":
+            files = _materialize_package(recipe)
+            paths = [path for path, _ in files]
+            assert len(paths) == len(set(paths))
+            for path in paths:
+                WorkflowPackageDigestRecord.model_validate({
+                    "path": path,
+                    "size": 0,
+                    "sha256": SHA256_A,
+                })
+
+            observed = {
+                "max_files": len(files),
+                "max_file_bytes": max(map(lambda item: len(item[1]), files)),
+                "max_total_bytes": sum(len(content) for _, content in files),
+            }
+            limits = load_package_contract().resource_rules
+            violations = {
+                name
+                for name, value in observed.items()
+                if value > getattr(limits, name)
+            }
+            expected_violations = (
+                set() if vector["expected"]["accepted"] else {vector["limit"]}
+            )
+            assert violations == expected_violations
+            assert observed[vector["limit"]] == vector["expected"]["observed"]
+        elif recipe["kind"] == "marketplaceIndex":
+            catalog = _materialize_catalog(recipe)
+            encoded_catalog = json.dumps(
+                catalog,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            assert (
+                len(encoded_catalog)
+                <= load_package_contract().resource_rules.max_index_bytes
+            )
+            if vector["expected"]["accepted"]:
+                parsed = WorkflowPackageIndex.model_validate(catalog)
+                assert len(parsed.packages) == vector["expected"]["observed"]
+            else:
+                with pytest.raises(ValidationError):
+                    WorkflowPackageIndex.model_validate(catalog)
+            assert len(catalog["packages"]) == vector["expected"]["observed"]
         else:
-            assert recipe["count"] == vector["expected"]["observed"]
+            raise AssertionError(f"unsupported boundary recipe: {recipe['kind']}")
 
 
 def test_generator_check_mode_and_argument_contract() -> None:
@@ -395,3 +592,23 @@ def test_generator_check_mode_and_argument_contract() -> None:
             check=False,
         )
         assert rejected.returncode != 0
+
+
+def test_generator_write_preserves_artifact_when_atomic_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "workflow-package-v1.json"
+    artifact.write_bytes(b"published contract\n")
+    original_entries = set(tmp_path.iterdir())
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("simulated interrupted replacement")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="interrupted replacement"):
+        contract_generator._write(artifact, b"new contract\n")
+
+    assert artifact.read_bytes() == b"published contract\n"
+    assert set(tmp_path.iterdir()) == original_entries

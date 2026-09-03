@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 from typing import Annotated, Any, Literal
+import unicodedata
+from urllib.parse import parse_qsl, urlparse
 
 from pydantic import (
     BaseModel,
@@ -31,6 +33,24 @@ CANONICAL_RELATIVE_PATH_PATTERN = r"^(?!/)(?!.*(?:^|/)\.\.?(/|$))(?!.*\\)(?!.*\x
 
 _SEMANTIC_VERSION = re.compile(SEMANTIC_VERSION_PATTERN, re.ASCII)
 _TAG = re.compile(TAG_PATTERN, re.ASCII)
+_CREDENTIAL_PARAMETER_PARTS = frozenset({
+    "auth",
+    "authorization",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "secret",
+    "signature",
+    "token",
+})
+_CREDENTIAL_PARAMETER_COMPACT_NAMES = frozenset({
+    "accesstoken",
+    "apikey",
+    "privatekey",
+    "secretkey",
+    "securitytoken",
+})
 
 BoundedText = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=256)]
@@ -48,7 +68,6 @@ class StrictMarketplaceModel(BaseModel):
         extra="forbid",
         frozen=True,
         strict=True,
-        populate_by_name=True,
     )
 
 
@@ -58,7 +77,31 @@ def _require_clean_text(value: str, *, label: str) -> str:
     return value
 
 
+def _require_credential_free_repository_identity(value: str) -> str:
+    value = _require_clean_text(value, label="repository identity")
+    try:
+        parsed = urlparse(value)
+    except ValueError as error:
+        raise ValueError("repository identity must be a valid URL") from error
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return value
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("repository identity must not contain credentials")
+    for parameters in (parsed.params, parsed.query, parsed.fragment):
+        for name, _ in parse_qsl(parameters, keep_blank_values=True):
+            parts = set(re.findall(r"[a-z0-9]+", name.casefold()))
+            compact_name = re.sub(r"[^a-z0-9]+", "", name.casefold())
+            if (
+                parts & _CREDENTIAL_PARAMETER_PARTS
+                or compact_name in _CREDENTIAL_PARAMETER_COMPACT_NAMES
+            ):
+                raise ValueError("repository identity must not contain credentials")
+    return value
+
+
 def _require_canonical_relative_path(value: str) -> str:
+    if unicodedata.normalize("NFC", value) != value:
+        raise ValueError("path must use NFC Unicode normalization")
     if (
         not value
         or value.startswith("/")
@@ -73,6 +116,27 @@ def _require_canonical_relative_path(value: str) -> str:
     if parts[0].endswith(":"):
         raise ValueError("path must be a canonical package-relative path")
     return value
+
+
+def _canonical_path_identity(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _paths_have_canonical_collision(values: list[str]) -> bool:
+    identities = [_canonical_path_identity(value) for value in values]
+    return len(identities) != len(set(identities))
+
+
+def _paths_have_segment_ancestry(values: list[str]) -> bool:
+    identities = {_canonical_path_identity(value) for value in values}
+    for child in identities:
+        segments = child.split("/")
+        if any(
+            "/".join(segments[:boundary]) in identities
+            for boundary in range(1, len(segments))
+        ):
+            return True
+    return False
 
 
 def _require_unique_text(values: list[str], *, label: str) -> list[str]:
@@ -110,7 +174,10 @@ class WorkflowMember(StrictMarketplaceModel):
 
     @model_validator(mode="after")
     def reject_self_alias(self) -> "WorkflowMember":
-        if self.companion == self.definition:
+        if self.companion is not None and _paths_have_canonical_collision([
+            self.definition,
+            self.companion,
+        ]):
             raise ValueError("workflow member path must not alias another member")
         return self
 
@@ -177,7 +244,7 @@ class WorkflowPackageManifest(StrictMarketplaceModel):
             for member in self.workflows
             if member.companion is not None
         )
-        if len(paths) != len(set(paths)):
+        if _paths_have_canonical_collision(paths):
             raise ValueError("workflow member path must not alias another member")
         return self
 
@@ -246,8 +313,10 @@ class WorkflowPackageIndex(StrictMarketplaceModel):
         if ids != sorted(ids):
             raise ValueError("marketplace package entries must be sorted by id")
         paths = [entry.package_path for entry in self.packages]
-        if len(paths) != len(set(paths)):
+        if _paths_have_canonical_collision(paths):
             raise ValueError("marketplace package paths must be unique")
+        if _paths_have_segment_ancestry(paths):
+            raise ValueError("marketplace package roots must not be nested")
         return self
 
 
@@ -282,7 +351,7 @@ class WorkflowPackageDigests(StrictMarketplaceModel):
     @model_validator(mode="after")
     def validate_order_and_identity(self) -> "WorkflowPackageDigests":
         paths = [record.path for record in self.files]
-        if len(paths) != len(set(paths)):
+        if _paths_have_canonical_collision(paths):
             raise ValueError("digest record paths must be unique")
         if paths != sorted(paths):
             raise ValueError("digest records must be sorted by path")
@@ -355,7 +424,12 @@ class WorkflowMarketplaceSource(StrictMarketplaceModel):
     ref: str | None = Field(default=None, min_length=1, max_length=1024)
     enabled: bool = True
 
-    @field_validator("repository_url", "ref")
+    @field_validator("repository_url")
+    @classmethod
+    def validate_repository_url(cls, value: str) -> str:
+        return _require_credential_free_repository_identity(value)
+
+    @field_validator("ref")
     @classmethod
     def validate_source_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -376,7 +450,12 @@ class InstallRequest(StrictMarketplaceModel):
         json_schema_extra={"pattern": CANONICAL_RELATIVE_PATH_PATTERN},
     )
 
-    @field_validator("identifier", "ref")
+    @field_validator("identifier")
+    @classmethod
+    def validate_identifier(cls, value: str) -> str:
+        return _require_credential_free_repository_identity(value)
+
+    @field_validator("ref")
     @classmethod
     def validate_request_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -439,6 +518,11 @@ class InstalledPackageProvenance(StrictMarketplaceModel):
         alias="workflowPaths", min_length=1, max_length=512
     )
 
+    @field_validator("repository_url")
+    @classmethod
+    def validate_repository_url(cls, value: str) -> str:
+        return _require_credential_free_repository_identity(value)
+
     @field_validator("package_path")
     @classmethod
     def validate_package_path(cls, value: str) -> str:
@@ -455,7 +539,7 @@ class InstalledPackageProvenance(StrictMarketplaceModel):
     @classmethod
     def validate_workflow_paths(cls, value: list[str]) -> list[str]:
         paths = [_require_canonical_relative_path(path) for path in value]
-        if len(paths) != len(set(paths)):
+        if _paths_have_canonical_collision(paths):
             raise ValueError("workflow paths must be unique")
         return paths
 
