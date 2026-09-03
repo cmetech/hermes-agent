@@ -51,6 +51,23 @@ def _spec() -> HandoffSpec:
     )
 
 
+def _conversation_spec() -> HandoffSpec:
+    return HandoffSpec(
+        mode="conversation",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="Review this change.",
+        output_schema=None,
+        deadline_at=datetime(2026, 9, 2, tzinfo=UTC),
+        attribution={"sender": "default"},
+        required_capabilities=frozenset(),
+        return_route={
+            "kind": "operator",
+            "profile": "default",
+            "inbox_id": "desktop-inbox-1",
+        },
+    )
+
+
 class _Crash(BaseException):
     pass
 
@@ -630,6 +647,46 @@ def test_repeated_terminal_advance_is_an_idempotent_noop(tmp_path):
 
     assert repeated.snapshot == terminal
     assert repeated.operation is None
+    assert channel.calls == []
+
+
+def test_acknowledge_is_local_idempotent_and_preserves_transport_truth(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    channel = FakeChannel()
+    service = AgentHandoffService(store=store, channel=channel)
+    snapshot = service.create(
+        _conversation_spec(), "operator/default", handoff_key="desktop-1"
+    )
+    lease = store.claim_advance(
+        snapshot.handoff_id,
+        "worker",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    terminal = store.commit_observation(
+        lease, ChannelObservation(phase="failed", failure_code="remote_failed")
+    )
+    attention = store.attention(snapshot.handoff_id, limit=1)
+    assert len(attention) == 1
+    assert attention[0].method == "attention"
+    assert attention[0].state == "delivered"
+
+    first = service.command(
+        snapshot.handoff_id,
+        "acknowledge",
+        command_id="ack-1",
+        actor="operator",
+    )
+    second = service.command(
+        snapshot.handoff_id,
+        "acknowledge",
+        command_id="ack-1",
+        actor="operator",
+    )
+
+    assert first == second == terminal
+    assert store.attention(snapshot.handoff_id, limit=10) == ()
     assert channel.calls == []
 
 

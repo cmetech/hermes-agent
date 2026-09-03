@@ -540,7 +540,9 @@ class AgentHandoffService:
         text: str | None = None,
         correlation_id: str | None = None,
     ) -> HandoffSnapshot:
-        if kind not in {"cancel", "message", "reconcile", "respond", "steer"}:
+        if kind not in {
+            "acknowledge", "cancel", "message", "reconcile", "respond", "steer",
+        }:
             raise UnsupportedHandoffCommand(kind)
         values = {
             "request_id": request_id,
@@ -549,6 +551,7 @@ class AgentHandoffService:
             "correlation_id": correlation_id,
         }
         expected = {
+            "acknowledge": set(),
             "cancel": set(),
             "reconcile": set(),
             "respond": {"request_id", "choice"},
@@ -558,6 +561,10 @@ class AgentHandoffService:
         supplied = {name for name, value in values.items() if value is not None}
         if supplied != expected:
             raise ValueError("handoff command arguments are invalid")
+
+        if kind == "acknowledge":
+            self.store.acknowledge(handoff_id, actor=actor)
+            return self.store.get(handoff_id)
 
         payload = {"actor": actor, **{key: values[key] for key in expected}}
         try:

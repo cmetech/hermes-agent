@@ -55,6 +55,23 @@ def _conversation_spec() -> HandoffSpec:
     )
 
 
+def _prepare_conversation(store: HandoffStore):
+    spec = _conversation_spec()
+    snapshot = store.create_or_get(
+        "bot/default/session-1", "call-1", spec, spec.fingerprint
+    )
+    snapshot = store.bind(
+        snapshot.handoff_id,
+        "local_runs",
+        {"profile": "reviewer", "mechanism": "local_runs"},
+        {},
+        snapshot.state_version,
+    )
+    lease = _claim(store, snapshot.handoff_id)
+    store.journal_attempt(lease, "submit")
+    return snapshot, lease
+
+
 def _create(store: HandoffStore, key: str = "node/review"):
     spec = _spec()
     return store.create_or_get("workflow/run-1", key, spec, spec.fingerprint)
@@ -125,6 +142,309 @@ def test_task_spec_serialization_omits_absent_return_route(tmp_path):
 
     assert "return_route" not in json.loads(raw)
     assert store.get(created.handoff_id).spec.fingerprint == _spec().fingerprint
+
+
+def test_v1_database_migrates_to_v2_without_losing_rows(tmp_path):
+    path = tmp_path / "handoffs.db"
+    legacy = HandoffStore(path)
+    snapshot = _create(legacy)
+    legacy.record_command(
+        snapshot.handoff_id, "reconcile-1", "reconcile", {"actor": "operator"}
+    )
+    legacy.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE IF EXISTS handoff_deliveries")
+        conn.execute("PRAGMA user_version=1")
+
+    migrated = HandoffStore(path)
+
+    assert migrated.get(snapshot.handoff_id).handoff_id == snapshot.handoff_id
+    assert migrated.get_command(snapshot.handoff_id, "reconcile-1").kind == "reconcile"
+    assert [
+        event.kind
+        for event in migrated.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=10
+        ).events
+    ] == ["created", "reconcile_requested"]
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='handoff_deliveries'"
+        ).fetchone() == ("handoff_deliveries",)
+    migrated.close()
+
+    reopened = HandoffStore(path)
+    assert reopened.get(snapshot.handoff_id).handoff_id == snapshot.handoff_id
+
+
+def test_future_database_version_is_rejected(tmp_path):
+    path = tmp_path / "handoffs.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA user_version=99")
+
+    with pytest.raises(store_module.HandoffStoreError, match="unsupported.*99"):
+        HandoffStore(path)
+
+
+def test_v1_migration_rolls_back_schema_and_version_together(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    store.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE handoff_deliveries")
+        conn.execute("PRAGMA user_version=1")
+    monkeypatch.setattr(
+        store_module,
+        "_SCHEMA",
+        (*store_module._SCHEMA, "this is not valid SQL"),
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        HandoffStore(path)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='handoff_deliveries'"
+        ).fetchone() is None
+
+
+@pytest.mark.parametrize(
+    ("phase", "failure_code", "terminal_result"),
+    [
+        ("needs_input", None, None),
+        ("indeterminate", "observation_indeterminate", None),
+        ("succeeded", None, _result("private result")),
+        ("failed", "remote_failed", None),
+        ("cancelled", None, None),
+    ],
+)
+def test_attention_observation_creates_one_redacted_delivery(
+    tmp_path, phase, failure_code, terminal_result
+):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    snapshot, lease = _prepare_conversation(store)
+    observation = ChannelObservation(
+        phase=phase,
+        checkpoint={"status": phase},
+        failure_code=failure_code,
+        terminal_result=terminal_result,
+    )
+
+    observed = store.commit_observation(lease, observation)
+    replayed = store.commit_observation(lease, observation)
+    deliveries = store.attention(snapshot.handoff_id, limit=10)
+
+    assert replayed == observed
+    assert len(deliveries) == 1
+    assert deliveries[0].handoff_id == snapshot.handoff_id
+    assert deliveries[0].route == _conversation_spec().return_route
+    assert deliveries[0].event_sequence == store.evidence(
+        snapshot.handoff_id, after_sequence=0, limit=100
+    ).events[-1].sequence
+    with sqlite3.connect(path) as conn:
+        raw = repr(conn.execute("SELECT * FROM handoff_deliveries").fetchall())
+    assert "private result" not in raw
+
+
+def test_task_observation_never_creates_a_return_delivery(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot = _create(store)
+    lease = _claim(store, snapshot.handoff_id)
+
+    store.commit_observation(
+        lease, ChannelObservation(phase="failed", failure_code="remote_failed")
+    )
+
+    assert store.attention(snapshot.handoff_id, limit=10) == ()
+
+
+def test_observation_and_return_delivery_are_one_transaction(tmp_path):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    snapshot, lease = _prepare_conversation(store)
+    before = store.get(snapshot.handoff_id)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_delivery BEFORE INSERT ON handoff_deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'injected delivery failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected delivery failure"):
+        store.commit_observation(
+            lease,
+            ChannelObservation(phase="failed", failure_code="remote_failed"),
+        )
+
+    assert store.get(snapshot.handoff_id) == before
+    assert store.attention(snapshot.handoff_id, limit=10) == ()
+
+
+def test_delivery_claim_release_completion_is_fenced_and_restart_safe(tmp_path):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    snapshot, handoff_lease = _prepare_conversation(store)
+    store.commit_observation(
+        handoff_lease,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("private result")
+        ),
+    )
+    due = store.due_deliveries(now=datetime.now(UTC), limit=10)
+    assert len(due) == 1
+    first = store.claim_delivery(
+        due[0].delivery_id,
+        "publisher-1",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert first is not None
+    assert store.claim_delivery(
+        due[0].delivery_id,
+        "publisher-2",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    ) is None
+    store.close()
+
+    restarted = HandoffStore(path)
+    takeover = restarted.claim_delivery(
+        due[0].delivery_id,
+        "publisher-2",
+        now=first.expires_at,
+        lease_seconds=30,
+    )
+    assert takeover is not None
+    assert takeover.epoch == first.epoch + 1
+    with pytest.raises(StaleAdvanceLease):
+        restarted.complete_delivery(first)
+    retry_at = datetime.now(UTC) + timedelta(seconds=5)
+    released = restarted.release_delivery(
+        takeover,
+        next_attempt_at=retry_at,
+        failure_code="publish_failed",
+    )
+    assert released.state == "pending"
+    assert released.failure_code == "publish_failed"
+    assert restarted.due_deliveries(now=datetime.now(UTC), limit=10) == ()
+    retry = restarted.claim_delivery(
+        due[0].delivery_id,
+        "publisher-3",
+        now=retry_at,
+        lease_seconds=30,
+    )
+    assert retry is not None
+    completed = restarted.complete_delivery(retry)
+    assert completed.state == "delivered"
+    assert restarted.due_deliveries(now=retry_at, limit=10) == ()
+
+
+def test_delivery_retry_limit_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "_MAX_DELIVERY_ATTEMPTS", 1)
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, handoff_lease = _prepare_conversation(store)
+    store.commit_observation(
+        handoff_lease,
+        ChannelObservation(phase="failed", failure_code="remote_failed"),
+    )
+    delivery = store.due_deliveries(now=datetime.now(UTC), limit=1)[0]
+    lease = store.claim_delivery(
+        delivery.delivery_id,
+        "publisher",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+
+    failed = store.release_delivery(
+        lease,
+        next_attempt_at=datetime.now(UTC),
+        failure_code="publish_failed",
+    )
+
+    assert failed.state == "failed"
+    assert store.due_deliveries(now=datetime.now(UTC), limit=1) == ()
+    assert len(store.attention(snapshot.handoff_id, limit=10)) == 1
+
+
+def test_expired_final_delivery_attempt_is_marked_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "_MAX_DELIVERY_ATTEMPTS", 1)
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, handoff_lease = _prepare_conversation(store)
+    store.commit_observation(
+        handoff_lease,
+        ChannelObservation(phase="failed", failure_code="remote_failed"),
+    )
+    delivery = store.due_deliveries(now=datetime.now(UTC), limit=1)[0]
+    lease = store.claim_delivery(
+        delivery.delivery_id,
+        "crashed-publisher",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+
+    assert store.claim_delivery(
+        delivery.delivery_id,
+        "restarted-publisher",
+        now=lease.expires_at,
+        lease_seconds=30,
+    ) is None
+
+    failed = store.get_delivery(delivery.delivery_id)
+    assert failed.state == "failed"
+    assert failed.failure_code == "delivery_attempts_exhausted"
+    assert store.attention(snapshot.handoff_id, limit=1) == (failed,)
+
+
+def test_delivery_can_fail_closed_without_clearing_attention(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, handoff_lease = _prepare_conversation(store)
+    store.commit_observation(
+        handoff_lease,
+        ChannelObservation(phase="failed", failure_code="remote_failed"),
+    )
+    delivery = store.due_deliveries(now=datetime.now(UTC), limit=1)[0]
+    lease = store.claim_delivery(
+        delivery.delivery_id,
+        "publisher",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+
+    failed = store.fail_delivery(lease, failure_code="wake_unavailable")
+
+    assert failed.state == "failed"
+    assert failed.failure_code == "wake_unavailable"
+    assert store.attention(snapshot.handoff_id, limit=10) == (failed,)
+
+
+def test_acknowledgement_clears_attention_without_changing_delivery_truth(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, lease = _prepare_conversation(store)
+    terminal = store.commit_observation(
+        lease, ChannelObservation(phase="failed", failure_code="remote_failed")
+    )
+    delivery = store.attention(snapshot.handoff_id, limit=1)[0]
+
+    acknowledged = store.acknowledge(snapshot.handoff_id, actor="operator")
+
+    assert acknowledged == 1
+    assert store.attention(snapshot.handoff_id, limit=10) == ()
+    assert store.get(snapshot.handoff_id) == terminal
+    assert store.get_delivery(delivery.delivery_id).state == delivery.state
+    assert store.get_delivery(delivery.delivery_id).acknowledged_at is not None
+    assert [
+        event.kind
+        for event in store.evidence(
+            snapshot.handoff_id, after_sequence=0, limit=100
+        ).events
+    ][-1] == "acknowledged"
+    assert store.acknowledge(snapshot.handoff_id, actor="operator") == 0
 
 
 def test_concurrent_creators_converge_on_one_handoff(tmp_path):
