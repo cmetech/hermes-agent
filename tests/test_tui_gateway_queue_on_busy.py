@@ -375,6 +375,87 @@ def test_handoff_return_poller_defers_ack_until_durable_turn_receipt(monkeypatch
     assert released == []
 
 
+def test_handoff_return_long_turn_uses_receipt_only_reclaims(monkeypatch):
+    from tools import process_registry as registry_module
+
+    event = {
+        "type": "handoff_return",
+        "delivery_id": "delivery-1",
+        "handoff_id": "handoff-1",
+        "profile": "default",
+        "session_id": "session-key",
+        "session_key": "session-key",
+        "tool_call_id": "call-1",
+        "hop_count": 0,
+        "delivery_claim": {},
+    }
+    claims = iter(["initial", "reclaimed", "receipt", "restarted"])
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: next(claims))
+    monkeypatch.setattr(
+        registry_module,
+        "format_process_notification",
+        lambda *_args, **_kwargs: "handoff finished",
+    )
+    monkeypatch.setattr(ad, "begin_handoff_return_delivery", lambda *_args: True)
+    monkeypatch.setattr(
+        ad,
+        "handoff_return_receipt_pending",
+        lambda claim: claim in {"reclaimed", "restarted"},
+    )
+    deferred = []
+    completed = []
+    released = []
+    monkeypatch.setattr(
+        ad, "defer_event_delivery_receipt", lambda _evt, claim: deferred.append(claim)
+    )
+    monkeypatch.setattr(
+        ad, "complete_event_delivery", lambda _evt, claim: completed.append(claim)
+    )
+    monkeypatch.setattr(
+        ad, "release_event_delivery", lambda _evt, claim: released.append(claim)
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    persisted = [False]
+    callbacks = []
+    starts = []
+
+    def _run(*_args, **kwargs):
+        starts.append("started")
+        callbacks.append(kwargs["terminal_callback"])
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _run)
+    db = types.SimpleNamespace(
+        has_platform_message_id=lambda _sid, _message_id: persisted[0]
+    )
+    session = _session(
+        agent=types.SimpleNamespace(session_id="session-key", _session_db=db)
+    )
+
+    assert server._dispatch_handoff_return("sid", session, event) is True
+    assert server._dispatch_handoff_return("sid", session, event) is True
+    assert starts == ["started"]
+    assert deferred == ["initial", "reclaimed"]
+
+    persisted[0] = True
+    callbacks[0]({"status": "settled", "text": "ok"})
+    assert server._dispatch_handoff_return("sid", session, event) is True
+
+    assert completed == ["receipt"]
+    assert released == []
+
+    event["delivery_id"] = "delivery-after-restart"
+    persisted[0] = False
+    restarted_session = _session(
+        agent=types.SimpleNamespace(session_id="session-key", _session_db=db)
+    )
+    assert (
+        server._dispatch_handoff_return("restarted", restarted_session, event) is False
+    )
+    assert starts == ["started"]
+    assert released == ["restarted"]
+
+
 def test_handoff_return_replay_acknowledges_without_running_model(monkeypatch):
     from tools import process_registry as registry_module
 

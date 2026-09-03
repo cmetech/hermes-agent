@@ -432,6 +432,39 @@ def test_receipt_pending_dispatch_stays_ordered_for_the_same_host(tmp_path):
     assert due[0].event_sequence > first.event_sequence
 
 
+def test_receipt_pending_dispatch_does_not_exhaust_long_turn_attempts(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    _snapshot, advance = _prepare_conversation(store)
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    delivery = store.due_deliveries(now=datetime.now(UTC), limit=1)[0]
+    lease = store.claim_delivery(
+        delivery.delivery_id,
+        "tui-process",
+        now=delivery.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert lease is not None
+    store.begin_delivery_dispatch(lease)
+    pending = store.defer_delivery_receipt(
+        lease,
+        next_attempt_at=datetime.now(UTC) + timedelta(seconds=2),
+    )
+
+    reclaim_at = pending.next_attempt_at
+    for _ in range(10):
+        lease = store.claim_delivery(
+            delivery.delivery_id,
+            "tui-process",
+            now=reclaim_at,
+            lease_seconds=30,
+        )
+        assert lease is not None
+        reclaim_at = lease.expires_at
+
+    assert store.get_delivery(delivery.delivery_id).attempts == 1
+    assert store.complete_delivery(lease).state == "delivered"
+
+
 def test_receipt_pending_dispatch_is_reconciled_by_a_restarted_host(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot, advance = _prepare_conversation(store)

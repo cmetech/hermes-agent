@@ -349,6 +349,7 @@ import json
 import os
 import queue
 import sys
+import threading
 
 from hermes_cli.handoff.supervisor import create_agent_handoff_supervisor
 import hermes_cli.handoff.supervisor as supervisor_module
@@ -389,6 +390,7 @@ else:
         "session_key": "bot-session-1",
         "profile_home": str(home),
         "_finalized": False,
+        "history_lock": threading.Lock(),
     }
     server._hermes_home = home
     assert server._session_owns_notification_event("reconnected", session, event)

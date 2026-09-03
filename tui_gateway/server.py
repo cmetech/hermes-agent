@@ -11945,10 +11945,13 @@ def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
         begin_handoff_return_delivery,
         claim_event_delivery,
         complete_event_delivery,
+        defer_event_delivery_receipt,
+        handoff_return_receipt_pending,
         release_event_delivery,
     )
     from tools.process_registry import format_process_notification
 
+    delivery_id = str(evt.get("delivery_id") or "")
     claim = claim_event_delivery(evt, "tui-poller")
     if claim is None:
         return False
@@ -11958,29 +11961,56 @@ def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
         return False
     if _handoff_return_persisted(session, evt):
         complete_event_delivery(evt, claim)
+        with session["history_lock"]:
+            if session.get("_handoff_return_inflight") == delivery_id:
+                session.pop("_handoff_return_inflight", None)
         return True
+    receipt_recovery = handoff_return_receipt_pending(claim)
+    with session["history_lock"]:
+        delivery_inflight = (
+            session.get("_handoff_return_inflight") == delivery_id
+        )
+    if receipt_recovery:
+        if delivery_inflight:
+            defer_event_delivery_receipt(evt, claim)
+            return True
+        release_event_delivery(evt, claim)
+        return False
     if not begin_handoff_return_delivery(claim):
         try:
             release_event_delivery(evt, claim)
         except Exception:
             logger.debug("could not release superseded handoff return", exc_info=True)
         return False
+    with session["history_lock"]:
+        session["_handoff_return_inflight"] = delivery_id
     _emit("status.update", sid, {"kind": "process", "text": text})
 
     settled = False
+    receipt_deferred = False
+    receipt_lock = threading.Lock()
+
+    def _clear_inflight() -> None:
+        with session["history_lock"]:
+            if session.get("_handoff_return_inflight") == delivery_id:
+                session.pop("_handoff_return_inflight", None)
 
     def _receipt(_outcome: dict) -> None:
         nonlocal settled
-        if settled:
-            return
-        settled = True
         try:
-            if _handoff_return_persisted(session, evt):
-                complete_event_delivery(evt, claim)
-            else:
-                release_event_delivery(evt, claim)
+            with receipt_lock:
+                if settled:
+                    return
+                settled = True
+                if not receipt_deferred:
+                    if _handoff_return_persisted(session, evt):
+                        complete_event_delivery(evt, claim)
+                    else:
+                        release_event_delivery(evt, claim)
         except Exception:
             logger.warning("handoff return receipt update failed", exc_info=True)
+        finally:
+            _clear_inflight()
 
     metadata = _handoff_return_display_metadata(evt)
     started = _run_prompt_submit(
@@ -11994,9 +12024,17 @@ def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
         handoff_return_hop_count=metadata["hop_count"],
         terminal_callback=_receipt,
     )
-    if not started and not settled:
-        settled = True
-        release_event_delivery(evt, claim)
+    with receipt_lock:
+        if not started and not settled:
+            settled = True
+            release_event_delivery(evt, claim)
+            _clear_inflight()
+        elif started and not settled:
+            try:
+                defer_event_delivery_receipt(evt, claim)
+                receipt_deferred = True
+            except Exception:
+                logger.warning("handoff return receipt deferral failed", exc_info=True)
     return bool(started)
 
 
