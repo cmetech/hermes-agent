@@ -263,6 +263,53 @@ def test_installed_distribution_contains_complete_sharepoint_connector(
 
 
 @pytest.mark.integration
+def test_installed_distribution_exposes_deterministic_workflow_schema_corpus(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, env, _wheels = installed_distribution
+    command = [
+        sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "workflow",
+        "schema-corpus",
+        "--profile",
+        "archon-2026-07",
+        "--json",
+    ]
+
+    first = subprocess.run(
+        command,
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+    second = subprocess.run(
+        command,
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert first.returncode == second.returncode == 0, first.stderr.decode("utf-8")
+    assert first.stderr == second.stderr == b""
+    assert first.stdout == second.stdout
+    assert len(first.stdout) <= 160_001
+    corpus = json.loads(first.stdout.decode("utf-8"))
+    assert corpus["format_version"] == 1
+    assert corpus["profile"] == "archon-2026-07"
+    assert corpus["normalizer_version"] == 6
+    assert corpus["contract"]["normalizer"] == (
+        "plugins.workflow.language.normalize_workflow"
+    )
+    assert corpus["contract"]["contract_digest"].startswith("sha256:")
+    assert (site / "plugins/workflow/language_conformance.py").is_file()
+
+
+@pytest.mark.integration
 def test_installed_distribution_runs_sealed_openai_credential_transaction(
     tmp_path: Path,
     installed_distribution,

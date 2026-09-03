@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Callable
 
+from plugins.workflow.language_conformance import workflow_language_conformance
 from plugins.workflow.language_schema import workflow_authoring_contract
 from plugins.workflow.models import WorkflowLanguageProfile
 
@@ -19,18 +21,29 @@ def configure_schema_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Emit stable JSON output")
 
 
+def emit_authoring_json(
+    args: argparse.Namespace,
+    producer: Callable[[WorkflowLanguageProfile], dict[str, object]],
+) -> int:
+    """Emit one deterministic authoring-data envelope."""
+    payload = producer(WorkflowLanguageProfile(args.profile))
+    print(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":") if args.json else None,
+            indent=None if args.json else 2,
+        )
+    )
+    return 0
+
+
 def emit_schema(args: argparse.Namespace) -> int:
     """Emit one deterministic workflow authoring contract."""
-    contract = workflow_authoring_contract(WorkflowLanguageProfile(args.profile))
-    if args.json:
-        print(
-            json.dumps(
-                contract,
-                sort_keys=True,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-    else:
-        print(json.dumps(contract, sort_keys=True, ensure_ascii=False, indent=2))
-    return 0
+    return emit_authoring_json(args, workflow_authoring_contract)
+
+
+def emit_schema_corpus(args: argparse.Namespace) -> int:
+    """Emit one deterministic workflow authoring conformance corpus."""
+    return emit_authoring_json(args, workflow_language_conformance)
