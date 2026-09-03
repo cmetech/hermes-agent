@@ -10,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
 from plugins.platforms.raft.adapter import (
     ACTIVITY_DRAIN_SCHEMA,
     ACTIVITY_EVENT_SCHEMA,
@@ -37,7 +38,7 @@ from plugins.platforms.raft.adapter import (
     interactive_setup,
     register,
 )
-from gateway.session import build_session_key
+from gateway.session import SessionSource, build_session_key
 
 RAFT_CHANNEL_SCHEMA = "raft-channel-wake.v1"
 FUTURE_RAFT_CHANNEL_SCHEMA = "raft-channel-wake.v2"
@@ -117,6 +118,50 @@ class TestRaftWakeHttp:
 
         assert body == {"ok": False, "error": "content_not_allowed"}
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handoff_return_uses_shared_busy_queue_boundary(self):
+        adapter = _make_adapter()
+        adapter.set_message_handler(AsyncMock())
+        source = SessionSource(
+            platform=Platform("raft"),
+            chat_id="default",
+            chat_type="dm",
+            user_id="raft-bridge",
+            profile="default",
+        )
+        session_key = build_session_key(source)
+        adapter._active_sessions[session_key] = asyncio.Event()
+        older = MessageEvent(
+            text="older return",
+            source=source,
+            internal=True,
+            message_id="delivery-old",
+            allow_gateway_control=False,
+        )
+        adapter._pending_messages[session_key] = older
+
+        async def reject_at_capacity(event, key):
+            assert key == session_key
+            event._gateway_queue_backpressure = True
+            return True
+
+        busy_handler = AsyncMock(side_effect=reject_at_capacity)
+        adapter.set_busy_session_handler(busy_handler)
+        newer = MessageEvent(
+            text="newer return",
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            message_id="delivery-new",
+            allow_gateway_control=False,
+        )
+
+        await adapter.handle_message(newer)
+
+        busy_handler.assert_awaited_once_with(newer, session_key)
+        assert newer._gateway_queue_backpressure is True
+        assert adapter._pending_messages[session_key] is older
 
 
 class TestRaftActivityHttp:
@@ -217,4 +262,3 @@ class TestRaftConfig:
         assert env_path.read_text(encoding="utf-8") == "RAFT_PROFILE=existing\n"
         assert os.environ["RAFT_PROFILE"] == "existing"
         assert "Keeping RAFT_PROFILE=existing" in capsys.readouterr().out
-
