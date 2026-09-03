@@ -319,7 +319,9 @@ def message_agent_tool(
         return _err(
             "Target is ambiguous; use one of: " + ", ".join(exc.choices) + "."
         )
-    except (LookupError, ValueError):
+    except ValueError:
+        return _err("Agent handoff target configuration is invalid.")
+    except LookupError:
         resolved_target = None
 
     if resolved_target is not None and resolved_target.endpoint is not None:

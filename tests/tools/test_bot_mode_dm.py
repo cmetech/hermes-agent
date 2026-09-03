@@ -254,6 +254,33 @@ def test_unregistered_peer_rejected(tmp_path):
     assert result["peers"] == ["spark"]
 
 
+@pytest.mark.parametrize(
+    "target", ["researcher", "spark/reviewer", "spark", "reviewer@cloud"]
+)
+def test_malformed_agent_directory_cannot_fall_back_to_legacy_delivery(
+    tmp_path, monkeypatch, target
+):
+    home = _managed_home(
+        tmp_path, teammates=("researcher",), peers=("spark",)
+    )
+    (home / "config.yaml").write_text(
+        "handoff:\n  agents:\n    reviewer:\n"
+        "      default: hermes://local/researcher\n",
+        encoding="utf-8",
+    )
+    calls = _capture_spawn(monkeypatch)
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target=target, message="review this", agent=agent
+        )
+    )
+
+    assert result["error"] == "Agent handoff target configuration is invalid."
+    assert calls == []
+
+
 # ── delivery command shape ───────────────────────────────────────────────────
 
 
