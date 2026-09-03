@@ -99,6 +99,47 @@ def test_submit_retries_with_identical_canonical_body_and_bounded_key(monkeypatc
         _client().submit(handoff_id="x" * 250, prompt="x")
 
 
+def test_canonical_bot_chat_session_is_reused_or_created_with_valid_id(monkeypatch):
+    requests = []
+    responses = iter([
+        _Response(b'{"data":[]}'),
+        _Response(b'{"session":{"id":"session-1"}}'),
+        _Response(b'{"data":[{"id":"session-1","title":"Bot Chat"}]}'),
+    ])
+
+    def open_request(request, **_kwargs):
+        requests.append(request)
+        return next(responses)
+
+    monkeypatch.setattr(runs_module, "open_credentialed_url", open_request)
+    created = _client().ensure_session("Bot Chat", source="bot_handoff")
+    reused = _client().ensure_session("Bot Chat", source="bot_handoff")
+
+    assert created == reused == "session-1"
+    assert requests[0].full_url.endswith(
+        "/api/sessions?limit=200&title=Bot+Chat&include_hidden=1"
+    )
+    assert requests[1].data == b'{"source":"bot_handoff","title":"Bot Chat"}'
+    assert requests[1].get_method() == "POST"
+
+
+def test_session_resolution_rejects_invalid_listing_and_session_ids(monkeypatch):
+    responses = iter([
+        _Response(b'{"data":"not-a-list"}'),
+        _Response(b'{"data":[{"id":"bad/id","title":"Bot Chat"}]}'),
+    ])
+    monkeypatch.setattr(
+        runs_module,
+        "open_credentialed_url",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(ValueError, match="session listing"):
+        _client().find_session("Bot Chat")
+    with pytest.raises(ValueError, match="session_id"):
+        _client().find_session("Bot Chat")
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

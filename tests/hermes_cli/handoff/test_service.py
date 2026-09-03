@@ -1060,6 +1060,54 @@ def test_control_commands_are_closed_idempotent_and_phase_checked(tmp_path):
             command_id="future-1",
             actor="workflow",
         )
+
+
+def test_control_eligibility_uses_sealed_capabilities_not_peer_mechanism(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    channel = FakeChannel()
+    service = AgentHandoffService(store=store, channel=channel)
+    snapshot = service.create(_spec(), "workflow/run-1", handoff_key="local")
+    snapshot = store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {
+            "profile": "reviewer",
+            "mechanism": "runs",
+            "capabilities": [
+                "authoritative_status",
+                "cancellation",
+                "durable_admission",
+                "follow_up",
+            ],
+        },
+        {"run_id": "run-1", "status": "running"},
+        snapshot.state_version,
+    )
+    lease = store.claim_advance(
+        snapshot.handoff_id,
+        "worker",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    store.journal_attempt(lease, "submit")
+    active = store.commit_observation(
+        lease,
+        ChannelObservation(
+            phase="active", checkpoint={"run_id": "run-1", "status": "running"}
+        ),
+    )
+
+    service.command(
+        active.handoff_id,
+        "message",
+        command_id="message-1",
+        actor="workflow",
+        text="Check this.",
+        correlation_id="follow-up-1",
+    )
+
+    assert store.get_command(active.handoff_id, "message-1").kind == "message"
     with pytest.raises(ValueError):
         service.command(
             snapshot.handoff_id,

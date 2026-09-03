@@ -9,6 +9,7 @@ import threading
 
 import pytest
 
+import hermes_cli.handoff.peer as peer_module
 import hermes_cli.handoff.runs as runs_module
 from hermes_cli.handoff.models import HandoffEndpoint, HandoffSpec
 from hermes_cli.handoff.peer import PeerHermesChannel
@@ -18,6 +19,7 @@ from hermes_cli.handoff.service import (
     ChannelIndeterminate,
 )
 from hermes_cli.handoff.store import HandoffStore
+from hermes_cli.peers import ResolvedPeer
 
 
 PEER_KEY = "peer-api-key-0123456789abcdef"
@@ -170,15 +172,26 @@ def _write_peer(home: Path, url: str, *, key: str = PEER_KEY) -> None:
     (home / ".env").write_text(f"HERMES_PEER_SPARK_KEY={key}\n", encoding="utf-8")
 
 
-def _spec(*, capabilities=frozenset(), prompt="Review this change.") -> HandoffSpec:
+def _spec(
+    *, capabilities=frozenset(), prompt="Review this change.", mode="task"
+) -> HandoffSpec:
     return HandoffSpec(
-        mode="task",
+        mode=mode,
         endpoint=HandoffEndpoint.parse("hermes://peer/spark/reviewer"),
         prompt=prompt,
         output_schema=None,
         deadline_at=datetime(2026, 9, 3, tzinfo=timezone.utc),
         attribution={"workflow": "release-check", "node": "review"},
         required_capabilities=frozenset(capabilities),
+        return_route=(
+            {
+                "kind": "operator",
+                "profile": "default",
+                "inbox_id": "desktop-1",
+            }
+            if mode == "conversation"
+            else None
+        ),
     )
 
 
@@ -270,6 +283,123 @@ def test_bind_seals_only_capabilities_and_nonsecret_scope_digests(
     persisted = json.dumps({"binding": dict(bound.binding), "checkpoint": dict(bound.checkpoint)})
     assert PEER_KEY not in persisted
     assert peer_server not in persisted
+
+
+def test_legacy_peer_conversation_uses_bounded_dm_and_never_resends_ambiguity(
+    tmp_path, monkeypatch
+):
+    channel = PeerHermesChannel(tmp_path)
+    spec = _spec(mode="conversation")
+    service = AgentHandoffService(
+        store=HandoffStore(tmp_path / "handoffs.db"), channel=channel
+    )
+    created = service.create(spec, "bot/default/session-1", handoff_key="message-1")
+    resolved = ResolvedPeer(
+        name="spark",
+        profile="reviewer",
+        profile_base_url="https://peer.example.test/p/reviewer",
+        origin_sha256="a" * 64,
+        auth_scope_sha256="b" * 64,
+        key=PEER_KEY,
+    )
+    monkeypatch.setattr(channel, "_resolve", lambda *_args: (resolved, None))
+    monkeypatch.setattr(
+        peer_module,
+        "ensure_peer_bot_chat",
+        lambda *_args: "session-1",
+        raising=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        peer_module,
+        "peer_dm_request",
+        lambda _client, message, *, session_id: calls.append((message, session_id))
+        or {"session_id": session_id, "reply": "done"},
+        raising=False,
+    )
+
+    bound = channel.bind(created, budget_seconds=1)
+    snapshot = replace(
+        created,
+        mechanism=bound.mechanism,
+        binding=bound.binding,
+        checkpoint=bound.checkpoint,
+    )
+    completed = channel.submit(snapshot, budget_seconds=1)
+    ambiguous = channel.reconcile(
+        replace(snapshot, phase="indeterminate", failure_code="submission_indeterminate"),
+        budget_seconds=1,
+    )
+
+    assert bound.mechanism == "peer_dm"
+    assert bound.binding["capabilities"] == ()
+    assert bound.checkpoint == {"session_id": "session-1"}
+    assert completed.phase == "succeeded"
+    assert completed.terminal_result["text"] == "done"
+    assert ambiguous.phase == "indeterminate"
+    assert calls == [(spec.prompt, "session-1")]
+
+
+def test_controlled_peer_conversation_uses_bot_chat_run_session(
+    tmp_path, monkeypatch
+):
+    channel = PeerHermesChannel(tmp_path)
+    spec = _spec(mode="conversation", capabilities={"cancellation", "follow_up"})
+    service = AgentHandoffService(
+        store=HandoffStore(tmp_path / "handoffs.db"), channel=channel
+    )
+    created = service.create(spec, "bot/default/session-1", handoff_key="message-1")
+    resolved = ResolvedPeer(
+        name="spark",
+        profile="reviewer",
+        profile_base_url="https://peer.example.test/p/reviewer",
+        origin_sha256="a" * 64,
+        auth_scope_sha256="b" * 64,
+        key=PEER_KEY,
+    )
+    capabilities = frozenset({
+        "authoritative_status",
+        "cancellation",
+        "durable_admission",
+        "follow_up",
+        "steering",
+    })
+    monkeypatch.setattr(
+        channel, "_assess", lambda *_args: (resolved, capabilities, None)
+    )
+    monkeypatch.setattr(channel, "_resolve", lambda *_args: (resolved, None))
+    monkeypatch.setattr(
+        peer_module.RunsClient,
+        "ensure_session",
+        lambda *_args, **_kwargs: "session-1",
+    )
+    submitted = {}
+
+    def submit(_client, **kwargs):
+        submitted.update(kwargs)
+        return {
+            "run_id": "run-1",
+            "status": "started",
+            "idempotency_key": f"handoff-{created.handoff_id}",
+        }
+
+    monkeypatch.setattr(peer_module.RunsClient, "submit", submit)
+
+    bound = channel.bind(created, budget_seconds=1)
+    observation = channel.submit(
+        replace(
+            created,
+            mechanism=bound.mechanism,
+            binding=bound.binding,
+            checkpoint=bound.checkpoint,
+        ),
+        budget_seconds=1,
+    )
+
+    assert bound.mechanism == "peer_runs"
+    assert bound.checkpoint == {"session_id": "session-1"}
+    assert submitted["session_id"] == "session-1"
+    assert observation.checkpoint["session_id"] == "session-1"
 
 
 @pytest.mark.parametrize(

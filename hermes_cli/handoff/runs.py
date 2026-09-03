@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 import re
 from time import monotonic
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -19,6 +20,7 @@ MAX_RESPONSE_BYTES = 600_000
 MAX_RESULT_BYTES = 500_000
 _READ_CHUNK_BYTES = 64 * 1024
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
+_APPROVAL_CHOICES = ("once", "session", "always", "deny")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,34 @@ def _identifier(value: object, name: str) -> str:
     if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
         raise ValueError(f"Run {name} is invalid")
     return value
+
+
+def advertised_capabilities(
+    document: dict[str, object],
+) -> tuple[frozenset[str], str | None]:
+    features = document.get("features")
+    if not isinstance(features, dict) or features.get("run_submission") is not True:
+        return frozenset(), "run_submission_unavailable"
+    idempotency = features.get("runs_idempotency")
+    if (
+        not isinstance(idempotency, dict)
+        or idempotency.get("supported") is not True
+        or idempotency.get("durable") is not True
+    ):
+        return frozenset(), "runs_not_durable"
+    if features.get("run_status") is not True:
+        return frozenset(), "run_status_unavailable"
+    capabilities = {"authoritative_status", "durable_admission"}
+    if features.get("run_stop") is True:
+        capabilities.add("cancellation")
+    if (
+        features.get("run_approval_response") is True
+        and features.get("approval_events") is True
+    ):
+        capabilities.add("approval")
+    if features.get("run_steer") is True:
+        capabilities.update({"steering", "follow_up"})
+    return frozenset(capabilities), None
 
 
 def _direct_opener(redirect_handler):
@@ -122,6 +152,63 @@ class RunsClient:
         if not isinstance(value, dict):
             raise ValueError("Runs endpoint returned non-object JSON")
         return value
+
+    def find_session(self, title: str) -> str | None:
+        if (
+            not isinstance(title, str)
+            or not title
+            or title != title.strip()
+            or len(title.encode("utf-8")) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in title)
+        ):
+            raise ValueError("session title is invalid")
+        query = urllib.parse.urlencode({
+            "limit": 200,
+            "title": title,
+            "include_hidden": 1,
+        })
+        listing = self.request_json(f"/api/sessions?{query}")
+        rows = listing.get("data")
+        if not isinstance(rows, list):
+            raise ValueError("session listing is invalid")
+        for row in rows:
+            if isinstance(row, dict) and row.get("title") == title:
+                return _identifier(row.get("id"), "session_id")
+        return None
+
+    def ensure_session(self, title: str, *, source: str) -> str:
+        source = _identifier(source, "source")
+        existing = self.find_session(title)
+        if existing is not None:
+            return existing
+        try:
+            created = self.request_json(
+                "/api/sessions",
+                method="POST",
+                body={"title": title, "source": source},
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400 and (existing := self.find_session(title)) is not None:
+                return existing
+            raise
+        session = created.get("session")
+        if not isinstance(session, dict):
+            session = created
+        return _identifier(
+            session.get("id") or session.get("session_id"), "session_id"
+        )
+
+    def chat(self, session_id: str, message: str) -> dict[str, object]:
+        session_id = _identifier(session_id, "session_id")
+        response = self.request_json(
+            f"/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat",
+            method="POST",
+            body={"message": message},
+        )
+        actual = response.get("session_id")
+        if actual is not None:
+            _identifier(actual, "session_id")
+        return response
 
     def submit(
         self,
@@ -221,6 +308,25 @@ def observation_from_status(
     if not _SAFE_IDENTIFIER.fullmatch(status):
         raise ValueError("Run status is invalid")
     checkpoint["status"] = status
+    if status == "waiting_for_approval" and response.get("approval") is not None:
+        approval = response.get("approval")
+        if not isinstance(approval, dict):
+            raise ValueError("Run approval facts are missing")
+        choices = approval.get("choices")
+        if not isinstance(choices, list | tuple):
+            raise ValueError("Run approval choices are invalid")
+        normalized = [choice for choice in _APPROVAL_CHOICES if choice in choices]
+        checkpoint.update({
+            "approval_request_id": _identifier(
+                approval.get("request_id"), "approval request_id"
+            ),
+            "approval_choices": normalized,
+        })
+        if not normalized:
+            raise ValueError("Run approval facts are invalid")
+    else:
+        checkpoint.pop("approval_request_id", None)
+        checkpoint.pop("approval_choices", None)
 
     if status == "completed":
         return ChannelObservation(
@@ -255,3 +361,64 @@ def observation_from_status(
             failure_code="run_status_unknown",
         )
     return ChannelObservation(phase=phase, checkpoint=checkpoint)
+
+
+def deliver_run_command(
+    client: RunsClient, snapshot: HandoffSnapshot, command
+) -> tuple[str, str | None]:
+    run_id = str((snapshot.checkpoint or {}).get("run_id") or "")
+    if not run_id or command.kind not in {"respond", "steer", "message"}:
+        return "indeterminate", "command_delivery_indeterminate"
+
+    if command.delivery_state == "attempted":
+        if command.kind == "respond":
+            return _reconcile_approval(client, run_id, command)
+        try:
+            client.status(run_id)
+        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+            pass
+        return "indeterminate", "guidance_delivery_indeterminate"
+
+    if command.kind == "respond":
+        try:
+            response = client.approve(
+                run_id,
+                request_id=str(command.payload["request_id"]),
+                choice=str(command.payload["choice"]),
+            )
+        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+            return _reconcile_approval(client, run_id, command)
+        if (
+            response.get("request_id") != command.payload["request_id"]
+            or response.get("choice") != command.payload["choice"]
+        ):
+            return _reconcile_approval(client, run_id, command)
+        return "delivered", None
+
+    try:
+        response = client.steer(run_id, str(command.payload["text"]))
+    except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+        return "indeterminate", "guidance_delivery_indeterminate"
+    if response.get("accepted") is not True:
+        return "indeterminate", "guidance_delivery_indeterminate"
+    return "delivered", None
+
+
+def _reconcile_approval(
+    client: RunsClient, run_id: str, command
+) -> tuple[str, str | None]:
+    try:
+        response = client.status(run_id)
+    except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
+        return "indeterminate", "approval_response_indeterminate"
+    approval = response.get("approval")
+    still_pending = (
+        response.get("status") == "waiting_for_approval"
+        and isinstance(approval, dict)
+        and approval.get("request_id") == command.payload["request_id"]
+    )
+    return (
+        ("indeterminate", "approval_response_indeterminate")
+        if still_pending
+        else ("delivered", None)
+    )

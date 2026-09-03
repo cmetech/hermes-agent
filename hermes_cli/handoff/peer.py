@@ -5,14 +5,22 @@ from __future__ import annotations
 from pathlib import Path
 import urllib.error
 
-from hermes_cli.peers import ResolvedPeer, resolve_peer
+from hermes_cli.peers import (
+    ResolvedPeer,
+    ensure_peer_bot_chat,
+    peer_dm_request,
+    resolve_peer,
+)
 
 from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot
 from .runs import (
     RunsClient,
     RunsConnection,
     RunsDeadline,
+    advertised_capabilities,
+    deliver_run_command,
     observation_from_status,
+    terminal_result,
 )
 from .service import (
     ChannelDefinitelyNotAccepted,
@@ -20,7 +28,6 @@ from .service import (
     ChannelRetryableFailure,
     EndpointAssessment,
 )
-from .store import CommandRecord
 
 
 _BASE_CAPABILITIES = frozenset({
@@ -28,7 +35,6 @@ _BASE_CAPABILITIES = frozenset({
     "cancellation",
     "durable_admission",
 })
-_APPROVAL_CHOICES = ("once", "session", "always", "deny")
 
 
 def _failure_code(exc: urllib.error.HTTPError) -> str:
@@ -37,33 +43,6 @@ def _failure_code(exc: urllib.error.HTTPError) -> str:
     if exc.code == 404:
         return "peer_profile_not_found"
     return f"http_{int(exc.code)}"
-
-
-def _advertised_capabilities(document: dict[str, object]) -> tuple[frozenset[str], str | None]:
-    features = document.get("features")
-    if not isinstance(features, dict) or features.get("run_submission") is not True:
-        return frozenset(), "run_submission_unavailable"
-    idempotency = features.get("runs_idempotency")
-    if (
-        not isinstance(idempotency, dict)
-        or idempotency.get("supported") is not True
-        or idempotency.get("durable") is not True
-    ):
-        return frozenset(), "runs_not_durable"
-    if features.get("run_status") is not True:
-        return frozenset(), "run_status_unavailable"
-
-    capabilities = {"authoritative_status", "durable_admission"}
-    if features.get("run_stop") is True:
-        capabilities.add("cancellation")
-    if (
-        features.get("run_approval_response") is True
-        and features.get("approval_events") is True
-    ):
-        capabilities.add("approval")
-    if features.get("run_steer") is True:
-        capabilities.update({"steering", "follow_up"})
-    return frozenset(capabilities), None
 
 
 class PeerHermesChannel:
@@ -107,7 +86,7 @@ class PeerHermesChannel:
             return None, frozenset(), _failure_code(exc)
         except (OSError, TimeoutError, ValueError):
             return None, frozenset(), "endpoint_unavailable"
-        capabilities, failure = _advertised_capabilities(document)
+        capabilities, failure = advertised_capabilities(document)
         return (resolved if failure is None else None), capabilities, failure
 
     def validate_endpoint(
@@ -127,11 +106,47 @@ class PeerHermesChannel:
     def bind(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
-        resolved, capabilities, failure = self._assess(
-            snapshot.spec.endpoint, RunsDeadline(budget_seconds)
+        deadline = RunsDeadline(budget_seconds)
+        legacy_conversation = (
+            snapshot.spec.mode == "conversation"
+            and not snapshot.spec.required_capabilities
         )
+        if legacy_conversation:
+            resolved, failure = self._resolve(snapshot.spec.endpoint)
+            capabilities = frozenset()
+        else:
+            resolved, capabilities, failure = self._assess(
+                snapshot.spec.endpoint, deadline
+            )
         if resolved is None:
             return ChannelObservation(phase="failed", failure_code=failure)
+        client = RunsClient(
+            RunsConnection(resolved.profile_base_url, resolved.key), deadline
+        )
+        if legacy_conversation:
+            try:
+                session_id = ensure_peer_bot_chat(client)
+            except urllib.error.HTTPError as exc:
+                return ChannelObservation(
+                    phase="failed", failure_code=_failure_code(exc)
+                )
+            except (OSError, TimeoutError, ValueError):
+                return ChannelObservation(
+                    phase="prepared", failure_code="endpoint_unavailable"
+                )
+            return ChannelObservation(
+                phase="prepared",
+                mechanism="peer_dm",
+                binding={
+                    "peer": resolved.name,
+                    "profile": resolved.profile,
+                    "mechanism": "peer_dm",
+                    "capabilities": [],
+                    "origin_sha256": resolved.origin_sha256,
+                    "auth_scope_sha256": resolved.auth_scope_sha256,
+                },
+                checkpoint={"session_id": session_id},
+            )
         required = _BASE_CAPABILITIES | (
             snapshot.spec.required_capabilities - {"structured_output"}
         )
@@ -139,6 +154,20 @@ class PeerHermesChannel:
             return ChannelObservation(
                 phase="failed", failure_code="capability_mismatch"
             )
+        checkpoint = {}
+        if snapshot.spec.mode == "conversation":
+            try:
+                checkpoint = {"session_id": client.ensure_session(
+                    "Bot Chat", source="bot_handoff"
+                )}
+            except urllib.error.HTTPError as exc:
+                return ChannelObservation(
+                    phase="failed", failure_code=_failure_code(exc)
+                )
+            except (OSError, TimeoutError, ValueError):
+                return ChannelObservation(
+                    phase="prepared", failure_code="endpoint_unavailable"
+                )
         return ChannelObservation(
             phase="prepared",
             mechanism="peer_runs",
@@ -150,6 +179,7 @@ class PeerHermesChannel:
                 "origin_sha256": resolved.origin_sha256,
                 "auth_scope_sha256": resolved.auth_scope_sha256,
             },
+            checkpoint=checkpoint,
         )
 
     def _bound_client(
@@ -175,10 +205,30 @@ class PeerHermesChannel:
         self, snapshot: HandoffSnapshot, deadline: RunsDeadline
     ) -> ChannelObservation:
         client = self._bound_client(snapshot, deadline)
+        session_id = str((snapshot.checkpoint or {}).get("session_id") or "")
+        if snapshot.mechanism == "peer_dm":
+            if not session_id:
+                raise ChannelIndeterminate("session_missing")
+            try:
+                response = peer_dm_request(
+                    client, snapshot.spec.prompt, session_id=session_id
+                )
+            except urllib.error.HTTPError as exc:
+                if 400 <= exc.code < 500:
+                    raise ChannelDefinitelyNotAccepted(_failure_code(exc)) from exc
+                raise ChannelIndeterminate() from exc
+            except (OSError, TimeoutError, ValueError) as exc:
+                raise ChannelIndeterminate() from exc
+            return ChannelObservation(
+                phase="succeeded",
+                checkpoint={"session_id": response["session_id"], "status": "completed"},
+                terminal_result=terminal_result(response["reply"]),
+            )
         try:
             response = client.submit(
                 handoff_id=snapshot.handoff_id,
                 prompt=snapshot.spec.prompt,
+                session_id=session_id or None,
             )
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
@@ -190,13 +240,16 @@ class PeerHermesChannel:
             raise ChannelIndeterminate() from exc
         except (OSError, TimeoutError, ValueError) as exc:
             raise ChannelIndeterminate() from exc
+        checkpoint = {
+            "run_id": response["run_id"],
+            "idempotency_key": response["idempotency_key"],
+            "status": response["status"],
+        }
+        if session_id:
+            checkpoint["session_id"] = session_id
         return ChannelObservation(
             phase="submitted",
-            checkpoint={
-                "run_id": response["run_id"],
-                "idempotency_key": response["idempotency_key"],
-                "status": response["status"],
-            },
+            checkpoint=checkpoint,
         )
 
     def submit(
@@ -227,53 +280,14 @@ class PeerHermesChannel:
             observation = observation_from_status(
                 snapshot, response, cancelling=cancelling
             )
-            checkpoint = dict(observation.checkpoint)
-            if observation.phase == "needs_input":
-                approval = response.get("approval")
-                if not isinstance(approval, dict):
-                    raise ValueError("Run approval facts are missing")
-                request_id = approval.get("request_id")
-                choices = approval.get("choices")
-                if not isinstance(choices, list | tuple):
-                    raise ValueError("Run approval choices are invalid")
-                normalized = [choice for choice in _APPROVAL_CHOICES if choice in choices]
-                if not isinstance(request_id, str) or not normalized:
-                    raise ValueError("Run approval facts are invalid")
-                checkpoint.update({
-                    "approval_request_id": request_id,
-                    "approval_choices": normalized,
-                })
-            else:
-                checkpoint.pop("approval_request_id", None)
-                checkpoint.pop("approval_choices", None)
             return ChannelObservation(
                 phase=observation.phase,
-                checkpoint=checkpoint,
+                checkpoint=observation.checkpoint,
                 terminal_result=observation.terminal_result,
                 failure_code=observation.failure_code,
             )
         except (TypeError, UnicodeError, ValueError) as exc:
             raise ChannelIndeterminate() from exc
-
-    def _reconcile_approval(
-        self, client: RunsClient, snapshot: HandoffSnapshot, command: CommandRecord
-    ) -> tuple[str, str | None]:
-        run_id = str((snapshot.checkpoint or {}).get("run_id") or "")
-        try:
-            response = client.status(run_id)
-        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
-            return "indeterminate", "approval_response_indeterminate"
-        approval = response.get("approval")
-        still_pending = (
-            response.get("status") == "waiting_for_approval"
-            and isinstance(approval, dict)
-            and approval.get("request_id") == command.payload["request_id"]
-        )
-        return (
-            ("indeterminate", "approval_response_indeterminate")
-            if still_pending
-            else ("delivered", None)
-        )
 
     def deliver_command(
         self,
@@ -284,46 +298,17 @@ class PeerHermesChannel:
     ) -> tuple[str, str | None]:
         deadline = RunsDeadline(budget_seconds)
         client = self._bound_client(snapshot, deadline)
-        run_id = str((snapshot.checkpoint or {}).get("run_id") or "")
-        if not run_id or command.kind not in {"respond", "steer", "message"}:
-            return "indeterminate", "command_delivery_indeterminate"
-
-        if command.delivery_state == "attempted":
-            if command.kind == "respond":
-                return self._reconcile_approval(client, snapshot, command)
-            try:
-                client.status(run_id)
-            except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
-                pass
-            return "indeterminate", "guidance_delivery_indeterminate"
-
-        if command.kind == "respond":
-            try:
-                response = client.approve(
-                    run_id,
-                    request_id=str(command.payload["request_id"]),
-                    choice=str(command.payload["choice"]),
-                )
-            except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
-                return self._reconcile_approval(client, snapshot, command)
-            if (
-                response.get("request_id") != command.payload["request_id"]
-                or response.get("choice") != command.payload["choice"]
-            ):
-                return self._reconcile_approval(client, snapshot, command)
-            return "delivered", None
-
-        try:
-            response = client.steer(run_id, str(command.payload["text"]))
-        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError):
-            return "indeterminate", "guidance_delivery_indeterminate"
-        if response.get("accepted") is not True:
-            return "indeterminate", "guidance_delivery_indeterminate"
-        return "delivered", None
+        return deliver_run_command(client, snapshot, command)
 
     def reconcile(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "peer_dm":
+            return ChannelObservation(
+                phase="indeterminate",
+                checkpoint=snapshot.checkpoint or {},
+                failure_code=snapshot.failure_code or "submission_indeterminate",
+            )
         deadline = RunsDeadline(budget_seconds)
         if (snapshot.checkpoint or {}).get("run_id"):
             return self._observe(
@@ -336,11 +321,23 @@ class PeerHermesChannel:
     def observe(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "peer_dm":
+            return ChannelObservation(
+                phase="indeterminate",
+                checkpoint=snapshot.checkpoint or {},
+                failure_code="observation_indeterminate",
+            )
         return self._observe(snapshot, RunsDeadline(budget_seconds))
 
     def cancel(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
+        if snapshot.mechanism == "peer_dm":
+            return ChannelObservation(
+                phase="indeterminate",
+                checkpoint=snapshot.checkpoint or {},
+                failure_code="cancellation_indeterminate",
+            )
         deadline = RunsDeadline(budget_seconds)
         if (snapshot.checkpoint or {}).get("status") == "stopping":
             return self._observe(snapshot, deadline, cancelling=True)

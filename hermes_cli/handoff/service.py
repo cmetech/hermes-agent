@@ -578,18 +578,17 @@ class AgentHandoffService:
         snapshot = self.store.get(handoff_id)
         if kind in {"respond", "steer", "message"}:
             if (
-                snapshot.mechanism != "peer_runs"
-                or snapshot.cancel_requested_at is not None
+                snapshot.cancel_requested_at is not None
                 or snapshot.phase in _TERMINAL_PHASES
             ):
-                raise ValueError("handoff does not accept peer control commands")
+                raise ValueError("handoff does not accept control commands")
             required = {
                 "respond": "approval",
                 "steer": "steering",
                 "message": "follow_up",
             }[kind]
             if required not in set((snapshot.binding or {}).get("capabilities") or ()):
-                raise ValueError("handoff peer does not advertise this control")
+                raise ValueError("handoff does not advertise this control")
         if kind == "respond":
             checkpoint = snapshot.checkpoint or {}
             if (

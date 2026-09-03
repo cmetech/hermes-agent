@@ -153,6 +153,7 @@ def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, objec
         return MappingProxyType({})
     keys = set(value)
     local_keys = {"profile", "mechanism"}
+    local_runs_keys = local_keys | {"capabilities"}
     peer_keys = {
         "auth_scope_sha256",
         "capabilities",
@@ -161,7 +162,7 @@ def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, objec
         "peer",
         "profile",
     }
-    if keys not in (local_keys, peer_keys):
+    if keys not in (local_keys, local_runs_keys, peer_keys):
         raise ValueError("handoff binding is invalid")
     profile, mechanism = value["profile"], value["mechanism"]
     if not isinstance(profile, str) or not _safe_identifier(mechanism):
@@ -173,19 +174,38 @@ def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, objec
     if keys == local_keys:
         return MappingProxyType({"profile": profile, "mechanism": mechanism})
 
-    peer = value["peer"]
     capabilities = value["capabilities"]
+    if not isinstance(capabilities, list | tuple | set | frozenset) or not all(
+        isinstance(item, str) for item in capabilities
+    ):
+        raise ValueError("handoff binding is invalid")
+    capability_set = frozenset(capabilities)
+    if keys == local_runs_keys:
+        if (
+            mechanism != "runs"
+            or not capability_set <= _CHANNEL_CAPABILITIES
+            or not _REQUIRED_PEER_CAPABILITIES <= capability_set
+        ):
+            raise ValueError("handoff binding is invalid")
+        return _freeze({
+            "profile": profile,
+            "mechanism": mechanism,
+            "capabilities": sorted(capability_set),
+        })  # type: ignore[return-value]
+
+    peer = value["peer"]
     origin_sha256 = value["origin_sha256"]
     auth_scope_sha256 = value["auth_scope_sha256"]
     if (
         not isinstance(peer, str)
         or not _PEER_NAME.fullmatch(peer)
-        or mechanism != "peer_runs"
-        or not isinstance(capabilities, list | tuple | set | frozenset)
-        or not capabilities
-        or not all(isinstance(item, str) for item in capabilities)
-        or not frozenset(capabilities) <= _CHANNEL_CAPABILITIES
-        or not _REQUIRED_PEER_CAPABILITIES <= frozenset(capabilities)
+        or mechanism not in {"peer_dm", "peer_runs"}
+        or not capability_set <= _CHANNEL_CAPABILITIES
+        or (mechanism == "peer_dm" and bool(capability_set))
+        or (
+            mechanism == "peer_runs"
+            and not _REQUIRED_PEER_CAPABILITIES <= capability_set
+        )
         or not isinstance(origin_sha256, str)
         or not _SHA256.fullmatch(origin_sha256)
         or not isinstance(auth_scope_sha256, str)
@@ -196,7 +216,7 @@ def _normalize_binding(value: Mapping[str, object] | None) -> Mapping[str, objec
         "peer": peer,
         "profile": profile,
         "mechanism": mechanism,
-        "capabilities": sorted(frozenset(capabilities)),
+        "capabilities": sorted(capability_set),
         "origin_sha256": origin_sha256,
         "auth_scope_sha256": auth_scope_sha256,
     })  # type: ignore[return-value]

@@ -242,6 +242,43 @@ def test_conversation_fingerprint_includes_normalized_return_route():
     assert b'"return_route":{"delivery_policy":"wake"' in first.fingerprint_input
 
 
+def test_conversation_bindings_accept_sealed_local_runs_and_peer_dm_capabilities():
+    local = ChannelObservation(
+        phase="prepared",
+        mechanism="runs",
+        binding={
+            "profile": "reviewer",
+            "mechanism": "runs",
+            "capabilities": [
+                "authoritative_status",
+                "cancellation",
+                "durable_admission",
+                "follow_up",
+            ],
+        },
+    )
+    peer_dm = ChannelObservation(
+        phase="prepared",
+        mechanism="peer_dm",
+        binding={
+            "peer": "spark",
+            "profile": "reviewer",
+            "mechanism": "peer_dm",
+            "capabilities": [],
+            "origin_sha256": "a" * 64,
+            "auth_scope_sha256": "b" * 64,
+        },
+    )
+
+    assert local.binding["capabilities"] == (
+        "authoritative_status",
+        "cancellation",
+        "durable_admission",
+        "follow_up",
+    )
+    assert peer_dm.binding["capabilities"] == ()
+
+
 def test_spec_reuses_bounded_structured_output_normalization():
     properties = {str(index): {"type": "string"} for index in range(1_025)}
 

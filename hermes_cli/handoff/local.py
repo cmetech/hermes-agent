@@ -41,6 +41,8 @@ from .runs import (
     RunsClient,
     RunsConnection,
     RunsDeadline,
+    advertised_capabilities,
+    deliver_run_command,
     observation_from_status,
     terminal_result,
 )
@@ -70,6 +72,10 @@ _AUTHORITATIVE_RUNS_FAILURES = frozenset({
     "http_405",
 })
 _INTERACTIVE_CAPABILITIES = frozenset({"approval", "interactive", "needs_input"})
+_BASE_CAPABILITIES = frozenset({
+    "authoritative_status", "cancellation", "durable_admission",
+})
+_CLI_MECHANISMS = frozenset({"local_cli", "local_bot_cli"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,8 +395,10 @@ def _profile_root(home: Path) -> Path:
     return home.parent.parent if home.parent.name == "profiles" else home
 
 
-def _wrapper_argv(handoff_id: str, profile: str) -> list[str]:
-    return [
+def _wrapper_argv(
+    handoff_id: str, profile: str, title: str | None = None
+) -> list[str]:
+    argv = [
         sys.executable or "python3",
         "-m",
         "hermes_cli.handoff.local",
@@ -398,13 +406,18 @@ def _wrapper_argv(handoff_id: str, profile: str) -> list[str]:
         handoff_id,
         profile,
     ]
+    if title is not None:
+        argv.append(title)
+    return argv
 
 
 def _command_sha256(argv: list[str]) -> str:
     return sha256("\0".join(argv).encode("utf-8")).hexdigest()
 
 
-def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
+def _run_cli_wrapper(
+    handoff_id: str, profile: str, title: str | None = None
+) -> int:
     validate_profile_name(profile)
     source_home = get_hermes_home().expanduser().resolve()
     with _open_cli_dir(source_home, handoff_id) as (_paths, directory_fd):
@@ -425,7 +438,7 @@ def _run_cli_wrapper(handoff_id: str, profile: str) -> int:
             argv = local_delivery_command(
                 profile,
                 f"/dev/fd/{prompt_fd}",
-                title=f"Handoff: {handoff_id}",
+                title=title or f"Handoff: {handoff_id}",
             )
             try:
                 with acquire_turn_lock(_profile_root(get_hermes_home()), profile):
@@ -532,7 +545,7 @@ class LocalHermesChannel:
 
     def cleanup_committed(self, snapshot: HandoffSnapshot) -> None:
         """Remove transient CLI bytes after their durable fact is committed."""
-        if snapshot.mechanism != "local_cli":
+        if snapshot.mechanism not in _CLI_MECHANISMS:
             return
         checkpoint = snapshot.checkpoint or {}
         if (
@@ -624,6 +637,33 @@ class LocalHermesChannel:
             else (None, failure)
         )
 
+    def _assess_conversation(
+        self,
+        endpoint: HandoffEndpoint,
+        required_capabilities: frozenset[str],
+        deadline: _Deadline,
+    ) -> tuple[_Connection | None, frozenset[str], str | None]:
+        connection, failure = self._connection(endpoint.profile)
+        if connection is None:
+            return None, frozenset(), failure
+        try:
+            document = RunsClient(connection, deadline).request_json(
+                "/v1/capabilities"
+            )
+        except urllib.error.HTTPError as exc:
+            return None, frozenset(), _failure_code(exc)
+        except (OSError, TimeoutError, ValueError):
+            return None, frozenset(), "endpoint_unavailable"
+        capabilities, failure = advertised_capabilities(document)
+        required = _BASE_CAPABILITIES | (
+            required_capabilities - {"structured_output"}
+        )
+        if failure is not None:
+            return None, capabilities, failure
+        if not required <= capabilities:
+            return None, capabilities, "capability_mismatch"
+        return connection, capabilities, None
+
     def validate_endpoint(
         self, endpoint: HandoffEndpoint, _initiator: str
     ) -> EndpointAssessment:
@@ -644,56 +684,48 @@ class LocalHermesChannel:
             failure_code=failure,
         )
 
-    def _find_session(
-        self, connection: _Connection, title: str, deadline: _Deadline
-    ) -> str | None:
-        query = urllib.parse.urlencode({
-            "limit": 200,
-            "title": title,
-            "include_hidden": 1,
-        })
-        listing = RunsClient(connection, deadline).request_json(
-            f"/api/sessions?{query}"
-        )
-        rows = listing.get("data")
-        if not isinstance(rows, list):
-            raise ValueError("handoff session listing is invalid")
-        for row in rows:
-            if isinstance(row, dict) and (row.get("title") or "").strip() == title:
-                session_id = str(row.get("id") or "")
-                return session_id or None
-        return None
-
-    def _ensure_session(
-        self, connection: _Connection, handoff_id: str, deadline: _Deadline
-    ) -> str:
-        title = f"Handoff: {handoff_id}"
-        existing = self._find_session(connection, title, deadline)
-        if existing:
-            return existing
-        try:
-            created = RunsClient(connection, deadline).request_json(
-                "/api/sessions",
-                method="POST",
-                body={"title": title, "source": "handoff"},
-            )
-        except urllib.error.HTTPError as exc:
-            if exc.code != 400:
-                raise
-            existing = self._find_session(connection, title, deadline)
-            if existing:
-                return existing
-            raise
-        session = created.get("session")
-        session_id = str(session.get("id") or "") if isinstance(session, dict) else ""
-        if not session_id:
-            raise ValueError("handoff session creation returned no id")
-        return session_id
-
     def bind(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
         deadline = _Deadline(budget_seconds)
+        if (
+            snapshot.spec.mode == "conversation"
+            and not snapshot.spec.required_capabilities
+        ):
+            cli_failure = _local_cli_failure(frozenset(), host_os=os.name)
+            if cli_failure is not None:
+                return ChannelObservation(phase="failed", failure_code=cli_failure)
+            return self._bind_cli(snapshot, mechanism="local_bot_cli")
+        if snapshot.spec.mode == "conversation":
+            connection, capabilities, failure = self._assess_conversation(
+                snapshot.spec.endpoint,
+                snapshot.spec.required_capabilities,
+                deadline,
+            )
+            if connection is None:
+                return ChannelObservation(phase="failed", failure_code=failure)
+            try:
+                session_id = RunsClient(connection, deadline).ensure_session(
+                    "Bot Chat", source="bot_handoff"
+                )
+            except urllib.error.HTTPError as exc:
+                return ChannelObservation(
+                    phase="failed", failure_code=_failure_code(exc)
+                )
+            except (OSError, TimeoutError, ValueError):
+                return ChannelObservation(
+                    phase="prepared", failure_code="endpoint_unavailable"
+                )
+            return ChannelObservation(
+                phase="prepared",
+                mechanism="runs",
+                binding={
+                    "profile": snapshot.spec.endpoint.profile,
+                    "mechanism": "runs",
+                    "capabilities": sorted(capabilities),
+                },
+                checkpoint={"session_id": session_id},
+            )
         connection, failure = self._assess(snapshot.spec.endpoint, deadline)
         if connection is None:
             if failure in _AUTHORITATIVE_RUNS_FAILURES:
@@ -707,7 +739,9 @@ class LocalHermesChannel:
                 return self._bind_cli(snapshot)
             return ChannelObservation(phase="prepared", failure_code=failure)
         try:
-            session_id = self._ensure_session(connection, snapshot.handoff_id, deadline)
+            session_id = RunsClient(connection, deadline).ensure_session(
+                f"Handoff: {snapshot.handoff_id}", source="handoff"
+            )
         except urllib.error.HTTPError as exc:
             return ChannelObservation(phase="prepared", failure_code=_failure_code(exc))
         except (OSError, TimeoutError, ValueError):
@@ -721,7 +755,9 @@ class LocalHermesChannel:
             checkpoint={"session_id": session_id},
         )
 
-    def _bind_cli(self, snapshot: HandoffSnapshot) -> ChannelObservation:
+    def _bind_cli(
+        self, snapshot: HandoffSnapshot, *, mechanism: str = "local_cli"
+    ) -> ChannelObservation:
         prompt = snapshot.spec.prompt.encode("utf-8")
         with _open_cli_dir(
             self._source_home, snapshot.handoff_id
@@ -729,10 +765,10 @@ class LocalHermesChannel:
             _atomic_bytes_at(directory_fd, "prompt.txt", prompt)
         return ChannelObservation(
             phase="prepared",
-            mechanism="local_cli",
+            mechanism=mechanism,
             binding={
                 "profile": snapshot.spec.endpoint.profile,
-                "mechanism": "local_cli",
+                "mechanism": mechanism,
             },
             checkpoint={"request_sha256": sha256(prompt).hexdigest()},
         )
@@ -881,7 +917,9 @@ class LocalHermesChannel:
         ):
             raise ChannelDefinitelyNotAccepted("local_cli_prompt_changed")
         argv = _wrapper_argv(
-            snapshot.handoff_id, snapshot.spec.endpoint.profile
+            snapshot.handoff_id,
+            snapshot.spec.endpoint.profile,
+            "Bot Chat" if snapshot.mechanism == "local_bot_cli" else None,
         )
         tree = ManagedProcessTree.spawn(
             argv,
@@ -981,7 +1019,7 @@ class LocalHermesChannel:
     def submit(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
-        if snapshot.mechanism == "local_cli":
+        if snapshot.mechanism in _CLI_MECHANISMS:
             return self._submit_cli(snapshot)
         return self._submit(snapshot, _Deadline(budget_seconds))
 
@@ -1015,7 +1053,7 @@ class LocalHermesChannel:
     def reconcile(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
-        if snapshot.mechanism == "local_cli":
+        if snapshot.mechanism in _CLI_MECHANISMS:
             return self._observe_cli(
                 snapshot, cancelling=snapshot.cancel_requested_at is not None
             )
@@ -1028,10 +1066,18 @@ class LocalHermesChannel:
             )
         return self._submit(snapshot, deadline)
 
+    def deliver_command(
+        self, snapshot, command, *, budget_seconds: float
+    ) -> tuple[str, str | None]:
+        client = RunsClient(
+            self._bound_connection(snapshot), _Deadline(budget_seconds)
+        )
+        return deliver_run_command(client, snapshot, command)
+
     def observe(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
-        if snapshot.mechanism == "local_cli":
+        if snapshot.mechanism in _CLI_MECHANISMS:
             return self._observe_cli(
                 snapshot, cancelling=snapshot.cancel_requested_at is not None
             )
@@ -1040,7 +1086,7 @@ class LocalHermesChannel:
     def cancel(
         self, snapshot: HandoffSnapshot, *, budget_seconds: float
     ) -> ChannelObservation:
-        if snapshot.mechanism == "local_cli":
+        if snapshot.mechanism in _CLI_MECHANISMS:
             receipt = self._receipt_observation(snapshot)
             if receipt is not None:
                 return receipt
@@ -1104,10 +1150,11 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-cli", action="store_true")
     parser.add_argument("handoff_id")
     parser.add_argument("profile")
+    parser.add_argument("title", nargs="?")
     args = parser.parse_args(argv)
     if not args.run_cli or os.name == "nt":
         return 2
-    return _run_cli_wrapper(args.handoff_id, args.profile)
+    return _run_cli_wrapper(args.handoff_id, args.profile, args.title)
 
 
 if __name__ == "__main__":

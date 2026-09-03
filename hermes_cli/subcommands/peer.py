@@ -42,14 +42,16 @@ import urllib.request
 import uuid
 
 from hermes_cli.peers import (
+    BOT_CHAT_TITLE,
+    ensure_peer_bot_chat,
     load_peer_registry,
     parse_peer_target,
     peer_base_url,
     peer_key_env,
+    peer_dm_request,
     valid_peer_name,
 )
-
-BOT_CHAT_TITLE = "Bot Chat"
+from hermes_cli.handoff.runs import RunsClient, RunsConnection, RunsDeadline
 
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
@@ -139,44 +141,26 @@ def _find_bot_chat(base: str, key: str) -> str | None:
     return the ordinary visible listing, so this single request degrades
     to exactly the previous behavior against them.
     """
-    query = urllib.parse.urlencode({"limit": 200, "title": BOT_CHAT_TITLE, "include_hidden": 1})
-    listing = _request(f"{base}/api/sessions?{query}", key)
-    for session in listing.get("data") or []:
-        if isinstance(session, dict) and (session.get("title") or "").strip() == BOT_CHAT_TITLE:
-            return str(session.get("id") or "") or None
-    return None
+    return RunsClient(
+        RunsConnection(base, key), RunsDeadline(LIST_TIMEOUT_S)
+    ).find_session(BOT_CHAT_TITLE)
 
 
 def _ensure_bot_chat(base: str, key: str) -> str:
-    existing = _find_bot_chat(base, key)
-    if existing:
-        return existing
     try:
-        created = _request(
-            f"{base}/api/sessions",
-            key,
-            method="POST",
-            body={"title": BOT_CHAT_TITLE, "source": "bot_peer_dm"},
+        return ensure_peer_bot_chat(
+            RunsClient(RunsConnection(base, key), RunsDeadline(LIST_TIMEOUT_S))
         )
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
         if exc.code == 400 and "title" in detail.lower():
-            # Older peer (no title/include_hidden lookup support): its
-            # canonical Bot Chat exists but is hidden, so we couldn't see it
-            # and the create collided with the UNIQUE(title) guard.
             raise RuntimeError(
-                f"Peer already has a '{BOT_CHAT_TITLE}' session but it is hidden and the "
-                f"peer's gateway is too old to expose hidden sessions to this lookup "
-                f"(HTTP 400: {detail}). Update the peer's hermes-agent, or unhide the "
-                f"session there: PATCH /api/sessions/<id> {{\"hidden\": false}}."
+                f"Peer already has a '{BOT_CHAT_TITLE}' session but it is hidden and "
+                f"the peer's gateway is too old to expose hidden sessions to this "
+                f"lookup (HTTP 400: {detail}). Update the peer's hermes-agent, or "
+                "unhide the session there."
             ) from exc
         raise
-    # Real api_server wraps the row: {"object": "hermes.session", "session": {...}}.
-    session = created.get("session") if isinstance(created.get("session"), dict) else created
-    session_id = str(session.get("id") or session.get("session_id") or "")
-    if not session_id:
-        raise RuntimeError("Peer did not return a session id for the new Bot Chat")
-    return session_id
 
 
 def _parse_target(target: str) -> tuple[str, str | None]:
@@ -398,27 +382,23 @@ def cmd_peer(args) -> int:
 
         try:
             session_id = _ensure_bot_chat(base, key)
-            result = _request(
-                f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat",
-                key,
-                method="POST",
-                body={"message": message},
-                timeout=DM_TIMEOUT_S,
+            result = peer_dm_request(
+                RunsClient(RunsConnection(base, key), RunsDeadline(DM_TIMEOUT_S)),
+                message,
+                session_id=session_id,
             )
         except urllib.error.HTTPError as exc:
             print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}", file=sys.stderr)
             return 1
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
             return 1
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
             return 1
 
-        reply = ""
-        msg = result.get("message")
-        if isinstance(msg, dict):
-            reply = str(msg.get("content") or "")
+        session_id = result["session_id"]
+        reply = result["reply"]
         if getattr(args, "json", False):
             print(json.dumps({"peer": peer_name, "profile": profile, "session_id": result.get("session_id") or session_id, "reply": reply}))
         else:
