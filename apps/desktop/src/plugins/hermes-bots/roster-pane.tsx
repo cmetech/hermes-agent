@@ -60,6 +60,7 @@ import { $groupChats, $groupChatWorkspace, $groupNeedsYou } from './group-chat'
 import { disbandGroupChat, GroupChatWorkspace, openGroupChat } from './group-chat-view'
 import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-membership'
 import { $groupMainTabsRev, shouldRenderGroupChatInPane } from './group-panes'
+import { Handoffs } from './handoffs'
 import { $showHiddenBots, isBotHidden, isBotPinned } from './hidden-bots'
 import { useBots } from './i18n'
 import { deleteBot, mergeServerMeta, pullServerAvatars } from './profile-ops'
@@ -75,7 +76,7 @@ import {
   RosterSectionHeader
 } from './roster-sections'
 import type { ResolvedRosterGatewaySection } from './roster-sections'
-import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
+import { botRosterMeta, botWorkspaceOwnerKey, resolveBotConnectionRoute, setBotsWorkspaceOwner } from './routing'
 import { ACTIVE_WINDOW_S, activeBots, BOT_ROSTER_SEARCH_THRESHOLD, rosterActivityMatches } from './row-helpers'
 import { backfillMessagingProtocol } from './soul'
 import type { BotMeta, GatewaySource, GroupMember, RosterActivityFilter, RosterKindFilter, RosterRow } from './types'
@@ -315,6 +316,9 @@ export function BotsPane() {
 
     return activityOf(b) - activityOf(a)
   })
+
+  const handoffBot = selectedRosterBot(roster, selectedRosterKey)
+  const handoffRoute = resolveBotConnectionRoute(handoffBot)
 
   // React Query can briefly report neither loading nor data while the plugin
   // and the persisted connection registry hydrate. Keep that transition in a
@@ -645,6 +649,11 @@ export function BotsPane() {
           </DropdownMenu>
         </div>
       </div>
+      <Handoffs
+        profile={handoffBot?.name || activeProfile}
+        route={handoffRoute.route}
+        unavailable={handoffRoute.status === 'owner_removed'}
+      />
       {showRosterTools ? (
         <div className="flex min-w-0 items-center gap-1 px-2.5 pb-1.5">
           {showRosterSearch ? (

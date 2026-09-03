@@ -178,6 +178,17 @@ describe('the Bots pane dock', () => {
 
     harness.dispose()
   })
+
+  it('keeps the handoff inspector inside Bots instead of registering a second chat pane', () => {
+    paneStores()
+    const harness = recordingContext()
+
+    plugin.register(harness.ctx)
+
+    expect(harness.find('pane')).toBeTruthy()
+    expect(harness.find('handoffs')).toBeUndefined()
+    harness.dispose()
+  })
 })
 
 describe('the Scheduled jobs pane', () => {
