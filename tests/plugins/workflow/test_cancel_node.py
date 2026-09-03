@@ -1520,6 +1520,21 @@ def test_nested_approval_rejection_reaps_a_parallel_body_process(
     store = RunStore(tmp_path / "home", max_total_workers=2)
     run_id = _admit(store, compilation, key="phase6-nested-rejection-process")
     scheduler = RunScheduler(store, max_parallel_nodes=2)
+    approval = scheduler.executors["approval"]
+
+    class ApprovalAfterProcessStarts:
+        def execute(self, context):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if any(
+                    event["event_type"] == "process_started"
+                    for event in store.tail_events(run_id)
+                ):
+                    return approval.execute(context)
+                time.sleep(0.01)
+            pytest.fail("parallel body process did not start")
+
+    scheduler.executors["approval"] = ApprovalAfterProcessStarts()
     finished = threading.Event()
 
     def run_scheduler() -> None:
@@ -1532,7 +1547,7 @@ def test_nested_approval_rejection_reaps_a_parallel_body_process(
 
     worker = threading.Thread(target=run_scheduler, daemon=True)
     worker.start()
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 20
     identity = None
     paused = None
     while time.monotonic() < deadline:
