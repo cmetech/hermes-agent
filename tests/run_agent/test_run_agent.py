@@ -117,6 +117,27 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
 
+def test_flush_persists_platform_message_identity_without_changing_content(agent):
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.session_id = "session-123"
+    agent._last_flushed_db_idx = 0
+    agent._persist_user_message_idx = 0
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    message = {
+        "role": "user",
+        "content": "handoff finished",
+        "message_id": "delivery-1",
+    }
+
+    agent._flush_messages_to_session_db([message], [])
+
+    row = agent._session_db.append_messages_batch.call_args.kwargs["messages"][0]
+    assert row["content"] == "handoff finished"
+    assert row["platform_message_id"] == "delivery-1"
+
+
 def test_direct_session_db_flushes_share_marker_claim(agent):
     """A direct flush cannot interleave its marker check with `_persist_session`."""
     class _BarrierDB:
@@ -3045,6 +3066,27 @@ class TestRunConversation:
         agent._use_prompt_caching = False
         agent.compression_enabled = False
         agent.save_trajectories = False
+
+    def test_persisted_handoff_identity_never_reaches_provider_payload(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(content="Done")
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "handoff finished",
+                persist_user_message_id="delivery-1",
+                persist_user_display_kind="handoff_return",
+                persist_user_display_metadata={"handoff_id": "handoff-1"},
+            )
+
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert [message["role"] for message in sent] == ["system", "user"]
+        assert sent[-1] == {"role": "user", "content": "handoff finished"}
+        assert result["final_response"] == "Done"
 
     def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
         relay_lease = SimpleNamespace(

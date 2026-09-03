@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import peers
+from hermes_cli.handoff.runs import RunsClient, RunsConnection, RunsDeadline
 
 
 def _write_profile(
@@ -118,3 +119,32 @@ def test_legacy_peer_helpers_preserve_bare_and_profile_target_behavior():
         peers.peer_base_url(entry, "researcher")
         == "http://spark.lan:8377/p/researcher"
     )
+
+
+def test_shared_peer_dm_uses_canonical_session_and_bounded_chat(monkeypatch):
+    client = RunsClient(
+        RunsConnection("https://peer.example.test", "secret"), RunsDeadline(2)
+    )
+    calls = []
+    monkeypatch.setattr(
+        client,
+        "ensure_session",
+        lambda title, *, source: calls.append(("session", title, source))
+        or "session-1",
+    )
+    monkeypatch.setattr(
+        client,
+        "chat",
+        lambda session_id, message: calls.append(("chat", session_id, message))
+        or {"session_id": session_id, "message": {"content": "done"}},
+    )
+
+    result = peers.peer_dm_request(client, "hello")
+
+    assert result == {"session_id": "session-1", "reply": "done"}
+    assert calls == [
+        ("session", "Bot Chat", "bot_peer_dm"),
+        ("chat", "session-1", "hello"),
+    ]
+    with pytest.raises(ValueError, match="message"):
+        peers.peer_dm_request(client, "x" * 500_001)

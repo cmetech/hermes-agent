@@ -51,6 +51,23 @@ def _spec() -> HandoffSpec:
     )
 
 
+def _conversation_spec() -> HandoffSpec:
+    return HandoffSpec(
+        mode="conversation",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="Review this change.",
+        output_schema=None,
+        deadline_at=datetime(2026, 9, 2, tzinfo=UTC),
+        attribution={"sender": "default"},
+        required_capabilities=frozenset(),
+        return_route={
+            "kind": "operator",
+            "profile": "default",
+            "inbox_id": "desktop-inbox-1",
+        },
+    )
+
+
 class _Crash(BaseException):
     pass
 
@@ -633,6 +650,46 @@ def test_repeated_terminal_advance_is_an_idempotent_noop(tmp_path):
     assert channel.calls == []
 
 
+def test_acknowledge_is_local_idempotent_and_preserves_transport_truth(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    channel = FakeChannel()
+    service = AgentHandoffService(store=store, channel=channel)
+    snapshot = service.create(
+        _conversation_spec(), "operator/default", handoff_key="desktop-1"
+    )
+    lease = store.claim_advance(
+        snapshot.handoff_id,
+        "worker",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    terminal = store.commit_observation(
+        lease, ChannelObservation(phase="failed", failure_code="remote_failed")
+    )
+    attention = store.attention(snapshot.handoff_id, limit=1)
+    assert len(attention) == 1
+    assert attention[0].method == "attention"
+    assert attention[0].state == "delivered"
+
+    first = service.command(
+        snapshot.handoff_id,
+        "acknowledge",
+        command_id="ack-1",
+        actor="operator",
+    )
+    second = service.command(
+        snapshot.handoff_id,
+        "acknowledge",
+        command_id="ack-1",
+        actor="operator",
+    )
+
+    assert first == second == terminal
+    assert store.attention(snapshot.handoff_id, limit=10) == ()
+    assert channel.calls == []
+
+
 def test_concurrent_advances_make_only_one_channel_call(tmp_path):
     service, _store, channel, snapshot = _service(tmp_path)
     snapshot = _bind(service, channel, snapshot.handoff_id)
@@ -1003,6 +1060,54 @@ def test_control_commands_are_closed_idempotent_and_phase_checked(tmp_path):
             command_id="future-1",
             actor="workflow",
         )
+
+
+def test_control_eligibility_uses_sealed_capabilities_not_peer_mechanism(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    channel = FakeChannel()
+    service = AgentHandoffService(store=store, channel=channel)
+    snapshot = service.create(_spec(), "workflow/run-1", handoff_key="local")
+    snapshot = store.bind(
+        snapshot.handoff_id,
+        "runs",
+        {
+            "profile": "reviewer",
+            "mechanism": "runs",
+            "capabilities": [
+                "authoritative_status",
+                "cancellation",
+                "durable_admission",
+                "follow_up",
+            ],
+        },
+        {"run_id": "run-1", "status": "running"},
+        snapshot.state_version,
+    )
+    lease = store.claim_advance(
+        snapshot.handoff_id,
+        "worker",
+        now=datetime.now(UTC),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    store.journal_attempt(lease, "submit")
+    active = store.commit_observation(
+        lease,
+        ChannelObservation(
+            phase="active", checkpoint={"run_id": "run-1", "status": "running"}
+        ),
+    )
+
+    service.command(
+        active.handoff_id,
+        "message",
+        command_id="message-1",
+        actor="workflow",
+        text="Check this.",
+        correlation_id="follow-up-1",
+    )
+
+    assert store.get_command(active.handoff_id, "message-1").kind == "message"
     with pytest.raises(ValueError):
         service.command(
             snapshot.handoff_id,

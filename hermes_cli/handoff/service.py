@@ -540,7 +540,9 @@ class AgentHandoffService:
         text: str | None = None,
         correlation_id: str | None = None,
     ) -> HandoffSnapshot:
-        if kind not in {"cancel", "message", "reconcile", "respond", "steer"}:
+        if kind not in {
+            "acknowledge", "cancel", "message", "reconcile", "respond", "steer",
+        }:
             raise UnsupportedHandoffCommand(kind)
         values = {
             "request_id": request_id,
@@ -549,6 +551,7 @@ class AgentHandoffService:
             "correlation_id": correlation_id,
         }
         expected = {
+            "acknowledge": set(),
             "cancel": set(),
             "reconcile": set(),
             "respond": {"request_id", "choice"},
@@ -558,6 +561,10 @@ class AgentHandoffService:
         supplied = {name for name, value in values.items() if value is not None}
         if supplied != expected:
             raise ValueError("handoff command arguments are invalid")
+
+        if kind == "acknowledge":
+            self.store.acknowledge(handoff_id, actor=actor)
+            return self.store.get(handoff_id)
 
         payload = {"actor": actor, **{key: values[key] for key in expected}}
         try:
@@ -571,18 +578,17 @@ class AgentHandoffService:
         snapshot = self.store.get(handoff_id)
         if kind in {"respond", "steer", "message"}:
             if (
-                snapshot.mechanism != "peer_runs"
-                or snapshot.cancel_requested_at is not None
+                snapshot.cancel_requested_at is not None
                 or snapshot.phase in _TERMINAL_PHASES
             ):
-                raise ValueError("handoff does not accept peer control commands")
+                raise ValueError("handoff does not accept control commands")
             required = {
                 "respond": "approval",
                 "steer": "steering",
                 "message": "follow_up",
             }[kind]
             if required not in set((snapshot.binding or {}).get("capabilities") or ()):
-                raise ValueError("handoff peer does not advertise this control")
+                raise ValueError("handoff does not advertise this control")
         if kind == "respond":
             checkpoint = snapshot.checkpoint or {}
             if (

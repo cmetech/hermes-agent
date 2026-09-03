@@ -30,6 +30,36 @@ def _spec(**changes: object) -> HandoffSpec:
     return HandoffSpec(**values)
 
 
+def _bot_route(**changes: object) -> dict[str, object]:
+    route: dict[str, object] = {
+        "kind": "bot",
+        "host_kind": "gateway",
+        "profile": "default",
+        "session_id": "20260902_120000_abc123",
+        "session_key": "agent:default:telegram:dm:42",
+        "tool_call_id": "call_message_1",
+        "delivery_policy": "wake",
+        "hop_count": 0,
+    }
+    route.update(changes)
+    return route
+
+
+def _conversation_spec(**changes: object) -> HandoffSpec:
+    values = {
+        "mode": "conversation",
+        "endpoint": _endpoint(),
+        "prompt": "Can you review the release?",
+        "output_schema": None,
+        "deadline_at": datetime(2026, 9, 1, 12, 30, tzinfo=timezone.utc),
+        "attribution": {"sender": "default"},
+        "required_capabilities": {"follow_up"},
+        "return_route": _bot_route(),
+    }
+    values.update(changes)
+    return HandoffSpec(**values)
+
+
 def test_endpoint_parses_only_canonical_local_profile_uri():
     endpoint = _endpoint()
 
@@ -105,7 +135,7 @@ def test_spec_normalizes_aware_deadline_and_freezes_semantic_values():
 
 
 @pytest.mark.parametrize("changes", [
-    {"mode": "conversation"},
+    {"mode": "chat"},
     {"prompt": "   \n\t"},
     {"prompt": "x" * 500_001},
     {"deadline_at": datetime(2026, 9, 1, 12, 30)},
@@ -140,6 +170,116 @@ def test_spec_accepts_closed_stage_two_capabilities():
         "steering",
         "structured_output",
     })
+
+
+def test_conversation_spec_accepts_closed_bot_and_operator_return_routes():
+    bot = _conversation_spec()
+    operator = _conversation_spec(
+        return_route={
+            "kind": "operator",
+            "profile": "default",
+            "inbox_id": "desktop",
+        }
+    )
+
+    assert bot.mode == "conversation"
+    assert isinstance(bot.return_route, MappingProxyType)
+    assert bot.return_route == _bot_route()
+    assert operator.return_route == {
+        "inbox_id": "desktop",
+        "kind": "operator",
+        "profile": "default",
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"output_schema": {"type": "string"}},
+        {"return_route": _bot_route(kind="workflow")},
+        {"return_route": _bot_route(host_kind="desktop")},
+        {"return_route": _bot_route(profile="Default")},
+        {"return_route": _bot_route(session_id="https://unsafe.test")},
+        {"return_route": _bot_route(session_key="/Users/example/.hermes")},
+        {"return_route": _bot_route(tool_call_id="Bearer secret")},
+        {"return_route": _bot_route(delivery_policy="always")},
+        {"return_route": _bot_route(hop_count=True)},
+        {"return_route": _bot_route(hop_count=-1)},
+        {"return_route": _bot_route(hop_count=2)},
+        {"return_route": {**_bot_route(), "authorization": "Bearer secret"}},
+        {
+            "return_route": {
+                "kind": "operator",
+                "profile": "default",
+                "inbox_id": "https://unsafe.test",
+            }
+        },
+    ],
+)
+def test_conversation_spec_rejects_unsafe_or_noncontract_return_routes(changes):
+    with pytest.raises(ValueError):
+        _conversation_spec(**changes)
+
+
+def test_task_spec_rejects_a_return_route():
+    with pytest.raises(ValueError):
+        _spec(return_route=_bot_route())
+
+
+def test_conversation_fingerprint_includes_normalized_return_route():
+    first = _conversation_spec(return_route=_bot_route())
+    second = _conversation_spec(
+        return_route={
+            "hop_count": 0,
+            "delivery_policy": "wake",
+            "tool_call_id": "call_message_1",
+            "session_key": "agent:default:telegram:dm:42",
+            "session_id": "20260902_120000_abc123",
+            "profile": "default",
+            "host_kind": "gateway",
+            "kind": "bot",
+        }
+    )
+
+    assert first.fingerprint_input == second.fingerprint_input
+    assert b'"return_route":{"delivery_policy":"wake"' in first.fingerprint_input
+
+
+def test_conversation_bindings_accept_sealed_local_runs_and_peer_dm_capabilities():
+    local = ChannelObservation(
+        phase="prepared",
+        mechanism="runs",
+        binding={
+            "profile": "reviewer",
+            "mechanism": "runs",
+            "capabilities": [
+                "authoritative_status",
+                "cancellation",
+                "durable_admission",
+                "follow_up",
+            ],
+        },
+    )
+    peer_dm = ChannelObservation(
+        phase="prepared",
+        mechanism="peer_dm",
+        binding={
+            "peer": "spark",
+            "profile": "reviewer",
+            "mechanism": "peer_dm",
+            "capabilities": [],
+            "origin_sha256": "a" * 64,
+            "auth_scope_sha256": "b" * 64,
+        },
+    )
+
+    assert local.binding["capabilities"] == (
+        "authoritative_status",
+        "cancellation",
+        "durable_admission",
+        "follow_up",
+    )
+    assert peer_dm.binding["capabilities"] == ()
 
 
 def test_spec_reuses_bounded_structured_output_normalization():

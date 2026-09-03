@@ -39,6 +39,7 @@ _PROTOCOL_HEADING = "## Messaging other agents"
 # receives the protocol section. Must match the desktop plugin's
 # createCanonicalChat title and the `-c "Bot Chat"` resume target.
 BOT_CHAT_TITLE = "Bot Chat"
+PROTOCOL_VERSION = 3
 
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
@@ -383,7 +384,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     # Protocol-text version salt: bumping this refreshes every eternal Bot
     # Chat prompt ONCE so existing bots adopt a new protocol section (e.g.
     # the v2 message_agent tool replacing the shellout instructions).
-    surface["protocol_version"] = 2
+    surface["protocol_version"] = PROTOCOL_VERSION
     try:
         # Peer gateways are part of the messaging surface: registering one
         # must refresh eternal Bot Chat prompts so the cross-machine DM

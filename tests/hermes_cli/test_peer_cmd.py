@@ -172,6 +172,33 @@ class _FakePeer(BaseHTTPRequestHandler):
         pass
 
 
+class _AmbientProxy(BaseHTTPRequestHandler):
+    requests: list[str] = []
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        type(self).requests.append(self.path)
+        self._json({"data": [{"id": "bc_proxy", "title": "Bot Chat"}]})
+
+    def do_POST(self):
+        type(self).requests.append(self.path)
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self._json({
+            "session_id": "bc_proxy",
+            "message": {"role": "assistant", "content": "reply through proxy"},
+        })
+
+    def log_message(self, *args):  # noqa: D102 — silence test server logging
+        pass
+
+
 @pytest.fixture()
 def fake_peer_server():
     _FakePeer.sessions = []
@@ -187,6 +214,42 @@ def fake_peer_server():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_dm_preserves_ambient_proxy_policy(monkeypatch, capsys):
+    _AmbientProxy.requests = []
+    proxy = HTTPServer(("127.0.0.1", 0), _AmbientProxy)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        peer_cmd.urllib.request,
+        "getproxies",
+        lambda: {"http": f"http://127.0.0.1:{proxy.server_port}"},
+    )
+    monkeypatch.setattr(peer_cmd.urllib.request, "_opener", None)
+    monkeypatch.setattr(
+        peer_cmd,
+        "_load_peers",
+        lambda: {"spark": {"url": "http://peer.example.invalid"}},
+    )
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: "secret-key-123456")
+
+    try:
+        rc = peer_cmd.cmd_peer(
+            SimpleNamespace(
+                peer_action="dm",
+                target="spark",
+                message="ping",
+                json=True,
+            )
+        )
+    finally:
+        proxy.shutdown()
+        thread.join(timeout=5)
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["reply"] == "reply through proxy"
+    assert len(_AmbientProxy.requests) == 2
 
 
 def test_dm_creates_bot_chat_then_chats(monkeypatch, capsys, fake_peer_server):

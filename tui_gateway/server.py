@@ -11755,7 +11755,11 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
         # routing. That avoids wrong-session delivery while still allowing a
         # resumed continuation with the same durable key/lineage to claim it.
 
-    evt_key = str(evt.get("session_key") or "")
+    evt_key = str(
+        evt.get("session_key")
+        or (evt.get("session_id") if evt.get("type") == "handoff_return" else "")
+        or ""
+    )
     if not evt_key:
         return False
 
@@ -11832,9 +11836,23 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     """
     if session.get("_finalized"):
         return False
+    if evt.get("type") == "handoff_return":
+        try:
+            from hermes_cli.profiles import profile_matches_home
+
+            if not profile_matches_home(
+                str(evt.get("profile") or ""), session.get("profile_home")
+            ):
+                return False
+        except Exception:
+            return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
-    evt_key = str(evt.get("session_key") or "")
+    evt_key = str(
+        evt.get("session_key")
+        or (evt.get("session_id") if evt.get("type") == "handoff_return" else "")
+        or ""
+    )
     if not evt_key:
         return False
     current_keys = {
@@ -11855,7 +11873,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
 
 def _notification_event_requires_owner(evt: dict) -> bool:
     """Whether ``evt`` must be positively claimed before TUI delivery."""
-    return evt.get("type") == "async_delegation" or bool(
+    return evt.get("type") in {"async_delegation", "handoff_return"} or bool(
         str(evt.get("origin_ui_session_id") or "")
         or str(evt.get("session_key") or "")
     )
@@ -11895,7 +11913,130 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
+    if evt_type == "handoff_return":
+        return (evt.get("delivery_id", ""), evt_type)
     return (evt_sid, evt_type)
+
+
+def _handoff_return_display_metadata(evt: dict) -> dict:
+    return {
+        "delivery_id": str(evt.get("delivery_id") or ""),
+        "handoff_id": str(evt.get("handoff_id") or ""),
+        "tool_call_id": str(evt.get("tool_call_id") or ""),
+        "hop_count": min(max(int(evt.get("hop_count", 0)), 0) + 1, 1),
+    }
+
+
+def _handoff_return_persisted(session: dict, evt: dict) -> bool:
+    delivery_id = str(evt.get("delivery_id") or "")
+    agent = session.get("agent")
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or session.get("session_key") or "")
+    if not delivery_id or db is None or not session_id:
+        return False
+    try:
+        return bool(db.has_platform_message_id(session_id, delivery_id))
+    except Exception:
+        return False
+
+
+def _dispatch_handoff_return(sid: str, session: dict, evt: dict) -> bool:
+    from tools.async_delegation import (
+        begin_handoff_return_delivery,
+        claim_event_delivery,
+        complete_event_delivery,
+        defer_event_delivery_receipt,
+        handoff_return_receipt_pending,
+        release_event_delivery,
+    )
+    from tools.process_registry import format_process_notification
+
+    delivery_id = str(evt.get("delivery_id") or "")
+    claim = claim_event_delivery(evt, "tui-poller")
+    if claim is None:
+        return False
+    text = format_process_notification(evt, delivery_claim=claim)
+    if not text:
+        release_event_delivery(evt, claim)
+        return False
+    if _handoff_return_persisted(session, evt):
+        complete_event_delivery(evt, claim)
+        with session["history_lock"]:
+            if session.get("_handoff_return_inflight") == delivery_id:
+                session.pop("_handoff_return_inflight", None)
+            session["running"] = False
+        return True
+    receipt_recovery = handoff_return_receipt_pending(claim)
+    with session["history_lock"]:
+        delivery_inflight = (
+            session.get("_handoff_return_inflight") == delivery_id
+        )
+    if receipt_recovery:
+        if delivery_inflight:
+            defer_event_delivery_receipt(evt, claim)
+            return True
+        release_event_delivery(evt, claim)
+        return False
+    if not begin_handoff_return_delivery(claim):
+        try:
+            release_event_delivery(evt, claim)
+        except Exception:
+            logger.debug("could not release superseded handoff return", exc_info=True)
+        return False
+    with session["history_lock"]:
+        session["_handoff_return_inflight"] = delivery_id
+    _emit("status.update", sid, {"kind": "process", "text": text})
+
+    settled = False
+    receipt_deferred = False
+    receipt_lock = threading.Lock()
+
+    def _clear_inflight() -> None:
+        with session["history_lock"]:
+            if session.get("_handoff_return_inflight") == delivery_id:
+                session.pop("_handoff_return_inflight", None)
+
+    def _receipt(_outcome: dict) -> None:
+        nonlocal settled
+        try:
+            with receipt_lock:
+                if settled:
+                    return
+                settled = True
+                if not receipt_deferred:
+                    if _handoff_return_persisted(session, evt):
+                        complete_event_delivery(evt, claim)
+                    else:
+                        release_event_delivery(evt, claim)
+        except Exception:
+            logger.warning("handoff return receipt update failed", exc_info=True)
+        finally:
+            _clear_inflight()
+
+    metadata = _handoff_return_display_metadata(evt)
+    started = _run_prompt_submit(
+        f"__handoff__{evt.get('delivery_id', '')}",
+        sid,
+        session,
+        text,
+        display_kind="handoff_return",
+        display_metadata=metadata,
+        persist_user_message_id=str(evt.get("delivery_id") or ""),
+        handoff_return_hop_count=metadata["hop_count"],
+        terminal_callback=_receipt,
+    )
+    with receipt_lock:
+        if not started and not settled:
+            settled = True
+            release_event_delivery(evt, claim)
+            _clear_inflight()
+        elif started and not settled:
+            try:
+                defer_event_delivery_receipt(evt, claim)
+                receipt_deferred = True
+            except Exception:
+                logger.warning("handoff return receipt deferral failed", exc_info=True)
+    return bool(started)
 
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
@@ -12277,6 +12418,27 @@ def _notification_poller_loop(
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
 
+        if evt.get("type") == "handoff_return":
+            with session["history_lock"]:
+                if session.get("running"):
+                    process_registry.completion_queue.put(evt)
+                    _handoff_busy = True
+                else:
+                    session["running"] = True
+                    _handoff_busy = False
+            if _handoff_busy:
+                time.sleep(0.25)
+                continue
+            try:
+                if not _dispatch_handoff_return(sid, session, evt):
+                    with session["history_lock"]:
+                        session["running"] = False
+            except Exception as exc:
+                logger.warning("handoff return dispatch failed: %s", exc)
+                with session["history_lock"]:
+                    session["running"] = False
+            continue
+
         text = format_process_notification(evt)
         if not text:
             continue
@@ -12366,6 +12528,21 @@ def _notification_poller_loop(
             continue
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+            continue
+        if evt.get("type") == "handoff_return":
+            with session["history_lock"]:
+                if session.get("running"):
+                    process_registry.completion_queue.put(evt)
+                    break
+                session["running"] = True
+            try:
+                if not _dispatch_handoff_return(sid, session, evt):
+                    with session["history_lock"]:
+                        session["running"] = False
+            except Exception as exc:
+                logger.warning("handoff return shutdown dispatch failed: %s", exc)
+                with session["history_lock"]:
+                    session["running"] = False
             continue
         text = format_process_notification(evt)
         if not text:
@@ -12737,6 +12914,8 @@ def _run_prompt_submit(
     *,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    persist_user_message_id: str | None = None,
+    handoff_return_hop_count: int | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     tool_operation_context=None,
@@ -13076,6 +13255,8 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if persist_user_message_id and "persist_user_message_id" in _run_params:
+                run_kwargs["persist_user_message_id"] = persist_user_message_id
             if (
                 tool_operation_context is not None
                 and "tool_operation_context" in _run_params
@@ -13090,8 +13271,13 @@ def _run_prompt_submit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+            from tools.async_delegation import handoff_return_context
+
+            agent._gateway_session_key = session.get("session_key") or ""
+            agent._handoff_return_host_kind = "web"
             try:
-                result = agent.run_conversation(run_message, **run_kwargs)
+                with handoff_return_context(agent, handoff_return_hop_count):
+                    result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 # Stop AND join before anything below emits: an in-flight tick
                 # surviving past message.complete would roll the client's final
@@ -17910,6 +18096,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.
 from . import (  # noqa: E402
+    methods_agent_handoff as _methods_agent_handoff,
     methods_browser_control as _methods_browser_control,
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
@@ -17922,6 +18109,7 @@ from . import (  # noqa: E402
 )
 
 for _m in (
+    _methods_agent_handoff,
     _methods_browser_control,
     _methods_session,
     _methods_prompt,

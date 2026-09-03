@@ -2528,6 +2528,9 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    "platform_message_id": (
+                        msg.get("platform_message_id") or msg.get("message_id")
+                    ),
                 }
                 if isinstance(msg.get("_row_id"), int):
                     _row["_row_id"] = msg["_row_id"]
@@ -9973,6 +9976,7 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_message_id: Optional[str] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
@@ -10349,6 +10353,7 @@ class AIAgent:
                         stream_callback,
                         persist_user_message,
                         persist_user_timestamp=persist_user_timestamp,
+                        persist_user_message_id=persist_user_message_id,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,

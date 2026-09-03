@@ -73,6 +73,28 @@ def _bound(tmp_path, monkeypatch):
     )
 
 
+def _conversation(snapshot, *, controlled: bool):
+    spec = HandoffSpec(
+        mode="conversation",
+        endpoint=snapshot.spec.endpoint,
+        prompt=snapshot.spec.prompt,
+        output_schema=None,
+        deadline_at=snapshot.spec.deadline_at,
+        attribution={"sender": "default"},
+        required_capabilities=(
+            frozenset({"cancellation", "follow_up"})
+            if controlled
+            else frozenset()
+        ),
+        return_route={
+            "kind": "operator",
+            "profile": "default",
+            "inbox_id": "desktop-1",
+        },
+    )
+    return replace(snapshot, spec=spec, spec_fingerprint=spec.fingerprint)
+
+
 def _write_receipt(
     snapshot, *, stdout=b"done", stderr=b"", exit_code=0, outcome="completed"
 ):
@@ -126,6 +148,135 @@ def test_bind_uses_cli_only_after_authoritative_runs_unavailability(tmp_path, mo
     assert uncertain.mechanism is None
     assert bound.binding == {"profile": "reviewer", "mechanism": "local_cli"}
     assert set(bound.checkpoint) == {"request_sha256"}
+
+
+def test_legacy_conversation_binds_existing_bot_chat_cli_even_when_runs_exists(
+    tmp_path, monkeypatch
+):
+    snapshot = _conversation(_snapshot(tmp_path, monkeypatch), controlled=False)
+    channel = LocalHermesChannel()
+    monkeypatch.setattr(
+        channel,
+        "_assess",
+        lambda *_args: (local_module._Connection("http://local", "secret"), None),
+    )
+
+    bound = channel.bind(snapshot, budget_seconds=1)
+
+    assert bound.mechanism == "local_bot_cli"
+    assert bound.binding == {"profile": "reviewer", "mechanism": "local_bot_cli"}
+    assert local_module._wrapper_argv(
+        snapshot.handoff_id, "reviewer", "Bot Chat"
+    )[-1] == "Bot Chat"
+
+
+def test_controlled_conversation_requires_runs_and_never_falls_back_to_cli(
+    tmp_path, monkeypatch
+):
+    snapshot = _conversation(_snapshot(tmp_path, monkeypatch), controlled=True)
+    channel = LocalHermesChannel()
+    monkeypatch.setattr(
+        channel,
+        "_assess_conversation",
+        lambda *_args: (None, frozenset(), "capability_mismatch"),
+        raising=False,
+    )
+
+    refused = channel.bind(snapshot, budget_seconds=1)
+
+    assert refused.mechanism is None
+    assert refused.failure_code == "capability_mismatch"
+    assert not (
+        Path(os.environ["HERMES_HOME"])
+        / "handoffs"
+        / snapshot.handoff_id
+        / "prompt.txt"
+    ).exists()
+
+
+def test_controlled_conversation_seals_runs_capabilities_and_bot_chat_session(
+    tmp_path, monkeypatch
+):
+    snapshot = _conversation(_snapshot(tmp_path, monkeypatch), controlled=True)
+    channel = LocalHermesChannel()
+    connection = local_module._Connection("http://local", "secret")
+    capabilities = frozenset({
+        "authoritative_status",
+        "cancellation",
+        "durable_admission",
+        "follow_up",
+    })
+    monkeypatch.setattr(
+        channel,
+        "_assess_conversation",
+        lambda *_args: (connection, capabilities, None),
+        raising=False,
+    )
+    seen = {}
+
+    def ensure_session(_client, title, *, source):
+        seen.update(title=title, source=source)
+        return "session-1"
+
+    monkeypatch.setattr(local_module.RunsClient, "ensure_session", ensure_session)
+
+    bound = channel.bind(snapshot, budget_seconds=1)
+
+    assert seen == {"title": "Bot Chat", "source": "bot_handoff"}
+    assert bound.mechanism == "runs"
+    assert bound.binding == {
+        "profile": "reviewer",
+        "mechanism": "runs",
+        "capabilities": tuple(sorted(capabilities)),
+    }
+    assert bound.checkpoint == {"session_id": "session-1"}
+
+
+def test_controlled_local_conversation_delivers_follow_up_through_bound_run(
+    tmp_path, monkeypatch
+):
+    snapshot = replace(
+        _conversation(_snapshot(tmp_path, monkeypatch), controlled=True),
+        phase="active",
+        mechanism="runs",
+        binding={
+            "profile": "reviewer",
+            "mechanism": "runs",
+            "capabilities": [
+                "authoritative_status",
+                "cancellation",
+                "durable_admission",
+                "follow_up",
+            ],
+        },
+        checkpoint={"run_id": "run-1", "status": "running"},
+    )
+    channel = LocalHermesChannel()
+    monkeypatch.setattr(
+        channel,
+        "_bound_connection",
+        lambda *_args: local_module._Connection("http://local", "secret"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        local_module.RunsClient,
+        "steer",
+        lambda _client, run_id, text: calls.append((run_id, text))
+        or {"accepted": True},
+    )
+
+    result = channel.deliver_command(
+        snapshot,
+        SimpleNamespace(
+            kind="message",
+            delivery_state="pending",
+            payload={"text": "Check this."},
+        ),
+        budget_seconds=1,
+    )
+
+    assert result == ("delivered", None)
+    assert calls == [("run-1", "Check this.")]
 
 
 def test_default_service_anchors_cli_spool_to_its_store_home(tmp_path, monkeypatch):

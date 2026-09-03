@@ -1,11 +1,258 @@
 schema_version: 1
 feature: agent-handoff
-# Stages 1 and 2 provide local and authenticated peer Workflow handoffs. The
-# handoff service remains consumer-neutral; Workflow owns only its assignment,
-# wait, and interaction projections.
+# Stages 1-3 provide local and authenticated peer Workflow handoffs plus
+# durable Bot/Desktop conversations and returns. The handoff service remains
+# consumer-neutral; each consumer owns only its projection and delivery edge.
 delivered_stages:
 - stage_1_local_workflow_handoffs
 - stage_2_remote_workflow_handoffs
+- stage_3_bot_mode_desktop_handoffs
+stage_3:
+  implementation_commits:
+  - fbc0a046e19631e57d902819327c698fc0cb3001 feat(handoff): define conversation return contract
+  - 0c364af8ab7157da2812f0a7cdd44798d3da8490 feat(handoff): persist return delivery attention
+  - 1f6b6861f77757edec4db86abe00226c131b3b35 feat(handoff): resolve configured bot destinations
+  - 5aad04d3e1a60571f65825e575524847b159ef71 feat(handoff): bind durable bot conversations
+  - 368dabcca8bc39c92968b5a575c348751c7a1eca feat(bot): route messages through agent handoffs
+  - 1ff9686d6cbfc26948d60882fd5a766844039946 feat(handoff): supervise durable bot returns
+  - ebbae4f073fd42216f204b66154ee3ddb99b1c57 feat(handoff): deliver durable bot returns
+  - 227903b38a2ecc531ec853e0986e47f74eb97251 feat(desktop): expose agent handoff operations
+  - 5c2be49feb4e893fde08b0d5f6083353515ef6c1 feat(desktop): show durable agent handoffs
+  - ed6322a8ec32eae34bee58164b92677f2e69d1e6 fix(handoff): use valid bot command actor
+  - d3da42dc96cc9735107dcf9d40d9f0f4b2709448 test(handoff): prove durable bot return path
+  - 4648d038ac2f2dd803694218b0ec13e412e959e2 fix(handoff): reject invalid agent directories
+  - 5e0456f9ec1d39449cfdbf90c2b444ed912062dd fix(handoff): fail closed on wake policy errors
+  - 4853f5ddd216cba9b41b550b60df5108acd9c5f2 fix(bot): preserve legacy peer dm timing
+  - 4ad22a301d79ddca0b5565dc1f7351f43e4faa4e fix(handoff): bind returns to initiating host
+  - 3973be3d404d238a4e81ca4057b05adb1e85a67a fix(desktop): show bounded handoff results
+  - d1b53b2cd4640e1313232d233fd084abffa12d20 test(handoff): strengthen restart and race boundaries
+  - 7bb611b434100da321bcdc278d4b96a22ca9acf2 test(handoff): prove supervisor shutdown quiescence
+  - e415cbb17158ff1572dee7eec968167678de1a97 fix(bot): preserve classic cli handoff boundary
+  - f168ca873d9603559ce4001344e155e846a4a8ba test(handoff): cross initiating process restarts
+  - ae5f8da5b6c09e096eb6ae897557c9ebe01f6a9b fix(bot): preserve correlated handoff mechanism
+  - e46e501f84298511e23d8b61678c30d09d7ead5a fix(handoff): supersede stale return attention
+  - 8986696272f5c48edfc302f89d07f1e4e424a614 fix(handoff): fail closed on malformed directory config
+  - acbae1949ba7ccf7d36edf9aa3e65c86537f6350 fix(handoff): reject nonmapping directory config
+  - 52898e408a211aaa47f9d3d567af2e78db494896 fix(handoff): suppress pending gateway return replay
+  - fcbe98ad8702026711a78815205ceca6e7883b36 fix(peer): preserve legacy transport policy
+  - dab94bd5895c66368f4e5a8df1daaeb150c0595a fix(handoff): retain uncertain gateway receipts
+  - 9c31748e833d5df41be1ed76bbfc71a191125ef3 fix(handoff): reject empty directory documents
+  - 62bd97a2c2f935c6be9a5149338b3502e744d9ff fix(handoff): fence superseded gateway returns
+  - cf01f53a99b50862b0953b2ee5e33305da6df397 fix(handoff): fence superseded desktop returns
+  - f711df25a91f360281d8d27e51163bdd6cae0bb2 fix(handoff): reject unavailable directory configs
+  - 2234ab62f8fb86bd9025d774f540529addaa9a1a fix(handoff): release settled dispatch reservations
+  - 83da57266745e74e3bdda6b25765cc8b76e51a53 fix(handoff): retain queued return reservations
+  - 91820352f225e6530fc2b332741df0fef27a771c fix(handoff): reconcile return owner rotation
+  - db5da1c2ab6251d02e5d56dac1ea88816787e50e fix(handoff): release restart receipt identity
+  - c8ed1474fde94b83929ab420b98ec7f9326d37ad fix(handoff): retry return queue backpressure
+  - ff05217f576411946777b82b71600caa4d0437f1 fix(handoff): preserve raft return queueing
+  - 951fc20680613e95c7d78c443f976c4ccfd1cfe1 fix(handoff): preserve returns during gateway drain
+  - 02d655c9cde51dd66bb12f91c38131d7d5431e75 fix(handoff): reconcile discarded gateway returns
+  - ad4c53bac83effda0a70b3caebd0c999fb664439 test(handoff): assert queued return hop context
+  - d09c9aff098e83c2e62d40b87338ecf4eee45700 fix(handoff): authenticate discarded return metadata
+  - c3e7de1817b7ea0e8ab3ed8023f26b1f43934f95 fix(handoff): release interrupted queued returns
+  - 907b47b6ae91bc1ac48ed750bffa1c927a7ab0de fix(handoff): clear interrupted return overflow
+  - 5af122a0fd72196f0331e8d51fff07a5bc94263d fix(handoff): defer long tui return receipts
+  - 7520760ff03f8c6b355b250cca51b741b8f56539 fix(handoff): release tui receipt session claim
+  planning_commits:
+  - b145996c6791e5ffae46376293b5374ddfa334e1 docs(plan): prepare agent handoff stage 3
+  - 36431b0491310f8509619527c80a0f59a6e82833 docs(plan): include stage 3 operator returns
+  owned_paths:
+  - agent/conversation_loop.py
+  - agent/tool_executor.py
+  - agent/turn_context.py
+  - apps/desktop/src/plugins/hermes-bots/handoffs.test.tsx
+  - apps/desktop/src/plugins/hermes-bots/handoffs.tsx
+  - apps/desktop/src/plugins/hermes-bots/plugin-panes.test.tsx
+  - apps/desktop/src/plugins/hermes-bots/roster-pane.tsx
+  - docs/assessments/2026-09-02-agent-handoff-stage-3-implementation-readiness.md
+  - docs/reviews/2026-09-02-agent-handoff-stage-3-adversarial-review.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-code-review-prompt.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-code-review-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-code-review-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-remediation-rereview-prompt.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-remediation-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-remediation-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-convergence-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-convergence-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-dispatch-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-queue-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-capacity-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-owner-restart-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-raft-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-raft-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-drain-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-receipt-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-receipt-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-interrupt-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-tui-receipt-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-tui-session-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-tui-session-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-final-rereview-claude.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-final-rereview-codex.md
+  - docs/reviews/2026-09-03-agent-handoff-stage-3-adversarial-review-reconciliation.md
+  - docs/superpowers/plans/2026-09-02-bot-mode-desktop-agent-handoff-stage-3.md
+  - gateway/run.py
+  - hermes_cli/config.py
+  - hermes_cli/config_defaults.py
+  - hermes_cli/handoff/__init__.py
+  - hermes_cli/handoff/cli.py
+  - hermes_cli/handoff/directory.py
+  - hermes_cli/handoff/local.py
+  - hermes_cli/handoff/models.py
+  - hermes_cli/handoff/peer.py
+  - hermes_cli/handoff/projection.py
+  - hermes_cli/handoff/runs.py
+  - hermes_cli/handoff/service.py
+  - hermes_cli/handoff/store.py
+  - hermes_cli/handoff/supervisor.py
+  - hermes_cli/peers.py
+  - hermes_cli/plugins.py
+  - hermes_cli/subcommands/peer.py
+  - plugins/platforms/raft/adapter.py
+  - run_agent.py
+  - tests/agent/test_synthetic_turn_display_kind.py
+  - tests/agent/test_tool_executor_middleware.py
+  - tests/agent/test_turn_context.py
+  - tests/gateway/test_completion_delivery.py
+  - tests/gateway/test_plugin_background_services.py
+  - tests/gateway/test_raft_adapter.py
+  - tests/gateway/test_run_progress_topics.py
+  - tests/gateway/test_session_split_brain_11016.py
+  - tests/hermes_cli/handoff/test_bot_conversation_e2e.py
+  - tests/hermes_cli/handoff/test_bot_return_recovery_e2e.py
+  - tests/hermes_cli/handoff/test_cli.py
+  - tests/hermes_cli/handoff/test_directory.py
+  - tests/hermes_cli/handoff/test_local_cli.py
+  - tests/hermes_cli/handoff/test_models.py
+  - tests/hermes_cli/handoff/test_peer_e2e.py
+  - tests/hermes_cli/handoff/test_peer.py
+  - tests/hermes_cli/handoff/test_runs_client.py
+  - tests/hermes_cli/handoff/test_service.py
+  - tests/hermes_cli/handoff/test_store.py
+  - tests/hermes_cli/handoff/test_supervisor.py
+  - tests/hermes_cli/test_peers.py
+  - tests/hermes_cli/test_config_read_guard.py
+  - tests/hermes_cli/test_plugin_background_services.py
+  - tests/hermes_cli/test_web_server_plugin_services.py
+  - tests/plugins/workflow/test_installed_distribution_e2e.py
+  - tests/run_agent/test_run_agent.py
+  - tests/test_hermes_state.py
+  - tests/test_tui_gateway_queue_on_busy.py
+  - tests/tools/test_bot_mode_dm.py
+  - tests/tools/test_bot_mode_probe.py
+  - tests/tui_gateway/test_agent_handoff_methods.py
+  - tests/tui_gateway/test_protocol.py
+  - tools/async_delegation.py
+  - tools/bot_mode_dm.py
+  - tools/bot_mode_probe.py
+  - tools/process_registry.py
+  - tui_gateway/methods_agent_handoff.py
+  - tui_gateway/server.py
+  protocol_clarifications:
+  - legacy local names retain Bot Chat CLI compatibility; legacy bare-peer and
+    peer/profile names retain direct Peer DM timing; canonical URI or directory
+    endpoints opt into the durable controlled conversation path
+  - one conversation handoff represents one bounded request/reply lifecycle;
+    correlated follow-up creates a new keyed destination operation while
+    retaining the canonical Bot Chat session
+  - exact approval responses, follow-up, steer, stop, and interruption use the
+    advertised Runs contract; arbitrary remote questions remain deferred
+  - durable return rows and restart scans are authoritative; the in-process
+    completion queue is only a fast path and transcript acknowledgement prevents
+    duplicate wake turns after a crash
+  - newer attention atomically supersedes older undispatched return projections;
+    a durable SQLite dispatch reservation orders a claimed return against later
+    attention before any gateway adapter or model boundary is crossed
+  - adapter acceptance remains pending until its transcript receipt is readable,
+    including receipt-read exceptions; same-process replay retains the delivery
+    identity while durable restart reconciliation remains authoritative
+  - a busy session preserves distinct handoff return identities in the existing
+    bounded FIFO; queue acceptance retains the durable reservation without
+    consuming receipt-poll attempts, while a full FIFO returns retryable
+    backpressure without consuming a delivery attempt
+  - same-process supervisor owner rotation may reconcile the retained producer
+    identity; a genuinely fresh process clears its temporary recovery identity
+    before making the one keyed retry
+  - bundled adapters, including Raft, route non-control handoff returns through
+    the shared FIFO, identity, capacity, and backpressure boundary
+  - restart draining does not bypass that boundary; durable non-control returns
+    reach observable FIFO admission before generic drain messaging
+  - concrete gateway discard paths release only the exact queued handoff return
+    reservation; live queued turns retain receipt-pending protection without an
+    arbitrary timeout that could duplicate a slow model turn
+  - queued delivery metadata can authorize durable reconciliation only when the
+    event is trusted internal, non-control, and self-consistent with its message
+    identity
+  - busy /stop, /new, and /reset reconcile the exact adapter-head event they
+    intentionally discard through the same authenticated abandonment helper
+  - the same busy interruption boundary reconciles authenticated returns in
+    the runner-owned FIFO overflow before clearing the complete queue
+  - Desktop/TUI moves an admitted asynchronous return into durable receipt-only
+    recovery, so long model turns do not consume delivery attempts or reinject
+  - persisted Desktop/TUI receipt reconciliation releases the poller's
+    no-turn session claim so later prompts and returns cannot remain falsely busy
+  - an existing agent-directory config must parse to a mapping before a missing
+    alias may reach compatibility resolution; malformed, scalar, null, and empty
+    documents fail closed
+  - controlled local and peer handoffs bypass ambient proxies; legacy peer DM
+    preserves its established installed opener and ambient proxy policy while
+    retaining redirect credential stripping
+  - a closed, host-derived gateway or web binding is part of each Bot return
+    route; only that initiating host may select, claim, or consume its delivery
+  - classic CLI Bot Chat has no durable return host, so new friendly local
+    sends retain background CLI delivery while canonical/directory handoffs and
+    every correlated continuation fail closed without sending
+  - Bot and Desktop Stage 3 creation does not expose a deadline; existing
+    Workflow deadlines remain coordinator-owned and are re-proved by the remote
+    Workflow E2E until the shared service gains a consumer-neutral deadline
+    policy contract
+  intentional_exclusions:
+  - generic channel registration, GitLab+ICM, repository channels, and A2A
+  - peer DM replacement, relay retirement, and durable legacy compatibility
+    delivery
+  - Windows CLI destination locking and any Stage 5 retirement decision
+  adversarial_review:
+    verdict: passed_independent_claude_and_codex_rereview
+    confirmed_and_remediated:
+    - legacy peer/profile timing remains on direct Peer DM instead of blocking a
+      bounded supervisor tick
+    - return claims are bound to the initiating gateway or web host before claim
+    - invalid directory and wake configuration fail closed
+    - Desktop detail exposes only a bounded, forcibly redacted result preview
+    - initiating gateway and TUI return recovery cross fresh process boundaries
+    - classic CLI cannot create an undeliverable durable return or discard a
+      handoff ID into an uncorrelated legacy send
+    - stale attention cannot wake after a newer terminal observation commits
+    - malformed or unavailable directory configuration cannot reach a
+      compatibility transport
+    - durable dispatch, receipt, owner-rotation, process-restart, bounded-FIFO,
+      Raft, and gateway-drain races retain one return identity
+    - accepted returns discarded by a known gateway boundary release their
+      exact reservation, and external events cannot forge release metadata
+    - busy destructive commands cannot pop an accepted queued return while
+      leaving its durable receipt reservation live
+    - busy destructive commands also reconcile accepted returns behind the
+      adapter head before clearing FIFO overflow
+    - long Desktop/TUI turns retain one receipt-pending attempt across lease
+      rotation, then complete through the current transcript receipt claim
+    - Desktop/TUI persisted receipt settlement clears the poller's no-turn
+      running claim before later prompts or returns arrive
+    verification:
+    - required adversarial gate: 395 passed, 0 failed, 1 native-Windows skip
+    - final affected gate: 1404 passed, 0 failed, 5 platform-specific skips
+    - final durability and race stress: 63 passed, 0 failed across 7 executions
+    - installed-wheel gate: 2 passed, 0 failed
+    - full Desktop Bot-plugin gate: 579 passed, 0 failed; typecheck passed
+    inherited_diagnostics:
+    - whole-Workflow SQLite background-thread lifecycle remains load-sensitive
+      on macOS; the Stage 3 supervisor shutdown regression and aggregate gate
+      are clean
+    - one unchanged Desktop group-round ordering assertion failed under a later
+      full parallel diagnostic and passed immediately in isolation
+    - one remote approval/restart assertion observed a stale Workflow state
+      version during the first final 36-file parallel diagnostic; its exact
+      parametrized case passed seven immediate isolated reruns
 stage_2:
   implementation_commits:
   - b022c6d703b0c7494f1ba0157d23bb337e355da2 feat(handoff): define strict peer endpoint contract
@@ -174,7 +421,6 @@ rollback:
     rollback must not delete profile-local evidence, remote references, command
     journals, or receipts automatically
 deferred_stages:
-  stage_3: Bot Mode and Desktop migration plus durable return delivery
   stage_4: separately distributed GitLab+ICM plugin and channel registration
   stage_5: Windows destination lock, operational hardening, and retirement review
 verification:
@@ -368,6 +614,12 @@ upstream_changes:
   - every remote Workflow admission uses one stable bounded idempotency key and reconciles ambiguity with the identical request
   - peer credentials resolve lazily from the initiating profile and are neither persisted nor forwarded across an unsafe redirect or ambient proxy
   - peer control intent is journaled before I/O and an ambiguous non-idempotent response is never replayed blindly
+  - an existing directory document must be a valid mapping before alias-miss compatibility routing is allowed
+  - Bot return attention keeps immutable event evidence while superseding older undispatched projections
+  - a durable delivery-dispatch reservation linearly orders gateway adapter crossing against newer attention and recovers after lease expiry
+  - gateway adapter acceptance retains its process identity until the durable transcript receipt can be read
+  - known gateway discard boundaries release the exact durable return reservation while authenticated internal metadata prevents an external event from releasing it
+  - Desktop/TUI uses the same receipt-only recovery for long model turns and releases the poller's session claim when receipt settlement starts no turn
   tests:
   - tests/hermes_cli/handoff/test_models.py
   - tests/hermes_cli/handoff/test_store.py
@@ -397,6 +649,11 @@ upstream_changes:
     Reuse the configured peer registry and shared Runs transport rather than
     calling the peer CLI or copying its reservation logic. Keep command
     ambiguity non-replayable and polling by Run ID sufficient for correctness.
+    Preserve strict directory-document validation, attention supersession, the
+    durable dispatch reservation, and transcript-receipt replay fencing.
+    Controlled Runs traffic bypasses ambient proxies; legacy peer DM retains its
+    established opener/proxy behavior, with authorization stripping on redirects
+    in both cases.
     keep the CLI fallback disabled on Windows until the destination lock has a
     real cross-process implementation. Rerun the handoff, Runs, peer, Bot-lock,
     and real two-profile suites after overlap.

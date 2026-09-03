@@ -4737,6 +4737,8 @@ class PluginManager:
                 f"unknown background service host: {', '.join(unknown)}"
             )
         qualified_name = f"{plugin}:{name}"
+        if qualified_name == "core:agent_handoff":
+            raise ValueError("core background service name is reserved")
         with self._background_service_lock:
             if qualified_name in self._background_services:
                 raise ValueError(
@@ -4806,9 +4808,24 @@ class PluginManager:
         delivery_port=None,
         factory_start_event: threading.Event | None = None,
     ) -> BackgroundServiceHost:
+        registrations = tuple(self._background_services.values())
+        if self._discovered:
+            from hermes_cli.handoff.supervisor import create_agent_handoff_supervisor
+
+            registrations += (
+                BackgroundServiceRegistration(
+                    qualified_name="core:agent_handoff",
+                    plugin="core",
+                    name="agent_handoff",
+                    factory=lambda context: create_agent_handoff_supervisor(
+                        context, source_home=self.home_path
+                    ),
+                    hosts=frozenset({"web", "gateway"}),
+                ),
+            )
         self._background_service_generation += 1
         host = BackgroundServiceHost(
-            tuple(self._background_services.values()),
+            registrations,
             host_kind=host_kind,
             host_instance_id=uuid.uuid4().hex,
             generation=self._background_service_generation,

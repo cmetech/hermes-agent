@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import math
 import sys
 from uuid import uuid4
 
 from .models import HANDOFF_PHASES, HandoffSnapshot
+from .projection import evidence_payload as _evidence_payload
+from .projection import snapshot_summary as _summary
 from .service import AgentHandoffService, HandoffServiceError
 from .store import (
-    EvidencePage,
     HandoffConflict,
     HandoffNotFound,
     HandoffStateConflict,
@@ -22,54 +22,6 @@ from .store import (
 
 def _service() -> AgentHandoffService:
     return AgentHandoffService()
-
-
-def _timestamp(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    return (
-        value.astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
-
-
-def _summary(snapshot: HandoffSnapshot) -> dict[str, object]:
-    result = snapshot.terminal_result
-    terminal_summary = None
-    if result is not None:
-        terminal_summary = {
-            "media_type": result["media_type"],
-            "sha256": result["sha256"],
-            "size_bytes": result["size_bytes"],
-        }
-    created = snapshot.created_at or datetime.now(timezone.utc)
-    return {
-        "handoff_id": snapshot.handoff_id,
-        "endpoint": snapshot.spec.endpoint.canonical,
-        "mechanism": snapshot.mechanism,
-        "phase": snapshot.phase,
-        "age_seconds": max(0, int((datetime.now(timezone.utc) - created).total_seconds())),
-        "next_observation_at": _timestamp(snapshot.next_advance_at),
-        "terminal_summary": terminal_summary,
-        "failure_code": snapshot.failure_code,
-        "created_at": _timestamp(snapshot.created_at),
-        "updated_at": _timestamp(snapshot.updated_at),
-    }
-
-
-def _event(event) -> dict[str, object]:
-    return {
-        "handoff_id": event.handoff_id,
-        "sequence": event.sequence,
-        "event_id": event.event_id,
-        "phase_before": event.phase_before,
-        "phase_after": event.phase_after,
-        "kind": event.kind,
-        "actor": event.actor,
-        "data": dict(event.data),
-        "created_at": _timestamp(event.created_at),
-    }
 
 
 def _print_snapshot(snapshot: HandoffSnapshot) -> None:
@@ -97,14 +49,6 @@ def _print_error(code: str, *, json_output: bool, command_id: str | None = None)
     print(f"error: {code}", file=sys.stderr)
     if command_id is not None:
         print(f"command_id: {command_id}", file=sys.stderr)
-
-
-def _evidence_payload(page: EvidencePage) -> dict[str, object]:
-    return {
-        "events": [_event(event) for event in page.events],
-        "next_after_sequence": page.next_after_sequence,
-        "has_more": page.has_more,
-    }
 
 
 def cmd_handoff(args) -> int:

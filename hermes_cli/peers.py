@@ -7,13 +7,19 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli.profiles import validate_profile_name
 
+if TYPE_CHECKING:
+    from .handoff.runs import RunsClient
+
 
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+BOT_CHAT_TITLE = "Bot Chat"
+MAX_PEER_DM_BYTES = 500_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,12 +150,40 @@ def resolve_peer(
     )
 
 
+def ensure_peer_bot_chat(client: RunsClient) -> str:
+    return client.ensure_session(BOT_CHAT_TITLE, source="bot_peer_dm")
+
+
+def peer_dm_request(
+    client: RunsClient, message: str, *, session_id: str | None = None
+) -> dict[str, str]:
+    if (
+        not isinstance(message, str)
+        or not message
+        or "\0" in message
+        or len(message.encode("utf-8")) > MAX_PEER_DM_BYTES
+    ):
+        raise ValueError("peer message is invalid")
+    session_id = session_id or ensure_peer_bot_chat(client)
+    response = client.chat(session_id, message)
+    response_session_id = response.get("session_id")
+    if isinstance(response_session_id, str):
+        session_id = response_session_id
+    payload = response.get("message")
+    reply = payload.get("content") if isinstance(payload, dict) else None
+    if not isinstance(reply, str):
+        raise ValueError("peer message response is invalid")
+    return {"session_id": session_id, "reply": reply}
+
+
 __all__ = [
     "ResolvedPeer",
+    "ensure_peer_bot_chat",
     "load_peer_registry",
     "parse_peer_target",
     "peer_base_url",
     "peer_key_env",
+    "peer_dm_request",
     "resolve_peer",
     "valid_peer_name",
 ]
