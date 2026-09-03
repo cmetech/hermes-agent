@@ -31,6 +31,14 @@ def _register(manager: PluginManager, name: str, factory) -> None:
 
 def _install_test_manager(monkeypatch, manager: PluginManager, events: list[str]) -> None:
     from hermes_cli import plugins
+    from hermes_cli.handoff import supervisor
+
+    class IdleCoreService:
+        def run(self, stop_event: threading.Event) -> None:
+            stop_event.wait()
+
+        def health(self) -> BackgroundServiceHealth:
+            return BackgroundServiceHealth(state="healthy", code="ready")
 
     def discover_and_load(force: bool = False) -> None:
         assert force is False
@@ -39,6 +47,11 @@ def _install_test_manager(monkeypatch, manager: PluginManager, events: list[str]
 
     monkeypatch.setattr(manager, "discover_and_load", discover_and_load)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    monkeypatch.setattr(
+        supervisor,
+        "create_agent_handoff_supervisor",
+        lambda *_args, **_kwargs: IdleCoreService(),
+    )
 
 
 def _isolate_lifespan_resources(monkeypatch, events: list[str]) -> None:
@@ -52,6 +65,7 @@ def _isolate_lifespan_resources(monkeypatch, events: list[str]) -> None:
 
     monkeypatch.setattr(web_server, "run_reaper", reaper)
     monkeypatch.setattr(web_server.PTY_REGISTRY, "close_all", close_all)
+    monkeypatch.setattr(web_server, "_eager_reconcile_own_session_db", lambda: None)
     monkeypatch.delenv("HERMES_DESKTOP", raising=False)
 
 
@@ -157,3 +171,33 @@ def test_web_host_import_graph_is_workflow_agnostic() -> None:
     )
 
     assert not any(module.startswith("plugins.workflow") for module in imports)
+
+
+def test_real_handoff_supervisor_quiesces_repeatedly(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    for _ in range(5):
+        manager = PluginManager(scope_key=str(tmp_path))
+        manager._discovered = True
+        host = manager.start_background_services("web", shutdown_timeout=2)
+        _wait_until(
+            lambda: {
+                item.qualified_name: item.lifecycle for item in host.snapshot()
+            }.get("core:agent_handoff")
+            == "running"
+        )
+
+        assert host.shutdown() is True
+        snapshot = next(
+            item
+            for item in host.snapshot()
+            if item.qualified_name == "core:agent_handoff"
+        )
+        assert snapshot.lifecycle == "stopped"
+        assert snapshot.thread_alive is False
+        assert snapshot.health_probe_alive is False
+
+    from hermes_cli.handoff.store import HandoffStore
+
+    with HandoffStore(tmp_path / "handoffs.db") as store:
+        assert store.list(None, limit=1, before=None) == ()
