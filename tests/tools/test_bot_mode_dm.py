@@ -388,20 +388,20 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
             agent=agent,
         )
     )
-    assert result["status"] == "prepared"
-    assert "spark" in result["to"]
-    assert service.calls[0][1].endpoint.canonical == (
-        "hermes://peer/spark/researcher"
-    )
-    assert service.calls[0][1].required_capabilities == frozenset()
-    assert calls == []
+    assert result["status"] == "sent"
+    assert service.calls == []
+    mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    assert mode == "stdin"
+    assert transport_argv == [
+        "hermes", "-p", "default", "peer", "dm", "spark/researcher"
+    ]
 
     # bare peer name targets the peer's main agent
     result2 = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
     assert result2["status"] == "sent"
-    mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
     assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
 

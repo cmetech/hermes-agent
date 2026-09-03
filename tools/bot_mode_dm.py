@@ -28,14 +28,11 @@ Containment contract (MUST hold — reviewers check all three):
 - Everything here is additive. The legacy protocol transports
   (``hermes -p`` / ``hermes peer dm``) keep working for older prompts.
 
-The transports themselves are unchanged and proven:
-- local teammate  → ``hermes -p <name> chat --in ~ -c "Bot Chat"
-  --create-if-missing -Q --query-file <tmp>`` (one turn, reply on stdout)
-- peer teammate   → ``hermes peer dm <peer>[/<name>] < <tmp>``
-
-Both run through ``terminal_tool(background=True, notify_on_complete=True)``
-so the reply lands as a completion notification on the sender's NEXT turn —
-the same wake shape every Bot Mode agent already knows.
+Canonical and directory targets use the durable handoff service. Legacy bare
+peer and ``<peer>/<agent>`` targets retain the proven ``hermes peer dm``
+background transport until peer DM offers an asynchronous receipt boundary;
+running its synchronous chat inside the handoff supervisor would exceed the
+supervisor's bounded maintenance budget on ordinary model turns.
 """
 
 from __future__ import annotations
@@ -324,7 +321,11 @@ def message_agent_tool(
     except LookupError:
         resolved_target = None
 
-    if resolved_target is not None and resolved_target.endpoint is not None:
+    if (
+        resolved_target is not None
+        and resolved_target.endpoint is not None
+        and resolved_target.source != "legacy_peer"
+    ):
         if (
             resolved_target.endpoint.kind == "local"
             and resolved_target.endpoint.profile == me
