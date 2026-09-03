@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 from typing import Literal
 
-from hermes_cli.config import load_config_readonly
+from hermes_cli.config import load_config_readonly, read_user_config_raw
 from hermes_cli.peers import load_peer_registry, parse_peer_target, valid_peer_name
 from hermes_constants import named_profile_is_deleted
 
@@ -83,6 +83,13 @@ def _peer_names(home: Path) -> frozenset[str]:
     )
 
 
+def _validate_config_source(home: Path) -> None:
+    try:
+        read_user_config_raw(home / "config.yaml")
+    except Exception as exc:
+        raise ValueError("handoff directory configuration is invalid") from exc
+
+
 def _validate_endpoint(
     endpoint: HandoffEndpoint,
     *,
@@ -99,6 +106,7 @@ def load_agent_directory(
     initiating_home: str | Path,
 ) -> tuple[AgentDirectoryEntry, ...]:
     home = Path(initiating_home).expanduser().resolve()
+    _validate_config_source(home)
     config = load_config_readonly(config_path=home / "config.yaml") or {}
     handoff = config.get("handoff")
     if not isinstance(handoff, Mapping):
@@ -166,6 +174,7 @@ def resolve_agent_target(
     if not isinstance(target, str) or not target.strip():
         raise ValueError("agent target is required")
     home = Path(initiating_home).expanduser().resolve()
+    _validate_config_source(home)
     raw = target.strip()
     local_profiles = frozenset(_local_profiles(home))
     peer_names = _peer_names(home)
