@@ -85,7 +85,7 @@ def _peer_names(home: Path) -> frozenset[str]:
 
 def _validate_config_source(home: Path) -> None:
     try:
-        read_user_config_raw(home / "config.yaml")
+        read_user_config_raw(home / "config.yaml", require_mapping=True)
     except Exception as exc:
         raise ValueError("handoff directory configuration is invalid") from exc
 

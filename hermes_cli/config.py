@@ -3629,7 +3629,9 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def read_user_config_raw(
+    config_path: Optional[Path] = None, *, require_mapping: bool = False
+) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
@@ -3662,7 +3664,7 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
       * unparseable YAML / other I/O errors → raises (callers that want
         fail-open already wrap in try/except; callers with last-known-good
         or warn semantics rely on the exception)
-      * non-dict YAML root → ``{}``
+      * non-dict YAML root → ``{}``, or raises when ``require_mapping=True``
 
     ``config_path`` defaults to :func:`get_config_path` (profile-aware).
     Pass an explicit path when the caller resolves its own home (gateway
@@ -3672,9 +3674,13 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
         config_path = get_config_path()
     try:
         with open(config_path, encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+            data = fast_safe_load(f)
     except FileNotFoundError:
         return {}
+    if data is None:
+        data = {}
+    if require_mapping and not isinstance(data, dict):
+        raise ValueError("config root must be a mapping")
     return data if isinstance(data, dict) else {}
 
 
