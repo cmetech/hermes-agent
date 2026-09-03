@@ -3235,6 +3235,108 @@ def node_kind_descriptors(
     return descriptors
 
 
+def _phase6_scoped_semantic_descriptors(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> list[dict[str, object]]:
+    """Project the v6 body schema and durable codes as scoped editor rules."""
+    group_schema = _object_schema(
+        "loop_group",
+        profile,
+        normalizer_version=normalizer_version,
+    )
+    group_properties = group_schema["properties"]
+    body_schema = group_properties["nodes"]
+    iteration_schema = group_properties["max_iterations"]
+    durable_codes = phase6_durable_code_catalog()
+    validation_codes = {
+        "topology": "loop_group_topology_invalid",
+        "visibility": "loop_group_scope_invalid",
+        "nesting": "loop_group_shape_invalid",
+        "capacity": "loop_group_product_limit",
+        "work_product": "loop_group_product_limit",
+    }
+    if not set(validation_codes.values()) <= set(durable_codes):
+        raise RuntimeError("scoped semantic rules require registered Phase 6 codes")
+
+    rules = [
+        {
+            "id": "scoped-dag-topology-v1",
+            "group_kind": "loop_group",
+            "body_path": ["loop_group", "nodes"],
+            "node_id_field": "id",
+            "depends_on_field": "depends_on",
+            "allowed_node_kinds": list(NODE_TYPES),
+            "forbidden_node_kinds": [
+                *COMPILE_DIRECTIVE_TYPES,
+                "workflow",
+                *(
+                    node_kind
+                    for node_kind in EXECUTABLE_NODE_TYPES
+                    if node_kind not in NODE_TYPES
+                ),
+            ],
+            "forbidden_group_fields": ["retry"],
+            "group_fields": sorted(group_properties),
+            "required_group_fields": list(group_schema["required"]),
+            "min_nodes": body_schema["minItems"],
+            "max_depth": 1,
+            "max_nodes": body_schema["maxItems"],
+            "max_edges": 4_096,
+            "min_iterations": iteration_schema["minimum"],
+            "max_iterations": iteration_schema["maximum"],
+            "primary_sink": "first-terminal-in-definition-order",
+            "validation_codes": validation_codes,
+        },
+        {
+            "id": "scoped-output-reference-v1",
+            "current_scope": {
+                "producer_scope": "body-sibling",
+                "requires_direct_dependency": True,
+            },
+            "outer_scope": {
+                "producer_scope": "outer-node",
+                "requires_group_dependency": True,
+            },
+            "previous_iteration": {
+                "producer_scope": "body-node",
+                "prefix": "$LOOP_PREV.",
+                "requires_direct_dependency": False,
+            },
+            "companion_node_paths": {
+                "format": "group/child",
+                "separator": "/",
+                "field_paths": [
+                    "sidecar.outward_action_nodes[]",
+                    "sidecar.assignments.*",
+                ],
+            },
+            "validation_code": validation_codes["visibility"],
+        },
+        {
+            "id": "loop-group-work-product-v1",
+            "limit": 4_096,
+            "accumulators": ["executions", "attempts"],
+            "group_iterations_path": ["loop_group", "max_iterations"],
+            "ordinary_loop_multiplier_path": ["loop", "max_iterations"],
+            "retry_max_attempts_path": ["retry", "max_attempts"],
+            "approval_max_attempts_path": [
+                "approval",
+                "on_reject",
+                "max_attempts",
+            ],
+            "ordinary_loop_default_multiplier": 1,
+            "command_prompt_default_retries": 2,
+            "other_default_retries": 0,
+            "approval_default_max_attempts": 3,
+            "attempt_multiplier": "retries-plus-initial-attempt",
+            "group_multiplier": "group-iterations",
+            "validation_code": validation_codes["work_product"],
+        },
+    ]
+    return rules
+
+
 def semantic_rule_descriptors(
     profile: WorkflowLanguageProfile,
     *,
@@ -3245,11 +3347,12 @@ def semantic_rule_descriptors(
     selected_version = _authoring_normalizer_version(selected, normalizer_version)
     archon_v3 = supports_phase3_semantics(selected, selected_version)
     phase4 = supports_phase4_semantics(selected, selected_version)
+    phase6 = supports_phase6_semantics(selected, selected_version)
     definition_applicability = {
         "profiles": [selected.value],
         "documents": ["definition"],
     }
-    return [
+    rules = [
         {
             "id": "dag-topology",
             "label": "DAG topology",
@@ -3417,7 +3520,16 @@ def semantic_rule_descriptors(
             },
             "examples": [["publish"]],
         },
+        *(
+            _phase6_scoped_semantic_descriptors(
+                selected,
+                selected_version,
+            )
+            if phase6
+            else []
+        ),
     ]
+    return [{**rule, "kind": rule["id"]} for rule in rules]
 
 
 def contract_documentation(

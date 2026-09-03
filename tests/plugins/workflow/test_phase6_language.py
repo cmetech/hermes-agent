@@ -13,12 +13,14 @@ from plugins.workflow.language import (
     verify_language_snapshot,
     WorkflowLanguageCompatibilityError,
 )
+from plugins.workflow.language_schema import workflow_authoring_contract
 from plugins.workflow.models import (
     LoopGroupChildScope,
     WorkflowLanguageProfile,
     WorkflowValidationError,
 )
 from plugins.workflow.schema import (
+    _LOOP_GROUP_WORK_LIMIT,
     _compile_workflow_source_document,
     load_workflow,
     load_workflow_snapshot,
@@ -533,6 +535,56 @@ def test_v6_accepts_exact_4096_child_attempt_product(tmp_path, workflow_writer):
     assert (
         _normalize_v6_without_admission(path).definition.nodes[0].node_type
         == "loop_group"
+    )
+
+
+def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
+    tmp_path, workflow_writer
+):
+    body = [
+        {"id": "command", "command": "run"},
+        {"id": "bash", "bash": "true"},
+        {
+            "id": "loop",
+            "loop": {
+                "command": "repeat",
+                "until": "done",
+                "max_iterations": 4,
+            },
+        },
+        {
+            "id": "approval",
+            "approval": {
+                "message": "Continue?",
+                "on_reject": {"prompt": "Revise"},
+            },
+        },
+    ]
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group(body, max_iterations=2)],
+    )
+
+    package = _normalize_v6_without_admission(path)
+    semantics = package.language.node_semantics["process-items"]["loop_group"]
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+    work = next(
+        rule
+        for rule in contract["semantic_rules"]
+        if rule.get("kind") == "loop-group-work-product-v1"
+    )
+
+    assert work["accumulators"] == ["executions", "attempts"]
+    assert work["limit"] == _LOOP_GROUP_WORK_LIMIT
+    assert semantics["child_executions"] == 2 * (1 + 1 + 4 + 1)
+    assert semantics["child_attempts"] == 2 * (
+        (1 * (work["command_prompt_default_retries"] + 1))
+        + (1 * (work["other_default_retries"] + 1))
+        + (4 * (work["other_default_retries"] + 1))
+        + (1 * (work["approval_default_max_attempts"] + 1))
     )
 
 

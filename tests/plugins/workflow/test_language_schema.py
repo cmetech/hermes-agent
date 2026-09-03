@@ -140,6 +140,111 @@ def test_explicit_v6_contract_derives_bounded_loop_group_surface():
     ]
 
 
+def test_explicit_v6_contract_publishes_scoped_graph_semantics():
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    contract = workflow_authoring_contract(profile, normalizer_version=6)
+    rules = {rule["kind"]: rule for rule in contract["semantic_rules"]}
+
+    assert {
+        "scoped-dag-topology-v1",
+        "scoped-output-reference-v1",
+        "loop-group-work-product-v1",
+    } <= set(rules)
+    scoped = rules["scoped-dag-topology-v1"]
+    assert scoped["group_kind"] == "loop_group"
+    assert scoped["body_path"] == ["loop_group", "nodes"]
+    assert scoped["node_id_field"] == "id"
+    assert scoped["depends_on_field"] == "depends_on"
+    assert scoped["allowed_node_kinds"] == [
+        "command",
+        "prompt",
+        "bash",
+        "script",
+        "loop",
+        "approval",
+        "cancel",
+    ]
+    assert scoped["forbidden_node_kinds"] == [
+        "include",
+        "workflow",
+        "loop_group",
+    ]
+    assert scoped["forbidden_group_fields"] == ["retry"]
+    assert scoped["group_fields"] == sorted(loop_group_field_names())
+    assert scoped["required_group_fields"] == [
+        "nodes",
+        "until",
+        "max_iterations",
+    ]
+    assert scoped["min_nodes"] == 1
+    assert scoped["max_depth"] == 1
+    assert scoped["max_nodes"] == 512
+    assert scoped["max_edges"] == 4096
+    assert scoped["min_iterations"] == 1
+    assert scoped["max_iterations"] == 100
+    assert scoped["primary_sink"] == "first-terminal-in-definition-order"
+    assert scoped["validation_codes"] == {
+        "topology": "loop_group_topology_invalid",
+        "visibility": "loop_group_scope_invalid",
+        "nesting": "loop_group_shape_invalid",
+        "capacity": "loop_group_product_limit",
+        "work_product": "loop_group_product_limit",
+    }
+
+    references = rules["scoped-output-reference-v1"]
+    assert references["current_scope"]["requires_direct_dependency"] is True
+    assert references["outer_scope"]["requires_group_dependency"] is True
+    assert references["previous_iteration"]["prefix"] == "$LOOP_PREV."
+    assert references["companion_node_paths"] == {
+        "format": "group/child",
+        "separator": "/",
+        "field_paths": [
+            "sidecar.outward_action_nodes[]",
+            "sidecar.assignments.*",
+        ],
+    }
+
+    work = rules["loop-group-work-product-v1"]
+    assert work["limit"] == 4096
+    assert work["accumulators"] == ["executions", "attempts"]
+    assert work["group_iterations_path"] == ["loop_group", "max_iterations"]
+    assert work["ordinary_loop_multiplier_path"] == ["loop", "max_iterations"]
+    assert work["retry_max_attempts_path"] == ["retry", "max_attempts"]
+    assert work["approval_max_attempts_path"] == [
+        "approval",
+        "on_reject",
+        "max_attempts",
+    ]
+    assert work["ordinary_loop_default_multiplier"] == 1
+    assert work["command_prompt_default_retries"] == 2
+    assert work["other_default_retries"] == 0
+    assert work["approval_default_max_attempts"] == 3
+    assert json.loads(json.dumps(rules, sort_keys=True)) == rules
+
+
+@pytest.mark.parametrize(
+    ("profile", "normalizer_version"),
+    [
+        (WorkflowLanguageProfile.HERMES_LEGACY, 2),
+        (WorkflowLanguageProfile.ARCHON_2026_07, 5),
+    ],
+)
+def test_profiles_without_loop_groups_omit_scoped_graph_semantics(
+    profile, normalizer_version
+):
+    rules = workflow_authoring_contract(
+        profile,
+        normalizer_version=normalizer_version,
+    )["semantic_rules"]
+
+    scoped_kinds = {
+        "scoped-dag-topology-v1",
+        "scoped-output-reference-v1",
+        "loop-group-work-product-v1",
+    }
+    assert scoped_kinds.isdisjoint(rule["kind"] for rule in rules)
+
+
 @pytest.mark.parametrize(
     ("group_options", "expected"),
     [
