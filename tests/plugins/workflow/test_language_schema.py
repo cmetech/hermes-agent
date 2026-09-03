@@ -49,6 +49,16 @@ def _descriptor_definition(contract: dict, descriptor: dict) -> dict:
     return contract["field_definitions"][descriptor["definition_ref"]]
 
 
+def _node_kind_semantic_definition(contract: dict, descriptor: dict) -> dict:
+    reference = descriptor["semantic_ref"]
+    node_kind = next(
+        item
+        for item in contract["node_kinds"]
+        if item["id"] == reference["node_kind"]
+    )
+    return node_kind["semantic_definitions"][reference["definition"]]
+
+
 def test_archon_authoring_contract_is_bounded_and_versioned():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
@@ -215,15 +225,20 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
         "prefix": "$LOOP_PREV.",
         "requires_direct_dependency": False,
     }
-    assert references["group_until_bash"] == {
+    assert references["semantic_ref"] == {
+        "node_kind": "loop_group",
+        "definition": "scoped-output-reference-v1",
+    }
+    reference_details = _node_kind_semantic_definition(contract, references)
+    assert reference_details["group_until_bash"] == {
         "field_path": ["loop_group", "until_bash"],
         "current_scope": "all-body-nodes",
     }
-    assert references["companion_node_paths"] == {
+    assert reference_details["companion_node_paths"] == {
         "format": "group/child",
         "field_paths": ["sidecar.outward_action_nodes[]"],
     }
-    assert references["validation_codes"] == {
+    assert reference_details["validation_codes"] == {
         "body": "loop_group_scope_invalid",
         "group_until_bash": {
             "visibility": "output_reference_not_declared_dependency",
@@ -233,8 +248,14 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
 
     work = rules["loop-group-work-product-v1"]
     assert work["limit"] == 4096
-    assert work["expression_format"] == "prefix-v1"
-    assert work["accumulators"] == {
+    assert work["accumulators"] == ["executions", "attempts"]
+    assert work["semantic_ref"] == {
+        "node_kind": "loop_group",
+        "definition": "loop-group-work-product-v1",
+    }
+    formula = _node_kind_semantic_definition(contract, work)
+    assert formula["expression_format"] == "prefix-v1"
+    assert formula["expressions"] == {
         "executions": [
             "*",
             "group_iterations",
@@ -266,7 +287,7 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     assert work["command_prompt_default_retries"] == 2
     assert work["other_default_retries"] == 0
     assert work["approval_default_max_attempts"] == 3
-    assert work["ordinary_loop_multiplier"] == {
+    assert formula["selectors"]["ordinary_loop_multiplier"] == {
         "first_match": [
             {
                 "node_kind": "loop",
@@ -276,7 +297,7 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
             {"constant": 1},
         ],
     }
-    assert work["selected_retries"] == {
+    assert formula["selectors"]["selected_retries"] == {
         "first_match": [
             {
                 "mapping_at": ["approval", "on_reject"],
@@ -302,16 +323,55 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     )
     assert loop_group_topic == {
         "id": "durable-loop-groups",
-        "semantic_rule_ids": [
-            "scoped-dag-topology-v1",
-            "scoped-output-reference-v1",
-            "loop-group-work-product-v1",
+        "title": "Durable bounded loop groups",
+        "description": "One immutable nested body with bounded iterations.",
+        "field_paths": [
+            "nodes[].loop_group.nodes",
+            "nodes[].loop_group.until",
+            "nodes[].loop_group.max_iterations",
+            "nodes[].loop_group.fresh_context",
+            "nodes[].loop_group.until_bash",
+            "nodes[].loop_group.interactive",
+            "nodes[].loop_group.signal_completes",
+            "nodes[].loop_group.gate_message",
         ],
-        "effective_interactive_requires": [
-            "workflow.interactive",
-            "loop_group.interactive",
-        ],
-        "additional_rejected_field": "returns",
+        "applicability": {
+            "profiles": ["archon-2026-07"],
+            "documents": ["definition"],
+        },
+        "parameters": {
+            "body_depth": 1,
+            "body_nodes": {"minimum": 1, "maximum": 512},
+            "body_edges": {"maximum": 4096},
+            "max_iterations": {"minimum": 1, "maximum": 100},
+            "primary_sink": "first_terminal_in_definition_order",
+            "group_fields": [
+                "fresh_context",
+                "gate_message",
+                "interactive",
+                "max_iterations",
+                "nodes",
+                "signal_completes",
+                "until",
+                "until_bash",
+            ],
+            "reference_scopes": {
+                "current_body": "direct_sibling_dependency",
+                "outer": "direct_group_dependency",
+                "previous_body": "immediately_previous_iteration",
+            },
+            "effective_interactive_requires": [
+                "workflow.interactive",
+                "loop_group.interactive",
+            ],
+            "rejected": [
+                "include",
+                "nested_loop_group",
+                "runtime_workflow",
+                "group_retry",
+                "returns",
+            ],
+        },
     }
     assert json.loads(json.dumps(rules, sort_keys=True)) == rules
 

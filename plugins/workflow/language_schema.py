@@ -3203,6 +3203,90 @@ def _node_example(node_type: str) -> dict[str, object]:
     return example
 
 
+def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
+    return {
+        "scoped-output-reference-v1": {
+            "group_until_bash": {
+                "field_path": ["loop_group", "until_bash"],
+                "current_scope": "all-body-nodes",
+            },
+            "companion_node_paths": {
+                "format": "group/child",
+                "field_paths": ["sidecar.outward_action_nodes[]"],
+            },
+            "validation_codes": {
+                "body": "loop_group_scope_invalid",
+                "group_until_bash": {
+                    "visibility": "output_reference_not_declared_dependency",
+                    "structured_output": "loop_group_scope_invalid",
+                },
+            },
+        },
+        "loop-group-work-product-v1": {
+            "expression_format": "prefix-v1",
+            "expressions": {
+                "executions": [
+                    "*",
+                    "group_iterations",
+                    ["sum", "body_nodes", "ordinary_loop_multiplier"],
+                ],
+                "attempts": [
+                    "*",
+                    "group_iterations",
+                    [
+                        "sum",
+                        "body_nodes",
+                        [
+                            "*",
+                            "ordinary_loop_multiplier",
+                            ["+", "selected_retries", 1],
+                        ],
+                    ],
+                ],
+            },
+            "selectors": {
+                "ordinary_loop_multiplier": {
+                    "first_match": [
+                        {
+                            "node_kind": "loop",
+                            "field_path": ["loop", "max_iterations"],
+                            "default": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
+                        },
+                        {
+                            "constant": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
+                        },
+                    ],
+                },
+                "selected_retries": {
+                    "first_match": [
+                        {
+                            "mapping_at": ["approval", "on_reject"],
+                            "field_path": [
+                                "approval",
+                                "on_reject",
+                                "max_attempts",
+                            ],
+                            "default": LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
+                        },
+                        {
+                            "mapping_at": ["retry"],
+                            "field_path": ["retry", "max_attempts"],
+                            "default": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+                        },
+                        {
+                            "node_kind_in": ["command", "prompt"],
+                            "constant": LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES,
+                        },
+                        {
+                            "constant": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+                        },
+                    ],
+                },
+            },
+        },
+    }
+
+
 def node_kind_descriptors(
     profile: WorkflowLanguageProfile,
     *,
@@ -3258,7 +3342,7 @@ def node_kind_descriptors(
             )
         )
         fields.sort(key=lambda item: (item["order"], item["field_path"]))
-        descriptors.append({
+        descriptor = {
             "id": node_type,
             "label": _humanize(node_type),
             "description": f"Author a Hermes {node_type} workflow node.",
@@ -3274,7 +3358,12 @@ def node_kind_descriptors(
             "status": _editor_status(_field_status(payload, selected).status),
             "examples": [_node_example(node_type)],
             "fields": fields,
-        })
+        }
+        if node_type == "loop_group":
+            descriptor["semantic_definitions"] = (
+                _phase6_node_kind_semantic_definitions()
+            )
+        descriptors.append(descriptor)
     return descriptors
 
 
@@ -3356,46 +3445,15 @@ def _phase6_scoped_semantic_descriptors(
                 "prefix": "$LOOP_PREV.",
                 "requires_direct_dependency": False,
             },
-            "group_until_bash": {
-                "field_path": ["loop_group", "until_bash"],
-                "current_scope": "all-body-nodes",
-            },
-            "companion_node_paths": {
-                "format": "group/child",
-                "field_paths": ["sidecar.outward_action_nodes[]"],
-            },
-            "validation_codes": {
-                "body": validation_codes["visibility"],
-                "group_until_bash": {
-                    "visibility": "output_reference_not_declared_dependency",
-                    "structured_output": validation_codes["visibility"],
-                },
+            "semantic_ref": {
+                "node_kind": "loop_group",
+                "definition": "scoped-output-reference-v1",
             },
         },
         {
             "id": "loop-group-work-product-v1",
             "limit": LOOP_GROUP_WORK_LIMIT,
-            "expression_format": "prefix-v1",
-            "accumulators": {
-                "executions": [
-                    "*",
-                    "group_iterations",
-                    ["sum", "body_nodes", "ordinary_loop_multiplier"],
-                ],
-                "attempts": [
-                    "*",
-                    "group_iterations",
-                    [
-                        "sum",
-                        "body_nodes",
-                        [
-                            "*",
-                            "ordinary_loop_multiplier",
-                            ["+", "selected_retries", 1],
-                        ],
-                    ],
-                ],
-            },
+            "accumulators": ["executions", "attempts"],
             "group_iterations_path": ["loop_group", "max_iterations"],
             "ordinary_loop_multiplier_path": ["loop", "max_iterations"],
             "retry_max_attempts_path": ["retry", "max_attempts"],
@@ -3414,44 +3472,10 @@ def _phase6_scoped_semantic_descriptors(
             "approval_default_max_attempts": (
                 LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS
             ),
-            "ordinary_loop_multiplier": {
-                "first_match": [
-                    {
-                        "node_kind": "loop",
-                        "field_path": ["loop", "max_iterations"],
-                        "default": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
-                    },
-                    {
-                        "constant": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
-                    },
-                ],
+            "semantic_ref": {
+                "node_kind": "loop_group",
+                "definition": "loop-group-work-product-v1",
             },
-            "selected_retries": {
-                "first_match": [
-                    {
-                        "mapping_at": ["approval", "on_reject"],
-                        "field_path": [
-                            "approval",
-                            "on_reject",
-                            "max_attempts",
-                        ],
-                        "default": LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
-                    },
-                    {
-                        "mapping_at": ["retry"],
-                        "field_path": ["retry", "max_attempts"],
-                        "default": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
-                    },
-                    {
-                        "node_kind_in": ["command", "prompt"],
-                        "constant": LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES,
-                    },
-                    {
-                        "constant": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
-                    },
-                ],
-            },
-            "validation_code": validation_codes["work_product"],
         },
     ]
     return rules
@@ -3771,16 +3795,37 @@ def contract_documentation(
         [
             {
                 "id": "durable-loop-groups",
-                "semantic_rule_ids": [
-                    "scoped-dag-topology-v1",
-                    "scoped-output-reference-v1",
-                    "loop-group-work-product-v1",
+                "title": "Durable bounded loop groups",
+                "description": "One immutable nested body with bounded iterations.",
+                "field_paths": [
+                    f"nodes[].loop_group.{spec.yaml_name}"
+                    for spec in _specs("loop_group")
                 ],
-                "effective_interactive_requires": [
-                    "workflow.interactive",
-                    "loop_group.interactive",
-                ],
-                "additional_rejected_field": "returns",
+                "applicability": applicability,
+                "parameters": {
+                    "body_depth": 1,
+                    "body_nodes": {"minimum": 1, "maximum": 512},
+                    "body_edges": {"maximum": LOOP_GROUP_MAX_EDGES},
+                    "max_iterations": {"minimum": 1, "maximum": 100},
+                    "primary_sink": "first_terminal_in_definition_order",
+                    "group_fields": sorted(LOOP_GROUP_FIELDS),
+                    "reference_scopes": {
+                        "current_body": "direct_sibling_dependency",
+                        "outer": "direct_group_dependency",
+                        "previous_body": "immediately_previous_iteration",
+                    },
+                    "effective_interactive_requires": [
+                        "workflow.interactive",
+                        "loop_group.interactive",
+                    ],
+                    "rejected": [
+                        "include",
+                        "nested_loop_group",
+                        "runtime_workflow",
+                        "group_retry",
+                        "returns",
+                    ],
+                },
             }
         ]
         if phase6
