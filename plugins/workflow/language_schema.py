@@ -21,7 +21,13 @@ from plugins.workflow.language import (
     supports_phase5_semantics,
     supports_phase6_semantics,
 )
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowLanguageSelection
+from plugins.workflow.models import (
+    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
+    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+    WorkflowLanguageProfile,
+    WorkflowLanguageSelection,
+)
 
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -3220,6 +3226,20 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
                     "visibility": "output_reference_not_declared_dependency",
                     "structured_output": "loop_group_scope_invalid",
                 },
+            },
+            "semantic_codes": {
+                "current_scope_missing_dependency": (
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                ),
+                "outer_scope_missing_group_dependency": (
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                ),
+                "previous_iteration_unknown_producer": (
+                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE
+                ),
+                "companion_unknown_node": (
+                    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE
+                ),
             },
         },
         "loop-group-work-product-v1": {

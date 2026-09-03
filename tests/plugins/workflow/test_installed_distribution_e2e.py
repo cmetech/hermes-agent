@@ -21,6 +21,35 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
 
 
+def _installed_console_path(prefix: Path) -> Path:
+    candidates = (
+        prefix / "bin" / "hermes",
+        prefix / "Scripts" / "hermes.exe",
+        prefix / "Scripts" / "hermes",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        "installed hermes console was not found under bin/ or Scripts/"
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (Path("bin/hermes"), Path("Scripts/hermes.exe")),
+    ids=("posix", "windows-native"),
+)
+def test_installed_console_resolver_supports_native_schemes(
+    tmp_path: Path, relative_path: Path
+) -> None:
+    expected = tmp_path / relative_path
+    expected.parent.mkdir(parents=True)
+    expected.write_text("installed console\n", encoding="utf-8")
+
+    assert _installed_console_path(tmp_path) == expected
+
+
 def _temporary_source_vendor(build_source: Path) -> None:
     """Stage approved connector bytes into an isolated wheel-build tree."""
     source = resolve_ericsson_connector_source(repo_root=build_source)
@@ -290,8 +319,7 @@ def test_installed_distribution_exposes_deterministic_workflow_schema_corpus(
     installed_distribution,
 ) -> None:
     site, env, _wheels = installed_distribution
-    console = site.parent / "console-install" / "bin" / "hermes"
-    assert console.is_file()
+    console = _installed_console_path(site.parent / "console-install")
     command = [
         str(console),
         "workflow",

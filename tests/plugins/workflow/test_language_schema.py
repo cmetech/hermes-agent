@@ -245,6 +245,16 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
             "structured_output": "loop_group_scope_invalid",
         },
     }
+    assert reference_details["semantic_codes"] == {
+        "current_scope_missing_dependency": "scoped-reference-missing-dependency",
+        "outer_scope_missing_group_dependency": (
+            "scoped-reference-missing-dependency"
+        ),
+        "previous_iteration_unknown_producer": (
+            "scoped-reference-unknown-producer"
+        ),
+        "companion_unknown_node": "scoped-companion-reference-unknown-node",
+    }
 
     work = rules["loop-group-work-product-v1"]
     assert work["limit"] == 4096

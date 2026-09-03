@@ -62,6 +62,7 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
+    WorkflowSemanticValidationIssue,
     WorkflowStructuredOutput,
     WorkflowValidationError,
 )
@@ -1276,6 +1277,12 @@ def _language_payload(package: WorkflowPackage) -> dict[str, object]:
     return payload
 
 
+def _semantic_issue_payload(issue: ValidationIssue) -> dict[str, str]:
+    if isinstance(issue, WorkflowSemanticValidationIssue):
+        return {"semantic_code": issue.semantic_code}
+    return {}
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     compilation = (
@@ -1315,6 +1322,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         issue_entries.append({
             "path": issue.path,
             "code": issue.code,
+            **_semantic_issue_payload(issue),
             "message": issue.message,
             "severity": issue.severity,
             "blocking": issue.blocking,
@@ -3056,6 +3064,7 @@ def workflow_command(
             {
                 "code": issue.code,
                 "path": issue.path,
+                **_semantic_issue_payload(issue),
                 "severity": issue.severity,
                 "blocking": issue.blocking,
             }

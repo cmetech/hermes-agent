@@ -7,7 +7,12 @@ from typing import Iterable
 
 from plugins.workflow.language import CURRENT_NORMALIZER_BY_PROFILE
 from plugins.workflow.language_schema import workflow_authoring_contract
-from plugins.workflow.models import WorkflowLanguageProfile
+from plugins.workflow.models import (
+    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
+    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+    WorkflowLanguageProfile,
+)
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -29,36 +34,16 @@ def _diagnostic(
     scope: str = "root",
     severity: str = "error",
     blocking: bool = True,
+    semantic_code: str | None = None,
 ) -> dict[str, object]:
     return {
         "blocking": blocking,
+        "code": semantic_code or hermes_code,
         "hermes_code": hermes_code,
         "path": path,
         "scope": scope,
         "severity": severity,
     }
-
-
-def _portable_diagnostic_code(
-    hermes_code: str,
-    path: str,
-    definition_yaml: str,
-    companion_yaml: str | None,
-) -> str:
-    """Project a native diagnostic into the corpus' portable code vocabulary."""
-    if hermes_code == "loop_group_scope_invalid" and path.endswith(
-        (".prompt", ".command", ".bash", ".script")
-    ):
-        if "$LOOP_PREV." in definition_yaml:
-            return "scoped-reference-unknown-producer"
-        return "scoped-reference-missing-dependency"
-    if (
-        hermes_code == "unknown_sidecar_node"
-        and path == "sidecar.outward_action_nodes"
-        and companion_yaml is not None
-    ):
-        return "scoped-companion-reference-unknown-node"
-    return hermes_code
 
 
 def _case(
@@ -81,12 +66,6 @@ def _case(
     normalized_diagnostics = [
         {
             **diagnostic,
-            "code": _portable_diagnostic_code(
-                str(diagnostic["hermes_code"]),
-                str(diagnostic["path"]),
-                definition_yaml,
-                effective_companion,
-            ),
             "document": (
                 "companion"
                 if str(diagnostic["path"]).startswith("sidecar.")
@@ -380,12 +359,14 @@ def _archon_loop_group_cases(
         path: str,
         *,
         scope: str = group_scope,
+        semantic_code: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         return (
             _diagnostic(
                 hermes_code,
                 path,
                 scope=scope,
+                semantic_code=semantic_code,
             ),
         )
 
@@ -613,8 +594,34 @@ def _archon_loop_group_cases(
             diagnostics=issue(
                 "loop_group_scope_invalid",
                 "nodes[0].loop_group.nodes[1].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                ),
             ),
             features=("reference:current-body", "invalid:missing-dependency"),
+        ),
+        _case(
+            profile,
+            "loop-group-mixed-ref-needs-dependency",
+            _group_definition(
+                "loop-group-mixed-ref-needs-dependency",
+                """        - id: producer
+          prompt: Produce.
+        - id: consumer
+          prompt: Use $LOOP_PREV.producer.output and $producer.output""",
+            ),
+            diagnostics=issue(
+                "loop_group_scope_invalid",
+                "nodes[0].loop_group.nodes[1].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                ),
+            ),
+            features=(
+                "reference:current-body",
+                "reference:loop-prev",
+                "invalid:missing-dependency",
+            ),
         ),
         _case(
             profile,
@@ -638,6 +645,9 @@ def _archon_loop_group_cases(
             diagnostics=issue(
                 "loop_group_scope_invalid",
                 "nodes[1].loop_group.nodes[0].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                ),
             ),
             features=("reference:outer", "invalid:missing-dependency"),
         ),
@@ -660,6 +670,9 @@ def _archon_loop_group_cases(
             diagnostics=issue(
                 "loop_group_scope_invalid",
                 "nodes[0].loop_group.nodes[0].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE
+                ),
             ),
             features=("reference:loop-prev", "invalid:unknown-producer"),
         ),
@@ -712,6 +725,9 @@ outward_action_policy: approval_required"""
             diagnostics=issue(
                 "unknown_sidecar_node",
                 "sidecar.outward_action_nodes",
+                semantic_code=(
+                    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE
+                ),
             ),
             features=("field-family:sidecar", "reference:companion-group-child"),
         ),

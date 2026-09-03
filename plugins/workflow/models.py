@@ -347,6 +347,24 @@ class ValidationIssue:
     source_line: int | None = None
 
 
+SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE = (
+    "scoped-reference-missing-dependency"
+)
+SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE = (
+    "scoped-reference-unknown-producer"
+)
+SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE = (
+    "scoped-companion-reference-unknown-node"
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkflowSemanticValidationIssue(ValidationIssue):
+    """A validation issue with additive branch-specific semantic authority."""
+
+    semantic_code: str
+
+
 class WorkflowValidationError(ValueError):
     """Raised when a portable package cannot be normalized safely."""
 

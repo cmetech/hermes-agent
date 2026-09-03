@@ -122,6 +122,7 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-forbidden-retry",
         "loop-group-current-ref-with-dependency",
         "loop-group-current-ref-needs-dependency",
+        "loop-group-mixed-ref-needs-dependency",
         "loop-group-outer-ref-with-dependency",
         "loop-group-outer-ref-needs-dependency",
         "loop-group-loop-prev-valid",
@@ -187,19 +188,6 @@ def _authority_outcome(case: dict[str, object]):
         source,
         normalizer_version=case["normalizer_version"],
     )
-
-
-def _portable_code_from_authority(issue) -> str:
-    if issue.code == "loop_group_scope_invalid":
-        if issue.message.startswith("unknown previous-iteration body node:"):
-            return "scoped-reference-unknown-producer"
-        if " is outside the loop-group scope" in issue.message:
-            return "scoped-reference-missing-dependency"
-    if issue.code == "unknown_sidecar_node" and issue.message.startswith(
-        "outward_action_nodes references unknown node:"
-    ):
-        return "scoped-companion-reference-unknown-node"
-    return issue.code
 
 
 def _authored_document_and_scope(
@@ -327,7 +315,7 @@ def test_every_case_agrees_with_hermes_parser_normalizer_and_diagnostics(profile
             item["blocking"] for item in expected
         ], case["id"]
         assert [
-            _portable_code_from_authority(issue) for issue in actual
+            getattr(issue, "semantic_code", issue.code) for issue in actual
         ] == [item["code"] for item in expected], case["id"]
         assert [
             _authored_document_and_scope(case, issue) for issue in actual

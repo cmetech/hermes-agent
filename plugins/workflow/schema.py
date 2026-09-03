@@ -75,6 +75,9 @@ from plugins.workflow.language_schema import (
     WorkflowReferenceSyntaxError,
 )
 from plugins.workflow.models import (
+    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
+    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
     ValidationIssue,
     ValidatedWorkflowResourceBodies,
     WorkflowDefinition,
@@ -85,6 +88,7 @@ from plugins.workflow.models import (
     WorkflowRuntimeConfig,
     WorkflowSourceDocument,
     WorkflowSourceNode,
+    WorkflowSemanticValidationIssue,
     WorkflowValidationError,
     freeze_value,
 )
@@ -175,13 +179,35 @@ ASSIGNMENT_POLICY_CAPABILITIES = {
 
 
 def _issue(
-    path: str, code: str, message: str, *, line: int | None = None
+    path: str,
+    code: str,
+    message: str,
+    *,
+    line: int | None = None,
+    semantic_code: str | None = None,
 ) -> ValidationIssue:
+    if semantic_code is not None:
+        return WorkflowSemanticValidationIssue(
+            path=path,
+            code=code,
+            message=message,
+            source_line=line,
+            semantic_code=semantic_code,
+        )
     return ValidationIssue(path=path, code=code, message=message, source_line=line)
 
 
-def _fail(path: str, code: str, message: str, *, line: int | None = None) -> None:
-    raise WorkflowValidationError(_issue(path, code, message, line=line))
+def _fail(
+    path: str,
+    code: str,
+    message: str,
+    *,
+    line: int | None = None,
+    semantic_code: str | None = None,
+) -> None:
+    raise WorkflowValidationError(
+        _issue(path, code, message, line=line, semantic_code=semantic_code)
+    )
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -1966,6 +1992,9 @@ def _validate_v6_loop_group_references(
                             "loop_group_scope_invalid",
                             f"unknown previous-iteration body node: {producer_id}",
                             line=line,
+                            semantic_code=(
+                                SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE
+                            ),
                         )
                     )
                     continue
@@ -2001,6 +2030,9 @@ def _validate_v6_loop_group_references(
                             ),
                             f"output reference {reference.node_id} is outside the loop-group scope",
                             line=line,
+                            semantic_code=(
+                                SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                            ),
                         )
                     )
                     continue
@@ -2658,6 +2690,11 @@ def _expand_root_sidecar_node_references(
                 "sidecar.outward_action_nodes",
                 "unknown_sidecar_node",
                 f"outward_action_nodes references unknown node: {authored_id}",
+                semantic_code=(
+                    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE
+                    if allow_scoped and "/" in authored_id
+                    else None
+                ),
             )
         expanded.extend(instance_nodes)
     rewritten = dict(sidecar)

@@ -679,6 +679,48 @@ def test_json_load_failures_preserve_typed_workflow_issue_codes(
     assert envelope["error"]["details"]["issues"][0]["code"] == expected_code
 
 
+def test_json_load_failure_exposes_additive_semantic_issue_code(
+    workflow_writer, tmp_path, capsys
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="semantic-load-error",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "done",
+                    "max_iterations": 1,
+                    "nodes": [
+                        {"id": "producer", "prompt": "produce"},
+                        {"id": "consumer", "prompt": "Use $producer.output"},
+                    ],
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    issue = _json_envelope(capsys)["error"]["details"]["issues"][0]
+    assert issue == {
+        "blocking": True,
+        "code": "loop_group_scope_invalid",
+        "path": "nodes[0].loop_group.nodes[1].prompt",
+        "semantic_code": "scoped-reference-missing-dependency",
+        "severity": "error",
+    }
+
+
 def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
     workflow_writer, tmp_path, capsys
 ):

@@ -976,6 +976,38 @@ def test_v6_rejects_invalid_body_reference_scopes(
     _assert_issue(path, "loop_group_scope_invalid", expected_path)
 
 
+def test_v6_mixed_references_keep_exact_missing_dependency_semantic_code(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group([
+                {"id": "producer", "prompt": "produce"},
+                {
+                    "id": "consumer",
+                    "prompt": (
+                        "Use $LOOP_PREV.producer.output and $producer.output"
+                    ),
+                },
+            ])
+        ],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_without_admission(path)
+
+    assert [
+        (issue.code, getattr(issue, "semantic_code", None))
+        for issue in raised.value.issues
+    ] == [
+        (
+            "loop_group_scope_invalid",
+            "scoped-reference-missing-dependency",
+        )
+    ]
+
+
 def test_v6_admits_previous_iteration_reference_in_body_condition(
     tmp_path, workflow_writer
 ) -> None:
