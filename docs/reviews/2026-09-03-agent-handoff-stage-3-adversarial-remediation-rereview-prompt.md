@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `f711df25a91f360281d8d27e51163bdd6cae0bb2`
-- Remediated tree: `9eaa8dd91a93778c941418b6d6560f01d7e5edf1`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..f711df25a91f360281d8d27e51163bdd6cae0bb2`
-- Range commits: 17
+- Remediated candidate: `2234ab62f8fb86bd9025d774f540529addaa9a1a`
+- Remediated tree: `39c4cc222964861e0360f4a5867a23444c09cc0a`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..2234ab62f8fb86bd9025d774f540529addaa9a1a`
+- Range commits: 19
 - Range paths: 16
-- Range diff: `+1356/-30`; 613 inserted lines are review prompts, not
+- Range diff: `+1398/-31`; 617 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -51,7 +51,11 @@ waits for an earlier reserved dispatch to settle, and an abandoned reservation
 yields to the newer return after lease expiry. A later pass proved that the
 messaging gateway used this reservation but the Desktop/TUI dispatcher did not.
 The current candidate applies the same shared reservation immediately before
-both gateway and Desktop/TUI model dispatch.
+both gateway and Desktop/TUI model dispatch. The same pass also proved that a
+successfully completed reservation kept its marker and could block a terminal
+return created later. Terminal settlement now clears the active reservation;
+new attention can acknowledge already-settled rows, and only an earlier pending
+reservation can hold back a newer return.
 
 Prove or falsify all of the following:
 
