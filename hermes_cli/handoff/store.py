@@ -589,6 +589,12 @@ class HandoffStore:
         )
         state = "pending" if method == "wake" else "delivered"
         stamp = _timestamp(event.created_at)
+        # Attention projects current state; retain older rows as acknowledged evidence.
+        self._conn.execute(
+            """UPDATE handoff_deliveries SET acknowledged_at=?, updated_at=?
+               WHERE handoff_id=? AND event_sequence<? AND acknowledged_at IS NULL""",
+            (stamp, stamp, snapshot.handoff_id, event.sequence),
+        )
         self._conn.execute(
             """INSERT INTO handoff_deliveries
                (delivery_id, handoff_id, event_sequence, route_kind, route_json,

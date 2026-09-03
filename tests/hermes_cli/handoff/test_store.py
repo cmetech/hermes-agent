@@ -251,6 +251,30 @@ def test_attention_observation_creates_one_redacted_delivery(
     assert "private result" not in raw
 
 
+def test_new_attention_supersedes_an_undelivered_return(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, lease = _prepare_conversation(store)
+
+    store.commit_observation(lease, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    store.commit_observation(lease, ChannelObservation(phase="active"))
+    store.commit_observation(
+        lease,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("terminal result")
+        ),
+    )
+
+    attention = store.attention(snapshot.handoff_id, limit=10)
+    due = store.due_deliveries(now=datetime.now(UTC), limit=10)
+
+    assert len(attention) == 1
+    assert len(due) == 1
+    assert due[0].delivery_id == attention[0].delivery_id
+    assert due[0].event_sequence > first.event_sequence
+    assert store.get_delivery(first.delivery_id).acknowledged_at is not None
+
+
 def test_task_observation_never_creates_a_return_delivery(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot = _create(store)
