@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import queue
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -109,6 +112,64 @@ async def _advance_until(service, handoff_id: str, phases: set[str]):
             return snapshot
         await asyncio.sleep(0.02)
     raise AssertionError(f"handoff stayed in {snapshot.phase}")
+
+
+async def _gateway_supervisor_process(
+    home: Path, handoff_id: str, action: str
+) -> dict:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    code = r'''
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import sys
+
+from hermes_cli.handoff.supervisor import create_agent_handoff_supervisor
+from hermes_cli.plugin_services import BackgroundServiceContext
+from tools.process_registry import process_registry
+
+payload = json.loads(sys.argv[1])
+supervisor = create_agent_handoff_supervisor(
+    BackgroundServiceContext(
+        host_kind="gateway",
+        host_instance_id=f"gateway-{payload['action']}",
+    ),
+    source_home=Path(os.environ["HERMES_HOME"]),
+)
+runtime = next(item for item in supervisor._profiles if item.profile == "default")
+if payload["action"] == "observe":
+    failures = supervisor._advance(
+        supervisor._selected_profiles(), datetime.now(timezone.utc)
+    )
+    event = None
+else:
+    supervisor.tick()
+    failures = 0
+    event = process_registry.completion_queue.get_nowait()
+snapshot = runtime.service.get(payload["handoff_id"])
+delivery = runtime.service.store.attention(payload["handoff_id"], limit=1)[0]
+print(json.dumps({
+    "failures": failures,
+    "phase": snapshot.phase,
+    "attempts": delivery.attempts,
+    "event": event,
+}))
+for item in supervisor._profiles:
+    item.service.store.close()
+'''
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", code, json.dumps({"handoff_id": handoff_id, "action": action})],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
 
 
 @pytest.mark.asyncio
@@ -327,6 +388,50 @@ async def test_initiator_restart_recovers_run_and_unclaimed_return(bot_profiles)
         assert events.get_nowait()["handoff_id"] == completed.handoff_id
         assert restarted.store.attention(completed.handoff_id, limit=10)[0].attempts == 1
         restarted.store.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_supervisor_process_restart_observes_then_claims_real_run(
+    bot_profiles,
+):
+    default_home, _reviewer_home = bot_profiles
+    destination = _RecordingAgent(blocked=True)
+    async with local_gateway._gateway(
+        bot_profiles, agent=lambda **_kwargs: destination
+    ) as (adapter, _server):
+        created = json.loads(
+            await asyncio.to_thread(
+                bot_mode_dm.message_agent_tool,
+                target="hermes://local/reviewer",
+                message="Review across initiating gateway processes.",
+                tool_call_id="call-stage3-gateway-process-restart",
+                agent=_BotCaller(default_home),
+            )
+        )
+        service = AgentHandoffService(HandoffStore(default_home / "handoffs.db"))
+        active = await _advance_until(service, created["handoff_id"], {"active"})
+        run_id = active.checkpoint["run_id"]
+        service.store.close()
+        destination.release.set()
+        await local_gateway._wait_for_run_task(adapter, run_id)
+
+        observed = await _gateway_supervisor_process(
+            default_home, created["handoff_id"], "observe"
+        )
+        claimed = await _gateway_supervisor_process(
+            default_home, created["handoff_id"], "claim"
+        )
+
+    assert observed == {
+        "failures": 0,
+        "phase": "succeeded",
+        "attempts": 0,
+        "event": None,
+    }
+    assert claimed["phase"] == "succeeded"
+    assert claimed["attempts"] == 1
+    assert claimed["event"]["handoff_id"] == created["handoff_id"]
+    assert claimed["event"]["host_kind"] == "gateway"
 
 
 @pytest.mark.asyncio

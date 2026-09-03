@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -32,7 +33,14 @@ import tui_gateway.server as tui_server
 UTC = timezone.utc
 
 
-def _finish_conversation(home, *, policy: str = "wake", hop_count: int = 0):
+def _finish_conversation(
+    home,
+    *,
+    policy: str = "wake",
+    hop_count: int = 0,
+    host_kind: str = "gateway",
+    session_key: str = "agent:default:telegram:dm:42",
+):
     store = HandoffStore(home / "handoffs.db")
     spec = HandoffSpec(
         mode="conversation",
@@ -44,10 +52,10 @@ def _finish_conversation(home, *, policy: str = "wake", hop_count: int = 0):
         required_capabilities=frozenset(),
         return_route={
             "kind": "bot",
-            "host_kind": "gateway",
+            "host_kind": host_kind,
             "profile": "default",
             "session_id": "bot-session-1",
-            "session_key": "agent:default:telegram:dm:42",
+            "session_key": session_key,
             "tool_call_id": "call-1",
             "delivery_policy": policy,
             "hop_count": hop_count,
@@ -327,6 +335,91 @@ def _tui_rpc_process(home, method: str, params: dict) -> dict:
     return json.loads(completed.stdout)
 
 
+def _tui_return_process(home: Path, action: str) -> dict:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            r'''
+from pathlib import Path
+from types import SimpleNamespace
+import json
+import os
+import queue
+import sys
+
+from hermes_cli.handoff.supervisor import create_agent_handoff_supervisor
+import hermes_cli.handoff.supervisor as supervisor_module
+from hermes_cli.plugin_services import BackgroundServiceContext
+from hermes_state import SessionDB
+from tools.async_delegation import claim_event_delivery
+from tools.process_registry import process_registry
+import tui_gateway.server as server
+
+action = sys.argv[1]
+home = Path(os.environ["HERMES_HOME"])
+if action == "disconnect":
+    supervisor_module._DELIVERY_LEASE_SECONDS = 1.0
+supervisor = create_agent_handoff_supervisor(
+    BackgroundServiceContext(host_kind="web", host_instance_id=f"tui-{action}"),
+    source_home=home,
+)
+supervisor.tick()
+event = process_registry.completion_queue.get_nowait()
+runtime = next(item for item in supervisor._profiles if item.profile == "default")
+db = SessionDB(home / "state.db")
+if action == "disconnect":
+    claim = claim_event_delivery(event, "tui-poller")
+    assert claim is not None
+    db.create_session("bot-session-1", "cli")
+    db.set_session_title("bot-session-1", "Bot Chat")
+    db.append_message(
+        "bot-session-1",
+        "user",
+        "durable handoff return",
+        platform_message_id=event["delivery_id"],
+        display_kind="handoff_return",
+    )
+    dispatched = None
+else:
+    session = {
+        "agent": SimpleNamespace(_session_db=db, session_id="bot-session-1"),
+        "session_key": "bot-session-1",
+        "profile_home": str(home),
+        "_finalized": False,
+    }
+    server._hermes_home = home
+    assert server._session_owns_notification_event("reconnected", session, event)
+    server._run_prompt_submit = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("persisted return must not run another model turn")
+    )
+    dispatched = server._dispatch_handoff_return("reconnected", session, event)
+delivery = runtime.service.store.get_delivery(event["delivery_id"])
+print(json.dumps({
+    "delivery_id": event["delivery_id"],
+    "dispatched": dispatched,
+    "persisted": db.has_platform_message_id("bot-session-1", event["delivery_id"]),
+    "state": delivery.state,
+    "attempts": delivery.attempts,
+}), file=server._real_stdout)
+db.close()
+for item in supervisor._profiles:
+    item.service.store.close()
+''',
+            action,
+        ],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
 def test_tui_desktop_process_restart_reopens_durable_attention(_profile_home):
     home = _profile_home
     store, snapshot = _finish_conversation(home)
@@ -346,4 +439,34 @@ def test_tui_desktop_process_restart_reopens_durable_attention(_profile_home):
     assert reopened["result"]["result_preview"] == {
         "text": "review complete",
         "truncated": False,
+    }
+
+
+def test_tui_process_disconnect_reconnect_acks_persisted_return_without_model_turn(
+    _profile_home,
+):
+    home = _profile_home
+    store, snapshot = _finish_conversation(
+        home, host_kind="web", session_key="bot-session-1"
+    )
+    delivery_id = store.attention(snapshot.handoff_id, limit=1)[0].delivery_id
+    store.close()
+
+    disconnected = _tui_return_process(home, "disconnect")
+    time.sleep(1.1)
+    reconnected = _tui_return_process(home, "reconnect")
+
+    assert disconnected == {
+        "delivery_id": delivery_id,
+        "dispatched": None,
+        "persisted": True,
+        "state": "pending",
+        "attempts": 1,
+    }
+    assert reconnected == {
+        "delivery_id": delivery_id,
+        "dispatched": True,
+        "persisted": True,
+        "state": "delivered",
+        "attempts": 2,
     }
