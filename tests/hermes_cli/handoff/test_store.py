@@ -432,7 +432,7 @@ def test_receipt_pending_dispatch_stays_ordered_for_the_same_host(tmp_path):
     assert due[0].event_sequence > first.event_sequence
 
 
-def test_receipt_pending_dispatch_yields_to_a_restarted_host(tmp_path):
+def test_receipt_pending_dispatch_is_reconciled_by_a_restarted_host(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot, advance = _prepare_conversation(store)
     store.commit_observation(advance, ChannelObservation(phase="needs_input"))
@@ -457,13 +457,20 @@ def test_receipt_pending_dispatch_yields_to_a_restarted_host(tmp_path):
         ),
     )
 
-    assert store.claim_delivery(
+    restarted_lease = store.claim_delivery(
         first.delivery_id,
         "gateway-after-restart",
         now=pending.next_attempt_at,
         lease_seconds=30,
-    ) is None
-    assert store.get_delivery(first.delivery_id).acknowledged_at is not None
+    )
+    assert restarted_lease is not None
+    assert store.get_delivery(first.delivery_id).attempts == 1
+    settled = store.release_delivery(
+        restarted_lease,
+        next_attempt_at=datetime.now(UTC) + timedelta(seconds=2),
+        failure_code="delivery_retryable",
+    )
+    assert settled.acknowledged_at is not None
     due = store.due_deliveries(now=pending.next_attempt_at, limit=10)
     assert len(due) == 1
     assert due[0].event_sequence > first.event_sequence

@@ -27593,12 +27593,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_claim_id = ""
         durable_delegation_id = ""
         event_claim = None
+        receipt_recovery = False
         if evt.get("type") == "handoff_return":
             from tools.async_delegation import (
                 begin_handoff_return_delivery,
                 claim_event_delivery,
                 complete_event_delivery,
                 defer_event_delivery_receipt,
+                handoff_return_receipt_pending,
                 release_event_delivery,
             )
 
@@ -27650,6 +27652,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.warning("Could not acknowledge persisted handoff return")
                     return False
+            receipt_recovery = handoff_return_receipt_pending(event_claim)
         elif evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
@@ -27749,6 +27752,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         release_event_delivery(evt, event_claim)
                 return None
+
+        if receipt_recovery and event_claim is not None:
+            claimed = event_claim
+            event_claim = None
+            release_event_delivery(evt, claimed)
+            return False
 
         accepted = accepted_pending_persistence = False
         try:

@@ -361,7 +361,7 @@ def test_gateway_handoff_return_releases_when_acceptance_is_not_persisted(tmp_pa
     [False, RuntimeError("receipt unavailable")],
     ids=["not-yet-persisted", "receipt-read-failed"],
 )
-def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
+def test_gateway_handoff_return_survives_supervisor_owner_rotation_before_receipt(
     tmp_path, post_acceptance_receipt,
 ):
     store, event = _handoff_event(tmp_path)
@@ -392,7 +392,7 @@ def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
     pending = store.get_delivery(event["delivery_id"])
     replay_lease = store.claim_delivery(
         pending.delivery_id,
-        event["delivery_claim"]["owner"],
+        "supervisor-2",
         now=pending.next_attempt_at,
         lease_seconds=30,
     )
@@ -413,7 +413,7 @@ def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
     pending = store.get_delivery(event["delivery_id"])
     final_lease = store.claim_delivery(
         pending.delivery_id,
-        event["delivery_claim"]["owner"],
+        "supervisor-3",
         now=pending.next_attempt_at,
         lease_seconds=30,
     )

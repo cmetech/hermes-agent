@@ -607,6 +607,16 @@ def begin_handoff_return_delivery(claim: object) -> bool:
         return False
 
 
+def handoff_return_receipt_pending(claim: object) -> bool:
+    """Whether a validated claim is reconciling an accepted adapter dispatch."""
+    if not isinstance(claim, _HandoffReturnClaim):
+        return False
+    try:
+        return claim.store.delivery_receipt_pending(claim.lease)
+    except Exception:
+        return False
+
+
 @contextmanager
 def handoff_return_context(agent: object, hop_count: Optional[int]):
     """Install host-only hop state for exactly one synthetic return turn."""

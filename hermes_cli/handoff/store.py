@@ -1381,9 +1381,6 @@ class HandoffStore:
                 and row["failure_code"] == _DELIVERY_RECEIPT_PENDING
                 and row["dispatch_started_at"] is not None
             )
-            same_receipt_owner = bool(
-                receipt_pending and row["lease_owner"] == owner
-            )
             if (
                 row is not None
                 and row["state"] == "pending"
@@ -1395,33 +1392,24 @@ class HandoffStore:
                     or existing_expiry <= now
                 )
                 and self._has_newer_delivery(row)
-                and not same_receipt_owner
+                and not receipt_pending
             ):
                 self._acknowledge_superseded_delivery(row, now)
                 return None
-            if receipt_pending and not same_receipt_owner:
-                self._conn.execute(
-                    """UPDATE handoff_deliveries
-                       SET lease_owner=NULL, lease_expires_at=NULL,
-                           dispatch_started_at=NULL, failure_code=NULL,
-                           updated_at=? WHERE delivery_id=?""",
-                    (stamp, delivery_id),
-                )
-            if same_receipt_owner:
+            if receipt_pending:
                 changed = self._conn.execute(
                     """UPDATE handoff_deliveries
-                       SET lease_epoch=lease_epoch+1, lease_expires_at=?,
-                           updated_at=?
+                       SET lease_owner=?, lease_epoch=lease_epoch+1,
+                           lease_expires_at=?, updated_at=?
                        WHERE delivery_id=? AND method='wake' AND state='pending'
-                         AND acknowledged_at IS NULL AND lease_owner=?
-                         AND failure_code=?
+                         AND acknowledged_at IS NULL AND failure_code=?
                          AND (next_attempt_at IS NULL OR next_attempt_at<=?)
                          AND lease_expires_at<=?""",
                     (
+                        owner,
                         _timestamp(expires_at),
                         stamp,
                         delivery_id,
-                        owner,
                         _DELIVERY_RECEIPT_PENDING,
                         stamp,
                         stamp,
@@ -1465,6 +1453,15 @@ class HandoffStore:
                 (delivery_id,),
             ).fetchone()
             return DeliveryLease(delivery_id, owner, row["lease_epoch"], expires_at)
+
+    def delivery_receipt_pending(self, lease: DeliveryLease) -> bool:
+        """Whether this live claim is reconciling prior adapter acceptance."""
+        with self._lock:
+            row = self._delivery_lease_row(lease, _utc_now())
+            return bool(
+                row["failure_code"] == _DELIVERY_RECEIPT_PENDING
+                and row["dispatch_started_at"] is not None
+            )
 
     def _delivery_lease_row(
         self, lease: DeliveryLease, now: datetime
