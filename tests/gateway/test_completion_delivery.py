@@ -436,6 +436,93 @@ def test_gateway_handoff_return_survives_supervisor_owner_rotation_before_receip
     store.close()
 
 
+def test_gateway_handoff_return_process_restart_retries_after_receipt_recovery(
+    tmp_path,
+):
+    store, event = _handoff_event(tmp_path)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="678",
+    )
+    first_adapter = SimpleNamespace(handle_message=AsyncMock())
+    first_runner = _runner(first_adapter, origins={
+        event["session_key"]: SimpleNamespace(origin=source),
+    })
+    first_runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    first_runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+    )
+    first_runner._async_session_store = SimpleNamespace(
+        _store=first_runner.session_store,
+        has_platform_message_id=AsyncMock(return_value=False),
+    )
+
+    assert asyncio.run(
+        first_runner._deliver_completion_notification(None, event)
+    ) is False
+    first_adapter.handle_message.assert_awaited_once()
+
+    pending = store.get_delivery(event["delivery_id"])
+    recovery_lease = store.claim_delivery(
+        pending.delivery_id,
+        "gateway-after-restart",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert recovery_lease is not None
+    replay = {
+        **event,
+        "delivery_claim": {
+            "owner": recovery_lease.owner,
+            "epoch": recovery_lease.epoch,
+            "expires_at": recovery_lease.expires_at.isoformat(),
+        },
+    }
+
+    restarted_adapter = SimpleNamespace(handle_message=AsyncMock())
+    restarted_runner = _runner(restarted_adapter, origins={
+        event["session_key"]: SimpleNamespace(origin=source),
+    })
+    restarted_runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    restarted_runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+    )
+    restarted_runner._async_session_store = SimpleNamespace(
+        _store=restarted_runner.session_store,
+        has_platform_message_id=AsyncMock(side_effect=[False, False, True]),
+    )
+
+    assert asyncio.run(
+        restarted_runner._deliver_completion_notification(None, replay)
+    ) is False
+    restarted_adapter.handle_message.assert_not_awaited()
+    identity = restarted_runner._completion_delivery_identity(event)
+    assert identity not in restarted_runner._completion_deliveries_inflight
+
+    pending = store.get_delivery(event["delivery_id"])
+    retry_lease = store.claim_delivery(
+        pending.delivery_id,
+        "gateway-retry",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert retry_lease is not None
+    replay["delivery_claim"] = {
+        "owner": retry_lease.owner,
+        "epoch": retry_lease.epoch,
+        "expires_at": retry_lease.expires_at.isoformat(),
+    }
+
+    assert asyncio.run(
+        restarted_runner._deliver_completion_notification(None, replay)
+    ) is True
+    restarted_adapter.handle_message.assert_awaited_once()
+    assert store.get_delivery(event["delivery_id"]).state == "delivered"
+    store.close()
+
+
 def test_gateway_handoff_return_waits_for_queued_turn_receipt(tmp_path):
     store, event, advance = _handoff_event(
         tmp_path, phase="needs_input", return_advance=True

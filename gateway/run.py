@@ -27756,6 +27756,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if receipt_recovery and event_claim is not None:
             claimed = event_claim
             event_claim = None
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    self._completion_deliveries_inflight.discard(identity)
             release_event_delivery(evt, claimed)
             return False
 
