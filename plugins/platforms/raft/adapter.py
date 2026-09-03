@@ -739,6 +739,12 @@ class RaftAdapter(BasePlatformAdapter):
         if not self._message_handler:
             return
 
+        # Durable synthetic returns need the runner-owned FIFO/backpressure
+        # contract; the Raft wake shortcut below is only for Raft wake hints.
+        if event.internal and not event.allow_gateway_control:
+            await super().handle_message(event)
+            return
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),

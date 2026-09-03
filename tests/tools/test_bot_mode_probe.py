@@ -140,6 +140,10 @@ def test_fingerprint_stable_when_nothing_changes(tmp_path):
     assert bot_mode_probe.capability_fingerprint(home) == bot_mode_probe.capability_fingerprint(home)
 
 
+def test_stage_three_protocol_epoch_is_exactly_three():
+    assert bot_mode_probe.PROTOCOL_VERSION == 3
+
+
 def test_fingerprint_changes_on_each_capability_axis(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

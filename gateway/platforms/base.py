@@ -6059,7 +6059,9 @@ class BasePlatformAdapter(ABC):
             session_key,
         )
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        # The dead owner never consumed the queued follow-up. Keep it for the
+        # replacement turn; dropping it here can strand durable synthetic
+        # deliveries that are waiting for their transcript receipt.
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True

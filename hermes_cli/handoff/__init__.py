@@ -1,5 +1,12 @@
 """Public local agent-handoff contract."""
 
+from .directory import (
+    AgentDirectoryEntry,
+    AmbiguousAgentTarget,
+    ResolvedAgentTarget,
+    load_agent_directory,
+    resolve_agent_target,
+)
 from .models import (
     HANDOFF_PHASES,
     ChannelObservation,
@@ -32,9 +39,11 @@ from .store import (
 )
 
 __all__ = [
+    "AgentDirectoryEntry",
     "AdvanceLease",
     "AdvanceResult",
     "AgentHandoffService",
+    "AmbiguousAgentTarget",
     "HANDOFF_PHASES",
     "ChannelObservation",
     "ChannelDefinitelyNotAccepted",
@@ -54,6 +63,9 @@ __all__ = [
     "HandoffStore",
     "HandoffStoreError",
     "PeerHermesChannel",
+    "ResolvedAgentTarget",
     "StaleAdvanceLease",
     "UnsupportedHandoffCommand",
+    "load_agent_directory",
+    "resolve_agent_target",
 ]

@@ -11,6 +11,7 @@ import sqlite3
 import threading
 from types import SimpleNamespace
 import urllib.error
+import urllib.request
 
 import pytest
 from aiohttp import web
@@ -235,6 +236,93 @@ def _service(
 
 async def _advance(service: AgentHandoffService, handoff_id: str):
     return await asyncio.to_thread(service.advance, handoff_id, budget_seconds=3)
+
+
+def _json_request(url: str, key: str):
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    with urllib.request.urlopen(request, timeout=3) as response:
+        return json.loads(response.read())
+
+
+@pytest.mark.asyncio
+async def test_remote_bot_conversation_uses_authenticated_profile_bot_chat(
+    tmp_path, monkeypatch
+):
+    async with _peer_gateway(tmp_path, monkeypatch) as harness:
+        spec = HandoffSpec(
+            mode="conversation",
+            endpoint=HandoffEndpoint.parse("hermes://peer/spark/reviewer"),
+            prompt="Message from 🤖 hermes (@hermes): Review the release.",
+            output_schema=None,
+            deadline_at=None,
+            attribution={"profile": "default", "handle": "hermes"},
+            required_capabilities=frozenset({"cancellation", "follow_up"}),
+            return_route={
+                "kind": "bot",
+                "host_kind": "gateway",
+                "profile": "default",
+                "session_id": "bot-session-1",
+                "session_key": "agent:default:telegram:dm:42",
+                "tool_call_id": "call-peer-bot",
+                "delivery_policy": "wake",
+                "hop_count": 0,
+            },
+        )
+        service = AgentHandoffService(
+            HandoffStore(harness.initiating_home / "handoffs.db"),
+            channel=PeerHermesChannel(harness.initiating_home),
+        )
+        created = service.create(
+            spec, "bot/default/bot-session-1", handoff_key="call-peer-bot"
+        )
+        bound = (await _advance(service, created.handoff_id)).snapshot
+        submitted = (await _advance(service, created.handoff_id)).snapshot
+        for _ in range(40):
+            completed = (await _advance(service, created.handoff_id)).snapshot
+            if completed.phase == "succeeded":
+                break
+            await asyncio.sleep(0.02)
+
+        assert bound.mechanism == "peer_runs"
+        assert bound.checkpoint["session_id"] == submitted.checkpoint["session_id"]
+        assert (
+            submitted.checkpoint["idempotency_key"]
+            == f"handoff-{created.handoff_id}"
+        )
+        assert completed.phase == "succeeded"
+        assert completed.terminal_result["text"] == '{"answer":"approved"}'
+        assert sum(agent.calls for agent in harness.agents) == 1
+        sessions = await asyncio.to_thread(
+            _json_request,
+            f"{harness.url}/p/reviewer/api/sessions?title=Bot%20Chat&include_hidden=1",
+            DESTINATION_KEY,
+        )
+        assert [(row["id"], row["title"]) for row in sessions["data"]] == [
+            (bound.checkpoint["session_id"], "Bot Chat")
+        ]
+        with pytest.raises(urllib.error.HTTPError) as wrong_credential:
+            await asyncio.to_thread(
+                _json_request,
+                f"{harness.url}/p/reviewer/api/sessions?title=Bot%20Chat",
+                SOURCE_KEY,
+            )
+        assert wrong_credential.value.code == 401
+        with pytest.raises(urllib.error.HTTPError) as unrelated_profile:
+            await asyncio.to_thread(
+                _json_request,
+                f"{harness.url}/p/missing/api/sessions?title=Bot%20Chat",
+                DESTINATION_KEY,
+            )
+        assert unrelated_profile.value.code == 404
+        persisted = b"".join(
+            path.read_bytes() for path in harness.initiating_home.glob("handoffs.db*")
+        )
+        assert DESTINATION_KEY.encode() not in persisted
+        assert harness.url.encode() not in persisted
+        service.store.close()
 
 
 @pytest.mark.asyncio

@@ -1699,3 +1699,138 @@ print(json.dumps(payload))
         "canonical_output": '{"answer":"ready"}',
         "canonical_sha256": hashlib.sha256(b'{"answer":"ready"}').hexdigest(),
     }
+
+
+@pytest.mark.integration
+def test_extracted_wheel_registers_agent_handoff_stage_3(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, base_env, _wheels = installed_distribution
+    home = tmp_path / "clean-home"
+    probe_path = tmp_path / "stage3_handoff_probe.py"
+    probe_path.write_text(
+        r'''
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+import hermes_cli.handoff.store as store_module
+import hermes_cli.handoff.supervisor as supervisor_module
+from hermes_cli.handoff import (
+    AgentHandoffService,
+    ChannelObservation,
+    HandoffEndpoint,
+    HandoffSpec,
+    HandoffStore,
+)
+import tui_gateway.server as server
+
+home = Path(__import__("sys").argv[1])
+home.mkdir(parents=True, exist_ok=True)
+store = HandoffStore(home / "handoffs.db")
+service = AgentHandoffService(store)
+spec = HandoffSpec(
+    mode="conversation",
+    endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+    prompt="Review the installed distribution.",
+    output_schema=None,
+    deadline_at=None,
+    attribution={"profile": "default"},
+    required_capabilities=frozenset(),
+    return_route={
+        "kind": "operator",
+        "profile": "default",
+        "inbox_id": "installed-stage3",
+    },
+)
+created = service.create(spec, "operator/default", handoff_key="installed-stage3")
+bound = store.bind(
+    created.handoff_id,
+    "local_bot_cli",
+    {"profile": "reviewer", "mechanism": "local_bot_cli"},
+    {},
+    created.state_version,
+)
+lease = store.claim_advance(
+    bound.handoff_id,
+    "installed-probe",
+    now=datetime.now(timezone.utc),
+    lease_seconds=30,
+)
+assert lease is not None
+store.journal_attempt(lease, "submit")
+store.commit_observation(
+    lease,
+    ChannelObservation(phase="failed", failure_code="remote_failed"),
+)
+listed = service.list({}, limit=10)
+attention_before = store.has_attention(created.handoff_id)
+service.command(
+    created.handoff_id,
+    "acknowledge",
+    command_id="installed-ack",
+    actor="operator",
+)
+payload = {
+    "store_module": str(Path(store_module.__file__).resolve()),
+    "supervisor_module": str(Path(supervisor_module.__file__).resolve()),
+    "schema_version": store._conn.execute("PRAGMA user_version").fetchone()[0],
+    "created_id": created.handoff_id,
+    "listed": [item.handoff_id for item in listed],
+    "attention_before": attention_before,
+    "attention_after": store.has_attention(created.handoff_id),
+    "agent_rpc": sorted(name for name in server._methods if name.startswith("agent_handoff.")),
+    "existing_rpc": sorted(name for name in server._methods if name.startswith("handoff.")),
+}
+store.close()
+print(json.dumps(payload), file=server._real_stdout)
+'''.strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    env = base_env.copy()
+    env["HERMES_HOME"] = str(home)
+    probe = subprocess.run(
+        [sys.executable, str(probe_path), str(home)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert probe.returncode == 0, probe.stderr
+    payload = json.loads(probe.stdout)
+    assert Path(payload["store_module"]).is_relative_to(site.resolve())
+    assert Path(payload["supervisor_module"]).is_relative_to(site.resolve())
+    assert payload == {
+        "store_module": payload["store_module"],
+        "supervisor_module": payload["supervisor_module"],
+        "schema_version": 3,
+        "created_id": payload["created_id"],
+        "listed": [payload["created_id"]],
+        "attention_before": True,
+        "attention_after": False,
+        "agent_rpc": [
+            "agent_handoff.command",
+            "agent_handoff.create",
+            "agent_handoff.directory",
+            "agent_handoff.evidence",
+            "agent_handoff.get",
+            "agent_handoff.list",
+        ],
+        "existing_rpc": ["handoff.fail", "handoff.request", "handoff.state"],
+    }
+
+    handoff_help = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "handoff", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert handoff_help.returncode == 0, handoff_help.stderr
+    assert "usage: hermes handoff" in handoff_help.stdout

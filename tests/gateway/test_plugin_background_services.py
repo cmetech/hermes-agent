@@ -125,6 +125,7 @@ async def test_gateway_start_hosts_services_after_discovery_before_running(
                 item.qualified_name: item.lifecycle for item in host.snapshot()
             }
             == {
+                "core:agent_handoff": "running",
                 "gateway-test:broken": "failed",
                 "gateway-test:coordinator": "running",
             }

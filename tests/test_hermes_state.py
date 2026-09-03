@@ -4784,6 +4784,25 @@ class TestDisplayMetadataPersistence:
         assert reloaded[0]["display_kind"] == "async_delegation_complete"
         assert reloaded[0]["display_metadata"] == meta
 
+    def test_handoff_return_identity_and_display_metadata_round_trip_together(self, db):
+        db.create_session("s1", source="desktop")
+        db.append_messages_batch(
+            "s1",
+            [{
+                "role": "user",
+                "content": "handoff finished",
+                "message_id": "delivery-1",
+                "display_kind": "handoff_return",
+                "display_metadata": {"handoff_id": "handoff-1"},
+            }],
+        )
+
+        assert db.has_platform_message_id("s1", "delivery-1") is True
+        row = db.get_messages_as_conversation("s1")[0]
+        assert row["message_id"] == "delivery-1"
+        assert row["display_kind"] == "handoff_return"
+        assert row["display_metadata"] == {"handoff_id": "handoff-1"}
+
 
 
 class TestDisplayMetadataReadPaths:

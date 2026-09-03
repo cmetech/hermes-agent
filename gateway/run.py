@@ -45,7 +45,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Literal, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -3159,6 +3159,7 @@ def _consume_gateway_tool_choice(runner, session_key: str):
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
 _UNSET = object()
+_HANDOFF_QUEUE_BACKPRESSURE = "handoff_queue_backpressure"
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -4329,7 +4330,9 @@ def _format_concise_process_notification(
     return text
 
 
-def _format_gateway_process_notification(evt: dict) -> "str | None":
+def _format_gateway_process_notification(
+    evt: dict, *, delivery_claim: object = None
+) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
@@ -4359,9 +4362,11 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
+    if evt_type in {"async_delegation", "handoff_return"}:
         # Reuse the shared rich formatter (self-contained task-source block).
         from tools.process_registry import format_process_notification
+        if evt_type == "handoff_return":
+            return format_process_notification(evt, delivery_claim=delivery_claim)
         return format_process_notification(evt)
 
     return None
@@ -4392,7 +4397,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
             "watch_overflow_released",
         }:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "handoff_return"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -6971,6 +6976,14 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_display_kind"] = (
                     ctx.persist_user_display_kind
                 )
+                if getattr(ctx, "persist_user_display_metadata", None):
+                    _conversation_kwargs["persist_user_display_metadata"] = (
+                        ctx.persist_user_display_metadata
+                    )
+            if getattr(ctx, "persist_user_message_id", None):
+                _conversation_kwargs["persist_user_message_id"] = (
+                    ctx.persist_user_message_id
+                )
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
@@ -6982,7 +6995,15 @@ class TurnRunner:
                 _conversation_kwargs["tool_operation_context"] = (
                     _tool_operation_context
                 )
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            _return_hop = getattr(ctx, "handoff_return_hop_count", None)
+            from tools.async_delegation import handoff_return_context
+
+            agent._gateway_session_key = ctx.session_key or ""
+            agent._handoff_return_host_kind = "gateway"
+            with handoff_return_context(agent, _return_hop):
+                result = agent.run_conversation(
+                    _api_run_message, **_conversation_kwargs
+                )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -10837,10 +10858,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self, session_key: str, event: MessageEvent
+    ) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -10850,6 +10873,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return False
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
         security_metadata_keys = (
             "hermes_plugin_id",
@@ -10857,6 +10882,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "gateway_session_key",
             "gateway_session_id",
             "gateway_session_strict",
+            "persist_user_display_kind",
+            "persist_user_display_metadata",
+            "handoff_return_hop_count",
         )
         same_security_context = existing is not None and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
@@ -10881,7 +10909,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -10889,9 +10917,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -10948,6 +10977,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+
+        # Internal synthetic events must always use the observable FIFO path,
+        # and must report backpressure while draining. Otherwise an accepted
+        # handoff return can be discarded before its transcript receipt exists.
+        if getattr(event, "internal", False) and not event.allow_gateway_control:
+            if self._draining or not self._queue_or_replace_pending_event(
+                session_key, event
+            ):
+                setattr(event, "_gateway_queue_backpressure", True)
+            return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -11057,20 +11096,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Plugin events carry untrusted
-        # payload text, so queue those through the gateway FIFO to keep their
-        # security metadata separate from pending user input.
-        if getattr(event, "internal", False) and not event.allow_gateway_control:
-            self._queue_or_replace_pending_event(session_key, event)
-            return True
+        # Internal control events still bypass ordinary busy text handling.
         if getattr(event, "internal", False):
             return False
 
@@ -20820,9 +20846,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # content are untouched — display_kind is a DB-only sidecar stripped
         # from every provider-bound payload (see conversation_loop's
         # api_msg.pop("display_kind")).
-        persist_user_display_kind = (
-            "internal_notification" if getattr(event, "internal", False) else None
+        persist_user_display_kind = event_metadata.get(
+            "persist_user_display_kind"
+        ) or ("internal_notification" if getattr(event, "internal", False) else None)
+        persist_user_display_metadata = event_metadata.get(
+            "persist_user_display_metadata"
         )
+        persist_user_message_id = (
+            str(event.message_id)
+            if persist_user_display_kind == "handoff_return" and event.message_id
+            else None
+        )
+        handoff_return_hop_count = event_metadata.get("handoff_return_hop_count")
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -22386,6 +22421,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_message_id=persist_user_message_id,
+                handoff_return_hop_count=handoff_return_hop_count,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -27268,7 +27306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> Optional[bool] | Literal["handoff_queue_backpressure"]:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing must come from the queued event itself, not from whatever
@@ -27322,6 +27360,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 evt.get("session_id", "unknown"),
             )
             return None
+        if evt.get("type") == "handoff_return":
+            try:
+                from hermes_cli.profiles import profile_matches_home
+
+                if not profile_matches_home(
+                    str(evt.get("profile") or ""),
+                    self._resolve_profile_home_for_source(source),
+                ):
+                    logger.warning("Dropping handoff return for a foreign profile")
+                    return None
+            except Exception:
+                logger.warning("Could not verify handoff return profile", exc_info=True)
+                return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         # Alias-aware resolution (relay-plane): a relay-fronted gateway
         # registers ONE adapter under Platform.RELAY fronting N logical
@@ -27380,17 +27431,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
         try:
             metadata = {}
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            parent_session_id = str(
+                evt.get("parent_session_id")
+                or (evt.get("session_id") if evt.get("type") == "handoff_return" else "")
+                or ""
+            ).strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if evt.get("type") == "handoff_return":
+                metadata.update({
+                    "gateway_session_key": str(evt.get("session_key") or ""),
+                    "persist_user_display_kind": "handoff_return",
+                    "persist_user_display_metadata": {
+                        "delivery_id": str(evt.get("delivery_id") or ""),
+                        "handoff_id": str(evt.get("handoff_id") or ""),
+                        "tool_call_id": str(evt.get("tool_call_id") or ""),
+                        "hop_count": min(
+                            max(int(evt.get("hop_count", 0)), 0) + 1, 1
+                        ),
+                    },
+                    "handoff_return_hop_count": min(
+                        max(int(evt.get("hop_count", 0)), 0) + 1, 1
+                    ),
+                })
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=str(
+                    evt.get("delivery_id")
+                    if evt.get("type") == "handoff_return"
+                    else evt.get("message_id")
+                    or ""
+                ).strip()
+                or None,
                 metadata=metadata,
+                allow_gateway_control=evt.get("type") != "handoff_return",
             )
+            if evt.get("type") == "handoff_return" and self._draining:
+                return _HANDOFF_QUEUE_BACKPRESSURE
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name,
@@ -27407,6 +27487,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(_prime):
                 _prime(synth_event)
             await adapter.handle_message(synth_event)
+            if getattr(synth_event, "_gateway_queue_backpressure", False):
+                return _HANDOFF_QUEUE_BACKPRESSURE
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
@@ -27425,6 +27507,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
+            return (evt_type, producer_id, "") if producer_id else None
+        if evt_type == "handoff_return":
+            producer_id = str(evt.get("delivery_id") or "")
             return (evt_type, producer_id, "") if producer_id else None
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
@@ -27501,7 +27586,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "deliver"
 
     async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict,
+        self, synth_text: "str | None", evt: dict,
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -27514,7 +27599,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
-        if evt.get("type") == "async_delegation":
+        event_claim = None
+        receipt_recovery = False
+        if evt.get("type") == "handoff_return":
+            from tools.async_delegation import (
+                begin_handoff_return_delivery,
+                claim_event_delivery,
+                complete_event_delivery,
+                defer_event_delivery_receipt,
+                handoff_return_receipt_pending,
+                release_event_delivery,
+            )
+
+            event_claim = claim_event_delivery(evt, f"gateway:{id(self)}")
+            if event_claim is None:
+                return None
+            synth_text = _format_gateway_process_notification(
+                evt, delivery_claim=event_claim
+            )
+            if not synth_text:
+                release_event_delivery(evt, event_claim)
+                return False
+            parent_session_id = str(evt.get("session_id") or "").strip()
+            verdict = await self._classify_completion_target(parent_session_id)
+            if verdict != "deliver":
+                release_event_delivery(evt, event_claim)
+                return False if verdict == "retry" else None
+            target_session_id = parent_session_id
+            try:
+                tip = await self._session_db.get_compression_tip(parent_session_id)
+                if tip:
+                    target_session_id = tip
+            except (AttributeError, TypeError):
+                pass
+            except Exception:
+                release_event_delivery(evt, event_claim)
+                return False
+            try:
+                already_persisted = await self.async_session_store.has_platform_message_id(
+                    target_session_id, str(evt.get("delivery_id") or "")
+                )
+            except Exception:
+                with self._completion_delivery_lock:
+                    receipt_pending = identity in self._completion_deliveries_inflight
+                if receipt_pending:
+                    defer_event_delivery_receipt(evt, event_claim)
+                    return None
+                release_event_delivery(evt, event_claim)
+                return False
+            if already_persisted:
+                claimed = event_claim
+                event_claim = None
+                try:
+                    complete_event_delivery(evt, claimed)
+                    if identity is not None:
+                        with self._completion_delivery_lock:
+                            self._completion_deliveries_inflight.discard(identity)
+                    return True
+                except Exception:
+                    logger.warning("Could not acknowledge persisted handoff return")
+                    return False
+            receipt_recovery = handoff_return_receipt_pending(event_claim)
+        elif evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
@@ -27602,30 +27748,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return False
         if identity is not None:
             with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    return None
-                self._completion_deliveries_inflight.add(identity)
+                duplicate_inflight = identity in self._completion_deliveries_inflight
+                duplicate_delivered = identity in self._completion_deliveries_delivered
+                if not duplicate_inflight and not duplicate_delivered:
+                    self._completion_deliveries_inflight.add(identity)
+            if duplicate_inflight or duplicate_delivered:
+                if event_claim is not None:
+                    if duplicate_inflight and evt.get("type") == "handoff_return":
+                        defer_event_delivery_receipt(evt, event_claim)
+                    else:
+                        release_event_delivery(evt, event_claim)
+                return None
 
-        accepted = False
-        try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
-            if injection_result is not True:
-                return injection_result
-            accepted = True
-
+        if receipt_recovery and event_claim is not None:
+            claimed = event_claim
+            event_claim = None
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-                    self._completion_deliveries_delivered[identity] = None
-                    while (
-                        len(self._completion_deliveries_delivered)
-                        > self._completion_delivery_retention
-                    ):
-                        self._completion_deliveries_delivered.popitem(last=False)
+            release_event_delivery(evt, claimed)
+            return False
 
+        accepted = accepted_pending_persistence = False
+        try:
+            if event_claim is not None and not begin_handoff_return_delivery(event_claim):
+                return None
+            injection_result = await self._inject_watch_notification(synth_text, evt)
+            if injection_result == _HANDOFF_QUEUE_BACKPRESSURE:
+                claimed = event_claim
+                event_claim = None
+                release_event_delivery(evt, claimed, attempted=False)
+                return False
+            if injection_result is not True:
+                return injection_result
+            if event_claim is not None:
+                accepted_pending_persistence = True
+                try:
+                    persisted = await self.async_session_store.has_platform_message_id(
+                        target_session_id, str(evt.get("delivery_id") or "")
+                    )
+                except Exception:
+                    return False
+                if not persisted:
+                    return False
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
             # after adapter acceptance; this gateway keeps no parallel ledger.
@@ -27641,9 +27806,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Could not acknowledge durable async completion %s: %s",
                         durable_delegation_id, exc,
                     )
+            if event_claim is not None:
+                claimed = event_claim
+                event_claim = None
+                try:
+                    complete_event_delivery(evt, claimed)
+                except Exception:
+                    logger.warning("Could not acknowledge handoff return")
+                    return False
+            accepted = True
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    self._completion_deliveries_inflight.discard(identity)
+                    self._completion_deliveries_delivered[identity] = None
+                    while (
+                        len(self._completion_deliveries_delivered)
+                        > self._completion_delivery_retention
+                    ):
+                        self._completion_deliveries_delivered.popitem(last=False)
             return True
         finally:
-            if identity is not None and not accepted:
+            if (
+                identity is not None
+                and not accepted
+                and not accepted_pending_persistence
+            ):
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:
@@ -27655,6 +27842,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
+            if event_claim is not None:
+                try:
+                    if accepted_pending_persistence:
+                        defer_event_delivery_receipt(evt, event_claim)
+                    else:
+                        release_event_delivery(evt, event_claim)
+                except Exception:
+                    logger.debug("Could not release durable handoff return", exc_info=True)
 
     @staticmethod
     def _completion_notification_batch_key(evt: dict) -> tuple[str, ...]:
@@ -28026,6 +28221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # so requeue anything that isn't ours.
                 requeue = []
                 async_events = []
+                handoff_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
@@ -28033,6 +28229,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                     if evt.get("type") == "async_delegation":
                         async_events.append(evt)
+                    elif evt.get("type") == "handoff_return":
+                        handoff_events.append(evt)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
@@ -28063,6 +28261,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         for evt in group:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                for evt in handoff_events:
+                    try:
+                        delivered = await self._deliver_completion_notification(None, evt)
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                    except Exception as e:
+                        _pr.completion_queue.put(evt)
+                        logger.error("Agent handoff return injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -28789,10 +28995,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
+        # A handoff return accepted into the busy FIFO owns a durable dispatch
+        # reservation until its synthetic user row is persisted. A true
+        # conversation boundary discards that queued turn, so release the
+        # reservation explicitly instead of leaving an impossible receipt
+        # pending forever. Ordinary queued user messages retain the existing
+        # boundary behavior.
+        for adapter in self._iter_gateway_adapters():
+            pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(pending, dict):
+                continue
+            queued = pending.get(session_key)
+            if self._queued_handoff_delivery_id(queued):
+                pending.pop(session_key, None)
+                self._abandon_queued_handoff_return(queued)
         # Structural clear: every conversation-scoped field resets in one
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
         if state is not None:
+            queued_events = state.conversation.queued_events
+            for queued in queued_events if isinstance(queued_events, list) else ():
+                if self._queued_handoff_delivery_id(queued):
+                    self._abandon_queued_handoff_return(queued)
             state.conversation.clear()
         # Legacy plain-dict stores still registered in
         # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
@@ -28807,6 +29031,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
         )
+
+    @staticmethod
+    def _queued_handoff_delivery_id(event: Any) -> str:
+        if not getattr(event, "internal", False) or getattr(
+            event, "allow_gateway_control", True
+        ):
+            return ""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ""
+        if metadata.get("persist_user_display_kind") != "handoff_return":
+            return ""
+        delivery_id = str(getattr(event, "message_id", None) or "").strip()
+        display_metadata = metadata.get("persist_user_display_metadata")
+        if not isinstance(display_metadata, dict):
+            return ""
+        recorded_id = str(display_metadata.get("delivery_id", "")).strip()
+        return delivery_id if delivery_id and recorded_id == delivery_id else ""
+
+    def _abandon_queued_handoff_return(self, event: Any) -> bool:
+        delivery_id = self._queued_handoff_delivery_id(event)
+        source = getattr(event, "source", None)
+        if not delivery_id or source is None:
+            return False
+        identity = ("handoff_return", delivery_id, "")
+        lock = getattr(self, "_completion_delivery_lock", None)
+        inflight = getattr(self, "_completion_deliveries_inflight", None)
+        if lock is not None and inflight is not None:
+            with lock:
+                inflight.discard(identity)
+        try:
+            from hermes_cli.handoff.store import HandoffStore
+
+            home = self._resolve_profile_home_for_source(source)
+            with HandoffStore(Path(home) / "handoffs.db") as store:
+                store.abandon_delivery_dispatch(
+                    delivery_id,
+                    next_attempt_at=datetime.now(timezone.utc)
+                    + timedelta(seconds=2),
+                )
+            return True
+        except Exception:
+            logger.warning(
+                "Could not release discarded handoff return %s",
+                delivery_id,
+                exc_info=True,
+            )
+            return False
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear per-session control state that must not survive a boundary switch."""
@@ -28971,8 +29243,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            discarded = adapter.get_pending_message(session_key)
+            if discarded is not None:
+                self._abandon_queued_handoff_return(discarded)
         if _iac_state is not None:
+            for discarded in _iac_state.conversation.queued_events:
+                self._abandon_queued_handoff_return(discarded)
+            _iac_state.conversation.queued_events.clear()
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
             self._release_running_agent_state(session_key)
@@ -30166,6 +30443,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_message_id: Optional[str] = None,
+        handoff_return_hop_count: Optional[int] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -30186,6 +30466,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_message_id=persist_user_message_id,
+                handoff_return_hop_count=handoff_return_hop_count,
                 message_type=message_type,
             )
 
@@ -30199,6 +30482,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_message_id=persist_user_message_id,
+                handoff_return_hop_count=handoff_return_hop_count,
                 message_type=message_type,
             )
 
@@ -30342,6 +30628,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_message_id: Optional[str] = None,
+        handoff_return_hop_count: Optional[int] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -30653,6 +30942,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
         )
+        turn_ctx.persist_user_display_metadata = persist_user_display_metadata
+        turn_ctx.persist_user_message_id = persist_user_message_id
+        turn_ctx.handoff_return_hop_count = handoff_return_hop_count
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
         # TurnRunner.progress_callback (bound method, same signature).
@@ -31682,6 +31974,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key or "?",
                     self._status_action_label(),
                 )
+                if pending_event is not None:
+                    self._abandon_queued_handoff_return(pending_event)
                 pending_event = None
                 pending = None
 
@@ -31817,6 +32111,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_persist_user_display_kind = None
+                next_persist_user_display_metadata = None
+                next_persist_user_message_id = None
+                next_handoff_return_hop_count = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -31849,6 +32147,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_metadata = getattr(pending_event, "metadata", None) or {}
+                    next_persist_user_display_kind = next_metadata.get(
+                        "persist_user_display_kind"
+                    ) or (
+                        "internal_notification"
+                        if getattr(pending_event, "internal", False)
+                        else None
+                    )
+                    next_persist_user_display_metadata = next_metadata.get(
+                        "persist_user_display_metadata"
+                    )
+                    next_persist_user_message_id = (
+                        str(pending_event.message_id)
+                        if next_persist_user_display_kind == "handoff_return"
+                        and pending_event.message_id
+                        else None
+                    )
+                    next_handoff_return_hop_count = next_metadata.get(
+                        "handoff_return_hop_count"
+                    )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -31903,6 +32221,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_display_kind=next_persist_user_display_kind,
+                    persist_user_display_metadata=next_persist_user_display_metadata,
+                    persist_user_message_id=next_persist_user_message_id,
+                    handoff_return_hop_count=next_handoff_return_hop_count,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

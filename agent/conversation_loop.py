@@ -1924,6 +1924,7 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
+    persist_user_message_id: Optional[str] = None,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
@@ -1946,6 +1947,8 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
+        persist_user_message_id: Optional platform/delivery identity stored on
+            the persisted user row for replay deduplication.
         persist_user_display_kind: Optional presentation type for a
             synthesized user turn (``auto_continue``, ``model_switch``, …).
             Display-only: transcript surfaces render the row as a timeline
@@ -2026,6 +2029,7 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_message_id,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
@@ -2371,6 +2375,8 @@ def run_conversation(
             # event row enters the live history.
             _display_kind = api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+            api_msg.pop("message_id", None)
+            api_msg.pop("platform_message_id", None)
 
             # Legacy hidden redirect placeholders (#88955): rows persisted
             # BEFORE the writer-side api_content stamp in

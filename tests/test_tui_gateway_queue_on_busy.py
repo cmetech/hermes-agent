@@ -12,6 +12,10 @@ path retained as a compatibility fallback.
 import threading
 import time
 import types
+from datetime import datetime, timezone
+from hashlib import sha256
+
+import pytest
 
 import tools.async_delegation as ad
 from tui_gateway import server
@@ -308,6 +312,353 @@ def test_compress_no_rotation_does_not_bump_queue_generation(monkeypatch):
     server._sync_session_key_after_compress("sid", session)
 
     assert session["_queued_prompt_generation"] == 2
+
+
+def test_handoff_return_poller_defers_ack_until_durable_turn_receipt(monkeypatch):
+    from tools import process_registry as registry_module
+
+    event = {
+        "type": "handoff_return",
+        "delivery_id": "delivery-1",
+        "handoff_id": "handoff-1",
+        "profile": "default",
+        "session_id": "session-key",
+        "session_key": "session-key",
+        "tool_call_id": "call-1",
+        "hop_count": 0,
+        "delivery_claim": {
+            "owner": "supervisor",
+            "epoch": 1,
+            "expires_at": "2099-01-01T00:00:00+00:00",
+        },
+    }
+    monkeypatch.setattr(
+        registry_module,
+        "format_process_notification",
+        lambda evt, delivery_claim=None: "handoff finished",
+    )
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: "claim-1")
+    monkeypatch.setattr(ad, "begin_handoff_return_delivery", lambda *_args: True)
+    completed = []
+    released = []
+    monkeypatch.setattr(ad, "complete_event_delivery", lambda *_args: completed.append("done"))
+    monkeypatch.setattr(ad, "release_event_delivery", lambda *_args: released.append("retry"))
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    captured = {}
+    persisted = [False]
+
+    def _run(_rid, _sid, _session, _text, **kwargs):
+        captured.update(kwargs)
+        assert completed == []
+        persisted[0] = True
+        kwargs["terminal_callback"]({"status": "settled", "text": "ok"})
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _run)
+    db = types.SimpleNamespace(
+        has_platform_message_id=lambda sid, message_id: (
+            persisted[0] and sid == "session-key" and message_id == "delivery-1"
+        )
+    )
+    session = _session(
+        agent=types.SimpleNamespace(session_id="session-key", _session_db=db),
+        profile_home=None,
+    )
+
+    assert server._dispatch_handoff_return("sid", session, event) is True
+
+    assert captured["display_kind"] == "handoff_return"
+    assert captured["persist_user_message_id"] == "delivery-1"
+    assert captured["handoff_return_hop_count"] == 1
+    assert captured["display_metadata"]["handoff_id"] == "handoff-1"
+    assert completed == ["done"]
+    assert released == []
+
+
+def test_handoff_return_long_turn_uses_receipt_only_reclaims(monkeypatch):
+    from tools import process_registry as registry_module
+
+    event = {
+        "type": "handoff_return",
+        "delivery_id": "delivery-1",
+        "handoff_id": "handoff-1",
+        "profile": "default",
+        "session_id": "session-key",
+        "session_key": "session-key",
+        "tool_call_id": "call-1",
+        "hop_count": 0,
+        "delivery_claim": {},
+    }
+    claims = iter(["initial", "reclaimed", "receipt", "restarted"])
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: next(claims))
+    monkeypatch.setattr(
+        registry_module,
+        "format_process_notification",
+        lambda *_args, **_kwargs: "handoff finished",
+    )
+    monkeypatch.setattr(ad, "begin_handoff_return_delivery", lambda *_args: True)
+    monkeypatch.setattr(
+        ad,
+        "handoff_return_receipt_pending",
+        lambda claim: claim in {"reclaimed", "restarted"},
+    )
+    deferred = []
+    completed = []
+    released = []
+    monkeypatch.setattr(
+        ad, "defer_event_delivery_receipt", lambda _evt, claim: deferred.append(claim)
+    )
+    monkeypatch.setattr(
+        ad, "complete_event_delivery", lambda _evt, claim: completed.append(claim)
+    )
+    monkeypatch.setattr(
+        ad, "release_event_delivery", lambda _evt, claim: released.append(claim)
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    persisted = [False]
+    callbacks = []
+    starts = []
+
+    def _run(*_args, **kwargs):
+        starts.append("started")
+        callbacks.append(kwargs["terminal_callback"])
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _run)
+    db = types.SimpleNamespace(
+        has_platform_message_id=lambda _sid, _message_id: persisted[0]
+    )
+    session = _session(
+        agent=types.SimpleNamespace(session_id="session-key", _session_db=db)
+    )
+
+    assert server._dispatch_handoff_return("sid", session, event) is True
+    assert server._dispatch_handoff_return("sid", session, event) is True
+    assert starts == ["started"]
+    assert deferred == ["initial", "reclaimed"]
+
+    persisted[0] = True
+    callbacks[0]({"status": "settled", "text": "ok"})
+    assert server._dispatch_handoff_return("sid", session, event) is True
+
+    assert completed == ["receipt"]
+    assert released == []
+
+    event["delivery_id"] = "delivery-after-restart"
+    persisted[0] = False
+    restarted_session = _session(
+        agent=types.SimpleNamespace(session_id="session-key", _session_db=db)
+    )
+    assert (
+        server._dispatch_handoff_return("restarted", restarted_session, event) is False
+    )
+    assert starts == ["started"]
+    assert released == ["restarted"]
+
+
+def test_handoff_return_replay_acknowledges_without_running_model(monkeypatch):
+    from tools import process_registry as registry_module
+
+    event = {
+        "type": "handoff_return",
+        "delivery_id": "delivery-1",
+        "handoff_id": "handoff-1",
+        "profile": "default",
+        "session_id": "session-key",
+        "session_key": "session-key",
+        "tool_call_id": "call-1",
+        "hop_count": 0,
+        "delivery_claim": {},
+    }
+    monkeypatch.setattr(
+        registry_module,
+        "format_process_notification",
+        lambda evt, delivery_claim=None: "handoff finished",
+    )
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: "claim-1")
+    completed = []
+    monkeypatch.setattr(ad, "complete_event_delivery", lambda *_args: completed.append("done"))
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("persisted return must not run twice")
+        ),
+    )
+    db = types.SimpleNamespace(
+        has_platform_message_id=lambda _sid, message_id: (
+            message_id == "delivery-1"
+        )
+    )
+    session = _session(
+        agent=types.SimpleNamespace(session_id="session-key", _session_db=db),
+        profile_home=None,
+        running=True,
+    )
+
+    assert server._dispatch_handoff_return("sid", session, event) is True
+
+    assert completed == ["done"]
+    assert session["running"] is False
+
+
+def test_handoff_return_superseded_during_receipt_check_never_starts_model(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.handoff.models import (
+        ChannelObservation,
+        HandoffEndpoint,
+        HandoffSpec,
+    )
+    from hermes_cli.handoff.store import HandoffStore
+    from tools import process_registry as registry_module
+
+    db_path = tmp_path / "handoffs.db"
+    store = HandoffStore(db_path)
+    spec = HandoffSpec(
+        mode="conversation",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="review",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"profile": "default"},
+        required_capabilities=frozenset(),
+        return_route={
+            "kind": "bot",
+            "host_kind": "web",
+            "profile": "default",
+            "session_id": "session-key",
+            "session_key": "session-key",
+            "tool_call_id": "call-1",
+            "delivery_policy": "wake",
+            "hop_count": 0,
+        },
+    )
+    snapshot = store.create_or_get(
+        "bot/default/session-key", "call-1", spec, spec.fingerprint
+    )
+    snapshot = store.bind(
+        snapshot.handoff_id,
+        "local_runs",
+        {"profile": "reviewer", "mechanism": "local_runs"},
+        {},
+        snapshot.state_version,
+    )
+    advance = store.claim_advance(
+        snapshot.handoff_id,
+        "worker",
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    assert advance is not None
+    store.journal_attempt(advance, "submit")
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    lease = store.claim_delivery(
+        first.delivery_id,
+        "supervisor",
+        now=datetime.now(timezone.utc),
+        lease_seconds=30,
+    )
+    assert lease is not None
+    claim = ad._HandoffReturnClaim(
+        store,
+        lease,
+        store.get(snapshot.handoff_id),
+        ("default", first.delivery_id, lease.owner, lease.epoch),
+    )
+    event = {
+        "type": "handoff_return",
+        "delivery_id": first.delivery_id,
+        "handoff_id": snapshot.handoff_id,
+        "profile": "default",
+        "session_id": "session-key",
+        "session_key": "session-key",
+        "tool_call_id": "call-1",
+        "hop_count": 0,
+        "delivery_claim": {},
+    }
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: claim)
+    monkeypatch.setattr(
+        registry_module,
+        "format_process_notification",
+        lambda *_args, **_kwargs: "needs input",
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    model_starts = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: model_starts.append("started") or True,
+    )
+
+    class _SessionDB:
+        def has_platform_message_id(self, _session_id, _delivery_id):
+            store.commit_observation(advance, ChannelObservation(phase="active"))
+            result = b"terminal result"
+            store.commit_observation(
+                advance,
+                ChannelObservation(
+                    phase="succeeded",
+                    terminal_result={
+                        "text": result.decode(),
+                        "sha256": sha256(result).hexdigest(),
+                        "media_type": "text/plain",
+                        "size_bytes": len(result),
+                    },
+                ),
+            )
+            return False
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            session_id="session-key", _session_db=_SessionDB()
+        )
+    )
+
+    assert server._dispatch_handoff_return("sid", session, event) is False
+    assert model_starts == []
+    reopened = HandoffStore(db_path)
+    assert reopened.get_delivery(first.delivery_id).acknowledged_at is not None
+    terminal = reopened.due_deliveries(
+        now=datetime.now(timezone.utc), limit=10, host_kind="web"
+    )
+    assert len(terminal) == 1
+    assert terminal[0].event_sequence > first.event_sequence
+    reopened.close()
+
+
+def test_handoff_return_hop_context_is_restored_after_failure():
+    from tools.async_delegation import handoff_return_context
+
+    agent = types.SimpleNamespace(_handoff_return_hop_count=0)
+    with pytest.raises(RuntimeError, match="turn failed"):
+        with handoff_return_context(agent, 1):
+            assert agent._handoff_return_hop_count == 1
+            raise RuntimeError("turn failed")
+
+    assert agent._handoff_return_hop_count == 0
+
+
+def test_handoff_return_owner_requires_matching_profile(monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "profile_matches_home",
+        lambda profile, _home=None: profile == "default",
+    )
+    session = _session(session_key="session-key", profile_home="/profiles/default")
+    event = {
+        "type": "handoff_return",
+        "session_id": "session-key",
+        "profile": "other",
+    }
+
+    assert server._session_owns_notification_event("sid", session, event) is False
+    event["profile"] = "default"
+    assert server._session_owns_notification_event("sid", session, event) is True
 
 
 
@@ -779,4 +1130,3 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-

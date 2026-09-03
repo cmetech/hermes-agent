@@ -13,6 +13,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -68,6 +69,52 @@ class _FakeAgent:
         self._bot_mode_protocol = True
         self.tools: list = []
         self.valid_tool_names: set = set()
+        self._gateway_session_key = "agent:default:telegram:dm:42"
+        self._handoff_return_host_kind = "gateway"
+        self._current_turn_id = "turn-1"
+
+
+class _FakeHandoffService:
+    def __init__(self, snapshot=None):
+        self.snapshot = snapshot
+        self.calls = []
+        self.created = {}
+        self.store = SimpleNamespace(close=lambda: self.calls.append(("close",)))
+
+    def create(self, spec, initiator, *, handoff_key):
+        self.calls.append(("create", spec, initiator, handoff_key))
+        key = (initiator, handoff_key)
+        existing = self.created.get(key)
+        if existing is not None:
+            if existing.spec.fingerprint != spec.fingerprint:
+                raise ValueError("conflicting handoff key")
+            self.snapshot = existing
+            return existing
+        self.snapshot = SimpleNamespace(
+            handoff_id="handoff-1", phase="prepared", spec=spec
+        )
+        self.created[key] = self.snapshot
+        return self.snapshot
+
+    def get(self, handoff_id):
+        self.calls.append(("get", handoff_id))
+        return self.snapshot
+
+    def command(self, handoff_id, kind, **kwargs):
+        self.calls.append(("command", handoff_id, kind, kwargs))
+        return self.snapshot
+
+    def advance(self, handoff_id, *, budget_seconds):
+        self.calls.append(("advance", handoff_id, budget_seconds))
+        return SimpleNamespace(snapshot=self.snapshot)
+
+
+def _fake_handoff_service(monkeypatch, snapshot=None):
+    service = _FakeHandoffService(snapshot)
+    monkeypatch.setattr(
+        bot_mode_dm, "_handoff_service", lambda _home: service, raising=False
+    )
+    return service
 
 
 # ── injection gate (leak containment) ────────────────────────────────────────
@@ -125,6 +172,19 @@ def test_schema_never_in_global_registry():
 
     for names in toolsets.TOOLSETS.values():
         assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME not in names
+
+
+def test_schema_adds_only_optional_handoff_id_and_canonical_targets():
+    function = bot_mode_dm.message_agent_tool_schema()["function"]
+    parameters = function["parameters"]
+
+    assert set(parameters["properties"]) == {"target", "message", "handoff_id"}
+    assert parameters["required"] == ["target", "message"]
+    assert "hermes://local/" in parameters["properties"]["target"]["description"]
+    assert "hermes://peer/" in parameters["properties"]["target"]["description"]
+    assert not {
+        "actor", "credential", "hop_count", "poll", "timeout", "url", "workflow"
+    } & set(parameters["properties"])
 
 
 # ── dispatch gate (defense in depth) ─────────────────────────────────────────
@@ -195,6 +255,33 @@ def test_unregistered_peer_rejected(tmp_path):
     assert result["peers"] == ["spark"]
 
 
+@pytest.mark.parametrize(
+    "target", ["researcher", "spark/reviewer", "spark", "reviewer@cloud"]
+)
+def test_malformed_agent_directory_cannot_fall_back_to_legacy_delivery(
+    tmp_path, monkeypatch, target
+):
+    home = _managed_home(
+        tmp_path, teammates=("researcher",), peers=("spark",)
+    )
+    (home / "config.yaml").write_text(
+        "handoff:\n  agents:\n    reviewer:\n"
+        "      default: hermes://local/researcher\n",
+        encoding="utf-8",
+    )
+    calls = _capture_spawn(monkeypatch)
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target=target, message="review this", agent=agent
+        )
+    )
+
+    assert result["error"] == "Agent handoff target configuration is invalid."
+    assert calls == []
+
+
 # ── delivery command shape ───────────────────────────────────────────────────
 
 
@@ -218,7 +305,7 @@ def _runner_parts(command):
 
 
 def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
-    calls = _capture_spawn(monkeypatch)
+    service = _fake_handoff_service(monkeypatch)
     home = _managed_home(tmp_path, teammates=("researcher",))
     agent = _FakeAgent(home, title="Bot Chat")
 
@@ -229,43 +316,35 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
                 'status? give me the "PAYLOAD_SENTINEL_7A91" numbers '
                 "$(and this is not shell)"
             ),
+            tool_call_id="call-1",
             agent=agent,
         )
     )
-    assert result["status"] == "sent"
-    assert result["to"] == "@researcher"
-    assert result["process_id"] == "proc_test1234"
-    assert "do NOT wait" in result["detail"]
-
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["background"] is True
-    assert call["notify_on_complete"] is True
-    assert call["_host_local"] is True
-    assert Path(call["workdir"]) == Path(bot_mode_dm.__file__).resolve().parent.parent
-    command = call["command"]
-    mode, dm_file, transport_argv = _runner_parts(command)
-    assert mode == "query-file"
-    assert transport_argv == [
-        "hermes",
-        "-p",
-        "researcher",
-        "chat",
-        "--in",
-        "~",
-        "-c",
-        "Bot Chat",
-        "--create-if-missing",
-        "-Q",
-    ]
-    # message body rides the temp file, never the command line
-    assert "PAYLOAD_SENTINEL_7A91" not in command
-    assert "$(" not in command
-
-    # attribution prefix applied server-side; body verbatim inside the file
-    content = Path(dm_file).read_text(encoding="utf-8")
-    assert content.startswith("Message from 🤖 hermes (@hermes): ")
-    assert '$(and this is not shell)' in content
+    assert result == {
+        "status": "prepared",
+        "to": "hermes://local/researcher",
+        "handoff_id": "handoff-1",
+        "detail": "Message accepted for asynchronous handoff; finish your turn.",
+    }
+    created = service.calls[0]
+    spec = created[1]
+    assert created[2:] == ("bot/default/sess-1", "call-1")
+    assert spec.mode == "conversation"
+    assert spec.endpoint.canonical == "hermes://local/researcher"
+    assert spec.required_capabilities == frozenset()
+    assert spec.prompt.startswith("Message from 🤖 hermes (@hermes): ")
+    assert '$(and this is not shell)' in spec.prompt
+    assert spec.return_route == {
+        "kind": "bot",
+        "host_kind": "gateway",
+        "profile": "default",
+        "session_id": "sess-1",
+        "session_key": "agent:default:telegram:dm:42",
+        "tool_call_id": "call-1",
+        "delivery_policy": "wake",
+        "hop_count": 0,
+    }
+    assert service.calls[1] == ("advance", "handoff-1", 2.0)
 
 
 def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
@@ -298,18 +377,26 @@ def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
 
 
 def test_peer_delivery_command(tmp_path, monkeypatch):
+    service = _fake_handoff_service(monkeypatch)
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, peers=("spark",))
     agent = _FakeAgent(home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
+        bot_mode_dm.message_agent_tool(
+            target="spark/researcher",
+            message="ping",
+            tool_call_id="call-peer",
+            agent=agent,
+        )
     )
     assert result["status"] == "sent"
-    assert "spark" in result["to"]
+    assert service.calls == []
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark/researcher"]
+    assert transport_argv == [
+        "hermes", "-p", "default", "peer", "dm", "spark/researcher"
+    ]
 
     # bare peer name targets the peer's main agent
     result2 = json.loads(
@@ -323,17 +410,18 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
 
 def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     """A named-profile bot signs with its own handle, not @hermes."""
-    calls = _capture_spawn(monkeypatch)
+    service = _fake_handoff_service(monkeypatch)
     home = _managed_home(tmp_path, teammates=("researcher", "coder"))
     profile_home = home / "profiles" / "coder"
     agent = _FakeAgent(profile_home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+        bot_mode_dm.message_agent_tool(
+            target="researcher", message="hi", tool_call_id="call-1", agent=agent
+        )
     )
-    assert result["status"] == "sent"
-    _mode, dm_file, _transport_argv = _runner_parts(calls[0]["command"])
-    assert Path(dm_file).read_text(encoding="utf-8").startswith(
+    assert result["status"] == "prepared"
+    assert service.calls[0][1].prompt.startswith(
         "Message from 🤖 coder (@coder): "
     )
 
@@ -342,17 +430,357 @@ def test_spawn_failure_reports_error(tmp_path, monkeypatch):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
 
-    import tools.terminal_tool as terminal_tool_module
-
-    def boom(command, **kwargs):
-        raise RuntimeError("spawn failed")
-
-    monkeypatch.setattr(terminal_tool_module, "terminal_tool", boom)
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_handoff_service",
+        lambda _home: (_ for _ in ()).throw(RuntimeError("store failed")),
+        raising=False,
+    )
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
     assert "error" in result
     assert "could not be started" in result["error"]
+
+
+def test_explicit_canonical_target_requires_controlled_runs(tmp_path, monkeypatch):
+    service = _fake_handoff_service(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="hermes://local/researcher",
+        message="review this",
+        tool_call_id="call-controlled",
+        agent=agent,
+    ))
+
+    assert result["handoff_id"] == "handoff-1"
+    spec = service.calls[0][1]
+    assert spec.required_capabilities == frozenset({"cancellation", "follow_up"})
+
+
+@pytest.mark.parametrize("target", ["hermes://local/researcher", "reviewer"])
+def test_classic_cli_bot_chat_rejects_targets_that_need_a_return_host(
+    tmp_path, monkeypatch, target
+):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    home.joinpath("config.yaml").write_text(
+        "handoff:\n"
+        "  agents:\n"
+        "    reviewer:\n"
+        "      default: hermes://local/researcher\n"
+        "      endpoints:\n"
+        "      - hermes://local/researcher\n",
+        encoding="utf-8",
+    )
+    agent = _FakeAgent(home)
+    del agent._handoff_return_host_kind
+    del agent._gateway_session_key
+    service = _fake_handoff_service(monkeypatch)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target=target, message="review this", agent=agent)
+    )
+
+    assert result["error"] == (
+        "Durable agent handoffs require a running Gateway or Desktop Bot Chat; "
+        "this classic CLI Bot Chat can use only a friendly local teammate name."
+    )
+    assert service.calls == []
+
+
+def test_classic_cli_bot_chat_keeps_friendly_local_background_delivery(
+    tmp_path, monkeypatch
+):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+    del agent._handoff_return_host_kind
+    del agent._gateway_session_key
+    service = _fake_handoff_service(monkeypatch)
+    calls = _capture_spawn(monkeypatch)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="researcher", message="review this", agent=agent
+        )
+    )
+
+    assert result["status"] == "sent"
+    assert service.calls == []
+    mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    assert mode == "query-file"
+    assert transport_argv == [
+        "hermes",
+        "-p",
+        "researcher",
+        "chat",
+        "--in",
+        "~",
+        "-c",
+        "Bot Chat",
+        "--create-if-missing",
+        "-Q",
+    ]
+
+
+@pytest.mark.parametrize("target", ["researcher", "spark/reviewer", "spark"])
+def test_classic_cli_follow_up_never_falls_back_to_uncorrelated_legacy_delivery(
+    tmp_path, monkeypatch, target
+):
+    home = _managed_home(
+        tmp_path, teammates=("researcher",), peers=("spark",)
+    )
+    agent = _FakeAgent(home)
+    del agent._handoff_return_host_kind
+    del agent._gateway_session_key
+    service = _fake_handoff_service(monkeypatch)
+    calls = _capture_spawn(monkeypatch)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target=target,
+            message="continue the review",
+            handoff_id="existing-handoff",
+            agent=agent,
+        )
+    )
+
+    assert result["error"] == (
+        "Continuing a durable agent handoff requires its canonical or directory "
+        "target in a running Gateway or Desktop Bot Chat; no legacy delivery was sent."
+    )
+    assert service.calls == []
+    assert calls == []
+
+
+def test_handoff_follow_up_verifies_owner_target_and_uses_tool_call_id(
+    tmp_path, monkeypatch
+):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+    route = {
+        "kind": "bot",
+        "host_kind": "gateway",
+        "profile": "default",
+        "session_id": "sess-1",
+        "session_key": "agent:default:telegram:dm:42",
+        "tool_call_id": "call-original",
+        "delivery_policy": "wake",
+        "hop_count": 0,
+    }
+    snapshot = SimpleNamespace(
+        handoff_id="handoff-1",
+        phase="active",
+        spec=SimpleNamespace(
+            mode="conversation",
+            endpoint=SimpleNamespace(canonical="hermes://local/researcher"),
+            return_route=route,
+        ),
+        checkpoint={"run_id": "run-1", "status": "running"},
+    )
+    service = _fake_handoff_service(monkeypatch, snapshot)
+
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="check this",
+        handoff_id="handoff-1",
+        tool_call_id="call-follow-up",
+        agent=agent,
+    ))
+
+    assert result["handoff_id"] == "handoff-1"
+    command = next(call for call in service.calls if call[0] == "command")
+    assert command == (
+        "command",
+        "handoff-1",
+        "message",
+        {
+            "command_id": "call-follow-up",
+            "actor": "bot",
+            "text": "check this",
+            "correlation_id": "call-follow-up",
+        },
+    )
+
+
+def test_exact_pending_approval_choice_becomes_correlated_response(
+    tmp_path, monkeypatch
+):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+    snapshot = SimpleNamespace(
+        handoff_id="handoff-1",
+        phase="needs_input",
+        spec=SimpleNamespace(
+            mode="conversation",
+            endpoint=SimpleNamespace(canonical="hermes://local/researcher"),
+            return_route={
+                "kind": "bot",
+                "host_kind": "gateway",
+                "profile": "default",
+                "session_id": "sess-1",
+                "session_key": "agent:default:telegram:dm:42",
+            },
+        ),
+        checkpoint={
+            "run_id": "run-1",
+            "status": "waiting_for_approval",
+            "approval_request_id": "approval-1",
+            "approval_choices": ("once", "deny"),
+        },
+    )
+    service = _fake_handoff_service(monkeypatch, snapshot)
+
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="Once",
+        handoff_id="handoff-1",
+        tool_call_id="call-answer",
+        agent=agent,
+    ))
+
+    assert result["status"] == "needs_input"
+    command = next(call for call in service.calls if call[0] == "command")
+    assert command[2:] == (
+        "respond",
+        {
+            "command_id": "call-answer",
+            "actor": "bot",
+            "request_id": "approval-1",
+            "choice": "once",
+        },
+    )
+
+
+def test_tool_retry_reuses_handoff_key_and_conflicting_payload_fails_closed(
+    tmp_path, monkeypatch
+):
+    service = _fake_handoff_service(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+
+    first = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="review this",
+        tool_call_id="call-stable",
+        agent=agent,
+    ))
+    replay = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="review this",
+        tool_call_id="call-stable",
+        agent=agent,
+    ))
+    conflict = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="different payload",
+        tool_call_id="call-stable",
+        agent=agent,
+    ))
+
+    assert first["handoff_id"] == replay["handoff_id"] == "handoff-1"
+    assert "error" in conflict
+    creates = [call for call in service.calls if call[0] == "create"]
+    assert [call[3] for call in creates] == ["call-stable"] * 3
+
+
+def test_unsafe_canonical_target_error_does_not_echo_authority(tmp_path):
+    home = _managed_home(tmp_path)
+    result = bot_mode_dm.message_agent_tool(
+        target="hermes://peer/user:secret@spark/reviewer",
+        message="hello",
+        tool_call_id="call-1",
+        agent=_FakeAgent(home),
+    )
+
+    assert "secret" not in result
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["host_kind", "profile", "session_id", "session_key", "target", "terminal"],
+)
+def test_handoff_follow_up_rejects_foreign_or_terminal_rows(
+    tmp_path, monkeypatch, change
+):
+    home = _managed_home(tmp_path, teammates=("researcher", "coder"))
+    agent = _FakeAgent(home)
+    route = {
+        "kind": "bot",
+        "host_kind": "gateway",
+        "profile": "default",
+        "session_id": "sess-1",
+        "session_key": "agent:default:telegram:dm:42",
+        "tool_call_id": "call-original",
+        "delivery_policy": "wake",
+        "hop_count": 0,
+    }
+    if change in route:
+        route[change] = "other"
+    snapshot = SimpleNamespace(
+        handoff_id="handoff-1",
+        phase="succeeded" if change == "terminal" else "active",
+        spec=SimpleNamespace(
+            mode="conversation",
+            endpoint=SimpleNamespace(
+                canonical=(
+                    "hermes://local/coder"
+                    if change == "target"
+                    else "hermes://local/researcher"
+                )
+            ),
+            return_route=route,
+        ),
+        checkpoint={"run_id": "run-1", "status": "running"},
+    )
+    service = _fake_handoff_service(monkeypatch, snapshot)
+
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="check this",
+        handoff_id="handoff-1",
+        tool_call_id="call-follow-up",
+        agent=agent,
+    ))
+
+    assert "error" in result
+    assert not any(call[0] == "command" for call in service.calls)
+
+
+def test_hop_one_is_preserved_for_supervisor_loop_limit(tmp_path, monkeypatch):
+    service = _fake_handoff_service(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+    agent._handoff_return_hop_count = 1
+
+    bot_mode_dm.message_agent_tool(
+        target="researcher",
+        message="one follow-on",
+        tool_call_id="call-1",
+        agent=agent,
+    )
+
+    assert service.calls[0][1].return_route["hop_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "config", ["bot_mode: disabled\n", "bot_mode: [\n"]
+)
+def test_invalid_wake_configuration_falls_back_to_durable_attention(
+    tmp_path, config
+):
+    home = _managed_home(tmp_path)
+    (home / "config.yaml").write_text(config, encoding="utf-8")
+
+    assert bot_mode_dm._handoff_wake_enabled(home) is False
+
+
+def test_valid_omitted_wake_setting_keeps_default_enabled(tmp_path):
+    home = _managed_home(tmp_path)
+    (home / "config.yaml").write_text("bot_mode: {}\n", encoding="utf-8")
+
+    assert bot_mode_dm._handoff_wake_enabled(home) is True
 
 
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────

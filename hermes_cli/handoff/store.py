@@ -24,15 +24,21 @@ from hermes_constants import get_hermes_home
 from .models import ChannelObservation, HandoffEndpoint, HandoffSnapshot, HandoffSpec
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 3
 _MAX_JSON_BYTES = 16_384
+_MAX_DELIVERY_ATTEMPTS = 8
+_DELIVERY_RECEIPT_PENDING = "delivery_receipt_pending"
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
+_ATTENTION_PHASES = frozenset({
+    "needs_input", "indeterminate", "succeeded", "failed", "cancelled",
+})
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 _SEMANTIC_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,511}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMAND_KINDS = frozenset({"cancel", "message", "reconcile", "respond", "steer"})
 _APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
 _DELIVERY_STATES = frozenset({"delivered", "indeterminate"})
+_RETURN_DELIVERY_STATES = frozenset({"pending", "delivered", "failed"})
 _ATTEMPT_OPERATIONS = frozenset({"bind", "submit", "reconcile", "observe", "cancel"})
 _SAFE_DATA_KEYS = frozenset({
     "actor",
@@ -141,6 +147,14 @@ class AdvanceLease:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliveryLease:
+    delivery_id: str
+    owner: str
+    epoch: int
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class HandoffEvent:
     handoff_id: str
     sequence: int
@@ -168,6 +182,22 @@ class CommandRecord:
     kind: str
     payload: Mapping[str, object]
     delivery_state: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryRecord:
+    delivery_id: str
+    handoff_id: str
+    event_sequence: int
+    route: Mapping[str, object]
+    method: str
+    state: str
+    attempts: int
+    next_attempt_at: datetime | None
+    acknowledged_at: datetime | None
+    failure_code: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -295,18 +325,18 @@ def _command_payload(
 
 
 def _spec_json(spec: HandoffSpec) -> str:
-    return _json(
-        {
-            "mode": spec.mode,
-            "endpoint": spec.endpoint.canonical,
-            "prompt": spec.prompt,
-            "output_schema": spec.output_schema,
-            "deadline_at": _timestamp(spec.deadline_at),
-            "attribution": spec.attribution,
-            "required_capabilities": sorted(spec.required_capabilities),
-        },
-        max_bytes=3_200_000,
-    )
+    payload = {
+        "mode": spec.mode,
+        "endpoint": spec.endpoint.canonical,
+        "prompt": spec.prompt,
+        "output_schema": spec.output_schema,
+        "deadline_at": _timestamp(spec.deadline_at),
+        "attribution": spec.attribution,
+        "required_capabilities": sorted(spec.required_capabilities),
+    }
+    if spec.return_route is not None:
+        payload["return_route"] = spec.return_route
+    return _json(payload, max_bytes=3_200_000)
 
 
 def _spec_from_json(value: str) -> HandoffSpec:
@@ -320,6 +350,7 @@ def _spec_from_json(value: str) -> HandoffSpec:
         deadline_at=deadline,
         attribution=raw["attribution"],
         required_capabilities=frozenset(raw["required_capabilities"]),
+        return_route=raw.get("return_route"),
     )
 
 
@@ -371,8 +402,32 @@ _SCHEMA = (
         updated_at TEXT NOT NULL,
         PRIMARY KEY (handoff_id, command_id)
     )""",
+    """CREATE TABLE IF NOT EXISTS handoff_deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL,
+        event_sequence INTEGER NOT NULL,
+        route_kind TEXT NOT NULL,
+        route_json TEXT NOT NULL,
+        method TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT,
+        lease_owner TEXT,
+        lease_epoch INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at TEXT,
+        dispatch_started_at TEXT,
+        acknowledged_at TEXT,
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (handoff_id, event_sequence, route_kind),
+        FOREIGN KEY (handoff_id, event_sequence)
+            REFERENCES handoff_events(handoff_id, sequence) ON DELETE CASCADE
+    )""",
     "CREATE INDEX IF NOT EXISTS handoffs_due_idx ON handoffs(phase, next_advance_at)",
     "CREATE INDEX IF NOT EXISTS handoffs_created_idx ON handoffs(created_at DESC, handoff_id DESC)",
+    """CREATE INDEX IF NOT EXISTS handoff_deliveries_due_idx
+       ON handoff_deliveries(state, method, next_attempt_at)""",
 )
 
 
@@ -422,12 +477,16 @@ class HandoffStore:
     def _install_schema(self) -> None:
         with self._lock, write_txn(self._conn):
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, _SCHEMA_VERSION):
+            if version not in (0, 1, 2, _SCHEMA_VERSION):
                 raise HandoffStoreError(
                     f"unsupported handoff schema version: {version}"
                 )
             for statement in _SCHEMA:
                 self._conn.execute(statement)
+            if version == 2:
+                self._conn.execute(
+                    "ALTER TABLE handoff_deliveries ADD COLUMN dispatch_started_at TEXT"
+                )
             self._conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
 
     def _secure_files(self) -> None:
@@ -485,12 +544,14 @@ class HandoffStore:
         actor: str = "service",
         data: Mapping[str, object] | None = None,
         created_at: datetime | None = None,
-    ) -> None:
+    ) -> HandoffEvent:
         safe = _safe_data(data, reject_unsafe=False)
         sequence = self._conn.execute(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM handoff_events WHERE handoff_id=?",
             (handoff_id,),
         ).fetchone()[0]
+        event_id = str(uuid4())
+        stamp = created_at or _utc_now()
         self._conn.execute(
             """INSERT INTO handoff_events
                (handoff_id, sequence, event_id, phase_before, phase_after, kind, actor,
@@ -499,13 +560,65 @@ class HandoffStore:
             (
                 handoff_id,
                 sequence,
-                str(uuid4()),
+                event_id,
                 phase_before,
                 phase_after,
                 _identifier(kind, "event kind"),
                 _identifier(actor, "event actor"),
                 _json(safe),
-                _timestamp(created_at or _utc_now()),
+                _timestamp(stamp),
+            ),
+        )
+        return HandoffEvent(
+            handoff_id=handoff_id,
+            sequence=sequence,
+            event_id=event_id,
+            phase_before=phase_before,
+            phase_after=phase_after,
+            kind=kind,
+            actor=actor,
+            data=safe,
+            created_at=stamp,
+        )
+
+    def _append_delivery(
+        self, snapshot: HandoffSnapshot, event: HandoffEvent
+    ) -> None:
+        route = snapshot.spec.return_route
+        if route is None or event.phase_after not in _ATTENTION_PHASES:
+            return
+        route_kind = str(route["kind"])
+        method = (
+            str(route["delivery_policy"])
+            if route_kind == "bot"
+            else "attention"
+        )
+        state = "pending" if method == "wake" else "delivered"
+        stamp = _timestamp(event.created_at)
+        # Attention projects current state; retain older rows as acknowledged evidence.
+        self._conn.execute(
+            """UPDATE handoff_deliveries SET acknowledged_at=?, updated_at=?
+               WHERE handoff_id=? AND event_sequence<? AND acknowledged_at IS NULL
+                 AND (dispatch_started_at IS NULL OR state!='pending')""",
+            (stamp, stamp, snapshot.handoff_id, event.sequence),
+        )
+        self._conn.execute(
+            """INSERT INTO handoff_deliveries
+               (delivery_id, handoff_id, event_sequence, route_kind, route_json,
+                method, state, next_attempt_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(handoff_id, event_sequence, route_kind) DO NOTHING""",
+            (
+                str(uuid4()),
+                snapshot.handoff_id,
+                event.sequence,
+                route_kind,
+                _json(route),
+                method,
+                state,
+                stamp if state == "pending" else None,
+                stamp,
+                stamp,
             ),
         )
 
@@ -935,6 +1048,8 @@ class HandoffStore:
                 if values == existing:
                     return current
                 raise HandoffStateConflict("terminal handoff facts are immutable")
+            if values == existing:
+                return current
 
             self._conn.execute(
                 """UPDATE handoffs SET phase=?, mechanism=?, binding_json=?, checkpoint_json=?,
@@ -942,7 +1057,7 @@ class HandoffStore:
                    state_version=state_version+1, updated_at=? WHERE handoff_id=?""",
                 (*values, _timestamp(now), lease.handoff_id),
             )
-            self._append_event(
+            event = self._append_event(
                 lease.handoff_id,
                 phase_before=current.phase,
                 phase_after=observation.phase,
@@ -954,7 +1069,9 @@ class HandoffStore:
                 },
                 created_at=now,
             )
-            return self._snapshot(self._row(lease.handoff_id))
+            snapshot = self._snapshot(self._row(lease.handoff_id))
+            self._append_delivery(snapshot, event)
+            return snapshot
 
     def release_advance(
         self,
@@ -1156,6 +1273,422 @@ class HandoffStore:
                 ).fetchone()
             )
 
+    def get_delivery(self, delivery_id: str) -> DeliveryRecord:
+        delivery_id = _identifier(delivery_id, "delivery ID")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM handoff_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                raise HandoffNotFound("handoff delivery not found")
+            return self._delivery(row)
+
+    def attention(
+        self, handoff_id: str, *, limit: int
+    ) -> tuple[DeliveryRecord, ...]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 200
+        ):
+            raise ValueError("handoff attention limit must be between 1 and 200")
+        with self._lock:
+            self._row(handoff_id)
+            rows = self._conn.execute(
+                """SELECT * FROM handoff_deliveries
+                   WHERE handoff_id=? AND acknowledged_at IS NULL
+                   ORDER BY created_at, delivery_id LIMIT ?""",
+                (handoff_id, limit),
+            ).fetchall()
+            return tuple(self._delivery(row) for row in rows)
+
+    def has_attention(self, handoff_id: str) -> bool:
+        with self._lock:
+            self._row(handoff_id)
+            return self._conn.execute(
+                """SELECT 1 FROM handoff_deliveries
+                   WHERE handoff_id=? AND acknowledged_at IS NULL LIMIT 1""",
+                (handoff_id,),
+            ).fetchone() is not None
+
+    def due_deliveries(
+        self, *, now: datetime, limit: int, host_kind: str | None = None
+    ) -> tuple[DeliveryRecord, ...]:
+        now = _aware_utc(now, "delivery due time")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 200
+        ):
+            raise ValueError("handoff delivery limit must be between 1 and 200")
+        if host_kind is not None and host_kind not in {"gateway", "web"}:
+            raise ValueError("handoff delivery host kind is invalid")
+        stamp = _timestamp(now)
+        with self._lock:
+            query = """SELECT delivery.* FROM handoff_deliveries AS delivery
+                   WHERE delivery.method='wake' AND delivery.state='pending'
+                     AND delivery.acknowledged_at IS NULL
+                     AND (delivery.next_attempt_at IS NULL OR delivery.next_attempt_at<=?)
+                     AND (delivery.lease_owner IS NULL OR delivery.lease_expires_at<=?)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM handoff_deliveries AS earlier
+                          WHERE earlier.handoff_id=delivery.handoff_id
+                            AND earlier.event_sequence<delivery.event_sequence
+                            AND earlier.state='pending'
+                            AND earlier.acknowledged_at IS NULL
+                            AND earlier.dispatch_started_at IS NOT NULL
+                     )"""
+            params: list[object] = [stamp, stamp]
+            if host_kind is not None:
+                query += " AND json_extract(route_json, '$.host_kind')=?"
+                params.append(host_kind)
+            query += " ORDER BY next_attempt_at, created_at, delivery_id LIMIT ?"
+            params.append(limit)
+            rows = self._conn.execute(query, params).fetchall()
+            return tuple(self._delivery(row) for row in rows)
+
+    def claim_delivery(
+        self,
+        delivery_id: str,
+        owner: str,
+        *,
+        now: datetime,
+        lease_seconds: float,
+    ) -> DeliveryLease | None:
+        delivery_id = _identifier(delivery_id, "delivery ID")
+        owner = _identifier(owner, "delivery owner")
+        now = _aware_utc(now, "delivery lease time")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int | float)
+            or not math.isfinite(lease_seconds)
+            or lease_seconds <= 0
+        ):
+            raise ValueError("handoff delivery lease must be finite and positive")
+        expires_at = now + timedelta(seconds=float(lease_seconds))
+        stamp = _timestamp(now)
+        with self._lock, write_txn(self._conn):
+            row = self._conn.execute(
+                "SELECT * FROM handoff_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            existing_expiry = (
+                None if row is None else _parse_timestamp(row["lease_expires_at"])
+            )
+            receipt_pending = bool(
+                row is not None
+                and row["failure_code"] == _DELIVERY_RECEIPT_PENDING
+                and row["dispatch_started_at"] is not None
+            )
+            if (
+                row is not None
+                and row["state"] == "pending"
+                and row["acknowledged_at"] is None
+                and row["dispatch_started_at"] is not None
+                and (
+                    row["lease_owner"] is None
+                    or existing_expiry is None
+                    or existing_expiry <= now
+                )
+                and self._has_newer_delivery(row)
+                and not receipt_pending
+            ):
+                self._acknowledge_superseded_delivery(row, now)
+                return None
+            if receipt_pending:
+                changed = self._conn.execute(
+                    """UPDATE handoff_deliveries
+                       SET lease_owner=?, lease_epoch=lease_epoch+1,
+                           lease_expires_at=?, updated_at=?
+                       WHERE delivery_id=? AND method='wake' AND state='pending'
+                         AND acknowledged_at IS NULL AND failure_code=?
+                         AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                         AND lease_expires_at<=?""",
+                    (
+                        owner,
+                        _timestamp(expires_at),
+                        stamp,
+                        delivery_id,
+                        _DELIVERY_RECEIPT_PENDING,
+                        stamp,
+                        stamp,
+                    ),
+                ).rowcount
+            else:
+                changed = self._conn.execute(
+                    """UPDATE handoff_deliveries
+                       SET lease_owner=?, lease_epoch=lease_epoch+1,
+                           lease_expires_at=?, attempts=attempts+1, updated_at=?
+                       WHERE delivery_id=? AND method='wake' AND state='pending'
+                         AND acknowledged_at IS NULL AND attempts<?
+                         AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                         AND (lease_owner IS NULL OR lease_expires_at<=?)""",
+                    (
+                        owner,
+                        _timestamp(expires_at),
+                        stamp,
+                        delivery_id,
+                        _MAX_DELIVERY_ATTEMPTS,
+                        stamp,
+                        stamp,
+                    ),
+                ).rowcount
+            if changed != 1:
+                self._conn.execute(
+                    """UPDATE handoff_deliveries
+                       SET state='failed', next_attempt_at=NULL,
+                           lease_owner=NULL, lease_expires_at=NULL,
+                           failure_code=COALESCE(
+                               failure_code, 'delivery_attempts_exhausted'
+                           ), updated_at=?
+                       WHERE delivery_id=? AND method='wake' AND state='pending'
+                         AND acknowledged_at IS NULL AND attempts>=?
+                         AND (lease_owner IS NULL OR lease_expires_at<=?)""",
+                    (stamp, delivery_id, _MAX_DELIVERY_ATTEMPTS, stamp),
+                )
+                return None
+            row = self._conn.execute(
+                "SELECT lease_epoch FROM handoff_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            return DeliveryLease(delivery_id, owner, row["lease_epoch"], expires_at)
+
+    def delivery_receipt_pending(self, lease: DeliveryLease) -> bool:
+        """Whether this live claim is reconciling prior adapter acceptance."""
+        with self._lock:
+            row = self._delivery_lease_row(lease, _utc_now())
+            return bool(
+                row["failure_code"] == _DELIVERY_RECEIPT_PENDING
+                and row["dispatch_started_at"] is not None
+            )
+
+    def _delivery_lease_row(
+        self, lease: DeliveryLease, now: datetime
+    ) -> sqlite3.Row:
+        if not isinstance(lease, DeliveryLease):
+            raise ValueError("handoff delivery lease is invalid")
+        row = self._conn.execute(
+            "SELECT * FROM handoff_deliveries WHERE delivery_id=?",
+            (lease.delivery_id,),
+        ).fetchone()
+        expires_at = None if row is None else _parse_timestamp(row["lease_expires_at"])
+        if (
+            row is None
+            or row["lease_owner"] != lease.owner
+            or row["lease_epoch"] != lease.epoch
+            or row["state"] != "pending"
+            or row["acknowledged_at"] is not None
+            or expires_at is None
+            or expires_at <= now
+        ):
+            raise StaleAdvanceLease("handoff delivery lease is stale")
+        return row
+
+    def _has_newer_delivery(self, row: sqlite3.Row) -> bool:
+        return self._conn.execute(
+            """SELECT 1 FROM handoff_deliveries
+               WHERE handoff_id=? AND event_sequence>? AND acknowledged_at IS NULL
+               LIMIT 1""",
+            (row["handoff_id"], row["event_sequence"]),
+        ).fetchone() is not None
+
+    def _acknowledge_superseded_delivery(
+        self, row: sqlite3.Row, now: datetime
+    ) -> None:
+        self._conn.execute(
+            """UPDATE handoff_deliveries SET acknowledged_at=?, next_attempt_at=NULL,
+                      lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+               WHERE delivery_id=? AND acknowledged_at IS NULL""",
+            (_timestamp(now), _timestamp(now), row["delivery_id"]),
+        )
+
+    def begin_delivery_dispatch(self, lease: DeliveryLease) -> DeliveryRecord:
+        """Durably order adapter dispatch against a newer attention event."""
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            self._delivery_lease_row(lease, now)
+            self._conn.execute(
+                """UPDATE handoff_deliveries
+                   SET dispatch_started_at=COALESCE(dispatch_started_at, ?), updated_at=?
+                   WHERE delivery_id=?""",
+                (_timestamp(now), _timestamp(now), lease.delivery_id),
+            )
+            return self.get_delivery(lease.delivery_id)
+
+    def release_delivery(
+        self,
+        lease: DeliveryLease,
+        *,
+        next_attempt_at: datetime,
+        failure_code: str,
+        attempted: bool = True,
+    ) -> DeliveryRecord:
+        next_attempt_at = _aware_utc(next_attempt_at, "next delivery attempt")
+        failure_code = _identifier(failure_code, "delivery failure code")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            row = self._delivery_lease_row(lease, now)
+            if row["dispatch_started_at"] is not None and self._has_newer_delivery(row):
+                self._acknowledge_superseded_delivery(row, now)
+                return self.get_delivery(lease.delivery_id)
+            attempts = max(int(row["attempts"]) - (not attempted), 0)
+            state = "failed" if attempts >= _MAX_DELIVERY_ATTEMPTS else "pending"
+            self._conn.execute(
+                """UPDATE handoff_deliveries
+                   SET state=?, next_attempt_at=?, lease_owner=NULL,
+                       lease_expires_at=NULL, dispatch_started_at=NULL,
+                       attempts=?, failure_code=?, updated_at=?
+                   WHERE delivery_id=?""",
+                (
+                    state,
+                    _timestamp(next_attempt_at) if state == "pending" else None,
+                    attempts,
+                    failure_code,
+                    _timestamp(now),
+                    lease.delivery_id,
+                ),
+            )
+            return self.get_delivery(lease.delivery_id)
+
+    def defer_delivery_receipt(
+        self, lease: DeliveryLease, *, next_attempt_at: datetime
+    ) -> DeliveryRecord:
+        """Keep an accepted dispatch reserved while its transcript receipt lands."""
+        next_attempt_at = _aware_utc(next_attempt_at, "next delivery attempt")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            row = self._delivery_lease_row(lease, now)
+            if row["dispatch_started_at"] is None:
+                raise HandoffStateConflict(
+                    "handoff delivery has no active dispatch reservation"
+                )
+            retry_at = _timestamp(next_attempt_at)
+            self._conn.execute(
+                """UPDATE handoff_deliveries
+                   SET next_attempt_at=?, lease_expires_at=?, failure_code=?,
+                       updated_at=? WHERE delivery_id=?""",
+                (
+                    retry_at,
+                    retry_at,
+                    _DELIVERY_RECEIPT_PENDING,
+                    _timestamp(now),
+                    lease.delivery_id,
+                ),
+            )
+            return self.get_delivery(lease.delivery_id)
+
+    def abandon_delivery_dispatch(
+        self, delivery_id: str, *, next_attempt_at: datetime
+    ) -> DeliveryRecord:
+        """Release a dispatch whose accepted in-memory turn was discarded."""
+        delivery_id = _identifier(delivery_id, "delivery ID")
+        next_attempt_at = _aware_utc(next_attempt_at, "next delivery attempt")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            row = self._conn.execute(
+                "SELECT * FROM handoff_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                raise HandoffNotFound("handoff delivery not found")
+            if (
+                row["state"] == "pending"
+                and row["acknowledged_at"] is None
+                and row["dispatch_started_at"] is not None
+            ):
+                if self._has_newer_delivery(row):
+                    self._acknowledge_superseded_delivery(row, now)
+                else:
+                    self._conn.execute(
+                        """UPDATE handoff_deliveries
+                           SET next_attempt_at=?, lease_owner=NULL,
+                               lease_expires_at=NULL, dispatch_started_at=NULL,
+                               failure_code='delivery_retryable', updated_at=?
+                           WHERE delivery_id=?""",
+                        (
+                            _timestamp(next_attempt_at),
+                            _timestamp(now),
+                            delivery_id,
+                        ),
+                    )
+            return self.get_delivery(delivery_id)
+
+    def complete_delivery(self, lease: DeliveryLease) -> DeliveryRecord:
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            row = self._delivery_lease_row(lease, now)
+            acknowledged_at = (
+                _timestamp(now) if self._has_newer_delivery(row) else None
+            )
+            self._conn.execute(
+                """UPDATE handoff_deliveries
+                   SET state='delivered', next_attempt_at=NULL, lease_owner=NULL,
+                       lease_expires_at=NULL, dispatch_started_at=NULL,
+                       failure_code=NULL,
+                       acknowledged_at=COALESCE(acknowledged_at, ?), updated_at=?
+                   WHERE delivery_id=?""",
+                (acknowledged_at, _timestamp(now), lease.delivery_id),
+            )
+            return self.get_delivery(lease.delivery_id)
+
+    def fail_delivery(
+        self, lease: DeliveryLease, *, failure_code: str
+    ) -> DeliveryRecord:
+        failure_code = _identifier(failure_code, "delivery failure code")
+        with self._lock, write_txn(self._conn):
+            now = _utc_now()
+            self._delivery_lease_row(lease, now)
+            self._conn.execute(
+                """UPDATE handoff_deliveries
+                   SET state='failed', next_attempt_at=NULL, lease_owner=NULL,
+                       lease_expires_at=NULL, dispatch_started_at=NULL,
+                       failure_code=?, updated_at=?
+                   WHERE delivery_id=?""",
+                (failure_code, _timestamp(now), lease.delivery_id),
+            )
+            return self.get_delivery(lease.delivery_id)
+
+    def acknowledge(self, handoff_id: str, *, actor: str) -> int:
+        actor = _identifier(actor, "acknowledgement actor")
+        with self._lock, write_txn(self._conn):
+            handoff = self._row(handoff_id)
+            now = _utc_now()
+            changed = self._conn.execute(
+                """UPDATE handoff_deliveries SET acknowledged_at=?, updated_at=?
+                   WHERE handoff_id=? AND acknowledged_at IS NULL""",
+                (_timestamp(now), _timestamp(now), handoff_id),
+            ).rowcount
+            if changed:
+                self._append_event(
+                    handoff_id,
+                    phase_before=handoff["phase"],
+                    phase_after=handoff["phase"],
+                    kind="acknowledged",
+                    actor=actor,
+                    created_at=now,
+                )
+            return changed
+
+    @staticmethod
+    def _delivery(row: sqlite3.Row) -> DeliveryRecord:
+        if row["state"] not in _RETURN_DELIVERY_STATES:
+            raise HandoffStoreError("handoff delivery state is invalid")
+        return DeliveryRecord(
+            delivery_id=row["delivery_id"],
+            handoff_id=row["handoff_id"],
+            event_sequence=row["event_sequence"],
+            route=_freeze(json.loads(row["route_json"])),  # type: ignore[arg-type]
+            method=row["method"],
+            state=row["state"],
+            attempts=row["attempts"],
+            next_attempt_at=_parse_timestamp(row["next_attempt_at"]),
+            acknowledged_at=_parse_timestamp(row["acknowledged_at"]),
+            failure_code=row["failure_code"],
+            created_at=_parse_timestamp(row["created_at"]),  # type: ignore[arg-type]
+            updated_at=_parse_timestamp(row["updated_at"]),  # type: ignore[arg-type]
+        )
+
     @staticmethod
     def _command(row: sqlite3.Row) -> CommandRecord:
         return CommandRecord(
@@ -1173,6 +1706,8 @@ class HandoffStore:
 __all__ = [
     "AdvanceLease",
     "CommandRecord",
+    "DeliveryLease",
+    "DeliveryRecord",
     "EvidencePage",
     "HandoffConflict",
     "HandoffEvent",

@@ -1799,10 +1799,13 @@ class ProcessRegistry:
             # they carry routing metadata. Ownerless ordinary events preserve
             # legacy single-session delivery.
             is_async_delegation = evt.get("type") == "async_delegation"
+            is_handoff_return = evt.get("type") == "handoff_return"
             evt_session_key = str(evt.get("session_key") or "")
             evt_origin_sid = str(evt.get("origin_ui_session_id") or "")
-            requires_positive_proof = is_async_delegation or bool(
-                evt_session_key or evt_origin_sid
+            requires_positive_proof = (
+                is_async_delegation
+                or is_handoff_return
+                or bool(evt_session_key or evt_origin_sid)
             )
             if owns_event is not None and requires_positive_proof:
                 try:
@@ -1820,6 +1823,11 @@ class ProcessRegistry:
                 # Durable restore can enqueue previous-process payloads into a
                 # fresh registry. An unfiltered legacy drain cannot prove
                 # ownership, so leave those events queued for the owner.
+                requeue.append(evt)
+                continue
+            if is_handoff_return:
+                # Its private result can only be formatted after a durable
+                # lease check. Gateway/TUI idle consumers own that claim.
                 requeue.append(evt)
                 continue
             # Local consumed/observed state may suppress only events this
@@ -3146,7 +3154,46 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
     return line
 
 
-def format_process_notification(evt: dict) -> "str | None":
+def _format_handoff_return(evt: dict, delivery_claim: object) -> "str | None":
+    from tools.async_delegation import claimed_handoff_snapshot
+
+    snapshot = claimed_handoff_snapshot(delivery_claim)
+    if snapshot is None:
+        return None
+    phase = snapshot.phase
+    handoff_id = snapshot.handoff_id
+    lines = [f"[AGENT HANDOFF RETURN — {handoff_id}]", f"Status: {phase}."]
+    if phase == "succeeded":
+        lines.append("The remote agent completed successfully.")
+        result = snapshot.terminal_result or {}
+        text = redact_sensitive_text(str(result.get("text") or ""), force=True)
+        if text:
+            lines.extend(("--- RESULT ---", text))
+    elif phase == "needs_input":
+        checkpoint = snapshot.checkpoint or {}
+        choices = ", ".join(checkpoint.get("approval_choices") or ())
+        lines.append(
+            "The remote agent needs your input."
+            + (f" Allowed responses: {choices}." if choices else "")
+        )
+    elif phase == "indeterminate":
+        lines.append("The remote outcome could not be determined; inspect Needs Attention.")
+    elif phase == "cancelled":
+        lines.append("The remote handoff was cancelled.")
+    else:
+        lines.append("The remote handoff failed.")
+    if snapshot.failure_code:
+        lines.append(f"Failure code: {snapshot.failure_code}.")
+    rendered = "\n".join(lines)
+    encoded = rendered.encode("utf-8")
+    if len(encoded) > 32768:
+        rendered = encoded[:32740].decode("utf-8", errors="ignore") + "\n[truncated]"
+    return rendered
+
+
+def format_process_notification(
+    evt: dict, *, delivery_claim: object = None
+) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
     Handles completion events (notify_on_complete), watch pattern matches,
@@ -3187,6 +3234,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if evt_type == "handoff_return":
+        return _format_handoff_return(evt, delivery_claim)
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

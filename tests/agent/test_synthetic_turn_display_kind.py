@@ -97,6 +97,23 @@ def test_row_is_typed_by_the_turn_start_persist(agent_db):
     assert row["content"] == NOTE
 
 
+def test_handoff_return_row_carries_delivery_identity_before_the_turn_runs(agent_db):
+    agent, db, sid = agent_db
+
+    _build(
+        agent,
+        persist_user_message_id="delivery-1",
+        persist_user_display_kind="handoff_return",
+        persist_user_display_metadata={"handoff_id": "handoff-1"},
+    )
+
+    assert db.has_platform_message_id(sid, "delivery-1") is True
+    row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+    assert row["message_id"] == "delivery-1"
+    assert row["display_kind"] == "handoff_return"
+    assert row["display_metadata"] == {"handoff_id": "handoff-1"}
+
+
 def test_a_real_user_turn_stays_untyped(agent_db):
     agent, db, sid = agent_db
 
