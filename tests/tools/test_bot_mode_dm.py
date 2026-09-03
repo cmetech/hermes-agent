@@ -662,6 +662,25 @@ def test_hop_one_is_preserved_for_supervisor_loop_limit(tmp_path, monkeypatch):
     assert service.calls[0][1].return_route["hop_count"] == 1
 
 
+@pytest.mark.parametrize(
+    "config", ["bot_mode: disabled\n", "bot_mode: [\n"]
+)
+def test_invalid_wake_configuration_falls_back_to_durable_attention(
+    tmp_path, config
+):
+    home = _managed_home(tmp_path)
+    (home / "config.yaml").write_text(config, encoding="utf-8")
+
+    assert bot_mode_dm._handoff_wake_enabled(home) is False
+
+
+def test_valid_omitted_wake_setting_keeps_default_enabled(tmp_path):
+    home = _managed_home(tmp_path)
+    (home / "config.yaml").write_text("bot_mode: {}\n", encoding="utf-8")
+
+    assert bot_mode_dm._handoff_wake_enabled(home) is True
+
+
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────
 
 

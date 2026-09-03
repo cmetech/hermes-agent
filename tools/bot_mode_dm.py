@@ -462,15 +462,18 @@ def _operation_id(agent: Any, tool_call_id: str, target: str) -> str:
 
 def _handoff_wake_enabled(home: Path) -> bool:
     try:
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly, read_user_config_raw
 
+        # Validate the source file before consulting the merged/LKG view: a
+        # broken wake policy must degrade to durable Needs Attention, not wake.
+        read_user_config_raw(home / "config.yaml")
         config = load_config_readonly(config_path=home / "config.yaml") or {}
         bot_mode = config.get("bot_mode")
-        return not isinstance(bot_mode, Mapping) or bot_mode.get(
+        return isinstance(bot_mode, Mapping) and bot_mode.get(
             "handoff_return_wake", True
         ) is not False
     except Exception:
-        return True
+        return False
 
 
 def _handoff_delivery(
