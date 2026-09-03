@@ -11,13 +11,13 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `8986696272f5c48edfc302f89d07f1e4e424a614`
-- Remediated tree: `405b47910aea03e176c460029aabfedfd9f1fa3a`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..8986696272f5c48edfc302f89d07f1e4e424a614`
-- Range commits: 3
-- Range paths: 5
-- Range diff: `+450/-1`; 398 inserted lines are the shared original review
-  prompt, not production behavior.
+- Remediated candidate: `7c02e8af587e594fe36d4ecb7072b1b1dcb1fc3a`
+- Remediated tree: `9a0c8c2320d567a625f62f7384b818fa35baceb3`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..7c02e8af587e594fe36d4ecb7072b1b1dcb1fc3a`
+- Range commits: 6
+- Range paths: 7
+- Range diff: `+602/-4`; 540 inserted lines are review prompts, not
+  production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
 must be detached and clean before and after review.
@@ -68,7 +68,7 @@ or parse failure to the resolver's closed `ValueError` contract.
 
 Prove or falsify all of the following:
 
-- syntactically malformed and unreadable config fail before local, peer,
+- syntactically malformed, non-mapping, and unreadable config fail before local, peer,
   bare-peer, or relay fallback and before any handoff, subprocess, peer DM,
   relay, warning-backup, or other transport side effect;
 - missing config and valid minimal config retain the documented empty-directory
