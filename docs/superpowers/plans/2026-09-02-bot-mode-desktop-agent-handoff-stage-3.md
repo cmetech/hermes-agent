@@ -119,7 +119,7 @@ new counts before editing.
 
 ---
 
-## Task 1: Add the closed conversation and Bot return-route contract
+## Task 1: Add the closed conversation return-route contract
 
 **Owns:**
 
@@ -129,16 +129,18 @@ new counts before editing.
 - `tests/hermes_cli/handoff/test_models.py`
 - `tests/hermes_cli/handoff/test_store.py`
 
-**Produces:** `mode="conversation"` and an optional bounded, immutable Bot
-return route without changing any existing task row or fingerprint.
+**Produces:** `mode="conversation"` and optional bounded, immutable Bot-session
+or operator-inbox return routes without changing any existing task row or
+fingerprint.
 
 ### RED
 
 - [ ] Add tests proving only `task` and `conversation` are accepted;
-  conversation rejects `output_schema`; the Bot route accepts only initiating
+  conversation rejects `output_schema`; a Bot route accepts only initiating
   profile, durable session ID/key, tool-call ID, closed delivery policy, and
-  bounded incoming hop; unsafe/unknown/credential-shaped values fail closed;
-  and task mode cannot carry a Bot route.
+  bounded incoming hop; an operator route accepts only profile and a
+  host-generated inbox ID; unsafe/unknown/credential-shaped values fail closed;
+  and task mode cannot carry a return route.
 - [ ] Prove a v1 task `spec_json` loads unchanged and absent `return_route`
   leaves its exact serialized bytes, fingerprint input, and fingerprint
   unchanged.

@@ -234,8 +234,8 @@ Needs Attention item and inspector result available.
 ### Handoff specification
 
 Extend `HandoffSpec.mode` from `Literal["task"]` to
-`Literal["task", "conversation"]` and add one optional, closed Bot return route
-containing only:
+`Literal["task", "conversation"]` and add one optional, closed return route.
+A Bot route contains only:
 
 - initiating profile;
 - durable canonical Bot Chat session ID;
@@ -243,6 +243,10 @@ containing only:
 - initiating model tool-call ID;
 - delivery policy; and
 - incoming automatic-hop count.
+
+An operator route contains only the initiating profile and a host-generated UI
+inbox identifier. It creates durable attention for Desktop-created handoffs but
+never wakes a Bot or accepts a renderer-supplied actor.
 
 No provider name, peer URL, credential, authorization material, raw transport
 ID, or unrestricted metadata belongs in the route. Existing task rows have no
