@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `83da57266745e74e3bdda6b25765cc8b76e51a53`
-- Remediated tree: `862cb257b8209b5abfdada5b16400ba2164b816c`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..83da57266745e74e3bdda6b25765cc8b76e51a53`
-- Range commits: 21
+- Remediated candidate: `91820352f225e6530fc2b332741df0fef27a771c`
+- Remediated tree: `8c3941d705746fc6b39e774922eac29ae53c96ee`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..91820352f225e6530fc2b332741df0fef27a771c`
+- Range commits: 23
 - Range paths: 16
-- Range diff: `+1704/-57`; 621 inserted lines are review prompts, not
+- Range diff: `+1753/-57`; 647 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -67,8 +67,14 @@ returns as non-control internal events so the established identity-preserving
 FIFO handles busy sessions. After adapter acceptance, it durably retains the
 dispatch reservation in a receipt-pending state. Same-host transcript probes do
 not consume attempts or admit newer returns; a visible delivery ID completes
-the row without another model turn, while a changed host owner follows restart
-recovery instead of trusting lost process memory.
+the row without another model turn. A final controller probe then proved that
+reloading the background service changes its supervisor owner UUID without
+replacing the gateway process or its live in-memory identity guard. The current
+candidate transfers a receipt-pending lease across that owner rotation without
+clearing the dispatch reservation or consuming an attempt. The gateway uses its
+process-local identity only to distinguish that live owner rotation from a true
+process restart; after a true restart it releases the stale receipt reservation
+for durable transcript reconciliation and normal keyed retry.
 
 Prove or falsify all of the following:
 
@@ -83,8 +89,11 @@ Prove or falsify all of the following:
 - adapter queue acceptance without a transcript receipt retains the reservation
   and stable delivery identity, does not merge distinct handoff return texts,
   and does not consume additional delivery attempts while polling;
+- background-service owner rotation in the same gateway process transfers the
+  receipt-pending lease without reinjection, clearing the reservation, or
+  consuming an attempt;
 - an abandoned reserved dispatch reconciles through transcript receipt and
-  lease-expiry recovery without blocking or duplicating the newer return;
+  restart/lease recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
 - acknowledgement, failed wake, attention-only policy, restart recovery,
   host/profile filtering, attempt limits, and one-delivery transcript replay
@@ -131,7 +140,12 @@ budget while the in-process guard suppressed duplicate submission. The current
 candidate retains the durable reservation across this accepted-but-unpersisted
 interval and uses receipt-only same-host retries that do not increment attempts.
 Distinct handoff returns use the gateway's existing non-control internal FIFO,
-not generic pending-text merging.
+not generic pending-text merging. Receipt-pending claims may transfer between
+supervisor owners because a background-service reload rotates that owner while
+the gateway and its in-memory identity guard remain live. A true gateway process
+restart has no matching in-memory identity, so it releases and reconciles the
+stale receipt reservation before retry instead of trusting vanished process
+state.
 
 Prove or falsify all of the following:
 
@@ -140,6 +154,8 @@ Prove or falsify all of the following:
 - a busy adapter's queue acceptance cannot release the durable dispatch
   reservation, unblock a newer return, merge two delivery identities, or
   consume the attempt budget while waiting for persistence;
+- rotating the background-service supervisor owner inside the same gateway
+  process cannot cause reinjection or clear the accepted dispatch reservation;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
