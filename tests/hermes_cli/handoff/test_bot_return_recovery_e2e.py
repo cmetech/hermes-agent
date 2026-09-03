@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import queue
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -294,3 +299,51 @@ def test_disabled_or_hop_limited_wake_retains_attention(
     delivery = store.attention(snapshot.handoff_id, limit=1)[0]
     assert delivery.failure_code == failure_code
     store.close()
+
+
+def _tui_rpc_process(home, method: str, params: dict) -> dict:
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["STAGE3_RPC"] = json.dumps({"id": "stage3", "method": method, "params": params})
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os; from pathlib import Path; "
+                "import tui_gateway.server as s; "
+                "s._hermes_home=Path(os.environ['HERMES_HOME']); "
+                "s._real_stdout.write(json.dumps(s.handle_request("
+                "json.loads(os.environ['STAGE3_RPC']))))"
+            ),
+        ],
+        cwd=Path(__file__).parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_tui_desktop_process_restart_reopens_durable_attention(_profile_home):
+    home = _profile_home
+    store, snapshot = _finish_conversation(home)
+    store.close()
+
+    listed = _tui_rpc_process(
+        home, "agent_handoff.list", {"profile": "default", "limit": 10}
+    )
+    reopened = _tui_rpc_process(
+        home,
+        "agent_handoff.evidence",
+        {"profile": "default", "handoff_id": snapshot.handoff_id, "limit": 10},
+    )
+
+    assert listed["result"]["handoffs"][0]["handoff_id"] == snapshot.handoff_id
+    assert listed["result"]["handoffs"][0]["needs_attention"] is True
+    assert reopened["result"]["result_preview"] == {
+        "text": "review complete",
+        "truncated": False,
+    }

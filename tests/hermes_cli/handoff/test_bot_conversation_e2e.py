@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import queue
 import threading
 
 import pytest
 
 from agent import secret_scope
 from hermes_cli.handoff import AgentHandoffService, HandoffStore
+from hermes_cli.handoff.supervisor import AgentHandoffSupervisor
 from tests.hermes_cli.handoff import test_local_runs as local_gateway
 from tools import bot_mode_dm, bot_mode_probe
 
@@ -280,4 +282,113 @@ async def test_bot_handoff_round_trips_exact_remote_approval_choice(bot_profiles
             ).delivery_state
             == "delivered"
         )
+        service.store.close()
+
+
+@pytest.mark.asyncio
+async def test_initiator_restart_recovers_run_and_unclaimed_return(bot_profiles):
+    default_home, _reviewer_home = bot_profiles
+    destination = _RecordingAgent(blocked=True)
+    async with local_gateway._gateway(
+        bot_profiles, agent=lambda **_kwargs: destination
+    ) as (adapter, _server):
+        created = json.loads(
+            await asyncio.to_thread(
+                bot_mode_dm.message_agent_tool,
+                target="hermes://local/reviewer",
+                message="Review across a restart.",
+                tool_call_id="call-stage3-restart",
+                agent=_BotCaller(default_home),
+            )
+        )
+        before = AgentHandoffService(HandoffStore(default_home / "handoffs.db"))
+        active = await _advance_until(before, created["handoff_id"], {"active"})
+        run_id = active.checkpoint["run_id"]
+        before.store.close()
+
+        destination.release.set()
+        await local_gateway._wait_for_run_task(adapter, run_id)
+        restarted = AgentHandoffService(HandoffStore(default_home / "handoffs.db"))
+        completed = await _advance_until(
+            restarted, created["handoff_id"], {"succeeded"}
+        )
+        events = queue.Queue()
+        supervisor = AgentHandoffSupervisor(
+            [("default", default_home)],
+            owner="restarted-gateway",
+            host_kind="gateway",
+            completion_queue=events,
+            service_factory=lambda _home: restarted,
+        )
+
+        supervisor.tick()
+
+        assert completed.checkpoint["run_id"] == run_id
+        assert events.get_nowait()["handoff_id"] == completed.handoff_id
+        assert restarted.store.attention(completed.handoff_id, limit=10)[0].attempts == 1
+        restarted.store.close()
+
+
+@pytest.mark.asyncio
+async def test_real_runs_cancellation_completion_race_returns_once(bot_profiles):
+    default_home, _reviewer_home = bot_profiles
+    destination = _RecordingAgent(blocked=True)
+    async with local_gateway._gateway(
+        bot_profiles, agent=lambda **_kwargs: destination
+    ) as (adapter, _server):
+        created = json.loads(
+            await asyncio.to_thread(
+                bot_mode_dm.message_agent_tool,
+                target="hermes://local/reviewer",
+                message="Race cancellation with completion.",
+                tool_call_id="call-stage3-real-race",
+                agent=_BotCaller(default_home),
+            )
+        )
+        service = AgentHandoffService(HandoffStore(default_home / "handoffs.db"))
+        active = await _advance_until(service, created["handoff_id"], {"active"})
+        barrier = threading.Barrier(3)
+        failures: list[Exception] = []
+
+        def cancel() -> None:
+            try:
+                barrier.wait()
+                service.command(
+                    active.handoff_id,
+                    "cancel",
+                    command_id="cancel-stage3-real-race",
+                    actor="bot",
+                )
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def complete() -> None:
+            barrier.wait()
+            destination.release.set()
+
+        cancel_thread = threading.Thread(target=cancel)
+        complete_thread = threading.Thread(target=complete)
+        cancel_thread.start()
+        complete_thread.start()
+        barrier.wait()
+        cancel_thread.join(timeout=3)
+        complete_thread.join(timeout=3)
+
+        terminal = await _advance_until(
+            service, active.handoff_id, {"succeeded", "cancelled"}
+        )
+        await local_gateway._wait_for_run_task(adapter, active.checkpoint["run_id"])
+
+        assert failures == []
+        assert not cancel_thread.is_alive() and not complete_thread.is_alive()
+        assert len(service.store.attention(terminal.handoff_id, limit=10)) == 1
+        events = queue.Queue()
+        AgentHandoffSupervisor(
+            [("default", default_home)],
+            owner="race-gateway",
+            host_kind="gateway",
+            completion_queue=events,
+            service_factory=lambda _home: service,
+        ).tick()
+        assert events.qsize() == 1
         service.store.close()
