@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `02d655c9cde51dd66bb12f91c38131d7d5431e75`
-- Remediated tree: `e915e8fa5a4101d7f45e289ea33d81f530bce5b1`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..02d655c9cde51dd66bb12f91c38131d7d5431e75`
-- Range commits: 33
+- Remediated candidate: `ad4c53bac83effda0a70b3caebd0c999fb664439`
+- Remediated tree: `192e496d5746e17845a4d0ca51c977525ef42862`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..ad4c53bac83effda0a70b3caebd0c999fb664439`
+- Range commits: 35
 - Range paths: 21
-- Range diff: `+2488/-87`; 708 inserted lines are review prompts, not
+- Range diff: `+2520/-87`; 738 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
