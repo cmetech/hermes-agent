@@ -45,7 +45,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Literal, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -3159,6 +3159,7 @@ def _consume_gateway_tool_choice(runner, session_key: str):
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
 _UNSET = object()
+_HANDOFF_QUEUE_BACKPRESSURE = "handoff_queue_backpressure"
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -10857,10 +10858,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self, session_key: str, event: MessageEvent
+    ) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -10870,6 +10873,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return False
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
         security_metadata_keys = (
             "hermes_plugin_id",
@@ -10904,7 +10909,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -10912,9 +10917,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -11092,7 +11098,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # payload text, so queue those through the gateway FIFO to keep their
         # security metadata separate from pending user input.
         if getattr(event, "internal", False) and not event.allow_gateway_control:
-            self._queue_or_replace_pending_event(session_key, event)
+            if not self._queue_or_replace_pending_event(session_key, event):
+                setattr(event, "_gateway_queue_backpressure", True)
             return True
         if getattr(event, "internal", False):
             return False
@@ -27303,7 +27310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> Optional[bool] | Literal["handoff_queue_backpressure"]:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing must come from the queued event itself, not from whatever
@@ -27482,6 +27489,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(_prime):
                 _prime(synth_event)
             await adapter.handle_message(synth_event)
+            if getattr(synth_event, "_gateway_queue_backpressure", False):
+                return _HANDOFF_QUEUE_BACKPRESSURE
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
@@ -27767,6 +27776,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event_claim is not None and not begin_handoff_return_delivery(event_claim):
                 return None
             injection_result = await self._inject_watch_notification(synth_text, evt)
+            if injection_result == _HANDOFF_QUEUE_BACKPRESSURE:
+                claimed = event_claim
+                event_claim = None
+                release_event_delivery(evt, claimed, attempted=False)
+                return False
             if injection_result is not True:
                 return injection_result
             if event_claim is not None:

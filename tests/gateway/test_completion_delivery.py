@@ -18,6 +18,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    PlatformConfig,
+    SendResult,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli.handoff.models import ChannelObservation, HandoffEndpoint, HandoffSpec
@@ -26,6 +33,23 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 UTC = timezone.utc
+
+
+class _BusyAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return SendResult(success=True, message_id="reply-1")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +123,7 @@ def _handoff_event(
     phase="succeeded",
     host_kind="gateway",
     return_advance=False,
+    session_key="agent:main:telegram:dm:12345:678",
 ):
     store = HandoffStore(home / "handoffs.db")
     spec = HandoffSpec(
@@ -114,7 +139,7 @@ def _handoff_event(
             "host_kind": host_kind,
             "profile": "default",
             "session_id": "session-1",
-            "session_key": "agent:main:telegram:dm:12345:678",
+            "session_key": session_key,
             "tool_call_id": "call-1",
             "delivery_policy": "wake",
             "hop_count": 0,
@@ -177,7 +202,7 @@ def _handoff_event(
         "event_sequence": delivery.event_sequence,
         "profile": "default",
         "session_id": "session-1",
-        "session_key": "agent:main:telegram:dm:12345:678",
+        "session_key": session_key,
         "tool_call_id": "call-1",
         "hop_count": 0,
         "delivery_claim": {
@@ -520,6 +545,125 @@ def test_gateway_handoff_return_process_restart_retries_after_receipt_recovery(
     ) is True
     restarted_adapter.handle_message.assert_awaited_once()
     assert store.get_delivery(event["delivery_id"]).state == "delivered"
+    store.close()
+
+
+def test_gateway_handoff_return_retries_after_busy_fifo_capacity(tmp_path):
+    store, event, advance = _handoff_event(
+        tmp_path,
+        phase="needs_input",
+        return_advance=True,
+        session_key="agent:main:telegram:dm:12345",
+    )
+    adapter = _BusyAdapter()
+    handler = AsyncMock(return_value=None)
+    adapter.set_message_handler(handler)
+    runner = _runner(adapter)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._is_user_authorized = lambda _source: True
+    runner._effective_busy_input_mode = lambda _source: "queue"
+    runner._draining = False
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        has_platform_message_id=AsyncMock(
+            side_effect=[False, False, False, True]
+        ),
+    )
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = event["session_key"]
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._heal_stale_session_lock = lambda _session_key: None
+    filler = MessageEvent(
+        text="queued",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="678",
+        ),
+    )
+    adapter._pending_messages[session_key] = filler
+    runner._session_state(session_key).conversation.queued_events.extend(
+        [filler] * (runner._BUSY_QUEUE_MAX_PENDING - 1)
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, event)
+    ) is False
+    rejected = store.get_delivery(event["delivery_id"])
+    assert rejected.attempts == 0
+    assert rejected.failure_code == "delivery_backpressure"
+    assert rejected.acknowledged_at is None
+    handler.assert_not_awaited()
+
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded",
+            terminal_result={
+                "text": "terminal result",
+                "sha256": sha256(b"terminal result").hexdigest(),
+                "media_type": "text/plain",
+                "size_bytes": len(b"terminal result"),
+            },
+        ),
+    )
+    assert store.get_delivery(event["delivery_id"]).acknowledged_at is not None
+
+    adapter._pending_messages.clear()
+    runner._session_state(session_key).conversation.queued_events.clear()
+    terminal = store.attention(event["handoff_id"], limit=1)[0]
+    terminal_lease = store.claim_delivery(
+        terminal.delivery_id,
+        "supervisor-terminal",
+        now=terminal.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert terminal_lease is not None
+    terminal_event = {
+        **event,
+        "delivery_id": terminal.delivery_id,
+        "event_sequence": terminal.event_sequence,
+        "delivery_claim": {
+            "owner": terminal_lease.owner,
+            "epoch": terminal_lease.epoch,
+            "expires_at": terminal_lease.expires_at.isoformat(),
+        },
+    }
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, terminal_event)
+    ) is False
+    queued = adapter.get_pending_message(session_key)
+    assert queued is not None
+    assert queued.message_id == terminal.delivery_id
+    asyncio.run(handler(queued))
+    handler.assert_awaited_once()
+
+    pending = store.get_delivery(terminal.delivery_id)
+    receipt_lease = store.claim_delivery(
+        pending.delivery_id,
+        "supervisor-receipt",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert receipt_lease is not None
+    terminal_event["delivery_claim"] = {
+        "owner": receipt_lease.owner,
+        "epoch": receipt_lease.epoch,
+        "expires_at": receipt_lease.expires_at.isoformat(),
+    }
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, terminal_event)
+    ) is True
+    handler.assert_awaited_once()
+    assert store.get_delivery(terminal.delivery_id).state == "delivered"
     store.close()
 
 

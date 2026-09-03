@@ -739,7 +739,9 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: Any) -> None:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: Any) -> None:
+def release_event_delivery(
+    evt: Dict[str, Any], claim_id: Any, *, attempted: bool = True
+) -> None:
     if evt.get("type") == "handoff_return" and isinstance(
         claim_id, _HandoffReturnClaim
     ):
@@ -747,7 +749,10 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: Any) -> None:
             claim_id.store.release_delivery(
                 claim_id.lease,
                 next_attempt_at=datetime.now(timezone.utc) + timedelta(seconds=2),
-                failure_code="delivery_retryable",
+                failure_code=(
+                    "delivery_retryable" if attempted else "delivery_backpressure"
+                ),
+                attempted=attempted,
             )
         finally:
             claim_id.store.close()

@@ -1522,6 +1522,7 @@ class HandoffStore:
         *,
         next_attempt_at: datetime,
         failure_code: str,
+        attempted: bool = True,
     ) -> DeliveryRecord:
         next_attempt_at = _aware_utc(next_attempt_at, "next delivery attempt")
         failure_code = _identifier(failure_code, "delivery failure code")
@@ -1531,16 +1532,18 @@ class HandoffStore:
             if row["dispatch_started_at"] is not None and self._has_newer_delivery(row):
                 self._acknowledge_superseded_delivery(row, now)
                 return self.get_delivery(lease.delivery_id)
-            state = "failed" if row["attempts"] >= _MAX_DELIVERY_ATTEMPTS else "pending"
+            attempts = max(int(row["attempts"]) - (not attempted), 0)
+            state = "failed" if attempts >= _MAX_DELIVERY_ATTEMPTS else "pending"
             self._conn.execute(
                 """UPDATE handoff_deliveries
                    SET state=?, next_attempt_at=?, lease_owner=NULL,
                        lease_expires_at=NULL, dispatch_started_at=NULL,
-                       failure_code=?, updated_at=?
+                       attempts=?, failure_code=?, updated_at=?
                    WHERE delivery_id=?""",
                 (
                     state,
                     _timestamp(next_attempt_at) if state == "pending" else None,
+                    attempts,
                     failure_code,
                     _timestamp(now),
                     lease.delivery_id,
