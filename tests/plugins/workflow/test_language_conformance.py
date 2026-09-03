@@ -4,6 +4,7 @@ from collections.abc import Mapping
 import json
 from pathlib import Path
 import re
+from typing import cast
 
 import pytest
 import yaml
@@ -11,7 +12,11 @@ import yaml
 from plugins.workflow.language import CURRENT_NORMALIZER_BY_PROFILE
 from plugins.workflow.language_conformance import workflow_language_conformance
 from plugins.workflow.language_schema import workflow_authoring_contract
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowValidationError
+from plugins.workflow.models import (
+    WorkflowLanguageProfile,
+    WorkflowNode,
+    WorkflowValidationError,
+)
 from plugins.workflow.schema import (
     _compile_workflow_source_document,
     parse_workflow_source_bytes,
@@ -23,17 +28,46 @@ MAX_CORPUS_CASES = 64
 MAX_CORPUS_BYTES = 160_000
 
 
+def _mapping(value: object) -> Mapping[str, object]:
+    assert isinstance(value, Mapping)
+    return cast(Mapping[str, object], value)
+
+
+def _mapping_list(value: object) -> list[dict[str, object]]:
+    assert isinstance(value, list)
+    assert all(isinstance(item, dict) for item in value)
+    return cast(list[dict[str, object]], value)
+
+
+def _string_list(value: object) -> list[str]:
+    assert isinstance(value, list)
+    assert all(isinstance(item, str) for item in value)
+    return cast(list[str], value)
+
+
+def _text(value: object) -> str:
+    assert isinstance(value, str)
+    return value
+
+
+def _integer(value: object) -> int:
+    assert isinstance(value, int) and not isinstance(value, bool)
+    return value
+
+
 def _cases(profile: WorkflowLanguageProfile) -> dict[str, dict[str, object]]:
     corpus = workflow_language_conformance(profile)
-    return {case["id"]: case for case in corpus["cases"]}
+    return {
+        _text(case["id"]): case for case in _mapping_list(corpus["cases"])
+    }
 
 
 def _parse_case(case: dict[str, object]):
     return parse_workflow_source_bytes(
-        f"{case['id']}.yaml",
-        workflow_bytes=case["definition_yaml"].encode("utf-8"),
+        f"{_text(case['id'])}.yaml",
+        workflow_bytes=_text(case["definition_yaml"]).encode("utf-8"),
         sidecar_bytes=(
-            case["companion_yaml"].encode("utf-8")
+            _text(case["companion_yaml"]).encode("utf-8")
             if "companion_yaml" in case
             else None
         ),
@@ -66,24 +100,28 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
         "normalizer": "plugins.workflow.language.normalize_workflow",
         "validator": "plugins.workflow.schema._compile_workflow_source_document",
     }
-    assert first["x-hermes-provenance"]["producer"] == "hermes-agent"
-    assert first["x-hermes-provenance"]["command"] == (
+    provenance = _mapping(first["x-hermes-provenance"])
+    cases = _mapping_list(first["cases"])
+    assert provenance["producer"] == "hermes-agent"
+    assert provenance["command"] == (
         f"hermes workflow schema-corpus --profile {profile.value} --json"
     )
-    assert 1 <= len(first["cases"]) <= MAX_CORPUS_CASES
+    assert 1 <= len(cases) <= MAX_CORPUS_CASES
     assert len(encoded) <= MAX_CORPUS_BYTES
 
-    ids = [case["id"] for case in first["cases"]]
+    ids = [_text(case["id"]) for case in cases]
     assert len(ids) == len(set(ids))
-    for case in first["cases"]:
+    for case in cases:
         assert case["profile"] == profile.value
         assert case["normalizer_version"] == CURRENT_NORMALIZER_BY_PROFILE[profile]
         assert isinstance(case["definition_yaml"], str)
         assert case["definition_yaml"].endswith("\n")
         assert isinstance(case["valid"], bool)
-        assert case["codes"] == [item["code"] for item in case["diagnostics"]]
-        assert case["features"] == sorted(set(case["features"]))
-        for diagnostic in case["diagnostics"]:
+        diagnostics = _mapping_list(case["diagnostics"])
+        features = _string_list(case["features"])
+        assert case["codes"] == [item["code"] for item in diagnostics]
+        assert features == sorted(set(features))
+        for diagnostic in diagnostics:
             assert set(diagnostic) == {
                 "blocking",
                 "code",
@@ -94,7 +132,8 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
                 "severity",
             }
             assert diagnostic["document"] in {"definition", "companion"}
-            assert diagnostic["scope"] == "root" or diagnostic["scope"].startswith(
+            scope = _text(diagnostic["scope"])
+            assert scope == "root" or scope.startswith(
                 "loop-group:"
             )
 
@@ -145,7 +184,7 @@ def test_archon_work_one_over_uses_exact_4097_authority_value():
     with pytest.raises(WorkflowValidationError) as exc_info:
         _authority_outcome(case)
 
-    assert case["projection"]["child_attempts"] == 4_097
+    assert _mapping(case["projection"])["child_attempts"] == 4_097
     assert "work bound 4097 exceeds ceiling 4096" in exc_info.value.issues[0].message
 
 
@@ -155,7 +194,7 @@ def test_archon_unknown_loop_group_field_remains_in_authored_source():
     ]
     source = _parse_case(case)
 
-    assert source.definition_bytes == case["definition_yaml"].encode("utf-8")
+    assert source.definition_bytes == _text(case["definition_yaml"]).encode("utf-8")
     assert source.nodes[0].value["future_editor_field"] == {
         "preserve": "exactly"
     }
@@ -167,16 +206,17 @@ def test_archon_unknown_loop_group_field_remains_in_authored_source():
 def test_corpus_covers_supported_node_kinds_and_field_families(profile):
     corpus = workflow_language_conformance(profile)
     feature_tags = {
-        feature for case in corpus["cases"] for feature in case["features"]
+        feature
+        for case in _mapping_list(corpus["cases"])
+        for feature in _string_list(case["features"])
     }
     contract = workflow_authoring_contract(profile)
 
-    assert {f"node-kind:{item['id']}" for item in contract["node_kinds"]} <= (
-        feature_tags
-    )
+    node_kinds = _mapping_list(contract["node_kinds"])
+    assert {f"node-kind:{item['id']}" for item in node_kinds} <= feature_tags
     expected_families = {
         f"field-family:{field_id.partition('.')[0].replace('_', '-')}"
-        for field_id in contract["field_definitions"]
+        for field_id in _mapping(contract["field_definitions"])
     }
     expected_families.update({"field-family:definition", "field-family:sidecar"})
     assert expected_families <= feature_tags
@@ -186,7 +226,7 @@ def _authority_outcome(case: dict[str, object]):
     source = _parse_case(case)
     return _compile_workflow_source_document(
         source,
-        normalizer_version=case["normalizer_version"],
+        normalizer_version=_integer(case["normalizer_version"]),
     )
 
 
@@ -211,23 +251,26 @@ def _authored_document_and_scope(
 def _authored_kind_and_family_features(
     case: dict[str, object],
 ) -> set[str]:
-    definition = yaml.safe_load(case["definition_yaml"])
-    companion = yaml.safe_load(case.get("companion_yaml", "{}")) or {}
+    definition = _mapping(yaml.safe_load(_text(case["definition_yaml"])))
+    companion = _mapping(
+        yaml.safe_load(_text(case.get("companion_yaml", "{}"))) or {}
+    )
     kinds = {
-        item["id"]
+        _text(item["id"])
         for known_profile in WorkflowLanguageProfile
-        for item in workflow_authoring_contract(known_profile)["node_kinds"]
+        for item in _mapping_list(
+            workflow_authoring_contract(known_profile)["node_kinds"]
+        )
     }
     nodes: list[Mapping[str, object]] = []
-    pending = list(definition.get("nodes", ()))
+    pending = _mapping_list(definition.get("nodes", []))
     while pending:
         node = pending.pop(0)
-        if not isinstance(node, Mapping):
-            continue
         nodes.append(node)
         group = node.get("loop_group")
         if isinstance(group, Mapping):
-            pending.extend(group.get("nodes", ()))
+            group_mapping = cast(Mapping[str, object], group)
+            pending.extend(_mapping_list(group_mapping.get("nodes", [])))
 
     features = {
         f"node-kind:{kind}"
@@ -250,22 +293,27 @@ def _authored_kind_and_family_features(
             features.add("field-family:loop-group")
         approval = node.get("approval")
         if isinstance(approval, Mapping):
+            approval_mapping = cast(Mapping[str, object], approval)
             features.add("field-family:approval")
-            if isinstance(approval.get("on_reject"), Mapping):
+            if isinstance(approval_mapping.get("on_reject"), Mapping):
                 features.add("field-family:approval-reject")
         if isinstance(node.get("agents"), Mapping):
             features.add("field-family:agent")
         hooks = node.get("hooks")
         if isinstance(hooks, Mapping):
+            hooks_mapping = cast(Mapping[str, object], hooks)
             features.add("field-family:hook-event")
-            entries = [entry for values in hooks.values() for entry in values]
+            entries = [
+                entry
+                for values in hooks_mapping.values()
+                for entry in _mapping_list(values)
+            ]
             if entries:
                 features.add("field-family:hook-entry")
             responses = [
-                entry.get("response")
+                cast(Mapping[str, object], entry["response"])
                 for entry in entries
-                if isinstance(entry, Mapping)
-                and isinstance(entry.get("response"), Mapping)
+                if isinstance(entry.get("response"), Mapping)
             ]
             if responses:
                 features.add("field-family:hook-response")
@@ -279,10 +327,11 @@ def _authored_kind_and_family_features(
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
 def test_kind_and_field_family_tags_are_present_in_authored_yaml(profile):
-    for case in workflow_language_conformance(profile)["cases"]:
+    cases = _mapping_list(workflow_language_conformance(profile)["cases"])
+    for case in cases:
         declared = {
             feature
-            for feature in case["features"]
+            for feature in _string_list(case["features"])
             if feature.startswith(("node-kind:", "field-family:"))
         }
         assert declared <= _authored_kind_and_family_features(case), case["id"]
@@ -290,7 +339,8 @@ def test_kind_and_field_family_tags_are_present_in_authored_yaml(profile):
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
 def test_every_case_agrees_with_hermes_parser_normalizer_and_diagnostics(profile):
-    for case in workflow_language_conformance(profile)["cases"]:
+    cases = _mapping_list(workflow_language_conformance(profile)["cases"])
+    for case in cases:
         try:
             package = _authority_outcome(case)
         except WorkflowValidationError as exc:
@@ -300,7 +350,7 @@ def test_every_case_agrees_with_hermes_parser_normalizer_and_diagnostics(profile
             actual = package.validation_issues
             actual_valid = not any(issue.blocking for issue in actual)
 
-        expected = case["diagnostics"]
+        expected = _mapping_list(case["diagnostics"])
         assert actual_valid is case["valid"], case["id"]
         assert [issue.code for issue in actual] == [
             item["hermes_code"] for item in expected
@@ -329,6 +379,10 @@ def test_projection_facts_are_produced_by_the_normalized_workflow():
     multiple_terminals = cases["loop-group-first-terminal-primary"]
     package = _authority_outcome(multiple_terminals)
     group = package.definition.nodes[0]
+    children = group.value["nodes"]
+    assert isinstance(children, tuple)
+    assert all(isinstance(child, WorkflowNode) for child in children)
+    typed_children = cast(tuple[WorkflowNode, ...], children)
 
     assert multiple_terminals["projection"] == {
         "group_id": group.id,
@@ -336,7 +390,7 @@ def test_projection_facts_are_produced_by_the_normalized_workflow():
             "primary_sink"
         ],
         "scoped_node_ids": [
-            f"{group.id}/{child.id}" for child in group.value["nodes"]
+            f"{group.id}/{child.id}" for child in typed_children
         ],
     }
 
@@ -351,8 +405,8 @@ def test_distributed_jira_case_is_exact_and_provenance_tagged():
     )
     companion = definition.with_name("jira-defect-loop.hermes.yaml")
 
-    assert case["definition_yaml"].encode("utf-8") == definition.read_bytes()
-    assert case["companion_yaml"].encode("utf-8") == companion.read_bytes()
+    assert _text(case["definition_yaml"]).encode("utf-8") == definition.read_bytes()
+    assert _text(case["companion_yaml"]).encode("utf-8") == companion.read_bytes()
     assert case["provenance"] == {
         "kind": "distributed-workflow-package",
         "definition": (

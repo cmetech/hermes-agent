@@ -316,6 +316,7 @@ jobs:
               tests/plugins/workflow/test_language.py
               tests/plugins/workflow/test_language_snapshot.py
               tests/plugins/workflow/test_language_schema.py
+              tests/plugins/workflow/test_language_conformance.py
               tests/plugins/workflow/test_scheduling_middleware_e2e.py
               tests/plugins/workflow/test_showcase_catalog.py
               tests/plugins/workflow/test_coordinator_multiprocess.py

@@ -9,7 +9,7 @@ import json
 import math
 import re
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 from plugins.workflow.language import (
     CURRENT_NORMALIZER_BY_PROFILE,
@@ -170,29 +170,32 @@ def loop_group_node_work_factors(
     node_type: str,
     value: object,
     options: Mapping[str, object],
-) -> tuple[object, object]:
+) -> tuple[int, int]:
     """Return the per-node multiplier and selected retry count used by v6."""
+    value_mapping = (
+        cast(Mapping[str, object], value) if isinstance(value, Mapping) else None
+    )
     multiplier = (
-        value.get(
+        value_mapping.get(
             "max_iterations",
             LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
         )
-        if node_type == "loop" and isinstance(value, Mapping)
+        if node_type == "loop" and value_mapping is not None
         else LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
     )
     retry = options.get("retry")
     approval_rework = (
-        value.get("on_reject")
-        if node_type == "approval" and isinstance(value, Mapping)
+        value_mapping.get("on_reject")
+        if node_type == "approval" and value_mapping is not None
         else None
     )
     if isinstance(approval_rework, Mapping):
-        retries = approval_rework.get(
+        retries = cast(Mapping[str, object], approval_rework).get(
             "max_attempts",
             LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
         )
     elif isinstance(retry, Mapping):
-        retries = retry.get(
+        retries = cast(Mapping[str, object], retry).get(
             "max_attempts",
             LOOP_GROUP_OTHER_DEFAULT_RETRIES,
         )
@@ -200,7 +203,12 @@ def loop_group_node_work_factors(
         retries = LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
     else:
         retries = LOOP_GROUP_OTHER_DEFAULT_RETRIES
-    return multiplier, retries
+    if any(
+        isinstance(factor, bool) or not isinstance(factor, int) or factor < 0
+        for factor in (multiplier, retries)
+    ):
+        raise ValueError("loop-group work factors must be non-negative integers")
+    return cast(int, multiplier), cast(int, retries)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3362,7 +3370,7 @@ def node_kind_descriptors(
             )
         )
         fields.sort(key=lambda item: (item["order"], item["field_path"]))
-        descriptor = {
+        descriptor: dict[str, object] = {
             "id": node_type,
             "label": _humanize(node_type),
             "description": f"Author a Hermes {node_type} workflow node.",
@@ -3411,7 +3419,7 @@ def _phase6_scoped_semantic_descriptors(
     if not set(validation_codes.values()) <= set(durable_codes):
         raise RuntimeError("scoped semantic rules require registered Phase 6 codes")
 
-    rules = [
+    rules: list[dict[str, object]] = [
         {
             "id": "scoped-dag-topology-v1",
             "group_kind": "loop_group",

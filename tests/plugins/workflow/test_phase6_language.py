@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from typing import cast
 
 import pytest
 import yaml
@@ -661,42 +662,54 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
         WorkflowLanguageProfile.ARCHON_2026_07,
         normalizer_version=6,
     )
+    semantic_rules = cast(list[dict[str, object]], contract["semantic_rules"])
     work = next(
         rule
-        for rule in contract["semantic_rules"]
+        for rule in semantic_rules
         if rule.get("kind") == "loop-group-work-product-v1"
     )
     topology = next(
         rule
-        for rule in contract["semantic_rules"]
+        for rule in semantic_rules
         if rule.get("kind") == "scoped-dag-topology-v1"
     )
-    reference = work["semantic_ref"]
+    reference = cast(dict[str, str], work["semantic_ref"])
+    node_kinds = cast(list[dict[str, object]], contract["node_kinds"])
     loop_group_kind = next(
         item
-        for item in contract["node_kinds"]
+        for item in node_kinds
         if item["id"] == reference["node_kind"]
     )
-    formula = loop_group_kind["semantic_definitions"][reference["definition"]]
+    semantic_definitions = cast(
+        dict[str, dict[str, object]], loop_group_kind["semantic_definitions"]
+    )
+    formula = semantic_definitions[reference["definition"]]
+    expressions = cast(dict[str, object], formula["expressions"])
+    selectors = cast(dict[str, object], formula["selectors"])
+    ordinary_multiplier = cast(
+        dict[str, object], selectors["ordinary_loop_multiplier"]
+    )
+    selected_retries = cast(dict[str, object], selectors["selected_retries"])
+    accumulators = cast(list[str], work["accumulators"])
 
     assert formula["expression_format"] == "prefix-v1"
-    assert work["accumulators"] == ["executions", "attempts"]
-    assert set(formula["expressions"]) == set(work["accumulators"])
+    assert accumulators == ["executions", "attempts"]
+    assert set(expressions) == set(accumulators)
     assert work["limit"] == language_schema.LOOP_GROUP_WORK_LIMIT
     assert topology["max_edges"] == language_schema.LOOP_GROUP_MAX_EDGES
     assert [
         _evaluate_contract_selector(
-            formula["selectors"]["ordinary_loop_multiplier"], node
+            ordinary_multiplier, node
         )
         for node in body
     ] == [1, 1, 1, 4, 1, 1, 1]
     assert [
-        _evaluate_contract_selector(formula["selectors"]["selected_retries"], node)
+        _evaluate_contract_selector(selected_retries, node)
         for node in body
     ] == [2, 4, 3, 0, 3, 5, 0]
     evaluated = {
         name: _evaluate_contract_expression(expression, formula, body, 2)
-        for name, expression in formula["expressions"].items()
+        for name, expression in expressions.items()
     }
     assert evaluated == {"executions": 20, "attempts": 54}
     assert evaluated == {
