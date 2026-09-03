@@ -161,6 +161,16 @@ def _snapshot(service, snapshot) -> dict:
     return payload
 
 
+def _detail_snapshot(service, snapshot) -> dict:
+    from hermes_cli.handoff.projection import result_preview
+
+    payload = _snapshot(service, snapshot)
+    preview = result_preview(snapshot)
+    if preview is not None:
+        payload["result_preview"] = preview
+    return payload
+
+
 def _directory(rid, params: dict) -> dict:
     try:
         _require_params(params, frozenset())
@@ -241,7 +251,7 @@ def _get(rid, params: dict) -> dict:
     try:
         _require_params(params, {"handoff_id"})
         with _service(params) as (_profile, _home, service):
-            payload = _snapshot(service, service.get(params["handoff_id"]))
+            payload = _detail_snapshot(service, service.get(params["handoff_id"]))
         return _bound_server._ok(rid, payload)
     except Exception as exc:
         return _error(rid, exc)
@@ -283,7 +293,10 @@ def _evidence(rid, params: dict) -> dict:
                 after_sequence=params.get("after_sequence", 0),
                 limit=params.get("limit", 100),
             )
-            payload = {**_snapshot(service, snapshot), **evidence_payload(page)}
+            payload = {
+                **_detail_snapshot(service, snapshot),
+                **evidence_payload(page),
+            }
         return _bound_server._ok(rid, payload)
     except Exception as exc:
         return _error(rid, exc)

@@ -43,6 +43,10 @@ interface HandoffEvent {
 
 interface HandoffEvidence extends HandoffSummary {
   events: HandoffEvent[]
+  result_preview?: {
+    text: string
+    truncated: boolean
+  }
 }
 
 interface InboxPayload {
@@ -324,6 +328,14 @@ export function Handoffs({ profile, route = null, unavailable = false }: Handoff
                     <div className="text-(--ui-text-tertiary)">
                       Result: {detail.data.terminal_summary.size_bytes} B · {detail.data.terminal_summary.media_type}
                     </div>
+                  ) : null}
+                  {detail.data?.result_preview?.text ? (
+                    <pre
+                      aria-label="Handoff result"
+                      className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-(--chrome-action-hover) p-1.5 text-[0.6875rem]"
+                    >
+                      {detail.data.result_preview.text}
+                    </pre>
                   ) : null}
                   {detail.data?.events?.length ? (
                     <ol aria-label="Handoff evidence" className="grid gap-0.5">

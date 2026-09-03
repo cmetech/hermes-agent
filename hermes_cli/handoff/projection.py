@@ -8,6 +8,9 @@ from .models import HandoffSnapshot
 from .store import EvidencePage, HandoffEvent
 
 
+_RESULT_PREVIEW_BYTES = 8192
+
+
 def _timestamp(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -45,6 +48,23 @@ def snapshot_summary(
     }
 
 
+def result_preview(snapshot: HandoffSnapshot) -> dict[str, object] | None:
+    result = snapshot.terminal_result
+    if result is None or not result.get("text"):
+        return None
+    from agent.redact import redact_sensitive_text
+
+    text = redact_sensitive_text(str(result["text"]), force=True)
+    encoded = text.encode("utf-8")
+    truncated = len(encoded) > _RESULT_PREVIEW_BYTES
+    if truncated:
+        marker = b"\n[truncated]"
+        text = (encoded[: _RESULT_PREVIEW_BYTES - len(marker)] + marker).decode(
+            "utf-8", errors="ignore"
+        )
+    return {"text": text, "truncated": truncated}
+
+
 def event_summary(event: HandoffEvent) -> dict[str, object]:
     return {
         "handoff_id": event.handoff_id,
@@ -67,4 +87,9 @@ def evidence_payload(page: EvidencePage) -> dict[str, object]:
     }
 
 
-__all__ = ["event_summary", "evidence_payload", "snapshot_summary"]
+__all__ = [
+    "event_summary",
+    "evidence_payload",
+    "result_preview",
+    "snapshot_summary",
+]

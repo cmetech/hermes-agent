@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -233,6 +234,75 @@ def test_list_get_and_evidence_use_shared_projection(profile_home, no_advance):
     assert evidence["handoff_id"] == handoff_id
     assert evidence["events"][0]["kind"] == "created"
     assert "prompt" not in repr((listed, fetched, evidence))
+
+
+def test_result_preview_is_redacted_bounded_and_detail_only(profile_home):
+    secret = "Authorization: Bearer super-secret-token-value"
+    text = secret + "\n" + ("result " * 3000)
+    spec = HandoffSpec(
+        mode="conversation",
+        endpoint=HandoffEndpoint.parse("hermes://local/reviewer"),
+        prompt="Review this.",
+        output_schema=None,
+        deadline_at=None,
+        attribution={"profile": "ops", "source": "desktop"},
+        required_capabilities=frozenset(),
+        return_route={"kind": "operator", "profile": "ops", "inbox_id": "desktop"},
+    )
+    with HandoffStore(profile_home / "handoffs.db") as store:
+        snapshot = store.create_or_get(
+            "operator/ops", "preview", spec, spec.fingerprint
+        )
+        lease = store.claim_advance(
+            snapshot.handoff_id,
+            "test",
+            now=datetime.now(timezone.utc),
+            lease_seconds=30,
+        )
+        assert lease is not None
+        store.commit_binding(
+            lease,
+            "runs",
+            {
+                "profile": "reviewer",
+                "mechanism": "runs",
+                "capabilities": ["authoritative_status", "durable_admission"],
+            },
+            {},
+        )
+        store.journal_attempt(lease, "submit")
+        store.commit_observation(
+            lease,
+            ChannelObservation(
+                phase="succeeded",
+                terminal_result={
+                    "text": text,
+                    "sha256": sha256(text.encode()).hexdigest(),
+                    "media_type": "text/plain",
+                    "size_bytes": len(text.encode()),
+                },
+            ),
+        )
+
+    listed = _result(_call("agent_handoff.list", {"profile": "ops"}))
+    fetched = _result(
+        _call(
+            "agent_handoff.get",
+            {"profile": "ops", "handoff_id": snapshot.handoff_id},
+        )
+    )
+    evidence = _result(
+        _call(
+            "agent_handoff.evidence",
+            {"profile": "ops", "handoff_id": snapshot.handoff_id},
+        )
+    )
+
+    assert "result_preview" not in listed["handoffs"][0]
+    assert fetched["result_preview"] == evidence["result_preview"]
+    assert secret not in fetched["result_preview"]["text"]
+    assert fetched["result_preview"]["truncated"] is True
+    assert len(fetched["result_preview"]["text"].encode()) <= 8192
 
 
 def test_command_derives_operator_actor_and_is_idempotent(profile_home, no_advance):

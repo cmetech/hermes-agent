@@ -79,6 +79,7 @@ function answer(method: string, overrides: Record<string, unknown> = {}) {
   if (method === 'agent_handoff.evidence') {
     return {
       ...row,
+      result_preview: { text: 'review complete', truncated: false },
       events: [
         {
           actor: 'service',
@@ -208,6 +209,7 @@ describe('safe inbox and inspector', () => {
       profile: 'backend-reviewer'
     })
     expect(screen.getByText('Result: 42 B · text/plain')).toBeTruthy()
+    expect(screen.getByText('review complete')).toBeTruthy()
     expect(screen.queryByText(/Bearer private|private remote failure|private result/)).toBeNull()
   })
 })
