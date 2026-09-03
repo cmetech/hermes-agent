@@ -145,7 +145,7 @@ def test_task_spec_serialization_omits_absent_return_route(tmp_path):
     assert store.get(created.handoff_id).spec.fingerprint == _spec().fingerprint
 
 
-def test_v1_database_migrates_to_v2_without_losing_rows(tmp_path):
+def test_v1_database_migrates_to_current_schema_without_losing_rows(tmp_path):
     path = tmp_path / "handoffs.db"
     legacy = HandoffStore(path)
     snapshot = _create(legacy)
@@ -168,7 +168,7 @@ def test_v1_database_migrates_to_v2_without_losing_rows(tmp_path):
         ).events
     ] == ["created", "reconcile_requested"]
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE name='handoff_deliveries'"
         ).fetchone() == ("handoff_deliveries",)
@@ -176,6 +176,35 @@ def test_v1_database_migrates_to_v2_without_losing_rows(tmp_path):
 
     reopened = HandoffStore(path)
     assert reopened.get(snapshot.handoff_id).handoff_id == snapshot.handoff_id
+
+
+def test_v2_database_adds_delivery_dispatch_state_without_losing_rows(tmp_path):
+    path = tmp_path / "handoffs.db"
+    store = HandoffStore(path)
+    snapshot, lease = _prepare_conversation(store)
+    store.commit_observation(lease, ChannelObservation(phase="needs_input"))
+    delivery = store.attention(snapshot.handoff_id, limit=1)[0]
+    store.close()
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(handoff_deliveries)")
+        }
+        if "dispatch_started_at" in columns:
+            conn.execute(
+                "ALTER TABLE handoff_deliveries DROP COLUMN dispatch_started_at"
+            )
+        conn.execute("PRAGMA user_version=2")
+
+    migrated = HandoffStore(path)
+
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(handoff_deliveries)")
+        }
+        assert "dispatch_started_at" in columns
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert migrated.get_delivery(delivery.delivery_id).handoff_id == snapshot.handoff_id
+    migrated.close()
 
 
 def test_future_database_version_is_rejected(tmp_path):
@@ -273,6 +302,87 @@ def test_new_attention_supersedes_an_undelivered_return(tmp_path):
     assert due[0].delivery_id == attention[0].delivery_id
     assert due[0].event_sequence > first.event_sequence
     assert store.get_delivery(first.delivery_id).acknowledged_at is not None
+
+
+@pytest.mark.parametrize("settle", ["complete", "release"])
+def test_dispatch_started_before_supersession_finishes_in_event_order(
+    tmp_path, settle
+):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, advance = _prepare_conversation(store)
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    delivery_lease = store.claim_delivery(
+        first.delivery_id,
+        "gateway",
+        now=first.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert delivery_lease is not None
+    store.begin_delivery_dispatch(delivery_lease)
+
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("terminal result")
+        ),
+    )
+
+    assert store.get_delivery(first.delivery_id).acknowledged_at is None
+    assert store.due_deliveries(now=datetime.now(UTC), limit=10) == ()
+    if settle == "complete":
+        settled = store.complete_delivery(delivery_lease)
+        assert settled.state == "delivered"
+    else:
+        settled = store.release_delivery(
+            delivery_lease,
+            next_attempt_at=datetime.now(UTC) + timedelta(seconds=2),
+            failure_code="delivery_retryable",
+        )
+        assert settled.state == "pending"
+    assert settled.acknowledged_at is not None
+    due = store.due_deliveries(now=datetime.now(UTC), limit=10)
+    assert len(due) == 1
+    assert due[0].event_sequence > first.event_sequence
+
+
+def test_abandoned_dispatch_yields_to_newer_delivery_after_lease_expiry(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, advance = _prepare_conversation(store)
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    delivery_lease = store.claim_delivery(
+        first.delivery_id,
+        "gateway-before-restart",
+        now=first.next_attempt_at,
+        lease_seconds=1,
+    )
+    assert delivery_lease is not None
+    store.begin_delivery_dispatch(delivery_lease)
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("terminal result")
+        ),
+    )
+
+    after_expiry = delivery_lease.expires_at + timedelta(microseconds=1)
+    assert [
+        item.delivery_id
+        for item in store.due_deliveries(now=after_expiry, limit=10)
+    ] == [first.delivery_id]
+    assert store.claim_delivery(
+        first.delivery_id,
+        "gateway-after-restart",
+        now=after_expiry,
+        lease_seconds=30,
+    ) is None
+    assert store.get_delivery(first.delivery_id).acknowledged_at is not None
+    due = store.due_deliveries(now=after_expiry, limit=10)
+    assert len(due) == 1
+    assert due[0].event_sequence > first.event_sequence
 
 
 def test_task_observation_never_creates_a_return_delivery(tmp_path):

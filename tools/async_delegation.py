@@ -596,6 +596,17 @@ def claimed_handoff_snapshot(claim: object):
     return claim.snapshot if isinstance(claim, _HandoffReturnClaim) else None
 
 
+def begin_handoff_return_delivery(claim: object) -> bool:
+    """Durably order a handoff return dispatch against supersession."""
+    if not isinstance(claim, _HandoffReturnClaim):
+        return False
+    try:
+        claim.store.begin_delivery_dispatch(claim.lease)
+        return True
+    except Exception:
+        return False
+
+
 @contextmanager
 def handoff_return_context(agent: object, hop_count: Optional[int]):
     """Install host-only hop state for exactly one synthetic return turn."""

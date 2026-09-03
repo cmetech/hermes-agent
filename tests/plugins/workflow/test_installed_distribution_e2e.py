@@ -1808,7 +1808,7 @@ print(json.dumps(payload), file=server._real_stdout)
     assert payload == {
         "store_module": payload["store_module"],
         "supervisor_module": payload["supervisor_module"],
-        "schema_version": 2,
+        "schema_version": 3,
         "created_id": payload["created_id"],
         "listed": [payload["created_id"]],
         "attention_before": True,

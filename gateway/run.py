@@ -27594,6 +27594,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_claim = None
         if evt.get("type") == "handoff_return":
             from tools.async_delegation import (
+                begin_handoff_return_delivery,
                 claim_event_delivery,
                 complete_event_delivery,
                 release_event_delivery,
@@ -27741,6 +27742,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = accepted_pending_persistence = False
         try:
+            if event_claim is not None and not begin_handoff_return_delivery(event_claim):
+                return None
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
