@@ -23,24 +23,42 @@ def _yaml(value: str) -> str:
 
 
 def _diagnostic(
-    code: str,
+    hermes_code: str,
     path: str,
     *,
-    hermes_code: str | None = None,
-    document: str = "definition",
     scope: str = "root",
     severity: str = "error",
     blocking: bool = True,
 ) -> dict[str, object]:
     return {
         "blocking": blocking,
-        "code": code,
-        "document": document,
-        "hermes_code": hermes_code or code,
+        "hermes_code": hermes_code,
         "path": path,
         "scope": scope,
         "severity": severity,
     }
+
+
+def _portable_diagnostic_code(
+    hermes_code: str,
+    path: str,
+    definition_yaml: str,
+    companion_yaml: str | None,
+) -> str:
+    """Project a native diagnostic into the corpus' portable code vocabulary."""
+    if hermes_code == "loop_group_scope_invalid" and path.endswith(
+        (".prompt", ".command", ".bash", ".script")
+    ):
+        if "$LOOP_PREV." in definition_yaml:
+            return "scoped-reference-unknown-producer"
+        return "scoped-reference-missing-dependency"
+    if (
+        hermes_code == "unknown_sidecar_node"
+        and path == "sidecar.outward_action_nodes"
+        and companion_yaml is not None
+    ):
+        return "scoped-companion-reference-unknown-node"
+    return hermes_code
 
 
 def _case(
@@ -54,7 +72,29 @@ def _case(
     projection: dict[str, object] | None = None,
     provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    normalized_diagnostics = list(diagnostics)
+    effective_companion = companion_yaml
+    if (
+        effective_companion is None
+        and profile is WorkflowLanguageProfile.ARCHON_2026_07
+    ):
+        effective_companion = "language_compatibility: archon-2026-07\n"
+    normalized_diagnostics = [
+        {
+            **diagnostic,
+            "code": _portable_diagnostic_code(
+                str(diagnostic["hermes_code"]),
+                str(diagnostic["path"]),
+                definition_yaml,
+                effective_companion,
+            ),
+            "document": (
+                "companion"
+                if str(diagnostic["path"]).startswith("sidecar.")
+                else "definition"
+            ),
+        }
+        for diagnostic in diagnostics
+    ]
     value: dict[str, object] = {
         "id": case_id,
         "profile": profile.value,
@@ -67,12 +107,6 @@ def _case(
         "diagnostics": normalized_diagnostics,
         "features": sorted(set(features)),
     }
-    effective_companion = companion_yaml
-    if (
-        effective_companion is None
-        and profile is WorkflowLanguageProfile.ARCHON_2026_07
-    ):
-        effective_companion = "language_compatibility: archon-2026-07\n"
     if effective_companion is not None:
         value["companion_yaml"] = effective_companion
     if projection is not None:
@@ -342,19 +376,16 @@ def _archon_loop_group_cases(
     group_scope = "loop-group:group"
 
     def issue(
-        code: str,
+        hermes_code: str,
         path: str,
         *,
-        hermes_code: str | None = None,
-        document: str = "definition",
+        scope: str = group_scope,
     ) -> tuple[dict[str, object], ...]:
         return (
             _diagnostic(
-                code,
+                hermes_code,
                 path,
-                hermes_code=hermes_code,
-                document=document,
-                scope=group_scope,
+                scope=scope,
             ),
         )
 
@@ -551,7 +582,9 @@ def _archon_loop_group_cases(
                 "        - id: work\n          prompt: Work.",
                 group_options="    retry: {max_attempts: 1}",
             ),
-            diagnostics=issue("loop_group_shape_invalid", "nodes[0].retry"),
+            diagnostics=issue(
+                "loop_group_shape_invalid", "nodes[0].retry", scope="root"
+            ),
             features=("invalid:group-retry",),
         ),
         _case(
@@ -578,9 +611,8 @@ def _archon_loop_group_cases(
           prompt: Use $producer.output""",
             ),
             diagnostics=issue(
-                "scoped-reference-missing-dependency",
+                "loop_group_scope_invalid",
                 "nodes[0].loop_group.nodes[1].prompt",
-                hermes_code="loop_group_scope_invalid",
             ),
             features=("reference:current-body", "invalid:missing-dependency"),
         ),
@@ -604,9 +636,8 @@ def _archon_loop_group_cases(
                 outer_nodes="  - id: outer\n    prompt: Produce.",
             ),
             diagnostics=issue(
-                "scoped-reference-missing-dependency",
+                "loop_group_scope_invalid",
                 "nodes[1].loop_group.nodes[0].prompt",
-                hermes_code="loop_group_scope_invalid",
             ),
             features=("reference:outer", "invalid:missing-dependency"),
         ),
@@ -627,9 +658,8 @@ def _archon_loop_group_cases(
                 "        - id: consumer\n          prompt: Use $LOOP_PREV.missing.output",
             ),
             diagnostics=issue(
-                "scoped-reference-unknown-producer",
+                "loop_group_scope_invalid",
                 "nodes[0].loop_group.nodes[0].prompt",
-                hermes_code="loop_group_scope_invalid",
             ),
             features=("reference:loop-prev", "invalid:unknown-producer"),
         ),
@@ -680,10 +710,8 @@ outward_action_nodes: [group/missing]
 outward_action_policy: approval_required"""
             ),
             diagnostics=issue(
-                "scoped-companion-reference-unknown-node",
+                "unknown_sidecar_node",
                 "sidecar.outward_action_nodes",
-                hermes_code="unknown_sidecar_node",
-                document="companion",
             ),
             features=("field-family:sidecar", "reference:companion-group-child"),
         ),
@@ -699,19 +727,39 @@ outward_action_policy: approval_required"""
         ),
         _case(
             profile,
-            "loop-group-work-product-over-boundary",
+            "loop-group-work-one-over",
             _group_definition(
-                "loop-group-work-over",
-                "\n".join(
-                    f"        - id: prompt{index}\n          prompt: Work."
-                    for index in range(14)
-                ),
-                max_iterations=100,
+                "loop-group-work-one-over",
+                "\n".join((
+                    *(
+                        f"        - id: prompt{index}\n          prompt: Work."
+                        for index in range(80)
+                    ),
+                    "        - id: cancel\n          cancel: Stop.",
+                )),
+                max_iterations=17,
             ),
             diagnostics=issue(
                 "loop_group_product_limit", "nodes[0].loop_group"
             ),
             features=("boundary:work-product-over",),
+            projection={"child_attempts": 4_097},
+        ),
+        _case(
+            profile,
+            "loop-group-unknown-field-preserved",
+            _group_definition(
+                "loop-group-unknown-field-preserved",
+                "        - id: work\n          prompt: Work.",
+                group_fields=(
+                    "      future_editor_field: {preserve: exactly}"
+                ),
+            ),
+            diagnostics=issue(
+                "loop_group_shape_invalid",
+                "nodes[0].loop_group.future_editor_field",
+            ),
+            features=("field-family:loop-group", "preservation:unknown-field"),
         ),
     ]
 

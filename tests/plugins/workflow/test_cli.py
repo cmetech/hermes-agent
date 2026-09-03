@@ -1110,6 +1110,32 @@ def test_schema_corpus_json_is_compact_utf8_bounded_and_byte_deterministic(capsy
     )
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"cases": [{} for _ in range(65)]}, "more than 64 cases"),
+        ({"cases": [], "padding": "x" * 160_000}, "more than 160000 bytes"),
+    ],
+    ids=["case-count", "encoded-bytes"],
+)
+def test_schema_corpus_refuses_to_print_out_of_bounds_payloads(
+    payload, message, monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    monkeypatch.setattr(
+        schema_cli,
+        "workflow_language_conformance",
+        lambda _profile: payload,
+    )
+    args = argparse.Namespace(profile="archon-2026-07", json=True)
+
+    with pytest.raises(ValueError, match=message):
+        schema_cli.emit_schema_corpus(args)
+
+    assert capsys.readouterr().out == ""
+
+
 @pytest.mark.parametrize("action", ["schema", "schema-corpus"])
 @pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
 def test_packaged_schema_command_is_read_only_before_normal_startup(

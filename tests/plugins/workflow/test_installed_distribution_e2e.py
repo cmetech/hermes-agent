@@ -160,6 +160,28 @@ def installed_distribution(tmp_path_factory):
     )
     assert install.returncode == 0, f"wheel extraction failed:\n{install.stderr}"
 
+    console_root = root / "console-install"
+    console_install = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--prefix",
+            str(console_root),
+            "--no-deps",
+            str(wheels[0]),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert console_install.returncode == 0, (
+        f"wheel console install failed:\n{console_install.stderr}"
+    )
+
     env = os.environ.copy()
     env["PYTHONPATH"] = str(site)
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
@@ -268,10 +290,10 @@ def test_installed_distribution_exposes_deterministic_workflow_schema_corpus(
     installed_distribution,
 ) -> None:
     site, env, _wheels = installed_distribution
+    console = site.parent / "console-install" / "bin" / "hermes"
+    assert console.is_file()
     command = [
-        sys.executable,
-        "-m",
-        "hermes_cli.main",
+        str(console),
         "workflow",
         "schema-corpus",
         "--profile",

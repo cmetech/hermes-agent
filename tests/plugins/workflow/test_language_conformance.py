@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from pathlib import Path
+import re
 
 import pytest
+import yaml
 
 from plugins.workflow.language import CURRENT_NORMALIZER_BY_PROFILE
 from plugins.workflow.language_conformance import workflow_language_conformance
@@ -23,6 +26,20 @@ MAX_CORPUS_BYTES = 160_000
 def _cases(profile: WorkflowLanguageProfile) -> dict[str, dict[str, object]]:
     corpus = workflow_language_conformance(profile)
     return {case["id"]: case for case in corpus["cases"]}
+
+
+def _parse_case(case: dict[str, object]):
+    return parse_workflow_source_bytes(
+        f"{case['id']}.yaml",
+        workflow_bytes=case["definition_yaml"].encode("utf-8"),
+        sidecar_bytes=(
+            case["companion_yaml"].encode("utf-8")
+            if "companion_yaml" in case
+            else None
+        ),
+        source="conformance",
+        precedence=1,
+    )
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -113,9 +130,36 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-companion-child-reference-valid",
         "loop-group-companion-child-reference-unknown",
         "loop-group-work-product-boundary",
-        "loop-group-work-product-over-boundary",
+        "loop-group-work-one-over",
+        "loop-group-unknown-field-preserved",
         "jira-defect-loop-distributed",
     } <= set(cases)
+
+
+def test_archon_work_one_over_uses_exact_4097_authority_value():
+    case = _cases(WorkflowLanguageProfile.ARCHON_2026_07)[
+        "loop-group-work-one-over"
+    ]
+
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        _authority_outcome(case)
+
+    assert case["projection"]["child_attempts"] == 4_097
+    assert "work bound 4097 exceeds ceiling 4096" in exc_info.value.issues[0].message
+
+
+def test_archon_unknown_loop_group_field_remains_in_authored_source():
+    case = _cases(WorkflowLanguageProfile.ARCHON_2026_07)[
+        "loop-group-unknown-field-preserved"
+    ]
+    source = _parse_case(case)
+
+    assert source.definition_bytes == case["definition_yaml"].encode("utf-8")
+    assert source.nodes[0].value["future_editor_field"] == {
+        "preserve": "exactly"
+    }
+    assert case["valid"] is False
+    assert case["codes"] == ["loop_group_shape_invalid"]
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -138,21 +182,122 @@ def test_corpus_covers_supported_node_kinds_and_field_families(profile):
 
 
 def _authority_outcome(case: dict[str, object]):
-    source = parse_workflow_source_bytes(
-        f"{case['id']}.yaml",
-        workflow_bytes=case["definition_yaml"].encode("utf-8"),
-        sidecar_bytes=(
-            case["companion_yaml"].encode("utf-8")
-            if "companion_yaml" in case
-            else None
-        ),
-        source="conformance",
-        precedence=1,
-    )
+    source = _parse_case(case)
     return _compile_workflow_source_document(
         source,
         normalizer_version=case["normalizer_version"],
     )
+
+
+def _portable_code_from_authority(issue) -> str:
+    if issue.code == "loop_group_scope_invalid":
+        if issue.message.startswith("unknown previous-iteration body node:"):
+            return "scoped-reference-unknown-producer"
+        if " is outside the loop-group scope" in issue.message:
+            return "scoped-reference-missing-dependency"
+    if issue.code == "unknown_sidecar_node" and issue.message.startswith(
+        "outward_action_nodes references unknown node:"
+    ):
+        return "scoped-companion-reference-unknown-node"
+    return issue.code
+
+
+def _authored_document_and_scope(
+    case: dict[str, object], issue
+) -> tuple[str, str]:
+    source = _parse_case(case)
+    document = "companion" if issue.path.startswith("sidecar.") else "definition"
+    group_match = re.match(r"nodes\[(\d+)]\.loop_group(?:\.|$)", issue.path)
+    if (
+        group_match is not None
+        and case["profile"] == WorkflowLanguageProfile.ARCHON_2026_07.value
+    ):
+        group = source.nodes[int(group_match.group(1))]
+        return document, f"loop-group:{group.id}"
+    if document == "companion" and issue.code == "unknown_sidecar_node":
+        reference = source.sidecar["outward_action_nodes"][0]
+        return document, f"loop-group:{reference.split('/', maxsplit=1)[0]}"
+    return document, "root"
+
+
+def _authored_kind_and_family_features(
+    case: dict[str, object],
+) -> set[str]:
+    definition = yaml.safe_load(case["definition_yaml"])
+    companion = yaml.safe_load(case.get("companion_yaml", "{}")) or {}
+    kinds = {
+        item["id"]
+        for known_profile in WorkflowLanguageProfile
+        for item in workflow_authoring_contract(known_profile)["node_kinds"]
+    }
+    nodes: list[Mapping[str, object]] = []
+    pending = list(definition.get("nodes", ()))
+    while pending:
+        node = pending.pop(0)
+        if not isinstance(node, Mapping):
+            continue
+        nodes.append(node)
+        group = node.get("loop_group")
+        if isinstance(group, Mapping):
+            pending.extend(group.get("nodes", ()))
+
+    features = {
+        f"node-kind:{kind}"
+        for node in nodes
+        for kind in kinds
+        if kind in node
+    }
+    if nodes:
+        features.add("field-family:node")
+    if set(definition) - {"name", "description", "nodes"}:
+        features.add("field-family:definition")
+    if set(companion) - {"language_compatibility"}:
+        features.add("field-family:sidecar")
+    for node in nodes:
+        if "retry" in node:
+            features.add("field-family:retry")
+        if "loop" in node:
+            features.add("field-family:loop")
+        if "loop_group" in node:
+            features.add("field-family:loop-group")
+        approval = node.get("approval")
+        if isinstance(approval, Mapping):
+            features.add("field-family:approval")
+            if isinstance(approval.get("on_reject"), Mapping):
+                features.add("field-family:approval-reject")
+        if isinstance(node.get("agents"), Mapping):
+            features.add("field-family:agent")
+        hooks = node.get("hooks")
+        if isinstance(hooks, Mapping):
+            features.add("field-family:hook-event")
+            entries = [entry for values in hooks.values() for entry in values]
+            if entries:
+                features.add("field-family:hook-entry")
+            responses = [
+                entry.get("response")
+                for entry in entries
+                if isinstance(entry, Mapping)
+                and isinstance(entry.get("response"), Mapping)
+            ]
+            if responses:
+                features.add("field-family:hook-response")
+            if any(
+                isinstance(response.get("hookSpecificOutput"), Mapping)
+                for response in responses
+            ):
+                features.add("field-family:hook-specific")
+    return features
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_kind_and_field_family_tags_are_present_in_authored_yaml(profile):
+    for case in workflow_language_conformance(profile)["cases"]:
+        declared = {
+            feature
+            for feature in case["features"]
+            if feature.startswith(("node-kind:", "field-family:"))
+        }
+        assert declared <= _authored_kind_and_family_features(case), case["id"]
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -180,6 +325,14 @@ def test_every_case_agrees_with_hermes_parser_normalizer_and_diagnostics(profile
         ], case["id"]
         assert [issue.blocking for issue in actual] == [
             item["blocking"] for item in expected
+        ], case["id"]
+        assert [
+            _portable_code_from_authority(issue) for issue in actual
+        ] == [item["code"] for item in expected], case["id"]
+        assert [
+            _authored_document_and_scope(case, issue) for issue in actual
+        ] == [
+            (item["document"], item["scope"]) for item in expected
         ], case["id"]
 
 
