@@ -11,12 +11,12 @@ synthetic probes in temporary paths. Return one Markdown report to stdout.
 ## Immutable scope
 
 - Original reviewed candidate: `2affe5e02307475274cb3d72c24af59f72682945`
-- Remediated candidate: `91820352f225e6530fc2b332741df0fef27a771c`
-- Remediated tree: `8c3941d705746fc6b39e774922eac29ae53c96ee`
-- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..91820352f225e6530fc2b332741df0fef27a771c`
-- Range commits: 23
+- Remediated candidate: `db5da1c2ab6251d02e5d56dac1ea88816787e50e`
+- Remediated tree: `12a694a88a95ad3ad9efea440db6b8961077e940`
+- Remediation range: `2affe5e02307475274cb3d72c24af59f72682945..db5da1c2ab6251d02e5d56dac1ea88816787e50e`
+- Range commits: 25
 - Range paths: 16
-- Range diff: `+1753/-57`; 647 inserted lines are review prompts, not
+- Range diff: `+1859/-57`; 663 inserted lines are review prompts, not
   production behavior.
 
 Verify these facts and stop with `SCOPE ERROR` if they differ. The checkout
@@ -74,7 +74,11 @@ candidate transfers a receipt-pending lease across that owner rotation without
 clearing the dispatch reservation or consuming an attempt. The gateway uses its
 process-local identity only to distinguish that live owner rotation from a true
 process restart; after a true restart it releases the stale receipt reservation
-for durable transcript reconciliation and normal keyed retry.
+for durable transcript reconciliation and normal keyed retry. A final
+controller regression proved that this restart-only release left the temporary
+identity which the new process had just installed, suppressing that process's
+later retry. The current candidate removes the temporary identity before the
+restart reconciliation return.
 
 Prove or falsify all of the following:
 
@@ -92,6 +96,8 @@ Prove or falsify all of the following:
 - background-service owner rotation in the same gateway process transfers the
   receipt-pending lease without reinjection, clearing the reservation, or
   consuming an attempt;
+- true process restart releases both the receipt reservation and the temporary
+  identity installed by the recovering process, permitting its later retry;
 - an abandoned reserved dispatch reconciles through transcript receipt and
   restart/lease recovery without blocking or duplicating the newer return;
 - replay of either observation cannot erase or duplicate the current delivery;
@@ -145,7 +151,8 @@ supervisor owners because a background-service reload rotates that owner while
 the gateway and its in-memory identity guard remain live. A true gateway process
 restart has no matching in-memory identity, so it releases and reconciles the
 stale receipt reservation before retry instead of trusting vanished process
-state.
+state. That restart-only path also removes the temporary identity installed by
+the new process before returning, so it cannot suppress its own later retry.
 
 Prove or falsify all of the following:
 
@@ -156,6 +163,8 @@ Prove or falsify all of the following:
   consume the attempt budget while waiting for persistence;
 - rotating the background-service supervisor owner inside the same gateway
   process cannot cause reinjection or clear the accepted dispatch reservation;
+- a true process restart can release the stale reservation and subsequently
+  retry in the same new gateway process without self-suppression;
 - once the delivery ID is visible in the persisted transcript, replay completes
   and acknowledges durable delivery without another model turn;
 - adapter rejection, exceptions before acceptance, stale claims, gateway
