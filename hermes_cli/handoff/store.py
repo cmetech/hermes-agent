@@ -598,7 +598,7 @@ class HandoffStore:
         self._conn.execute(
             """UPDATE handoff_deliveries SET acknowledged_at=?, updated_at=?
                WHERE handoff_id=? AND event_sequence<? AND acknowledged_at IS NULL
-                 AND dispatch_started_at IS NULL""",
+                 AND (dispatch_started_at IS NULL OR state!='pending')""",
             (stamp, stamp, snapshot.handoff_id, event.sequence),
         )
         self._conn.execute(
@@ -1334,6 +1334,7 @@ class HandoffStore:
                          SELECT 1 FROM handoff_deliveries AS earlier
                           WHERE earlier.handoff_id=delivery.handoff_id
                             AND earlier.event_sequence<delivery.event_sequence
+                            AND earlier.state='pending'
                             AND earlier.acknowledged_at IS NULL
                             AND earlier.dispatch_started_at IS NOT NULL
                      )"""
@@ -1521,7 +1522,8 @@ class HandoffStore:
             self._conn.execute(
                 """UPDATE handoff_deliveries
                    SET state='delivered', next_attempt_at=NULL, lease_owner=NULL,
-                       lease_expires_at=NULL, failure_code=NULL,
+                       lease_expires_at=NULL, dispatch_started_at=NULL,
+                       failure_code=NULL,
                        acknowledged_at=COALESCE(acknowledged_at, ?), updated_at=?
                    WHERE delivery_id=?""",
                 (acknowledged_at, _timestamp(now), lease.delivery_id),
@@ -1538,7 +1540,8 @@ class HandoffStore:
             self._conn.execute(
                 """UPDATE handoff_deliveries
                    SET state='failed', next_attempt_at=NULL, lease_owner=NULL,
-                       lease_expires_at=NULL, failure_code=?, updated_at=?
+                       lease_expires_at=NULL, dispatch_started_at=NULL,
+                       failure_code=?, updated_at=?
                    WHERE delivery_id=?""",
                 (failure_code, _timestamp(now), lease.delivery_id),
             )

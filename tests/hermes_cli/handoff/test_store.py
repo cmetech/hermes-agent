@@ -385,6 +385,40 @@ def test_abandoned_dispatch_yields_to_newer_delivery_after_lease_expiry(tmp_path
     assert due[0].event_sequence > first.event_sequence
 
 
+def test_completed_dispatch_does_not_block_a_later_terminal_return(tmp_path):
+    store = HandoffStore(tmp_path / "handoffs.db")
+    snapshot, advance = _prepare_conversation(store)
+    store.commit_observation(advance, ChannelObservation(phase="needs_input"))
+    first = store.attention(snapshot.handoff_id, limit=1)[0]
+    delivery_lease = store.claim_delivery(
+        first.delivery_id,
+        "gateway",
+        now=first.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert delivery_lease is not None
+    store.begin_delivery_dispatch(delivery_lease)
+    store.complete_delivery(delivery_lease)
+
+    store.commit_observation(advance, ChannelObservation(phase="active"))
+    store.commit_observation(
+        advance,
+        ChannelObservation(
+            phase="succeeded", terminal_result=_result("terminal result")
+        ),
+    )
+
+    old = store.get_delivery(first.delivery_id)
+    assert old.state == "delivered"
+    assert old.acknowledged_at is not None
+    attention = store.attention(snapshot.handoff_id, limit=10)
+    due = store.due_deliveries(now=datetime.now(UTC), limit=10)
+    assert len(attention) == 1
+    assert len(due) == 1
+    assert due[0].delivery_id == attention[0].delivery_id
+    assert due[0].event_sequence > first.event_sequence
+
+
 def test_task_observation_never_creates_a_return_delivery(tmp_path):
     store = HandoffStore(tmp_path / "handoffs.db")
     snapshot = _create(store)
