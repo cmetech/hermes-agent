@@ -27635,6 +27635,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event_claim = None
                 try:
                     complete_event_delivery(evt, claimed)
+                    if identity is not None:
+                        with self._completion_delivery_lock:
+                            self._completion_deliveries_inflight.discard(identity)
                     return True
                 except Exception:
                     logger.warning("Could not acknowledge persisted handoff return")
@@ -27736,7 +27739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return None
                 self._completion_deliveries_inflight.add(identity)
 
-        accepted = False
+        accepted = accepted_pending_persistence = False
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
@@ -27749,6 +27752,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     return False
                 if not persisted:
+                    accepted_pending_persistence = True
                     return False
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
@@ -27785,7 +27789,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._completion_deliveries_delivered.popitem(last=False)
             return True
         finally:
-            if identity is not None and not accepted:
+            if (
+                identity is not None
+                and not accepted
+                and not accepted_pending_persistence
+            ):
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:

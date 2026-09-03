@@ -350,6 +350,81 @@ def test_gateway_handoff_return_releases_when_acceptance_is_not_persisted(tmp_pa
     store.close()
 
 
+def test_gateway_handoff_return_does_not_reinject_before_acceptance_persists(
+    tmp_path,
+):
+    store, event = _handoff_event(tmp_path)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="678",
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={
+        event["session_key"]: SimpleNamespace(origin=source),
+    })
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={"ended_at": None}),
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        has_platform_message_id=AsyncMock(
+            side_effect=[False, False, False, True]
+        ),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, event)
+    ) is False
+    pending = store.get_delivery(event["delivery_id"])
+    replay_lease = store.claim_delivery(
+        pending.delivery_id,
+        "supervisor-2",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert replay_lease is not None
+    replay = {
+        **event,
+        "delivery_claim": {
+            "owner": replay_lease.owner,
+            "epoch": replay_lease.epoch,
+            "expires_at": replay_lease.expires_at.isoformat(),
+        },
+    }
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, replay)
+    ) is None
+    adapter.handle_message.assert_awaited_once()
+    pending = store.get_delivery(event["delivery_id"])
+    final_lease = store.claim_delivery(
+        pending.delivery_id,
+        "supervisor-3",
+        now=pending.next_attempt_at,
+        lease_seconds=30,
+    )
+    assert final_lease is not None
+    replay["delivery_claim"] = {
+        "owner": final_lease.owner,
+        "epoch": final_lease.epoch,
+        "expires_at": final_lease.expires_at.isoformat(),
+    }
+
+    assert asyncio.run(
+        runner._deliver_completion_notification(None, replay)
+    ) is True
+    adapter.handle_message.assert_awaited_once()
+    assert store.get_delivery(event["delivery_id"]).state == "delivered"
+    assert (
+        runner._completion_delivery_identity(event)
+        not in runner._completion_deliveries_inflight
+    )
+    store.close()
+
+
 def test_gateway_handoff_return_user_boundary_fails_closed_with_attention(tmp_path):
     store, event = _handoff_event(tmp_path)
     adapter = SimpleNamespace(handle_message=AsyncMock())
