@@ -524,6 +524,36 @@ def test_classic_cli_bot_chat_keeps_friendly_local_background_delivery(
     ]
 
 
+@pytest.mark.parametrize("target", ["researcher", "spark/reviewer", "spark"])
+def test_classic_cli_follow_up_never_falls_back_to_uncorrelated_legacy_delivery(
+    tmp_path, monkeypatch, target
+):
+    home = _managed_home(
+        tmp_path, teammates=("researcher",), peers=("spark",)
+    )
+    agent = _FakeAgent(home)
+    del agent._handoff_return_host_kind
+    del agent._gateway_session_key
+    service = _fake_handoff_service(monkeypatch)
+    calls = _capture_spawn(monkeypatch)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target=target,
+            message="continue the review",
+            handoff_id="existing-handoff",
+            agent=agent,
+        )
+    )
+
+    assert result["error"] == (
+        "Continuing a durable agent handoff requires its canonical or directory "
+        "target in a running Gateway or Desktop Bot Chat; no legacy delivery was sent."
+    )
+    assert service.calls == []
+    assert calls == []
+
+
 def test_handoff_follow_up_verifies_owner_target_and_uses_tool_call_id(
     tmp_path, monkeypatch
 ):

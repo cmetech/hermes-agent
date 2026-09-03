@@ -368,6 +368,12 @@ def message_agent_tool(
             tool_call_id=tool_call_id,
             agent=agent,
         )
+    if str(handoff_id or "").strip():
+        return _err(
+            "Continuing a durable agent handoff requires its canonical or directory "
+            "target in a running Gateway or Desktop Bot Chat; no legacy delivery "
+            "was sent."
+        )
     if "://" in raw_target:
         return _err("Invalid canonical handoff target.")
 
