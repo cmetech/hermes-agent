@@ -1,0 +1,450 @@
+{
+  "compatibility_rules": {
+    "missing_external_requirements": "advisory",
+    "semantic_version_standard": "SemVer 2.0.0",
+    "supported_contract_versions": [
+      1
+    ],
+    "supported_index_schema_versions": [
+      1
+    ],
+    "supported_manifest_schema_versions": [
+      1
+    ],
+    "unsupported_versions": "fail_closed",
+    "version_comparison": "SemVer_2.0.0_precedence_build_metadata_ignored"
+  },
+  "contract_version": 1,
+  "diagnostic_codes": {
+    "package_catalog_entry_limit": "The repository index contains too many package entries.",
+    "package_contract_unsupported": "The requested package contract version is unsupported.",
+    "package_digest_invalid": "A publisher digest record is structurally invalid.",
+    "package_digest_mismatch": "Publisher claims differ from independently computed package bytes.",
+    "package_file_count_limit": "The package includes more files than the contract permits.",
+    "package_file_size_limit": "A package file exceeds the per-file byte limit.",
+    "package_index_invalid": "The repository marketplace index is structurally invalid.",
+    "package_index_size_limit": "The repository marketplace index exceeds its byte limit.",
+    "package_manifest_invalid": "The workflow package manifest is structurally invalid.",
+    "package_member_missing": "A manifest-declared workflow member is missing.",
+    "package_path_absolute": "A package member path is absolute.",
+    "package_path_backslash": "A package member path contains a backslash.",
+    "package_path_collision": "Two package member paths have an ambiguous canonical identity.",
+    "package_path_nul": "A package member path contains a NUL byte.",
+    "package_path_traversal": "A package member path contains traversal or dot segments.",
+    "package_repository_metadata": "A package contains nested repository metadata.",
+    "package_root_nested": "Package roots may not overlap or nest.",
+    "package_symlink_unsupported": "Distributable symbolic links are unsupported.",
+    "package_total_size_limit": "Included package bytes exceed the aggregate byte limit."
+  },
+  "digest_rules": {
+    "algorithm": "sha256",
+    "bytes": "exact_no_normalization",
+    "domain_separator_base64": "aGVybWVzLndvcmtmbG93LXBhY2thZ2UudjEA",
+    "excluded_paths": [
+      "digests.json"
+    ],
+    "file_hash_encoding": "raw_32_byte_sha256",
+    "file_size_encoding": "unsigned_64_bit_big_endian",
+    "included_paths": "all_regular_files_below_package_root",
+    "ordering": "unicode_code_point_by_canonical_path",
+    "path_length_encoding": "unsigned_64_bit_big_endian"
+  },
+  "digests_schema": {
+    "$defs": {
+      "WorkflowPackageDigestRecord": {
+        "additionalProperties": false,
+        "description": "Exact-byte digest claim for one included package file.",
+        "properties": {
+          "path": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "title": "Path",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size": {
+            "maximum": 1048576,
+            "minimum": 0,
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "title": "WorkflowPackageDigestRecord",
+        "type": "object"
+      }
+    },
+    "$id": "https://hermes-agent.dev/contracts/workflow-package-digests-v1.schema.json",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Canonical generated ``digests.json`` claim.",
+    "properties": {
+      "algorithm": {
+        "const": "sha256",
+        "title": "Algorithm",
+        "type": "string"
+      },
+      "contractVersion": {
+        "const": 1,
+        "title": "Contractversion",
+        "type": "integer"
+      },
+      "files": {
+        "items": {
+          "$ref": "#/$defs/WorkflowPackageDigestRecord"
+        },
+        "maxItems": 512,
+        "minItems": 1,
+        "title": "Files",
+        "type": "array"
+      },
+      "packageDigest": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Packagedigest",
+        "type": "string"
+      }
+    },
+    "required": [
+      "contractVersion",
+      "algorithm",
+      "files",
+      "packageDigest"
+    ],
+    "title": "WorkflowPackageDigests",
+    "type": "object"
+  },
+  "marketplace_index_schema": {
+    "$defs": {
+      "WorkflowPackageIndexEntry": {
+        "additionalProperties": false,
+        "description": "Bounded discovery metadata for one repository package.",
+        "properties": {
+          "contractVersion": {
+            "const": 1,
+            "title": "Contractversion",
+            "type": "integer"
+          },
+          "description": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Description",
+            "type": "string"
+          },
+          "displayName": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Displayname",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
+            "title": "Id",
+            "type": "string"
+          },
+          "license": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "License",
+            "type": "string"
+          },
+          "packageDigest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Packagedigest",
+            "type": "string"
+          },
+          "packagePath": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "title": "Packagepath",
+            "type": "string"
+          },
+          "publisher": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Publisher",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$",
+              "type": "string"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Tags",
+            "type": "array"
+          },
+          "version": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "displayName",
+          "description",
+          "license",
+          "publisher",
+          "tags",
+          "packagePath",
+          "contractVersion",
+          "packageDigest"
+        ],
+        "title": "WorkflowPackageIndexEntry",
+        "type": "object"
+      }
+    },
+    "$id": "https://hermes-agent.dev/contracts/workflow-marketplace-index-v1.schema.json",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Canonical repository marketplace index.",
+    "properties": {
+      "packages": {
+        "items": {
+          "$ref": "#/$defs/WorkflowPackageIndexEntry"
+        },
+        "maxItems": 4096,
+        "title": "Packages",
+        "type": "array"
+      },
+      "schemaVersion": {
+        "const": 1,
+        "title": "Schemaversion",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "schemaVersion",
+      "packages"
+    ],
+    "title": "WorkflowPackageIndex",
+    "type": "object"
+  },
+  "package_manifest_schema": {
+    "$defs": {
+      "ExternalRequirements": {
+        "additionalProperties": false,
+        "description": "Declared destination capabilities; absence is advisory, not corruption.",
+        "properties": {
+          "providers": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Providers",
+            "type": "array"
+          },
+          "runtimes": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Runtimes",
+            "type": "array"
+          },
+          "secrets": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Secrets",
+            "type": "array"
+          },
+          "services": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Services",
+            "type": "array"
+          },
+          "tools": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "runtimes",
+          "tools",
+          "providers",
+          "services",
+          "secrets"
+        ],
+        "title": "ExternalRequirements",
+        "type": "object"
+      },
+      "WorkflowMember": {
+        "additionalProperties": false,
+        "description": "One declared workflow definition and its optional companion YAML.",
+        "properties": {
+          "companion": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "title": "Companion"
+          },
+          "definition": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "title": "Definition",
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition"
+        ],
+        "title": "WorkflowMember",
+        "type": "object"
+      }
+    },
+    "$id": "https://hermes-agent.dev/contracts/workflow-package-manifest-v1.schema.json",
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Canonical ``workflow-package.json`` version-one manifest.",
+    "properties": {
+      "description": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "title": "Description",
+        "type": "string"
+      },
+      "displayName": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Displayname",
+        "type": "string"
+      },
+      "externalRequirements": {
+        "$ref": "#/$defs/ExternalRequirements"
+      },
+      "id": {
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
+        "title": "Id",
+        "type": "string"
+      },
+      "license": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "License",
+        "type": "string"
+      },
+      "publisher": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Publisher",
+        "type": "string"
+      },
+      "schemaVersion": {
+        "const": 1,
+        "title": "Schemaversion",
+        "type": "integer"
+      },
+      "tags": {
+        "items": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$",
+          "type": "string"
+        },
+        "maxItems": 64,
+        "minItems": 1,
+        "title": "Tags",
+        "type": "array"
+      },
+      "version": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$",
+        "title": "Version",
+        "type": "string"
+      },
+      "workflows": {
+        "items": {
+          "$ref": "#/$defs/WorkflowMember"
+        },
+        "maxItems": 512,
+        "minItems": 1,
+        "title": "Workflows",
+        "type": "array"
+      }
+    },
+    "required": [
+      "schemaVersion",
+      "id",
+      "version",
+      "displayName",
+      "description",
+      "license",
+      "publisher",
+      "tags",
+      "workflows",
+      "externalRequirements"
+    ],
+    "title": "WorkflowPackageManifest",
+    "type": "object"
+  },
+  "path_rules": {
+    "reject_backslashes": true,
+    "reject_casefold_collisions": true,
+    "reject_dot_segments": true,
+    "reject_empty_segments": true,
+    "reject_nested_package_roots": true,
+    "reject_nul": true,
+    "reject_repository_metadata": true,
+    "reject_symlinks": true,
+    "relative_only": true,
+    "separator": "/",
+    "unicode_normalization": "NFC"
+  },
+  "resource_rules": {
+    "max_catalog_entries": 4096,
+    "max_file_bytes": 1048576,
+    "max_files": 512,
+    "max_index_bytes": 1048576,
+    "max_total_bytes": 8388608
+  }
+}

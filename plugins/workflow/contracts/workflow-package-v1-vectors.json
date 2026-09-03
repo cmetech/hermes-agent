@@ -1,0 +1,659 @@
+{
+  "boundaryVectors": [
+    {
+      "expected": {
+        "accepted": true,
+        "diagnosticCode": null,
+        "limit": 512,
+        "observed": 512
+      },
+      "limit": "max_files",
+      "name": "file_count_exact",
+      "recipe": {
+        "count": 512,
+        "encoding": "utf-8",
+        "kind": "items",
+        "repeat": ""
+      }
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_file_count_limit",
+        "limit": 512,
+        "observed": 513
+      },
+      "limit": "max_files",
+      "name": "file_count_over",
+      "recipe": {
+        "count": 513,
+        "encoding": "utf-8",
+        "kind": "items",
+        "repeat": ""
+      }
+    },
+    {
+      "expected": {
+        "accepted": true,
+        "diagnosticCode": null,
+        "limit": 1048576,
+        "observed": 1048576,
+        "sha256": "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360"
+      },
+      "limit": "max_file_bytes",
+      "name": "file_bytes_exact",
+      "recipe": {
+        "count": 1048576,
+        "encoding": "utf-8",
+        "kind": "bytes",
+        "repeat": "a"
+      }
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_file_size_limit",
+        "limit": 1048576,
+        "observed": 1048577,
+        "sha256": "4a3f0c0c213adea174f9a3d4c13177315b588bdb2e9c1012d3d0bf0453ca0f6a"
+      },
+      "limit": "max_file_bytes",
+      "name": "file_bytes_over",
+      "recipe": {
+        "count": 1048577,
+        "encoding": "utf-8",
+        "kind": "bytes",
+        "repeat": "a"
+      }
+    },
+    {
+      "expected": {
+        "accepted": true,
+        "diagnosticCode": null,
+        "limit": 8388608,
+        "observed": 8388608,
+        "sha256": "9f5bc72de6f6780c7ff33ab7f43e17badeb87155dc19363de9a9f037c8128c45"
+      },
+      "limit": "max_total_bytes",
+      "name": "total_bytes_exact",
+      "recipe": {
+        "count": 8388608,
+        "encoding": "utf-8",
+        "kind": "bytes",
+        "repeat": "z"
+      }
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_total_size_limit",
+        "limit": 8388608,
+        "observed": 8388609,
+        "sha256": "7caf91be0551de5b45bfbed32570c8cedf17763fce3cb9c9057cf29fede3eb35"
+      },
+      "limit": "max_total_bytes",
+      "name": "total_bytes_over",
+      "recipe": {
+        "count": 8388609,
+        "encoding": "utf-8",
+        "kind": "bytes",
+        "repeat": "z"
+      }
+    },
+    {
+      "expected": {
+        "accepted": true,
+        "diagnosticCode": null,
+        "limit": 1048576,
+        "observed": 1048576,
+        "sha256": "1d6349e5fdf65001cfc50aaa242d9d1da37f119ce85739876a68f35fcd4042ed"
+      },
+      "limit": "max_index_bytes",
+      "name": "index_bytes_exact",
+      "recipe": {
+        "count": 1048576,
+        "encoding": "utf-8",
+        "kind": "bytes",
+        "repeat": "i"
+      }
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_index_size_limit",
+        "limit": 1048576,
+        "observed": 1048577,
+        "sha256": "e6537d3f536288db9ecb31f412f6890263769541e4cb1c6c5905e0394e1016a8"
+      },
+      "limit": "max_index_bytes",
+      "name": "index_bytes_over",
+      "recipe": {
+        "count": 1048577,
+        "encoding": "utf-8",
+        "kind": "bytes",
+        "repeat": "i"
+      }
+    },
+    {
+      "expected": {
+        "accepted": true,
+        "diagnosticCode": null,
+        "limit": 4096,
+        "observed": 4096
+      },
+      "limit": "max_catalog_entries",
+      "name": "catalog_entries_exact",
+      "recipe": {
+        "count": 4096,
+        "encoding": "utf-8",
+        "kind": "items",
+        "repeat": ""
+      }
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_catalog_entry_limit",
+        "limit": 4096,
+        "observed": 4097
+      },
+      "limit": "max_catalog_entries",
+      "name": "catalog_entries_over",
+      "recipe": {
+        "count": 4097,
+        "encoding": "utf-8",
+        "kind": "items",
+        "repeat": ""
+      }
+    }
+  ],
+  "contractVersion": 1,
+  "digestVectors": [
+    {
+      "expectedPackageDigest": "513c7c45405ac09059d613c26db3e61ad157d289b5436ead29708db9c8f54840",
+      "expectedSortedPaths": [
+        "README.md"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "Héllø, 世界\n"
+          },
+          "expected": {
+            "sha256": "09bd80f7b80f8bcda2d14b129312cd24ebf291baaf24bfe4a7186d56ddf5b837",
+            "size": 16
+          },
+          "path": "README.md"
+        }
+      ],
+      "name": "utf8"
+    },
+    {
+      "expectedPackageDigest": "907b98974e8c670409983687765c13cf75f143b4d5e33f9fa24b5c69d30964e8",
+      "expectedSortedPaths": [
+        "fixtures/raw.bin"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "base64",
+            "value": "AP+AAQ=="
+          },
+          "expected": {
+            "sha256": "6509423fd9da5c225d2f8619ffae394b40f9f7686fee55a38c54b1424ac65f46",
+            "size": 4
+          },
+          "path": "fixtures/raw.bin"
+        }
+      ],
+      "name": "binary_base64"
+    },
+    {
+      "expectedPackageDigest": "0936ef7e1c05f992a4971a9d37be65161b5677c76f6fa210f9943f52fb7134da",
+      "expectedSortedPaths": [
+        "scripts/example.txt"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "one\ntwo\n"
+          },
+          "expected": {
+            "sha256": "c3f9c8c283a2b1f2f1896f27a01cbe3cddc0c9d93f752e4639035a0f5b36f6e8",
+            "size": 8
+          },
+          "path": "scripts/example.txt"
+        }
+      ],
+      "name": "line_endings_lf"
+    },
+    {
+      "expectedPackageDigest": "c79a156d85f1950564aaa12baa53aefa389ae9a4cf560eb4d98b6c06f803cd48",
+      "expectedSortedPaths": [
+        "scripts/example.txt"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "one\r\ntwo\r\n"
+          },
+          "expected": {
+            "sha256": "6f4792b265fe72790b344fd3ef5294701d9d087bed9fce815c0f4bbad6d2ed87",
+            "size": 10
+          },
+          "path": "scripts/example.txt"
+        }
+      ],
+      "name": "line_endings_crlf"
+    },
+    {
+      "expectedPackageDigest": "610e6d56f1c3a20a6f8f86b1ee345693913ff05d2de73f055f9278b702bba246",
+      "expectedSortedPaths": [
+        "fixtures/empty"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": ""
+          },
+          "expected": {
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "size": 0
+          },
+          "path": "fixtures/empty"
+        }
+      ],
+      "name": "empty_bytes"
+    },
+    {
+      "expectedPackageDigest": "ec2f5a814bd68621cf1cbe0805e11ba6ad1128465ba9039b796e08539af02538",
+      "expectedSortedPaths": [
+        "fixtures/café/猫.txt"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "雪\n"
+          },
+          "expected": {
+            "sha256": "fa717a4768de2a0256209be52fe7fd5c9d100983d5454023aca1fec35b92e731",
+            "size": 4
+          },
+          "path": "fixtures/café/猫.txt"
+        }
+      ],
+      "name": "unicode_paths"
+    },
+    {
+      "expectedPackageDigest": "2afc9c540ae9ba9bb5fabe1a125a62f7841075aad1edb31acc10d79c11a938fd",
+      "expectedSortedPaths": [
+        "A.txt",
+        "z.txt",
+        "é.txt"
+      ],
+      "files": [
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "z"
+          },
+          "expected": {
+            "sha256": "594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b06",
+            "size": 1
+          },
+          "path": "z.txt"
+        },
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "A"
+          },
+          "expected": {
+            "sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+            "size": 1
+          },
+          "path": "A.txt"
+        },
+        {
+          "content": {
+            "encoding": "utf-8",
+            "value": "e"
+          },
+          "expected": {
+            "sha256": "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+            "size": 1
+          },
+          "path": "é.txt"
+        }
+      ],
+      "name": "sorting"
+    }
+  ],
+  "pathVectors": [
+    {
+      "expected": {
+        "accepted": true,
+        "normalizedPath": "fixtures/café/猫.txt"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "fixtures/café/猫.txt"
+      },
+      "name": "unicode_path"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_absolute"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "/workflows/unsafe.yaml"
+      },
+      "name": "absolute"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_traversal"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "workflows/../secret.yaml"
+      },
+      "name": "traversal"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_backslash"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "workflows\\unsafe.yaml"
+      },
+      "name": "backslash"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_nul"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "workflows/unsafe\u0000.yaml"
+      },
+      "name": "nul"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_collision"
+      },
+      "input": {
+        "kind": "regular",
+        "paths": [
+          "fixtures/Report.json",
+          "fixtures/report.json"
+        ]
+      },
+      "name": "case_collision"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_symlink_unsupported"
+      },
+      "input": {
+        "kind": "symlink",
+        "path": "scripts/current",
+        "target": "run.py"
+      },
+      "name": "symlink"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_root_nested"
+      },
+      "input": {
+        "paths": [
+          "workflow-package.json",
+          "packages/child/workflow-package.json"
+        ]
+      },
+      "name": "nested_package_root"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_repository_metadata"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "fixtures/.git/config"
+      },
+      "name": "repository_metadata"
+    }
+  ],
+  "validationVectors": [
+    {
+      "document": "workflow-package.json",
+      "expected": {
+        "accepted": true
+      },
+      "name": "manifest_valid",
+      "value": {
+        "description": "Diagnostic and support-bundle workflows for laptops.",
+        "displayName": "Laptop Support",
+        "externalRequirements": {
+          "providers": [],
+          "runtimes": [
+            "uv"
+          ],
+          "secrets": [],
+          "services": [],
+          "tools": []
+        },
+        "id": "laptop-support",
+        "license": "MIT",
+        "publisher": "example-company",
+        "schemaVersion": 1,
+        "tags": [
+          "diagnostics",
+          "support"
+        ],
+        "version": "1.2.3",
+        "workflows": [
+          {
+            "companion": "workflows/laptop-diagnostic.hermes.yaml",
+            "definition": "workflows/laptop-diagnostic.yaml"
+          }
+        ]
+      }
+    },
+    {
+      "document": "workflow-package.json",
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_manifest_invalid"
+      },
+      "name": "manifest_semver_invalid",
+      "value": {
+        "description": "Diagnostic and support-bundle workflows for laptops.",
+        "displayName": "Laptop Support",
+        "externalRequirements": {
+          "providers": [],
+          "runtimes": [
+            "uv"
+          ],
+          "secrets": [],
+          "services": [],
+          "tools": []
+        },
+        "id": "laptop-support",
+        "license": "MIT",
+        "publisher": "example-company",
+        "schemaVersion": 1,
+        "tags": [
+          "diagnostics",
+          "support"
+        ],
+        "version": "01.2.3",
+        "workflows": [
+          {
+            "companion": "workflows/laptop-diagnostic.hermes.yaml",
+            "definition": "workflows/laptop-diagnostic.yaml"
+          }
+        ]
+      }
+    },
+    {
+      "document": "workflow-package.json",
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_contract_unsupported"
+      },
+      "name": "manifest_contract_unsupported",
+      "value": {
+        "description": "Diagnostic and support-bundle workflows for laptops.",
+        "displayName": "Laptop Support",
+        "externalRequirements": {
+          "providers": [],
+          "runtimes": [
+            "uv"
+          ],
+          "secrets": [],
+          "services": [],
+          "tools": []
+        },
+        "id": "laptop-support",
+        "license": "MIT",
+        "publisher": "example-company",
+        "schemaVersion": 2,
+        "tags": [
+          "diagnostics",
+          "support"
+        ],
+        "version": "1.2.3",
+        "workflows": [
+          {
+            "companion": "workflows/laptop-diagnostic.hermes.yaml",
+            "definition": "workflows/laptop-diagnostic.yaml"
+          }
+        ]
+      }
+    },
+    {
+      "document": "workflow-package.json",
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_manifest_invalid"
+      },
+      "name": "manifest_trust_state_forbidden",
+      "value": {
+        "description": "Diagnostic and support-bundle workflows for laptops.",
+        "displayName": "Laptop Support",
+        "externalRequirements": {
+          "providers": [],
+          "runtimes": [
+            "uv"
+          ],
+          "secrets": [],
+          "services": [],
+          "tools": []
+        },
+        "id": "laptop-support",
+        "license": "MIT",
+        "publisher": "example-company",
+        "schemaVersion": 1,
+        "tags": [
+          "diagnostics",
+          "support"
+        ],
+        "trusted": true,
+        "version": "1.2.3",
+        "workflows": [
+          {
+            "companion": "workflows/laptop-diagnostic.hermes.yaml",
+            "definition": "workflows/laptop-diagnostic.yaml"
+          }
+        ]
+      }
+    },
+    {
+      "document": ".well-known/hermes-workflows/index.json",
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_index_invalid"
+      },
+      "name": "index_entry_malformed",
+      "value": {
+        "packages": [
+          {
+            "contractVersion": 1,
+            "description": "Diagnostic and support-bundle workflows for laptops.",
+            "displayName": "Laptop Support",
+            "id": "laptop-support",
+            "license": "MIT",
+            "packageDigest": "bad",
+            "packagePath": "packages/laptop-support",
+            "publisher": "example-company",
+            "tags": [
+              "diagnostics",
+              "support"
+            ],
+            "version": "1.2.3"
+          }
+        ],
+        "schemaVersion": 1
+      }
+    },
+    {
+      "document": "digests.json",
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_digest_invalid"
+      },
+      "name": "digest_record_malformed",
+      "value": {
+        "algorithm": "sha256",
+        "contractVersion": 1,
+        "files": [
+          {
+            "path": "workflow-package.json",
+            "sha256": "bad",
+            "size": 2
+          }
+        ],
+        "packageDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "actualPackageDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "document": "digests.json",
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_digest_mismatch"
+      },
+      "name": "publisher_digest_mismatch",
+      "value": {
+        "algorithm": "sha256",
+        "contractVersion": 1,
+        "files": [
+          {
+            "path": "workflow-package.json",
+            "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "size": 2
+          }
+        ],
+        "packageDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    }
+  ]
+}
