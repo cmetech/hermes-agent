@@ -121,9 +121,22 @@ export interface WorkflowMarketplaceSource {
   repository_url: string
 }
 
+export type WorkflowMarketplaceSourceRefreshState =
+  'authentication-failed' | 'fresh' | 'incompatible' | 'malformed' | 'stale' | 'unavailable'
+
+export interface WorkflowMarketplaceSourceRecord extends WorkflowMarketplaceSource {
+  attempted_at: null | string
+  diagnostic_code: null | string
+  message: null | string
+  refresh_state: null | WorkflowMarketplaceSourceRefreshState
+  resolved_commit: null | string
+  verified_at: null | string
+  verified_package_count: number
+}
+
 export interface WorkflowMarketplaceSourceList {
   profile: string
-  sources: WorkflowMarketplaceSource[]
+  sources: WorkflowMarketplaceSourceRecord[]
 }
 
 export interface WorkflowMarketplaceSourceResponse {
@@ -467,6 +480,7 @@ interface WorkflowMarketplaceOperationBase<Kind extends WorkflowMarketplaceOpera
   kind: Kind
   profile: string
   schema_version: 1
+  source_name: Kind extends 'refresh' ? string : null
   updated_at: string
 }
 

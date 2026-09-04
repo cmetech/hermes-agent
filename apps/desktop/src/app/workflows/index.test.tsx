@@ -48,6 +48,12 @@ vi.mock('@/hermes', () => ({
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
   listWorkflowEvents: (...args: unknown[]) => listWorkflowEvents(...args),
   listInstalledWorkflowPackages: (...args: unknown[]) => listInstalledWorkflowPackages(...args),
+  listWorkflowMarketplaceOperations: vi.fn().mockResolvedValue({
+    limit: 100,
+    offset: 0,
+    operations: [],
+    profile: 'default'
+  }),
   listWorkflowMarketplaceSources: (...args: unknown[]) => listWorkflowMarketplaceSources(...args),
   listWorkflowRuns: (...args: unknown[]) => listWorkflowRuns(...args),
   mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args),

@@ -49,6 +49,14 @@ _MAX_SOURCE_STATE_BYTES = 1024 * 1024
 _MAX_CATALOG_STATE_BYTES = 64 * 1024 * 1024
 _MAX_ERROR_BYTES = 4096
 _SOURCE_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"\b(access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b(\s*[=:])\s*\S+",
+    re.IGNORECASE,
+)
+_LOCAL_PATH = re.compile(
+    r"(?:^|\s)(?:/(?:private|tmp|users|home|var/folders|var/tmp|var/cache)/\S*|[A-Za-z]:\\\S*|\\\\[^\\\s]+\\\S*|[^\s]*(?:\.staging|\.quarantine)(?:/|\\)\S*)",
+    re.IGNORECASE,
+)
 
 RefreshState = Literal[
     "fresh",
@@ -60,6 +68,11 @@ RefreshState = Literal[
     "unavailable",
     "cancelled",
 ]
+
+
+def _redact_sensitive_text(value: str) -> str:
+    redacted = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED]", value)
+    return _LOCAL_PATH.sub(" [REDACTED_PATH]", redacted).strip()
 
 
 class _StateModel(BaseModel):
@@ -132,6 +145,7 @@ class SourceRefreshStatus(_StateModel):
         if (
             git_text_contains_credentials(value)
             or safe_git_error(completed).strip() != value
+            or _redact_sensitive_text(value) != value
         ):
             raise ValueError("refresh status message must be canonically redacted")
         return value
@@ -356,6 +370,7 @@ def _redacted_error(error: WorkflowMarketplaceError, repository_url: str) -> str
         args=(), returncode=1, stdout="", stderr=str(error)
     )
     rendered = safe_git_error(completed, repository_url).strip()
+    rendered = _redact_sensitive_text(rendered)
     if not rendered or git_text_contains_credentials(rendered):
         rendered = "marketplace source refresh failed"
     encoded = rendered.encode("utf-8")[:_MAX_ERROR_BYTES]

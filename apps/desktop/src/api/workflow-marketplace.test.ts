@@ -46,6 +46,7 @@ function pendingOperation() {
     progress: 0,
     result: null,
     schema_version: 1,
+    source_name: 'company',
     started_at: null,
     state: 'pending',
     updated_at: NOW
@@ -58,6 +59,19 @@ function source() {
     name: 'company',
     ref: 'main',
     repository_url: 'https://example.test/team/workflows.git'
+  }
+}
+
+function sourceRecord() {
+  return {
+    ...source(),
+    attempted_at: NOW,
+    diagnostic_code: null,
+    message: null,
+    refresh_state: 'fresh',
+    resolved_commit: '4'.repeat(40),
+    verified_at: NOW,
+    verified_package_count: 1
   }
 }
 
@@ -93,7 +107,7 @@ describe('workflow marketplace API', () => {
           schema_version: 1
         }
       })
-      .mockResolvedValueOnce({ ok: true, value: { profile: 'support', sources: [source()] } })
+      .mockResolvedValueOnce({ ok: true, value: { profile: 'support', sources: [sourceRecord()] } })
       .mockResolvedValueOnce({ ok: true, value: { profile: 'support', source: source(), status: 'created' } })
       .mockResolvedValueOnce({ ok: true, value: { profile: 'support', source: source(), status: 'updated' } })
       .mockResolvedValueOnce({ ok: true, value: { profile: 'support', source: source(), status: 'disabled' } })

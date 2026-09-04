@@ -28,6 +28,7 @@ import type {
   WorkflowMarketplaceSearchPage,
   WorkflowMarketplaceSource,
   WorkflowMarketplaceSourceList,
+  WorkflowMarketplaceSourceRecord,
   WorkflowMarketplaceSourceRefresh,
   WorkflowMarketplaceSourceResponse,
   WorkflowMarketplaceStringSetChange,
@@ -727,6 +728,113 @@ function decodeSource(value: unknown): WorkflowMarketplaceSource | null {
   return { enabled, name, ref, repository_url: repositoryUrl }
 }
 
+const DIAGNOSTIC_CREDENTIAL_ASSIGNMENT =
+  /\b(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]/i
+
+const DIAGNOSTIC_LOCAL_PATH =
+  /(?:^|\s)(?:\/(?:private|tmp|users|home|var\/folders|var\/tmp|var\/cache)\/|[A-Za-z]:\\|\\\\[^\\\s]+\\|[^\s]*(?:\.staging|\.quarantine)(?:\/|\\))/i
+
+function safeDiagnosticText(value: unknown): string | null {
+  const decoded = cleanText(value, 1, 4096)
+
+  return decoded !== null &&
+    !containsControl(decoded) &&
+    !DIAGNOSTIC_CREDENTIAL_ASSIGNMENT.test(decoded) &&
+    !DIAGNOSTIC_LOCAL_PATH.test(decoded) &&
+    !hasCredentialAuthority(decoded) &&
+    !hasCredentialParameter(decoded)
+    ? decoded
+    : null
+}
+
+function decodeSourceRecord(value: unknown): WorkflowMarketplaceSourceRecord | null {
+  const record = exactRecord(value, [
+    'attempted_at',
+    'diagnostic_code',
+    'enabled',
+    'message',
+    'name',
+    'ref',
+    'refresh_state',
+    'repository_url',
+    'resolved_commit',
+    'verified_at',
+    'verified_package_count'
+  ])
+
+  if (record === null) {
+    return null
+  }
+
+  const source = decodeSource({
+    enabled: record.get('enabled'),
+    name: record.get('name'),
+    ref: record.get('ref'),
+    repository_url: record.get('repository_url')
+  })
+
+  const rawAttemptedAt = record.get('attempted_at')
+  const attemptedAt = rawAttemptedAt === null ? null : canonicalTimestamp(rawAttemptedAt)
+  const rawDiagnosticCode = record.get('diagnostic_code')
+  const diagnosticCode = rawDiagnosticCode === null ? null : cleanText(rawDiagnosticCode, 1, 128)
+  const rawMessage = record.get('message')
+  const message = rawMessage === null ? null : safeDiagnosticText(rawMessage)
+  const refreshState = record.get('refresh_state')
+  const rawResolvedCommit = record.get('resolved_commit')
+  const resolvedCommit = rawResolvedCommit === null ? null : cleanText(rawResolvedCommit, 40, 40)
+  const rawVerifiedAt = record.get('verified_at')
+  const verifiedAt = rawVerifiedAt === null ? null : canonicalTimestamp(rawVerifiedAt)
+  const verifiedPackageCount = integer(record.get('verified_package_count'), 0, 4096)
+
+  const validRefreshState =
+    refreshState === null ||
+    refreshState === 'authentication-failed' ||
+    refreshState === 'fresh' ||
+    refreshState === 'incompatible' ||
+    refreshState === 'malformed' ||
+    refreshState === 'stale' ||
+    refreshState === 'unavailable'
+
+  const hasVerifiedCache = resolvedCommit !== null || verifiedAt !== null
+
+  if (
+    source === null ||
+    (attemptedAt === null && rawAttemptedAt !== null) ||
+    (diagnosticCode === null && rawDiagnosticCode !== null) ||
+    (diagnosticCode !== null && !IDENTIFIER.test(diagnosticCode)) ||
+    (message === null && rawMessage !== null) ||
+    !validRefreshState ||
+    (resolvedCommit === null && rawResolvedCommit !== null) ||
+    (resolvedCommit !== null && !COMMIT.test(resolvedCommit)) ||
+    (verifiedAt === null && rawVerifiedAt !== null) ||
+    verifiedPackageCount === null ||
+    (resolvedCommit === null) !== (verifiedAt === null) ||
+    (!hasVerifiedCache && verifiedPackageCount !== 0) ||
+    (refreshState === null &&
+      (attemptedAt !== null || diagnosticCode !== null || message !== null || hasVerifiedCache)) ||
+    (refreshState !== null && attemptedAt === null) ||
+    (refreshState === 'fresh' && (!hasVerifiedCache || diagnosticCode !== null || message !== null)) ||
+    (refreshState === 'stale' && (!hasVerifiedCache || diagnosticCode === null || message === null)) ||
+    (refreshState !== null &&
+      refreshState !== 'fresh' &&
+      refreshState !== 'stale' &&
+      (hasVerifiedCache || verifiedPackageCount !== 0 || diagnosticCode === null || message === null))
+  ) {
+    return null
+  }
+
+  return {
+    ...source,
+    attempted_at: attemptedAt,
+    diagnostic_code: diagnosticCode,
+    message,
+    refresh_state: refreshState,
+    resolved_commit: resolvedCommit,
+    verified_at: verifiedAt,
+    verified_package_count: verifiedPackageCount
+  }
+}
+
 export function decodeWorkflowMarketplaceCapabilities(value: unknown): WorkflowMarketplaceCapabilities | null {
   const record = exactRecord(value, ['capabilities', 'profile', 'schema_version'])
 
@@ -759,7 +867,7 @@ export function decodeWorkflowMarketplaceSourceList(value: unknown): WorkflowMar
   }
 
   const profile = cleanText(record.get('profile'), 1, 256)
-  const sources = decodeArray(record.get('sources'), 128, decodeSource)
+  const sources = decodeArray(record.get('sources'), 128, decodeSourceRecord)
 
   if (profile === null || sources === null || !unique(sources.map(source => source.name))) {
     return null
@@ -2130,7 +2238,7 @@ interface WorkflowMarketplaceOperationContract {
   readonly succeeded: (
     common: WorkflowMarketplaceSucceededCommon,
     result: WorkflowMarketplaceOperationResult
-  ) => WorkflowMarketplaceOperation | null
+  ) => object | null
 }
 
 function succeededShape(common: WorkflowMarketplaceSucceededCommon): WorkflowMarketplaceSucceededCommon & {
@@ -2415,6 +2523,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     'progress',
     'result',
     'schema_version',
+    'source_name',
     'started_at',
     'state',
     'updated_at'
@@ -2439,6 +2548,8 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
   const rawStartedAt = record.get('started_at')
   const startedAt = rawStartedAt === null ? null : canonicalTimestamp(rawStartedAt)
   const state = record.get('state')
+  const rawSourceName = record.get('source_name')
+  const sourceName = rawSourceName === null ? null : cleanText(rawSourceName, 1, 64)
   const updatedAt = canonicalTimestamp(record.get('updated_at'))
 
   if (
@@ -2448,6 +2559,9 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     id === null ||
     !OPERATION_ID.test(id) ||
     kind === null ||
+    (sourceName === null && rawSourceName !== null) ||
+    (sourceName !== null && !SOURCE_NAME.test(sourceName)) ||
+    (kind === 'refresh') !== (sourceName !== null) ||
     phase === null ||
     !IDENTIFIER.test(phase) ||
     profile === null ||
@@ -2470,19 +2584,13 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     return null
   }
 
-  const common: {
-    created_at: string
-    id: string
-    kind: WorkflowMarketplaceOperationKind
-    profile: string
-    schema_version: 1
-    updated_at: string
-  } = {
+  const common = {
     created_at: createdAt,
     id,
     kind,
     profile,
-    schema_version: 1,
+    schema_version: 1 as const,
+    source_name: sourceName,
     updated_at: updatedAt
   }
 
@@ -2507,7 +2615,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
       result: null,
       started_at: null,
       state: 'pending'
-    }
+    } as WorkflowMarketplaceOperation
   }
 
   if (state === 'running') {
@@ -2531,7 +2639,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
       result: null,
       started_at: startedAt,
       state: 'running'
-    }
+    } as WorkflowMarketplaceOperation
   }
 
   if (state === 'succeeded') {
@@ -2546,7 +2654,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
       return null
     }
 
-    return operationContract.succeeded(
+    const succeeded = operationContract.succeeded(
       {
         created_at: createdAt,
         finished_at: finishedAt,
@@ -2558,6 +2666,8 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
       },
       result
     )
+
+    return succeeded === null ? null : ({ ...succeeded, source_name: sourceName } as WorkflowMarketplaceOperation)
   }
 
   if (state === 'failed') {
@@ -2581,7 +2691,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
       result: null,
       started_at: startedAt,
       state: 'failed'
-    }
+    } as WorkflowMarketplaceOperation
   }
 
   if (phase !== 'cancelled' || finishedAt === null || result !== null || error !== null || progress >= 100) {
@@ -2597,7 +2707,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     result: null,
     started_at: startedAt,
     state: 'cancelled'
-  }
+  } as WorkflowMarketplaceOperation
 }
 
 export function decodeWorkflowMarketplaceOperationPage(value: unknown): WorkflowMarketplaceOperationPage | null {

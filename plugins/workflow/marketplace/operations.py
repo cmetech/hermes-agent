@@ -218,6 +218,9 @@ class MarketplaceOperation(_StrictOperationModel):
     schema_version: Literal[1] = Field(alias="schemaVersion")
     id: str = Field(pattern=_OPERATION_ID.pattern)
     kind: str = Field(min_length=1, max_length=64, pattern=_IDENTIFIER.pattern)
+    source_name: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=SOURCE_NAME_PATTERN
+    )
     profile: str = Field(min_length=1, max_length=256)
     state: OperationState
     phase: str = Field(min_length=1, max_length=64, pattern=_IDENTIFIER.pattern)
@@ -249,6 +252,8 @@ class MarketplaceOperation(_StrictOperationModel):
 
     @model_validator(mode="after")
     def validate_state_shape(self) -> "MarketplaceOperation":
+        if (self.kind == "refresh") != (self.source_name is not None):
+            raise ValueError("operation source identity is inconsistent")
         if self.state == "pending":
             if (
                 self.started_at is not None
@@ -426,6 +431,20 @@ def _clean_identifier(value: object, *, label: str, maximum: int = 64) -> str:
     return value
 
 
+def _refresh_source_name(kind: str, target: str | None) -> str | None:
+    """Project only the canonical public source identity for refresh operations."""
+
+    if kind != "refresh":
+        return None
+    prefix = "source:"
+    if target is None or not target.startswith(prefix):
+        raise ValueError("refresh operation target is invalid")
+    source_name = target[len(prefix) :]
+    if re.fullmatch(SOURCE_NAME_PATTERN, source_name, flags=re.ASCII) is None:
+        raise ValueError("refresh operation target is invalid")
+    return source_name
+
+
 def _clean_identity(value: object, *, label: str, maximum: int) -> str:
     if (
         not isinstance(value, str)
@@ -523,6 +542,7 @@ class WorkflowMarketplaceOperationRegistry:
             "schemaVersion": 1,
             "id": record.id,
             "kind": record.kind,
+            "source_name": _refresh_source_name(record.kind, record.target),
             "profile": self.profile,
             "state": record.state,
             "phase": record.phase,
@@ -618,6 +638,7 @@ class WorkflowMarketplaceOperationRegistry:
             raise TypeError("operation call must be callable")
         if target is not None:
             target = _clean_identity(target, label="operation target", maximum=512)
+        _refresh_source_name(kind, target)
         with self._lock:
             if self._closed:
                 raise MarketplaceOperationCapacityError(

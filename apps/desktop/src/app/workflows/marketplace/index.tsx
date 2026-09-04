@@ -15,18 +15,21 @@ import {
   isWorkflowMarketplaceUnsupportedError,
   listInstalledWorkflowPackages,
   listWorkflowMarketplaceSources,
+  refreshWorkflowMarketplaceSource,
   searchWorkflowPackages
 } from '@/hermes'
 import type { WorkflowMarketplaceScope } from '@/hermes'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useI18n } from '@/i18n'
-import { ChevronLeft } from '@/lib/icons'
+import { ChevronLeft, RefreshCw } from '@/lib/icons'
 import type { WorkflowMarketplaceOperation, WorkflowMarketplacePackageDetail } from '@/types/hermes'
 
 import { installedProvenanceErrorKind, InstalledProvenanceNotice } from './installed-packages'
 import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList, type MarketplacePackageSelection } from './package-list'
 import { marketplaceKeys } from './query-keys'
+import { ManageWorkflowSourcesDialog } from './source-dialog'
+import { useMarketplaceOperation } from './use-marketplace-operation'
 
 const PAGE_LIMIT = 50
 const NARROW_MARKETPLACE_QUERY = '(max-width: 39.999rem)'
@@ -101,10 +104,14 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const backButtonRef = useRef<HTMLButtonElement>(null)
   const selectionOriginRef = useRef<HTMLButtonElement | null>(null)
   const detailRetryRef = useRef<DetailRetryAttempt | null>(null)
+  const manageSourcesRef = useRef<HTMLButtonElement>(null)
+  const refreshAllGuardRef = useRef(false)
   const previousScopeKeyRef = useRef(scopeKey)
   const [filterState, setFilterState] = useState<ScopedFilters>({ offset: 0, query: '', scopeKey, source: null })
   const [selectionState, setSelectionState] = useState<null | ScopedSelection>(null)
   const [detailRetryState, setDetailRetryState] = useState<DetailRetryAttempt | null>(null)
+  const [sourcesDialogOpen, setSourcesDialogOpen] = useState(false)
+  const [refreshingSources, setRefreshingSources] = useState(false)
 
   const filters = filterState.scopeKey === scopeKey ? filterState : { offset: 0, query: '', scopeKey, source: null }
 
@@ -119,6 +126,9 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const supportsSearch = capabilities.data?.capabilities.includes('search') === true
   const supportsSources = capabilities.data?.capabilities.includes('sources') === true
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
+  const supportsOperations = capabilities.data?.capabilities.includes('operations') === true
+  const supportsSourceOperations = supportsSources && supportsOperations
+  const sourceOperations = useMarketplaceOperation(scope, supportsSourceOperations)
 
   const sources = useQuery({
     enabled: supportsSources,
@@ -326,6 +336,31 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     }
   }
 
+  const refreshAllSources = async () => {
+    if (refreshAllGuardRef.current) {
+      return
+    }
+
+    refreshAllGuardRef.current = true
+    setRefreshingSources(true)
+
+    try {
+      for (const source of sources.data?.sources ?? []) {
+        if (source.enabled) {
+          await sourceOperations.start(source.name, () => refreshWorkflowMarketplaceSource(source.name, scope))
+        }
+      }
+    } finally {
+      refreshAllGuardRef.current = false
+      setRefreshingSources(false)
+    }
+  }
+
+  const closeSources = () => {
+    setSourcesDialogOpen(false)
+    requestAnimationFrame(() => manageSourcesRef.current?.focus())
+  }
+
   if (capabilities.isPending) {
     return (
       <div
@@ -483,8 +518,44 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
               ))}
             </SelectContent>
           </Select>
+          {supportsSourceOperations ? (
+            <>
+              <Button
+                aria-busy={refreshingSources}
+                disabled={refreshingSources || !sources.data?.sources.some(source => source.enabled)}
+                onClick={() => void refreshAllSources()}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                <RefreshCw className="size-4" />
+                {copy.workflowMarketplaceRefresh}
+              </Button>
+              <Button
+                onClick={() => setSourcesDialogOpen(true)}
+                ref={manageSourcesRef}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                {copy.workflowMarketplaceManageSources}
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs text-(--ui-text-tertiary)" role="status">
+              {copy.workflowMarketplaceUnsupportedSources}
+            </span>
+          )}
         </div>
       ) : null}
+
+      <ManageWorkflowSourcesDialog
+        onClose={closeSources}
+        open={sourcesDialogOpen}
+        operations={sourceOperations}
+        scope={scope}
+        supported={supportsSourceOperations}
+      />
 
       {stale && !(narrow && selection) ? (
         <p

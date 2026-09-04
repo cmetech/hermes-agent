@@ -845,6 +845,122 @@ def test_source_crud_search_and_removal_leave_an_orphaned_install(
     assert service.installed_store.package_root(installed.identity).is_dir()
 
 
+def test_source_list_records_reconcile_persisted_refresh_and_cache_state(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="zeta",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="alpha",
+            repositoryUrl=published_repo.remote.as_uri(),
+            enabled=False,
+        )
+    )
+
+    never_refreshed = service.list_source_records()
+
+    assert [item.name for item in never_refreshed] == ["alpha", "zeta"]
+    assert never_refreshed[0].enabled is False
+    assert never_refreshed[0].refresh_state is None
+    assert never_refreshed[1].attempted_at is None
+    assert never_refreshed[1].resolved_commit is None
+    assert never_refreshed[1].verified_at is None
+    assert never_refreshed[1].verified_package_count == 0
+
+    refreshed = service.refresh_source("zeta")
+    current = service.list_source_records()[1]
+
+    assert current.refresh_state == "fresh"
+    assert current.attempted_at == refreshed.verified_at
+    assert current.resolved_commit == refreshed.resolved_commit
+    assert current.verified_at == refreshed.verified_at
+    assert current.verified_package_count == 1
+    assert current.diagnostic_code is None
+    assert current.message is None
+
+    service.update_source(
+        "zeta",
+        published_repo.remote.as_uri(),
+        ref=refreshed.resolved_commit,
+        enabled=True,
+    )
+    invalidated = service.list_source_records()[1]
+
+    assert invalidated.refresh_state is None
+    assert invalidated.resolved_commit is None
+    assert invalidated.verified_at is None
+    assert invalidated.verified_package_count == 0
+
+
+def test_source_list_records_preserve_verified_cache_after_failure_and_fail_closed_on_malformed_state(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="company",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    refreshed = service.refresh_source("company")
+    configured = service.list_sources()[0]
+    service.catalog.source_store.record_failed_refresh(
+        configured,
+        WorkflowMarketplaceError(
+            "source_unavailable", "token=secret /private/tmp/checkout"
+        ),
+        attempted_at="2026-09-04T01:00:00Z",
+        state="unavailable",
+    )
+
+    stale = service.list_source_records()[0]
+    assert stale.refresh_state == "stale"
+    assert stale.attempted_at == "2026-09-04T01:00:00Z"
+    assert stale.resolved_commit == refreshed.resolved_commit
+    assert stale.verified_at == refreshed.verified_at
+    assert stale.verified_package_count == 1
+    assert stale.diagnostic_code == "source_unavailable"
+    assert "secret" not in (stale.message or "")
+    assert "/private/tmp" not in (stale.message or "")
+
+    service.catalog.source_store.catalog_path.write_text(
+        '{"schemaVersion":1,"verified":"bad"}'
+    )
+    with pytest.raises(WorkflowMarketplaceError):
+        service.list_source_records()
+
+
+def test_source_list_records_report_auth_failure_without_inventing_cache(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    configured = service.add_source(
+        WorkflowMarketplaceSource(
+            name="private",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    service.catalog.source_store.record_failed_refresh(
+        configured,
+        WorkflowMarketplaceError("source_authentication_failed", "credential rejected"),
+        attempted_at="2026-09-04T01:00:00Z",
+        state="authentication-failed",
+    )
+
+    failed = service.list_source_records()[0]
+    assert failed.refresh_state == "authentication-failed"
+    assert failed.resolved_commit is None
+    assert failed.verified_at is None
+    assert failed.verified_package_count == 0
+    assert failed.diagnostic_code == "source_authentication_failed"
+
+
 def test_source_edit_invalidates_cache_without_uninstalling_packages(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,

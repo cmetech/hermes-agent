@@ -141,6 +141,7 @@ def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -
     terminal = _wait_terminal(registry, started.id)
 
     assert started.profile == "support"
+    assert started.source_name == "company"
     assert started.id.startswith("wmop_")
     assert terminal.state == "succeeded"
     assert terminal.phase == "completed"
@@ -153,6 +154,34 @@ def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -
     with pytest.raises(Exception):
         terminal.result.value.workflows[0].state = "untrusted"
     assert registry.get(started.id, actor="operator-a").result == _result()
+    assert registry.list(actor="operator-a")[0].source_name == "company"
+    assert "target" not in started.model_dump(mode="json", by_alias=False)
+
+
+def test_operation_source_identity_is_refresh_only_and_target_derived(registry) -> None:
+    package = registry.start(
+        "install_confirm",
+        lambda _cancellation: _result(),
+        actor="operator-a",
+        target="package:company/support",
+    )
+
+    assert package.source_name is None
+
+    for target in (
+        None,
+        "company",
+        "source:",
+        "source:Company",
+        "source:company/extra",
+    ):
+        with pytest.raises(ValueError, match="refresh operation target"):
+            registry.start(
+                "refresh",
+                lambda _cancellation: _result(),
+                actor="operator-a",
+                target=target,
+            )
 
 
 def test_cancelled_fetch_never_reports_a_result(registry) -> None:
@@ -467,6 +496,7 @@ def test_terminal_ttl_evicts_only_expired_terminal_operations() -> None:
             "refresh",
             lambda cancellation: _result(),
             actor="operator-a",
+            target="source:company",
         )
         assert _wait_terminal(registry, finished.id).state == "succeeded"
 
@@ -549,6 +579,7 @@ def test_idle_registry_can_be_retired_but_active_registry_is_preserved() -> None
             "refresh",
             lambda _token: (entered.set(), release.wait(timeout=5), _result())[-1],
             actor="operator-a",
+            target="source:company",
         )
         assert entered.wait(timeout=2)
         assert registry.retire_if_idle() is False
@@ -557,7 +588,7 @@ def test_idle_registry_can_be_retired_but_active_registry_is_preserved() -> None
         assert registry.retire_if_idle() is True
         registry.close_retired()
         with pytest.raises(MarketplaceOperationRegistryError) as closed:
-            registry.start("refresh", lambda _token: _result())
+            registry.start("refresh", lambda _token: _result(), target="source:company")
         assert closed.value.code == "marketplace_operation_unavailable"
     finally:
         release.set()

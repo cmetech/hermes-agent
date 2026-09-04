@@ -23,6 +23,7 @@ from pydantic import (
     StrictInt,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from hermes_cli.git_source import (
@@ -65,7 +66,7 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$", re.ASCII)
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|auth(?:orization)?|"
-    r"password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]\s*)"
+    r"token|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]\s*)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _LOCAL_PATH = re.compile(
@@ -130,9 +131,97 @@ class MarketplaceCapabilitiesResponse(_StrictApiModel):
     ] = Field(min_length=7, max_length=7)
 
 
+class MarketplaceSourceListItem(_StrictApiModel):
+    name: str = Field(min_length=1, max_length=64, pattern=SOURCE_NAME_PATTERN)
+    repository_url: str = Field(min_length=1, max_length=4096)
+    ref: str | None = Field(default=None, min_length=1, max_length=1024)
+    enabled: StrictBool
+    refresh_state: (
+        Literal[
+            "fresh",
+            "stale",
+            "authentication-failed",
+            "malformed",
+            "incompatible",
+            "unavailable",
+        ]
+        | None
+    ) = None
+    attempted_at: str | None = Field(default=None, min_length=20, max_length=64)
+    resolved_commit: str | None = Field(default=None, pattern=_COMMIT.pattern)
+    verified_at: str | None = Field(default=None, min_length=20, max_length=64)
+    verified_package_count: StrictInt = Field(ge=0, le=4096)
+    diagnostic_code: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=_ERROR_CODE.pattern
+    )
+    message: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    @field_validator("repository_url")
+    @classmethod
+    def validate_repository_url(cls, value: str) -> str:
+        try:
+            validate_credential_free_git_source(value)
+        except GitSourceError as error:
+            raise ValueError("repository URL is invalid") from error
+        return value
+
+    @field_validator("attempted_at", "verified_at")
+    @classmethod
+    def validate_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.endswith("Z"):
+            raise ValueError("timestamp is invalid")
+        try:
+            from datetime import datetime, timezone
+
+            parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+        except ValueError as error:
+            raise ValueError("timestamp is invalid") from error
+        if parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") != value:
+            raise ValueError("timestamp is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def require_refresh_cache_relationship(self) -> "MarketplaceSourceListItem":
+        has_verified = self.resolved_commit is not None or self.verified_at is not None
+        if (self.resolved_commit is None) != (self.verified_at is None):
+            raise ValueError("verified source cache identity is incomplete")
+        if not has_verified and self.verified_package_count != 0:
+            raise ValueError("package count requires a verified source cache")
+        if self.refresh_state is None:
+            if (
+                self.attempted_at is not None
+                or self.diagnostic_code is not None
+                or self.message is not None
+                or has_verified
+            ):
+                raise ValueError("never-refreshed source contains refresh state")
+        elif self.attempted_at is None:
+            raise ValueError("refresh state requires an attempted timestamp")
+        elif self.refresh_state == "fresh":
+            if (
+                not has_verified
+                or self.diagnostic_code is not None
+                or self.message is not None
+            ):
+                raise ValueError("fresh source cache relationship is invalid")
+        elif self.refresh_state == "stale":
+            if not has_verified or self.diagnostic_code is None or self.message is None:
+                raise ValueError("stale source cache relationship is invalid")
+        elif (
+            has_verified
+            or self.verified_package_count != 0
+            or self.diagnostic_code is None
+            or self.message is None
+        ):
+            raise ValueError("failed source refresh relationship is invalid")
+        return self
+
+
 class MarketplaceSourceListResponse(_StrictApiModel):
     profile: str = Field(min_length=1, max_length=256)
-    sources: list[WorkflowMarketplaceSource] = Field(max_length=128)
+    sources: list[MarketplaceSourceListItem] = Field(max_length=128)
 
 
 class MarketplaceSourceResponse(_StrictApiModel):
@@ -879,7 +968,16 @@ def create_marketplace_router(
     def list_sources(request: Request):
         _authorize(verified_operator, request, "read")
         _key, profile, service, _registry = api.current()
-        sources = _service_call(service.list_sources)
+        source_records = _service_call(service.list_source_records)
+        sources = [
+            MarketplaceSourceListItem.model_validate(
+                _sanitize_result(
+                    _public(source),
+                    allow_confirmation_token=False,
+                )
+            )
+            for source in source_records
+        ]
         return MarketplaceSourceListResponse(
             profile=profile,
             sources=sorted(sources, key=lambda item: item.name),
@@ -1453,6 +1551,7 @@ __all__ = [
     "MarketplaceOperationPage",
     "MarketplacePackagePage",
     "MarketplaceSourceListResponse",
+    "MarketplaceSourceListItem",
     "MarketplaceSourceResponse",
     "WorkflowMarketplaceApiContext",
     "create_marketplace_router",

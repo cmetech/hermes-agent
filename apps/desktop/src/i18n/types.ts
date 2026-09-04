@@ -2140,6 +2140,41 @@ export interface Translations {
     workflowMarketplaceNoRequirements: string
     workflowMarketplaceInstalledPackages: string
     workflowMarketplaceSourceUnavailable: string
+    workflowMarketplaceManageSources: string
+    workflowMarketplaceRefresh: string
+    workflowMarketplaceRefreshAll: string
+    workflowMarketplaceSourcesTitle: string
+    workflowMarketplaceSourcesDescription: string
+    workflowMarketplaceAddSource: string
+    workflowMarketplaceEditSource: (source: string) => string
+    workflowMarketplaceRemoveSource: (source: string) => string
+    workflowMarketplaceRemoveSourceAction: string
+    workflowMarketplaceEnableSource: (source: string) => string
+    workflowMarketplaceDisableSource: (source: string) => string
+    workflowMarketplaceRefreshSource: (source: string) => string
+    workflowMarketplaceSourceArticle: (source: string) => string
+    workflowMarketplaceSourceName: string
+    workflowMarketplaceRepositoryUrl: string
+    workflowMarketplaceGitRef: string
+    workflowMarketplaceSaveSource: string
+    workflowMarketplaceEnabled: string
+    workflowMarketplaceDisabled: string
+    workflowMarketplaceDefaultBranch: string
+    workflowMarketplaceLastVerified: (timestamp: string) => string
+    workflowMarketplaceLastAttempted: (timestamp: string) => string
+    workflowMarketplaceNeverVerified: string
+    workflowMarketplacePackageCount: (count: number) => string
+    workflowMarketplaceFresh: string
+    workflowMarketplaceAuthenticationRequired: string
+    workflowMarketplaceUnavailable: string
+    workflowMarketplaceNeverRefreshed: string
+    workflowMarketplaceRefreshStatusUnavailable: string
+    workflowMarketplaceOperationEvicted: string
+    workflowMarketplaceAuthGuidance: string
+    workflowMarketplaceSafeError: string
+    workflowMarketplaceRemoveTitle: (source: string) => string
+    workflowMarketplaceRemoveDescription: string
+    workflowMarketplaceUnsupportedSources: string
     workflowCatalog: string
     workflowCatalogLoading: string
     workflowCatalogErrorTitle: string

@@ -81,6 +81,7 @@ from .package import (
 )
 from .provenance import InstalledPackageStore, direct_source_key
 from .source_store import (
+    RefreshState,
     WorkflowSourceStore,
     _path_entry_exists,
     _read_bounded,
@@ -597,6 +598,23 @@ class _FetchedCandidate:
     package_path: str
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowMarketplaceSourceListing:
+    """One configured source joined to its last persisted refresh authority."""
+
+    name: str
+    repository_url: str
+    ref: str | None
+    enabled: bool
+    refresh_state: RefreshState | None
+    attempted_at: str | None
+    resolved_commit: str | None
+    verified_at: str | None
+    verified_package_count: int
+    diagnostic_code: str | None
+    message: str | None
+
+
 class WorkflowMarketplaceService:
     """Own source, package lifecycle, review, and origin-aware trust rules."""
 
@@ -666,6 +684,43 @@ class WorkflowMarketplaceService:
 
     def list_sources(self) -> tuple[WorkflowMarketplaceSource, ...]:
         return self.catalog.source_store.list_sources()
+
+    def list_source_records(self) -> tuple[WorkflowMarketplaceSourceListing, ...]:
+        """Return source configuration and cache status from one locked snapshot."""
+
+        sources, verified_catalogs, refresh_statuses = (
+            self.catalog.source_store.snapshot()
+        )
+        verified_by_name = {
+            catalog.source.name: catalog for catalog in verified_catalogs
+        }
+        status_by_name = {status.source_name: status for status in refresh_statuses}
+        records: list[WorkflowMarketplaceSourceListing] = []
+        for source in sorted(sources, key=lambda item: item.name):
+            verified = verified_by_name.get(source.name)
+            status = status_by_name.get(source.name)
+            records.append(
+                WorkflowMarketplaceSourceListing(
+                    name=source.name,
+                    repository_url=source.repository_url,
+                    ref=source.ref,
+                    enabled=source.enabled,
+                    refresh_state=status.state if status is not None else None,
+                    attempted_at=status.attempted_at if status is not None else None,
+                    resolved_commit=(
+                        verified.resolved_commit if verified is not None else None
+                    ),
+                    verified_at=verified.verified_at if verified is not None else None,
+                    verified_package_count=(
+                        len(verified.packages) if verified is not None else 0
+                    ),
+                    diagnostic_code=(
+                        status.diagnostic_code if status is not None else None
+                    ),
+                    message=status.message if status is not None else None,
+                )
+            )
+        return tuple(records)
 
     def set_source_enabled(self, name: str, enabled: bool) -> WorkflowMarketplaceSource:
         return self.catalog.source_store.set_enabled(name, enabled)
@@ -2144,4 +2199,8 @@ class WorkflowMarketplaceService:
         }
 
 
-__all__ = ["ConfirmationTargetMetadata", "WorkflowMarketplaceService"]
+__all__ = [
+    "ConfirmationTargetMetadata",
+    "WorkflowMarketplaceService",
+    "WorkflowMarketplaceSourceListing",
+]

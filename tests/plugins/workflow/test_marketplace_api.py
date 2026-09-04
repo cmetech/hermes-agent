@@ -52,6 +52,7 @@ from plugins.workflow.marketplace.operations import (
 from plugins.workflow.marketplace.service import (
     ConfirmationTargetMetadata,
     WorkflowMarketplaceService,
+    WorkflowMarketplaceSourceListing,
 )
 
 
@@ -319,6 +320,25 @@ class _FakeService:
     def list_sources(self):
         self.calls.append(("list_sources",))
         return tuple(self.sources)
+
+    def list_source_records(self):
+        self.calls.append(("list_source_records",))
+        return tuple(
+            WorkflowMarketplaceSourceListing(
+                name=source.name,
+                repository_url=source.repository_url,
+                ref=source.ref,
+                enabled=source.enabled,
+                refresh_state=None,
+                attempted_at=None,
+                resolved_commit=None,
+                verified_at=None,
+                verified_package_count=0,
+                diagnostic_code=None,
+                message=None,
+            )
+            for source in self.sources
+        )
 
     def update_source(self, name, repository_url, *, ref, enabled):
         self.calls.append(("update_source", name, repository_url, ref, enabled))
@@ -590,7 +610,21 @@ def test_source_crud_is_strict_and_returns_credential_free_models(api) -> None:
     assert disabled.status_code == 200
     assert disabled.json()["source"]["enabled"] is False
     assert listed.status_code == 200
-    assert [item["name"] for item in listed.json()["sources"]] == ["company"]
+    assert listed.json()["sources"] == [
+        {
+            "attempted_at": None,
+            "diagnostic_code": None,
+            "enabled": False,
+            "message": None,
+            "name": "company",
+            "ref": "stable",
+            "refresh_state": None,
+            "repository_url": "https://example.test/updated.git",
+            "resolved_commit": None,
+            "verified_at": None,
+            "verified_package_count": 0,
+        }
+    ]
     assert removed.status_code == 200
 
 
@@ -618,6 +652,37 @@ def test_source_enable_rejects_coercion_and_unknown_fields(api, body) -> None:
 
     assert response.status_code == 422
     assert response.json()["detail"] == {"code": "marketplace_request_invalid"}
+
+
+def test_source_list_projection_redacts_local_repository_and_diagnostic_secrets(
+    api,
+) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="file:///private/tmp/operator/repo.git",
+            ref=None,
+            enabled=True,
+            refresh_state="stale",
+            attempted_at=_NOW,
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            verified_package_count=1,
+            diagnostic_code="source_unavailable",
+            message="token=secret",
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    encoded = json.dumps(response.json())
+    assert response.json()["sources"][0]["repository_url"] == "file:///REDACTED"
+    assert "secret" not in encoded
+    assert "/private/tmp" not in encoded
 
 
 @pytest.mark.parametrize(
@@ -895,8 +960,11 @@ def test_lifecycle_route_groups_are_thin_background_adapters(
     terminal = _wait_operation(client, started.json()["id"])
 
     assert started.status_code == 202
+    assert started.json()["source_name"] is None
     assert terminal["state"] == "succeeded"
+    assert terminal["source_name"] is None
     assert terminal["result"]["type"] == result_type
+    assert "target" not in json.dumps(terminal)
     assert any(call[0] == call_name for call in service.calls)
 
 
@@ -907,7 +975,16 @@ def test_operation_lookup_and_cancel_do_not_cross_actor_or_profile_scope(api) ->
         headers=_headers(),
     )
     operation_id = started.json()["id"]
-    _wait_operation(client, operation_id)
+    terminal = _wait_operation(client, operation_id)
+    listed = client.get(
+        "/api/plugins/workflow/marketplace/operations",
+        headers=_headers("read"),
+    ).json()["operations"]
+
+    assert started.json()["source_name"] == "company"
+    assert terminal["source_name"] == "company"
+    assert next(item for item in listed if item["id"] == operation_id) == terminal
+    assert "target" not in json.dumps(started.json())
 
     profile[0] = "other"
     home[0] = home[0].parent / "other"
@@ -1730,7 +1807,9 @@ def test_profile_context_evicts_idle_lru_and_preserves_result_isolation(
     )
     try:
         _key_a, _profile_a, _service_a, registry_a = context.current()
-        old = registry_a.start("refresh", lambda _token: _registry_result())
+        old = registry_a.start(
+            "refresh", lambda _token: _registry_result(), target="source:company"
+        )
         _wait_terminal = time.monotonic() + 2
         while registry_a.get(old.id).state not in {
             "succeeded",
@@ -1741,7 +1820,9 @@ def test_profile_context_evicts_idle_lru_and_preserves_result_isolation(
             time.sleep(0.01)
         home[0] = tmp_path / "b"
         _key_b, _profile_b, _service_b, registry_b = context.current()
-        old_b = registry_b.start("refresh", lambda _token: _registry_result())
+        old_b = registry_b.start(
+            "refresh", lambda _token: _registry_result(), target="source:company"
+        )
         deadline = time.monotonic() + 2
         while registry_b.get(old_b.id).state not in {
             "succeeded",
@@ -1756,7 +1837,9 @@ def test_profile_context_evicts_idle_lru_and_preserves_result_isolation(
         context.current()
 
         with pytest.raises(MarketplaceOperationRegistryError):
-            registry_b.start("refresh", lambda _token: _registry_result())
+            registry_b.start(
+                "refresh", lambda _token: _registry_result(), target="source:company"
+            )
         home[0] = tmp_path / "b"
         replacement = context.registry_for_current_profile()
         assert replacement is not registry_b
@@ -1788,6 +1871,7 @@ def test_profile_context_rejects_new_profile_while_capacity_is_active(
         registry.start(
             "refresh",
             lambda _token: (release.wait(timeout=5), _registry_result())[-1],
+            target="source:company",
         )
         home[0] = tmp_path / "b"
         with pytest.raises(HTTPException) as full:
@@ -1822,6 +1906,7 @@ def test_profile_context_shutdown_uses_one_overall_deadline(tmp_path) -> None:
                     release.wait(timeout=5),
                     _registry_result(),
                 )[-1],
+                target="source:company",
             )
         assert all(marker.wait(timeout=2) for marker in entered)
 
@@ -1871,7 +1956,7 @@ def test_unexpected_sync_exceptions_use_a_stable_redacted_json_envelope(api) -> 
             "https://user:secret@example.test/private /tmp/.staging token=secret"
         )
 
-    service.list_sources = fail
+    service.list_source_records = fail
     response = client.get(
         "/api/plugins/workflow/marketplace/sources",
         headers=_headers("read"),

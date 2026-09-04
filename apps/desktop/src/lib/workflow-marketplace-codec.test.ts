@@ -315,6 +315,7 @@ function operation(type: keyof typeof RESULT_KIND = 'installed_package') {
     progress: 100,
     result: operationResult(type),
     schema_version: 1,
+    source_name: RESULT_KIND[type] === 'refresh' ? 'company' : null,
     started_at: NOW,
     state: 'succeeded',
     updated_at: NOW
@@ -393,7 +394,23 @@ describe('workflow marketplace codec', () => {
         schema_version: 1
       })
     ).not.toBeNull()
-    expect(decodeWorkflowMarketplaceSourceList({ profile: 'support', sources: [source] })).not.toBeNull()
+    expect(
+      decodeWorkflowMarketplaceSourceList({
+        profile: 'support',
+        sources: [
+          {
+            ...source,
+            attempted_at: NOW,
+            diagnostic_code: null,
+            message: null,
+            refresh_state: 'fresh',
+            resolved_commit: COMMIT,
+            verified_at: NOW,
+            verified_package_count: 1
+          }
+        ]
+      })
+    ).not.toBeNull()
     expect(decodeWorkflowMarketplaceSourceResponse({ profile: 'support', source, status: 'created' })).not.toBeNull()
     expect(
       decodeWorkflowMarketplaceSearchPage({
@@ -445,12 +462,21 @@ describe('workflow marketplace codec', () => {
 
       for (const [, wrongKind] of entries) {
         if (wrongKind !== expectedKind) {
-          expect(decodeMarketplaceOperation({ ...operation(knownResultType), kind: wrongKind })).toBeNull()
+          expect(
+            decodeMarketplaceOperation({
+              ...operation(knownResultType),
+              kind: wrongKind,
+              source_name: wrongKind === 'refresh' ? 'company' : null
+            })
+          ).toBeNull()
         }
       }
     }
 
     expect(decodeMarketplaceOperation({ ...operation(), kind: 'future_marketplace_action' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...operation('source_refresh'), source_name: null })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...operation('source_refresh'), source_name: 'Company' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...operation('installed_package'), source_name: 'company' })).toBeNull()
   })
 
   it('enforces exact operation state/result/error pairings', () => {
@@ -486,10 +512,11 @@ describe('workflow marketplace codec', () => {
     const cancelled = { ...failed, error: null, phase: 'cancelled', state: 'cancelled' }
 
     for (const kind of Object.values(RESULT_KIND)) {
-      expect(decodeMarketplaceOperation({ ...pending, kind })).not.toBeNull()
-      expect(decodeMarketplaceOperation({ ...running, kind, phase: 'running' })).not.toBeNull()
-      expect(decodeMarketplaceOperation({ ...failed, kind })).not.toBeNull()
-      expect(decodeMarketplaceOperation({ ...cancelled, kind })).not.toBeNull()
+      const source_name = kind === 'refresh' ? 'company' : null
+      expect(decodeMarketplaceOperation({ ...pending, kind, source_name })).not.toBeNull()
+      expect(decodeMarketplaceOperation({ ...running, kind, phase: 'running', source_name })).not.toBeNull()
+      expect(decodeMarketplaceOperation({ ...failed, kind, source_name })).not.toBeNull()
+      expect(decodeMarketplaceOperation({ ...cancelled, kind, source_name })).not.toBeNull()
     }
 
     expect(decodeMarketplaceOperation({ ...pending, result: operationResult('installed_package') })).toBeNull()
@@ -501,7 +528,9 @@ describe('workflow marketplace codec', () => {
     expect(decodeMarketplaceOperation({ ...operation(), phase: 'committing' })).toBeNull()
     expect(decodeMarketplaceOperation({ ...failed, phase: 'completed' })).toBeNull()
     expect(decodeMarketplaceOperation({ ...cancelled, phase: 'failed' })).toBeNull()
-    expect(decodeMarketplaceOperation({ ...running, kind: 'refresh', phase: 'committing' })).toBeNull()
+    expect(
+      decodeMarketplaceOperation({ ...running, kind: 'refresh', phase: 'committing', source_name: 'company' })
+    ).toBeNull()
     expect(decodeMarketplaceOperation({ ...running, kind: 'install_confirm', phase: 'committing' })).not.toBeNull()
     expect(decodeMarketplaceOperation({ ...running, progress: 99 })).not.toBeNull()
     expect(decodeMarketplaceOperation({ ...running, progress: 100 })).toBeNull()
@@ -561,13 +590,92 @@ describe('workflow marketplace codec', () => {
       decodeWorkflowMarketplaceSourceList({
         profile: 'support',
         sources: Array.from({ length: 129 }, (_, index) => ({
+          attempted_at: null,
+          diagnostic_code: null,
           enabled: true,
+          message: null,
           name: `source-${index}`,
           ref: null,
-          repository_url: 'https://example.test/team/workflows.git'
+          refresh_state: null,
+          repository_url: 'https://example.test/team/workflows.git',
+          resolved_commit: null,
+          verified_at: null,
+          verified_package_count: 0
         }))
       })
     ).toBeNull()
+  })
+
+  it('enforces exact source-list refresh and verified-cache relationships', () => {
+    const base = {
+      enabled: true,
+      name: 'company',
+      ref: null,
+      repository_url: 'https://example.test/team/workflows.git'
+    }
+
+    const fresh = {
+      ...base,
+      attempted_at: NOW,
+      diagnostic_code: null,
+      message: null,
+      refresh_state: 'fresh',
+      resolved_commit: COMMIT,
+      verified_at: NOW,
+      verified_package_count: 1
+    }
+
+    const stale = {
+      ...fresh,
+      diagnostic_code: 'source_unavailable',
+      message: 'workflow marketplace source is unavailable',
+      refresh_state: 'stale'
+    }
+
+    const authenticationFailure = {
+      ...base,
+      attempted_at: NOW,
+      diagnostic_code: 'source_authentication_failed',
+      message: 'workflow marketplace source authentication failed',
+      refresh_state: 'authentication-failed',
+      resolved_commit: null,
+      verified_at: null,
+      verified_package_count: 0
+    }
+
+    for (const sourceRecord of [
+      {
+        ...base,
+        attempted_at: null,
+        diagnostic_code: null,
+        message: null,
+        refresh_state: null,
+        resolved_commit: null,
+        verified_at: null,
+        verified_package_count: 0
+      },
+      fresh,
+      stale,
+      authenticationFailure,
+      { ...fresh, enabled: false }
+    ]) {
+      expect(decodeWorkflowMarketplaceSourceList({ profile: 'support', sources: [sourceRecord] })).not.toBeNull()
+    }
+
+    for (const sourceRecord of [
+      { ...fresh, unexpected: true },
+      { ...fresh, attempted_at: 'yesterday' },
+      { ...fresh, resolved_commit: null },
+      { ...fresh, verified_at: null },
+      { ...fresh, diagnostic_code: 'source_failed', message: 'failed' },
+      { ...stale, diagnostic_code: null },
+      { ...authenticationFailure, resolved_commit: COMMIT, verified_at: NOW, verified_package_count: 1 },
+      { ...authenticationFailure, message: 'token=secret' },
+      { ...authenticationFailure, message: 'token=secret /private/tmp/checkout' },
+      { ...authenticationFailure, refresh_state: 'cancelled' }
+    ]) {
+      expect(decodeWorkflowMarketplaceSourceList({ profile: 'support', sources: [sourceRecord] })).toBeNull()
+    }
   })
 
   it.each([

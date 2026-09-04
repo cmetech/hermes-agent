@@ -21,22 +21,28 @@ import { marketplaceKeys } from './query-keys'
 import { WorkflowMarketplaceView } from './index'
 
 const api = vi.hoisted(() => ({
+  cancelOperation: vi.fn(),
   capabilities: vi.fn(),
   getOperation: vi.fn(),
   inspect: vi.fn(),
   installed: vi.fn(),
+  listOperations: vi.fn(),
+  refreshSource: vi.fn(),
   search: vi.fn(),
   sources: vi.fn()
 }))
 
 vi.mock('@/hermes', () => ({
+  cancelWorkflowMarketplaceOperation: (...args: unknown[]) => api.cancelOperation(...args),
   getWorkflowMarketplaceCapabilities: (...args: unknown[]) => api.capabilities(...args),
   getWorkflowMarketplaceOperation: (...args: unknown[]) => api.getOperation(...args),
   inspectWorkflowPackage: (...args: unknown[]) => api.inspect(...args),
   isWorkflowMarketplaceUnsupportedError: (error: unknown) =>
     typeof error === 'object' && error !== null && 'code' in error && error.code === 'marketplace_unsupported',
   listInstalledWorkflowPackages: (...args: unknown[]) => api.installed(...args),
+  listWorkflowMarketplaceOperations: (...args: unknown[]) => api.listOperations(...args),
   listWorkflowMarketplaceSources: (...args: unknown[]) => api.sources(...args),
+  refreshWorkflowMarketplaceSource: (...args: unknown[]) => api.refreshSource(...args),
   searchWorkflowPackages: (...args: unknown[]) => api.search(...args)
 }))
 
@@ -201,6 +207,7 @@ function succeededDetail(detail = packageDetail(), id = OPERATION_ID): WorkflowM
     progress: 100,
     result: { type: 'package_detail', value: detail },
     schema_version: 1,
+    source_name: null,
     started_at: NOW,
     state: 'succeeded',
     updated_at: NOW
@@ -219,8 +226,40 @@ function pendingDetail(id = OPERATION_ID): WorkflowMarketplaceOperation {
     progress: 0,
     result: null,
     schema_version: 1,
+    source_name: null,
     started_at: null,
     state: 'pending',
+    updated_at: NOW
+  }
+}
+
+function succeededRefresh(sourceName: string): WorkflowMarketplaceOperation {
+  return {
+    created_at: NOW,
+    error: null,
+    finished_at: NOW,
+    id: OPERATION_ID,
+    kind: 'refresh',
+    phase: 'completed',
+    profile: 'support',
+    progress: 100,
+    result: {
+      type: 'source_refresh',
+      value: {
+        diagnostic_code: null,
+        message: null,
+        package_count: 1,
+        repository_url: 'https://example.test/company/workflows.git',
+        resolved_commit: COMMIT,
+        source_name: sourceName,
+        state: 'fresh',
+        verified_at: NOW
+      }
+    },
+    schema_version: 1,
+    source_name: sourceName,
+    started_at: NOW,
+    state: 'succeeded',
     updated_at: NOW
   }
 }
@@ -235,6 +274,7 @@ function terminalDetail(state: 'cancelled' | 'failed'): WorkflowMarketplaceOpera
     progress: 50,
     result: null,
     schema_version: 1,
+    source_name: null,
     started_at: NOW,
     updated_at: NOW
   } as const
@@ -305,16 +345,30 @@ beforeEach(() => {
     profile: 'support',
     sources: [
       {
+        attempted_at: NOW,
+        diagnostic_code: null,
         enabled: true,
+        message: null,
         name: 'company',
         ref: 'main',
-        repository_url: 'https://example.test/company/workflows.git'
+        refresh_state: 'fresh',
+        repository_url: 'https://example.test/company/workflows.git',
+        resolved_commit: COMMIT,
+        verified_at: NOW,
+        verified_package_count: 1
       },
       {
+        attempted_at: null,
+        diagnostic_code: null,
         enabled: false,
+        message: null,
         name: 'disabled-source',
         ref: null,
-        repository_url: 'ssh://git@example.test/company/disabled.git'
+        refresh_state: null,
+        repository_url: 'ssh://git@example.test/company/disabled.git',
+        resolved_commit: null,
+        verified_at: null,
+        verified_package_count: 0
       }
     ]
   })
@@ -322,6 +376,9 @@ beforeEach(() => {
   api.installed.mockReset().mockResolvedValue({ packages: [installedPackage()], profile: 'support' })
   api.inspect.mockReset().mockResolvedValue(succeededDetail())
   api.getOperation.mockReset().mockResolvedValue(succeededDetail())
+  api.listOperations.mockReset().mockResolvedValue({ limit: 100, offset: 0, operations: [], profile: 'support' })
+  api.cancelOperation.mockReset()
+  api.refreshSource.mockReset().mockImplementation((name: string) => Promise.resolve(succeededRefresh(name)))
 })
 
 afterEach(() => {
@@ -336,6 +393,8 @@ describe('marketplace query keys', () => {
     expect(marketplaceKeys.capabilities(scopeKey)).toEqual(['workflow-marketplace', scopeKey, 'capabilities'])
     expect(marketplaceKeys.sources(scopeKey)).toEqual(['workflow-marketplace', scopeKey, 'sources'])
     expect(marketplaceKeys.installed(scopeKey)).toEqual(['workflow-marketplace', scopeKey, 'installed'])
+    expect(marketplaceKeys.operations(scopeKey)).toEqual(['workflow-marketplace', scopeKey, 'operations'])
+    expect(marketplaceKeys.searchRoot(scopeKey)).toEqual(['workflow-marketplace', scopeKey, 'search'])
     expect(marketplaceKeys.search(scopeKey, { limit: 50, offset: 50, query: 'laptop', source: 'company' })).toEqual([
       'workflow-marketplace',
       scopeKey,
@@ -356,6 +415,44 @@ describe('marketplace query keys', () => {
 })
 
 describe('WorkflowMarketplaceView', () => {
+  it('shows feature-detected Refresh and Manage Sources actions and returns focus after closing', async () => {
+    renderMarketplace()
+
+    const manage = await screen.findByRole('button', { name: 'Manage Sources' })
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeTruthy()
+    manage.focus()
+    fireEvent.click(manage)
+    expect(await screen.findByRole('dialog', { name: 'Workflow sources' })).toBeTruthy()
+    const dialog = screen.getByRole('dialog', { name: 'Workflow sources' })
+    fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' })[0])
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Workflow sources' })).toBeNull())
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(manage))
+  })
+
+  it('does not imply source operations when only catalog search is supported', async () => {
+    api.capabilities.mockResolvedValueOnce({ capabilities: ['search'], profile: 'support', schema_version: 1 })
+    renderMarketplace()
+
+    expect(await screen.findByRole('searchbox', { name: 'Search workflow packages' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Refresh' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Manage Sources' })).toBeNull()
+    expect(screen.getByText('Upgrade Hermes to manage and refresh workflow sources.')).toBeTruthy()
+  })
+
+  it('refreshes enabled sources sequentially from the toolbar and skips disabled sources', async () => {
+    const order: string[] = []
+    api.refreshSource.mockImplementation(async (name: string) => {
+      order.push(name)
+
+      return succeededRefresh(name)
+    })
+    renderMarketplace()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(order).toEqual(['company']))
+    expect(api.refreshSource).toHaveBeenCalledWith('company', scopeA)
+    expect(api.refreshSource).not.toHaveBeenCalledWith('disabled-source', expect.anything())
+  })
   it('feature-detects before search and shows upgrade guidance for an older backend', async () => {
     const probe = deferred<never>()
     api.capabilities.mockReturnValue(probe.promise)
