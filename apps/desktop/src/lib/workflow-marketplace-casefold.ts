@@ -153,9 +153,14 @@ function normalizeNfc(value: string): string {
 
 /** Mirrors Python 3.11's Unicode 14 NFC + str.casefold marketplace identity. */
 export function workflowMarketplaceCanonicalIdentity(value: string): string {
+  return workflowMarketplaceCasefold(normalizeNfc(value))
+}
+
+/** Mirrors Python 3.11's Unicode 14 str.casefold without normalization. */
+export function workflowMarketplaceCasefold(value: string): string {
   let result = ''
 
-  for (const character of normalizeNfc(value)) {
+  for (const character of value) {
     result += casefoldEntries.get(character) ?? character
   }
 

@@ -38,7 +38,7 @@ import type {
   WorkflowMarketplaceUpdateReview
 } from '@/types/hermes'
 
-import { workflowMarketplaceCanonicalIdentity } from './workflow-marketplace-casefold'
+import { workflowMarketplaceCanonicalIdentity, workflowMarketplaceCasefold } from './workflow-marketplace-casefold'
 
 const SHA256 = /^[0-9a-f]{64}$/
 const COMMIT = /^[0-9a-f]{40}$/
@@ -313,6 +313,7 @@ function repeatedlyDecode(value: string): string[] | null {
 
 const ENCODED_URL_DELIMITER = /%(?:2f|3a|3f|23|40|5c)/i
 const REDACTED_PLACEHOLDER = /^(?:\[?redacted(?:_path)?\]?)(?:\.git)?$/i
+const CREDENTIAL_PARAMETER_BOUNDARY = /[?#&;]([A-Za-z0-9_.~+%-]+)=/g
 
 function hasDotSegment(value: string): boolean {
   return /(?:^|[/:?#&;=])\.{1,2}(?=$|[/:?#&;=])/.test(value)
@@ -339,7 +340,7 @@ function parameterNameWords(name: string): Set<string> {
 
   const separated = decoded.replace(/(?<=[a-z0-9])(?=[A-Z])/g, ' ').replace(/(?<=[A-Z])(?=[A-Z][a-z])/g, ' ')
 
-  return new Set(separated.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+  return new Set(workflowMarketplaceCasefold(separated).match(/[a-z0-9]+/g) ?? [])
 }
 
 function isCredentialQualifierSequence(value: string): boolean {
@@ -369,7 +370,7 @@ function parameterNameContainsCredentials(name: string): boolean {
     return true
   }
 
-  const compactName = name.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const compactName = workflowMarketplaceCasefold(name).replace(/[^a-z0-9]+/g, '')
 
   return CREDENTIAL_COMPOUND_SUFFIXES.some(
     suffix => compactName.endsWith(suffix) && isCredentialQualifierSequence(compactName.slice(0, -suffix.length))
@@ -377,20 +378,7 @@ function parameterNameContainsCredentials(name: string): boolean {
 }
 
 function hasCredentialParameter(value: string): boolean {
-  const queryIndex = value.indexOf('?')
-  const fragmentIndex = value.indexOf('#')
-  const indices = [queryIndex, fragmentIndex].filter(index => index >= 0)
-
-  return indices.some(index =>
-    value
-      .slice(index + 1)
-      .split(/[&#;]/)
-      .some(parameter => {
-        const separator = parameter.indexOf('=')
-
-        return separator >= 0 && parameterNameContainsCredentials(parameter.slice(0, separator))
-      })
-  )
+  return [...value.matchAll(CREDENTIAL_PARAMETER_BOUNDARY)].some(match => parameterNameContainsCredentials(match[1]))
 }
 
 function hasRedactedPlaceholder(value: string): boolean {
@@ -504,8 +492,8 @@ function safeRepositoryUrl(value: unknown, mode: RepositoryUrlMode): string | nu
     return null
   }
 
-  if (/^git@[A-Za-z0-9.-]+:[^?\s]+$/.test(candidate)) {
-    if (!/^git@[A-Za-z0-9.-]+:[^?\s]+$/.test(fullyDecoded)) {
+  if (candidate.startsWith('git@')) {
+    if (!isSafeScpRepositoryUrl(candidate) || !isSafeScpRepositoryUrl(fullyDecoded)) {
       return null
     }
 
@@ -539,6 +527,13 @@ function safeRepositoryUrl(value: unknown, mode: RepositoryUrlMode): string | nu
   return safeFileRepositoryUrl(candidate, parsed, mode)
 }
 
+function isSafeScpRepositoryUrl(value: string): boolean {
+  const primary = value.split('#', 1)[0]
+  const match = /^git@([^@\s/:?#]+):(.+)$/.exec(primary)
+
+  return match !== null && !primary.includes('?') && !primary.slice(4).includes('@') && !/\s/.test(value)
+}
+
 export function isWorkflowMarketplaceRepositoryUrl(value: unknown): value is string {
   return safeRepositoryUrl(value, 'response') !== null
 }
@@ -546,14 +541,7 @@ export function isWorkflowMarketplaceRepositoryUrl(value: unknown): value is str
 function isSafeRepositoryShorthand(value: unknown): value is string {
   const decoded = cleanText(value, 1, 4096)
 
-  if (
-    decoded === null ||
-    containsControl(decoded) ||
-    decoded.includes('://') ||
-    decoded.includes('@') ||
-    decoded.includes('\\') ||
-    decoded.includes(':')
-  ) {
+  if (decoded === null || containsControl(decoded) || decoded.includes('\\')) {
     return false
   }
 
@@ -563,7 +551,17 @@ function isSafeRepositoryShorthand(value: unknown): value is string {
     return false
   }
 
-  const parts = decoded.split('/')
+  const boundary = [decoded.indexOf('?'), decoded.indexOf('#')]
+    .filter(index => index >= 0)
+    .reduce((left, right) => Math.min(left, right), decoded.length)
+
+  const identity = decoded.slice(0, boundary)
+
+  if (identity.includes('://') || identity.includes('@') || identity.includes(':')) {
+    return false
+  }
+
+  const parts = identity.split('/')
 
   return (
     parts.length >= 2 &&

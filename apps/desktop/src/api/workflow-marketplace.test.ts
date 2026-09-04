@@ -349,6 +349,7 @@ describe('workflow marketplace API', () => {
     'https://example.test/team/workflows.git',
     'ssh://git@example.test/team/workflows.git',
     'git@example.test:team/workflows.git',
+    'git@corp_alias:team/workflows.git',
     'file:/Users/operator/projects/workflows.git',
     'file:/tmp/workflows.git',
     'file:/Users/operator/.cache/workflows.git',
@@ -657,7 +658,12 @@ describe('workflow marketplace API', () => {
       ),
     () => prepareWorkflowPackageInstall({ identifier: 'file:///REDACTED' }, scope),
     () => prepareWorkflowPackageInstall({ identifier: 'owner/repository?access_token=secret' }, scope),
-    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository#access_token=secret' }, scope)
+    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository#access_token=secret' }, scope),
+    () =>
+      prepareWorkflowPackageInstall(
+        { identifier: 'owner/repository?next=https://private.test/repo?access_token=secret' },
+        scope
+      )
   ])('rejects unsafe client input before issuing a request', async call => {
     await expect(call()).rejects.toBeInstanceOf(TypeError)
     expect(apiStructured).not.toHaveBeenCalled()

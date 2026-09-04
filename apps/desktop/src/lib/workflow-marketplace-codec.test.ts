@@ -669,6 +669,7 @@ describe('workflow marketplace codec', () => {
       'owner/repository?monkey=value',
       'owner/repository#packages/support'
     ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(identifier)).toBe(true)
       expect(isWorkflowMarketplaceInstallIdentifier(identifier)).toBe(true)
     }
 
@@ -686,6 +687,64 @@ describe('workflow marketplace codec', () => {
       )
       expect(isWorkflowMarketplaceInstallIdentifier(`owner/repository?${key}=secret`)).toBe(false)
     }
+  })
+
+  it('scans credential parameters at every nested Git-source boundary', () => {
+    for (const identifier of [
+      'https://example.test/team/workflows.git?monkey=value&hockey=value&keyboard=value&keynote=value',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git?monkey=value',
+      'owner/repository#next=https://private.test/team/repo.git?keyboard=value'
+    ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(identifier)).toBe(true)
+      expect(isWorkflowMarketplaceInstallIdentifier(identifier)).toBe(true)
+    }
+
+    for (const identifier of [
+      'https://example.test/team/workflows.git?key=secret',
+      'https://example.test/team/workflows.git?%E2%84%AAey=secret',
+      'https://example.test/team/workflows.git?%C5%BFecret=secret',
+      'https://example.test/team/workflows.git?clie%6EtSecret=secret',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git?access_token=secret',
+      'https://example.test/team/workflows.git#next=https://private.test/team/repo.git?apiKey=secret',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git&clientSecret=secret',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git;password=secret',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git#authorization=secret',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git%3Faccess_token=secret',
+      'https://example.test/team/workflows.git?next=https://private.test/team/repo.git%253Faccess_token=secret',
+      'git@corp_alias:team/repo.git#next=https://private.test/team/repo.git?clientSecret=secret',
+      'owner/repository?next=https://private.test/team/repo.git?auth=secret'
+    ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(identifier)).toBe(false)
+      expect(isWorkflowMarketplaceInstallIdentifier(identifier)).toBe(false)
+    }
+  })
+
+  it.each([
+    'git@gitlab.example:team/repo.git#packages/support',
+    'git@corp_alias:team/repo.git',
+    'git@Corp_Alias-2:team/repo.git',
+    'git@repo_host.internal_2:team/repo.git#packages/support'
+  ])('accepts the backend-supported SCP host alias %s', repositoryUrl => {
+    expect(isWorkflowMarketplaceRepositoryUrl(repositoryUrl)).toBe(true)
+    expect(isWorkflowMarketplaceSourceRequestUrl(repositoryUrl)).toBe(true)
+    expect(isWorkflowMarketplaceInstallIdentifier(repositoryUrl)).toBe(true)
+  })
+
+  it.each([
+    'git@:team/repo.git',
+    'git@corp_alias:',
+    'git@corp/alias:team/repo.git',
+    'git@corp alias:team/repo.git',
+    'git@corp_alias:../repo.git',
+    'git@corp_alias:team/repo.git?ref=main',
+    'git@alice:secret@corp_alias:team/repo.git',
+    'git@corp_alias:team\\repo.git',
+    'git@corp#alias:team/repo.git',
+    `git@corp${String.fromCodePoint(127)}alias:team/repo.git`
+  ])('rejects the invalid SCP identity %s', repositoryUrl => {
+    expect(isWorkflowMarketplaceRepositoryUrl(repositoryUrl)).toBe(false)
+    expect(isWorkflowMarketplaceSourceRequestUrl(repositoryUrl)).toBe(false)
+    expect(isWorkflowMarketplaceInstallIdentifier(repositoryUrl)).toBe(false)
   })
 
   it('rejects non-canonical UTC timestamps', () => {
