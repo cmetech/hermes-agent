@@ -38,6 +38,8 @@ import type {
   WorkflowMarketplaceUpdateReview
 } from '@/types/hermes'
 
+import { workflowMarketplaceCanonicalIdentity } from './workflow-marketplace-casefold'
+
 const SHA256 = /^[0-9a-f]{64}$/
 const COMMIT = /^[0-9a-f]{40}$/
 
@@ -51,8 +53,59 @@ const IDENTIFIER = /^[a-z][a-z0-9_]{0,127}$/
 const OPERATION_ID = /^wmop_[0-9a-f]{12}_[0-9a-f]{32}$/
 const CONFIRMATION_TOKEN = /^[A-Za-z0-9_-]{32,4096}$/
 const ISO_UTC = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/
-const CREDENTIAL_QUERY_KEY = /(?:access|api|auth|authorization|client|credential|key|password|secret|token)/i
 const FILE_DECODE_LIMIT = 8
+
+const CREDENTIAL_PARAMETER_WORDS = new Set([
+  'auth',
+  'authorization',
+  'credential',
+  'credentials',
+  'key',
+  'password',
+  'secret',
+  'signature',
+  'token'
+])
+
+const CREDENTIAL_COMPOUND_QUALIFIERS = [
+  'access',
+  'api',
+  'auth',
+  'authorization',
+  'aws',
+  'azure',
+  'client',
+  'deploy',
+  'github',
+  'gitlab',
+  'google',
+  'oauth',
+  'private',
+  'secret',
+  'security'
+] as const
+
+const CREDENTIAL_COMPOUND_SUFFIXES = [
+  'credential',
+  'credentials',
+  'key',
+  'password',
+  'secret',
+  'signature',
+  'token'
+] as const
+
+const SENSITIVE_REPOSITORY_SEGMENTS = new Set([
+  '.cache',
+  '.quarantine',
+  '.staging',
+  'cache',
+  'caches',
+  'quarantine',
+  'staging',
+  'temp',
+  'tmp'
+])
 
 type Decoder<T> = (value: unknown) => T | null
 
@@ -135,7 +188,7 @@ function unique(values: readonly string[]): boolean {
 }
 
 function logicalIdentity(value: string): string {
-  return value.normalize('NFC').toLowerCase().toUpperCase().toLowerCase().normalize('NFC')
+  return workflowMarketplaceCanonicalIdentity(value)
 }
 
 function logicallyUnique(values: readonly string[]): boolean {
@@ -259,10 +312,68 @@ function repeatedlyDecode(value: string): string[] | null {
 }
 
 const ENCODED_URL_DELIMITER = /%(?:2f|3a|3f|23|40|5c)/i
-const REDACTED_IDENTITY = /\[?redacted(?:_path)?\]?/i
+const REDACTED_PLACEHOLDER = /^(?:\[?redacted(?:_path)?\]?)(?:\.git)?$/i
 
 function hasDotSegment(value: string): boolean {
-  return /(?:^|[/])\.{1,2}(?=$|[/#?])/.test(value) || /:(?:\.{1,2})(?=$|[/#?])/.test(value)
+  return /(?:^|[/:?#&;=])\.{1,2}(?=$|[/:?#&;=])/.test(value)
+}
+
+function parameterNameWords(name: string): Set<string> {
+  let decoded = name
+
+  for (let index = 0; index < 3; index += 1) {
+    let next: string
+
+    try {
+      next = decodeURIComponent(decoded.replaceAll('+', ' '))
+    } catch {
+      return new Set(['credential'])
+    }
+
+    if (next === decoded) {
+      break
+    }
+
+    decoded = next
+  }
+
+  const separated = decoded.replace(/(?<=[a-z0-9])(?=[A-Z])/g, ' ').replace(/(?<=[A-Z])(?=[A-Z][a-z])/g, ' ')
+
+  return new Set(separated.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+}
+
+function isCredentialQualifierSequence(value: string): boolean {
+  if (!value) {
+    return false
+  }
+
+  const reachable = new Set([0])
+
+  for (let start = 0; start < value.length; start += 1) {
+    if (!reachable.has(start)) {
+      continue
+    }
+
+    for (const qualifier of CREDENTIAL_COMPOUND_QUALIFIERS) {
+      if (value.startsWith(qualifier, start)) {
+        reachable.add(start + qualifier.length)
+      }
+    }
+  }
+
+  return reachable.has(value.length)
+}
+
+function parameterNameContainsCredentials(name: string): boolean {
+  if ([...parameterNameWords(name)].some(word => CREDENTIAL_PARAMETER_WORDS.has(word))) {
+    return true
+  }
+
+  const compactName = name.toLowerCase().replace(/[^a-z0-9]+/g, '')
+
+  return CREDENTIAL_COMPOUND_SUFFIXES.some(
+    suffix => compactName.endsWith(suffix) && isCredentialQualifierSequence(compactName.slice(0, -suffix.length))
+  )
 }
 
 function hasCredentialParameter(value: string): boolean {
@@ -277,9 +388,23 @@ function hasCredentialParameter(value: string): boolean {
       .some(parameter => {
         const separator = parameter.indexOf('=')
 
-        return separator >= 0 && CREDENTIAL_QUERY_KEY.test(parameter.slice(0, separator))
+        return separator >= 0 && parameterNameContainsCredentials(parameter.slice(0, separator))
       })
   )
+}
+
+function hasRedactedPlaceholder(value: string): boolean {
+  const queryIndex = value.indexOf('?')
+  const fragmentIndex = value.indexOf('#')
+
+  const identityEnd = [queryIndex, fragmentIndex]
+    .filter(index => index >= 0)
+    .reduce((left, right) => Math.min(left, right), value.length)
+
+  const identityParts = value.slice(0, identityEnd).split(/[/:]/)
+  const fragmentParts = fragmentIndex < 0 ? [] : value.slice(fragmentIndex + 1).split('/')
+
+  return [...identityParts, ...fragmentParts].some(part => REDACTED_PLACEHOLDER.test(part))
 }
 
 function hasCredentialAuthority(value: string): boolean {
@@ -310,9 +435,10 @@ function repositoryLayers(candidate: string): string[] | null {
   return layers
 }
 
-function safeFileRepositoryUrl(candidate: string, parsed: URL): string | null {
+type RepositoryUrlMode = 'request' | 'response'
+
+function safeFileRepositoryUrl(candidate: string, parsed: URL, mode: RepositoryUrlMode): string | null {
   if (
-    parsed.hash ||
     parsed.search ||
     parsed.username ||
     parsed.password ||
@@ -326,29 +452,20 @@ function safeFileRepositoryUrl(candidate: string, parsed: URL): string | null {
 
   const segments = normalized.split('/').filter(Boolean).map(logicalIdentity)
 
-  const sensitive = new Set([
-    '.cache',
-    '.quarantine',
-    '.staging',
-    'cache',
-    'caches',
-    'quarantine',
-    'staging',
-    'temp',
-    'tmp'
-  ])
-
   if (
     segments.length === 0 ||
     normalized.startsWith('//') ||
-    segments.some(segment => segment === '.' || segment === '..' || sensitive.has(segment)) ||
+    segments.some(segment => segment === '.' || segment === '..') ||
     /^[A-Za-z]:/.test(normalized.slice(1)) ||
-    segments.some(
-      (segment, index) =>
-        (segment === 'marketplace' && segments[index + 1] === 'workflows') ||
-        (segment === 'workflows' && segments[index + 1] === 'marketplace') ||
-        (segment === 'var' && segments[index + 1] === 'folders')
-    )
+    (mode === 'response' &&
+      (parsed.hash.length > 0 ||
+        segments.some(segment => SENSITIVE_REPOSITORY_SEGMENTS.has(segment)) ||
+        segments.some(
+          (segment, index) =>
+            (segment === 'marketplace' && segments[index + 1] === 'workflows') ||
+            (segment === 'workflows' && segments[index + 1] === 'marketplace') ||
+            (segment === 'var' && segments[index + 1] === 'folders')
+        )))
   ) {
     return null
   }
@@ -356,7 +473,7 @@ function safeFileRepositoryUrl(candidate: string, parsed: URL): string | null {
   return candidate
 }
 
-function safeRepositoryUrl(value: unknown, allowRedactedSentinel: boolean): string | null {
+function safeRepositoryUrl(value: unknown, mode: RepositoryUrlMode): string | null {
   const candidate = cleanText(value, 1, 4096)
 
   if (candidate === null || containsControl(candidate) || candidate.includes('\\')) {
@@ -364,10 +481,10 @@ function safeRepositoryUrl(value: unknown, allowRedactedSentinel: boolean): stri
   }
 
   if (candidate === 'file:///REDACTED') {
-    return allowRedactedSentinel ? candidate : null
+    return mode === 'response' ? candidate : null
   }
 
-  if (REDACTED_IDENTITY.test(candidate)) {
+  if (hasRedactedPlaceholder(candidate)) {
     return null
   }
 
@@ -383,8 +500,12 @@ function safeRepositoryUrl(value: unknown, allowRedactedSentinel: boolean): stri
     return null
   }
 
-  if (/^git@[A-Za-z0-9.-]+:[^?#\s]+$/.test(candidate)) {
-    if (!/^git@[A-Za-z0-9.-]+:[^?#\s]+$/.test(fullyDecoded)) {
+  if (/^file:/i.test(fullyDecoded) && !/^file:\//i.test(fullyDecoded)) {
+    return null
+  }
+
+  if (/^git@[A-Za-z0-9.-]+:[^?\s]+$/.test(candidate)) {
+    if (!/^git@[A-Za-z0-9.-]+:[^?\s]+$/.test(fullyDecoded)) {
       return null
     }
 
@@ -408,22 +529,58 @@ function safeRepositoryUrl(value: unknown, allowRedactedSentinel: boolean): stri
   }
 
   if (parsed.protocol === 'ssh:') {
-    return parsed.hostname && parsed.pathname && !parsed.search && !parsed.hash ? candidate : null
+    return parsed.hostname && parsed.pathname && !parsed.search ? candidate : null
   }
 
   if (parsed.protocol !== 'file:') {
     return null
   }
 
-  return safeFileRepositoryUrl(candidate, parsed)
+  return safeFileRepositoryUrl(candidate, parsed, mode)
 }
 
 export function isWorkflowMarketplaceRepositoryUrl(value: unknown): value is string {
-  return safeRepositoryUrl(value, true) !== null
+  return safeRepositoryUrl(value, 'response') !== null
+}
+
+function isSafeRepositoryShorthand(value: unknown): value is string {
+  const decoded = cleanText(value, 1, 4096)
+
+  if (
+    decoded === null ||
+    containsControl(decoded) ||
+    decoded.includes('://') ||
+    decoded.includes('@') ||
+    decoded.includes('\\') ||
+    decoded.includes(':')
+  ) {
+    return false
+  }
+
+  const layers = repositoryLayers(decoded)
+
+  if (layers === null || layers.length !== 1) {
+    return false
+  }
+
+  const parts = decoded.split('/')
+
+  return (
+    parts.length >= 2 &&
+    parts.every(
+      part =>
+        part.length > 0 &&
+        part.length <= 256 &&
+        part !== '.' &&
+        part !== '..' &&
+        !containsControl(part) &&
+        !hasRedactedPlaceholder(part)
+    )
+  )
 }
 
 export function isWorkflowMarketplaceSourceRequestUrl(value: unknown): value is string {
-  return safeRepositoryUrl(value, false) !== null
+  return safeRepositoryUrl(value, 'request') !== null || isSafeRepositoryShorthand(value)
 }
 
 export function isWorkflowMarketplaceSourceName(value: unknown): value is string {
@@ -449,32 +606,11 @@ export function isWorkflowMarketplaceInstallIdentifier(value: unknown): value is
     return false
   }
 
-  if (!decoded.includes('://') && !decoded.includes('@') && !decoded.includes('\\') && !decoded.includes(':')) {
-    const layers = repositoryLayers(decoded)
-
-    if (layers === null || layers.length !== 1 || decoded.includes('?') || decoded.includes('#')) {
-      return false
-    }
-
-    const parts = decoded.split('/')
-
-    if (
-      parts.length >= 2 &&
-      parts.every(
-        part =>
-          part.length > 0 &&
-          part.length <= 256 &&
-          part !== '.' &&
-          part !== '..' &&
-          !containsControl(part) &&
-          !REDACTED_IDENTITY.test(part)
-      )
-    ) {
-      return true
-    }
+  if (isSafeRepositoryShorthand(decoded)) {
+    return true
   }
 
-  return safeRepositoryUrl(decoded, false) !== null
+  return safeRepositoryUrl(decoded, 'request') !== null
 }
 
 export function isWorkflowMarketplaceConfirmationToken(value: unknown): value is string {
@@ -570,7 +706,7 @@ function decodeSource(value: unknown): WorkflowMarketplaceSource | null {
   const enabled = record.get('enabled')
   const name = cleanText(record.get('name'), 1, 64)
   const ref = optionalText(record.get('ref'), 1024)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
 
   if (
     typeof enabled !== 'boolean' ||
@@ -686,7 +822,7 @@ function decodeCatalogPackage(value: unknown): WorkflowMarketplaceCatalogPackage
   const packageDigest = cleanText(record.get('package_digest'), 64, 64)
   const packagePath = canonicalPath(record.get('package_path'))
   const publisher = cleanText(record.get('publisher'), 1, 256)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
   const state = record.get('state')
@@ -805,7 +941,7 @@ function decodeInstalledPackage(value: unknown): WorkflowMarketplaceInstalledPac
   const installedAt = canonicalTimestamp(record.get('installed_at'))
   const orphanedSource = record.get('orphaned_source')
   const packagePath = canonicalPath(record.get('package_path'))
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
   const version = cleanText(record.get('version'), 1, 128)
@@ -951,12 +1087,13 @@ function reviewsMatchAssessment(
   packageDigest: string
 ): boolean {
   const reviewNames = reviews.map(review => review.workflow_name)
+  const reviewNameSet = new Set(reviewNames)
 
   if (
     !logicallyUnique(assessment.workflow_names) ||
     !logicallyUnique(reviewNames) ||
     assessment.workflow_names.length !== reviewNames.length ||
-    assessment.workflow_names.some(name => !reviewNames.includes(name)) ||
+    assessment.workflow_names.some(name => !reviewNameSet.has(name)) ||
     reviews.some(review => review.package_digest !== packageDigest)
   ) {
     return false
@@ -1166,7 +1303,7 @@ export function decodeMarketplacePackageDetail(value: unknown): WorkflowMarketpl
   const packageDigest = cleanText(record.get('package_digest'), 64, 64)
   const packagePath = canonicalPath(record.get('package_path'))
   const publisher = cleanText(record.get('publisher'), 1, 256)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const resources = decodeArray(record.get('resources'), 512, decodeResource)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
@@ -1533,7 +1670,7 @@ export function decodeMarketplaceInstallReview(value: unknown): WorkflowMarketpl
   const fileChanges = decodeArray(record.get('file_changes'), 1024, decodeFileChange)
   const identity = decodeIdentity(record.get('identity'))
   const packagePath = canonicalPath(record.get('package_path'))
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const reviewDigest = cleanText(record.get('review_digest'), 64, 64)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
@@ -1628,7 +1765,7 @@ export function decodeMarketplaceUpdateReview(value: unknown): WorkflowMarketpla
   const oldCommit = cleanText(record.get('old_commit'), 40, 40)
   const oldDigest = cleanText(record.get('old_digest'), 64, 64)
   const oldVersion = cleanText(record.get('old_version'), 1, 128)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
   const requirementChanges = decodeRequirementChanges(record.get('requirement_changes'))
   const result = record.get('result')
   const reviewDigest = cleanText(record.get('review_digest'), 64, 64)
@@ -1782,6 +1919,7 @@ export function decodeMarketplaceTrustReview(value: unknown): WorkflowMarketplac
   const sourceName = cleanText(record.get('source_name'), 1, 64)
   const version = cleanText(record.get('version'), 1, 128)
   const workflows = decodeArray(record.get('workflows'), 512, decodeTrustReviewItem, 1)
+  const packageResourceSet = packageResources === null ? null : new Set(packageResources)
 
   if (
     confirmationToken === null ||
@@ -1799,11 +1937,10 @@ export function decodeMarketplaceTrustReview(value: unknown): WorkflowMarketplac
     version === null ||
     !SEMVER.test(version) ||
     workflows === null ||
+    packageResourceSet === null ||
     !logicallyUnique(workflows.map(item => item.workflow_name)) ||
     workflows.some(item => item.package_digest !== distributionDigest) ||
-    workflows.some(item =>
-      workflowResourcePaths(item).some(path => !packageResources.some(resource => resource === path))
-    )
+    workflows.some(item => workflowResourcePaths(item).some(path => !packageResourceSet.has(path)))
   ) {
     return null
   }
@@ -1891,7 +2028,7 @@ function decodeSourceRefresh(value: unknown): WorkflowMarketplaceSourceRefresh |
   const rawMessage = record.get('message')
   const message = rawMessage === null ? null : cleanText(rawMessage, 1, 4096)
   const packageCount = integer(record.get('package_count'), 0, 4096)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), 'response')
   const rawResolvedCommit = record.get('resolved_commit')
   const resolvedCommit = rawResolvedCommit === null ? null : cleanText(rawResolvedCommit, 40, 40)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
@@ -1972,27 +2109,157 @@ function decodeTrustState(value: unknown): WorkflowMarketplaceTrustState | null 
   return { state, workflow_name: workflowName }
 }
 
-type WorkflowMarketplaceOperationResultType = WorkflowMarketplaceOperationResult['type']
+interface WorkflowMarketplaceSucceededCommon {
+  readonly created_at: string
+  readonly finished_at: string
+  readonly id: string
+  readonly profile: string
+  readonly schema_version: 1
+  readonly started_at: string
+  readonly updated_at: string
+}
 
 interface WorkflowMarketplaceOperationContract {
-  readonly resultType: WorkflowMarketplaceOperationResultType
   readonly runningPhases: readonly string[]
+  readonly succeeded: (
+    common: WorkflowMarketplaceSucceededCommon,
+    result: WorkflowMarketplaceOperationResult
+  ) => WorkflowMarketplaceOperation | null
+}
+
+function succeededShape(common: WorkflowMarketplaceSucceededCommon): WorkflowMarketplaceSucceededCommon & {
+  error: null
+  phase: 'completed'
+  progress: 100
+  state: 'succeeded'
+} {
+  return {
+    ...common,
+    error: null,
+    phase: 'completed',
+    progress: 100,
+    state: 'succeeded'
+  }
 }
 
 const OPERATION_CONTRACTS: ReadonlyMap<WorkflowMarketplaceOperationKind, WorkflowMarketplaceOperationContract> =
   new Map([
-    ['refresh', { resultType: 'source_refresh', runningPhases: ['running', 'fetching', 'verifying'] }],
-    ['package_detail', { resultType: 'package_detail', runningPhases: ['running', 'fetching'] }],
-    ['update_check', { resultType: 'update_checks', runningPhases: ['running', 'fetching'] }],
-    ['install_prepare', { resultType: 'install_review', runningPhases: ['running', 'fetching', 'reviewing'] }],
-    ['install_confirm', { resultType: 'installed_package', runningPhases: ['running', 'committing'] }],
-    ['update_prepare', { resultType: 'update_review', runningPhases: ['running', 'fetching', 'reviewing'] }],
-    ['update_confirm', { resultType: 'updated_package', runningPhases: ['running', 'committing'] }],
-    ['remove_prepare', { resultType: 'remove_review', runningPhases: ['running', 'reviewing'] }],
-    ['remove_confirm', { resultType: 'removed_package', runningPhases: ['running', 'committing'] }],
-    ['trust_prepare', { resultType: 'trust_review', runningPhases: ['running', 'reviewing'] }],
-    ['trust_confirm', { resultType: 'trust_grant', runningPhases: ['running', 'committing'] }],
-    ['trust_revoke', { resultType: 'trust_revoke', runningPhases: ['running', 'committing'] }]
+    [
+      'refresh',
+      {
+        runningPhases: ['running', 'fetching', 'verifying'],
+        succeeded(common, result) {
+          return result.type === 'source_refresh' ? { ...succeededShape(common), kind: 'refresh', result } : null
+        }
+      }
+    ],
+    [
+      'package_detail',
+      {
+        runningPhases: ['running', 'fetching'],
+        succeeded(common, result) {
+          return result.type === 'package_detail' ? { ...succeededShape(common), kind: 'package_detail', result } : null
+        }
+      }
+    ],
+    [
+      'update_check',
+      {
+        runningPhases: ['running', 'fetching'],
+        succeeded(common, result) {
+          return result.type === 'update_checks' ? { ...succeededShape(common), kind: 'update_check', result } : null
+        }
+      }
+    ],
+    [
+      'install_prepare',
+      {
+        runningPhases: ['running', 'fetching', 'reviewing'],
+        succeeded(common, result) {
+          return result.type === 'install_review'
+            ? { ...succeededShape(common), kind: 'install_prepare', result }
+            : null
+        }
+      }
+    ],
+    [
+      'install_confirm',
+      {
+        runningPhases: ['running', 'committing'],
+        succeeded(common, result) {
+          return result.type === 'installed_package'
+            ? { ...succeededShape(common), kind: 'install_confirm', result }
+            : null
+        }
+      }
+    ],
+    [
+      'update_prepare',
+      {
+        runningPhases: ['running', 'fetching', 'reviewing'],
+        succeeded(common, result) {
+          return result.type === 'update_review' ? { ...succeededShape(common), kind: 'update_prepare', result } : null
+        }
+      }
+    ],
+    [
+      'update_confirm',
+      {
+        runningPhases: ['running', 'committing'],
+        succeeded(common, result) {
+          return result.type === 'updated_package'
+            ? { ...succeededShape(common), kind: 'update_confirm', result }
+            : null
+        }
+      }
+    ],
+    [
+      'remove_prepare',
+      {
+        runningPhases: ['running', 'reviewing'],
+        succeeded(common, result) {
+          return result.type === 'remove_review' ? { ...succeededShape(common), kind: 'remove_prepare', result } : null
+        }
+      }
+    ],
+    [
+      'remove_confirm',
+      {
+        runningPhases: ['running', 'committing'],
+        succeeded(common, result) {
+          return result.type === 'removed_package'
+            ? { ...succeededShape(common), kind: 'remove_confirm', result }
+            : null
+        }
+      }
+    ],
+    [
+      'trust_prepare',
+      {
+        runningPhases: ['running', 'reviewing'],
+        succeeded(common, result) {
+          return result.type === 'trust_review' ? { ...succeededShape(common), kind: 'trust_prepare', result } : null
+        }
+      }
+    ],
+    [
+      'trust_confirm',
+      {
+        runningPhases: ['running', 'committing'],
+        succeeded(common, result) {
+          return result.type === 'trust_grant' ? { ...succeededShape(common), kind: 'trust_confirm', result } : null
+        }
+      }
+    ],
+    [
+      'trust_revoke',
+      {
+        runningPhases: ['running', 'committing'],
+        succeeded(common, result) {
+          return result.type === 'trust_revoke' ? { ...succeededShape(common), kind: 'trust_revoke', result } : null
+        }
+      }
+    ]
   ])
 
 function decodeOperationKind(value: unknown): WorkflowMarketplaceOperationKind | null {
@@ -2197,67 +2464,133 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     return null
   }
 
-  if (
-    state === 'pending' &&
-    (phase !== 'queued' ||
+  const common: {
+    created_at: string
+    id: string
+    kind: WorkflowMarketplaceOperationKind
+    profile: string
+    schema_version: 1
+    updated_at: string
+  } = {
+    created_at: createdAt,
+    id,
+    kind,
+    profile,
+    schema_version: 1,
+    updated_at: updatedAt
+  }
+
+  if (state === 'pending') {
+    if (
+      phase !== 'queued' ||
       startedAt !== null ||
       finishedAt !== null ||
       result !== null ||
       error !== null ||
-      progress !== 0)
-  ) {
-    return null
+      progress !== 0
+    ) {
+      return null
+    }
+
+    return {
+      ...common,
+      error: null,
+      finished_at: null,
+      phase: 'queued',
+      progress: 0,
+      result: null,
+      started_at: null,
+      state: 'pending'
+    }
   }
 
-  if (
-    state === 'running' &&
-    (startedAt === null ||
+  if (state === 'running') {
+    if (
+      startedAt === null ||
       finishedAt !== null ||
       result !== null ||
       error !== null ||
-      !operationContract.runningPhases.includes(phase))
-  ) {
-    return null
+      progress >= 100 ||
+      !operationContract.runningPhases.includes(phase)
+    ) {
+      return null
+    }
+
+    return {
+      ...common,
+      error: null,
+      finished_at: null,
+      phase,
+      progress,
+      result: null,
+      started_at: startedAt,
+      state: 'running'
+    }
   }
 
-  if (
-    state === 'succeeded' &&
-    (phase !== 'completed' ||
+  if (state === 'succeeded') {
+    if (
+      phase !== 'completed' ||
       startedAt === null ||
       finishedAt === null ||
       result === null ||
-      result.type !== operationContract.resultType ||
       error !== null ||
-      progress !== 100)
-  ) {
-    return null
+      progress !== 100
+    ) {
+      return null
+    }
+
+    return operationContract.succeeded(
+      {
+        created_at: createdAt,
+        finished_at: finishedAt,
+        id,
+        profile,
+        schema_version: 1,
+        started_at: startedAt,
+        updated_at: updatedAt
+      },
+      result
+    )
   }
 
-  if (
-    state === 'failed' &&
-    (phase !== 'failed' || startedAt === null || finishedAt === null || result !== null || error === null)
-  ) {
-    return null
+  if (state === 'failed') {
+    if (
+      phase !== 'failed' ||
+      startedAt === null ||
+      finishedAt === null ||
+      result !== null ||
+      error === null ||
+      progress >= 100
+    ) {
+      return null
+    }
+
+    return {
+      ...common,
+      error,
+      finished_at: finishedAt,
+      phase: 'failed',
+      progress,
+      result: null,
+      started_at: startedAt,
+      state: 'failed'
+    }
   }
 
-  if (state === 'cancelled' && (phase !== 'cancelled' || finishedAt === null || result !== null || error !== null)) {
+  if (phase !== 'cancelled' || finishedAt === null || result !== null || error !== null || progress >= 100) {
     return null
   }
 
   return {
-    created_at: createdAt,
-    error,
+    ...common,
+    error: null,
     finished_at: finishedAt,
-    id,
-    kind,
-    phase,
-    profile,
+    phase: 'cancelled',
     progress,
-    result,
-    schema_version: 1,
+    result: null,
     started_at: startedAt,
-    state,
-    updated_at: updatedAt
+    state: 'cancelled'
   }
 }
 

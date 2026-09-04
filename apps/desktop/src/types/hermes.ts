@@ -432,7 +432,7 @@ export type WorkflowMarketplaceOperationResult =
   | { type: 'update_review'; value: WorkflowMarketplaceUpdateReview }
   | { type: 'updated_package'; value: WorkflowMarketplaceInstalledPackage }
 
-export interface WorkflowMarketplaceOperationResultTypeByKind {
+export type WorkflowMarketplaceOperationResultTypeByKind = {
   install_confirm: 'installed_package'
   install_prepare: 'install_review'
   package_detail: 'package_detail'
@@ -461,23 +461,80 @@ export interface WorkflowMarketplaceOperationError {
 
 export type WorkflowMarketplaceOperationState = 'cancelled' | 'failed' | 'pending' | 'running' | 'succeeded'
 
-export interface WorkflowMarketplaceOperation<
-  Kind extends WorkflowMarketplaceOperationKind = WorkflowMarketplaceOperationKind
-> {
+interface WorkflowMarketplaceOperationBase<Kind extends WorkflowMarketplaceOperationKind> {
   created_at: string
-  error: null | WorkflowMarketplaceOperationError
-  finished_at: null | string
   id: string
   kind: Kind
-  phase: string
   profile: string
-  progress: number
-  result: null | WorkflowMarketplaceOperationResultFor<Kind>
   schema_version: 1
-  started_at: null | string
-  state: WorkflowMarketplaceOperationState
   updated_at: string
 }
+
+type WorkflowMarketplacePendingOperation<Kind extends WorkflowMarketplaceOperationKind> =
+  WorkflowMarketplaceOperationBase<Kind> & {
+    error: null
+    finished_at: null
+    phase: 'queued'
+    progress: 0
+    result: null
+    started_at: null
+    state: 'pending'
+  }
+
+type WorkflowMarketplaceRunningOperation<Kind extends WorkflowMarketplaceOperationKind> =
+  WorkflowMarketplaceOperationBase<Kind> & {
+    error: null
+    finished_at: null
+    phase: string
+    progress: number
+    result: null
+    started_at: string
+    state: 'running'
+  }
+
+type WorkflowMarketplaceSucceededOperation<Kind extends WorkflowMarketplaceOperationKind> =
+  WorkflowMarketplaceOperationBase<Kind> & {
+    error: null
+    finished_at: string
+    phase: 'completed'
+    progress: 100
+    result: WorkflowMarketplaceOperationResultFor<Kind>
+    started_at: string
+    state: 'succeeded'
+  }
+
+type WorkflowMarketplaceFailedOperation<Kind extends WorkflowMarketplaceOperationKind> =
+  WorkflowMarketplaceOperationBase<Kind> & {
+    error: WorkflowMarketplaceOperationError
+    finished_at: string
+    phase: 'failed'
+    progress: number
+    result: null
+    started_at: string
+    state: 'failed'
+  }
+
+type WorkflowMarketplaceCancelledOperation<Kind extends WorkflowMarketplaceOperationKind> =
+  WorkflowMarketplaceOperationBase<Kind> & {
+    error: null
+    finished_at: string
+    phase: 'cancelled'
+    progress: number
+    result: null
+    started_at: null | string
+    state: 'cancelled'
+  }
+
+export type WorkflowMarketplaceOperationForKind<Kind extends WorkflowMarketplaceOperationKind> =
+  | WorkflowMarketplacePendingOperation<Kind>
+  | WorkflowMarketplaceRunningOperation<Kind>
+  | WorkflowMarketplaceSucceededOperation<Kind>
+  | WorkflowMarketplaceFailedOperation<Kind>
+  | WorkflowMarketplaceCancelledOperation<Kind>
+
+export type WorkflowMarketplaceOperation = {
+  [Kind in WorkflowMarketplaceOperationKind]: WorkflowMarketplaceOperationForKind<Kind>
+}[WorkflowMarketplaceOperationKind]
 
 export interface WorkflowMarketplaceOperationPage {
   limit: number

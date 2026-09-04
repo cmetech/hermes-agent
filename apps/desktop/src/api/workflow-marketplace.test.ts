@@ -350,12 +350,37 @@ describe('workflow marketplace API', () => {
     'ssh://git@example.test/team/workflows.git',
     'git@example.test:team/workflows.git',
     'file:/Users/operator/projects/workflows.git',
+    'file:/tmp/workflows.git',
+    'file:/Users/operator/.cache/workflows.git',
+    'https://example.test/team/redacted-tools.git',
+    'https://example.test/team/workflows.git?monkey=value',
+    'owner/repository#packages/support',
     'owner/repository/packages/laptop-support'
   ])('accepts the supported direct install identity %s', async identifier => {
     await prepareWorkflowPackageInstall({ identifier }, scope)
 
     expect(apiStructured).toHaveBeenCalledWith(
       expect.objectContaining({ body: { identifier }, path: '/api/plugins/workflow/marketplace/install/prepare' })
+    )
+  })
+
+  it.each([
+    'https://example.test/team/redacted-tools.git',
+    'ssh://git@example.test/team/workflows.git#packages/support',
+    'git@example.test:team/workflows.git#packages/support',
+    'file:/tmp/workflows.git',
+    'file:/Users/operator/.cache/workflows.git',
+    'owner/repository/packages/support'
+  ])('accepts the backend-supported source identity %s', async repositoryUrl => {
+    apiStructured.mockResolvedValue({ ok: true, value: { profile: 'support', source: source(), status: 'created' } })
+
+    await addWorkflowMarketplaceSource({ name: 'company', repositoryUrl }, scope)
+
+    expect(apiStructured).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: { name: 'company', repositoryUrl },
+        path: '/api/plugins/workflow/marketplace/sources'
+      })
     )
   })
 
@@ -632,7 +657,7 @@ describe('workflow marketplace API', () => {
       ),
     () => prepareWorkflowPackageInstall({ identifier: 'file:///REDACTED' }, scope),
     () => prepareWorkflowPackageInstall({ identifier: 'owner/repository?access_token=secret' }, scope),
-    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository#packages/support' }, scope)
+    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository#access_token=secret' }, scope)
   ])('rejects unsafe client input before issuing a request', async call => {
     await expect(call()).rejects.toBeInstanceOf(TypeError)
     expect(apiStructured).not.toHaveBeenCalled()

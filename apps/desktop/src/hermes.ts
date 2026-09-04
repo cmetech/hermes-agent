@@ -152,6 +152,7 @@ export type {
   WorkflowMarketplaceInstallReview,
   WorkflowMarketplaceOperation,
   WorkflowMarketplaceOperationError,
+  WorkflowMarketplaceOperationForKind,
   WorkflowMarketplaceOperationKind,
   WorkflowMarketplaceOperationPage,
   WorkflowMarketplaceOperationResult,
