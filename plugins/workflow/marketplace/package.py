@@ -34,7 +34,7 @@ from .models import (
 _MANIFEST_NAME = "workflow-package.json"
 _DIGESTS_NAME = "digests.json"
 _INDEX_PATH = (".well-known", "hermes-workflows", "index.json")
-_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:/")
+_WINDOWS_DRIVE_COMPONENT = re.compile(r"^[A-Za-z]:")
 _FILE_ATTRIBUTE_REPARSE_POINT = getattr(
     stat,
     "FILE_ATTRIBUTE_REPARSE_POINT",
@@ -88,10 +88,25 @@ class WorkflowDistribution:
 class _ScanLimits:
     contract: WorkflowPackageContract
     read_budget: WorkflowResourceReadBudget | None
+    traversal_entries: int = 0
     included_files: int = 0
     included_bytes: int = 0
 
-    def record(self, path: Path, content: bytes, *, included: bool) -> None:
+    def inspect_entry(self) -> None:
+        self.traversal_entries += 1
+        if self.traversal_entries > self.contract.resource_rules.max_traversal_entries:
+            _fail(
+                "package_traversal_limit",
+                "package exceeds the filesystem-entry traversal limit",
+            )
+
+    def inspect_file(
+        self,
+        relative_path: str,
+        metadata: os.stat_result,
+        *,
+        included: bool,
+    ) -> None:
         rules = self.contract.resource_rules
         if not included:
             return
@@ -101,18 +116,20 @@ class _ScanLimits:
                 "package_file_count_limit",
                 f"package exceeds the {rules.max_files}-file contract limit",
             )
-        if len(content) > rules.max_file_bytes:
+        if metadata.st_size > rules.max_file_bytes:
             _fail(
                 "package_file_size_limit",
-                f"{path.name!r} exceeds the per-file contract limit",
+                f"package file {relative_path!r} exceeds the per-file contract limit",
             )
-        self.included_bytes += len(content)
+        self.included_bytes += metadata.st_size
         if self.included_bytes > rules.max_total_bytes:
             _fail(
                 "package_total_size_limit",
                 "package exceeds the aggregate byte contract limit",
             )
-        if self.read_budget is not None:
+
+    def authenticate(self, path: Path, content: bytes, *, included: bool) -> None:
+        if included and self.read_budget is not None:
             _charge_read_budget(self.read_budget, path, content)
 
 
@@ -171,13 +188,11 @@ def _absolute(path: Path) -> Path:
 
 
 def _root_metadata(root: Path, *, missing_code: str) -> os.stat_result:
-    try:
-        metadata = root.lstat()
-    except OSError as exc:
-        raise WorkflowMarketplaceError(
-            missing_code,
-            "package or repository root is unavailable",
-        ) from exc
+    metadata = _lstat(
+        root,
+        code=missing_code,
+        message="package or repository root is unavailable",
+    )
     if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
         _fail("package_symlink_unsupported", "package roots must not be links")
     if not stat.S_ISDIR(metadata.st_mode):
@@ -185,14 +200,23 @@ def _root_metadata(root: Path, *, missing_code: str) -> os.stat_result:
     return metadata
 
 
+def _lstat(path: Path, *, code: str, message: str) -> os.stat_result:
+    try:
+        return path.lstat()
+    except OSError as exc:
+        raise WorkflowMarketplaceError(code, message) from exc
+
+
 def _canonical_path_error(relative_path: str) -> tuple[str, str] | None:
     if "\x00" in relative_path:
         return "package_path_nul", "package paths must not contain NUL bytes"
-    if relative_path.startswith("/") or _WINDOWS_DRIVE.match(relative_path):
+    parts = relative_path.split("/")
+    if relative_path.startswith("/") or any(
+        _WINDOWS_DRIVE_COMPONENT.match(part) for part in parts
+    ):
         return "package_path_absolute", "package paths must be relative"
     if "\\" in relative_path:
         return "package_path_backslash", "package paths must use forward slashes"
-    parts = relative_path.split("/")
     if not relative_path or any(part in {"", ".", ".."} for part in parts):
         return "package_path_traversal", "package paths must not contain dot segments"
     try:
@@ -263,6 +287,18 @@ def _stat_at(
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
+    except OSError as exc:
+        raise WorkflowMarketplaceError(code, message) from exc
+
+
+def _fstat(
+    descriptor: int,
+    *,
+    code: str,
+    message: str,
+) -> os.stat_result:
+    try:
+        return os.fstat(descriptor)
     except OSError as exc:
         raise WorkflowMarketplaceError(code, message) from exc
 
@@ -388,7 +424,7 @@ def _package_file(
 ) -> PackageFile:
     included = _included(relative_path, contract)
     path = root.joinpath(*relative_path.split("/"))
-    limits.record(path, content, included=included)
+    limits.authenticate(path, content, included=included)
     return PackageFile(
         relative_path=relative_path,
         path=path,
@@ -492,14 +528,40 @@ def _read_file_at(
         os.close(descriptor)
 
 
+@dataclass(slots=True)
+class _DirectoryScan:
+    descriptor: int
+    entries: Any
+    parts: tuple[str, ...]
+    parent_descriptor: int | None = None
+    name: str | None = None
+    opened: os.stat_result | None = None
+
+
+def _scan_directory(descriptor: int) -> Any:
+    try:
+        return os.scandir(descriptor)
+    except OSError as exc:
+        raise WorkflowMarketplaceError(
+            "package_digest_mismatch",
+            "package directory changed during scan",
+        ) from exc
+
+
 def _scan_descriptor_tree(
     root: Path,
     contract: WorkflowPackageContract,
     limits: _ScanLimits,
+    *,
+    anchored_descriptor: int | None = None,
 ) -> tuple[PackageFile, ...]:
     root_before = _root_metadata(root, missing_code="package_manifest_invalid")
     try:
-        root_descriptor = os.open(root, _open_flags(directory=True))
+        root_descriptor = (
+            os.open(root, _open_flags(directory=True))
+            if anchored_descriptor is None
+            else os.dup(anchored_descriptor)
+        )
     except OSError as exc:
         raise WorkflowMarketplaceError(
             "package_manifest_invalid",
@@ -507,8 +569,13 @@ def _scan_descriptor_tree(
         ) from exc
     files: list[PackageFile] = []
     identities: dict[str, str] = {}
+    scans: list[_DirectoryScan] = []
     try:
-        root_opened = os.fstat(root_descriptor)
+        root_opened = _fstat(
+            root_descriptor,
+            code="package_digest_mismatch",
+            message="package root changed during open",
+        )
         if (
             not stat.S_ISDIR(root_opened.st_mode)
             or _is_reparse_point(root_opened)
@@ -516,152 +583,81 @@ def _scan_descriptor_tree(
         ):
             _fail("package_digest_mismatch", "package root changed during open")
 
-        def walk(directory_descriptor: int, parent_parts: tuple[str, ...]) -> None:
+        scans.append(
+            _DirectoryScan(root_descriptor, _scan_directory(root_descriptor), ())
+        )
+        while scans:
+            current = scans[-1]
             try:
-                with os.scandir(directory_descriptor) as entries:
-                    names = sorted(entry.name for entry in entries)
+                entry = next(current.entries)
+            except StopIteration:
+                current.entries.close()
+                scans.pop()
+                if current.parent_descriptor is not None:
+                    assert current.name is not None
+                    assert current.opened is not None
+                    try:
+                        _recheck_directory_at(
+                            current.parent_descriptor,
+                            current.name,
+                            current.descriptor,
+                            current.opened,
+                            code="package_digest_mismatch",
+                            message=(
+                                "package directory changed during descriptor scan"
+                            ),
+                        )
+                    finally:
+                        os.close(current.descriptor)
+                continue
             except OSError as exc:
                 raise WorkflowMarketplaceError(
                     "package_digest_mismatch",
                     "package directory changed during scan",
                 ) from exc
-            for name in names:
-                relative_parts = (*parent_parts, name)
-                relative_path = "/".join(relative_parts)
-                _register_path(relative_path, identities)
-                _check_nested_manifest(relative_path)
-                before = _stat_at(
-                    directory_descriptor,
-                    name,
-                    code="package_digest_mismatch",
-                    message=f"package path {relative_path!r} changed during scan",
-                )
-                _ensure_safe_node(before, relative_path)
-                if stat.S_ISDIR(before.st_mode):
-                    message = f"package directory {relative_path!r} changed during scan"
-                    child_descriptor, opened = _open_directory_at(
-                        directory_descriptor,
-                        name,
-                        before,
-                        code="package_digest_mismatch",
-                        message=message,
-                    )
-                    try:
-                        walk(child_descriptor, relative_parts)
-                        _recheck_directory_at(
-                            directory_descriptor,
-                            name,
-                            child_descriptor,
-                            opened,
-                            code="package_digest_mismatch",
-                            message=message,
-                        )
-                    finally:
-                        os.close(child_descriptor)
-                    continue
-                content = _read_file_at(
-                    directory_descriptor,
-                    name,
-                    before,
-                    relative_path,
-                    maximum_size=contract.resource_rules.max_file_bytes,
-                )
-                files.append(
-                    _package_file(
-                        root,
-                        relative_path,
-                        content,
-                        contract=contract,
-                        limits=limits,
-                    )
-                )
-
-        walk(root_descriptor, ())
-        root_descriptor_after = os.fstat(root_descriptor)
-        root_path_after = root.lstat()
-        if _identity(root_opened) != _identity(root_descriptor_after) or _identity(
-            root_opened
-        ) != _identity(root_path_after):
-            _fail("package_digest_mismatch", "package root changed during scan")
-    finally:
-        os.close(root_descriptor)
-    return tuple(sorted(files, key=lambda item: item.relative_path))
-
-
-def _read_path_file(
-    path: Path,
-    before: os.stat_result,
-    relative_path: str,
-    *,
-    maximum_size: int,
-    unsafe_code: str = "package_digest_mismatch",
-    size_code: str | None = None,
-) -> bytes:
-    _check_file_size(before, relative_path, maximum_size, size_code)
-    try:
-        descriptor = os.open(path, _open_flags())
-    except OSError as exc:
-        raise WorkflowMarketplaceError(
-            unsafe_code,
-            f"package file {relative_path!r} could not be safely opened",
-        ) from exc
-    try:
-        return _read_opened_file(
-            descriptor,
-            before,
-            relative_path,
-            current_stat=path.lstat,
-            unsafe_code=unsafe_code,
-        )
-    finally:
-        os.close(descriptor)
-
-
-def _scan_path_tree(
-    root: Path,
-    contract: WorkflowPackageContract,
-    limits: _ScanLimits,
-) -> tuple[PackageFile, ...]:
-    """Portable fallback with pre/post component checks on every read."""
-
-    root_before = _root_metadata(root, missing_code="package_manifest_invalid")
-    files: list[PackageFile] = []
-    identities: dict[str, str] = {}
-
-    def walk(directory: Path, parent_parts: tuple[str, ...]) -> None:
-        directory_before = directory.lstat()
-        try:
-            with os.scandir(directory) as entries:
-                names = sorted(entry.name for entry in entries)
-        except OSError as exc:
-            raise WorkflowMarketplaceError(
-                "package_digest_mismatch",
-                "package directory changed during scan",
-            ) from exc
-        for name in names:
-            relative_parts = (*parent_parts, name)
+            limits.inspect_entry()
+            name = entry.name
+            relative_parts = (*current.parts, name)
             relative_path = "/".join(relative_parts)
             _register_path(relative_path, identities)
             _check_nested_manifest(relative_path)
-            path = directory / name
-            try:
-                before = path.lstat()
-            except OSError as exc:
-                raise WorkflowMarketplaceError(
-                    "package_digest_mismatch",
-                    f"package path {relative_path!r} changed during scan",
-                ) from exc
+            before = _stat_at(
+                current.descriptor,
+                name,
+                code="package_digest_mismatch",
+                message=f"package path {relative_path!r} changed during scan",
+            )
             _ensure_safe_node(before, relative_path)
             if stat.S_ISDIR(before.st_mode):
-                walk(path, relative_parts)
-                if _identity(before) != _identity(path.lstat()):
-                    _fail(
-                        "package_digest_mismatch",
-                        f"package directory {relative_path!r} changed during scan",
+                message = f"package directory {relative_path!r} changed during scan"
+                child_descriptor, opened = _open_directory_at(
+                    current.descriptor,
+                    name,
+                    before,
+                    code="package_digest_mismatch",
+                    message=message,
+                )
+                try:
+                    child_entries = _scan_directory(child_descriptor)
+                except WorkflowMarketplaceError:
+                    os.close(child_descriptor)
+                    raise
+                scans.append(
+                    _DirectoryScan(
+                        child_descriptor,
+                        child_entries,
+                        relative_parts,
+                        current.descriptor,
+                        name,
+                        opened,
                     )
+                )
                 continue
-            content = _read_path_file(
-                path,
+            included = _included(relative_path, contract)
+            limits.inspect_file(relative_path, before, included=included)
+            content = _read_file_at(
+                current.descriptor,
+                name,
                 before,
                 relative_path,
                 maximum_size=contract.resource_rules.max_file_bytes,
@@ -675,12 +671,27 @@ def _scan_path_tree(
                     limits=limits,
                 )
             )
-        if _identity(directory_before) != _identity(directory.lstat()):
-            _fail("package_digest_mismatch", "package directory changed during scan")
 
-    walk(root, ())
-    if _identity(root_before) != _identity(root.lstat()):
-        _fail("package_digest_mismatch", "package root changed during scan")
+        root_descriptor_after = _fstat(
+            root_descriptor,
+            code="package_digest_mismatch",
+            message="package root changed during scan",
+        )
+        root_path_after = _lstat(
+            root,
+            code="package_digest_mismatch",
+            message="package root changed during scan",
+        )
+        if _identity(root_opened) != _identity(root_descriptor_after) or _identity(
+            root_opened
+        ) != _identity(root_path_after):
+            _fail("package_digest_mismatch", "package root changed during scan")
+    finally:
+        for current in reversed(scans):
+            current.entries.close()
+            if current.descriptor != root_descriptor:
+                os.close(current.descriptor)
+        os.close(root_descriptor)
     return tuple(sorted(files, key=lambda item: item.relative_path))
 
 
@@ -689,6 +700,7 @@ def _scan_package_files(
     *,
     contract: WorkflowPackageContract,
     read_budget: WorkflowResourceReadBudget | None,
+    anchored_descriptor: int | None = None,
 ) -> tuple[PackageFile, ...]:
     if read_budget is not None and not isinstance(
         read_budget, WorkflowResourceReadBudget
@@ -696,9 +708,17 @@ def _scan_package_files(
         raise TypeError("read_budget must be a WorkflowResourceReadBudget")
     absolute_root = _absolute(root)
     limits = _ScanLimits(contract=contract, read_budget=read_budget)
-    if _HAS_DESCRIPTOR_WALK:
-        return _scan_descriptor_tree(absolute_root, contract, limits)
-    return _scan_path_tree(absolute_root, contract, limits)
+    if not _HAS_DESCRIPTOR_WALK:
+        _fail(
+            "package_digest_mismatch",
+            "descriptor-safe package traversal is unavailable",
+        )
+    return _scan_descriptor_tree(
+        absolute_root,
+        contract,
+        limits,
+        anchored_descriptor=anchored_descriptor,
+    )
 
 
 def scan_package_files(
@@ -923,6 +943,7 @@ def _load_distribution(
     expected_digest: str | None,
     read_budget: WorkflowResourceReadBudget | None,
     contract: WorkflowPackageContract,
+    anchored_descriptor: int | None = None,
 ) -> WorkflowDistribution:
     absolute_root = _absolute(root)
     root_before = _root_metadata(
@@ -933,6 +954,7 @@ def _load_distribution(
         absolute_root,
         contract=contract,
         read_budget=read_budget,
+        anchored_descriptor=anchored_descriptor,
     )
     manifest = _parse_manifest(files, contract)
     published = _parse_digests(files, contract)
@@ -944,15 +966,23 @@ def _load_distribution(
         actual,
         expected_digest,
     )
+    before_resolve = _lstat(
+        absolute_root,
+        code="package_digest_mismatch",
+        message="package root changed after validation",
+    )
     try:
-        before_resolve = absolute_root.lstat()
         canonical_root = absolute_root.resolve(strict=True)
-        after_resolve = absolute_root.lstat()
     except OSError as exc:
         raise WorkflowMarketplaceError(
             "package_digest_mismatch",
             "package root changed after validation",
         ) from exc
+    after_resolve = _lstat(
+        absolute_root,
+        code="package_digest_mismatch",
+        message="package root changed after validation",
+    )
     if (
         stat.S_ISLNK(before_resolve.st_mode)
         or _is_reparse_point(before_resolve)
@@ -985,104 +1015,140 @@ def load_distribution(
     )
 
 
-def _read_repository_index(root: Path, contract: WorkflowPackageContract) -> bytes:
-    if _HAS_DESCRIPTOR_WALK:
-        return _read_repository_index_at(root, contract)
-    root = _absolute(root)
-    root_before = _root_metadata(root, missing_code="package_index_invalid")
-    current = root
-    component_metadata: list[tuple[Path, os.stat_result]] = []
-    for component in _INDEX_PATH:
-        current = current / component
-        try:
-            metadata = current.lstat()
-        except OSError as exc:
-            raise WorkflowMarketplaceError(
-                "package_index_invalid",
-                "repository marketplace index is unavailable",
-            ) from exc
-        if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
-            _fail(
-                "package_symlink_unsupported",
-                "repository marketplace index path must not contain links",
-            )
-        component_metadata.append((current, metadata))
-    for path, metadata in component_metadata[:-1]:
-        if not stat.S_ISDIR(metadata.st_mode):
-            _fail("package_index_invalid", f"index component {path.name!r} is invalid")
-    index_path, index_before = component_metadata[-1]
-    if not stat.S_ISREG(index_before.st_mode):
-        _fail("package_index_invalid", "repository marketplace index is not a file")
-    maximum = contract.resource_rules.max_index_bytes
-    if index_before.st_size > maximum:
-        _fail(
-            "package_index_size_limit",
-            "repository marketplace index exceeds its byte limit",
-        )
-    content = _read_path_file(
-        index_path,
-        index_before,
-        "/".join(_INDEX_PATH),
-        maximum_size=maximum,
-        unsafe_code="package_index_invalid",
-        size_code="package_index_size_limit",
-    )
-    for path, before in reversed(component_metadata[:-1]):
-        if _identity(before) != _identity(path.lstat()):
-            _fail("package_index_invalid", "repository index path changed during read")
-    if _identity(root_before) != _identity(root.lstat()):
-        _fail("package_index_invalid", "repository root changed during index read")
-    return content
-
-
-def _read_repository_index_at(
+def _open_root_descriptor(
     root: Path,
-    contract: WorkflowPackageContract,
-) -> bytes:
-    root = _absolute(root)
-    root_before = _root_metadata(root, missing_code="package_index_invalid")
-    descriptors: list[int] = []
-    opened_directories: list[tuple[int, str, int, os.stat_result]] = []
+    *,
+    code: str,
+) -> tuple[int, os.stat_result]:
+    root_before = _root_metadata(root, missing_code=code)
     try:
         root_descriptor = os.open(root, _open_flags(directory=True))
-        descriptors.append(root_descriptor)
-        root_opened = os.fstat(root_descriptor)
-        if (
-            not stat.S_ISDIR(root_opened.st_mode)
-            or _is_reparse_point(root_opened)
-            or _identity(root_before) != _identity(root_opened)
-        ):
-            _fail("package_index_invalid", "repository root changed during open")
-        directory_descriptor = root_descriptor
-        for component in _INDEX_PATH[:-1]:
+    except OSError as exc:
+        raise WorkflowMarketplaceError(
+            code, "repository root changed during open"
+        ) from exc
+    try:
+        root_opened = _fstat(
+            root_descriptor,
+            code=code,
+            message="repository root changed during open",
+        )
+    except WorkflowMarketplaceError:
+        os.close(root_descriptor)
+        raise
+    if (
+        not stat.S_ISDIR(root_opened.st_mode)
+        or _is_reparse_point(root_opened)
+        or _identity(root_before) != _identity(root_opened)
+    ):
+        os.close(root_descriptor)
+        _fail(code, "repository root changed during open")
+    return root_descriptor, root_opened
+
+
+def _open_directory_chain(
+    root_descriptor: int,
+    components: tuple[str, ...],
+    *,
+    code: str,
+) -> list[tuple[int, str, int, os.stat_result]]:
+    chain: list[tuple[int, str, int, os.stat_result]] = []
+    directory_descriptor = root_descriptor
+    try:
+        for component in components:
             before = _stat_at(
                 directory_descriptor,
                 component,
-                code="package_index_invalid",
-                message="repository marketplace index is unavailable",
+                code=code,
+                message="repository directory path is unavailable",
             )
             if stat.S_ISLNK(before.st_mode) or _is_reparse_point(before):
                 _fail(
                     "package_symlink_unsupported",
-                    "repository marketplace index path must not contain links",
+                    "repository package paths must not contain links",
                 )
             if not stat.S_ISDIR(before.st_mode):
-                _fail("package_index_invalid", "repository index path is invalid")
+                _fail(code, "repository directory path is invalid")
             parent_descriptor = directory_descriptor
             directory_descriptor, opened = _open_directory_at(
                 parent_descriptor,
                 component,
                 before,
-                code="package_index_invalid",
-                message="repository marketplace index path changed during open",
+                code=code,
+                message="repository directory path changed during open",
             )
-            descriptors.append(directory_descriptor)
-            opened_directories.append((
+            chain.append((
                 parent_descriptor,
                 component,
                 directory_descriptor,
                 opened,
             ))
+        return chain
+    except BaseException:
+        for _, _, descriptor, _ in reversed(chain):
+            os.close(descriptor)
+        raise
+
+
+def _close_directory_chain(
+    chain: list[tuple[int, str, int, os.stat_result]],
+) -> None:
+    for _, _, descriptor, _ in reversed(chain):
+        os.close(descriptor)
+
+
+def _recheck_directory_chain(
+    chain: list[tuple[int, str, int, os.stat_result]],
+    *,
+    code: str,
+) -> None:
+    for parent, component, descriptor, opened in reversed(chain):
+        _recheck_directory_at(
+            parent,
+            component,
+            descriptor,
+            opened,
+            code=code,
+            message="repository directory path changed during read",
+        )
+
+
+def _recheck_root(
+    root: Path,
+    root_descriptor: int,
+    opened: os.stat_result,
+    *,
+    code: str,
+) -> None:
+    descriptor_after = _fstat(
+        root_descriptor,
+        code=code,
+        message="repository root changed during read",
+    )
+    path_after = _lstat(
+        root,
+        code=code,
+        message="repository root changed during read",
+    )
+    if _identity(opened) != _identity(descriptor_after) or _identity(
+        opened
+    ) != _identity(path_after):
+        _fail(code, "repository root changed during read")
+
+
+def _read_repository_index_at(
+    root: Path,
+    root_descriptor: int,
+    root_opened: os.stat_result,
+    contract: WorkflowPackageContract,
+) -> bytes:
+    chain = _open_directory_chain(
+        root_descriptor,
+        _INDEX_PATH[:-1],
+        code="package_index_invalid",
+    )
+    directory_descriptor = chain[-1][2]
+    try:
         filename = _INDEX_PATH[-1]
         index_before = _stat_at(
             directory_descriptor,
@@ -1107,35 +1173,16 @@ def _read_repository_index_at(
             unsafe_code="package_index_invalid",
             size_code="package_index_size_limit",
         )
-        for parent, component, descriptor, opened in reversed(opened_directories):
-            _recheck_directory_at(
-                parent,
-                component,
-                descriptor,
-                opened,
-                code="package_index_invalid",
-                message="repository marketplace index path changed during read",
-            )
-        root_descriptor_after = os.fstat(root_descriptor)
-        root_path_after = root.lstat()
-        if _identity(root_opened) != _identity(root_descriptor_after) or _identity(
-            root_opened
-        ) != _identity(root_path_after):
-            _fail("package_index_invalid", "repository root changed during index read")
+        _recheck_directory_chain(chain, code="package_index_invalid")
+        _recheck_root(
+            root,
+            root_descriptor,
+            root_opened,
+            code="package_index_invalid",
+        )
         return content
-    except WorkflowMarketplaceError:
-        raise
-    except OSError as exc:
-        raise WorkflowMarketplaceError(
-            "package_index_invalid",
-            "repository marketplace index changed during read",
-        ) from exc
     finally:
-        for descriptor in reversed(descriptors):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        _close_directory_chain(chain)
 
 
 def _parse_index(
@@ -1201,59 +1248,68 @@ def _parse_index(
 
 def _verify_index_entry(
     root: Path,
+    root_descriptor: int,
     entry: Any,
     contract: WorkflowPackageContract,
-) -> None:
+    roots: list[tuple[tuple[int, int], ...]],
+) -> tuple[tuple[int, int], ...]:
     package_root = root.joinpath(*entry.package_path.split("/"))
+    chain = _open_directory_chain(
+        root_descriptor,
+        tuple(entry.package_path.split("/")),
+        code="package_index_invalid",
+    )
     try:
-        metadata = package_root.lstat()
-    except OSError as exc:
-        raise WorkflowMarketplaceError(
-            "package_index_invalid",
-            f"indexed package root {entry.package_path!r} is unavailable",
-        ) from exc
-    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
-        _fail(
-            "package_symlink_unsupported",
-            f"indexed package root {entry.package_path!r} is a link",
+        directory_identities = tuple(
+            (opened.st_dev, opened.st_ino) for *_, opened in chain
         )
-    if not stat.S_ISDIR(metadata.st_mode):
-        _fail(
-            "package_index_invalid",
-            f"indexed package root {entry.package_path!r} is not a directory",
+        _reject_resolved_root_overlap(roots, directory_identities)
+        distribution = _load_distribution(
+            package_root,
+            expected_digest=entry.package_digest,
+            read_budget=None,
+            contract=contract,
+            anchored_descriptor=chain[-1][2],
         )
-    distribution = _load_distribution(
-        package_root,
-        expected_digest=entry.package_digest,
-        read_budget=None,
-        contract=contract,
-    )
-    manifest = distribution.manifest
-    projected = (
-        manifest.id,
-        manifest.version,
-        manifest.display_name,
-        manifest.description,
-        manifest.license,
-        manifest.publisher,
-        manifest.tags,
-        contract.contract_version,
-    )
-    claimed = (
-        entry.id,
-        entry.version,
-        entry.display_name,
-        entry.description,
-        entry.license,
-        entry.publisher,
-        entry.tags,
-        entry.contract_version,
-    )
-    if claimed != projected:
-        _fail(
-            "package_index_invalid",
-            f"repository metadata for package {entry.id!r} is stale",
+        _recheck_directory_chain(chain, code="package_index_invalid")
+        manifest = distribution.manifest
+        projected = (
+            manifest.id,
+            manifest.version,
+            manifest.display_name,
+            manifest.description,
+            manifest.license,
+            manifest.publisher,
+            manifest.tags,
+            contract.contract_version,
         )
+        claimed = (
+            entry.id,
+            entry.version,
+            entry.display_name,
+            entry.description,
+            entry.license,
+            entry.publisher,
+            entry.tags,
+            entry.contract_version,
+        )
+        if claimed != projected:
+            _fail(
+                "package_index_invalid",
+                f"repository metadata for package {entry.id!r} is stale",
+            )
+        return directory_identities
+    finally:
+        _close_directory_chain(chain)
+
+
+def _reject_resolved_root_overlap(
+    roots: list[tuple[tuple[int, int], ...]],
+    candidate: tuple[tuple[int, int], ...],
+) -> None:
+    for existing in roots:
+        if candidate[-1] in existing or existing[-1] in candidate:
+            _fail("package_root_nested", "resolved package roots must not overlap")
 
 
 def load_repository_index(root: Path) -> WorkflowPackageIndex:
@@ -1261,11 +1317,42 @@ def load_repository_index(root: Path) -> WorkflowPackageIndex:
 
     contract = _contract()
     absolute_root = _absolute(root)
-    content = _read_repository_index(absolute_root, contract)
-    index = _parse_index(content, contract)
-    for entry in index.packages:
-        _verify_index_entry(absolute_root, entry, contract)
-    return index
+    if not _HAS_DESCRIPTOR_WALK:
+        _fail(
+            "package_index_invalid",
+            "descriptor-safe repository traversal is unavailable",
+        )
+    root_descriptor, root_opened = _open_root_descriptor(
+        absolute_root,
+        code="package_index_invalid",
+    )
+    try:
+        content = _read_repository_index_at(
+            absolute_root,
+            root_descriptor,
+            root_opened,
+            contract,
+        )
+        index = _parse_index(content, contract)
+        roots: list[tuple[tuple[int, int], ...]] = []
+        for entry in index.packages:
+            directory_identities = _verify_index_entry(
+                absolute_root,
+                root_descriptor,
+                entry,
+                contract,
+                roots,
+            )
+            roots.append(directory_identities)
+        _recheck_root(
+            absolute_root,
+            root_descriptor,
+            root_opened,
+            code="package_index_invalid",
+        )
+        return index
+    finally:
+        os.close(root_descriptor)
 
 
 __all__ = [

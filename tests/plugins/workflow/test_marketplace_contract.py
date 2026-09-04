@@ -160,6 +160,14 @@ def _materialize_catalog(recipe: dict[str, Any]) -> dict[str, Any]:
     return {"schemaVersion": recipe["schemaVersion"], "packages": entries}
 
 
+def _materialize_filesystem_entries(recipe: dict[str, Any]) -> list[str]:
+    assert recipe["kind"] == "filesystemEntries"
+    return [
+        recipe["pathTemplate"].format(index=index)
+        for index in range(recipe["startIndex"], recipe["startIndex"] + recipe["count"])
+    ]
+
+
 def _composite_digest(files: list[tuple[str, bytes]]) -> str:
     digest = hashlib.sha256(b"hermes.workflow-package.v1\0")
     for path, content in sorted(files):
@@ -182,6 +190,7 @@ def test_contract_artifacts_are_deterministic_and_self_validating() -> None:
     contract = load_package_contract()
     assert contract.contract_version == 1
     assert contract.resource_rules.max_files == 512
+    assert contract.resource_rules.max_traversal_entries == 4096
     assert contract.resource_rules.max_file_bytes == 1_048_576
     assert contract.resource_rules.max_total_bytes == 8_388_608
     assert (
@@ -333,6 +342,35 @@ def test_package_paths_reject_non_nfc_text() -> None:
 
     with pytest.raises(ValidationError, match="NFC"):
         WorkflowPackageManifest.model_validate(manifest)
+
+
+@pytest.mark.parametrize("path", ["C:workflow.yaml", "safe/C:workflow.yaml"])
+@pytest.mark.parametrize("document", ["manifest", "digests", "index"])
+def test_public_package_paths_reject_drive_relative_components(
+    path: str,
+    document: str,
+) -> None:
+    contract = load_package_contract()
+    if document == "manifest":
+        value = valid_manifest()
+        value["workflows"] = [{"definition": path}]
+        model = WorkflowPackageManifest
+        schema = contract.package_manifest_schema
+    elif document == "digests":
+        value = valid_digests()
+        value["files"] = [{"path": path, "size": 1, "sha256": SHA256_A}]
+        model = WorkflowPackageDigests
+        schema = contract.digests_schema
+    else:
+        value = valid_index()
+        value["packages"][0]["packagePath"] = path
+        model = WorkflowPackageIndex
+        schema = contract.marketplace_index_schema
+
+    with pytest.raises(ValidationError):
+        model.model_validate(value)
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(schema).validate(value)
 
 
 def test_package_manifest_rejects_casefold_member_collisions() -> None:
@@ -501,6 +539,8 @@ def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
     assert {
         "unicode_path",
         "absolute",
+        "drive_relative",
+        "nested_drive_relative",
         "traversal",
         "backslash",
         "nul",
@@ -513,6 +553,14 @@ def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
     )
     assert (
         path_vectors["absolute"]["expected"]["diagnosticCode"]
+        == "package_path_absolute"
+    )
+    assert (
+        path_vectors["drive_relative"]["expected"]["diagnosticCode"]
+        == "package_path_absolute"
+    )
+    assert (
+        path_vectors["nested_drive_relative"]["expected"]["diagnosticCode"]
         == "package_path_absolute"
     )
     assert (
@@ -537,6 +585,8 @@ def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
     assert {
         "file_count_exact",
         "file_count_over",
+        "traversal_entries_exact",
+        "traversal_entries_over",
         "file_bytes_exact",
         "file_bytes_over",
         "total_bytes_exact",
@@ -625,6 +675,16 @@ def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
                 with pytest.raises(ValidationError):
                     WorkflowPackageIndex.model_validate(catalog)
             assert len(catalog["packages"]) == vector["expected"]["observed"]
+        elif recipe["kind"] == "filesystemEntries":
+            entries = _materialize_filesystem_entries(recipe)
+            assert len(entries) == len(set(entries))
+            limit = load_package_contract().resource_rules.max_traversal_entries
+            assert (len(entries) <= limit) is vector["expected"]["accepted"]
+            assert vector["expected"]["limit"] == limit
+            assert vector["expected"]["diagnosticCode"] == (
+                None if vector["expected"]["accepted"] else "package_traversal_limit"
+            )
+            assert len(entries) == vector["expected"]["observed"]
         else:
             raise AssertionError(f"unsupported boundary recipe: {recipe['kind']}")
 

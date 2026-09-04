@@ -29,7 +29,10 @@ SHA256_PATTERN = r"^[0-9a-f]{64}$"
 PACKAGE_ID_PATTERN = r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
 SOURCE_NAME_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
 TAG_PATTERN = r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$"
-CANONICAL_RELATIVE_PATH_PATTERN = r"^(?!/)(?!.*(?:^|/)\.\.?(/|$))(?!.*\\)(?!.*\x00).+$"
+CANONICAL_RELATIVE_PATH_PATTERN = (
+    r"^(?!/)(?![A-Za-z]:)(?!.*\/[A-Za-z]:)"
+    r"(?!.*(?:^|/)\.\.?(/|$))(?!.*\\)(?!.*\x00).+$"
+)
 
 _SEMANTIC_VERSION = re.compile(SEMANTIC_VERSION_PATTERN, re.ASCII)
 _TAG = re.compile(TAG_PATTERN, re.ASCII)
@@ -157,7 +160,7 @@ def _require_canonical_relative_path(value: str) -> str:
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("path must be a canonical package-relative path")
-    if parts[0].endswith(":"):
+    if any(re.match(r"^[A-Za-z]:", part) for part in parts):
         raise ValueError("path must be a canonical package-relative path")
     return value
 
@@ -418,6 +421,7 @@ class PathRules(StrictMarketplaceModel):
 
 class ResourceRules(StrictMarketplaceModel):
     max_files: int = Field(ge=1)
+    max_traversal_entries: int = Field(ge=1)
     max_file_bytes: int = Field(ge=1)
     max_total_bytes: int = Field(ge=1)
     max_index_bytes: int = Field(ge=1)

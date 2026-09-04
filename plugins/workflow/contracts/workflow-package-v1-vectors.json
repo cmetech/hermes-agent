@@ -56,6 +56,40 @@
       "expected": {
         "accepted": true,
         "diagnosticCode": null,
+        "limit": 4096,
+        "observed": 4096
+      },
+      "limit": "max_traversal_entries",
+      "name": "traversal_entries_exact",
+      "recipe": {
+        "count": 4096,
+        "entryKind": "directory",
+        "kind": "filesystemEntries",
+        "pathTemplate": "empty-{index:04d}",
+        "startIndex": 0
+      }
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_traversal_limit",
+        "limit": 4096,
+        "observed": 4097
+      },
+      "limit": "max_traversal_entries",
+      "name": "traversal_entries_over",
+      "recipe": {
+        "count": 4097,
+        "entryKind": "directory",
+        "kind": "filesystemEntries",
+        "pathTemplate": "empty-{index:04d}",
+        "startIndex": 0
+      }
+    },
+    {
+      "expected": {
+        "accepted": true,
+        "diagnosticCode": null,
         "limit": 1048576,
         "observed": 1048576,
         "packageDigest": "cadd527b93afa733b954ab39349401b805963886993452e03c7b94a576661e72"
@@ -446,6 +480,28 @@
         "path": "/workflows/unsafe.yaml"
       },
       "name": "absolute"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_absolute"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "C:workflow.yaml"
+      },
+      "name": "drive_relative"
+    },
+    {
+      "expected": {
+        "accepted": false,
+        "diagnosticCode": "package_path_absolute"
+      },
+      "input": {
+        "kind": "regular",
+        "path": "safe/C:workflow.yaml"
+      },
+      "name": "nested_drive_relative"
     },
     {
       "expected": {

@@ -34,7 +34,8 @@
     "package_repository_metadata": "A package contains nested repository metadata.",
     "package_root_nested": "Package roots may not overlap or nest.",
     "package_symlink_unsupported": "Distributable symbolic links are unsupported.",
-    "package_total_size_limit": "Included package bytes exceed the aggregate byte limit."
+    "package_total_size_limit": "Included package bytes exceed the aggregate byte limit.",
+    "package_traversal_limit": "The package contains more filesystem entries than the contract permits."
   },
   "digest_rules": {
     "algorithm": "sha256",
@@ -58,7 +59,7 @@
           "path": {
             "maxLength": 1024,
             "minLength": 1,
-            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\/[A-Za-z]:)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
             "title": "Path",
             "type": "string"
           },
@@ -166,7 +167,7 @@
           "packagePath": {
             "maxLength": 1024,
             "minLength": 1,
-            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\/[A-Za-z]:)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
             "title": "Packagepath",
             "type": "string"
           },
@@ -321,13 +322,13 @@
               }
             ],
             "default": null,
-            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\/[A-Za-z]:)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
             "title": "Companion"
           },
           "definition": {
             "maxLength": 1024,
             "minLength": 1,
-            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
+            "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\/[A-Za-z]:)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*\\\\)(?!.*\\x00).+$",
             "title": "Definition",
             "type": "string"
           }
@@ -445,6 +446,7 @@
     "max_file_bytes": 1048576,
     "max_files": 512,
     "max_index_bytes": 1048576,
-    "max_total_bytes": 8388608
+    "max_total_bytes": 8388608,
+    "max_traversal_entries": 4096
   }
 }

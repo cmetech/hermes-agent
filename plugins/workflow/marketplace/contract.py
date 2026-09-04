@@ -26,6 +26,7 @@ CONTRACT_PATH = CONTRACTS_DIR / "workflow-package-v1.json"
 VECTOR_PATH = CONTRACTS_DIR / "workflow-package-v1-vectors.json"
 
 PACKAGE_MAX_FILES = 512
+_PACKAGE_MAX_TRAVERSAL_ENTRIES = 4096
 PACKAGE_MAX_FILE_BYTES = 1024 * 1024
 PACKAGE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 _MARKETPLACE_INDEX_MAX_BYTES = 1024 * 1024
@@ -52,6 +53,7 @@ _DIAGNOSTIC_CODES = {
     "package_root_nested": "Package roots may not overlap or nest.",
     "package_symlink_unsupported": "Distributable symbolic links are unsupported.",
     "package_total_size_limit": "Included package bytes exceed the aggregate byte limit.",
+    "package_traversal_limit": "The package contains more filesystem entries than the contract permits.",
 }
 
 
@@ -107,6 +109,7 @@ def _contract_envelope_from_models() -> dict[str, object]:
         ),
         resource_rules=ResourceRules(
             max_files=PACKAGE_MAX_FILES,
+            max_traversal_entries=_PACKAGE_MAX_TRAVERSAL_ENTRIES,
             max_file_bytes=PACKAGE_MAX_FILE_BYTES,
             max_total_bytes=PACKAGE_MAX_TOTAL_BYTES,
             max_index_bytes=_MARKETPLACE_INDEX_MAX_BYTES,
@@ -310,6 +313,31 @@ def _catalog_boundary(
     }
 
 
+def _traversal_boundary(
+    name: str,
+    *,
+    count: int,
+) -> dict[str, object]:
+    accepted = count <= _PACKAGE_MAX_TRAVERSAL_ENTRIES
+    return {
+        "name": name,
+        "limit": "max_traversal_entries",
+        "recipe": {
+            "kind": "filesystemEntries",
+            "entryKind": "directory",
+            "pathTemplate": "empty-{index:04d}",
+            "startIndex": 0,
+            "count": count,
+        },
+        "expected": {
+            "accepted": accepted,
+            "diagnosticCode": None if accepted else "package_traversal_limit",
+            "limit": _PACKAGE_MAX_TRAVERSAL_ENTRIES,
+            "observed": count,
+        },
+    }
+
+
 def _contract_vectors() -> dict[str, object]:
     manifest = {
         "schemaVersion": 1,
@@ -442,6 +470,22 @@ def _contract_vectors() -> dict[str, object]:
                 },
             },
             {
+                "name": "drive_relative",
+                "input": {"path": "C:workflow.yaml", "kind": "regular"},
+                "expected": {
+                    "accepted": False,
+                    "diagnosticCode": "package_path_absolute",
+                },
+            },
+            {
+                "name": "nested_drive_relative",
+                "input": {"path": "safe/C:workflow.yaml", "kind": "regular"},
+                "expected": {
+                    "accepted": False,
+                    "diagnosticCode": "package_path_absolute",
+                },
+            },
+            {
                 "name": "traversal",
                 "input": {"path": "workflows/../secret.yaml", "kind": "regular"},
                 "expected": {
@@ -537,6 +581,14 @@ def _contract_vectors() -> dict[str, object]:
                         "content": _content_recipe(b""),
                     }
                 ],
+            ),
+            _traversal_boundary(
+                "traversal_entries_exact",
+                count=_PACKAGE_MAX_TRAVERSAL_ENTRIES,
+            ),
+            _traversal_boundary(
+                "traversal_entries_over",
+                count=_PACKAGE_MAX_TRAVERSAL_ENTRIES + 1,
             ),
             _package_boundary(
                 "file_bytes_exact",
