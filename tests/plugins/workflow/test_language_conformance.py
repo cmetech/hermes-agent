@@ -155,6 +155,32 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
     assert cases["loop-group-structured-path-impossible"]["codes"] == [
         "scoped-reference-structured-path-impossible"
     ]
+    assert cases["loop-group-promoted-schema-valid"]["valid"] is True
+    assert cases["loop-group-promoted-schema-body-impossible"]["diagnostics"] == [
+        {
+            "blocking": True,
+            "code": "scoped-reference-structured-path-impossible",
+            "document": "definition",
+            "hermes_code": "loop_group_scope_invalid",
+            "path": "nodes[1].loop_group.nodes[0].prompt",
+            "scope": "loop-group:group",
+            "severity": "error",
+        }
+    ]
+    assert cases["loop-group-promoted-schema-gate-impossible"]["diagnostics"] == [
+        {
+            "blocking": True,
+            "code": "scoped-reference-structured-path-impossible",
+            "document": "definition",
+            "hermes_code": "structured_output_field_impossible",
+            "path": "nodes[1].loop_group.gate_message",
+            "scope": "loop-group:group",
+            "severity": "error",
+        }
+    ]
+    assert cases["loop-group-promoted-schema-unsupported-conservative"][
+        "valid"
+    ] is True
     assert {
         "loop-group-all-body-kinds-valid",
         "loop-group-empty-body",
@@ -179,6 +205,10 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-structured-paths-valid",
         "loop-group-structured-schema-required",
         "loop-group-structured-path-impossible",
+        "loop-group-promoted-schema-valid",
+        "loop-group-promoted-schema-body-impossible",
+        "loop-group-promoted-schema-gate-impossible",
+        "loop-group-promoted-schema-unsupported-conservative",
         "loop-group-first-terminal-primary",
         "loop-group-companion-child-reference-valid",
         "loop-group-companion-child-reference-unknown",

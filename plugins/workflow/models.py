@@ -363,6 +363,29 @@ SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE = (
     "scoped-companion-reference-unknown-node"
 )
 LOOP_GROUP_WORK_LIMIT = 4_096
+STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES = MappingProxyType({
+    "type": "exclude-mode",
+    "properties": "exact-child",
+    "patternProperties": "nonempty-unknown",
+    "additionalProperties": "false-impossible/schema-tail/unknown",
+    "maxItems": "index>=impossible",
+    "prefixItems": "index-first",
+    "items": "schema-or-index",
+    "additionalItems": "list-overflow",
+    "allOf": "any-impossible",
+    "anyOf": "nonempty-all-impossible",
+    "oneOf": "nonempty-all-impossible",
+})
+STRUCTURED_PATH_UNION_KEYWORDS = ("anyOf", "oneOf")
+STRUCTURED_PATH_COMBINATOR_KEYWORDS = ("allOf", *STRUCTURED_PATH_UNION_KEYWORDS)
+STRUCTURED_PATH_DOTTED_TRAVERSAL_KEYWORDS = (
+    "$ref",
+    *STRUCTURED_PATH_COMBINATOR_KEYWORDS,
+    "properties",
+    "prefixItems",
+    "items",
+    "additionalItems",
+)
 
 
 @dataclass(frozen=True, kw_only=True)

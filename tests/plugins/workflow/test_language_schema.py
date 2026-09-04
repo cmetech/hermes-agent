@@ -237,63 +237,99 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     assert reference_details["companion_node_paths"] == {
         "format": "group/child",
         "field_paths": ["sidecar.outward_action_nodes[]"],
+        "validation_code": "unknown_sidecar_node",
     }
-    assert reference_details["validation_codes"] == {
-        "body": "loop_group_scope_invalid",
-        "group_until_bash": {
-            "visibility": "output_reference_not_declared_dependency",
-            "structured_output": "loop_group_scope_invalid",
-        },
-        "group_gate_message": "output_reference_not_declared_dependency",
-    }
-    assert reference_details["semantic_codes"] == {
-        "current_scope_missing_dependency": "scoped-reference-missing-dependency",
-        "outer_scope_missing_group_dependency": (
-            "scoped-reference-missing-dependency"
-        ),
-        "previous_iteration_unknown_producer": (
-            "scoped-reference-unknown-producer"
-        ),
-        "companion_unknown_node": "scoped-companion-reference-unknown-node",
-    }
-
     structured_details = reference_details["structured_path_constraint_v1"]
-    assert structured_details == {
-        "syntax_rule": "strict-output-reference",
-        "producer_schema_field": "output_format",
-        "applies_to": "scoped-output-reference-v1",
-        "diagnostic_table": {
-            "columns": [
-                "condition",
-                "semantic_code",
-                "body",
-                "group_until_bash",
-                "group_gate_message",
-            ],
-            "rows": [
-                [
-                    "producer_schema_missing",
-                    "scoped-reference-producer-schema-required",
-                    "loop_group_scope_invalid",
-                    "loop_group_scope_invalid",
-                    "output_reference_path_unsupported",
-                ],
-                [
-                    "path_proven_impossible",
-                    "scoped-reference-structured-path-impossible",
-                    "loop_group_scope_invalid",
-                    "loop_group_scope_invalid",
-                    "structured_output_field_impossible",
-                ],
-                [
-                    "path_targets_unaddressable_dotted_key",
-                    "scoped-reference-structured-path-impossible",
-                    "loop_group_scope_invalid",
-                    "loop_group_scope_invalid",
-                    "output_reference_path_unsupported",
-                ],
-            ],
+    assert structured_details["syntax_rule"] == "strict-output-reference"
+    assert structured_details["producer_schema_resolution_v1"] == {
+        "ordinary": ["output_format"],
+        "loop_group": [
+            "scoped-dag-topology-v1.primary_sink",
+            "output_format",
+        ],
+    }
+    proof = structured_details["conservative_tristate_v1"]
+    assert proof["accept"] == ["possible", "unknown"]
+    assert proof["reject"] == "impossible"
+    assert proof["modes"] == {
+        "ascii-decimal": "all(object,array)",
+        "other": "object",
+    }
+    assert proof["strategies"] == {
+        "schema": "false=impossible;true|nonmap=unknown",
+        "type": "exclude-mode",
+        "properties": "exact-child",
+        "patternProperties": "nonempty-unknown",
+        "additionalProperties": "false-impossible/schema-tail/unknown",
+        "maxItems": "index>=impossible",
+        "prefixItems": "index-first",
+        "items": "schema-or-index",
+        "additionalItems": "list-overflow",
+        "allOf": "any-impossible",
+        "union": ["anyOf", "oneOf", "nonempty-all-impossible"],
+        "unlisted": "ignored=unknown",
+    }
+    assert proof["$ref"] == (
+        "local-pointer(map/array,~0/~1);false|impossible=>impossible;"
+        "unresolved|nonlocal|cycle=>unknown"
+    )
+    assert proof["dotted_key"] == (
+        "after=impossible;joined-tail=literal-key;"
+        "walk=$ref(map)/combinators(any)/properties/array-items;"
+        "type=capable"
+    )
+    assert structured_details["diagnostic_table"] == {
+        "codes": {
+            "L": "loop_group_scope_invalid",
+            "D": "output_reference_not_declared_dependency",
+            "U": "output_reference_path_unsupported",
+            "F": "structured_output_field_impossible",
         },
+        "cols": ["when", "semantic", "body", "until", "gate"],
+        "rows": [
+            [
+                "dep",
+                "scoped-reference-missing-dependency",
+                "L",
+                "D",
+                "D",
+            ],
+            [
+                "prev",
+                "scoped-reference-unknown-producer",
+                "L",
+                "L",
+                None,
+            ],
+            [
+                "companion",
+                "scoped-companion-reference-unknown-node",
+                None,
+                None,
+                None,
+            ],
+            [
+                "no_schema",
+                "scoped-reference-producer-schema-required",
+                "L",
+                "L",
+                "U",
+            ],
+            [
+                "impossible",
+                "scoped-reference-structured-path-impossible",
+                "L",
+                "L",
+                "F",
+            ],
+            [
+                "dotted",
+                "scoped-reference-structured-path-impossible",
+                "L",
+                "L",
+                "U",
+            ],
+        ],
     }
 
     work = rules["loop-group-work-product-v1"]
@@ -337,35 +373,9 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
     assert work["command_prompt_default_retries"] == 2
     assert work["other_default_retries"] == 0
     assert work["approval_default_max_attempts"] == 3
-    assert formula["selectors"]["ordinary_loop_multiplier"] == {
-        "first_match": [
-            {
-                "node_kind": "loop",
-                "field_path": ["loop", "max_iterations"],
-                "default": 1,
-            },
-            {"constant": 1},
-        ],
-    }
-    assert formula["selectors"]["selected_retries"] == {
-        "first_match": [
-            {
-                "mapping_at": ["approval", "on_reject"],
-                "field_path": ["approval", "on_reject", "max_attempts"],
-                "default": 3,
-            },
-            {
-                "mapping_at": ["retry"],
-                "field_path": ["retry", "max_attempts"],
-                "default": 0,
-            },
-            {
-                "node_kind_in": ["command", "prompt"],
-                "constant": 2,
-            },
-            {"constant": 0},
-        ],
-    }
+    assert formula["retry_precedence"] == (
+        "approval>retry>command|prompt>default"
+    )
     loop_group_topic = next(
         topic
         for topic in contract["documentation"]["topics"]

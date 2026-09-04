@@ -80,6 +80,9 @@ from plugins.workflow.models import (
     SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
     SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
     SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+    STRUCTURED_PATH_COMBINATOR_KEYWORDS,
+    STRUCTURED_PATH_DOTTED_TRAVERSAL_KEYWORDS,
+    STRUCTURED_PATH_UNION_KEYWORDS,
     ValidationIssue,
     ValidatedWorkflowResourceBodies,
     WorkflowDefinition,
@@ -1579,7 +1582,7 @@ def _schema_has_unaddressable_dotted_key(
         referenced = resolve_local_ref(current.get("$ref"))
         if referenced is not None and visit(referenced, index):
             return True
-        for keyword in ("allOf", "anyOf", "oneOf"):
+        for keyword in STRUCTURED_PATH_COMBINATOR_KEYWORDS:
             branches = current.get(keyword)
             if isinstance(branches, tuple | list) and any(
                 visit(branch, index) for branch in branches
@@ -1718,7 +1721,7 @@ def _v3_schema_path_interpretation_impossible(
         for branch in all_of
     ):
         return True
-    for keyword in ("anyOf", "oneOf"):
+    for keyword in STRUCTURED_PATH_UNION_KEYWORDS:
         branches = schema.get(keyword)
         if (
             isinstance(branches, tuple | list)

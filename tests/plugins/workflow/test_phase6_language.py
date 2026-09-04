@@ -84,29 +84,52 @@ def _contract_path_value(value, path):
     return current
 
 
-def _evaluate_contract_selector(selector, node):
+def _evaluate_contract_selector(name, formula, descriptor, node):
     node_kind = next(kind for kind in language_schema.NODE_TYPES if kind in node)
-    for branch in selector["first_match"]:
-        if "node_kind" in branch:
-            matches = node_kind == branch["node_kind"]
-        elif "node_kind_in" in branch:
-            matches = node_kind in branch["node_kind_in"]
-        elif "mapping_at" in branch:
-            matches = isinstance(
-                _contract_path_value(node, branch["mapping_at"]), Mapping
+    if name == "ordinary_loop_multiplier":
+        if node_kind != "loop":
+            return descriptor["ordinary_loop_default_multiplier"]
+        selected = _contract_path_value(
+            node, descriptor["ordinary_loop_multiplier_path"]
+        )
+        return (
+            descriptor["ordinary_loop_default_multiplier"]
+            if selected is _MISSING
+            else selected
+        )
+
+    assert name == "selected_retries"
+    for branch in formula["retry_precedence"].split(">"):
+        if branch == "approval" and isinstance(
+            _contract_path_value(node, ["approval", "on_reject"]), Mapping
+        ):
+            selected = _contract_path_value(
+                node, descriptor["approval_max_attempts_path"]
             )
-        else:
-            matches = True
-        if not matches:
-            continue
-        if "constant" in branch:
-            return branch["constant"]
-        selected = _contract_path_value(node, branch["field_path"])
-        return branch["default"] if selected is _MISSING else selected
-    raise AssertionError("contract selector has no matching branch")
+            return (
+                descriptor["approval_default_max_attempts"]
+                if selected is _MISSING
+                else selected
+            )
+        if branch == "retry" and isinstance(node.get("retry"), Mapping):
+            selected = _contract_path_value(
+                node, descriptor["retry_max_attempts_path"]
+            )
+            return (
+                descriptor["other_default_retries"]
+                if selected is _MISSING
+                else selected
+            )
+        if branch == "command|prompt" and node_kind in {"command", "prompt"}:
+            return descriptor["command_prompt_default_retries"]
+        if branch == "default":
+            return descriptor["other_default_retries"]
+    raise AssertionError("published retry precedence has no default")
 
 
-def _evaluate_contract_expression(expression, work, body, group_iterations, node=None):
+def _evaluate_contract_expression(
+    expression, formula, descriptor, body, group_iterations, node=None
+):
     if isinstance(expression, int):
         return expression
     if isinstance(expression, str):
@@ -114,7 +137,9 @@ def _evaluate_contract_expression(expression, work, body, group_iterations, node
             return group_iterations
         if expression in {"ordinary_loop_multiplier", "selected_retries"}:
             assert node is not None
-            return _evaluate_contract_selector(work["selectors"][expression], node)
+            return _evaluate_contract_selector(
+                expression, formula, descriptor, node
+            )
         raise AssertionError(f"unknown contract reference: {expression}")
 
     operator, *operands = expression
@@ -124,7 +149,8 @@ def _evaluate_contract_expression(expression, work, body, group_iterations, node
         return sum(
             _evaluate_contract_expression(
                 term,
-                work,
+                formula,
+                descriptor,
                 body,
                 group_iterations,
                 node=child,
@@ -134,7 +160,8 @@ def _evaluate_contract_expression(expression, work, body, group_iterations, node
     values = [
         _evaluate_contract_expression(
             operand,
-            work,
+            formula,
+            descriptor,
             body,
             group_iterations,
             node=node,
@@ -146,6 +173,225 @@ def _evaluate_contract_expression(expression, work, body, group_iterations, node
     if operator == "+":
         return values[0] + values[1]
     raise AssertionError(f"unknown contract operator: {operator}")
+
+
+def _structured_path_constraint():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    semantic_rules = cast(list[dict[str, object]], contract["semantic_rules"])
+    rule = next(
+        item
+        for item in semantic_rules
+        if item["id"] == "scoped-output-reference-v1"
+    )
+    reference = cast(dict[str, str], rule["semantic_ref"])
+    node_kinds = cast(list[dict[str, object]], contract["node_kinds"])
+    kind = next(
+        item
+        for item in node_kinds
+        if item["id"] == reference["node_kind"]
+    )
+    definitions = cast(
+        dict[str, dict[str, object]], kind["semantic_definitions"]
+    )
+    return cast(
+        dict[str, object],
+        definitions[reference["definition"]]["structured_path_constraint_v1"],
+    )
+
+
+def _resolve_published_producer_schema(constraint, nodes, producer_id):
+    producer = next(node for node in nodes if node["id"] == producer_id)
+    resolution = constraint["producer_schema_resolution_v1"]
+    if "loop_group" not in producer:
+        return _contract_path_value(producer, resolution["ordinary"])
+
+    group_policy = resolution["loop_group"]
+    assert group_policy[0] == "scoped-dag-topology-v1.primary_sink"
+    body = producer["loop_group"]["nodes"]
+    depended_on = {
+        dependency for node in body for dependency in node.get("depends_on", ())
+    }
+    sink = next(node for node in body if node["id"] not in depended_on)
+    return _contract_path_value(sink, group_policy[1:])
+
+
+def _published_path_outcome(policy, schema, path_parts):
+    keywords = policy["strategies"]
+    assert policy["accept"] == ["possible", "unknown"]
+    assert policy["reject"] == "impossible"
+
+    def local_ref(root, reference):
+        if (
+            not isinstance(reference, str)
+            or not reference.startswith("#/")
+        ):
+            return _MISSING
+        current = root
+        for raw_part in reference[2:].split("/"):
+            part = raw_part.replace("~1", "/").replace("~0", "~")
+            if isinstance(current, Mapping) and part in current:
+                current = current[part]
+            elif (
+                isinstance(current, list | tuple)
+                and part.isascii()
+                and part.isdigit()
+                and int(part) < len(current)
+            ):
+                current = current[int(part)]
+            else:
+                return _MISSING
+        return current
+
+    def visit(current, remaining, root, resolving):
+        if current is False:
+            return "impossible"
+        if current is True or not isinstance(current, Mapping):
+            return "unknown"
+
+        segment = remaining[0]
+        index = int(segment) if segment.isascii() and segment.isdigit() else None
+        mode_key = "ascii-decimal" if index is not None else "other"
+        modes = (
+            ("object", "array")
+            if policy["modes"][mode_key] == "all(object,array)"
+            else (policy["modes"][mode_key],)
+        )
+        mode_outcomes = [
+            interpret(current, remaining, root, resolving, mode, index)
+            for mode in modes
+        ]
+        if all(outcome == "impossible" for outcome in mode_outcomes):
+            return "impossible"
+        if any(outcome == "possible" for outcome in mode_outcomes):
+            return "possible"
+        return "unknown"
+
+    def interpret(current, remaining, root, resolving, mode, index):
+        schema_type = current.get("type")
+        if keywords["type"] == "exclude-mode" and (
+            isinstance(schema_type, str) and schema_type != mode
+            or isinstance(schema_type, list | tuple) and mode not in schema_type
+        ):
+            return "impossible"
+
+        reference = current.get("$ref")
+        if (
+            policy["$ref"].startswith("local-pointer(map/array,~0/~1);")
+            and isinstance(reference, str)
+            and reference not in resolving
+        ):
+            target = local_ref(root, reference)
+            if target is False:
+                return "impossible"
+            if isinstance(target, Mapping) and interpret(
+                target,
+                remaining,
+                root,
+                resolving | {reference},
+                mode,
+                index,
+            ) == "impossible":
+                return "impossible"
+
+        if mode == "object":
+            property_name, *tail = remaining
+            properties = current.get("properties")
+            if isinstance(properties, Mapping) and property_name in properties:
+                child = properties[property_name]
+                if not tail:
+                    local_outcome = "impossible" if child is False else "possible"
+                else:
+                    local_outcome = visit(child, tuple(tail), root, resolving)
+            elif isinstance(current.get("patternProperties"), Mapping) and current[
+                "patternProperties"
+            ]:
+                local_outcome = "unknown"
+            else:
+                additional = current.get("additionalProperties", True)
+                if additional is False:
+                    local_outcome = "impossible"
+                elif isinstance(additional, Mapping) and tail:
+                    local_outcome = visit(additional, tuple(tail), root, resolving)
+                else:
+                    local_outcome = "unknown"
+        elif index is not None:
+            maximum = current.get("maxItems")
+            if (
+                isinstance(maximum, int)
+                and not isinstance(maximum, bool)
+                and index >= maximum
+            ):
+                return "impossible"
+            prefix = current.get("prefixItems")
+            if isinstance(prefix, list | tuple) and index < len(prefix):
+                child = prefix[index]
+            else:
+                items = current.get("items", True)
+                if isinstance(items, list | tuple):
+                    child = (
+                        items[index]
+                        if index < len(items)
+                        else current.get("additionalItems", True)
+                    )
+                else:
+                    child = items
+            local_outcome = (
+                ("impossible" if child is False else "possible")
+                if len(remaining) == 1
+                else visit(child, remaining[1:], root, resolving)
+            )
+        else:
+            return "impossible"
+
+        all_of = current.get("allOf")
+        if isinstance(all_of, list | tuple) and any(
+            branch is False
+            or isinstance(branch, Mapping)
+            and interpret(branch, remaining, root, resolving, mode, index)
+            == "impossible"
+            for branch in all_of
+        ):
+            return "impossible"
+        *union_keywords, union_strategy = keywords["union"]
+        assert union_strategy == "nonempty-all-impossible"
+        for keyword in union_keywords:
+            branches = current.get(keyword)
+            if (
+                isinstance(branches, list | tuple)
+                and branches
+                and all(
+                    branch is False
+                    or isinstance(branch, Mapping)
+                    and interpret(branch, remaining, root, resolving, mode, index)
+                    == "impossible"
+                    for branch in branches
+                )
+            ):
+                return "impossible"
+        return local_outcome
+
+    assert policy["strategies"]["unlisted"] == "ignored=unknown"
+    assert policy["$ref"].startswith("local-pointer(map/array,~0/~1);")
+    return visit(schema, tuple(path_parts), schema, frozenset())
+
+
+def _published_root_dotted_key(policy, schema, path_parts):
+    dotted = policy["dotted_key"]
+    assert dotted.startswith("after=impossible;joined-tail=literal-key;")
+    schema_type = schema.get("type")
+    object_capable = not (
+        isinstance(schema_type, str) and schema_type != "object"
+    ) and not (
+        isinstance(schema_type, list | tuple) and "object" not in schema_type
+    )
+    properties = schema.get("properties")
+    joined = ".".join(path_parts)
+    return (
+        object_capable
+        and "." in joined
+        and isinstance(properties, Mapping)
+        and joined in properties
+    )
 
 
 def _group(body=None, **overrides):
@@ -709,11 +955,6 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
     )
     formula = semantic_definitions[reference["definition"]]
     expressions = cast(dict[str, object], formula["expressions"])
-    selectors = cast(dict[str, object], formula["selectors"])
-    ordinary_multiplier = cast(
-        dict[str, object], selectors["ordinary_loop_multiplier"]
-    )
-    selected_retries = cast(dict[str, object], selectors["selected_retries"])
     accumulators = cast(list[str], work["accumulators"])
 
     assert formula["expression_format"] == "prefix-v1"
@@ -723,16 +964,18 @@ def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
     assert topology["max_edges"] == language_schema.LOOP_GROUP_MAX_EDGES
     assert [
         _evaluate_contract_selector(
-            ordinary_multiplier, node
+            "ordinary_loop_multiplier", formula, work, node
         )
         for node in body
     ] == [1, 1, 1, 4, 1, 1, 1]
     assert [
-        _evaluate_contract_selector(selected_retries, node)
+        _evaluate_contract_selector("selected_retries", formula, work, node)
         for node in body
     ] == [2, 4, 3, 0, 3, 5, 0]
     evaluated = {
-        name: _evaluate_contract_expression(expression, formula, body, 2)
+        name: _evaluate_contract_expression(
+            expression, formula, work, body, 2
+        )
         for name, expression in expressions.items()
     }
     assert evaluated == {"executions": 20, "attempts": 54}
@@ -875,7 +1118,7 @@ def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
             "status",
             "loop_group_scope_invalid",
             "scoped-reference-producer-schema-required",
-            "producer_schema_missing",
+            "no_schema",
         ),
         (
             "outer",
@@ -884,7 +1127,7 @@ def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
             "missing",
             "loop_group_scope_invalid",
             "scoped-reference-structured-path-impossible",
-            "path_proven_impossible",
+            "impossible",
         ),
         (
             "previous_iteration",
@@ -893,7 +1136,7 @@ def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
             "status",
             "loop_group_scope_invalid",
             "scoped-reference-producer-schema-required",
-            "producer_schema_missing",
+            "no_schema",
         ),
         (
             "current",
@@ -902,7 +1145,7 @@ def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
             "missing",
             "loop_group_scope_invalid",
             "scoped-reference-structured-path-impossible",
-            "path_proven_impossible",
+            "impossible",
         ),
         (
             "outer",
@@ -911,7 +1154,7 @@ def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
             "status",
             "output_reference_path_unsupported",
             "scoped-reference-producer-schema-required",
-            "producer_schema_missing",
+            "no_schema",
         ),
         (
             "outer",
@@ -924,7 +1167,7 @@ def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
             "record.status",
             "output_reference_path_unsupported",
             "scoped-reference-structured-path-impossible",
-            "path_targets_unaddressable_dotted_key",
+            "dotted",
         ),
     ],
 )
@@ -1010,20 +1253,20 @@ def test_v6_scoped_structured_reference_diagnostics_are_branch_local(
         dict[str, object], reference_definition["structured_path_constraint_v1"]
     )
     table = cast(dict[str, list[object]], constraint["diagnostic_table"])
-    columns = cast(list[str], table["columns"])
+    columns = cast(list[str], table["cols"])
     rows = cast(list[list[str]], table["rows"])
     diagnostic = next(
         dict(zip(columns, row, strict=True))
         for row in rows
         if row[0] == condition
     )
-    assert diagnostic["semantic_code"] == getattr(issue, "semantic_code")
+    assert diagnostic["semantic"] == getattr(issue, "semantic_code")
     descriptor_surface = {
         "body": "body",
-        "until_bash": "group_until_bash",
-        "gate_message": "group_gate_message",
+        "until_bash": "until",
+        "gate_message": "gate",
     }[surface]
-    assert diagnostic[descriptor_surface] == issue.code
+    assert table["codes"][diagnostic[descriptor_surface]] == issue.code
 
 
 def test_v6_accepts_structured_paths_on_all_scoped_reference_surfaces(
@@ -1069,6 +1312,202 @@ def test_v6_accepts_structured_paths_on_all_scoped_reference_surfaces(
 
     assert _normalize_v6_without_admission(path).definition.nodes[1].node_type == (
         "loop_group"
+    )
+
+
+@pytest.mark.parametrize(
+    ("surface", "field", "schema", "expected_outcome"),
+    [
+        (
+            "body",
+            "status",
+            {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "possible",
+        ),
+        (
+            "gate_message",
+            "status",
+            {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "possible",
+        ),
+        (
+            "body",
+            "missing",
+            {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "impossible",
+        ),
+        (
+            "gate_message",
+            "missing",
+            {
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "impossible",
+        ),
+        (
+            "gate_message",
+            "record.status",
+            {
+                "type": "object",
+                "properties": {"record.status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "impossible",
+        ),
+        (
+            "body",
+            "forbidden",
+            {"type": "object", "not": {"required": ["forbidden"]}},
+            "unknown",
+        ),
+        (
+            "body",
+            "records.1",
+            {
+                "type": "object",
+                "properties": {
+                    "records": {"type": "array", "maxItems": 1, "items": True}
+                },
+                "additionalProperties": False,
+            },
+            "impossible",
+        ),
+        (
+            "body",
+            "record.missing",
+            {
+                "$defs": {
+                    "record": {
+                        "type": "object",
+                        "properties": {"status": {"type": "string"}},
+                        "additionalProperties": False,
+                    }
+                },
+                "type": "object",
+                "properties": {"record": {"$ref": "#/$defs/record"}},
+                "additionalProperties": False,
+            },
+            "impossible",
+        ),
+        (
+            "body",
+            "choice.missing",
+            {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "anyOf": [
+                            {"type": "object", "additionalProperties": False},
+                            {"type": "object", "additionalProperties": False},
+                        ]
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "impossible",
+        ),
+        (
+            "body",
+            "dynamic",
+            {
+                "type": "object",
+                "patternProperties": {"^dynamic$": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "unknown",
+        ),
+    ],
+)
+def test_v6_group_producer_schema_and_path_decisions_follow_published_policy(
+    tmp_path,
+    workflow_writer,
+    surface,
+    field,
+    schema,
+    expected_outcome,
+):
+    producer_group = {
+        "id": "producer-group",
+        "loop_group": {
+            "until": "done",
+            "max_iterations": 1,
+            "nodes": [
+                {
+                    "id": "first-terminal",
+                    "prompt": "produce",
+                    "output_format": schema,
+                },
+                {
+                    "id": "second-terminal",
+                    "prompt": "do not promote",
+                    "output_format": {
+                        "type": "object",
+                        "properties": {"other": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                },
+            ],
+        },
+    }
+    reference = f"$producer-group.output.{field}"
+    consumer_group = _group(
+        [{"id": "consume", "prompt": reference if surface == "body" else "use"}],
+        **({"gate_message": reference} if surface == "gate_message" else {}),
+    )
+    consumer_group["depends_on"] = ["producer-group"]
+    nodes = [producer_group, consumer_group]
+    constraint = _structured_path_constraint()
+    resolved = _resolve_published_producer_schema(
+        constraint, nodes, "producer-group"
+    )
+    assert resolved is not _MISSING
+    outcome = _published_path_outcome(
+        constraint["conservative_tristate_v1"], resolved, field.split(".")
+    )
+    assert outcome == expected_outcome
+    path = workflow_writer(tmp_path, nodes=nodes)
+
+    if outcome in constraint["conservative_tristate_v1"]["accept"]:
+        package = _normalize_v6_without_admission(path)
+        assert package.language.structured_outputs["producer-group"] == (
+            package.language.structured_outputs["producer-group/first-terminal"]
+        )
+        return
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_without_admission(path)
+    issue = raised.value.issues[0]
+    table = constraint["diagnostic_table"]
+    condition = (
+        "dotted"
+        if _published_root_dotted_key(
+            constraint["conservative_tristate_v1"], resolved, field.split(".")
+        )
+        else "impossible"
+    )
+    diagnostic = next(
+        dict(zip(table["cols"], row, strict=True))
+        for row in table["rows"]
+        if row[0] == condition
+    )
+    contract_surface = "body" if surface == "body" else "gate"
+    assert (issue.code, getattr(issue, "semantic_code", None)) == (
+        table["codes"][diagnostic[contract_surface]],
+        diagnostic["semantic"],
     )
 
 

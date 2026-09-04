@@ -787,6 +787,137 @@ def _archon_loop_group_cases(
         ),
         _case(
             profile,
+            "loop-group-promoted-schema-valid",
+            _group_definition(
+                "loop-group-promoted-schema-valid",
+                "        - id: consume\n          prompt: Use $producer-group.output.status",
+                outer_nodes="""  - id: producer-group
+    loop_group:
+      until: done
+      max_iterations: 1
+      nodes:
+        - id: first-terminal
+          prompt: Produce.
+          output_format:
+            type: object
+            properties:
+              status: {type: string}
+            additionalProperties: false
+        - id: second-terminal
+          prompt: Not promoted.
+          output_format:
+            type: object
+            properties:
+              other: {type: string}
+            additionalProperties: false""",
+                group_fields=(
+                    "      gate_message: Review $producer-group.output.status"
+                ),
+                group_options="    depends_on: [producer-group]",
+            ),
+            features=(
+                "reference:outer",
+                "reference:structured-path",
+                "surface:group-gate-message",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-promoted-schema-body-impossible",
+            _group_definition(
+                "loop-group-promoted-schema-body-impossible",
+                "        - id: consume\n          prompt: Use $producer-group.output.missing",
+                outer_nodes="""  - id: producer-group
+    loop_group:
+      until: done
+      max_iterations: 1
+      nodes:
+        - id: first-terminal
+          prompt: Produce.
+          output_format:
+            type: object
+            properties:
+              status: {type: string}
+            additionalProperties: false""",
+                group_options="    depends_on: [producer-group]",
+            ),
+            diagnostics=issue(
+                "loop_group_scope_invalid",
+                "nodes[1].loop_group.nodes[0].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                ),
+            ),
+            features=(
+                "invalid:structured-path-impossible",
+                "reference:outer",
+                "reference:structured-path",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-promoted-schema-gate-impossible",
+            _group_definition(
+                "loop-group-promoted-schema-gate-impossible",
+                "        - id: consume\n          prompt: Consume.",
+                outer_nodes="""  - id: producer-group
+    loop_group:
+      until: done
+      max_iterations: 1
+      nodes:
+        - id: first-terminal
+          prompt: Produce.
+          output_format:
+            type: object
+            properties:
+              status: {type: string}
+            additionalProperties: false""",
+                group_fields=(
+                    "      gate_message: Review $producer-group.output.missing"
+                ),
+                group_options="    depends_on: [producer-group]",
+            ),
+            diagnostics=issue(
+                "structured_output_field_impossible",
+                "nodes[1].loop_group.gate_message",
+                semantic_code=(
+                    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                ),
+            ),
+            features=(
+                "invalid:structured-path-impossible",
+                "reference:outer",
+                "reference:structured-path",
+                "surface:group-gate-message",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-promoted-schema-unsupported-conservative",
+            _group_definition(
+                "loop-group-promoted-schema-unsupported-conservative",
+                "        - id: consume\n          prompt: Use $producer-group.output.forbidden",
+                outer_nodes="""  - id: producer-group
+    loop_group:
+      until: done
+      max_iterations: 1
+      nodes:
+        - id: first-terminal
+          prompt: Produce.
+          output_format:
+            type: object
+            not:
+              required: [forbidden]""",
+                group_options="    depends_on: [producer-group]",
+            ),
+            features=(
+                "reference:outer",
+                "reference:structured-path",
+                "schema-proof:unsupported-conservative",
+            ),
+        ),
+        _case(
+            profile,
             "loop-group-first-terminal-primary",
             _group_definition(
                 "loop-group-primary-sink",

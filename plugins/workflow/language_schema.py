@@ -28,6 +28,8 @@ from plugins.workflow.models import (
     SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
     SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
     SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+    STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES,
+    STRUCTURED_PATH_UNION_KEYWORDS,
     WorkflowLanguageProfile,
     WorkflowLanguageSelection,
 )
@@ -3229,62 +3231,102 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
             "companion_node_paths": {
                 "format": "group/child",
                 "field_paths": ["sidecar.outward_action_nodes[]"],
-            },
-            "validation_codes": {
-                "body": "loop_group_scope_invalid",
-                "group_until_bash": {
-                    "visibility": "output_reference_not_declared_dependency",
-                    "structured_output": "loop_group_scope_invalid",
-                },
-                "group_gate_message": "output_reference_not_declared_dependency",
-            },
-            "semantic_codes": {
-                "current_scope_missing_dependency": (
-                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
-                ),
-                "outer_scope_missing_group_dependency": (
-                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
-                ),
-                "previous_iteration_unknown_producer": (
-                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE
-                ),
-                "companion_unknown_node": (
-                    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE
-                ),
+                "validation_code": "unknown_sidecar_node",
             },
             "structured_path_constraint_v1": {
                 "syntax_rule": "strict-output-reference",
-                "producer_schema_field": "output_format",
-                "applies_to": "scoped-output-reference-v1",
-                "diagnostic_table": {
-                    "columns": [
-                        "condition",
-                        "semantic_code",
-                        "body",
-                        "group_until_bash",
-                        "group_gate_message",
+                "producer_schema_resolution_v1": {
+                    "ordinary": ["output_format"],
+                    "loop_group": [
+                        "scoped-dag-topology-v1.primary_sink",
+                        "output_format",
                     ],
+                },
+                "conservative_tristate_v1": {
+                    "accept": ["possible", "unknown"],
+                    "reject": "impossible",
+                    "modes": {
+                        "ascii-decimal": "all(object,array)",
+                        "other": "object",
+                    },
+                    "strategies": {
+                        "schema": (
+                            "false=impossible;true|nonmap=unknown"
+                        ),
+                        **{
+                            keyword: strategy
+                            for keyword, strategy in (
+                                STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES.items()
+                            )
+                            if keyword not in STRUCTURED_PATH_UNION_KEYWORDS
+                        },
+                        "union": [
+                            *STRUCTURED_PATH_UNION_KEYWORDS,
+                            STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES["anyOf"],
+                        ],
+                        "unlisted": "ignored=unknown",
+                    },
+                    "$ref": (
+                        "local-pointer(map/array,~0/~1);"
+                        "false|impossible=>impossible;"
+                        "unresolved|nonlocal|cycle=>unknown"
+                    ),
+                    "dotted_key": (
+                        "after=impossible;joined-tail=literal-key;"
+                        "walk=$ref(map)/combinators(any)/properties/array-items;"
+                        "type=capable"
+                    ),
+                },
+                "diagnostic_table": {
+                    "codes": {
+                        "L": "loop_group_scope_invalid",
+                        "D": "output_reference_not_declared_dependency",
+                        "U": "output_reference_path_unsupported",
+                        "F": "structured_output_field_impossible",
+                    },
+                    "cols": ["when", "semantic", "body", "until", "gate"],
                     "rows": [
                         [
-                            "producer_schema_missing",
+                            "dep",
+                            SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                            "L",
+                            "D",
+                            "D",
+                        ],
+                        [
+                            "prev",
+                            SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+                            "L",
+                            "L",
+                            None,
+                        ],
+                        [
+                            "companion",
+                            SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
+                            None,
+                            None,
+                            None,
+                        ],
+                        [
+                            "no_schema",
                             SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
-                            "loop_group_scope_invalid",
-                            "loop_group_scope_invalid",
-                            "output_reference_path_unsupported",
+                            "L",
+                            "L",
+                            "U",
                         ],
                         [
-                            "path_proven_impossible",
+                            "impossible",
                             SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
-                            "loop_group_scope_invalid",
-                            "loop_group_scope_invalid",
-                            "structured_output_field_impossible",
+                            "L",
+                            "L",
+                            "F",
                         ],
                         [
-                            "path_targets_unaddressable_dotted_key",
+                            "dotted",
                             SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
-                            "loop_group_scope_invalid",
-                            "loop_group_scope_invalid",
-                            "output_reference_path_unsupported",
+                            "L",
+                            "L",
+                            "U",
                         ],
                     ],
                 },
@@ -3292,6 +3334,7 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
         },
         "loop-group-work-product-v1": {
             "expression_format": "prefix-v1",
+            "retry_precedence": "approval>retry>command|prompt>default",
             "expressions": {
                 "executions": [
                     "*",
@@ -3311,45 +3354,6 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
                         ],
                     ],
                 ],
-            },
-            "selectors": {
-                "ordinary_loop_multiplier": {
-                    "first_match": [
-                        {
-                            "node_kind": "loop",
-                            "field_path": ["loop", "max_iterations"],
-                            "default": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
-                        },
-                        {
-                            "constant": LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
-                        },
-                    ],
-                },
-                "selected_retries": {
-                    "first_match": [
-                        {
-                            "mapping_at": ["approval", "on_reject"],
-                            "field_path": [
-                                "approval",
-                                "on_reject",
-                                "max_attempts",
-                            ],
-                            "default": LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
-                        },
-                        {
-                            "mapping_at": ["retry"],
-                            "field_path": ["retry", "max_attempts"],
-                            "default": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
-                        },
-                        {
-                            "node_kind_in": ["command", "prompt"],
-                            "constant": LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES,
-                        },
-                        {
-                            "constant": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
-                        },
-                    ],
-                },
             },
         },
     }
