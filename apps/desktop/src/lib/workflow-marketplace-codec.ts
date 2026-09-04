@@ -529,9 +529,17 @@ function safeRepositoryUrl(value: unknown, mode: RepositoryUrlMode): string | nu
 
 function isSafeScpRepositoryUrl(value: string): boolean {
   const primary = value.split('#', 1)[0]
-  const match = /^git@([^@\s/:?#]+):(.+)$/.exec(primary)
+  const prefix = 'git@'
+  const separator = primary.indexOf(':', prefix.length)
 
-  return match !== null && !primary.includes('?') && !primary.slice(4).includes('@') && !/\s/.test(value)
+  if (!primary.startsWith(prefix) || separator < 0 || primary.includes('?') || /\s/.test(value)) {
+    return false
+  }
+
+  const host = primary.slice(prefix.length, separator)
+  const repositoryPath = primary.slice(separator + 1)
+
+  return /^[^@\s/:?#]+$/.test(host) && repositoryPath.length > 0
 }
 
 export function isWorkflowMarketplaceRepositoryUrl(value: unknown): value is string {
@@ -547,7 +555,7 @@ function isSafeRepositoryShorthand(value: unknown): value is string {
 
   const layers = repositoryLayers(decoded)
 
-  if (layers === null || layers.length !== 1) {
+  if (layers === null || layers.some(layer => layer.includes('@')) || layers.length !== 1) {
     return false
   }
 

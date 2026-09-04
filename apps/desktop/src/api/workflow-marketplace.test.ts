@@ -350,12 +350,15 @@ describe('workflow marketplace API', () => {
     'ssh://git@example.test/team/workflows.git',
     'git@example.test:team/workflows.git',
     'git@corp_alias:team/workflows.git',
+    'git@corp_alias:team/repo@v2.git',
+    'git@Corp_Alias-2:team/dir@scope/repo.git',
     'file:/Users/operator/projects/workflows.git',
     'file:/tmp/workflows.git',
     'file:/Users/operator/.cache/workflows.git',
     'https://example.test/team/redacted-tools.git',
     'https://example.test/team/workflows.git?monkey=value',
     'owner/repository#packages/support',
+    'owner/repository?next=https://private.test/team/repo.git',
     'owner/repository/packages/laptop-support'
   ])('accepts the supported direct install identity %s', async identifier => {
     await prepareWorkflowPackageInstall({ identifier }, scope)
@@ -369,6 +372,8 @@ describe('workflow marketplace API', () => {
     'https://example.test/team/redacted-tools.git',
     'ssh://git@example.test/team/workflows.git#packages/support',
     'git@example.test:team/workflows.git#packages/support',
+    'git@corp_alias:team/repo@v2.git',
+    'git@Corp_Alias-2:team/dir@scope/repo.git',
     'file:/tmp/workflows.git',
     'file:/Users/operator/.cache/workflows.git',
     'owner/repository/packages/support'
@@ -651,6 +656,11 @@ describe('workflow marketplace API', () => {
     () => confirmWorkflowPackageInstall('short', scope),
     () => addWorkflowMarketplaceSource({ name: 'company', repositoryUrl: 'file:///REDACTED' }, scope),
     () =>
+      addWorkflowMarketplaceSource(
+        { name: 'company', repositoryUrl: 'owner/repository?next=ssh://git@private.test/team/repo.git' },
+        scope
+      ),
+    () =>
       updateWorkflowMarketplaceSource(
         'company',
         { enabled: true, ref: null, repositoryUrl: 'https://example.test/[REDACTED_PATH].git' },
@@ -663,7 +673,16 @@ describe('workflow marketplace API', () => {
       prepareWorkflowPackageInstall(
         { identifier: 'owner/repository?next=https://private.test/repo?access_token=secret' },
         scope
-      )
+      ),
+    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository?scope=@team' }, scope),
+    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository#scope=%2540team' }, scope),
+    () =>
+      prepareWorkflowPackageInstall(
+        { identifier: 'owner/repository?next=https://private.test/repo?scope=%2540team' },
+        scope
+      ),
+    () =>
+      prepareWorkflowPackageInstall({ identifier: 'owner/repository?next=ssh://git@private.test/team/repo.git' }, scope)
   ])('rejects unsafe client input before issuing a request', async call => {
     await expect(call()).rejects.toBeInstanceOf(TypeError)
     expect(apiStructured).not.toHaveBeenCalled()

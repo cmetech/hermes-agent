@@ -720,10 +720,37 @@ describe('workflow marketplace codec', () => {
   })
 
   it.each([
+    ['git@host:path', true],
+    ['git@gitlab.example:team/repo.git#packages/support', true],
+    ['git@corp_alias:team/repo@v2.git', true],
+    ['git@Corp_Alias-2:team/dir@scope/repo.git', true],
+    ['git@corp_alias:team/repo@@v2.git', true],
+    ['git@:team/repo.git', false],
+    ['git@corp_alias:', false],
+    ['git@@corp_alias:team/repo.git', false],
+    ['git@corp@alias:team/repo.git', false],
+    ['git@alice:secret@corp_alias:team/repo.git', false],
+    ['user:password@host:path', false],
+    ['owner/repository/subdir?channel=stable', true],
+    ['owner/repository?next=https://private.test/team/repo.git', true],
+    ['owner/repository?next=ssh://private.test/team/repo.git', true],
+    ['owner/repository?next=ssh://git@private.test/team/repo.git', false],
+    ['owner/repository?scope=@team', false],
+    ['owner/repository#scope=@team', false],
+    ['owner/repository?next=https://private.test/repo?access_token=secret', false]
+  ] as const)('matches backend Git-source request validation for %s', (identifier, expected) => {
+    expect(isWorkflowMarketplaceSourceRequestUrl(identifier)).toBe(expected)
+    expect(isWorkflowMarketplaceInstallIdentifier(identifier)).toBe(expected)
+  })
+
+  it.each([
     'git@gitlab.example:team/repo.git#packages/support',
     'git@corp_alias:team/repo.git',
     'git@Corp_Alias-2:team/repo.git',
-    'git@repo_host.internal_2:team/repo.git#packages/support'
+    'git@repo_host.internal_2:team/repo.git#packages/support',
+    'git@corp_alias:team/repo@v2.git',
+    'git@Corp_Alias-2:team/dir@scope/repo.git',
+    'git@corp_alias:team/repo@@v2.git'
   ])('accepts the backend-supported SCP host alias %s', repositoryUrl => {
     expect(isWorkflowMarketplaceRepositoryUrl(repositoryUrl)).toBe(true)
     expect(isWorkflowMarketplaceSourceRequestUrl(repositoryUrl)).toBe(true)
@@ -735,9 +762,13 @@ describe('workflow marketplace codec', () => {
     'git@corp_alias:',
     'git@corp/alias:team/repo.git',
     'git@corp alias:team/repo.git',
+    'git@corp_alias:team repo.git',
+    `git@corp_alias:team/${String.fromCodePoint(31)}repo.git`,
     'git@corp_alias:../repo.git',
     'git@corp_alias:team/repo.git?ref=main',
     'git@alice:secret@corp_alias:team/repo.git',
+    'git@@corp_alias:team/repo.git',
+    'git@corp@alias:team/repo.git',
     'git@corp_alias:team\\repo.git',
     'git@corp#alias:team/repo.git',
     `git@corp${String.fromCodePoint(127)}alias:team/repo.git`
@@ -745,6 +776,40 @@ describe('workflow marketplace codec', () => {
     expect(isWorkflowMarketplaceRepositoryUrl(repositoryUrl)).toBe(false)
     expect(isWorkflowMarketplaceSourceRequestUrl(repositoryUrl)).toBe(false)
     expect(isWorkflowMarketplaceInstallIdentifier(repositoryUrl)).toBe(false)
+  })
+
+  it('rejects shorthand authority markers before query and fragment truncation', () => {
+    for (const identifier of [
+      'owner/repository?scope=@team',
+      'owner/repository#scope=@team',
+      'owner/repository?scope=%40team',
+      'owner/repository?scope=%2540team',
+      'owner/repository#scope=%252540team',
+      'owner/repository?next=https://private.test/repo?scope=@team',
+      'owner/repository?next=https://private.test/repo?scope=%2540team',
+      'owner/repository#next=https://private.test/repo#scope=@team',
+      'owner/repository#next=https://private.test/repo#scope=%252540team',
+      'owner/repository?next=ssh://git@private.test/team/repo.git',
+      'owner/repository?next=ssh://git%40private.test/team/repo.git',
+      'owner/repository?next=ssh://git%2540private.test/team/repo.git',
+      'owner/repository?next=user:password@private.test:team/repo.git'
+    ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(identifier)).toBe(false)
+      expect(isWorkflowMarketplaceInstallIdentifier(identifier)).toBe(false)
+    }
+
+    for (const identifier of [
+      'owner/repository/subdir?channel=stable',
+      'owner/repository?next=https://private.test/team/repo.git',
+      'owner/repository?next=ssh://private.test/team/repo.git',
+      'owner/repository#packages/support?monkey=value',
+      'https://example.test/team/repo@v2.git',
+      'ssh://git@private.test/team/repo@v2.git',
+      'file:/tmp/repo@v2.git'
+    ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(identifier)).toBe(true)
+      expect(isWorkflowMarketplaceInstallIdentifier(identifier)).toBe(true)
+    }
   })
 
   it('rejects non-canonical UTC timestamps', () => {
