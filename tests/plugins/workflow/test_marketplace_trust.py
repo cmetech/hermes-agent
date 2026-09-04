@@ -644,6 +644,119 @@ def test_revoke_one_origin_digest_preserves_other_grants_and_other_digests(
     assert origin in payload["records"][second]["grants"]
 
 
+def test_trust_many_origin_grants_use_one_write_and_preserve_existing_origins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    first = "1" * 64
+    second = "2" * 64
+    first_risk = "a" * 64
+    second_risk = "b" * 64
+    origin = "marketplace:company/package"
+    store.trust(first, actor="manual", risk_digest=first_risk)
+    store.trust_origin(
+        first,
+        actor="other",
+        risk_digest=first_risk,
+        origin="marketplace:other/package",
+    )
+    original_write = store._write
+    writes = 0
+
+    def recording_write(payload):
+        nonlocal writes
+        writes += 1
+        return original_write(payload)
+
+    monkeypatch.setattr(store, "_write", recording_write)
+
+    assert (
+        store.trust_origin_many(
+            ((first, first_risk), (second, second_risk)),
+            actor="alice",
+            origin=origin,
+        )
+        == 2
+    )
+
+    payload = store.snapshot_read_only(max_bytes=1024 * 1024)
+    assert writes == 1
+    assert set(payload["records"][first]["grants"]) == {
+        "manual",
+        "marketplace:other/package",
+        origin,
+    }
+    assert set(payload["records"][second]["grants"]) == {origin}
+
+
+def test_trust_many_treats_commit_then_raise_as_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    first = "1" * 64
+    second = "2" * 64
+    origin = "marketplace:company/package"
+    store.trust(first, actor="manual", risk_digest="a" * 64)
+    original_write = store._write
+
+    def commit_then_raise(payload):
+        original_write(payload)
+        raise OSError("directory fsync failed after replacement")
+
+    monkeypatch.setattr(store, "_write", commit_then_raise)
+
+    assert (
+        store.trust_origin_many(
+            ((first, "a" * 64), (second, "b" * 64)),
+            actor="alice",
+            origin=origin,
+        )
+        == 2
+    )
+
+    payload = store.snapshot_read_only(max_bytes=1024 * 1024)
+    assert set(payload["records"][first]["grants"]) == {"manual", origin}
+    assert set(payload["records"][second]["grants"]) == {origin}
+
+
+@pytest.mark.parametrize(
+    "grants",
+    [(), (("bad", "a" * 64),), (("1" * 64, "a" * 64), ("1" * 64, "b" * 64))],
+)
+def test_trust_many_rejects_malformed_or_ambiguous_batches(
+    tmp_path: Path,
+    grants: tuple[tuple[str, str], ...],
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+
+    with pytest.raises(WorkflowTrustError):
+        store.trust_origin_many(
+            grants,
+            actor="alice",
+            origin="marketplace:company/package",
+        )
+
+    assert not store.path.exists()
+
+
+def test_trust_many_rejects_corrupt_store_without_rewrite(tmp_path: Path) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text("{broken", encoding="utf-8")
+    before = store.path.read_bytes()
+
+    with pytest.raises(WorkflowTrustError, match="corrupt"):
+        store.trust_origin_many(
+            (("1" * 64, "a" * 64),),
+            actor="alice",
+            origin="marketplace:company/package",
+        )
+
+    assert store.path.read_bytes() == before
+
+
 def test_revoke_one_origin_digest_missing_pair_does_not_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

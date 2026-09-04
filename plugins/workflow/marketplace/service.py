@@ -17,6 +17,7 @@ import tempfile
 from typing import Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+import yaml
 
 from hermes_cli.git_source import (
     GitSourceError,
@@ -38,6 +39,7 @@ from plugins.workflow.compilation import (
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.models import WorkflowMarketplaceBinding, WorkflowValidationError
 from plugins.workflow.schema import parse_workflow_source_bytes
+from plugins.workflow.resources import normalize_mcp_server_document
 from plugins.workflow.trust import WorkflowTrustStore
 from utils import atomic_write_text
 
@@ -60,6 +62,10 @@ from .models import (
     UpdateCheck,
     UpdateReview,
     WorkflowMarketplaceSource,
+    WorkflowCompatibilityChanges,
+    WorkflowCompatibilityIdentity,
+    WorkflowRiskChanges,
+    WorkflowRiskIdentity,
     WorkflowTrustReviewItem,
 )
 from .package import (
@@ -89,6 +95,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _DIRECT_PREFIX = "direct-"
 _DESTINATION_ADVISORY_CODES = frozenset({
     "execution_environment_unavailable",
+    "mcp_isolation",
     "mcp_unavailable",
     "provider_authority_missing",
     "provider_field_unsupported",
@@ -130,7 +137,7 @@ def _safe_message(message: object, repository_url: str = "") -> str:
     rendered = safe_git_error(result, repository_url).strip()
     if not rendered:
         rendered = "workflow marketplace operation failed"
-    return rendered.encode("utf-8")[:4096].decode("utf-8", errors="ignore")
+    return rendered.encode("utf-8")[:4000].decode("utf-8", errors="ignore")
 
 
 def _canonical_digest(domain: bytes, value: object) -> str:
@@ -161,6 +168,59 @@ def _requirement_changes(
         field: _set_change(getattr(old, field), getattr(candidate, field))
         for field in ("runtimes", "tools", "providers", "services", "secrets")
     })
+
+
+def _risk_changes(
+    old: Iterable[WorkflowTrustReviewItem],
+    candidate: Iterable[WorkflowTrustReviewItem],
+) -> WorkflowRiskChanges:
+    def values(
+        items: Iterable[WorkflowTrustReviewItem],
+    ) -> dict[tuple[str, str, str], WorkflowRiskIdentity]:
+        return {
+            (item.workflow_name, item.package_digest, item.risk_digest): (
+                WorkflowRiskIdentity(
+                    workflowName=item.workflow_name,
+                    packageDigest=item.package_digest,
+                    riskDigest=item.risk_digest,
+                )
+            )
+            for item in items
+        }
+
+    before = values(old)
+    after = values(candidate)
+    return WorkflowRiskChanges(
+        added=[after[key] for key in sorted(set(after) - set(before))],
+        removed=[before[key] for key in sorted(set(before) - set(after))],
+    )
+
+
+def _compatibility_changes(
+    old: Iterable[WorkflowTrustReviewItem],
+    candidate: Iterable[WorkflowTrustReviewItem],
+) -> WorkflowCompatibilityChanges:
+    def values(
+        items: Iterable[WorkflowTrustReviewItem],
+    ) -> dict[tuple[str, str, str], WorkflowCompatibilityIdentity]:
+        return {
+            (item.workflow_name, finding.code, finding.severity): (
+                WorkflowCompatibilityIdentity(
+                    workflowName=item.workflow_name,
+                    code=finding.code,
+                    severity=finding.severity,
+                )
+            )
+            for item in items
+            for finding in item.compatibility
+        }
+
+    before = values(old)
+    after = values(candidate)
+    return WorkflowCompatibilityChanges(
+        added=[after[key] for key in sorted(set(after) - set(before))],
+        removed=[before[key] for key in sorted(set(before) - set(after))],
+    )
 
 
 def _file_changes(
@@ -417,41 +477,57 @@ class _TrustConfirmationStore:
         return token
 
     def consume(self, token: str, *, actor: str, profile: str) -> _TrustAuthorization:
-        if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
-            _fail("confirmation_token_invalid", "confirmation token is invalid")
-        token_digest = hashlib.sha256(token.encode()).hexdigest()
         try:
-            parent_identity = self.source_store._ensure_private_root()
-            with workflow_lock(self.source_store.lock_path):
-                state = self._read()
-                now = self.clock()
-                record = next(
-                    (
-                        item
-                        for item in state.tokens
-                        if item.token_digest == token_digest
-                        and item.actor == actor
-                        and item.profile == profile
-                        and _parse_timestamp(item.expires_at) > now
-                    ),
-                    None,
-                )
-                if record is None:
-                    _fail(
-                        "confirmation_token_invalid",
-                        "confirmation token is invalid",
-                    )
-                self._write(
-                    [
-                        item
-                        for item in state.tokens
-                        if item.token_digest != token_digest
-                        and _parse_timestamp(item.expires_at) > now
-                    ],
+            with self.source_store._locked() as parent_identity:
+                return self.consume_locked(
+                    token,
+                    actor=actor,
+                    profile=profile,
                     parent_identity=parent_identity,
                 )
         except WorkflowLockTimeout as error:
             _fail("trust_confirmation_lock_timeout", str(error))
+
+    def consume_locked(
+        self,
+        token: str,
+        *,
+        actor: str,
+        profile: str,
+        parent_identity: tuple[int, int],
+    ) -> _TrustAuthorization:
+        """Consume while the caller holds the shared marketplace lifecycle lock."""
+
+        if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
+            _fail("confirmation_token_invalid", "confirmation token is invalid")
+        token_digest = hashlib.sha256(token.encode()).hexdigest()
+        state = self._read()
+        now = self.clock()
+        record = next(
+            (
+                item
+                for item in state.tokens
+                if item.token_digest == token_digest
+                and item.actor == actor
+                and item.profile == profile
+                and _parse_timestamp(item.expires_at) > now
+            ),
+            None,
+        )
+        if record is None:
+            _fail(
+                "confirmation_token_invalid",
+                "confirmation token is invalid",
+            )
+        self._write(
+            [
+                item
+                for item in state.tokens
+                if item.token_digest != token_digest
+                and _parse_timestamp(item.expires_at) > now
+            ],
+            parent_identity=parent_identity,
+        )
         return _TrustAuthorization(
             identity=record.identity,
             distribution_digest=record.distribution_digest,
@@ -543,6 +619,21 @@ class WorkflowMarketplaceService:
 
     def set_source_enabled(self, name: str, enabled: bool) -> WorkflowMarketplaceSource:
         return self.catalog.source_store.set_enabled(name, enabled)
+
+    def update_source(
+        self,
+        name: str,
+        repository_url: str,
+        *,
+        ref: str | None,
+        enabled: bool,
+    ) -> WorkflowMarketplaceSource:
+        return self.catalog.source_store.update(
+            name,
+            repository_url,
+            ref=ref,
+            enabled=enabled,
+        )
 
     def remove_source(self, name: str) -> WorkflowMarketplaceSource:
         return self.catalog.source_store.remove(name)
@@ -644,6 +735,11 @@ class WorkflowMarketplaceService:
                 checkout.root.joinpath(*entry.package_path.split("/")),
                 expected_digest=entry.package_digest,
             )
+            if distribution.manifest.id != package_id or entry.id != package_id:
+                _fail(
+                    "package_index_invalid",
+                    "registered package identity differs from repository index",
+                )
             yield _FetchedCandidate(
                 distribution=distribution,
                 identity=InstalledPackageIdentity(
@@ -855,21 +951,65 @@ class WorkflowMarketplaceService:
                 ))
         except WorkflowMarketplaceError:
             raise
-        except (KeyError, TypeError, ValueError, WorkflowValidationError) as error:
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            ValidationError,
+            WorkflowValidationError,
+            yaml.YAMLError,
+        ) as error:
             _fail(
                 "package_workflow_invalid",
-                _safe_message(error),
+                (
+                    "package workflow assessment is invalid"
+                    if isinstance(error, OSError)
+                    else _safe_message(error)
+                ),
             )
         package_paths = sorted(distribution.covered_paths)
-        command_resources = sorted(
-            path for path in package_paths if path.startswith("commands/")
-        )
-        script_resources = sorted(
-            path for path in package_paths if path.startswith("scripts/")
-        )
-        mcp_resources = sorted(
-            path for path in package_paths if path.startswith("mcp/")
-        )
+        mcp_disclosures: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+        def inspect_mcp(reference: str) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+            candidates = (
+                reference,
+                f"mcp/{reference}",
+                f"mcp/{reference.removesuffix('.yaml')}.yaml",
+            )
+            matched = next(
+                (candidate for candidate in candidates if candidate in files), None
+            )
+            if matched is None:
+                raise ValueError("declared MCP definition is unavailable")
+            cached = mcp_disclosures.get(matched)
+            if cached is None:
+                encoded = files[matched].content
+                if len(encoded) > 256_000:
+                    raise ValueError("MCP definition exceeds 256000 bytes")
+                document = yaml.safe_load(encoded.decode("utf-8")) or {}
+                servers = normalize_mcp_server_document(
+                    document,
+                    default_name=Path(matched).stem,
+                )
+                cached = (
+                    tuple(
+                        sorted(
+                            name
+                            for name, server in servers.items()
+                            if "command" in server
+                        )
+                    ),
+                    tuple(
+                        sorted(
+                            name for name, server in servers.items() if "url" in server
+                        )
+                    ),
+                )
+                mcp_disclosures[matched] = cached
+            return matched, cached[0], cached[1]
+
         rendered: list[WorkflowTrustReviewItem] = []
         blockers: list[PackageDiagnostic] = []
         for member, compilation, assessment in assessments:
@@ -892,14 +1032,33 @@ class WorkflowMarketplaceService:
                 if severity == "blocker":
                     blockers.append(diagnostic)
             nodes = compilation.package.definition.nodes
-            local_mcp = sorted(
-                value for value in risk.local_mcp_servers if "://" not in value
+            bindings = compilation.dependency_manifest.resources
+            command_resources = sorted({
+                binding.source_relative_path
+                for binding in bindings
+                if binding.resource_kind in {"command", "loop_command"}
+            })
+            script_resources = sorted({
+                binding.source_relative_path
+                for binding in bindings
+                if binding.resource_kind == "named_script"
+            })
+            mcp_bindings = tuple(
+                binding for binding in bindings if binding.resource_kind == "mcp"
             )
-            remote_mcp = sorted(
-                value for value in risk.local_mcp_servers if "://" in value
-            )
-            rendered.append(
-                WorkflowTrustReviewItem(
+            mcp_resource_paths = {
+                binding.source_relative_path for binding in mcp_bindings
+            }
+            local_mcp: set[str] = set()
+            remote_mcp: set[str] = set()
+            try:
+                for reference in risk.local_mcp_servers:
+                    matched, local_names, remote_names = inspect_mcp(reference)
+                    mcp_resource_paths.add(matched)
+                    local_mcp.update(local_names)
+                    remote_mcp.update(remote_names)
+                mcp_resources = sorted(mcp_resource_paths)
+                item = WorkflowTrustReviewItem(
                     workflowName=compilation.package.definition.name,
                     definitionPath=member.definition,
                     companionPath=member.companion,
@@ -921,16 +1080,33 @@ class WorkflowMarketplaceService:
                     mcpResources=mcp_resources,
                     requestedTools=sorted(risk.requested_tools),
                     requestedSkills=sorted(risk.requested_skills),
-                    localMcpServers=local_mcp,
-                    remoteMcpServers=remote_mcp,
+                    localMcpServers=sorted(local_mcp),
+                    remoteMcpServers=sorted(remote_mcp),
                     providers=sorted(risk.providers),
                     outwardActionNodes=sorted(risk.outward_action_nodes),
                     requiredSecrets=sorted(risk.required_secret_names),
                     externalRequirements=distribution.manifest.external_requirements,
-                    packageResources=package_paths,
+                    packageResourceSet="package",
                     compatibility=compatibility,
                 )
-            )
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                UnicodeError,
+                ValueError,
+                ValidationError,
+                yaml.YAMLError,
+            ) as error:
+                _fail(
+                    "package_workflow_invalid",
+                    (
+                        "package workflow assessment is invalid"
+                        if isinstance(error, OSError)
+                        else _safe_message(error)
+                    ),
+                )
+            rendered.append(item)
         return sorted(rendered, key=lambda item: item.workflow_name), sorted(
             blockers, key=lambda item: (item.code, item.message)
         )
@@ -993,6 +1169,7 @@ class WorkflowMarketplaceService:
                 unique_advisories.values(), key=lambda item: (item.code, item.message)
             ),
             externalRequirements=distribution.manifest.external_requirements,
+            packageResources=sorted(distribution.covered_paths),
         )
 
     def prepare_install(
@@ -1171,27 +1348,9 @@ class WorkflowMarketplaceService:
                 old_distribution.manifest.external_requirements,
                 fetched.distribution.manifest.external_requirements,
             )
-            risk_changes = _set_change(
-                (
-                    f"{item.workflow_name}:{item.package_digest}:{item.risk_digest}"
-                    for item in old_workflows
-                ),
-                (
-                    f"{item.workflow_name}:{item.package_digest}:{item.risk_digest}"
-                    for item in candidate_workflows
-                ),
-            )
-            compatibility_changes = _set_change(
-                (
-                    f"{item.workflow_name}:{finding.code}:{finding.severity}"
-                    for item in old_workflows
-                    for finding in item.compatibility
-                ),
-                (
-                    f"{item.workflow_name}:{finding.code}:{finding.severity}"
-                    for item in candidate_workflows
-                    for finding in item.compatibility
-                ),
+            risk_changes = _risk_changes(old_workflows, candidate_workflows)
+            compatibility_changes = _compatibility_changes(
+                old_workflows, candidate_workflows
             )
             review_digest = _canonical_digest(
                 _REVIEW_DOMAIN,
@@ -1273,6 +1432,8 @@ class WorkflowMarketplaceService:
     def check_updates(
         self,
         identity: InstalledPackageIdentity | None = None,
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
     ) -> tuple[UpdateCheck, ...]:
         installed_items = (
             (self.installed_store.get(identity),)
@@ -1282,14 +1443,58 @@ class WorkflowMarketplaceService:
         checks = []
         for installed in installed_items:
             if installed.identity.source_key.startswith(_DIRECT_PREFIX):
-                checks.append(
-                    UpdateCheck(
-                        identity=installed.identity,
-                        status="current",
-                        installedVersion=installed.package_version,
-                        candidateVersion=None,
+                try:
+                    with self._fetch_update(installed, cancelled=cancelled) as fetched:
+                        _workflows, blockers = self._assess_distribution(
+                            fetched.distribution,
+                            installed.identity,
+                            installed.source_name,
+                        )
+                        if blockers:
+                            _fail(
+                                "package_review_blocked",
+                                "candidate package has structural compatibility blockers",
+                            )
+                        candidate_version = fetched.distribution.manifest.version
+                        candidate_key = _semver_key(candidate_version)
+                        installed_key = _semver_key(installed.package_version)
+                        if candidate_key < installed_key:
+                            _fail(
+                                "package_version_regression",
+                                "candidate package version is older than the installed version",
+                            )
+                        if (
+                            candidate_key == installed_key
+                            and fetched.distribution.digest
+                            != installed.distribution_digest
+                        ):
+                            _fail(
+                                "package_version_conflict",
+                                "candidate changed bytes without advancing package version",
+                            )
+                        checks.append(
+                            UpdateCheck.model_validate({
+                                "identity": installed.identity,
+                                "status": (
+                                    "update_available"
+                                    if candidate_key > installed_key
+                                    else "current"
+                                ),
+                                "installedVersion": installed.package_version,
+                                "candidateVersion": candidate_version,
+                            })
+                        )
+                except WorkflowMarketplaceError as error:
+                    checks.append(
+                        UpdateCheck.model_validate({
+                            "identity": installed.identity,
+                            "status": "error",
+                            "installedVersion": installed.package_version,
+                            "candidateVersion": None,
+                            "diagnosticCode": error.code,
+                            "message": _safe_message(error, installed.repository_url),
+                        })
                     )
-                )
                 continue
             try:
                 item = self.catalog.inspect(
@@ -1419,12 +1624,18 @@ class WorkflowMarketplaceService:
         *,
         workflow_name: str | None = None,
         workflow_paths: tuple[str, ...] | None = None,
+        installed: InstalledPackageProvenance | None = None,
     ) -> tuple[
         InstalledPackageProvenance,
         list[WorkflowTrustReviewItem],
         str,
+        list[str],
     ]:
-        installed = self.installed_store.get(identity)
+        installed = installed or self.installed_store.get(identity)
+        if installed.identity != identity:
+            _fail(
+                "trust_review_changed", "installed package changed after trust review"
+            )
         distribution = load_distribution(
             self.installed_store.package_root(identity),
             expected_digest=installed.distribution_digest,
@@ -1453,12 +1664,13 @@ class WorkflowMarketplaceService:
                 "version": installed.package_version,
                 "commit": installed.resolved_commit,
                 "distributionDigest": installed.distribution_digest,
+                "packageResources": sorted(distribution.covered_paths),
                 "workflows": [
                     self._trust_digest_projection(item) for item in workflows
                 ],
             },
         )
-        return installed, workflows, review_digest
+        return installed, workflows, review_digest, sorted(distribution.covered_paths)
 
     def review_trust(
         self,
@@ -1467,8 +1679,8 @@ class WorkflowMarketplaceService:
         actor: str,
         workflow_name: str | None = None,
     ) -> TrustReview:
-        installed, workflows, review_digest = self._trust_review_parts(
-            identity, workflow_name=workflow_name
+        installed, workflows, review_digest, package_resources = (
+            self._trust_review_parts(identity, workflow_name=workflow_name)
         )
         token = self._trust_confirmations.issue(
             actor=actor,
@@ -1486,6 +1698,7 @@ class WorkflowMarketplaceService:
             version=installed.package_version,
             resolvedCommit=installed.resolved_commit,
             distributionDigest=installed.distribution_digest,
+            packageResources=package_resources,
             workflows=workflows,
         )
 
@@ -1500,29 +1713,53 @@ class WorkflowMarketplaceService:
             if isinstance(review_or_token, TrustReview)
             else review_or_token
         )
-        authorization = self._trust_confirmations.consume(
-            token, actor=actor, profile=self.profile
-        )
-        installed, workflows, current_digest = self._trust_review_parts(
-            authorization.identity,
-            workflow_paths=authorization.workflow_paths,
-        )
-        if (
-            installed.distribution_digest != authorization.distribution_digest
-            or current_digest != authorization.review_digest
-        ):
-            _fail(
-                "trust_review_changed",
-                "installed package changed after trust review",
-            )
-        origin = self._trust_origin(authorization.identity)
-        for item in workflows:
-            self.trust_store.trust_origin(
-                item.package_digest,
-                actor=actor,
-                risk_digest=item.risk_digest,
-                origin=origin,
-            )
+        try:
+            with self.catalog.source_store._locked() as parent_identity:
+                authorization = self._trust_confirmations.consume_locked(
+                    token,
+                    actor=actor,
+                    profile=self.profile,
+                    parent_identity=parent_identity,
+                )
+                _existed, installed_state = self.installed_store._snapshot()
+                installed = next(
+                    (
+                        record.provenance
+                        for record in installed_state.packages
+                        if record.provenance.identity == authorization.identity
+                    ),
+                    None,
+                )
+                if installed is None:
+                    _fail(
+                        "trust_review_changed",
+                        "installed package changed after trust review",
+                    )
+                installed, workflows, current_digest, _package_resources = (
+                    self._trust_review_parts(
+                        authorization.identity,
+                        workflow_paths=authorization.workflow_paths,
+                        installed=installed,
+                    )
+                )
+                if (
+                    installed.distribution_digest != authorization.distribution_digest
+                    or current_digest != authorization.review_digest
+                ):
+                    _fail(
+                        "trust_review_changed",
+                        "installed package changed after trust review",
+                    )
+                origin = self._trust_origin(authorization.identity)
+                self.trust_store.trust_origin_many(
+                    tuple(
+                        (item.package_digest, item.risk_digest) for item in workflows
+                    ),
+                    actor=actor,
+                    origin=origin,
+                )
+        except WorkflowLockTimeout as error:
+            _fail("trust_confirmation_lock_timeout", str(error))
         return self.workflow_trust(authorization.identity)
 
     def revoke_trust(
@@ -1531,8 +1768,8 @@ class WorkflowMarketplaceService:
         *,
         workflow_name: str | None = None,
     ) -> int:
-        _installed, workflows, _review_digest = self._trust_review_parts(
-            identity, workflow_name=workflow_name
+        _installed, workflows, _review_digest, _package_resources = (
+            self._trust_review_parts(identity, workflow_name=workflow_name)
         )
         origin = self._trust_origin(identity)
         return sum(
@@ -1543,7 +1780,9 @@ class WorkflowMarketplaceService:
     def workflow_trust(
         self, identity: InstalledPackageIdentity
     ) -> dict[str, Literal["trusted", "untrusted"]]:
-        _installed, workflows, _review_digest = self._trust_review_parts(identity)
+        _installed, workflows, _review_digest, _package_resources = (
+            self._trust_review_parts(identity)
+        )
         return {
             item.workflow_name: self.trust_store.check_read_only(
                 item.package_digest,

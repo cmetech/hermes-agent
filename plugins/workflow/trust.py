@@ -49,6 +49,7 @@ WORKFLOW_RESOURCE_MAX_FILES = 512
 WORKFLOW_TRUST_MAX_RECORDS = 4096
 WORKFLOW_TRUST_MAX_GRANTS_PER_RECORD = 64
 WORKFLOW_TRUST_MAX_STORE_BYTES = 4 * 1024 * 1024
+_WORKFLOW_TRUST_MAX_BATCH_GRANTS = 512
 _WORKFLOW_TRUST_MAX_ACTOR_CHARS = 128
 _WORKFLOW_TRUST_MAX_TIMESTAMP_CHARS = 64
 
@@ -1170,6 +1171,72 @@ class WorkflowTrustStore:
             )
             self._write(payload)
 
+    def trust_origin_many(
+        self,
+        grants: Iterable[tuple[str, str]],
+        *,
+        actor: str,
+        origin: str,
+    ) -> int:
+        """Apply one bounded set of installation grants in one atomic write."""
+
+        normalized_actor = _validated_trust_actor(actor)
+        normalized_origin = _validated_trust_origin(origin)
+        pending: list[tuple[str, str]] = []
+        for item in grants:
+            if len(pending) >= _WORKFLOW_TRUST_MAX_BATCH_GRANTS:
+                raise WorkflowTrustError("workflow trust grant batch exceeds capacity")
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or not isinstance(item[1], str)
+                or _SHA256.fullmatch(item[0]) is None
+                or _SHA256.fullmatch(item[1]) is None
+            ):
+                raise WorkflowTrustError(
+                    "package and risk digests must be SHA-256 hex values"
+                )
+            pending.append(item)
+        if not pending or len({digest for digest, _risk in pending}) != len(pending):
+            raise WorkflowTrustError("workflow trust grant batch is invalid")
+        trusted_at = datetime.now(timezone.utc).isoformat()
+        with _locked(self.lock_path):
+            original = self._read(mutation=True)
+            intended = deepcopy(original)
+            records = intended["records"]
+            assert isinstance(records, dict)
+            for package_digest, risk_digest in pending:
+                record = records.get(package_digest)
+                if record is None:
+                    if len(records) >= WORKFLOW_TRUST_MAX_RECORDS:
+                        raise WorkflowTrustError(
+                            "workflow trust store exceeds capacity"
+                        )
+                    record = _TrustRecord(grants={})
+                    records[package_digest] = record
+                assert isinstance(record, dict)
+                record_grants = record["grants"]
+                assert isinstance(record_grants, dict)
+                if (
+                    normalized_origin not in record_grants
+                    and len(record_grants) >= WORKFLOW_TRUST_MAX_GRANTS_PER_RECORD
+                ):
+                    raise WorkflowTrustError(
+                        "workflow trust grant capacity is exhausted"
+                    )
+                record_grants[normalized_origin] = _TrustGrant(
+                    actor=normalized_actor,
+                    risk_digest=risk_digest,
+                    trusted_at=trusted_at,
+                )
+            self._write_exact_mutation(
+                original,
+                intended,
+                indeterminate="workflow trust grant state is indeterminate",
+            )
+        return len(pending)
+
     def revoke(self, package_digest: str) -> bool:
         if not isinstance(package_digest, str) or _SHA256.fullmatch(package_digest) is None:
             return False
@@ -1218,22 +1285,31 @@ class WorkflowTrustStore:
     ) -> None:
         """Resolve a writer error only from the exact normalized store state."""
 
+        self._write_exact_mutation(
+            original,
+            intended,
+            indeterminate="workflow trust revocation state is indeterminate",
+        )
+
+    def _write_exact_mutation(
+        self,
+        original: _TrustPayload,
+        intended: _TrustPayload,
+        *,
+        indeterminate: str,
+    ) -> None:
         try:
             self._write(intended)
         except Exception as error:
             try:
                 current = self._read(mutation=True)
             except WorkflowTrustError as read_error:
-                raise WorkflowTrustError(
-                    "workflow trust revocation state is indeterminate"
-                ) from read_error
+                raise WorkflowTrustError(indeterminate) from read_error
             if current == intended:
                 return
             if current == original:
-                raise
-            raise WorkflowTrustError(
-                "workflow trust revocation state is indeterminate"
-            ) from error
+                raise error
+            raise WorkflowTrustError(indeterminate) from error
 
     def revoke_origin_for_digest(self, package_digest: str, origin: str) -> bool:
         """Remove one exact origin grant without affecting sibling grants."""

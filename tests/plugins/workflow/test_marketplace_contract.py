@@ -448,6 +448,7 @@ def test_marketplace_public_review_and_request_models_are_strict() -> None:
         "blockers": [],
         "advisories": [],
         "externalRequirements": valid_manifest()["externalRequirements"],
+        "packageResources": ["workflow-package.json", "workflows/diagnostic.yaml"],
     })
     assert assessment.package_digest == SHA256_A
 

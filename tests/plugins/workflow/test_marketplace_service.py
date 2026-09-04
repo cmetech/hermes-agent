@@ -7,16 +7,21 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import socket
 import subprocess
+import threading
 
 import pytest
 import yaml
 
+import plugins.workflow.marketplace.service as marketplace_service_module
 from plugins.workflow.marketplace.models import (
     InstallRequest,
     InstalledPackageIdentity,
     WorkflowMarketplaceSource,
+    WorkflowPackageIndex,
 )
+from plugins.workflow.marketplace.git import ResolvedCheckout
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
 from plugins.workflow.marketplace.service import WorkflowMarketplaceService
 from plugins.workflow.trust import WorkflowTrustError
@@ -290,6 +295,54 @@ def test_registered_install_uses_fresh_repository_bytes_not_cached_listing(
     assert review.resolved_commit == current_commit
 
 
+def test_registered_update_rejects_manifest_identity_mismatch_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = _install(service, published_repo)
+    destination = service.installed_store.package_root(installed.identity)
+    before_bytes = _snapshot(destination)
+    before_provenance = service.installed_store.get(installed.identity)
+    package_root = published_repo.work / "packages" / "laptop-support"
+    manifest = json.loads((package_root / "workflow-package.json").read_bytes())
+    manifest["id"] = "different-package"
+    manifest["version"] = "2.0.0"
+    (package_root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    candidate_digest = _publish(package_root)
+    index_path = published_repo.work / ".well-known/hermes-workflows/index.json"
+    index = json.loads(index_path.read_bytes())
+    index["packages"][0]["version"] = "2.0.0"
+    index["packages"][0]["packageDigest"] = candidate_digest
+    index_path.write_bytes(_json_bytes(index))
+    _git(published_repo.work, "add", ".")
+    _git(published_repo.work, "commit", "-m", "publish mismatched identity")
+    _git(published_repo.work, "push", "origin", "main")
+    monkeypatch.setattr(
+        service.catalog.git_fetcher,
+        "fetch",
+        lambda *_args, **_kwargs: ResolvedCheckout(
+            root=published_repo.work,
+            repository_url=published_repo.remote.as_uri(),
+            resolved_commit=_git(published_repo.work, "rev-parse", "head"),
+        ),
+    )
+    raw_index = json.loads(index_path.read_bytes())
+    monkeypatch.setattr(
+        marketplace_service_module,
+        "load_repository_index",
+        lambda _root: WorkflowPackageIndex.model_validate(raw_index),
+    )
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.prepare_update(installed.identity, actor="alice")
+
+    assert error.value.code == "package_index_invalid"
+    assert "different-package" not in str(error.value)
+    assert _snapshot(destination) == before_bytes
+    assert service.installed_store.get(installed.identity) == before_provenance
+
+
 def test_source_crud_search_and_removal_leave_an_orphaned_install(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,
@@ -306,6 +359,26 @@ def test_source_crud_search_and_removal_leave_an_orphaned_install(
     orphan = service.installed_packages()[0]
     assert orphan.identity == installed.identity
     assert orphan.orphaned_source is True
+    assert service.installed_store.package_root(installed.identity).is_dir()
+
+
+def test_source_edit_invalidates_cache_without_uninstalling_packages(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    before = service.installed_store.get(installed.identity)
+
+    updated = service.update_source(
+        "company",
+        published_repo.remote.as_uri(),
+        ref=installed.resolved_commit,
+        enabled=True,
+    )
+
+    assert updated.ref == installed.resolved_commit
+    assert service.search("") == ()
+    assert service.installed_store.get(installed.identity) == before
     assert service.installed_store.package_root(installed.identity).is_dir()
 
 
@@ -337,6 +410,159 @@ def test_direct_install_requires_one_unambiguous_package_and_honors_exact_ref(
     assert installed.version == "1.0.0"
     assert installed.identity.source_key.startswith("direct-")
     assert published_repo.remote.as_uri() in installed.repository_url
+
+
+def test_direct_update_checks_refetch_moved_branches_but_keep_exact_refs_current(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    first_commit = _git(published_repo.work, "rev-parse", "head")
+    branch_review = service.prepare_install(
+        InstallRequest(
+            identifier=published_repo.remote.as_uri(),
+            ref="main",
+            packagePath="packages/laptop-support",
+        ),
+        actor="alice",
+    )
+    branch_install = service.confirm_install(
+        branch_review.confirmation_token, actor="alice"
+    )
+    pinned_service = WorkflowMarketplaceService(
+        service.home.parent / "pinned-home", profile="support"
+    )
+    pinned_review = pinned_service.prepare_install(
+        InstallRequest(
+            identifier=published_repo.remote.as_uri(),
+            ref=first_commit,
+            packagePath="packages/laptop-support",
+        ),
+        actor="alice",
+    )
+    pinned_install = pinned_service.confirm_install(
+        pinned_review.confirmation_token, actor="alice"
+    )
+    _write_package(published_repo.work, "laptop-support", version="2.0.0")
+    published_repo.publish("publish direct v2")
+
+    branch_check = service.check_updates(branch_install.identity)[0]
+    pinned_check = pinned_service.check_updates(pinned_install.identity)[0]
+
+    assert branch_check.status == "update_available"
+    assert branch_check.candidate_version == "2.0.0"
+    assert pinned_check.status == "current"
+    assert pinned_check.candidate_version == "1.0.0"
+
+
+def test_direct_update_check_reports_sanitized_non_destructive_failure(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review = service.prepare_install(
+        InstallRequest(
+            identifier=published_repo.remote.as_uri(),
+            ref="main",
+            packagePath="packages/laptop-support",
+        ),
+        actor="alice",
+    )
+    installed = service.confirm_install(review.confirmation_token, actor="alice")
+    before_package = _snapshot(service.installed_store.package_root(installed.identity))
+    before_provenance = service.installed_store.get(installed.identity)
+    trust_review = service.review_trust(installed.identity, actor="alice")
+    service.grant_trust(trust_review, actor="alice")
+    before_trust = service.trust_store.snapshot_read_only(max_bytes=1024 * 1024)
+
+    def fail_fetch(*_args, **_kwargs):
+        raise WorkflowMarketplaceError(
+            "source_fetch_failed",
+            "fetch https://alice:top-secret@example.test/private.git?token=hidden failed",
+        )
+
+    monkeypatch.setattr(service.catalog.git_fetcher, "fetch", fail_fetch)
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.status == "error"
+    assert check.diagnostic_code == "source_fetch_failed"
+    assert check.message is not None
+    assert "alice" not in check.message
+    assert "top-secret" not in check.message
+    assert "hidden" not in check.message
+    assert (
+        _snapshot(service.installed_store.package_root(installed.identity))
+        == before_package
+    )
+    assert service.installed_store.get(installed.identity) == before_provenance
+    assert service.trust_store.snapshot_read_only(max_bytes=1024 * 1024) == before_trust
+
+
+def test_direct_update_check_reports_invalid_candidate_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    review = service.prepare_install(
+        InstallRequest(
+            identifier=published_repo.remote.as_uri(),
+            ref="main",
+            packagePath="packages/laptop-support",
+        ),
+        actor="alice",
+    )
+    installed = service.confirm_install(review.confirmation_token, actor="alice")
+    destination = service.installed_store.package_root(installed.identity)
+    before_package = _snapshot(destination)
+    before_provenance = service.installed_store.get(installed.identity)
+    root = published_repo.work / "packages" / "laptop-support"
+    manifest = json.loads((root / "workflow-package.json").read_bytes())
+    manifest["version"] = "2.0.0"
+    (root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    (root / "workflows" / "diagnostic.yaml").write_text(
+        "name: diagnostic\nnodes: [not-a-node]\n", encoding="utf-8"
+    )
+    _publish(root)
+    published_repo.publish("publish invalid direct candidate")
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.status == "error"
+    assert check.diagnostic_code == "package_workflow_invalid"
+    assert _snapshot(destination) == before_package
+    assert service.installed_store.get(installed.identity) == before_provenance
+
+
+@pytest.mark.parametrize(
+    ("candidate_version", "expected_code"),
+    [("0.9.0", "package_version_regression"), ("1.0.0", "package_version_conflict")],
+)
+def test_direct_update_check_enforces_version_progression_rules(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    candidate_version: str,
+    expected_code: str,
+) -> None:
+    review = service.prepare_install(
+        InstallRequest(
+            identifier=published_repo.remote.as_uri(),
+            ref="main",
+            packagePath="packages/laptop-support",
+        ),
+        actor="alice",
+    )
+    installed = service.confirm_install(review.confirmation_token, actor="alice")
+    _write_package(
+        published_repo.work,
+        "laptop-support",
+        version=candidate_version,
+        marker="changed-without-valid-progress",
+    )
+    published_repo.publish("publish invalid version progression")
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.status == "error"
+    assert check.diagnostic_code == expected_code
 
 
 def test_install_rejects_existing_identity_and_update_regressions(
@@ -450,6 +676,205 @@ def test_changed_update_reports_bounded_metadata_and_revokes_only_its_origin(
     )
 
 
+def test_update_review_accepts_maximum_workflow_name_with_structured_risk_changes(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    workflow_name = "w" * 128
+    _write_package(
+        published_repo.work,
+        "laptop-support",
+        version="1.0.0",
+        workflow_names=(workflow_name,),
+    )
+    published_repo.publish("publish maximum workflow name")
+    installed = _install(service, published_repo)
+    _write_package(
+        published_repo.work,
+        "laptop-support",
+        version="2.0.0",
+        workflow_names=(workflow_name,),
+        marker="changed-risk",
+    )
+    published_repo.publish("update maximum workflow name")
+
+    review = service.prepare_update(installed.identity, actor="alice")
+
+    assert review.result == "update_available"
+    assert review.risk_changes.added[0].workflow_name == workflow_name
+    assert review.risk_changes.removed[0].workflow_name == workflow_name
+
+
+def test_review_uses_one_shared_package_path_table_with_exact_recoverability(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    workflow_names = tuple(f"workflow-{index:02d}" for index in range(30))
+    _write_package(
+        published_repo.work,
+        "laptop-support",
+        version="2.0.0",
+        workflow_names=workflow_names,
+    )
+    package_root = published_repo.work / "packages" / "laptop-support"
+    for index in range(80):
+        (package_root / "scripts" / f"resource-{index:03d}.py").write_text(
+            f"VALUE = {index}\n", encoding="utf-8"
+        )
+    _publish(package_root)
+    published_repo.publish("publish bounded large review")
+    _add_and_refresh(service, published_repo)
+
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor="alice"
+    )
+    payload = review.model_dump(mode="json", by_alias=True)
+    expected_paths = sorted(
+        record["path"]
+        for record in json.loads((package_root / "digests.json").read_bytes())["files"]
+    )
+
+    assert review.assessment.package_resources == expected_paths
+    assert all(
+        item.package_resource_set == "package" for item in review.workflow_reviews
+    )
+    assert all("packageResources" not in item for item in payload["workflowReviews"])
+    assert len(json.dumps(payload, separators=(",", ":")).encode()) < 100_000
+
+    installed = service.confirm_install(review.confirmation_token, actor="alice")
+    trust_review = service.review_trust(installed.identity, actor="alice")
+    trust_payload = trust_review.model_dump(mode="json", by_alias=True)
+    assert trust_review.package_resources == expected_paths
+    assert all("packageResources" not in item for item in trust_payload["workflows"])
+    assert len(json.dumps(trust_payload, separators=(",", ":")).encode()) < 100_000
+
+
+def test_review_statically_discloses_actual_local_and_remote_mcp_servers(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_root = published_repo.work / "packages" / "laptop-support"
+    diagnostic_path = package_root / "workflows" / "diagnostic.yaml"
+    diagnostic_path.write_bytes(
+        yaml.safe_dump(
+            {
+                "name": "diagnostic",
+                "description": "MCP disclosure",
+                "nodes": [
+                    {
+                        "id": "ask",
+                        "prompt": "hello",
+                        "mcp": "mixed.yaml",
+                    }
+                ],
+            },
+            sort_keys=False,
+        ).encode()
+    )
+    (package_root / "mcp").mkdir(exist_ok=True)
+    (package_root / "mcp" / "mixed.yaml").write_text(
+        "mcp_servers:\n"
+        "  local_server:\n"
+        "    command: python\n"
+        "    args: [scripts/never-run.py]\n"
+        "  remote_server:\n"
+        "    url: https://mcp.example.test/events\n"
+        "    transport: sse\n",
+        encoding="utf-8",
+    )
+    _publish(package_root)
+    published_repo.publish("publish mixed MCP definitions")
+    installed = _install(service, published_repo)
+
+    def execution_forbidden(*_args, **_kwargs):
+        raise AssertionError("review attempted execution or network access")
+
+    monkeypatch.setattr(subprocess, "Popen", execution_forbidden)
+    monkeypatch.setattr(socket, "create_connection", execution_forbidden)
+    review = service.review_trust(installed.identity, actor="alice")
+    diagnostic = next(
+        item for item in review.workflows if item.workflow_name == "diagnostic"
+    )
+
+    assert diagnostic.mcp_resources == ["mcp/mixed.yaml"]
+    assert diagnostic.local_mcp_servers == ["local_server"]
+    assert diagnostic.remote_mcp_servers == ["remote_server"]
+    assert not (service.home / "executed").exists()
+
+
+def test_oversized_mcp_review_fails_stably_without_execution(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    package_root = published_repo.work / "packages" / "laptop-support"
+    diagnostic_path = package_root / "workflows" / "diagnostic.yaml"
+    diagnostic_path.write_bytes(
+        yaml.safe_dump(
+            {
+                "name": "diagnostic",
+                "description": "Oversized MCP",
+                "nodes": [{"id": "ask", "prompt": "hello", "mcp": "oversized.yaml"}],
+            },
+            sort_keys=False,
+        ).encode()
+    )
+    (package_root / "mcp").mkdir(exist_ok=True)
+    (package_root / "mcp" / "oversized.yaml").write_bytes(
+        b"server:\n  command: python\n  padding: " + b"x" * 256_001 + b"\n"
+    )
+    _publish(package_root)
+    published_repo.publish("publish oversized MCP definition")
+    _add_and_refresh(service, published_repo)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.prepare_install(
+            InstallRequest(identifier="company/laptop-support"), actor="alice"
+        )
+
+    assert error.value.code == "package_workflow_invalid"
+    assert str(error.value) == (
+        "package_workflow_invalid: package workflow assessment is invalid"
+    )
+
+
+@pytest.mark.parametrize(
+    ("reference", "content"),
+    [("malformed.yaml", "mcp_servers: [\n"), ("../../escape.yaml", None)],
+)
+def test_malformed_or_escaping_mcp_resources_fail_stably(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    reference: str,
+    content: str | None,
+) -> None:
+    package_root = published_repo.work / "packages" / "laptop-support"
+    (package_root / "workflows" / "diagnostic.yaml").write_bytes(
+        yaml.safe_dump(
+            {
+                "name": "diagnostic",
+                "description": "Invalid MCP",
+                "nodes": [{"id": "ask", "prompt": "hello", "mcp": reference}],
+            },
+            sort_keys=False,
+        ).encode()
+    )
+    if content is not None:
+        (package_root / "mcp").mkdir(exist_ok=True)
+        (package_root / "mcp" / reference).write_text(content, encoding="utf-8")
+    _publish(package_root)
+    published_repo.publish("publish invalid MCP definition")
+    _add_and_refresh(service, published_repo)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.prepare_install(
+            InstallRequest(identifier="company/laptop-support"), actor="alice"
+        )
+
+    assert error.value.code == "package_workflow_invalid"
+    assert len(str(error.value)) <= 4096
+
+
 def test_invalid_update_preserves_installed_bytes_provenance_and_trust(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,
@@ -491,7 +916,8 @@ def test_trust_review_is_exact_selectable_and_stale_reviews_fail_closed(
     )
     assert [item.workflow_name for item in selected.workflows] == ["diagnostic"]
     assert selected.workflows[0].shell_or_script_nodes == ["execute"]
-    assert selected.workflows[0].script_resources == ["scripts/never-run.py"]
+    assert selected.workflows[0].script_resources == []
+    assert "scripts/never-run.py" in selected.package_resources
     assert selected.workflows[0].external_requirements.runtimes == ["uv"]
     service.grant_trust(selected.confirmation_token, actor="alice")
     assert service.workflow_trust(installed.identity) == {
@@ -505,6 +931,165 @@ def test_trust_review_is_exact_selectable_and_stale_reviews_fail_closed(
     with pytest.raises(WorkflowMarketplaceError) as stale:
         service.grant_trust(all_review.confirmation_token, actor="alice")
     assert stale.value.code in {"package_digest_mismatch", "trust_review_changed"}
+
+
+def test_all_workflow_trust_grant_is_one_atomic_write_and_preserves_other_grants(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = _install(service, published_repo)
+    review = service.review_trust(installed.identity, actor="alice")
+    first = review.workflows[0]
+    service.trust_store.trust(
+        first.package_digest,
+        actor="manual",
+        risk_digest=first.risk_digest,
+    )
+    service.trust_store.trust_origin(
+        first.package_digest,
+        actor="other",
+        risk_digest=first.risk_digest,
+        origin="marketplace:other/package",
+    )
+    original_write = service.trust_store._write
+    writes = 0
+
+    def recording_write(payload):
+        nonlocal writes
+        writes += 1
+        return original_write(payload)
+
+    monkeypatch.setattr(service.trust_store, "_write", recording_write)
+
+    service.grant_trust(review, actor="alice")
+
+    payload = service.trust_store.snapshot_read_only(max_bytes=1024 * 1024)
+    assert writes == 1
+    assert set(payload["records"][first.package_digest]["grants"]) >= {
+        "manual",
+        "marketplace:other/package",
+        "marketplace:company/laptop-support",
+    }
+
+
+def test_failed_all_workflow_grant_is_zero_partial_and_consumes_review(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = _install(service, published_repo)
+    review = service.review_trust(installed.identity, actor="alice")
+    before = service.trust_store.snapshot_read_only(max_bytes=1024 * 1024)
+    original_write = service.trust_store._write
+    origin = "marketplace:company/laptop-support"
+
+    def fail_complete_origin_set(payload):
+        matching = sum(
+            origin in record["grants"] for record in payload["records"].values()
+        )
+        if matching == len(review.workflows):
+            raise OSError("injected pre-commit trust failure")
+        return original_write(payload)
+
+    monkeypatch.setattr(service.trust_store, "_write", fail_complete_origin_set)
+
+    with pytest.raises(OSError, match="pre-commit"):
+        service.grant_trust(review, actor="alice")
+
+    assert service.trust_store.snapshot_read_only(max_bytes=1024 * 1024) == before
+    with pytest.raises(WorkflowMarketplaceError) as replay:
+        service.grant_trust(review, actor="alice")
+    assert replay.value.code == "confirmation_token_invalid"
+
+
+@pytest.mark.parametrize("lifecycle", ["update", "remove"])
+def test_trust_grant_serializes_validation_and_write_with_lifecycle_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    lifecycle: str,
+) -> None:
+    installed = _install(service, published_repo)
+    trust_review = service.review_trust(installed.identity, actor="alice")
+    if lifecycle == "update":
+        _write_package(published_repo.work, "laptop-support", version="2.0.0")
+        published_repo.publish("publish concurrent update")
+        mutation_review = service.prepare_update(installed.identity, actor="alice")
+        mutation = lambda: service.confirm_update(
+            mutation_review.confirmation_token, actor="alice"
+        )
+    else:
+        mutation_review = service.prepare_remove(installed.identity, actor="alice")
+        mutation = lambda: service.confirm_remove(
+            mutation_review.confirmation_token, actor="alice"
+        )
+    original_builder = service.assessment_builder
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    mutation_started = threading.Event()
+    mutation_finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def blocking_builder(compilation):
+        validation_started.set()
+        if not release_validation.wait(5):
+            raise AssertionError("test did not release trust validation")
+        return original_builder(compilation)
+
+    def grant() -> None:
+        try:
+            service.grant_trust(trust_review, actor="alice")
+        except BaseException as error:
+            failures.append(error)
+
+    def mutate() -> None:
+        mutation_started.set()
+        try:
+            mutation()
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            mutation_finished.set()
+
+    service.assessment_builder = blocking_builder
+    grant_thread = threading.Thread(target=grant)
+    mutation_thread = threading.Thread(target=mutate)
+    grant_thread.start()
+    assert validation_started.wait(5)
+    mutation_thread.start()
+    assert mutation_started.wait(5)
+    assert not mutation_finished.wait(0.25)
+    release_validation.set()
+    grant_thread.join(5)
+    mutation_thread.join(5)
+
+    assert not grant_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert failures == []
+    payload = service.trust_store.snapshot_read_only(max_bytes=1024 * 1024)
+    assert all(
+        "marketplace:company/laptop-support" not in record["grants"]
+        for record in payload["records"].values()
+    )
+
+
+def test_trust_grant_rejects_stale_installed_provenance_without_any_grant(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    review = service.review_trust(installed.identity, actor="alice")
+    state = json.loads(service.installed_store.path.read_bytes())
+    state["packages"][0]["provenance"]["resolvedCommit"] = "f" * 40
+    service.installed_store.path.write_bytes(_json_bytes(state))
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.grant_trust(review, actor="alice")
+
+    assert error.value.code == "trust_review_changed"
+    assert (
+        service.trust_store.snapshot_read_only(max_bytes=1024 * 1024)["records"] == {}
+    )
 
 
 def test_revoke_trust_for_one_workflow_preserves_other_and_manual_grants(

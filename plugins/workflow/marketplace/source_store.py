@@ -636,6 +636,73 @@ class WorkflowSourceStore:
         except WorkflowLockTimeout as error:
             _fail("source_lock_timeout", str(error))
 
+    def update(
+        self,
+        name: str,
+        repository_url: str,
+        *,
+        ref: str | None,
+        enabled: bool,
+    ) -> WorkflowMarketplaceSource:
+        """Atomically replace one source configuration under the marketplace lock."""
+
+        normalized = _normalize_name(name)
+        updated = _canonical_source(
+            normalized,
+            repository_url,
+            ref=ref,
+            enabled=enabled,
+        )
+        try:
+            with self._locked() as parent_identity:
+                state = self._read_sources()
+                existing = next(
+                    (source for source in state.sources if source.name == normalized),
+                    None,
+                )
+                if existing is None:
+                    _fail(
+                        "source_not_found",
+                        f"marketplace source {normalized!r} was not found",
+                    )
+                identity_changed = (
+                    existing.repository_url != updated.repository_url
+                    or existing.ref != updated.ref
+                )
+                if identity_changed:
+                    catalog = self._read_catalog()
+                    self._write(
+                        self.catalog_path,
+                        _CatalogState.model_validate({
+                            "schemaVersion": _CATALOG_STATE_VERSION,
+                            "verified": [
+                                item
+                                for item in catalog.verified
+                                if item.source.name != normalized
+                            ],
+                            "statuses": [
+                                item
+                                for item in catalog.statuses
+                                if item.source_name != normalized
+                            ],
+                        }),
+                        parent_identity=parent_identity,
+                    )
+                self._write(
+                    self.path,
+                    _SourceState.model_validate({
+                        "schemaVersion": _SOURCE_STATE_VERSION,
+                        "sources": [
+                            updated if source.name == normalized else source
+                            for source in state.sources
+                        ],
+                    }),
+                    parent_identity=parent_identity,
+                )
+                return updated
+        except WorkflowLockTimeout as error:
+            _fail("source_lock_timeout", str(error))
+
     def remove(self, name: str) -> WorkflowMarketplaceSource:
         normalized = _normalize_name(name)
         try:

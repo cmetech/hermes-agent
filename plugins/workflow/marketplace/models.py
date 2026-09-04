@@ -469,11 +469,20 @@ class PackageReviewAssessment(StrictMarketplaceModel):
     blockers: list[PackageDiagnostic] = Field(max_length=512)
     advisories: list[PackageDiagnostic] = Field(max_length=512)
     external_requirements: ExternalRequirements = Field(alias="externalRequirements")
+    package_resources: list[str] = Field(alias="packageResources", max_length=512)
 
     @field_validator("workflow_names")
     @classmethod
     def validate_workflow_names(cls, value: list[str]) -> list[str]:
         return _require_unique_text(value, label="workflow names")
+
+    @field_validator("package_resources")
+    @classmethod
+    def validate_package_resources(cls, value: list[str]) -> list[str]:
+        paths = [_require_canonical_relative_path(path) for path in value]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("package review resources must be unique and sorted")
+        return paths
 
 
 class InstalledPackageIdentity(StrictMarketplaceModel):
@@ -539,6 +548,55 @@ class StringSetChange(StrictMarketplaceModel):
     def validate_values(cls, value: list[str]) -> list[str]:
         if value != sorted(value) or len(value) != len(set(value)):
             raise ValueError("review set changes must be unique and sorted")
+        return value
+
+
+class WorkflowRiskIdentity(StrictMarketplaceModel):
+    """One structured workflow risk identity used in update differences."""
+
+    workflow_name: ShortText = Field(alias="workflowName")
+    package_digest: str = Field(alias="packageDigest", pattern=SHA256_PATTERN)
+    risk_digest: str = Field(alias="riskDigest", pattern=SHA256_PATTERN)
+
+
+class WorkflowRiskChanges(StrictMarketplaceModel):
+    added: list[WorkflowRiskIdentity] = Field(max_length=512)
+    removed: list[WorkflowRiskIdentity] = Field(max_length=512)
+
+    @field_validator("added", "removed")
+    @classmethod
+    def validate_values(
+        cls, value: list[WorkflowRiskIdentity]
+    ) -> list[WorkflowRiskIdentity]:
+        keys = [
+            (item.workflow_name, item.package_digest, item.risk_digest)
+            for item in value
+        ]
+        if keys != sorted(keys) or len(keys) != len(set(keys)):
+            raise ValueError("workflow risk changes must be unique and sorted")
+        return value
+
+
+class WorkflowCompatibilityIdentity(StrictMarketplaceModel):
+    """One structured per-workflow compatibility finding identity."""
+
+    workflow_name: ShortText = Field(alias="workflowName")
+    code: str = Field(min_length=1, max_length=128)
+    severity: Literal["blocker", "advisory"]
+
+
+class WorkflowCompatibilityChanges(StrictMarketplaceModel):
+    added: list[WorkflowCompatibilityIdentity] = Field(max_length=512)
+    removed: list[WorkflowCompatibilityIdentity] = Field(max_length=512)
+
+    @field_validator("added", "removed")
+    @classmethod
+    def validate_values(
+        cls, value: list[WorkflowCompatibilityIdentity]
+    ) -> list[WorkflowCompatibilityIdentity]:
+        keys = [(item.workflow_name, item.code, item.severity) for item in value]
+        if keys != sorted(keys) or len(keys) != len(set(keys)):
+            raise ValueError("workflow compatibility changes must be unique and sorted")
         return value
 
 
@@ -629,7 +687,7 @@ class WorkflowTrustReviewItem(StrictMarketplaceModel):
     )
     required_secrets: list[ShortText] = Field(alias="requiredSecrets", max_length=512)
     external_requirements: ExternalRequirements = Field(alias="externalRequirements")
-    package_resources: list[str] = Field(alias="packageResources", max_length=512)
+    package_resource_set: Literal["package"] = Field(alias="packageResourceSet")
     compatibility: list[PackageDiagnostic] = Field(max_length=512)
 
     @field_validator(
@@ -638,7 +696,6 @@ class WorkflowTrustReviewItem(StrictMarketplaceModel):
         "command_resources",
         "script_resources",
         "mcp_resources",
-        "package_resources",
     )
     @classmethod
     def validate_resource_paths(cls, value):
@@ -719,8 +776,10 @@ class UpdateReview(StrictMarketplaceModel):
     file_changes: list[FileDigestChange] = Field(alias="fileChanges", max_length=1024)
     workflow_changes: StringSetChange = Field(alias="workflowChanges")
     requirement_changes: RequirementChanges = Field(alias="requirementChanges")
-    risk_changes: StringSetChange = Field(alias="riskChanges")
-    compatibility_changes: StringSetChange = Field(alias="compatibilityChanges")
+    risk_changes: WorkflowRiskChanges = Field(alias="riskChanges")
+    compatibility_changes: WorkflowCompatibilityChanges = Field(
+        alias="compatibilityChanges"
+    )
     assessment: PackageReviewAssessment
     workflow_reviews: list[WorkflowTrustReviewItem] = Field(
         alias="workflowReviews", max_length=512
@@ -753,18 +812,40 @@ class TrustReview(StrictMarketplaceModel):
     version: str = Field(pattern=SEMANTIC_VERSION_PATTERN)
     resolved_commit: str = Field(alias="resolvedCommit", pattern=r"^[0-9a-f]{40}$")
     distribution_digest: str = Field(alias="distributionDigest", pattern=SHA256_PATTERN)
+    package_resources: list[str] = Field(alias="packageResources", max_length=512)
     workflows: list[WorkflowTrustReviewItem] = Field(min_length=1, max_length=512)
+
+    @field_validator("package_resources")
+    @classmethod
+    def validate_package_resources(cls, value: list[str]) -> list[str]:
+        paths = [_require_canonical_relative_path(path) for path in value]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("trust review resources must be unique and sorted")
+        return paths
 
 
 class UpdateCheck(StrictMarketplaceModel):
     identity: InstalledPackageIdentity
-    status: Literal["current", "update_available", "orphaned"]
+    status: Literal["current", "update_available", "orphaned", "error"]
     installed_version: str = Field(
         alias="installedVersion", pattern=SEMANTIC_VERSION_PATTERN
     )
     candidate_version: str | None = Field(
         default=None, alias="candidateVersion", pattern=SEMANTIC_VERSION_PATTERN
     )
+    diagnostic_code: str | None = Field(
+        default=None, alias="diagnosticCode", min_length=1, max_length=128
+    )
+    message: BoundedText | None = None
+
+    @model_validator(mode="after")
+    def validate_diagnostic(self) -> "UpdateCheck":
+        if self.status == "error":
+            if self.diagnostic_code is None or self.message is None:
+                raise ValueError("failed update check requires a diagnostic")
+        elif self.diagnostic_code is not None or self.message is not None:
+            raise ValueError("successful update check cannot contain a diagnostic")
+        return self
 
 
 __all__ = [
@@ -786,6 +867,10 @@ __all__ = [
     "UpdateCheck",
     "UpdateReview",
     "WorkflowTrustReviewItem",
+    "WorkflowCompatibilityChanges",
+    "WorkflowCompatibilityIdentity",
+    "WorkflowRiskChanges",
+    "WorkflowRiskIdentity",
     "PathRules",
     "ResourceRules",
     "WorkflowMarketplaceSource",

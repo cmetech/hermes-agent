@@ -122,6 +122,87 @@ def test_source_store_supports_disable_remove_without_touching_other_sources(
         store.get("beta")
 
 
+def test_source_update_replaces_configuration_and_invalidates_verified_cache(
+    tmp_path: Path,
+) -> None:
+    from tests.plugins.workflow.test_marketplace_catalog import _bare_repository
+
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    first_remote, _ = _bare_repository(tmp_path / "first")
+    second_remote, _ = _bare_repository(tmp_path / "second")
+    store = WorkflowSourceStore(tmp_path / "home")
+    catalog = WorkflowMarketplaceCatalog(store, WorkflowGitFetcher())
+    catalog.add_source("company", first_remote.as_uri(), ref="main")
+    assert catalog.refresh_source("company").state == "fresh"
+    assert catalog.search("")
+
+    updated = store.update(
+        " COMPANY ",
+        second_remote.as_uri(),
+        ref=None,
+        enabled=True,
+    )
+
+    assert updated.name == "company"
+    assert updated.repository_url == second_remote.as_uri()
+    assert updated.ref is None
+    assert store.verified_catalogs() == ()
+    assert store.status("company") is None
+    assert catalog.search("") == ()
+
+
+def test_source_update_validation_failure_preserves_exact_source_and_cache(
+    tmp_path: Path,
+) -> None:
+    from tests.plugins.workflow.test_marketplace_catalog import _bare_repository
+
+    remote, _ = _bare_repository(tmp_path)
+    store = WorkflowSourceStore(tmp_path / "home")
+    catalog = WorkflowMarketplaceCatalog(store, WorkflowGitFetcher())
+    catalog.add_source("company", remote.as_uri(), ref="main")
+    assert catalog.refresh_source("company").state == "fresh"
+    before_sources = store.path.read_bytes()
+    before_catalog = store.catalog_path.read_bytes()
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.update(
+            "company",
+            "https://alice:top-secret@example.test/workflows.git",
+            ref="release",
+            enabled=False,
+        )
+
+    assert error.value.code == "source_credentials_forbidden"
+    assert "top-secret" not in str(error.value)
+    assert store.path.read_bytes() == before_sources
+    assert store.catalog_path.read_bytes() == before_catalog
+
+
+def test_enabled_only_source_update_preserves_compatible_verified_cache(
+    tmp_path: Path,
+) -> None:
+    from tests.plugins.workflow.test_marketplace_catalog import _bare_repository
+
+    remote, _ = _bare_repository(tmp_path)
+    store = WorkflowSourceStore(tmp_path / "home")
+    catalog = WorkflowMarketplaceCatalog(store, WorkflowGitFetcher())
+    original = catalog.add_source("company", remote.as_uri(), ref="main")
+    assert catalog.refresh_source("company").state == "fresh"
+    cached = store.cached(original)
+    assert cached is not None
+
+    updated = store.update(
+        "company",
+        original.repository_url,
+        ref=original.ref,
+        enabled=False,
+    )
+
+    assert updated.enabled is False
+    assert store.cached(updated) == cached
+
+
 @pytest.mark.parametrize(
     "payload",
     [
