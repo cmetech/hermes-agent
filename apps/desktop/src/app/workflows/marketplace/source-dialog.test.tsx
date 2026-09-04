@@ -412,6 +412,37 @@ describe('ManageWorkflowSourcesDialog', () => {
     expect(screen.getByRole('button', { name: 'Remove source' })).toBeTruthy()
   })
 
+  it('keeps removal busy through backend invalidation and ignores repeated confirmation', async () => {
+    const pending = deferred<{ profile: string; source: WorkflowMarketplaceSourceRecord }>()
+    api.remove.mockReturnValueOnce(pending.promise)
+    const view = renderDialog()
+    const invalidate = vi.spyOn(view.client, 'invalidateQueries')
+    const row = await screen.findByRole('article', { name: 'company source' })
+    fireEvent.click(within(row).getByRole('button', { name: 'Remove company' }))
+
+    const confirm = screen.getByRole('button', { name: 'Remove source' })
+    const confirmation = screen.getByRole('dialog')
+    act(() => {
+      fireEvent.click(confirm)
+      fireEvent.keyDown(confirmation, { key: 'Enter' })
+      fireEvent.click(confirm)
+    })
+
+    expect(api.remove).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: 'Removing source…' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    await act(async () => pending.resolve({ profile: 'support', source: source() }))
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: marketplaceKeys.sources('remote-a::support') })
+    )
+    expect(screen.getByRole('button', { name: 'Source removed' })).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Source removed' })).toBeNull())
+    expect(api.remove).toHaveBeenCalledTimes(1)
+  })
+
   it('requires remove confirmation and explains installed packages remain', async () => {
     renderDialog()
     const row = await screen.findByRole('article', { name: 'company source' })
@@ -588,6 +619,86 @@ describe('ManageWorkflowSourcesDialog', () => {
     expect((screen.getByLabelText('Source name') as HTMLInputElement).value).toBe('new-scope-draft')
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: marketplaceKeys.sources('remote-b::support') })
   })
+
+  it.each(['profile-a-first', 'profile-b-first'] as const)(
+    'keeps mutations in an origin-scoped ledger across A to B to A when %s completes',
+    async completionOrder => {
+      const pendingA = deferred<{ profile: string; source: WorkflowMarketplaceSourceRecord }>()
+      const pendingB = deferred<{ profile: string; source: WorkflowMarketplaceSourceRecord }>()
+      api.enable.mockImplementation((_name: string, _enabled: boolean, requestedScope: typeof scope) =>
+        requestedScope.connectionId === scope.connectionId ? pendingA.promise : pendingB.promise
+      )
+      const controller = operations()
+      const view = renderDialog(controller)
+      const invalidate = vi.spyOn(view.client, 'invalidateQueries')
+
+      let row = await screen.findByRole('article', { name: 'company source' })
+      fireEvent.click(within(row).getByRole('button', { name: 'Disable company' }))
+      expect(api.enable).toHaveBeenCalledWith('company', false, scope)
+
+      rerenderDialog(view, controller, scopeB)
+      row = await screen.findByRole('article', { name: 'company source' })
+      fireEvent.click(within(row).getByRole('button', { name: 'Disable company' }))
+      expect(api.enable).toHaveBeenCalledWith('company', false, scopeB)
+      expect(api.enable).toHaveBeenCalledTimes(2)
+
+      rerenderDialog(view, controller, scope)
+      row = await screen.findByRole('article', { name: 'company source' })
+      const returnedAction = within(row).getByRole('button', { name: 'Disable company' }) as HTMLButtonElement
+      expect(returnedAction.disabled).toBe(true)
+      fireEvent.click(returnedAction)
+      expect(api.enable).toHaveBeenCalledTimes(2)
+
+      await waitFor(
+        () =>
+          expect(api.list.mock.calls.filter(([requestedScope]) => requestedScope === scope).length).toBeGreaterThan(1),
+        { timeout: 2_000 }
+      )
+      const aReadsBeforeCompletion = api.list.mock.calls.filter(([requestedScope]) => requestedScope === scope).length
+
+      const resolveA = async () => {
+        const before = invalidate.mock.calls.length
+        await act(async () => pendingA.resolve({ profile: 'support', source: source({ enabled: false }) }))
+        await waitFor(() => expect(invalidate.mock.calls.length).toBe(before + 2))
+        expect(invalidate.mock.calls.slice(before).map(([filters]) => filters?.queryKey)).toEqual(
+          expect.arrayContaining([
+            marketplaceKeys.sources('remote-a::support'),
+            marketplaceKeys.searchRoot('remote-a::support')
+          ])
+        )
+        await waitFor(() =>
+          expect(api.list.mock.calls.filter(([requestedScope]) => requestedScope === scope).length).toBeGreaterThan(
+            aReadsBeforeCompletion
+          )
+        )
+      }
+      const resolveB = async () => {
+        const before = invalidate.mock.calls.length
+        await act(async () => pendingB.resolve({ profile: 'support', source: source({ enabled: false }) }))
+        await waitFor(() => expect(invalidate.mock.calls.length).toBe(before + 2))
+        expect(invalidate.mock.calls.slice(before).map(([filters]) => filters?.queryKey)).toEqual(
+          expect.arrayContaining([
+            marketplaceKeys.sources('remote-b::support'),
+            marketplaceKeys.searchRoot('remote-b::support')
+          ])
+        )
+      }
+
+      if (completionOrder === 'profile-a-first') {
+        await resolveA()
+        await resolveB()
+      } else {
+        await resolveB()
+        await resolveA()
+      }
+
+      expect(api.enable.mock.calls).toEqual([
+        ['company', false, scope],
+        ['company', false, scopeB]
+      ])
+      expect(screen.queryByRole('alert')).toBeNull()
+    }
+  )
 
   it('reconciles operations when the dialog is reopened', async () => {
     const controller = operations()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import threading
 import time
 
@@ -62,6 +63,12 @@ _REVIEW_DIGEST = "3" * 64
 _COMMIT = "4" * 40
 _TOKEN = "confirmation-token-value-1234567890"
 _NOW = datetime(2026, 9, 4, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+_DIAGNOSTIC_CORPUS = json.loads(
+    (
+        Path(__file__).parents[2]
+        / "fixtures/workflow-marketplace-source-diagnostics.json"
+    ).read_text()
+)
 
 
 def _encode_path_syntax(value: str, layers: int) -> str:
@@ -685,25 +692,7 @@ def test_source_list_projection_redacts_local_repository_and_diagnostic_secrets(
     assert "/private/tmp" not in encoded
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "failed(/private/tmp/secret)",
-        "at=/private/tmp/secret",
-        "failed(/root/secret/config.yml)",
-        "at=/workspace/project/config.yml",
-        'failed["/Volumes/External/repository/index.json"]',
-        "failed(/opt/hermes/cache/state.json)",
-        "at=file:///root/hermes/state.json",
-        "See /docs/authoring for recovery",
-        r"at=C:\Users\operator\secret",
-        "at=C:/Users/operator/secret",
-        r"at=\\server\share\secret",
-        "failed(/tmp/repo/.quarantine/secret)",
-        "failed(%2Fprivate%2Ftmp%2Fsecret)",
-        "failed(%252Fprivate%252Ftmp%252Fsecret)",
-    ],
-)
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["unsafe"])
 def test_source_list_projection_canonically_redacts_punctuated_and_encoded_diagnostics(
     api,
     message: str,
@@ -733,6 +722,32 @@ def test_source_list_projection_canonically_redacts_punctuated_and_encoded_diagn
     projected = response.json()["sources"][0]["message"]
     assert projected != message
     assert message not in json.dumps(response.json())
+
+
+def test_source_list_projection_canonicalizes_control_bearing_diagnostics(api) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=" \tfatal:\r\n remote unavailable\x7f retry  ",
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sources"][0]["message"] == "fatal: remote unavailable retry"
 
 
 @pytest.mark.parametrize(

@@ -2149,6 +2149,7 @@ export interface Translations {
     workflowMarketplaceEditSource: (source: string) => string
     workflowMarketplaceRemoveSource: (source: string) => string
     workflowMarketplaceRemoveSourceAction: string
+    workflowMarketplaceRemovingSource: string
     workflowMarketplaceEnableSource: (source: string) => string
     workflowMarketplaceDisableSource: (source: string) => string
     workflowMarketplaceEnableAction: string
@@ -2181,6 +2182,7 @@ export interface Translations {
     workflowMarketplaceSafeError: string
     workflowMarketplaceRemoveTitle: (source: string) => string
     workflowMarketplaceRemoveDescription: string
+    workflowMarketplaceSourceRemoved: string
     workflowMarketplaceUnsupportedSources: string
     workflowCatalog: string
     workflowCatalogLoading: string

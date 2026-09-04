@@ -2527,6 +2527,7 @@ export const en: Translations = {
     workflowMarketplaceEditSource: source => `Edit ${source}`,
     workflowMarketplaceRemoveSource: source => `Remove ${source}`,
     workflowMarketplaceRemoveSourceAction: 'Remove source',
+    workflowMarketplaceRemovingSource: 'Removing source…',
     workflowMarketplaceEnableSource: source => `Enable ${source}`,
     workflowMarketplaceDisableSource: source => `Disable ${source}`,
     workflowMarketplaceEnableAction: 'Enable',
@@ -2562,6 +2563,7 @@ export const en: Translations = {
     workflowMarketplaceRemoveTitle: source => `Remove ${source}?`,
     workflowMarketplaceRemoveDescription:
       'Installed packages remain installed. Removing this source may orphan future update discovery.',
+    workflowMarketplaceSourceRemoved: 'Source removed',
     workflowMarketplaceUnsupportedSources: 'Upgrade Hermes to manage and refresh workflow sources.',
     workflowCatalog: 'Workflow catalog',
     workflowCatalogLoading: 'Loading workflow catalog',

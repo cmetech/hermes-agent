@@ -32,6 +32,12 @@ from plugins.workflow.trust import WorkflowTrustError
 
 
 _DIGEST_DOMAIN = b"hermes.workflow-package.v1\0"
+_DIAGNOSTIC_CORPUS = json.loads(
+    (
+        Path(__file__).parents[2]
+        / "fixtures/workflow-marketplace-source-diagnostics.json"
+    ).read_text()
+)
 
 
 def _json_bytes(value: object) -> bytes:
@@ -938,26 +944,7 @@ def test_source_list_records_preserve_verified_cache_after_failure_and_fail_clos
         service.list_source_records()
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "failed(/private/tmp/secret)",
-        "at=/private/tmp/secret",
-        'failed["/Users/operator/work"]',
-        "failed(/root/secret/config.yml)",
-        "at=/workspace/project/config.yml",
-        'failed["/Volumes/External/repository/index.json"]',
-        "failed(/opt/hermes/cache/state.json)",
-        "at=file:///root/hermes/state.json",
-        "See /docs/authoring for recovery",
-        r"at=C:\Users\operator\secret",
-        "at=C:/Users/operator/secret",
-        r"at=\\server\share\secret",
-        "failed(/tmp/repo/.staging/secret)",
-        "failed(%2Fprivate%2Ftmp%2Fsecret)",
-        "failed(%252Fprivate%252Ftmp%252Fsecret)",
-    ],
-)
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["unsafe"])
 def test_refresh_diagnostics_redact_assignment_punctuation_and_encoded_local_paths_before_persistence(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,
@@ -984,20 +971,7 @@ def test_refresh_diagnostics_redact_assignment_punctuation_and_encoded_local_pat
     assert status.message is not None
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "workflow marketplace source refresh failed",
-        "See https://example.test/private/tmp for repository documentation",
-        "failed at [REDACTED_PATH]",
-        "Progress 50% complete",
-        "Compare input/output before retrying",
-        "Retry failed: punctuation is safe (again).",
-        "See https://example.test/input/output during progress 50%",
-        "A bare % or %zz or %2 escape is ordinary diagnostic prose",
-        "Encoded%20spacing and a bare 50% remain safe",
-    ],
-)
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["safe"])
 def test_refresh_diagnostics_accept_canonical_generic_and_nonlocal_slash_prose(
     message: str,
 ) -> None:
@@ -1010,6 +984,20 @@ def test_refresh_diagnostics_accept_canonical_generic_and_nonlocal_slash_prose(
     )
 
     assert status.message == message
+
+
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["unsafe"])
+def test_refresh_diagnostic_validator_rejects_shared_unsafe_corpus(
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=message,
+        )
 
 
 @pytest.mark.parametrize("layers", [1, 2, 8, 9])
@@ -1041,6 +1029,46 @@ def test_refresh_diagnostic_message_enforces_its_exact_size_bound() -> None:
     assert SourceRefreshStatus(**common, message="x" * 4096).message == "x" * 4096
     with pytest.raises(ValidationError):
         SourceRefreshStatus(**common, message="x" * 4097)
+    assert SourceRefreshStatus(**common, message="😀" * 4096).message == "😀" * 4096
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(**common, message="😀" * 4097)
+
+
+def test_refresh_diagnostics_canonicalize_controls_before_persistence_and_reject_raw_state(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    configured = service.add_source(
+        WorkflowMarketplaceSource(
+            name="company",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    raw = " \tfatal:\r\n remote unavailable\x7f retry  "
+
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=raw,
+        )
+
+    service.catalog.source_store.record_failed_refresh(
+        configured,
+        WorkflowMarketplaceError("source_unavailable", raw),
+        attempted_at="2026-09-04T01:00:00Z",
+        state="unavailable",
+    )
+
+    assert (
+        service.list_source_records()[0].message
+        == "source_unavailable: fatal: remote unavailable retry"
+    )
+    assert "\\r" not in service.catalog.source_store.catalog_path.read_text()
+    assert "\\n" not in service.catalog.source_store.catalog_path.read_text()
+    assert "\\t" not in service.catalog.source_store.catalog_path.read_text()
 
 
 def test_source_list_records_report_auth_failure_without_inventing_cache(

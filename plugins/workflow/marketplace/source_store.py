@@ -54,16 +54,17 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     r"\b(access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b(\s*[=:])\s*\S+",
     re.IGNORECASE,
 )
+_HTTP_DIAGNOSTIC_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _LOCAL_PATH = re.compile(
-    r"(?<![A-Za-z0-9:/])(?:"
-    r"file:/{1,3}[^\s\"'<>()[\]{},;]+|"
-    r"/{1,2}(?!/)(?:[^/\s\"'<>()[\]{},;?#=&]+/)+[^/\s\"'<>()[\]{},;?#=&]*|"
-    r"[A-Z]:[/\\][^\s\"'<>()[\]{},;]*|"
-    r"\\\\[^\\\s\"'<>()[\]{},;]+\\[^\s\"'<>()[\]{},;]*|"
-    r"[^\s\"'<>()[\]{},;=]*(?:[/\\])?\.(?:staging|quarantine)(?:[/\\][^\s\"'<>()[\]{},;]*)?"
+    r"(?:"
+    r"file:/+[^\s\"'<>()[\]{},;]+|"
+    r"(?<![A-Za-z0-9/])/{1,2}(?!/)(?:[^/\s\"'<>()[\]{},;?#=&]+/)+[^/\s\"'<>()[\]{},;?#=&]*|"
+    r"(?<![A-Za-z0-9])[A-Z]:/[^\s\"'<>()[\]{},;]*|"
+    r"[^\s\"'<>()[\]{},;=]*(?:/)?\.(?:staging|quarantine)(?:/[^\s\"'<>()[\]{},;]*)?"
     r")",
     re.IGNORECASE,
 )
+_CONTROL_OR_SPACE_RUN = re.compile(r"[\x00-\x20\x7f]+")
 _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _PATH_DECODE_MAX = 8
 _GENERIC_REFRESH_FAILURE = "workflow marketplace source refresh failed"
@@ -80,15 +81,29 @@ RefreshState = Literal[
 ]
 
 
+def _canonical_diagnostic_line(value: str) -> str:
+    return _CONTROL_OR_SPACE_RUN.sub(" ", value).strip()
+
+
+def _diagnostic_contains_control(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _diagnostic_contains_local_path(value: str) -> bool:
+    without_http_urls = _HTTP_DIAGNOSTIC_URL.sub("", value)
+    return _LOCAL_PATH.search(without_http_urls.replace("\\", "/")) is not None
+
+
 def redact_source_refresh_message(value: str, repository_url: str | None = None) -> str:
     """Return one bounded diagnostic with credentials and private paths removed."""
 
     completed = subprocess.CompletedProcess(
         args=(), returncode=1, stdout="", stderr=value
     )
-    redacted = safe_git_error(completed, repository_url).strip()
+    redacted = _canonical_diagnostic_line(safe_git_error(completed, repository_url))
     redacted = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED]", redacted)
-    redacted = _LOCAL_PATH.sub("[REDACTED_PATH]", redacted).strip()
+    if _diagnostic_contains_local_path(redacted):
+        return _GENERIC_REFRESH_FAILURE
 
     probe = redacted
     for _ in range(_PATH_DECODE_MAX):
@@ -101,7 +116,8 @@ def redact_source_refresh_message(value: str, repository_url: str | None = None)
         if decoded == probe:
             break
         if (
-            _LOCAL_PATH.search(decoded) is not None
+            _diagnostic_contains_control(decoded)
+            or _diagnostic_contains_local_path(decoded)
             or _CREDENTIAL_ASSIGNMENT.search(decoded) is not None
             or git_text_contains_credentials(decoded)
         ):

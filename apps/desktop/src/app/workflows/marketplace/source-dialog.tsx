@@ -44,6 +44,11 @@ interface ScopedActionFailure extends MarketplaceOperationOrigin {
   retry: () => Promise<boolean>
 }
 
+interface ScopedMutation extends MarketplaceOperationOrigin {
+  identity: string
+  token: object
+}
+
 interface ScopedRemoval extends MarketplaceOperationOrigin {
   name: string
 }
@@ -106,7 +111,7 @@ export function ManageWorkflowSourcesDialog({
   const queryClient = useQueryClient()
   const scopeKey = profileScopeKey(scope)
   const addButtonRef = useRef<HTMLButtonElement>(null)
-  const mutationGuardRef = useRef<null | object>(null)
+  const mutationLedgerRef = useRef(new Map<string, ScopedMutation>())
   const mountedRef = useRef(true)
   const actionGenerationRef = useRef(0)
   const renderedScopeKeyRef = useRef(scopeKey)
@@ -117,14 +122,13 @@ export function ManageWorkflowSourcesDialog({
   const [formOpen, setFormOpen] = useState(false)
   const [formScopeKey, setFormScopeKey] = useState<null | string>(null)
   const [removeSource, setRemoveSource] = useState<null | ScopedRemoval>(null)
-  const [mutationBusyOrigin, setMutationBusyOrigin] = useState<null | MarketplaceOperationOrigin>(null)
+  const [, setMutationLedgerRevision] = useState(0)
   const [refreshAllBusyScope, setRefreshAllBusyScope] = useState<null | string>(null)
   const [actionFailure, setActionFailure] = useState<null | ScopedActionFailure>(null)
 
   if (renderedScopeKeyRef.current !== scopeKey) {
     renderedScopeKeyRef.current = scopeKey
     actionGenerationRef.current += 1
-    mutationGuardRef.current = null
     refreshAllGuardRef.current = null
   }
 
@@ -145,7 +149,6 @@ export function ManageWorkflowSourcesDialog({
     setFormOpen(false)
     setFormScopeKey(null)
     setRemoveSource(null)
-    setMutationBusyOrigin(null)
     setRefreshAllBusyScope(null)
     setActionFailure(null)
   }, [scopeKey])
@@ -157,7 +160,6 @@ export function ManageWorkflowSourcesDialog({
     return () => {
       mountedRef.current = false
       actionGenerationRef.current += 1
-      mutationGuardRef.current = null
       refreshAllGuardRef.current = null
     }
   }, [])
@@ -178,10 +180,6 @@ export function ManageWorkflowSourcesDialog({
   })
 
   const invalidate = async (origin: MarketplaceOperationOrigin) => {
-    if (!actionOriginIsCurrent(origin)) {
-      return
-    }
-
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: marketplaceKeys.sources(origin.scopeKey) }),
       queryClient.invalidateQueries({ queryKey: marketplaceKeys.searchRoot(origin.scopeKey) })
@@ -193,14 +191,14 @@ export function ManageWorkflowSourcesDialog({
     action: () => Promise<unknown>,
     origin: MarketplaceOperationOrigin = currentActionOrigin()
   ): Promise<boolean> => {
-    const attempt = {}
+    const attempt: ScopedMutation = { ...origin, identity, token: {} }
 
-    if (!actionOriginIsCurrent(origin) || mutationGuardRef.current !== null) {
+    if (!actionOriginIsCurrent(origin) || mutationLedgerRef.current.has(origin.scopeKey)) {
       return false
     }
 
-    mutationGuardRef.current = attempt
-    setMutationBusyOrigin(origin)
+    mutationLedgerRef.current.set(origin.scopeKey, attempt)
+    setMutationLedgerRevision(revision => revision + 1)
 
     try {
       if (!actionOriginIsCurrent(origin)) {
@@ -208,11 +206,6 @@ export function ManageWorkflowSourcesDialog({
       }
 
       await action()
-
-      if (!actionOriginIsCurrent(origin)) {
-        return false
-      }
-
       await invalidate(origin)
 
       if (!actionOriginIsCurrent(origin)) {
@@ -241,12 +234,12 @@ export function ManageWorkflowSourcesDialog({
 
       return false
     } finally {
-      if (mutationGuardRef.current === attempt) {
-        mutationGuardRef.current = null
+      if (mutationLedgerRef.current.get(origin.scopeKey)?.token === attempt.token) {
+        mutationLedgerRef.current.delete(origin.scopeKey)
       }
 
-      if (actionOriginIsCurrent(origin)) {
-        setMutationBusyOrigin(current => (current === origin ? null : current))
+      if (mountedRef.current) {
+        setMutationLedgerRevision(revision => revision + 1)
       }
     }
   }
@@ -340,8 +333,7 @@ export function ManageWorkflowSourcesDialog({
   }
 
   const refreshAllBusy = refreshAllBusyScope === scopeKey
-  const mutationBusy =
-    mutationBusyOrigin?.scopeKey === scopeKey && mutationBusyOrigin.generation === actionGenerationRef.current
+  const mutationBusy = mutationLedgerRef.current.has(scopeKey)
   const visibleActionFailure =
     actionFailure?.scopeKey === scopeKey && actionFailure.generation === actionGenerationRef.current
       ? actionFailure
@@ -684,10 +676,11 @@ export function ManageWorkflowSourcesDialog({
       </Dialog>
 
       <ConfirmDialog
+        busyLabel={copy.workflowMarketplaceRemovingSource}
         confirmLabel={copy.workflowMarketplaceRemoveSourceAction}
         description={copy.workflowMarketplaceRemoveDescription}
         destructive
-        dismissOnConfirm
+        doneLabel={copy.workflowMarketplaceSourceRemoved}
         onClose={() => setRemoveSource(null)}
         onConfirm={async () => {
           if (visibleRemoval === null || !actionOriginIsCurrent(visibleRemoval)) {

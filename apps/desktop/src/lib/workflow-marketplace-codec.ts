@@ -731,23 +731,35 @@ function decodeSource(value: unknown): WorkflowMarketplaceSource | null {
 const DIAGNOSTIC_CREDENTIAL_ASSIGNMENT =
   /\b(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]/i
 
+const DIAGNOSTIC_HTTP_URL = /https?:\/\/[^\s<>"']+/gi
 const DIAGNOSTIC_LOCAL_PATH =
-  /(?<![A-Za-z0-9:/])(?:file:\/{1,3}[^\s"'<>()[\]{},;]+|\/{1,2}(?!\/)(?:[^/\s"'<>()[\]{},;?#=&]+\/)+[^/\s"'<>()[\]{},;?#=&]*|[A-Za-z]:[\\/][^\s"'<>()[\]{},;]*|\\\\[^\\\s"'<>()[\]{},;]+\\[^\s"'<>()[\]{},;]*|[^\s"'<>()[\]{},;=]*(?:[\\/])?\.(?:staging|quarantine)(?:[\\/][^\s"'<>()[\]{},;]*)?)/i
+  /(?:file:\/+[^\s"'<>()[\]{},;]+|(?<![A-Za-z0-9/])\/{1,2}(?!\/)(?:[^/\s"'<>()[\]{},;?#=&]+\/)+[^/\s"'<>()[\]{},;?#=&]*|(?<![A-Za-z0-9])[A-Za-z]:\/[^\s"'<>()[\]{},;]*|[^\s"'<>()[\]{},;=]*(?:\/)?\.(?:staging|quarantine)(?:\/[^\s"'<>()[\]{},;]*)?)/i
 
 const DIAGNOSTIC_PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/
 const DIAGNOSTIC_PERCENT_ESCAPE_RUN = /(?:%[0-9A-Fa-f]{2})+/g
 
+function diagnosticTextContainsLocalPath(value: string): boolean {
+  const withoutHttpUrls = value.replace(DIAGNOSTIC_HTTP_URL, '')
+
+  return DIAGNOSTIC_LOCAL_PATH.test(withoutHttpUrls.replaceAll('\\', '/'))
+}
+
 function diagnosticTextIsUnsafe(value: string): boolean {
   return (
     DIAGNOSTIC_CREDENTIAL_ASSIGNMENT.test(value) ||
-    DIAGNOSTIC_LOCAL_PATH.test(value) ||
+    diagnosticTextContainsLocalPath(value) ||
     hasCredentialAuthority(value) ||
     hasCredentialParameter(value)
   )
 }
 
 function safeDiagnosticText(value: unknown): string | null {
-  const decoded = cleanText(value, 1, 4096)
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const codePointLength = [...value].length
+  const decoded = codePointLength >= 1 && codePointLength <= 4096 && value.trim() === value ? value : null
 
   if (decoded === null || containsControl(decoded) || diagnosticTextIsUnsafe(decoded)) {
     return null
@@ -775,7 +787,7 @@ function safeDiagnosticText(value: unknown): string | null {
       return null
     }
 
-    if (diagnosticTextIsUnsafe(next)) {
+    if (containsControl(next) || diagnosticTextIsUnsafe(next)) {
       return null
     }
 
