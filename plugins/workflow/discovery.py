@@ -15,6 +15,7 @@ from plugins.workflow.marketplace.discovery import (
     WorkflowCandidate,
     _contains_workflow_package_marker,
     enumerate_workflow_candidates,
+    installed_binding_resolver,
 )
 from plugins.workflow.models import (
     ValidationIssue,
@@ -122,6 +123,11 @@ def discover_workflows(
         ("project", 1, Path(workdir).expanduser() / ".hermes" / "workflows"),
         ("profile", 2, Path(hermes_home).expanduser() / "workflows"),
     ])
+    profile_binding_resolver = (
+        binding_resolver
+        if binding_resolver is not None
+        else installed_binding_resolver(Path(hermes_home).expanduser())
+    )
     source_documents: list[WorkflowSourceDocument] = []
     for source, precedence, location in locations:
         scan_location = location
@@ -137,7 +143,11 @@ def discover_workflows(
             excluded_top_level=(
                 _PROFILE_STATE_DIRECTORIES if source == "profile" else frozenset()
             ),
-            binding_resolver=binding_resolver,
+            binding_resolver=(
+                binding_resolver
+                if binding_resolver is not None or source != "profile"
+                else profile_binding_resolver
+            ),
         ):
             source_documents.append(
                 _load_cached(candidate, source=source, precedence=precedence)

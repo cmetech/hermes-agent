@@ -14,6 +14,7 @@ from plugins.workflow.models import WorkflowMarketplaceBinding
 from plugins.workflow.trust import WorkflowResourceReadBudget
 
 from .package import WorkflowMarketplaceError, load_distribution
+from .provenance import InstalledPackageStore
 
 
 _MANIFEST_NAME = "workflow-package.json"
@@ -36,6 +37,12 @@ class _DirectoryEntry(Protocol):
 
 
 WorkflowBindingResolver = Callable[[Path, str], WorkflowMarketplaceBinding | None]
+
+
+def installed_binding_resolver(hermes_home: Path) -> WorkflowBindingResolver:
+    """Return the profile's exact provenance-backed binding resolver."""
+
+    return InstalledPackageStore(hermes_home).binding_for_workflow
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,4 +364,5 @@ __all__ = [
     "WorkflowCandidateFailure",
     "enumerate_workflow_candidates",
     "enumerate_workflow_candidates_isolated",
+    "installed_binding_resolver",
 ]

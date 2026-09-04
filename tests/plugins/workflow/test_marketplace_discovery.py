@@ -14,7 +14,12 @@ import yaml
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.discovery import clear_discovery_cache, discover_workflows
 from plugins.workflow.marketplace.discovery import enumerate_workflow_candidates
+from plugins.workflow.marketplace.models import (
+    InstalledPackageIdentity,
+    InstalledPackageProvenance,
+)
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
+from plugins.workflow.marketplace.provenance import InstalledPackageStore
 from plugins.workflow.models import (
     WorkflowMarketplaceBinding,
     WorkflowValidationError,
@@ -429,4 +434,65 @@ def test_discovery_cache_never_reuses_a_package_across_marketplace_bindings(
     assert second is not first
     assert first.marketplace_binding == first_binding
     assert second.marketplace_binding == second_binding
+    clear_discovery_cache()
+
+
+def test_profile_discovery_uses_exact_installed_provenance_by_default(
+    tmp_path: Path,
+) -> None:
+    clear_discovery_cache()
+    profile = tmp_path / "profile"
+    package_root, digest = _install_package(
+        profile / "workflows" / "marketplace" / "company" / "inbox-productivity",
+        "inbox-productivity",
+        ("profile-marketplace",),
+    )
+    project_root, _project_digest = _install_package(
+        tmp_path / "repo" / ".hermes" / "workflows" / "project-package",
+        "inbox-productivity",
+        ("project-package",),
+    )
+    identity = InstalledPackageIdentity(
+        sourceKey="company",
+        packageId="inbox-productivity",
+    )
+    provenance = InstalledPackageProvenance.model_validate({
+        "schemaVersion": 1,
+        "identity": identity.model_dump(mode="json", by_alias=True),
+        "sourceName": "company",
+        "repositoryUrl": "https://github.com/example/workflows.git",
+        "configuredRef": "main",
+        "resolvedCommit": "a" * 40,
+        "packagePath": "packages/inbox-productivity",
+        "packageVersion": "2.0.0",
+        "contractVersion": 1,
+        "distributionDigest": digest,
+        "installedAt": "2026-09-03T12:00:00Z",
+        "actor": "operator",
+        "workflowPaths": ["workflows/triage.yaml"],
+    })
+    store = InstalledPackageStore(profile)
+    store.put(provenance)
+
+    discovered = discover_workflows(tmp_path / "repo", profile, tmp_path / "home")
+    by_name = {item.definition.name: item for item in discovered}
+
+    assert by_name["profile-marketplace"].root == package_root.resolve()
+    assert by_name["profile-marketplace"].marketplace_binding is not None
+    assert (
+        by_name["profile-marketplace"].marketplace_binding.installation_key
+        == "company/inbox-productivity"
+    )
+    assert by_name["project-package"].root == project_root.resolve()
+    assert by_name["project-package"].marketplace_binding is None
+
+    store.put(provenance.model_copy(update={"distribution_digest": "0" * 64}))
+    clear_discovery_cache()
+    tampered = discover_workflows(tmp_path / "repo", profile, tmp_path / "home")
+    assert (
+        next(
+            item for item in tampered if item.definition.name == "profile-marketplace"
+        ).marketplace_binding
+        is None
+    )
     clear_discovery_cache()
