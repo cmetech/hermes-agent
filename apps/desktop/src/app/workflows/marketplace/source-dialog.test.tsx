@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { WorkflowMarketplaceApiError } from '@/api/workflow-marketplace'
@@ -108,13 +109,15 @@ function cancelledOperation(): WorkflowMarketplaceOperation {
 }
 
 function deferred<T>() {
+  let reject!: (reason?: unknown) => void
   let resolve!: (value: T) => void
 
-  const promise = new Promise<T>(done => {
-    resolve = done
+  const promise = new Promise<T>((onResolve, onReject) => {
+    reject = onReject
+    resolve = onResolve
   })
 
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
 
 function renderDialog(controller = operations(), supported = true, requestedScope = scope) {
@@ -277,6 +280,136 @@ describe('ManageWorkflowSourcesDialog', () => {
 
     fireEvent.click(within(row).getByRole('button', { name: 'Disable company' }))
     await waitFor(() => expect(api.enable).toHaveBeenCalledWith('company', false, scope))
+  })
+
+  it('uses matching Enable and Disable action labels for source toggles', async () => {
+    api.list.mockResolvedValue({
+      profile: 'support',
+      sources: [source(), source({ enabled: false, name: 'disabled-source' })]
+    })
+    renderDialog()
+
+    const enabled = await screen.findByRole('article', { name: 'company source' })
+    const disabled = screen.getByRole('article', { name: 'disabled-source source' })
+    expect(within(enabled).getByRole('button', { name: 'Disable company' }).textContent).toBe('Disable')
+    expect(within(disabled).getByRole('button', { name: 'Enable disabled-source' }).textContent).toBe('Enable')
+  })
+
+  it.each([
+    ['company', 'team', false],
+    ['team', 'company', true]
+  ] as const)(
+    'serializes rapid %s then %s mutations regardless of deferred completion order',
+    async (firstName, secondName, resolveBlockedFirst) => {
+      api.list.mockResolvedValue({ profile: 'support', sources: [source(), source({ name: 'team' })] })
+      const company = deferred<{ profile: string; source: WorkflowMarketplaceSourceRecord }>()
+      const team = deferred<{ profile: string; source: WorkflowMarketplaceSourceRecord }>()
+      api.enable.mockImplementation(name => (name === 'company' ? company.promise : team.promise))
+      renderDialog()
+
+      const first = await screen.findByRole('article', { name: `${firstName} source` })
+      const second = screen.getByRole('article', { name: `${secondName} source` })
+      act(() => {
+        fireEvent.click(within(first).getByRole('button', { name: `Disable ${firstName}` }))
+        fireEvent.click(within(second).getByRole('button', { name: `Disable ${secondName}` }))
+      })
+
+      expect(api.enable).toHaveBeenCalledTimes(1)
+      expect(api.enable).toHaveBeenCalledWith(firstName, false, scope)
+      expect((screen.getByRole('button', { name: 'Add source' }) as HTMLButtonElement).disabled).toBe(true)
+      expect((within(second).getByRole('button', { name: `Edit ${secondName}` }) as HTMLButtonElement).disabled).toBe(
+        true
+      )
+      expect((within(second).getByRole('button', { name: `Remove ${secondName}` }) as HTMLButtonElement).disabled).toBe(
+        true
+      )
+
+      if (resolveBlockedFirst) {
+        ;(secondName === 'company' ? company : team).resolve({ profile: 'support', source: source() })
+        await Promise.resolve()
+      }
+      ;(firstName === 'company' ? company : team).resolve({ profile: 'support', source: source() })
+      await waitFor(() =>
+        expect(
+          (within(second).getByRole('button', { name: `Disable ${secondName}` }) as HTMLButtonElement).disabled
+        ).toBe(false)
+      )
+      expect(api.enable).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it('preserves a failed mutation while another succeeds and Retry remains exact', async () => {
+    api.list.mockResolvedValue({ profile: 'support', sources: [source(), source({ name: 'team' })] })
+    api.enable.mockImplementationOnce(() => Promise.reject(new Error('network')))
+    renderDialog()
+
+    const company = await screen.findByRole('article', { name: 'company source' })
+    const team = screen.getByRole('article', { name: 'team source' })
+    fireEvent.click(within(company).getByRole('button', { name: 'Disable company' }))
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeTruthy()
+
+    fireEvent.click(within(team).getByRole('button', { name: 'Disable team' }))
+    await waitFor(() => expect(api.enable).toHaveBeenCalledWith('team', false, scope))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    await waitFor(() => expect(api.enable).toHaveBeenCalledTimes(3))
+    expect(api.enable.mock.calls).toEqual([
+      ['company', false, scope],
+      ['team', false, scope],
+      ['company', false, scope]
+    ])
+  })
+
+  it('keeps source mutations functional and single-admission under StrictMode replay', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const controller = operations()
+    const view = render(
+      <StrictMode>
+        <QueryClientProvider client={client}>
+          <I18nProvider>
+            <ManageWorkflowSourcesDialog onClose={vi.fn()} open operations={controller} scope={scope} supported />
+          </I18nProvider>
+        </QueryClientProvider>
+      </StrictMode>
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add source' }))
+    fireEvent.change(screen.getByLabelText('Source name'), { target: { value: 'team' } })
+    fireEvent.change(screen.getByLabelText('Repository URL'), {
+      target: { value: 'https://example.test/team.git' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save source' }))
+    await waitFor(() => expect(api.add).toHaveBeenCalledTimes(1))
+
+    const row = await screen.findByRole('article', { name: 'company source' })
+    fireEvent.click(within(row).getByRole('button', { name: 'Edit company' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save source' }))
+    await waitFor(() => expect(api.update).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Disable company' }))
+    await waitFor(() => expect(api.enable).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Remove company' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove source' }))
+    await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Remove source' })).toBeNull())
+
+    view.unmount()
+    expect(api.add).toHaveBeenCalledTimes(1)
+    expect(api.update).toHaveBeenCalledTimes(1)
+    expect(api.enable).toHaveBeenCalledTimes(1)
+    expect(api.remove).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps removal confirmation open when the exact mutation fails', async () => {
+    api.remove.mockRejectedValueOnce(new Error('network'))
+    renderDialog()
+    const row = await screen.findByRole('article', { name: 'company source' })
+    fireEvent.click(within(row).getByRole('button', { name: 'Remove company' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove source' }))
+
+    await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Remove source' })).toBeTruthy()
   })
 
   it('requires remove confirmation and explains installed packages remain', async () => {

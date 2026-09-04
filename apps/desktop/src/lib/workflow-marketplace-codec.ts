@@ -732,7 +732,10 @@ const DIAGNOSTIC_CREDENTIAL_ASSIGNMENT =
   /\b(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]/i
 
 const DIAGNOSTIC_LOCAL_PATH =
-  /(?<![A-Za-z0-9])(?:\/(?:private|tmp|users|home|var\/(?:folders|tmp|cache))(?:[\\/][^\s"'<>()[\]{},;]*)?|[A-Za-z]:\\[^\s"'<>()[\]{},;]*|\\\\[^\\\s"'<>()[\]{},;]+\\[^\s"'<>()[\]{},;]*|[^\s"'<>()[\]{},;=]*(?:[\\/])?\.(?:staging|quarantine)(?:[\\/][^\s"'<>()[\]{},;]*)?)/i
+  /(?<![A-Za-z0-9:/])(?:file:\/{1,3}[^\s"'<>()[\]{},;]+|\/{1,2}(?!\/)(?:[^/\s"'<>()[\]{},;?#=&]+\/)+[^/\s"'<>()[\]{},;?#=&]*|[A-Za-z]:[\\/][^\s"'<>()[\]{},;]*|\\\\[^\\\s"'<>()[\]{},;]+\\[^\s"'<>()[\]{},;]*|[^\s"'<>()[\]{},;=]*(?:[\\/])?\.(?:staging|quarantine)(?:[\\/][^\s"'<>()[\]{},;]*)?)/i
+
+const DIAGNOSTIC_PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/
+const DIAGNOSTIC_PERCENT_ESCAPE_RUN = /(?:%[0-9A-Fa-f]{2})+/g
 
 function diagnosticTextIsUnsafe(value: string): boolean {
   return (
@@ -753,16 +756,23 @@ function safeDiagnosticText(value: unknown): string | null {
   let probe = decoded
 
   for (let layer = 0; layer < 8; layer += 1) {
-    let next: string
-
-    try {
-      next = decodeURIComponent(probe)
-    } catch {
-      return null
+    if (!DIAGNOSTIC_PERCENT_ESCAPE.test(probe)) {
+      return decoded
     }
 
-    if (next === probe) {
-      return decoded
+    let invalidEncoding = false
+    const next = probe.replace(DIAGNOSTIC_PERCENT_ESCAPE_RUN, encoded => {
+      try {
+        return decodeURIComponent(encoded)
+      } catch {
+        invalidEncoding = true
+
+        return encoded
+      }
+    })
+
+    if (invalidEncoding) {
+      return null
     }
 
     if (diagnosticTextIsUnsafe(next)) {
@@ -772,7 +782,7 @@ function safeDiagnosticText(value: unknown): string | null {
     probe = next
   }
 
-  return probe.includes('%') ? null : decoded
+  return DIAGNOSTIC_PERCENT_ESCAPE.test(probe) ? null : decoded
 }
 
 function decodeSourceRecord(value: unknown): WorkflowMarketplaceSourceRecord | null {

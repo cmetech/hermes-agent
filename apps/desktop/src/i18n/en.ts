@@ -2529,6 +2529,8 @@ export const en: Translations = {
     workflowMarketplaceRemoveSourceAction: 'Remove source',
     workflowMarketplaceEnableSource: source => `Enable ${source}`,
     workflowMarketplaceDisableSource: source => `Disable ${source}`,
+    workflowMarketplaceEnableAction: 'Enable',
+    workflowMarketplaceDisableAction: 'Disable',
     workflowMarketplaceRefreshSource: source => `Refresh ${source}`,
     workflowMarketplaceSourceArticle: source => `${source} source`,
     workflowMarketplaceSourceName: 'Source name',

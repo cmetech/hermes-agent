@@ -700,7 +700,14 @@ describe('workflow marketplace codec', () => {
     'failed(/private/tmp/secret)',
     'at=/private/tmp/secret',
     'failed["/Users/operator/work"]',
+    'failed(/root/secret/config.yml)',
+    'at=/workspace/project/config.yml',
+    'failed["/Volumes/External/repository/index.json"]',
+    'failed(/opt/hermes/cache/state.json)',
+    'at=file:///root/hermes/state.json',
+    'See /docs/authoring for recovery',
     'at=C:\\Users\\operator\\secret',
+    'at=C:/Users/operator/secret',
     'at=\\\\server\\share\\secret',
     'failed(/tmp/repo/.staging/secret)',
     'failed(%2Fprivate%2Ftmp%2Fsecret)',
@@ -730,9 +737,14 @@ describe('workflow marketplace codec', () => {
 
   it.each([
     'workflow marketplace source refresh failed',
-    'See /docs/authoring for recovery',
     'See https://example.test/private/tmp for repository documentation',
-    'failed at [REDACTED_PATH]'
+    'failed at [REDACTED_PATH]',
+    'Progress 50% complete',
+    'Compare input/output before retrying',
+    'Retry failed: punctuation is safe (again).',
+    'See https://example.test/input/output during progress 50%',
+    'A bare % or %zz or %2 escape is ordinary diagnostic prose',
+    'Encoded%20spacing and a bare 50% remain safe'
   ])('accepts a canonical source diagnostic without a sensitive local path: %s', message => {
     expect(
       decodeWorkflowMarketplaceSourceList({
@@ -754,6 +766,59 @@ describe('workflow marketplace codec', () => {
         ]
       })
     ).not.toBeNull()
+  })
+
+  it.each([1, 2, 8, 9])('rejects an absolute local path nested through %i percent-encoding layers', layers => {
+    let message = '/root/workspace/secret.txt'
+
+    for (let layer = 0; layer < layers; layer += 1) {
+      message = encodeURIComponent(message)
+    }
+
+    expect(
+      decodeWorkflowMarketplaceSourceList({
+        profile: 'support',
+        sources: [
+          {
+            attempted_at: NOW,
+            diagnostic_code: 'source_unavailable',
+            enabled: true,
+            message,
+            name: 'company',
+            ref: null,
+            refresh_state: 'unavailable',
+            repository_url: 'https://example.test/team/workflows.git',
+            resolved_commit: null,
+            verified_at: null,
+            verified_package_count: 0
+          }
+        ]
+      })
+    ).toBeNull()
+  })
+
+  it('enforces the exact source diagnostic size bound', () => {
+    const response = (message: string) => ({
+      profile: 'support',
+      sources: [
+        {
+          attempted_at: NOW,
+          diagnostic_code: 'source_unavailable',
+          enabled: true,
+          message,
+          name: 'company',
+          ref: null,
+          refresh_state: 'unavailable',
+          repository_url: 'https://example.test/team/workflows.git',
+          resolved_commit: null,
+          verified_at: null,
+          verified_package_count: 0
+        }
+      ]
+    })
+
+    expect(decodeWorkflowMarketplaceSourceList(response('x'.repeat(4096)))).not.toBeNull()
+    expect(decodeWorkflowMarketplaceSourceList(response('x'.repeat(4097)))).toBeNull()
   })
 
   it.each([

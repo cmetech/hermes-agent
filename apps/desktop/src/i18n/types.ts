@@ -2151,6 +2151,8 @@ export interface Translations {
     workflowMarketplaceRemoveSourceAction: string
     workflowMarketplaceEnableSource: (source: string) => string
     workflowMarketplaceDisableSource: (source: string) => string
+    workflowMarketplaceEnableAction: string
+    workflowMarketplaceDisableAction: string
     workflowMarketplaceRefreshSource: (source: string) => string
     workflowMarketplaceSourceArticle: (source: string) => string
     workflowMarketplaceSourceName: string

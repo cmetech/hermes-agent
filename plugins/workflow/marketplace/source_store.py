@@ -55,14 +55,16 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     re.IGNORECASE,
 )
 _LOCAL_PATH = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:"
-    r"/(?:private|tmp|users|home|var/(?:folders|tmp|cache))(?:[/\\][^\s\"'<>()[\]{},;]*)?|"
-    r"[A-Z]:\\[^\s\"'<>()[\]{},;]*|"
+    r"(?<![A-Za-z0-9:/])(?:"
+    r"file:/{1,3}[^\s\"'<>()[\]{},;]+|"
+    r"/{1,2}(?!/)(?:[^/\s\"'<>()[\]{},;?#=&]+/)+[^/\s\"'<>()[\]{},;?#=&]*|"
+    r"[A-Z]:[/\\][^\s\"'<>()[\]{},;]*|"
     r"\\\\[^\\\s\"'<>()[\]{},;]+\\[^\s\"'<>()[\]{},;]*|"
     r"[^\s\"'<>()[\]{},;=]*(?:[/\\])?\.(?:staging|quarantine)(?:[/\\][^\s\"'<>()[\]{},;]*)?"
     r")",
     re.IGNORECASE,
 )
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _PATH_DECODE_MAX = 8
 _GENERIC_REFRESH_FAILURE = "workflow marketplace source refresh failed"
 
@@ -90,6 +92,8 @@ def redact_source_refresh_message(value: str, repository_url: str | None = None)
 
     probe = redacted
     for _ in range(_PATH_DECODE_MAX):
+        if _PERCENT_ESCAPE.search(probe) is None:
+            break
         try:
             decoded = urllib.parse.unquote(probe, errors="strict")
         except UnicodeDecodeError:
@@ -104,7 +108,7 @@ def redact_source_refresh_message(value: str, repository_url: str | None = None)
             return _GENERIC_REFRESH_FAILURE
         probe = decoded
     else:
-        if "%" in probe:
+        if _PERCENT_ESCAPE.search(probe) is not None:
             return _GENERIC_REFRESH_FAILURE
 
     return redacted[:_MAX_ERROR_BYTES]

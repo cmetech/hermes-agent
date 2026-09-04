@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import urllib.parse
 
 import pytest
 from pydantic import ValidationError
@@ -943,7 +944,14 @@ def test_source_list_records_preserve_verified_cache_after_failure_and_fail_clos
         "failed(/private/tmp/secret)",
         "at=/private/tmp/secret",
         'failed["/Users/operator/work"]',
+        "failed(/root/secret/config.yml)",
+        "at=/workspace/project/config.yml",
+        'failed["/Volumes/External/repository/index.json"]',
+        "failed(/opt/hermes/cache/state.json)",
+        "at=file:///root/hermes/state.json",
+        "See /docs/authoring for recovery",
         r"at=C:\Users\operator\secret",
+        "at=C:/Users/operator/secret",
         r"at=\\server\share\secret",
         "failed(/tmp/repo/.staging/secret)",
         "failed(%2Fprivate%2Ftmp%2Fsecret)",
@@ -980,9 +988,14 @@ def test_refresh_diagnostics_redact_assignment_punctuation_and_encoded_local_pat
     "message",
     [
         "workflow marketplace source refresh failed",
-        "See /docs/authoring for recovery",
         "See https://example.test/private/tmp for repository documentation",
         "failed at [REDACTED_PATH]",
+        "Progress 50% complete",
+        "Compare input/output before retrying",
+        "Retry failed: punctuation is safe (again).",
+        "See https://example.test/input/output during progress 50%",
+        "A bare % or %zz or %2 escape is ordinary diagnostic prose",
+        "Encoded%20spacing and a bare 50% remain safe",
     ],
 )
 def test_refresh_diagnostics_accept_canonical_generic_and_nonlocal_slash_prose(
@@ -997,6 +1010,37 @@ def test_refresh_diagnostics_accept_canonical_generic_and_nonlocal_slash_prose(
     )
 
     assert status.message == message
+
+
+@pytest.mark.parametrize("layers", [1, 2, 8, 9])
+def test_refresh_diagnostics_reject_bounded_nested_encoded_absolute_paths(
+    layers: int,
+) -> None:
+    message = "/root/workspace/secret.txt"
+    for _ in range(layers):
+        message = urllib.parse.quote(message, safe="")
+
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=message,
+        )
+
+
+def test_refresh_diagnostic_message_enforces_its_exact_size_bound() -> None:
+    common = {
+        "sourceName": "company",
+        "state": "unavailable",
+        "attemptedAt": "2026-09-04T01:00:00Z",
+        "diagnosticCode": "source_unavailable",
+    }
+
+    assert SourceRefreshStatus(**common, message="x" * 4096).message == "x" * 4096
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(**common, message="x" * 4097)
 
 
 def test_source_list_records_report_auth_failure_without_inventing_cache(
