@@ -16,6 +16,7 @@ from plugins.workflow.marketplace.api import (
     WorkflowMarketplaceApiContext,
     _body,
     _operation_result,
+    _safe_repository_url,
     create_marketplace_router,
 )
 from plugins.workflow.marketplace.catalog import CatalogPackage, SourceRefreshResult
@@ -1201,6 +1202,89 @@ def test_decode_cap_exhaustion_fails_closed_to_a_strict_sentinel(api) -> None:
         revalidated.model_dump(mode="json", by_alias=False)["value"]["repository_url"]
         == "file:///REDACTED"
     )
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:/Users/operator/repository.git#/private/tmp/secret",
+        "file:/Users/operator/repository.git#../quarantine/secret",
+        "file:/Users/operator/repository.git#%252Fhome%252Falice%252F.cache%252Fsecret",
+        "file:/Users/operator/repository.git?path=/private/tmp/secret",
+        "file:/Users/operator/repository.git?access_token=secret",
+        "file:/Users/operator/%23%252Fprivate%252Ftmp%252Fsecret/repository.git",
+        "file:/Users/operator/%3Faccess_token%3Dsecret/repository.git",
+        "file:/Users/oper\tator/repository.git",
+        "file:/Users/oper\nator/repository.git",
+        "file:/Users/oper\rator/repository.git",
+        "file:/Users/oper\x01ator/repository.git",
+        "file:/Users/oper\x7fator/repository.git",
+        "file:/Users/operator/%00/repository.git",
+        "file:/Users/operator/%09/repository.git",
+        "file:/Users/operator/%0A/repository.git",
+        "file:/Users/operator/%7F/repository.git",
+        "file:/Users/operator/%FF/repository.git",
+    ],
+)
+def test_file_repository_projection_redacts_fragments_controls_and_ambiguity(
+    api, local_url
+) -> None:
+    _client, _service, _context, _home, _profile = api
+
+    assert _safe_repository_url(local_url) == "file:///REDACTED"
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:/Users/operator/repository.git#/private/tmp/secret",
+        "file:/Users/operator/repository.git#%252Fhome%252Falice%252F.cache%252Fsecret",
+        "file:/Users/operator/%3Faccess_token%3Dsecret/repository.git",
+        "file:/Users/oper\tator/repository.git",
+        "file:/Users/oper\nator/repository.git",
+        "file:/Users/oper\rator/repository.git",
+        "file:/Users/oper\x01ator/repository.git",
+        "file:/Users/oper\x7fator/repository.git",
+        "file:/Users/operator/%09/repository.git",
+        "file:/Users/operator/%0A/repository.git",
+        "file:/Users/operator/%7F/repository.git",
+        "file:/Users/operator/%FF/repository.git",
+    ],
+)
+def test_file_repository_fragment_or_control_never_survives_operation_result(
+    api, local_url
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+
+    public = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    ).model_dump(mode="json", by_alias=False)
+
+    assert public["value"]["repository_url"] == "file:///REDACTED"
+    encoded = json.dumps(public)
+    assert "secret" not in encoded
+    assert "operator" not in encoded
+
+
+def test_file_repository_projection_preserves_ordinary_fragment_free_posix_identity(
+    api,
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = "file:/Users/operator/projects/workflows.git"
+
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    public = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    ).model_dump(mode="json", by_alias=False)
+
+    assert public["value"]["repository_url"] == local_url
 
 
 @pytest.mark.parametrize(

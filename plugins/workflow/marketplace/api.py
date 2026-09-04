@@ -620,6 +620,8 @@ def _safe_public_text(value: str) -> str:
 def _safe_repository_url(value: str) -> str:
     """Preserve a typed Git identity or replace sensitive local identity paths."""
 
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return _REDACTED_REPOSITORY_URL
     try:
         validate_credential_free_git_source(value)
         parsed = urllib.parse.urlsplit(value)
@@ -627,19 +629,23 @@ def _safe_repository_url(value: str) -> str:
         return _REDACTED_REPOSITORY_URL
     if parsed.scheme.casefold() != "file":
         return value
-    authority = parsed.netloc.casefold()
-    classification_path = parsed.path
+    components = [parsed.netloc, parsed.path, parsed.query, parsed.fragment]
     try:
         for _ in range(_REPOSITORY_PATH_DECODE_MAX):
-            decoded = urllib.parse.unquote(classification_path, errors="strict")
-            if decoded == classification_path:
+            decoded = [
+                urllib.parse.unquote(component, errors="strict")
+                for component in components
+            ]
+            if decoded == components:
                 break
-            classification_path = decoded
+            components = decoded
         else:
-            if "%" in classification_path:
+            if any("%" in component for component in components):
                 return _REDACTED_REPOSITORY_URL
     except UnicodeDecodeError:
         return _REDACTED_REPOSITORY_URL
+    authority, classification_path, query, fragment = components
+    authority = authority.casefold()
     classification_path = classification_path.replace("\\", "/")
     segments = tuple(
         segment.casefold() for segment in classification_path.split("/") if segment
@@ -649,10 +655,15 @@ def _safe_repository_url(value: str) -> str:
         or not classification_path.startswith("/")
         or classification_path.startswith("//")
         or not segments
-        or "%" in classification_path
+        or query
+        or fragment
+        or any("%" in component for component in components)
+        or "?" in classification_path
+        or "#" in classification_path
         or any(
             ord(character) < 32 or ord(character) == 127
-            for character in classification_path
+            for component in components
+            for character in component
         )
         or any(segment in {".", ".."} for segment in segments)
         or re.match(r"^[A-Za-z]:", classification_path.lstrip("/")) is not None
