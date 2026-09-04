@@ -1521,6 +1521,249 @@ def test_v6_accepts_exact_4096_child_attempt_product(tmp_path, workflow_writer):
             read_language_snapshot(over_limit)
 
 
+def test_v6_published_command_prompt_default_drives_runtime_admission(
+    tmp_path, workflow_writer, monkeypatch
+):
+    monkeypatch.setattr(
+        language_schema,
+        "LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES",
+        4,
+    )
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group(
+                [{"id": "prompt", "prompt": "run"}],
+                max_iterations=1,
+            )
+        ],
+    )
+
+    package = _normalize_v6_without_admission(path)
+    semantics = package.language.node_semantics["process-items"]["loop_group"]
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+    work = next(
+        rule
+        for rule in cast(list[dict[str, object]], contract["semantic_rules"])
+        if rule.get("kind") == "loop-group-work-product-v1"
+    )
+
+    assert work["command_prompt_default_retries"] == 4
+    assert (
+        semantics["child_executions"],
+        semantics["child_attempts"],
+        semantics["capacity"]["output_attempts"],
+    ) == (1, 5, 5)
+
+
+@pytest.mark.parametrize(
+    ("body_node", "expected_multiplier", "expected_retries", "output_attempts"),
+    [
+        (
+            {
+                "id": "loop",
+                "loop": {
+                    "prompt": "repeat",
+                    "until": "done",
+                    "max_iterations": 4,
+                },
+            },
+            4,
+            0,
+            4,
+        ),
+        (
+            {
+                "id": "approval",
+                "approval": {
+                    "message": "Continue?",
+                    "on_reject": {"prompt": "Revise", "max_attempts": 5},
+                },
+            },
+            1,
+            5,
+            6,
+        ),
+        (
+            {
+                "id": "bash",
+                "bash": "true",
+                "retry": {"max_attempts": 3},
+            },
+            1,
+            3,
+            4,
+        ),
+        ({"id": "command", "command": "run"}, 1, 2, 3),
+        ({"id": "prompt", "prompt": "run"}, 1, 2, 3),
+        ({"id": "bash-default", "bash": "true"}, 1, 0, 1),
+    ],
+    ids=(
+        "ordinary-loop-multiplier",
+        "approval-on-reject",
+        "retry",
+        "command-default",
+        "prompt-default",
+        "other-default",
+    ),
+)
+def test_v6_work_factor_precedence_matches_published_runtime_admission(
+    tmp_path,
+    workflow_writer,
+    body_node,
+    expected_multiplier,
+    expected_retries,
+    output_attempts,
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group([body_node], max_iterations=1)],
+    )
+
+    package = _normalize_v6_without_admission(path)
+    semantics = package.language.node_semantics["process-items"]["loop_group"]
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+    work = next(
+        rule
+        for rule in cast(list[dict[str, object]], contract["semantic_rules"])
+        if rule.get("kind") == "loop-group-work-product-v1"
+    )
+    reference = cast(dict[str, str], work["semantic_ref"])
+    loop_group_kind = next(
+        item
+        for item in cast(list[dict[str, object]], contract["node_kinds"])
+        if item["id"] == reference["node_kind"]
+    )
+    formula = cast(dict[str, dict[str, object]], loop_group_kind["semantic_definitions"])[
+        reference["definition"]
+    ]
+
+    assert _evaluate_contract_selector(
+        "ordinary_loop_multiplier", formula, work, body_node
+    ) == expected_multiplier
+    assert _evaluate_contract_selector(
+        "selected_retries", formula, work, body_node
+    ) == expected_retries
+    assert (
+        semantics["child_executions"],
+        semantics["child_attempts"],
+        semantics["capacity"]["output_attempts"],
+    ) == (
+        expected_multiplier,
+        expected_multiplier * (expected_retries + 1),
+        output_attempts,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "constant_name",
+        "descriptor_field",
+        "replacement",
+        "body_node",
+        "expected_executions",
+        "expected_attempts",
+    ),
+    [
+        (
+            "LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER",
+            "ordinary_loop_default_multiplier",
+            2,
+            {"id": "bash", "bash": "true"},
+            2,
+            2,
+        ),
+        (
+            "LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS",
+            "approval_default_max_attempts",
+            4,
+            {
+                "id": "approval",
+                "approval": {
+                    "message": "Continue?",
+                    "on_reject": {"prompt": "Revise"},
+                },
+            },
+            1,
+            5,
+        ),
+        (
+            "LOOP_GROUP_OTHER_DEFAULT_RETRIES",
+            "other_default_retries",
+            2,
+            {"id": "bash", "bash": "true"},
+            1,
+            3,
+        ),
+    ],
+    ids=("ordinary-multiplier-default", "approval-default", "other-default"),
+)
+def test_v6_published_work_defaults_drive_runtime_admission(
+    tmp_path,
+    workflow_writer,
+    monkeypatch,
+    constant_name,
+    descriptor_field,
+    replacement,
+    body_node,
+    expected_executions,
+    expected_attempts,
+):
+    monkeypatch.setattr(language_schema, constant_name, replacement)
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group([body_node], max_iterations=1)],
+    )
+
+    package = _normalize_v6_without_admission(path)
+    semantics = package.language.node_semantics["process-items"]["loop_group"]
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+    work = next(
+        rule
+        for rule in cast(list[dict[str, object]], contract["semantic_rules"])
+        if rule.get("kind") == "loop-group-work-product-v1"
+    )
+
+    assert work[descriptor_field] == replacement
+    assert semantics["child_executions"] == expected_executions
+    assert semantics["child_attempts"] == expected_attempts
+    assert semantics["capacity"]["output_attempts"] == expected_attempts
+
+
+def test_v6_raw_loop_child_string_retry_preserves_bare_value_error(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group(
+                [
+                    {
+                        "id": "retrying",
+                        "prompt": "Retry.",
+                        "retry": {"max_attempts": "nope"},
+                    }
+                ],
+                max_iterations=1,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError) as raised:
+        _normalize_v6_without_admission(path)
+
+    assert type(raised.value) is ValueError
+
+
 def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
     tmp_path, workflow_writer
 ):

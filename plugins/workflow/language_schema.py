@@ -170,49 +170,120 @@ def parse_assignment_deadline(value: object) -> str:
     return value
 
 
+@dataclass(frozen=True, slots=True)
+class LoopGroupWorkFactorAuthority:
+    """Declarative paths, precedence, and defaults for v6 work selection."""
+
+    ordinary_loop_node_type: str
+    approval_node_type: str
+    command_prompt_node_types: tuple[str, ...]
+    iterations_field: str
+    retry_field: str
+    approval_rework_field: str
+    max_attempts_field: str
+    ordinary_loop_default_multiplier: int
+    command_prompt_default_retries: int
+    other_default_retries: int
+    approval_default_max_attempts: int
+
+    @property
+    def command_prompt_selector(self) -> str:
+        return "|".join(self.command_prompt_node_types)
+
+    @property
+    def retry_precedence(self) -> tuple[str, ...]:
+        return (
+            self.approval_node_type,
+            self.retry_field,
+            self.command_prompt_selector,
+            "default",
+        )
+
+    @property
+    def ordinary_loop_multiplier_path(self) -> tuple[str, ...]:
+        return (self.ordinary_loop_node_type, self.iterations_field)
+
+    @property
+    def retry_max_attempts_path(self) -> tuple[str, ...]:
+        return (self.retry_field, self.max_attempts_field)
+
+    @property
+    def approval_max_attempts_path(self) -> tuple[str, ...]:
+        return (
+            self.approval_node_type,
+            self.approval_rework_field,
+            self.max_attempts_field,
+        )
+
+
+def _loop_group_work_factor_authority() -> LoopGroupWorkFactorAuthority:
+    return LoopGroupWorkFactorAuthority(
+        ordinary_loop_node_type="loop",
+        approval_node_type="approval",
+        command_prompt_node_types=("command", "prompt"),
+        iterations_field="max_iterations",
+        retry_field="retry",
+        approval_rework_field="on_reject",
+        max_attempts_field="max_attempts",
+        ordinary_loop_default_multiplier=(
+            LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+        ),
+        command_prompt_default_retries=(
+            LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
+        ),
+        other_default_retries=LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+        approval_default_max_attempts=(
+            LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS
+        ),
+    )
+
+
 def loop_group_node_work_factors(
     node_type: str,
     value: object,
     options: Mapping[str, object],
-) -> tuple[int, int]:
-    """Return the per-node multiplier and selected retry count used by v6."""
+) -> tuple[object, object]:
+    """Select raw v6 work factors without pre-empting authored-value validation."""
+    authority = _loop_group_work_factor_authority()
     value_mapping = (
         cast(Mapping[str, object], value) if isinstance(value, Mapping) else None
     )
     multiplier = (
         value_mapping.get(
-            "max_iterations",
-            LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER,
+            authority.iterations_field,
+            authority.ordinary_loop_default_multiplier,
         )
-        if node_type == "loop" and value_mapping is not None
-        else LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+        if node_type == authority.ordinary_loop_node_type
+        and value_mapping is not None
+        else authority.ordinary_loop_default_multiplier
     )
-    retry = options.get("retry")
+    retry = options.get(authority.retry_field)
     approval_rework = (
-        value_mapping.get("on_reject")
-        if node_type == "approval" and value_mapping is not None
+        value_mapping.get(authority.approval_rework_field)
+        if node_type == authority.approval_node_type and value_mapping is not None
         else None
     )
-    if isinstance(approval_rework, Mapping):
-        retries = cast(Mapping[str, object], approval_rework).get(
-            "max_attempts",
-            LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS,
-        )
-    elif isinstance(retry, Mapping):
-        retries = cast(Mapping[str, object], retry).get(
-            "max_attempts",
-            LOOP_GROUP_OTHER_DEFAULT_RETRIES,
-        )
-    elif node_type in {"command", "prompt"}:
-        retries = LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
-    else:
-        retries = LOOP_GROUP_OTHER_DEFAULT_RETRIES
-    if any(
-        isinstance(factor, bool) or not isinstance(factor, int) or factor < 0
-        for factor in (multiplier, retries)
-    ):
-        raise ValueError("loop-group work factors must be non-negative integers")
-    return cast(int, multiplier), cast(int, retries)
+    for selector in authority.retry_precedence:
+        if selector == authority.approval_node_type and isinstance(
+            approval_rework, Mapping
+        ):
+            return multiplier, cast(Mapping[str, object], approval_rework).get(
+                authority.max_attempts_field,
+                authority.approval_default_max_attempts,
+            )
+        if selector == authority.retry_field and isinstance(retry, Mapping):
+            return multiplier, cast(Mapping[str, object], retry).get(
+                authority.max_attempts_field,
+                authority.other_default_retries,
+            )
+        if (
+            selector == authority.command_prompt_selector
+            and node_type in authority.command_prompt_node_types
+        ):
+            return multiplier, authority.command_prompt_default_retries
+        if selector == "default":
+            return multiplier, authority.other_default_retries
+    raise RuntimeError("loop-group retry precedence requires a default selector")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3550,6 +3621,7 @@ def _node_example(node_type: str) -> dict[str, object]:
 
 
 def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
+    work_factors = _loop_group_work_factor_authority()
     return {
         "scoped-output-reference-v1": {
             "group_until_bash": {
@@ -3688,7 +3760,7 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
         },
         "loop-group-work-product-v1": {
             "expression_format": "prefix-v1",
-            "retry_precedence": "approval>retry>command|prompt>default",
+            "retry_precedence": ">".join(work_factors.retry_precedence),
             "expressions": {
                 "executions": [
                     "*",
@@ -3798,6 +3870,7 @@ def _phase6_scoped_semantic_descriptors(
     normalizer_version: int,
 ) -> list[dict[str, object]]:
     """Project the v6 body schema and durable codes as scoped editor rules."""
+    work_factors = _loop_group_work_factor_authority()
     group_schema = _object_schema(
         "loop_group",
         profile,
@@ -3896,22 +3969,24 @@ def _phase6_scoped_semantic_descriptors(
             "limit": LOOP_GROUP_WORK_LIMIT,
             "accumulators": ["executions", "attempts"],
             "group_iterations_path": ["loop_group", "max_iterations"],
-            "ordinary_loop_multiplier_path": ["loop", "max_iterations"],
-            "retry_max_attempts_path": ["retry", "max_attempts"],
-            "approval_max_attempts_path": [
-                "approval",
-                "on_reject",
-                "max_attempts",
-            ],
+            "ordinary_loop_multiplier_path": list(
+                work_factors.ordinary_loop_multiplier_path
+            ),
+            "retry_max_attempts_path": list(
+                work_factors.retry_max_attempts_path
+            ),
+            "approval_max_attempts_path": list(
+                work_factors.approval_max_attempts_path
+            ),
             "ordinary_loop_default_multiplier": (
-                LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+                work_factors.ordinary_loop_default_multiplier
             ),
             "command_prompt_default_retries": (
-                LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
+                work_factors.command_prompt_default_retries
             ),
-            "other_default_retries": LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+            "other_default_retries": work_factors.other_default_retries,
             "approval_default_max_attempts": (
-                LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS
+                work_factors.approval_default_max_attempts
             ),
             "semantic_ref": {
                 "node_kind": "loop_group",

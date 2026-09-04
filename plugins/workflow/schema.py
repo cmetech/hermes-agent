@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import replace
 import math
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -68,6 +68,7 @@ from plugins.workflow.language_schema import (
     iter_loop_previous_output_references,
     iter_output_references,
     loop_field_names,
+    loop_group_node_work_factors,
     loop_group_field_names,
     retry_field_names,
     script_value_is_inline,
@@ -802,23 +803,13 @@ def _loop_group_work_bounds(
     executions = 0
     attempts = 0
     for node in nodes:
-        multiplier = (
-            node.value.get("max_iterations", 1)
-            if node.node_type == "loop" and isinstance(node.value, Mapping)
-            else 1
+        raw_multiplier, raw_retries = loop_group_node_work_factors(
+            node.node_type,
+            node.value,
+            node.options,
         )
-        retry = node.options.get("retry")
-        approval_rework = (
-            node.value.get("on_reject")
-            if node.node_type == "approval" and isinstance(node.value, Mapping)
-            else None
-        )
-        if isinstance(approval_rework, Mapping):
-            retries = approval_rework.get("max_attempts", 3)
-        elif isinstance(retry, Mapping):
-            retries = retry.get("max_attempts", 0)
-        else:
-            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        multiplier: Any = raw_multiplier
+        retries: Any = raw_retries
         executions += multiplier
         attempts += multiplier * (int(retries) + 1)
     return (
@@ -857,23 +848,18 @@ def _loop_group_capacity_bounds(
     artifact_executions = 0
     process_executions = 0
     for node in nodes:
-        multiplier = (
-            int(node.value.get("max_iterations", 1))
-            if node.node_type == "loop" and isinstance(node.value, Mapping)
-            else 1
+        raw_multiplier, raw_retries = loop_group_node_work_factors(
+            node.node_type,
+            node.value,
+            node.options,
         )
-        retry = node.options.get("retry")
+        multiplier = int(cast(Any, raw_multiplier))
         approval_rework = (
             node.value.get("on_reject")
             if node.node_type == "approval" and isinstance(node.value, Mapping)
             else None
         )
-        if isinstance(approval_rework, Mapping):
-            retries = int(approval_rework.get("max_attempts", 3))
-        elif isinstance(retry, Mapping):
-            retries = int(retry.get("max_attempts", 0))
-        else:
-            retries = 2 if node.node_type in {"command", "prompt"} else 0
+        retries = int(cast(Any, raw_retries))
         executions = _checked_work_product(max_iterations, multiplier)
         attempts = _checked_work_product(executions, retries + 1)
         is_approval_rework = isinstance(approval_rework, Mapping)
