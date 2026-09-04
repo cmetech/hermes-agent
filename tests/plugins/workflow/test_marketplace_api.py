@@ -40,6 +40,7 @@ from plugins.workflow.marketplace.models import (
 )
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
 from plugins.workflow.marketplace.operations import (
+    MarketplaceOperation,
     MarketplaceOperationRegistryError,
     MarketplaceTrustRevokeOperationResult,
     MarketplaceTrustRevocationValue,
@@ -1037,11 +1038,22 @@ def test_refresh_preserves_schema_valid_local_repository_identity(api) -> None:
     assert terminal["state"] == "succeeded"
     assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
     assert "/private/tmp" not in json.dumps(terminal)
+    MarketplaceOperation.model_validate(terminal, by_name=True)
 
 
-def test_package_detail_and_installed_list_preserve_ordinary_local_source(api) -> None:
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:///Users/operator/repository.git",
+        "file://localhost/Users/operator/repository.git",
+        "file://LOCALHOST/Users/operator/repository.git",
+        "file://LoCaLhOsT/Users/operator/repository.git",
+    ],
+)
+def test_package_detail_and_installed_list_preserve_ordinary_local_source(
+    api, local_url
+) -> None:
     client, service, _context, _home, _profile = api
-    local_url = "file:///Volumes/WorkflowMarket/repository.git"
     inspection = _inspection().model_copy(update={"repository_url": local_url})
     installed = _installed().model_copy(update={"repository_url": local_url})
     service.inspect = lambda identifier, *, cancelled: inspection
@@ -1059,6 +1071,7 @@ def test_package_detail_and_installed_list_preserve_ordinary_local_source(api) -
 
     assert detail["state"] == "succeeded"
     assert detail["result"]["value"]["repository_url"] == local_url
+    MarketplaceOperation.model_validate(detail, by_name=True)
     assert listed.status_code == 200
     assert listed.json()["packages"][0]["repository_url"] == local_url
 
@@ -1067,8 +1080,13 @@ def test_package_detail_and_installed_list_preserve_ordinary_local_source(api) -
     "local_url",
     [
         "file:///C:/Users/alice/AppData/Local/Temp/repository.git",
+        "file://localhost/C:/Users/alice/repository.git",
+        "file://LOCALHOST/C:/Users/alice/repository.git",
         "file://server/share/repository.git",
+        "file:////server/share/repository.git",
+        "file://///server/share/repository.git",
         "file:///var/cache/hermes/.staging/repository.git",
+        "file://LOCALHOST/private/tmp/repository.git",
     ],
 )
 def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
@@ -1097,6 +1115,7 @@ def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
     assert "Users" not in json.dumps(terminal)
     assert "server" not in json.dumps(terminal)
     assert ".staging" not in json.dumps(terminal)
+    MarketplaceOperation.model_validate(terminal, by_name=True)
 
 
 @pytest.mark.parametrize(
@@ -1104,9 +1123,10 @@ def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
     [
         "file://user:password@localhost/private/tmp/repository.git",
         "https://user:secret@example.test/repository.git",
+        "file://[malformed/repository.git",
     ],
 )
-def test_credential_bearing_result_identities_fail_without_leaking(
+def test_malformed_or_credential_bearing_result_identities_fail_without_leaking(
     api, repository_url
 ) -> None:
     client, service, _context, _home, _profile = api

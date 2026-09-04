@@ -27,6 +27,7 @@ from pydantic import (
 
 from hermes_cli.git_source import (
     GitSourceError,
+    resolve_git_source,
     safe_git_error,
     validate_credential_free_git_source,
 )
@@ -75,6 +76,10 @@ _LOCAL_PATH = re.compile(
     r"\\\\[^\\\s]+\\[^\s\"']+|"
     r"(?:/[^\s\"']+)*(?:\.staging|\.quarantine|/cache|/staging|/quarantine)"
     r"(?:/[^\s\"']*)?)"
+)
+_SENSITIVE_REPOSITORY_PATH = re.compile(
+    r"(?i)(?:^|/)(?:tmp|temp|caches?|staging|quarantine|\.staging|\.quarantine)"
+    r"(?:/|$)|^/(?:private/)?var/folders(?:/|$)"
 )
 _SECRET_KEY = re.compile(
     r"^(?:access|refresh)?token$|^api(?:key)?$|^auth(?:orization)?$|^password$|"
@@ -605,21 +610,18 @@ def _safe_repository_url(value: str) -> str:
 
     try:
         validate_credential_free_git_source(value)
+        parsed = urllib.parse.urlsplit(resolve_git_source(value).clone_url)
     except GitSourceError:
         return _REDACTED_REPOSITORY_URL
-    parsed = urllib.parse.urlsplit(value)
     if parsed.scheme.casefold() != "file":
         return value
-    decoded_path = parsed.path
-    for _ in range(3):
-        next_path = urllib.parse.unquote(decoded_path)
-        if next_path == decoded_path:
-            break
-        decoded_path = next_path
+    authority = parsed.netloc.casefold()
+    decoded_path = urllib.parse.unquote(parsed.path)
     if (
-        parsed.netloc not in {"", "localhost"}
-        or re.match(r"^/[A-Za-z]:/", decoded_path) is not None
-        or _LOCAL_PATH.search(decoded_path) is not None
+        authority not in {"", "localhost"}
+        or (not authority and decoded_path.startswith("//"))
+        or re.match(r"^/[A-Za-z]:[/\\]", decoded_path) is not None
+        or _SENSITIVE_REPOSITORY_PATH.search(decoded_path) is not None
     ):
         return _REDACTED_REPOSITORY_URL
     return value
