@@ -345,6 +345,20 @@ describe('workflow marketplace API', () => {
     })
   })
 
+  it.each([
+    'https://example.test/team/workflows.git',
+    'ssh://git@example.test/team/workflows.git',
+    'git@example.test:team/workflows.git',
+    'file:/Users/operator/projects/workflows.git',
+    'owner/repository/packages/laptop-support'
+  ])('accepts the supported direct install identity %s', async identifier => {
+    await prepareWorkflowPackageInstall({ identifier }, scope)
+
+    expect(apiStructured).toHaveBeenCalledWith(
+      expect.objectContaining({ body: { identifier }, path: '/api/plugins/workflow/marketplace/install/prepare' })
+    )
+  })
+
   it('uses ambient scope but lets an explicit local/null scope override it', async () => {
     apiStructured.mockResolvedValue({ ok: true, value: { packages: [], profile: 'ambient-profile' } })
     setApiRequestConnection('remote-ambient')
@@ -355,6 +369,10 @@ describe('workflow marketplace API', () => {
     await listInstalledWorkflowPackages({ connectionId: 'local', profile: 'local-profile' })
     apiStructured.mockResolvedValue({ ok: true, value: { packages: [], profile: 'default' } })
     await listInstalledWorkflowPackages({ connectionId: null, profile: null })
+    apiStructured.mockResolvedValue({ ok: true, value: { packages: [], profile: 'named-profile' } })
+    await listInstalledWorkflowPackages('named-profile')
+    apiStructured.mockResolvedValue({ ok: true, value: { packages: [], profile: 'default' } })
+    await listInstalledWorkflowPackages(null)
 
     expect(apiStructured.mock.calls.map(([request]) => request)).toEqual([
       {
@@ -363,8 +381,125 @@ describe('workflow marketplace API', () => {
         profile: 'ambient-profile'
       },
       { connectionId: 'local', path: '/api/plugins/workflow/marketplace/installed', profile: 'local-profile' },
-      { connectionId: null, path: '/api/plugins/workflow/marketplace/installed', profile: null }
+      { connectionId: null, path: '/api/plugins/workflow/marketplace/installed', profile: null },
+      {
+        connectionId: 'remote-ambient',
+        path: '/api/plugins/workflow/marketplace/installed',
+        profile: 'named-profile'
+      },
+      { connectionId: 'remote-ambient', path: '/api/plugins/workflow/marketplace/installed' }
     ])
+  })
+
+  it('rejects unsafe runtime scope shapes without invoking getters or the network', async () => {
+    class ScopeClass {
+      connectionId = 'remote-a'
+      profile = 'support'
+    }
+
+    let getterRead = false
+    const getterScope = { connectionId: 'remote-a' }
+    Object.defineProperty(getterScope, 'profile', {
+      enumerable: true,
+      get() {
+        getterRead = true
+
+        return 'support'
+      }
+    })
+    const symbolScope = { connectionId: 'remote-a', profile: 'support', [Symbol('hidden')]: 'secret' }
+    const inheritedScope = Object.create({ polluted: true })
+    inheritedScope.connectionId = 'remote-a'
+    inheritedScope.profile = 'support'
+    const nonEnumerableScope = { connectionId: 'remote-a' }
+    Object.defineProperty(nonEnumerableScope, 'profile', { enumerable: false, value: 'support' })
+
+    for (const invalidScope of [
+      [],
+      {},
+      { connectionId: 'remote-a' },
+      { profile: 'support' },
+      { connectionId: undefined, profile: 'support' },
+      { connectionId: 'remote-a', extra: true, profile: 'support' },
+      symbolScope,
+      new ScopeClass(),
+      inheritedScope,
+      getterScope,
+      nonEnumerableScope,
+      42,
+      true,
+      '',
+      'x'.repeat(257),
+      'bad\nprofile',
+      { connectionId: 'bad\u0000remote', profile: 'support' },
+      { connectionId: 'remote-a', profile: 'x'.repeat(257) }
+    ]) {
+      await expect(listInstalledWorkflowPackages(invalidScope as never)).rejects.toBeInstanceOf(TypeError)
+    }
+
+    expect(getterRead).toBe(false)
+    expect(apiStructured).not.toHaveBeenCalled()
+  })
+
+  it('copies an explicit runtime scope before passing it to the bridge', async () => {
+    apiStructured.mockResolvedValue({ ok: true, value: { packages: [], profile: 'support' } })
+    const explicitScope = { connectionId: 'remote-a', profile: 'support' }
+
+    await listInstalledWorkflowPackages(explicitScope)
+    explicitScope.connectionId = 'mutated'
+    explicitScope.profile = 'mutated'
+
+    expect(apiStructured).toHaveBeenCalledWith({
+      connectionId: 'remote-a',
+      path: '/api/plugins/workflow/marketplace/installed',
+      profile: 'support'
+    })
+  })
+
+  it('routes all 23 helpers through the same fail-closed scope validator', async () => {
+    const invalidScope = { connectionId: 'remote-a', extra: true, profile: 'support' } as never
+    const packageIdentity = { packageId: 'laptop-support', sourceKey: 'company' }
+    const sourceInput = { name: 'company', repositoryUrl: 'https://example.test/team/workflows.git' }
+
+    const sourceUpdate = {
+      enabled: true,
+      ref: null,
+      repositoryUrl: 'https://example.test/team/workflows.git'
+    }
+
+    const calls = [
+      () => getWorkflowMarketplaceCapabilities(invalidScope),
+      () => listWorkflowMarketplaceSources(invalidScope),
+      () => addWorkflowMarketplaceSource(sourceInput, invalidScope),
+      () => updateWorkflowMarketplaceSource('company', sourceUpdate, invalidScope),
+      () => setWorkflowMarketplaceSourceEnabled('company', true, invalidScope),
+      () => removeWorkflowMarketplaceSource('company', invalidScope),
+      () => refreshWorkflowMarketplaceSource('company', invalidScope),
+      () => searchWorkflowPackages('laptop', invalidScope),
+      () => inspectWorkflowPackage('company', 'laptop-support', invalidScope),
+      () => listInstalledWorkflowPackages(invalidScope),
+      () => checkWorkflowPackageUpdates(packageIdentity, invalidScope),
+      () => prepareWorkflowPackageInstall({ identifier: 'company/laptop-support' }, invalidScope),
+      () => confirmWorkflowPackageInstall(TOKEN, invalidScope),
+      () => prepareWorkflowPackageUpdate(packageIdentity, invalidScope),
+      () => confirmWorkflowPackageUpdate(TOKEN, invalidScope),
+      () => prepareWorkflowPackageRemoval(packageIdentity, invalidScope),
+      () => confirmWorkflowPackageRemoval(TOKEN, invalidScope),
+      () => reviewWorkflowPackageTrust(packageIdentity, undefined, invalidScope),
+      () => grantWorkflowPackageTrust(TOKEN, invalidScope),
+      () => revokeWorkflowPackageTrust(packageIdentity, undefined, invalidScope),
+      () => listWorkflowMarketplaceOperations(invalidScope),
+      () => getWorkflowMarketplaceOperation(OPERATION_ID, invalidScope),
+      () => cancelWorkflowMarketplaceOperation(OPERATION_ID, invalidScope)
+    ]
+
+    expect(calls).toHaveLength(23)
+
+    for (const call of calls) {
+      await expect(call()).rejects.toBeInstanceOf(TypeError)
+    }
+
+    expect(apiStructured).not.toHaveBeenCalled()
   })
 
   it('throws one stable TypeError for malformed backend data without embedding it', async () => {
@@ -435,12 +570,69 @@ describe('workflow marketplace API', () => {
     expect(caught).not.toHaveProperty('body')
   })
 
+  it('keeps validated HTTP identity while replacing backend message text locally', async () => {
+    apiStructured.mockResolvedValue({
+      body: {
+        detail: {
+          code: 'source_authentication_failed',
+          message: 'access_token=secret https://alice:secret@example.test/private.git /private/tmp/cache'
+        }
+      },
+      ok: false,
+      status: 401
+    })
+
+    let caught: unknown
+
+    try {
+      await listWorkflowMarketplaceSources(scope)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toMatchObject({
+      code: 'source_authentication_failed',
+      message: 'Workflow marketplace request failed.',
+      status: 401
+    })
+    expect(JSON.stringify(caught)).not.toMatch(/secret|alice|private\/tmp/)
+  })
+
+  it('converts rejected transport calls into a distinct safe local network error', async () => {
+    apiStructured.mockRejectedValue(new Error('access_token=secret at /private/tmp/backend'))
+
+    let caught: unknown
+
+    try {
+      await listWorkflowMarketplaceSources(scope)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toMatchObject({
+      code: 'marketplace_network_error',
+      message: 'Unable to reach the Hermes workflow marketplace.',
+      status: 0
+    })
+    expect(JSON.stringify(caught)).not.toMatch(/secret|private\/tmp/)
+  })
+
   it.each([
     () => searchWorkflowPackages('x'.repeat(257), scope),
     () => searchWorkflowPackages('ok', scope, { limit: 0 }),
     () => listWorkflowMarketplaceOperations(scope, { offset: Number.MAX_SAFE_INTEGER + 1 }),
     () => getWorkflowMarketplaceOperation('../escape', scope),
-    () => confirmWorkflowPackageInstall('short', scope)
+    () => confirmWorkflowPackageInstall('short', scope),
+    () => addWorkflowMarketplaceSource({ name: 'company', repositoryUrl: 'file:///REDACTED' }, scope),
+    () =>
+      updateWorkflowMarketplaceSource(
+        'company',
+        { enabled: true, ref: null, repositoryUrl: 'https://example.test/[REDACTED_PATH].git' },
+        scope
+      ),
+    () => prepareWorkflowPackageInstall({ identifier: 'file:///REDACTED' }, scope),
+    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository?access_token=secret' }, scope),
+    () => prepareWorkflowPackageInstall({ identifier: 'owner/repository#packages/support' }, scope)
   ])('rejects unsafe client input before issuing a request', async call => {
     await expect(call()).rejects.toBeInstanceOf(TypeError)
     expect(apiStructured).not.toHaveBeenCalled()

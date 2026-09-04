@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
+import type { WorkflowMarketplaceFileChange } from '@/types/hermes'
+
 import {
   decodeMarketplaceErrorEnvelope,
   decodeMarketplaceInstallReview,
@@ -13,7 +15,9 @@ import {
   decodeWorkflowMarketplaceOperationPage,
   decodeWorkflowMarketplaceSearchPage,
   decodeWorkflowMarketplaceSourceList,
-  decodeWorkflowMarketplaceSourceResponse
+  decodeWorkflowMarketplaceSourceResponse,
+  isWorkflowMarketplaceRepositoryUrl,
+  isWorkflowMarketplaceSourceRequestUrl
 } from './workflow-marketplace-codec'
 
 const DIGEST = '1'.repeat(64)
@@ -22,6 +26,21 @@ const REVIEW_DIGEST = '3'.repeat(64)
 const COMMIT = '4'.repeat(40)
 const TOKEN = 'confirmation-token-value-1234567890'
 const NOW = '2026-09-04T00:00:00Z'
+
+const RESULT_KIND = {
+  install_review: 'install_prepare',
+  installed_package: 'install_confirm',
+  package_detail: 'package_detail',
+  remove_review: 'remove_prepare',
+  removed_package: 'remove_confirm',
+  source_refresh: 'refresh',
+  trust_grant: 'trust_confirm',
+  trust_review: 'trust_prepare',
+  trust_revoke: 'trust_revoke',
+  update_checks: 'update_check',
+  update_review: 'update_prepare',
+  updated_package: 'update_confirm'
+}
 
 function identity() {
   return { package_id: 'laptop-support', source_key: 'company' }
@@ -132,6 +151,8 @@ function emptySetChange() {
 }
 
 function updateReview(result: 'unchanged' | 'update_available' = 'update_available') {
+  const fileChanges: WorkflowMarketplaceFileChange[] = []
+
   return {
     assessment: assessment(),
     candidate_commit: COMMIT,
@@ -140,10 +161,10 @@ function updateReview(result: 'unchanged' | 'update_available' = 'update_availab
     compatibility_changes: { added: [], removed: [] },
     confirmation_token: result === 'unchanged' ? null : TOKEN,
     configured_ref: 'main',
-    file_changes: [],
+    file_changes: fileChanges,
     identity: identity(),
     old_commit: '5'.repeat(40),
-    old_digest: '6'.repeat(64),
+    old_digest: result === 'unchanged' ? DIGEST : '6'.repeat(64),
     old_version: '1.0.0',
     operation: 'update',
     repository_url: 'git@example.test:team/workflows.git',
@@ -280,7 +301,7 @@ function operation(type = 'installed_package') {
     error: null,
     finished_at: NOW,
     id: `wmop_${'a'.repeat(12)}_${'b'.repeat(32)}`,
-    kind: 'install_confirm',
+    kind: RESULT_KIND[type as keyof typeof RESULT_KIND],
     phase: 'completed',
     profile: 'support',
     progress: 100,
@@ -371,6 +392,22 @@ describe('workflow marketplace codec', () => {
     expect(decodeMarketplaceOperation(operation(type))).not.toBeNull()
   })
 
+  it('rejects every operation-kind/result mismatch and unknown operation kinds', () => {
+    const entries = Object.entries(RESULT_KIND)
+
+    for (const [resultType, expectedKind] of entries) {
+      expect(decodeMarketplaceOperation(operation(resultType))).not.toBeNull()
+
+      for (const [, wrongKind] of entries) {
+        if (wrongKind !== expectedKind) {
+          expect(decodeMarketplaceOperation({ ...operation(resultType), kind: wrongKind })).toBeNull()
+        }
+      }
+    }
+
+    expect(decodeMarketplaceOperation({ ...operation(), kind: 'future_marketplace_action' })).toBeNull()
+  })
+
   it('enforces exact operation state/result/error pairings', () => {
     const pending = {
       ...operation(),
@@ -383,11 +420,19 @@ describe('workflow marketplace codec', () => {
       state: 'pending'
     }
 
-    const running = { ...pending, phase: 'fetching', progress: 10, started_at: NOW, state: 'running' }
+    const running = {
+      ...pending,
+      kind: 'install_prepare',
+      phase: 'fetching',
+      progress: 10,
+      started_at: NOW,
+      state: 'running'
+    }
 
     const failed = {
       ...operation(),
       error: { code: 'source_authentication_failed', message: 'Workflow marketplace operation failed.' },
+      phase: 'failed',
       progress: 25,
       result: null,
       state: 'failed'
@@ -403,6 +448,13 @@ describe('workflow marketplace codec', () => {
     expect(decodeMarketplaceOperation({ ...failed, result: operationResult('installed_package') })).toBeNull()
     expect(decodeMarketplaceOperation({ ...operation(), progress: 99 })).toBeNull()
     expect(decodeMarketplaceOperation({ ...cancelled, error: failed.error })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...pending, phase: 'running' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...running, phase: 'completed' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...operation(), phase: 'committing' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...failed, phase: 'completed' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...cancelled, phase: 'failed' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...running, kind: 'refresh', phase: 'committing' })).toBeNull()
+    expect(decodeMarketplaceOperation({ ...running, kind: 'install_confirm', phase: 'committing' })).not.toBeNull()
   })
 
   it('rejects unknown keys, wrong result pairings, and confirmation-token smuggling', () => {
@@ -464,6 +516,8 @@ describe('workflow marketplace codec', () => {
 
   it.each([
     'https://example.test/team/workflows.git',
+    'https://example.test/team/workflows.git#packages/support',
+    'https://example.test/team/workflows.git?transport=smart',
     'ssh://git@example.test/team/workflows.git',
     'git@example.test:team/workflows.git',
     'file:/Users/operator/projects/workflows.git',
@@ -475,15 +529,56 @@ describe('workflow marketplace codec', () => {
   it.each([
     'https://user:secret@example.test/team/workflows.git',
     'https://example.test/team/workflows.git?access_token=secret',
+    'https://example.test/team/workflows.git?access%255Ftoken=secret',
+    'https://example.test/team/workflows.git#clientSecret=secret',
+    'https://example.test/team/workflows.git?next=https://alice:secret@private.example/repository.git',
+    'https://example.test/team/%2e%2e/secrets.git',
+    'https://example.test/team/%252e%252e/secrets.git',
+    'https://example.test/team%2Fother/workflows.git',
+    'https://user%3Asecret@example.test/team/workflows.git',
+    'ssh://git%3Asecret@example.test/team/workflows.git',
+    'ssh://git@example.test/team/workflows.git#packages/support',
     'javascript:alert(1)',
     'data:text/plain,secret',
     'https://example.test/team/%250Aworkflows.git',
     'ssh://git@example.test/team/%7Fworkflows.git',
     'file:/Users/operator/repository.git#secret',
+    'https://example.test/team/[REDACTED_PATH].git',
+    'file:///redacted',
+    'file:/Users/oper\tator/repository.git',
     'file:/Users/oper\nator/repository.git',
+    `file:/Users/oper${String.fromCodePoint(127)}ator/repository.git`,
     'file:/Users/operator/%FF/repository.git'
   ])('rejects the unsafe repository identity %s', repositoryUrl => {
     expect(decodeMarketplaceInstallReview({ ...installReview(), repository_url: repositoryUrl })).toBeNull()
+  })
+
+  it('separates sanitized response identities from source request identities', () => {
+    expect(isWorkflowMarketplaceRepositoryUrl('file:///REDACTED')).toBe(true)
+    expect(isWorkflowMarketplaceSourceRequestUrl('file:///REDACTED')).toBe(false)
+    expect(isWorkflowMarketplaceSourceRequestUrl('https://example.test/team/[REDACTED_PATH].git')).toBe(false)
+
+    for (const repositoryUrl of [
+      'https://example.test/team/workflows.git',
+      'https://example.test/team/workflows.git?transport=smart',
+      'https://example.test/team/workflows.git#packages/support',
+      'ssh://git@example.test/team/workflows.git',
+      'git@example.test:team/workflows.git',
+      'file:/Users/operator/projects/workflows.git'
+    ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(repositoryUrl)).toBe(true)
+    }
+
+    for (const repositoryUrl of [
+      'https://example.test/team/%2e%2e/secrets.git',
+      'https://example.test/team/%252e%252e/secrets.git',
+      'https://user%3Asecret@example.test/team/workflows.git',
+      'ssh://git@example.test/team/workflows.git?token=secret',
+      'git@example.test:team/workflows.git#packages/support',
+      'file:/Users/operator/projects/workflows.git#packages/support'
+    ]) {
+      expect(isWorkflowMarketplaceSourceRequestUrl(repositoryUrl)).toBe(false)
+    }
   })
 
   it('rejects non-canonical UTC timestamps', () => {
@@ -508,6 +603,173 @@ describe('workflow marketplace codec', () => {
         update_status: 'current'
       })
     ).not.toBeNull()
+  })
+
+  it('rejects package detail resource, workflow identity, and digest incoherence', () => {
+    const wrongDigest = packageDetail()
+    wrongDigest.workflows[0].package_digest = '9'.repeat(64)
+    expect(decodeMarketplacePackageDetail(wrongDigest)).toBeNull()
+
+    const duplicateWorkflow = packageDetail()
+    duplicateWorkflow.workflows = [{ ...workflowReview(), workflow_name: 'Laptop-Diagnostic' }, workflowReview()]
+    expect(decodeMarketplacePackageDetail(duplicateWorkflow)).toBeNull()
+
+    const duplicateResource = packageDetail()
+    duplicateResource.resources = [
+      { path: 'commands/Interpret.md', types: ['command'] },
+      ...duplicateResource.resources
+    ]
+    expect(decodeMarketplacePackageDetail(duplicateResource)).toBeNull()
+
+    const unicodeCasefoldResource = packageDetail()
+    unicodeCasefoldResource.resources = [
+      { path: 'commands/STRASSE.md', types: ['command'] },
+      { path: 'commands/Straße.md', types: ['command'] },
+      ...unicodeCasefoldResource.resources
+    ]
+    expect(decodeMarketplacePackageDetail(unicodeCasefoldResource)).toBeNull()
+  })
+
+  it('requires assessment workflow identities to exactly match reviewed workflows', () => {
+    const install = installReview()
+    install.assessment.workflow_names = ['extra']
+    expect(decodeMarketplaceInstallReview(install)).toBeNull()
+
+    const installDigest = installReview()
+    installDigest.workflow_reviews[0].package_digest = '9'.repeat(64)
+    expect(decodeMarketplaceInstallReview(installDigest)).toBeNull()
+
+    const update = updateReview()
+    update.assessment.workflow_names = ['extra', 'laptop-diagnostic']
+    expect(decodeMarketplaceUpdateReview(update)).toBeNull()
+
+    const updateDigest = updateReview()
+    updateDigest.workflow_reviews[0].package_digest = '9'.repeat(64)
+    expect(decodeMarketplaceUpdateReview(updateDigest)).toBeNull()
+
+    const missing = installReview()
+    missing.workflow_reviews.push({
+      ...workflowReview(),
+      definition_path: 'workflows/second.yaml',
+      workflow_name: 'second'
+    })
+    missing.assessment.package_resources.push('workflows/second.yaml')
+    expect(decodeMarketplaceInstallReview(missing)).toBeNull()
+
+    const casefoldCollision = installReview()
+    casefoldCollision.assessment.workflow_names = ['Laptop-Diagnostic', 'laptop-diagnostic']
+    casefoldCollision.workflow_reviews = [{ ...workflowReview(), workflow_name: 'Laptop-Diagnostic' }, workflowReview()]
+    expect(decodeMarketplaceInstallReview(casefoldCollision)).toBeNull()
+
+    const missingResource = installReview()
+    missingResource.assessment.package_resources = missingResource.assessment.package_resources.filter(
+      path => path !== 'scripts/collect.py'
+    )
+    expect(decodeMarketplaceInstallReview(missingResource)).toBeNull()
+
+    const trust = trustReview()
+    trust.workflows = [{ ...workflowReview(), workflow_name: 'Laptop-Diagnostic' }, workflowReview()]
+    expect(decodeMarketplaceTrustReview(trust)).toBeNull()
+
+    const trustDigest = trustReview()
+    trustDigest.workflows[0].package_digest = '9'.repeat(64)
+    expect(decodeMarketplaceTrustReview(trustDigest)).toBeNull()
+
+    const trustMissingResource = trustReview()
+    trustMissingResource.package_resources = trustMissingResource.package_resources.filter(
+      path => path !== 'commands/interpret.md'
+    )
+    expect(decodeMarketplaceTrustReview(trustMissingResource)).toBeNull()
+  })
+
+  it('rejects update file-change endpoint overlap and case-fold collisions', () => {
+    const duplicate = updateReview()
+    duplicate.file_changes = [
+      {
+        candidate_digest: DIGEST,
+        kind: 'added',
+        old_digest: null,
+        old_path: null,
+        path: 'scripts/new.py'
+      },
+      {
+        candidate_digest: DIGEST,
+        kind: 'added',
+        old_digest: null,
+        old_path: null,
+        path: 'scripts/new.py'
+      }
+    ]
+    expect(decodeMarketplaceUpdateReview(duplicate)).toBeNull()
+
+    const overlap = updateReview()
+    overlap.file_changes = [
+      {
+        candidate_digest: DIGEST,
+        kind: 'added',
+        old_digest: null,
+        old_path: null,
+        path: 'scripts/New.py'
+      },
+      {
+        candidate_digest: null,
+        kind: 'removed',
+        old_digest: DIGEST,
+        old_path: null,
+        path: 'scripts/new.py'
+      }
+    ]
+    expect(decodeMarketplaceUpdateReview(overlap)).toBeNull()
+
+    const renamedOverlap = updateReview()
+    renamedOverlap.file_changes = [
+      {
+        candidate_digest: DIGEST,
+        kind: 'renamed',
+        old_digest: DIGEST,
+        old_path: 'scripts/old.py',
+        path: 'scripts/new.py'
+      },
+      {
+        candidate_digest: DIGEST,
+        kind: 'added',
+        old_digest: null,
+        old_path: null,
+        path: 'scripts/old.py'
+      }
+    ]
+    expect(decodeMarketplaceUpdateReview(renamedOverlap)).toBeNull()
+  })
+
+  it('requires an unchanged update to preserve the package digest and contain no file changes', () => {
+    const changedDigest = updateReview('unchanged')
+    changedDigest.old_digest = '9'.repeat(64)
+    expect(decodeMarketplaceUpdateReview(changedDigest)).toBeNull()
+
+    const changedFile = updateReview('unchanged')
+    changedFile.file_changes = [
+      {
+        candidate_digest: DIGEST,
+        kind: 'added',
+        old_digest: null,
+        old_path: null,
+        path: 'scripts/new.py'
+      }
+    ]
+    expect(decodeMarketplaceUpdateReview(changedFile)).toBeNull()
+  })
+
+  it('accepts the exact maximum file-change collection when endpoints are unique', () => {
+    const review = updateReview()
+    review.file_changes = Array.from({ length: 1024 }, (_, index) => ({
+      candidate_digest: DIGEST,
+      kind: 'added' as const,
+      old_digest: null,
+      old_path: null,
+      path: `fixtures/change-${String(index).padStart(4, '0')}.txt`
+    }))
+
+    expect(decodeMarketplaceUpdateReview(review)).not.toBeNull()
   })
 
   it('decodes install, update, remove, and trust reviews directly', () => {
@@ -550,5 +812,22 @@ describe('workflow marketplace codec', () => {
       })
     ).toBeNull()
     expect(decodeMarketplaceErrorEnvelope({ detail: ['package_not_found'] })).toBeNull()
+  })
+
+  it.each([
+    'access_token=top-secret',
+    'clientSecret=top-secret',
+    'https://alice:secret@example.test/private.git',
+    '/private/tmp/marketplace-secret',
+    'secret\ncontrol',
+    'token%3Dencoded-secret'
+  ])('replaces untrusted error message text locally: %s', message => {
+    const decoded = decodeMarketplaceErrorEnvelope({ detail: { code: 'source_authentication_failed', message } })
+
+    expect(decoded).toEqual({
+      code: 'source_authentication_failed',
+      message: 'Workflow marketplace request failed.'
+    })
+    expect(JSON.stringify(decoded)).not.toContain(message)
   })
 })

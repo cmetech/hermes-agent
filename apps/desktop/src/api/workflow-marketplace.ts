@@ -13,8 +13,8 @@ import {
   isWorkflowMarketplaceOperationId,
   isWorkflowMarketplacePackageId,
   isWorkflowMarketplacePackagePath,
-  isWorkflowMarketplaceRepositoryUrl,
-  isWorkflowMarketplaceSourceName
+  isWorkflowMarketplaceSourceName,
+  isWorkflowMarketplaceSourceRequestUrl
 } from '@/lib/workflow-marketplace-codec'
 import type {
   WorkflowMarketplaceCapabilities,
@@ -26,14 +26,20 @@ import type {
   WorkflowMarketplaceSourceResponse
 } from '@/types/hermes'
 
-import { capabilityScoped, type ProfileScope } from './client'
+import { capabilityScoped } from './client'
 
 const ROOT = '/api/plugins/workflow/marketplace'
 const INVALID_RESPONSE = 'Hermes returned invalid workflow marketplace data.'
 const INVALID_REQUEST = 'Invalid workflow marketplace request.'
 const UNSUPPORTED_MESSAGE = 'Workflow Marketplace requires a newer Hermes backend. Please upgrade Hermes and try again.'
+const NETWORK_MESSAGE = 'Unable to reach the Hermes workflow marketplace.'
 
 type Decoder<T> = (value: unknown) => T | null
+
+export type WorkflowMarketplaceScope =
+  null | string | undefined | { connectionId: null | string; profile: null | string }
+
+type ProfileScope = WorkflowMarketplaceScope
 
 export interface WorkflowMarketplaceSourceCreateInput {
   enabled?: boolean
@@ -121,19 +127,59 @@ function boundedInteger(value: unknown, minimum: number, maximum: number): value
 
 function requestScope(scope?: ProfileScope): Pick<HermesApiRequest, 'connectionId' | 'profile'> {
   if (scope !== null && typeof scope === 'object') {
+    let prototype: object | null
+    let keys: readonly PropertyKey[]
+    let descriptors: PropertyDescriptorMap
+
+    try {
+      prototype = Object.getPrototypeOf(scope)
+      keys = Reflect.ownKeys(scope)
+      descriptors = Object.getOwnPropertyDescriptors(scope)
+    } catch {
+      failRequest()
+    }
+
     if (
-      (scope.connectionId !== undefined && scope.connectionId !== null && !boundedText(scope.connectionId, 256)) ||
-      (scope.profile !== undefined && scope.profile !== null && !boundedText(scope.profile, 256))
+      prototype !== Object.prototype ||
+      keys.length !== 2 ||
+      keys.some(key => key !== 'connectionId' && key !== 'profile')
     ) {
       failRequest()
     }
 
-    const connectionId =
-      typeof scope.connectionId === 'string' && scope.connectionId.trim() ? scope.connectionId.trim() : null
+    const connectionDescriptor = descriptors.connectionId
+    const profileDescriptor = descriptors.profile
 
-    const profile = typeof scope.profile === 'string' && scope.profile.trim() ? scope.profile.trim() : null
+    if (
+      connectionDescriptor === undefined ||
+      profileDescriptor === undefined ||
+      !connectionDescriptor.enumerable ||
+      !profileDescriptor.enumerable ||
+      !Object.hasOwn(connectionDescriptor, 'value') ||
+      !Object.hasOwn(profileDescriptor, 'value')
+    ) {
+      failRequest()
+    }
+
+    const connectionId = connectionDescriptor.value
+    const profile = profileDescriptor.value
+
+    if (
+      (connectionId !== null && !boundedText(connectionId, 256)) ||
+      (profile !== null && !boundedText(profile, 256))
+    ) {
+      failRequest()
+    }
 
     return { connectionId, profile }
+  }
+
+  if (typeof scope === 'string' && !boundedText(scope, 256)) {
+    failRequest()
+  }
+
+  if (scope !== undefined && scope !== null && typeof scope !== 'string') {
+    failRequest()
   }
 
   return capabilityScoped(scope)
@@ -161,7 +207,14 @@ async function requestMarketplace<T>(
   scope?: ProfileScope,
   capabilityProbe = false
 ): Promise<T> {
-  const response = await window.hermesDesktop.apiStructured<unknown>({ ...request, ...requestScope(scope) })
+  const scopedRequest = { ...request, ...requestScope(scope) }
+  let response
+
+  try {
+    response = await window.hermesDesktop.apiStructured<unknown>(scopedRequest)
+  } catch {
+    throw new WorkflowMarketplaceApiError('marketplace_network_error', 0, NETWORK_MESSAGE)
+  }
 
   if (!response.ok) {
     if (capabilityProbe && response.status === 404 && routeMissing(response.body)) {
@@ -252,7 +305,7 @@ export async function addWorkflowMarketplaceSource(
     !Object.hasOwn(input, 'name') ||
     !Object.hasOwn(input, 'repositoryUrl') ||
     !isWorkflowMarketplaceSourceName(input.name) ||
-    !isWorkflowMarketplaceRepositoryUrl(input.repositoryUrl) ||
+    !isWorkflowMarketplaceSourceRequestUrl(input.repositoryUrl) ||
     (input.enabled !== undefined && typeof input.enabled !== 'boolean') ||
     (input.ref !== undefined && input.ref !== null && !boundedText(input.ref, 1024))
   ) {
@@ -293,7 +346,7 @@ export async function updateWorkflowMarketplaceSource(
     !Object.hasOwn(input, 'repositoryUrl') ||
     typeof input.enabled !== 'boolean' ||
     (input.ref !== null && !boundedText(input.ref, 1024)) ||
-    !isWorkflowMarketplaceRepositoryUrl(input.repositoryUrl)
+    !isWorkflowMarketplaceSourceRequestUrl(input.repositoryUrl)
   ) {
     failRequest()
   }

@@ -432,6 +432,28 @@ export type WorkflowMarketplaceOperationResult =
   | { type: 'update_review'; value: WorkflowMarketplaceUpdateReview }
   | { type: 'updated_package'; value: WorkflowMarketplaceInstalledPackage }
 
+export interface WorkflowMarketplaceOperationResultTypeByKind {
+  install_confirm: 'installed_package'
+  install_prepare: 'install_review'
+  package_detail: 'package_detail'
+  refresh: 'source_refresh'
+  remove_confirm: 'removed_package'
+  remove_prepare: 'remove_review'
+  trust_confirm: 'trust_grant'
+  trust_prepare: 'trust_review'
+  trust_revoke: 'trust_revoke'
+  update_check: 'update_checks'
+  update_confirm: 'updated_package'
+  update_prepare: 'update_review'
+}
+
+export type WorkflowMarketplaceOperationKind = keyof WorkflowMarketplaceOperationResultTypeByKind
+
+export type WorkflowMarketplaceOperationResultFor<Kind extends WorkflowMarketplaceOperationKind> = Extract<
+  WorkflowMarketplaceOperationResult,
+  { type: WorkflowMarketplaceOperationResultTypeByKind[Kind] }
+>
+
 export interface WorkflowMarketplaceOperationError {
   code: string
   message: 'Workflow marketplace operation failed.'
@@ -439,16 +461,18 @@ export interface WorkflowMarketplaceOperationError {
 
 export type WorkflowMarketplaceOperationState = 'cancelled' | 'failed' | 'pending' | 'running' | 'succeeded'
 
-export interface WorkflowMarketplaceOperation {
+export interface WorkflowMarketplaceOperation<
+  Kind extends WorkflowMarketplaceOperationKind = WorkflowMarketplaceOperationKind
+> {
   created_at: string
   error: null | WorkflowMarketplaceOperationError
   finished_at: null | string
   id: string
-  kind: string
+  kind: Kind
   phase: string
   profile: string
   progress: number
-  result: null | WorkflowMarketplaceOperationResult
+  result: null | WorkflowMarketplaceOperationResultFor<Kind>
   schema_version: 1
   started_at: null | string
   state: WorkflowMarketplaceOperationState
@@ -464,7 +488,7 @@ export interface WorkflowMarketplaceOperationPage {
 
 export interface WorkflowMarketplaceErrorEnvelope {
   code: string
-  message?: string
+  message: 'Workflow marketplace request failed.'
 }
 
 export interface WorkflowProgress {

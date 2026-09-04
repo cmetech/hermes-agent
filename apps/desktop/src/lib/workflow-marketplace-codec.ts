@@ -14,6 +14,7 @@ import type {
   WorkflowMarketplaceInstallReview,
   WorkflowMarketplaceOperation,
   WorkflowMarketplaceOperationError,
+  WorkflowMarketplaceOperationKind,
   WorkflowMarketplaceOperationPage,
   WorkflowMarketplaceOperationResult,
   WorkflowMarketplacePackageDetail,
@@ -133,6 +134,14 @@ function unique(values: readonly string[]): boolean {
   return new Set(values).size === values.length
 }
 
+function logicalIdentity(value: string): string {
+  return value.normalize('NFC').toLowerCase().toUpperCase().toLowerCase().normalize('NFC')
+}
+
+function logicallyUnique(values: readonly string[]): boolean {
+  return unique(values.map(logicalIdentity))
+}
+
 function sortedUnique(values: readonly string[]): boolean {
   return unique(values) && values.every((value, index) => index === 0 || values[index - 1] <= value)
 }
@@ -227,91 +236,95 @@ function canonicalTimestamp(value: unknown): string | null {
   return value
 }
 
-function repeatedlyDecode(value: string): string | null {
+function repeatedlyDecode(value: string): string[] | null {
   let decoded = value
+  const layers = [value]
 
   try {
     for (let index = 0; index < FILE_DECODE_LIMIT; index += 1) {
       const next = decodeURIComponent(decoded)
 
       if (next === decoded) {
-        return next.includes('%') ? null : next
+        return next.includes('%') ? null : layers
       }
 
       decoded = next
+      layers.push(next)
     }
   } catch {
     return null
   }
 
-  return decoded.includes('%') ? null : decoded
+  return null
 }
 
-function safeRepositoryUrl(value: unknown): string | null {
-  const candidate = cleanText(value, 1, 4096)
+const ENCODED_URL_DELIMITER = /%(?:2f|3a|3f|23|40|5c)/i
+const REDACTED_IDENTITY = /\[?redacted(?:_path)?\]?/i
 
-  if (candidate === null || containsControl(candidate) || candidate.includes('\\')) {
-    return null
-  }
+function hasDotSegment(value: string): boolean {
+  return /(?:^|[/])\.{1,2}(?=$|[/#?])/.test(value) || /:(?:\.{1,2})(?=$|[/#?])/.test(value)
+}
 
-  if (candidate === 'file:///REDACTED') {
-    return candidate
-  }
+function hasCredentialParameter(value: string): boolean {
+  const queryIndex = value.indexOf('?')
+  const fragmentIndex = value.indexOf('#')
+  const indices = [queryIndex, fragmentIndex].filter(index => index >= 0)
 
-  const fullyDecoded = repeatedlyDecode(candidate)
+  return indices.some(index =>
+    value
+      .slice(index + 1)
+      .split(/[&#;]/)
+      .some(parameter => {
+        const separator = parameter.indexOf('=')
+
+        return separator >= 0 && CREDENTIAL_QUERY_KEY.test(parameter.slice(0, separator))
+      })
+  )
+}
+
+function hasCredentialAuthority(value: string): boolean {
+  return (
+    /(?:https?|ssh):\/\/[^/?#\s:@]+:[^/?#\s@]+@/i.test(value) ||
+    /(?:^|[^A-Za-z0-9._-])[A-Za-z0-9._-]+:[^@\s/]+@[A-Za-z0-9.-]+/.test(value)
+  )
+}
+
+function repositoryLayers(candidate: string): string[] | null {
+  const layers = repeatedlyDecode(candidate)
 
   if (
-    fullyDecoded === null ||
-    containsControl(fullyDecoded) ||
-    (fullyDecoded !== candidate && (fullyDecoded.includes('?') || fullyDecoded.includes('#')))
+    layers === null ||
+    layers.some(
+      layer =>
+        containsControl(layer) ||
+        layer.includes('\\') ||
+        ENCODED_URL_DELIMITER.test(layer) ||
+        hasDotSegment(layer) ||
+        hasCredentialParameter(layer) ||
+        hasCredentialAuthority(layer)
+    )
   ) {
     return null
   }
 
-  if (/^git@[A-Za-z0-9.-]+:[^?#\s]+$/.test(candidate)) {
-    return candidate
-  }
+  return layers
+}
 
-  let parsed: URL
-
-  try {
-    parsed = new URL(candidate)
-  } catch {
+function safeFileRepositoryUrl(candidate: string, parsed: URL): string | null {
+  if (
+    parsed.hash ||
+    parsed.search ||
+    parsed.username ||
+    parsed.password ||
+    (parsed.hostname && parsed.hostname.toLowerCase() !== 'localhost') ||
+    !parsed.pathname.startsWith('/')
+  ) {
     return null
   }
 
-  if (parsed.password || parsed.hash || (parsed.protocol === 'https:' && parsed.username)) {
-    return null
-  }
+  const normalized = parsed.pathname.replaceAll('\\', '/')
 
-  if (parsed.searchParams.size > 0) {
-    if ([...parsed.searchParams.keys()].some(key => CREDENTIAL_QUERY_KEY.test(key))) {
-      return null
-    }
-
-    return null
-  }
-
-  if (parsed.protocol === 'https:' || parsed.protocol === 'ssh:') {
-    return parsed.hostname && parsed.pathname ? candidate : null
-  }
-
-  if (parsed.protocol !== 'file:' || (parsed.hostname && parsed.hostname.toLowerCase() !== 'localhost')) {
-    return null
-  }
-
-  const path = repeatedlyDecode(parsed.pathname)
-
-  if (path === null || containsControl(path) || path.includes('#') || path.includes('?') || !path.startsWith('/')) {
-    return null
-  }
-
-  const normalized = path.replaceAll('\\', '/')
-
-  const segments = normalized
-    .split('/')
-    .filter(Boolean)
-    .map(segment => segment.toLowerCase())
+  const segments = normalized.split('/').filter(Boolean).map(logicalIdentity)
 
   const sensitive = new Set([
     '.cache',
@@ -343,8 +356,74 @@ function safeRepositoryUrl(value: unknown): string | null {
   return candidate
 }
 
+function safeRepositoryUrl(value: unknown, allowRedactedSentinel: boolean): string | null {
+  const candidate = cleanText(value, 1, 4096)
+
+  if (candidate === null || containsControl(candidate) || candidate.includes('\\')) {
+    return null
+  }
+
+  if (candidate === 'file:///REDACTED') {
+    return allowRedactedSentinel ? candidate : null
+  }
+
+  if (REDACTED_IDENTITY.test(candidate)) {
+    return null
+  }
+
+  const layers = repositoryLayers(candidate)
+
+  if (layers === null) {
+    return null
+  }
+
+  const fullyDecoded = layers.at(-1)
+
+  if (fullyDecoded === undefined) {
+    return null
+  }
+
+  if (/^git@[A-Za-z0-9.-]+:[^?#\s]+$/.test(candidate)) {
+    if (!/^git@[A-Za-z0-9.-]+:[^?#\s]+$/.test(fullyDecoded)) {
+      return null
+    }
+
+    return candidate
+  }
+
+  let parsed: URL
+
+  try {
+    parsed = new URL(fullyDecoded)
+  } catch {
+    return null
+  }
+
+  if (parsed.password || (parsed.protocol === 'https:' && parsed.username)) {
+    return null
+  }
+
+  if (parsed.protocol === 'https:') {
+    return parsed.hostname && parsed.pathname ? candidate : null
+  }
+
+  if (parsed.protocol === 'ssh:') {
+    return parsed.hostname && parsed.pathname && !parsed.search && !parsed.hash ? candidate : null
+  }
+
+  if (parsed.protocol !== 'file:') {
+    return null
+  }
+
+  return safeFileRepositoryUrl(candidate, parsed)
+}
+
 export function isWorkflowMarketplaceRepositoryUrl(value: unknown): value is string {
-  return safeRepositoryUrl(value) !== null
+  return safeRepositoryUrl(value, true) !== null
+}
+
+export function isWorkflowMarketplaceSourceRequestUrl(value: unknown): value is string {
+  return safeRepositoryUrl(value, false) !== null
 }
 
 export function isWorkflowMarketplaceSourceName(value: unknown): value is string {
@@ -370,20 +449,32 @@ export function isWorkflowMarketplaceInstallIdentifier(value: unknown): value is
     return false
   }
 
-  if (!decoded.includes('://') && !decoded.includes('@') && !decoded.includes('\\')) {
+  if (!decoded.includes('://') && !decoded.includes('@') && !decoded.includes('\\') && !decoded.includes(':')) {
+    const layers = repositoryLayers(decoded)
+
+    if (layers === null || layers.length !== 1 || decoded.includes('?') || decoded.includes('#')) {
+      return false
+    }
+
     const parts = decoded.split('/')
 
     if (
       parts.length >= 2 &&
       parts.every(
-        part => part.length > 0 && part.length <= 256 && part !== '.' && part !== '..' && !containsControl(part)
+        part =>
+          part.length > 0 &&
+          part.length <= 256 &&
+          part !== '.' &&
+          part !== '..' &&
+          !containsControl(part) &&
+          !REDACTED_IDENTITY.test(part)
       )
     ) {
       return true
     }
   }
 
-  return safeRepositoryUrl(decoded) !== null
+  return safeRepositoryUrl(decoded, false) !== null
 }
 
 export function isWorkflowMarketplaceConfirmationToken(value: unknown): value is string {
@@ -479,7 +570,7 @@ function decodeSource(value: unknown): WorkflowMarketplaceSource | null {
   const enabled = record.get('enabled')
   const name = cleanText(record.get('name'), 1, 64)
   const ref = optionalText(record.get('ref'), 1024)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
 
   if (
     typeof enabled !== 'boolean' ||
@@ -595,7 +686,7 @@ function decodeCatalogPackage(value: unknown): WorkflowMarketplaceCatalogPackage
   const packageDigest = cleanText(record.get('package_digest'), 64, 64)
   const packagePath = canonicalPath(record.get('package_path'))
   const publisher = cleanText(record.get('publisher'), 1, 256)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
   const state = record.get('state')
@@ -714,7 +805,7 @@ function decodeInstalledPackage(value: unknown): WorkflowMarketplaceInstalledPac
   const installedAt = canonicalTimestamp(record.get('installed_at'))
   const orphanedSource = record.get('orphaned_source')
   const packagePath = canonicalPath(record.get('package_path'))
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
   const version = cleanText(record.get('version'), 1, 128)
@@ -738,7 +829,7 @@ function decodeInstalledPackage(value: unknown): WorkflowMarketplaceInstalledPac
     version === null ||
     !SEMVER.test(version) ||
     workflowPaths === null ||
-    !unique(workflowPaths.map(path => path.normalize('NFC').toLocaleLowerCase('en-US')))
+    !logicallyUnique(workflowPaths)
   ) {
     return null
   }
@@ -814,6 +905,7 @@ function decodeAssessment(value: unknown): WorkflowMarketplaceAssessment | null 
     !SHA256.test(packageDigest) ||
     packageResources === null ||
     !sortedUnique(packageResources) ||
+    !logicallyUnique(packageResources) ||
     reviewDigest === null ||
     !SHA256.test(reviewDigest) ||
     workflowNames === null
@@ -839,7 +931,40 @@ function sortedStrings(value: unknown, maximum = 512, itemMaximum = 256): string
 function sortedPaths(value: unknown, maximum = 512): string[] | null {
   const paths = decodeArray(value, maximum, canonicalPath)
 
-  return paths !== null && sortedUnique(paths) ? paths : null
+  return paths !== null && sortedUnique(paths) && logicallyUnique(paths) ? paths : null
+}
+
+function workflowResourcePaths(review: WorkflowMarketplaceTrustReviewItem): string[] {
+  return [
+    review.definition_path,
+    ...(review.companion_path === null ? [] : [review.companion_path]),
+    ...review.command_resources,
+    ...review.script_resources,
+    ...review.mcp_resources,
+    ...review.mcp_resource_files
+  ]
+}
+
+function reviewsMatchAssessment(
+  assessment: WorkflowMarketplaceAssessment,
+  reviews: readonly WorkflowMarketplaceTrustReviewItem[],
+  packageDigest: string
+): boolean {
+  const reviewNames = reviews.map(review => review.workflow_name)
+
+  if (
+    !logicallyUnique(assessment.workflow_names) ||
+    !logicallyUnique(reviewNames) ||
+    assessment.workflow_names.length !== reviewNames.length ||
+    assessment.workflow_names.some(name => !reviewNames.includes(name)) ||
+    reviews.some(review => review.package_digest !== packageDigest)
+  ) {
+    return false
+  }
+
+  const packageResources = new Set(assessment.package_resources)
+
+  return reviews.every(review => workflowResourcePaths(review).every(path => packageResources.has(path)))
 }
 
 function decodeTrustReviewItem(value: unknown): WorkflowMarketplaceTrustReviewItem | null {
@@ -1041,7 +1166,7 @@ export function decodeMarketplacePackageDetail(value: unknown): WorkflowMarketpl
   const packageDigest = cleanText(record.get('package_digest'), 64, 64)
   const packagePath = canonicalPath(record.get('package_path'))
   const publisher = cleanText(record.get('publisher'), 1, 256)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const resources = decodeArray(record.get('resources'), 512, decodeResource)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
@@ -1082,6 +1207,7 @@ export function decodeMarketplacePackageDetail(value: unknown): WorkflowMarketpl
     !COMMIT.test(resolvedCommit) ||
     resources === null ||
     !sortedUnique(resources.map(item => item.path)) ||
+    !logicallyUnique(resources.map(item => item.path)) ||
     sourceName === null ||
     !SOURCE_NAME.test(sourceName) ||
     identifier !== `${sourceName}/${id}` ||
@@ -1091,7 +1217,9 @@ export function decodeMarketplacePackageDetail(value: unknown): WorkflowMarketpl
     version === null ||
     !SEMVER.test(version) ||
     workflows === null ||
-    !sortedUnique(workflows.map(item => item.workflow_name))
+    !sortedUnique(workflows.map(item => item.workflow_name)) ||
+    !logicallyUnique(workflows.map(item => item.workflow_name)) ||
+    workflows.some(item => item.package_digest !== packageDigest)
   ) {
     return null
   }
@@ -1227,6 +1355,14 @@ function decodeFileChange(value: unknown): WorkflowMarketplaceFileChange | null 
   }
 
   return { candidate_digest: candidateDigest, kind, old_digest: oldDigest, old_path: oldPath, path }
+}
+
+function fileChangesAreCoherent(changes: readonly WorkflowMarketplaceFileChange[]): boolean {
+  const endpoints = changes.flatMap(change =>
+    change.old_path === null ? [change.path] : [change.old_path, change.path]
+  )
+
+  return logicallyUnique(endpoints)
 }
 
 function decodeStringSetChange(value: unknown): WorkflowMarketplaceStringSetChange | null {
@@ -1397,7 +1533,7 @@ export function decodeMarketplaceInstallReview(value: unknown): WorkflowMarketpl
   const fileChanges = decodeArray(record.get('file_changes'), 1024, decodeFileChange)
   const identity = decodeIdentity(record.get('identity'))
   const packagePath = canonicalPath(record.get('package_path'))
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
   const resolvedCommit = cleanText(record.get('resolved_commit'), 40, 40)
   const reviewDigest = cleanText(record.get('review_digest'), 64, 64)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
@@ -1425,9 +1561,8 @@ export function decodeMarketplaceInstallReview(value: unknown): WorkflowMarketpl
     workflowReviews === null ||
     assessment.package_digest !== candidateDigest ||
     assessment.review_digest !== reviewDigest ||
-    workflowReviews.some(item => item.package_digest !== candidateDigest) ||
-    !unique(workflowReviews.map(item => item.workflow_name)) ||
-    !unique(fileChanges.map(item => `${item.kind}\0${item.path}\0${item.old_path ?? ''}`))
+    !reviewsMatchAssessment(assessment, workflowReviews, candidateDigest) ||
+    !fileChangesAreCoherent(fileChanges)
   ) {
     return null
   }
@@ -1493,7 +1628,7 @@ export function decodeMarketplaceUpdateReview(value: unknown): WorkflowMarketpla
   const oldCommit = cleanText(record.get('old_commit'), 40, 40)
   const oldDigest = cleanText(record.get('old_digest'), 64, 64)
   const oldVersion = cleanText(record.get('old_version'), 1, 128)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
   const requirementChanges = decodeRequirementChanges(record.get('requirement_changes'))
   const result = record.get('result')
   const reviewDigest = cleanText(record.get('review_digest'), 64, 64)
@@ -1535,8 +1670,9 @@ export function decodeMarketplaceUpdateReview(value: unknown): WorkflowMarketpla
     (result === 'unchanged' ? confirmationToken !== null : confirmationToken === null) ||
     assessment.package_digest !== candidateDigest ||
     assessment.review_digest !== reviewDigest ||
-    workflowReviews.some(item => item.package_digest !== candidateDigest) ||
-    !unique(workflowReviews.map(item => item.workflow_name))
+    !reviewsMatchAssessment(assessment, workflowReviews, candidateDigest) ||
+    !fileChangesAreCoherent(fileChanges) ||
+    (result === 'unchanged' && (oldDigest !== candidateDigest || fileChanges.length !== 0))
   ) {
     return null
   }
@@ -1663,8 +1799,11 @@ export function decodeMarketplaceTrustReview(value: unknown): WorkflowMarketplac
     version === null ||
     !SEMVER.test(version) ||
     workflows === null ||
-    !unique(workflows.map(item => item.workflow_name)) ||
-    workflows.some(item => item.package_digest !== distributionDigest)
+    !logicallyUnique(workflows.map(item => item.workflow_name)) ||
+    workflows.some(item => item.package_digest !== distributionDigest) ||
+    workflows.some(item =>
+      workflowResourcePaths(item).some(path => !packageResources.some(resource => resource === path))
+    )
   ) {
     return null
   }
@@ -1752,7 +1891,7 @@ function decodeSourceRefresh(value: unknown): WorkflowMarketplaceSourceRefresh |
   const rawMessage = record.get('message')
   const message = rawMessage === null ? null : cleanText(rawMessage, 1, 4096)
   const packageCount = integer(record.get('package_count'), 0, 4096)
-  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'))
+  const repositoryUrl = safeRepositoryUrl(record.get('repository_url'), true)
   const rawResolvedCommit = record.get('resolved_commit')
   const resolvedCommit = rawResolvedCommit === null ? null : cleanText(rawResolvedCommit, 40, 40)
   const sourceName = cleanText(record.get('source_name'), 1, 64)
@@ -1831,6 +1970,43 @@ function decodeTrustState(value: unknown): WorkflowMarketplaceTrustState | null 
   }
 
   return { state, workflow_name: workflowName }
+}
+
+type WorkflowMarketplaceOperationResultType = WorkflowMarketplaceOperationResult['type']
+
+interface WorkflowMarketplaceOperationContract {
+  readonly resultType: WorkflowMarketplaceOperationResultType
+  readonly runningPhases: readonly string[]
+}
+
+const OPERATION_CONTRACTS: ReadonlyMap<WorkflowMarketplaceOperationKind, WorkflowMarketplaceOperationContract> =
+  new Map([
+    ['refresh', { resultType: 'source_refresh', runningPhases: ['running', 'fetching', 'verifying'] }],
+    ['package_detail', { resultType: 'package_detail', runningPhases: ['running', 'fetching'] }],
+    ['update_check', { resultType: 'update_checks', runningPhases: ['running', 'fetching'] }],
+    ['install_prepare', { resultType: 'install_review', runningPhases: ['running', 'fetching', 'reviewing'] }],
+    ['install_confirm', { resultType: 'installed_package', runningPhases: ['running', 'committing'] }],
+    ['update_prepare', { resultType: 'update_review', runningPhases: ['running', 'fetching', 'reviewing'] }],
+    ['update_confirm', { resultType: 'updated_package', runningPhases: ['running', 'committing'] }],
+    ['remove_prepare', { resultType: 'remove_review', runningPhases: ['running', 'reviewing'] }],
+    ['remove_confirm', { resultType: 'removed_package', runningPhases: ['running', 'committing'] }],
+    ['trust_prepare', { resultType: 'trust_review', runningPhases: ['running', 'reviewing'] }],
+    ['trust_confirm', { resultType: 'trust_grant', runningPhases: ['running', 'committing'] }],
+    ['trust_revoke', { resultType: 'trust_revoke', runningPhases: ['running', 'committing'] }]
+  ])
+
+function decodeOperationKind(value: unknown): WorkflowMarketplaceOperationKind | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  for (const kind of OPERATION_CONTRACTS.keys()) {
+    if (value === kind) {
+      return kind
+    }
+  }
+
+  return null
 }
 
 function decodeOperationResult(value: unknown): WorkflowMarketplaceOperationResult | null {
@@ -1981,7 +2157,7 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
   const rawFinishedAt = record.get('finished_at')
   const finishedAt = rawFinishedAt === null ? null : canonicalTimestamp(rawFinishedAt)
   const id = cleanText(record.get('id'), 1, 128)
-  const kind = cleanText(record.get('kind'), 1, 64)
+  const kind = decodeOperationKind(record.get('kind'))
   const phase = cleanText(record.get('phase'), 1, 64)
   const profile = cleanText(record.get('profile'), 1, 256)
   const progress = integer(record.get('progress'), 0, 100)
@@ -1999,7 +2175,6 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     id === null ||
     !OPERATION_ID.test(id) ||
     kind === null ||
-    !IDENTIFIER.test(kind) ||
     phase === null ||
     !IDENTIFIER.test(phase) ||
     profile === null ||
@@ -2016,29 +2191,56 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
     return null
   }
 
+  const operationContract = OPERATION_CONTRACTS.get(kind)
+
+  if (operationContract === undefined) {
+    return null
+  }
+
   if (
     state === 'pending' &&
-    (startedAt !== null || finishedAt !== null || result !== null || error !== null || progress !== 0)
+    (phase !== 'queued' ||
+      startedAt !== null ||
+      finishedAt !== null ||
+      result !== null ||
+      error !== null ||
+      progress !== 0)
   ) {
     return null
   }
 
-  if (state === 'running' && (startedAt === null || finishedAt !== null || result !== null || error !== null)) {
+  if (
+    state === 'running' &&
+    (startedAt === null ||
+      finishedAt !== null ||
+      result !== null ||
+      error !== null ||
+      !operationContract.runningPhases.includes(phase))
+  ) {
     return null
   }
 
   if (
     state === 'succeeded' &&
-    (startedAt === null || finishedAt === null || result === null || error !== null || progress !== 100)
+    (phase !== 'completed' ||
+      startedAt === null ||
+      finishedAt === null ||
+      result === null ||
+      result.type !== operationContract.resultType ||
+      error !== null ||
+      progress !== 100)
   ) {
     return null
   }
 
-  if (state === 'failed' && (startedAt === null || finishedAt === null || result !== null || error === null)) {
+  if (
+    state === 'failed' &&
+    (phase !== 'failed' || startedAt === null || finishedAt === null || result !== null || error === null)
+  ) {
     return null
   }
 
-  if (state === 'cancelled' && (finishedAt === null || result !== null || error !== null)) {
+  if (state === 'cancelled' && (phase !== 'cancelled' || finishedAt === null || result !== null || error !== null)) {
     return null
   }
 
@@ -2116,11 +2318,14 @@ export function decodeMarketplaceErrorEnvelope(value: unknown): WorkflowMarketpl
   const detailMap = new Map(detailEntries)
   const code = cleanText(detailMap.get('code'), 1, 128)
   const rawMessage = detailMap.get('message')
-  const message = rawMessage === undefined ? undefined : cleanText(rawMessage, 1, 4096)
 
-  if (code === null || !IDENTIFIER.test(code) || message === null) {
+  if (
+    code === null ||
+    !IDENTIFIER.test(code) ||
+    (rawMessage !== undefined && (typeof rawMessage !== 'string' || rawMessage.length < 1 || rawMessage.length > 4096))
+  ) {
     return null
   }
 
-  return message === undefined ? { code } : { code, message }
+  return { code, message: 'Workflow marketplace request failed.' }
 }
