@@ -27,7 +27,6 @@ from pydantic import (
 
 from hermes_cli.git_source import (
     GitSourceError,
-    resolve_git_source,
     safe_git_error,
     validate_credential_free_git_source,
 )
@@ -610,18 +609,18 @@ def _safe_repository_url(value: str) -> str:
 
     try:
         validate_credential_free_git_source(value)
-        parsed = urllib.parse.urlsplit(resolve_git_source(value).clone_url)
+        parsed = urllib.parse.urlsplit(value)
     except GitSourceError:
         return _REDACTED_REPOSITORY_URL
     if parsed.scheme.casefold() != "file":
         return value
     authority = parsed.netloc.casefold()
-    decoded_path = urllib.parse.unquote(parsed.path)
+    classification_path = urllib.parse.unquote(parsed.path).replace("\\", "/")
     if (
         authority not in {"", "localhost"}
-        or (not authority and decoded_path.startswith("//"))
-        or re.match(r"^/[A-Za-z]:[/\\]", decoded_path) is not None
-        or _SENSITIVE_REPOSITORY_PATH.search(decoded_path) is not None
+        or (not authority and classification_path.startswith("//"))
+        or re.match(r"^/*[A-Za-z]:/", classification_path) is not None
+        or _SENSITIVE_REPOSITORY_PATH.search(classification_path) is not None
     ):
         return _REDACTED_REPOSITORY_URL
     return value
