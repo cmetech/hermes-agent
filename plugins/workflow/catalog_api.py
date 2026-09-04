@@ -48,6 +48,7 @@ from plugins.workflow.marketplace.discovery import (
     WorkflowCandidateFailure,
     _enumerate_workflow_candidates_for_catalog,
 )
+from plugins.workflow.marketplace.package import WorkflowMarketplaceError
 from plugins.workflow.projection_limits import (
     WORKFLOW_DEFINITION_MAX_EDGES,
     WORKFLOW_DEFINITION_MAX_NODES,
@@ -1248,9 +1249,12 @@ def _catalog_entry(
         else None
     )
     assessment = None
-    if compilation is not None and supports_phase5_semantics(
-        package.language.effective_profile,
-        package.language.normalizer_version,
+    if compilation is not None and (
+        package.marketplace_binding is not None
+        or supports_phase5_semantics(
+            package.language.effective_profile,
+            package.language.normalizer_version,
+        )
     ):
         assessment = assess_workflow_admission(
             compilation,
@@ -1483,7 +1487,13 @@ def build_workflow_catalog(
             raise WorkflowCatalogTrustUnavailableError(
                 "workflow catalog trust classification is unavailable"
             ) from exc
-        except (OSError, UnicodeError, WorkflowValidationError, ValueError):
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            WorkflowMarketplaceError,
+            WorkflowValidationError,
+        ):
             items.append(
                 _error_entry(package.definition.name, "invalid_definition")
             )
@@ -1638,9 +1648,12 @@ def build_workflow_detail(
                 available_services=connector_capabilities.ready_services,
             )
             if compilation is not None
-            and supports_phase5_semantics(
-                package.language.effective_profile,
-                package.language.normalizer_version,
+            and (
+                package.marketplace_binding is not None
+                or supports_phase5_semantics(
+                    package.language.effective_profile,
+                    package.language.normalizer_version,
+                )
             )
             else None
         )
@@ -1668,6 +1681,10 @@ def build_workflow_detail(
     except WorkflowValidationError as exc:
         raise WorkflowCatalogInvalidDefinitionError(
             "workflow detail contains an invalid package resource"
+        ) from exc
+    except WorkflowMarketplaceError as exc:
+        raise WorkflowCatalogInvalidDefinitionError(
+            "workflow detail marketplace integrity verification failed"
         ) from exc
     shown = qualify_workflow_catalog_package(
         package,

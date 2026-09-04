@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Literal, Mapping
+from typing import Iterable, Literal, Mapping, TypedDict, cast
 
 import yaml
 
@@ -41,9 +41,15 @@ _ISOLATION_CAPABILITIES = (
     "workdir_containment",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_TRUST_ORIGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}")
 WORKFLOW_RESOURCE_MAX_FILE_BYTES = 1024 * 1024
 WORKFLOW_RESOURCE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 WORKFLOW_RESOURCE_MAX_FILES = 512
+WORKFLOW_TRUST_MAX_RECORDS = 4096
+WORKFLOW_TRUST_MAX_GRANTS_PER_RECORD = 64
+WORKFLOW_TRUST_MAX_STORE_BYTES = 4 * 1024 * 1024
+_WORKFLOW_TRUST_MAX_ACTOR_CHARS = 128
+_WORKFLOW_TRUST_MAX_TIMESTAMP_CHARS = 64
 
 
 class WorkflowTrustError(RuntimeError):
@@ -588,6 +594,7 @@ def build_risk_summary(
     read_budget: WorkflowResourceReadBudget | None = None,
     compilation=None,
     provider_authority_digest: str | None = None,
+    package_digest: WorkflowPackageDigest | None = None,
 ) -> WorkflowRiskSummary:
     if provider_authority_digest is not None and not _SHA256.fullmatch(
         provider_authority_digest
@@ -600,9 +607,17 @@ def build_risk_summary(
             raise ValueError("compilation must be an immutable workflow compilation")
         if compilation.package != package:
             raise ValueError("risk compilation must contain the assessed package")
-        package_digest = compilation.composite_digest
+    if package_digest is not None:
+        if (
+            not isinstance(package_digest, WorkflowPackageDigest)
+            or _SHA256.fullmatch(package_digest.sha256) is None
+        ):
+            raise ValueError("package digest override must be an exact SHA-256 identity")
+        package_digest_value = package_digest.sha256
+    elif compilation is not None:
+        package_digest_value = compilation.composite_digest
     else:
-        package_digest = compute_package_digest(
+        package_digest_value = compute_package_digest(
             package, read_budget=read_budget
         ).sha256
     scoped_nodes = tuple(iter_scoped_workflow_nodes(package.definition))
@@ -778,7 +793,7 @@ def build_risk_summary(
             and dependency.sidecar_digest is not None
         )
     risk_fields = {
-        "package_digest": package_digest,
+        "package_digest": package_digest_value,
         "shell_or_script_nodes": shell_nodes,
         "requested_tools": requested_tools,
         "requested_skills": requested_skills,
@@ -911,6 +926,118 @@ def _locked(path: Path, timeout: float = _LOCK_TIMEOUT_SECONDS):
             os.close(descriptor)
 
 
+def _validated_trust_actor(actor: object) -> str:
+    if (
+        not isinstance(actor, str)
+        or not actor
+        or len(actor) > _WORKFLOW_TRUST_MAX_ACTOR_CHARS
+        or actor.strip() != actor
+        or not actor.isprintable()
+    ):
+        raise WorkflowTrustError("trust grant actor must be bounded printable text")
+    return actor
+
+
+def _validated_trust_origin(origin: object) -> str:
+    if not isinstance(origin, str) or _TRUST_ORIGIN.fullmatch(origin) is None:
+        raise WorkflowTrustError("trust grant origin must be a bounded safe identity")
+    return origin
+
+
+class _TrustGrant(TypedDict):
+    actor: str
+    risk_digest: str
+    trusted_at: str
+
+
+class _TrustRecord(TypedDict):
+    grants: dict[str, _TrustGrant]
+
+
+class _TrustPayload(TypedDict):
+    version: Literal[2]
+    records: dict[str, _TrustRecord]
+
+
+def _normalized_trust_grant(value: object) -> _TrustGrant:
+    if not isinstance(value, Mapping):
+        raise ValueError("trust grant shape is invalid")
+    raw = cast(Mapping[object, object], value)
+    if set(raw) != {
+        "actor",
+        "risk_digest",
+        "trusted_at",
+    }:
+        raise ValueError("trust grant shape is invalid")
+    actor = _validated_trust_actor(raw.get("actor"))
+    risk_digest = raw.get("risk_digest")
+    trusted_at = raw.get("trusted_at")
+    if not isinstance(risk_digest, str) or _SHA256.fullmatch(risk_digest) is None:
+        raise ValueError("trust grant risk digest is invalid")
+    if (
+        not isinstance(trusted_at, str)
+        or not trusted_at
+        or len(trusted_at) > _WORKFLOW_TRUST_MAX_TIMESTAMP_CHARS
+    ):
+        raise ValueError("trust grant timestamp is invalid")
+    try:
+        observed = datetime.fromisoformat(trusted_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("trust grant timestamp is invalid") from exc
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        raise ValueError("trust grant timestamp is invalid")
+    return {
+        "actor": actor,
+        "risk_digest": risk_digest,
+        "trusted_at": trusted_at,
+    }
+
+
+def _normalize_trust_payload(payload: object) -> _TrustPayload:
+    if not isinstance(payload, Mapping):
+        raise ValueError("unsupported trust-store shape")
+    raw_payload = cast(Mapping[object, object], payload)
+    if set(raw_payload) != {"version", "records"}:
+        raise ValueError("unsupported trust-store shape")
+    version = raw_payload.get("version")
+    records = raw_payload.get("records")
+    if version not in {1, 2} or not isinstance(records, Mapping):
+        raise ValueError("unsupported trust-store shape")
+    raw_records = cast(Mapping[object, object], records)
+    if len(raw_records) > WORKFLOW_TRUST_MAX_RECORDS:
+        raise ValueError("trust-store record limit exceeded")
+    normalized_records: dict[str, _TrustRecord] = {}
+    for package_digest, record in raw_records.items():
+        if (
+            not isinstance(package_digest, str)
+            or _SHA256.fullmatch(package_digest) is None
+            or not isinstance(record, Mapping)
+        ):
+            raise ValueError("trust-store record is invalid")
+        raw_record = cast(Mapping[object, object], record)
+        if version == 1:
+            grants = {"manual": _normalized_trust_grant(raw_record)}
+        else:
+            if set(raw_record) != {"grants"}:
+                raise ValueError("trust-store record is invalid")
+            raw_grants = raw_record.get("grants")
+            if (
+                not isinstance(raw_grants, Mapping)
+                or not raw_grants
+                or len(raw_grants) > WORKFLOW_TRUST_MAX_GRANTS_PER_RECORD
+            ):
+                raise ValueError("trust-store grant limit exceeded")
+            grants: dict[str, _TrustGrant] = {}
+            for origin, grant in cast(
+                Mapping[object, object], raw_grants
+            ).items():
+                grants[_validated_trust_origin(origin)] = _normalized_trust_grant(
+                    grant
+                )
+        normalized_records[package_digest] = {"grants": grants}
+    return {"version": 2, "records": normalized_records}
+
+
 class WorkflowTrustStore:
     """Profile-owned digest trust with atomic cross-process updates."""
 
@@ -920,46 +1047,38 @@ class WorkflowTrustStore:
 
     def _read(
         self, *, mutation: bool, max_bytes: int | None = None
-    ) -> dict[str, object]:
+    ) -> _TrustPayload:
         if not self.path.exists():
-            return {"version": 1, "records": {}}
+            return {"version": 2, "records": {}}
         if self.path.is_symlink():
             if mutation:
                 raise WorkflowTrustError(
                     "workflow trust store is corrupt: symlink not allowed"
                 )
-            return {"version": 1, "records": {}}
+            return {"version": 2, "records": {}}
         try:
-            if max_bytes is None:
-                text = self.path.read_text(encoding="utf-8")
-            else:
-                if (
-                    not isinstance(max_bytes, int)
-                    or isinstance(max_bytes, bool)
-                    or max_bytes <= 0
-                ):
-                    raise ValueError("trust-store read limit must be positive")
-                with self.path.open("rb") as stream:
-                    encoded = stream.read(max_bytes + 1)
-                if len(encoded) > max_bytes:
-                    raise ValueError("trust store exceeds the read limit")
-                text = encoded.decode("utf-8")
-            payload = json.loads(text)
-            if (
-                not isinstance(payload, dict)
-                or payload.get("version") != 1
-                or not isinstance(payload.get("records"), dict)
+            if max_bytes is not None and (
+                not isinstance(max_bytes, int)
+                or isinstance(max_bytes, bool)
+                or max_bytes <= 0
             ):
-                raise ValueError("unsupported trust-store shape")
-            return payload
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("trust-store read limit must be positive")
+            read_limit = min(
+                max_bytes or WORKFLOW_TRUST_MAX_STORE_BYTES,
+                WORKFLOW_TRUST_MAX_STORE_BYTES,
+            )
+            with self.path.open("rb") as stream:
+                encoded = stream.read(read_limit + 1)
+            if len(encoded) > read_limit:
+                raise ValueError("trust store exceeds the read limit")
+            return _normalize_trust_payload(json.loads(encoded.decode("utf-8")))
+        except (OSError, UnicodeError, ValueError, WorkflowTrustError) as exc:
             if mutation:
-                raise WorkflowTrustError(
-                    f"workflow trust store is corrupt: {exc}"
-                ) from exc
-            return {"version": 1, "records": {}}
+                raise WorkflowTrustError("workflow trust store is corrupt") from exc
+            return {"version": 2, "records": {}}
 
-    def _write(self, payload: dict[str, object]) -> None:
+    def _write(self, payload: _TrustPayload) -> None:
+        normalized = _normalize_trust_payload(payload)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name != "nt":
             os.chmod(self.path.parent, 0o700)
@@ -971,8 +1090,10 @@ class WorkflowTrustStore:
             if hasattr(os, "fchmod"):
                 os.fchmod(descriptor, 0o600)
             data = (
-                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+                json.dumps(normalized, sort_keys=True, separators=(",", ":")) + "\n"
             ).encode("utf-8")
+            if len(data) > WORKFLOW_TRUST_MAX_STORE_BYTES:
+                raise WorkflowTrustError("workflow trust store exceeds capacity")
             view = memoryview(data)
             while view:
                 written = os.write(descriptor, view)
@@ -998,31 +1119,91 @@ class WorkflowTrustStore:
             temporary.unlink(missing_ok=True)
 
     def trust(self, package_digest: str, *, actor: str, risk_digest: str) -> None:
+        self.trust_origin(
+            package_digest,
+            actor=actor,
+            risk_digest=risk_digest,
+            origin="manual",
+        )
+
+    def trust_origin(
+        self,
+        package_digest: str,
+        *,
+        actor: str,
+        risk_digest: str,
+        origin: str,
+    ) -> None:
         if not _SHA256.fullmatch(package_digest) or not _SHA256.fullmatch(risk_digest):
             raise WorkflowTrustError(
                 "package and risk digests must be SHA-256 hex values"
             )
+        normalized_actor = _validated_trust_actor(actor)
+        normalized_origin = _validated_trust_origin(origin)
         with _locked(self.lock_path):
             payload = self._read(mutation=True)
             records = payload["records"]
             assert isinstance(records, dict)
-            records[package_digest] = {
-                "actor": str(actor)[:128],
-                "risk_digest": risk_digest,
-                "trusted_at": datetime.now(timezone.utc).isoformat(),
-            }
+            record = records.get(package_digest)
+            if record is None:
+                if len(records) >= WORKFLOW_TRUST_MAX_RECORDS:
+                    raise WorkflowTrustError("workflow trust store exceeds capacity")
+                record = _TrustRecord(grants={})
+                records[package_digest] = record
+            assert isinstance(record, dict)
+            grants = record["grants"]
+            assert isinstance(grants, dict)
+            if (
+                normalized_origin not in grants
+                and len(grants) >= WORKFLOW_TRUST_MAX_GRANTS_PER_RECORD
+            ):
+                raise WorkflowTrustError("workflow trust grant capacity is exhausted")
+            grants[normalized_origin] = _TrustGrant(
+                actor=normalized_actor,
+                risk_digest=risk_digest,
+                trusted_at=datetime.now(timezone.utc).isoformat(),
+            )
             self._write(payload)
 
     def revoke(self, package_digest: str) -> bool:
+        if not isinstance(package_digest, str) or _SHA256.fullmatch(package_digest) is None:
+            return False
         with _locked(self.lock_path):
             payload = self._read(mutation=True)
             records = payload["records"]
             assert isinstance(records, dict)
-            existed = package_digest in records
-            if existed:
+            record = records.get(package_digest)
+            if not isinstance(record, dict):
+                return False
+            grants = record.get("grants")
+            if not isinstance(grants, dict) or grants.pop("manual", None) is None:
+                return False
+            if not grants:
                 del records[package_digest]
+            self._write(payload)
+            return True
+
+    def revoke_origin(self, origin: str) -> int:
+        normalized_origin = _validated_trust_origin(origin)
+        with _locked(self.lock_path):
+            payload = self._read(mutation=True)
+            records = payload["records"]
+            assert isinstance(records, dict)
+            revoked = 0
+            empty_records: list[str] = []
+            for package_digest, record in records.items():
+                assert isinstance(record, dict)
+                grants = record["grants"]
+                assert isinstance(grants, dict)
+                if grants.pop(normalized_origin, None) is not None:
+                    revoked += 1
+                if not grants:
+                    empty_records.append(package_digest)
+            for package_digest in empty_records:
+                del records[package_digest]
+            if revoked:
                 self._write(payload)
-            return existed
+            return revoked
 
     def check(
         self, package_digest: str, *, risk_digest: str | None = None
@@ -1032,7 +1213,7 @@ class WorkflowTrustStore:
                 self._read(mutation=False), package_digest, risk_digest=risk_digest
             )
 
-    def snapshot_read_only(self, *, max_bytes: int) -> dict[str, object]:
+    def snapshot_read_only(self, *, max_bytes: int) -> _TrustPayload:
         """Load one bounded trust snapshot without locks or filesystem writes."""
         return self._read(mutation=False, max_bytes=max_bytes)
 
@@ -1061,12 +1242,27 @@ class WorkflowTrustStore:
         *,
         risk_digest: str | None,
     ) -> Literal["trusted", "untrusted"]:
-        records = payload.get("records")
+        try:
+            normalized = _normalize_trust_payload(payload)
+        except (ValueError, WorkflowTrustError):
+            return "untrusted"
+        records = normalized.get("records")
         if not isinstance(records, dict):
             return "untrusted"
         record = records.get(package_digest)
         if not isinstance(record, dict):
             return "untrusted"
-        if risk_digest is not None and record.get("risk_digest") != risk_digest:
+        grants = record.get("grants")
+        if not isinstance(grants, dict) or not grants:
             return "untrusted"
-        return "trusted"
+        if risk_digest is None:
+            return "trusted"
+        return (
+            "trusted"
+            if any(
+                isinstance(grant, Mapping)
+                and grant.get("risk_digest") == risk_digest
+                for grant in grants.values()
+            )
+            else "untrusted"
+        )

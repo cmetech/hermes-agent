@@ -6606,14 +6606,37 @@ class RunStore:
                     compilation.composite_digest,
                     compilation.covered_relative_paths,
                 )
+                package_digest = expected_package_digest
                 if (
                     trusted_package_digest is not None
                     and trusted_package_digest != expected_package_digest
                 ):
-                    raise InputSnapshotError(
-                        "trusted workflow identity differs from its compilation"
+                    marketplace_binding = package.marketplace_binding
+                    if marketplace_binding is None:
+                        raise InputSnapshotError(
+                            "trusted workflow identity differs from its compilation"
+                        )
+                    from plugins.workflow.marketplace.trust_binding import (
+                        effective_marketplace_digest,
                     )
-                package_digest = expected_package_digest
+
+                    expected_effective_digest = effective_marketplace_digest(
+                        distribution_digest=marketplace_binding.distribution_digest,
+                        workflow_relative_path=(
+                            marketplace_binding.workflow_relative_path
+                        ),
+                        closure_digest=compilation.composite_digest,
+                    )
+                    if (
+                        trusted_package_digest.sha256 != expected_effective_digest
+                        or not set(compilation.covered_relative_paths).issubset(
+                            trusted_package_digest.covered_relative_paths
+                        )
+                    ):
+                        raise InputSnapshotError(
+                            "trusted workflow identity differs from its compilation"
+                        )
+                    package_digest = trusted_package_digest
                 snapshot_format_version = 2
             else:
                 package_digest = trusted_package_digest or compute_package_digest(

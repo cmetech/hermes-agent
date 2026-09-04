@@ -22,6 +22,7 @@ from plugins.workflow.input_contract import (
     WorkflowInputContractError,
     workflow_input_declarations,
 )
+from plugins.workflow.marketplace.package import WorkflowMarketplaceError
 from plugins.workflow.models import (
     RunExecutionLimits,
     WorkflowPackage,
@@ -392,6 +393,8 @@ def start_api_run(
         raise ApiAdmissionError(
             "workflow_catalog_capacity", status_code=503, retryable=True
         ) from exc
+    except WorkflowMarketplaceError as exc:
+        raise ApiAdmissionError("workflow_package_changed", status_code=409) from exc
     except WorkflowValidationError as exc:
         raise ApiAdmissionError("workflow_invalid_definition", status_code=422) from exc
     if package_digest.sha256 != risk.package_digest:
