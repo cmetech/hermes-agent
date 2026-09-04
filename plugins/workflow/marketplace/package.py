@@ -27,6 +27,7 @@ from .models import (
     WorkflowPackageContract,
     WorkflowPackageDigests,
     WorkflowPackageIndex,
+    WorkflowPackageIndexEntry,
     WorkflowPackageManifest,
 )
 
@@ -1246,6 +1247,92 @@ def _parse_index(
         ) from exc
 
 
+def _load_repository_index_document_at(
+    root: Path,
+    root_descriptor: int,
+    root_opened: os.stat_result,
+    contract: WorkflowPackageContract,
+) -> WorkflowPackageIndex:
+    content = _read_repository_index_at(
+        root,
+        root_descriptor,
+        root_opened,
+        contract,
+    )
+    index = _parse_index(content, contract)
+    _recheck_root(
+        root,
+        root_descriptor,
+        root_opened,
+        code="package_index_invalid",
+    )
+    return index
+
+
+def load_repository_index_document(root: Path) -> WorkflowPackageIndex:
+    """Load and validate only the bounded repository index document."""
+
+    contract = _contract()
+    absolute_root = _absolute(root)
+    if not _HAS_DESCRIPTOR_WALK:
+        _fail(
+            "package_index_invalid",
+            "descriptor-safe repository traversal is unavailable",
+        )
+    root_descriptor, root_opened = _open_root_descriptor(
+        absolute_root,
+        code="package_index_invalid",
+    )
+    try:
+        return _load_repository_index_document_at(
+            absolute_root,
+            root_descriptor,
+            root_opened,
+            contract,
+        )
+    finally:
+        os.close(root_descriptor)
+
+
+def verify_indexed_distribution(
+    entry: WorkflowPackageIndexEntry,
+    distribution: WorkflowDistribution,
+) -> None:
+    """Verify one loaded distribution against its canonical index projection."""
+
+    if distribution.digest != entry.package_digest:
+        _fail(
+            "package_digest_mismatch",
+            "repository index digest does not match package bytes",
+        )
+    manifest = distribution.manifest
+    projected = (
+        manifest.id,
+        manifest.version,
+        manifest.display_name,
+        manifest.description,
+        manifest.license,
+        manifest.publisher,
+        manifest.tags,
+        _contract().contract_version,
+    )
+    claimed = (
+        entry.id,
+        entry.version,
+        entry.display_name,
+        entry.description,
+        entry.license,
+        entry.publisher,
+        entry.tags,
+        entry.contract_version,
+    )
+    if claimed != projected:
+        _fail(
+            "package_index_invalid",
+            f"repository metadata for package {entry.id!r} is stale",
+        )
+
+
 def _verify_index_entry(
     root: Path,
     root_descriptor: int,
@@ -1272,32 +1359,7 @@ def _verify_index_entry(
             anchored_descriptor=chain[-1][2],
         )
         _recheck_directory_chain(chain, code="package_index_invalid")
-        manifest = distribution.manifest
-        projected = (
-            manifest.id,
-            manifest.version,
-            manifest.display_name,
-            manifest.description,
-            manifest.license,
-            manifest.publisher,
-            manifest.tags,
-            contract.contract_version,
-        )
-        claimed = (
-            entry.id,
-            entry.version,
-            entry.display_name,
-            entry.description,
-            entry.license,
-            entry.publisher,
-            entry.tags,
-            entry.contract_version,
-        )
-        if claimed != projected:
-            _fail(
-                "package_index_invalid",
-                f"repository metadata for package {entry.id!r} is stale",
-            )
+        verify_indexed_distribution(entry, distribution)
         return directory_identities
     finally:
         _close_directory_chain(chain)
@@ -1327,13 +1389,12 @@ def load_repository_index(root: Path) -> WorkflowPackageIndex:
         code="package_index_invalid",
     )
     try:
-        content = _read_repository_index_at(
+        index = _load_repository_index_document_at(
             absolute_root,
             root_descriptor,
             root_opened,
             contract,
         )
-        index = _parse_index(content, contract)
         roots: list[tuple[tuple[int, int], ...]] = []
         for entry in index.packages:
             directory_identities = _verify_index_entry(
@@ -1362,5 +1423,7 @@ __all__ = [
     "compute_distribution_digest",
     "load_distribution",
     "load_repository_index",
+    "load_repository_index_document",
     "scan_package_files",
+    "verify_indexed_distribution",
 ]

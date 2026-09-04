@@ -76,6 +76,8 @@ from .package import (
     WorkflowMarketplaceError,
     load_distribution,
     load_repository_index,
+    load_repository_index_document,
+    verify_indexed_distribution,
 )
 from .provenance import InstalledPackageStore, direct_source_key
 from .source_store import (
@@ -874,9 +876,10 @@ class WorkflowMarketplaceService:
                 source,
                 Path(temporary) / "repository",
                 sparse_paths=(_INDEX_PATH,),
+                selected_package_id=package_id,
                 cancelled=cancelled,
             )
-            index = load_repository_index(checkout.root)
+            index = load_repository_index_document(checkout.root)
             entry = next(
                 (item for item in index.packages if item.id == package_id), None
             )
@@ -889,11 +892,7 @@ class WorkflowMarketplaceService:
                 checkout.root.joinpath(*entry.package_path.split("/")),
                 expected_digest=entry.package_digest,
             )
-            if distribution.manifest.id != package_id or entry.id != package_id:
-                _fail(
-                    "package_index_invalid",
-                    "registered package identity differs from repository index",
-                )
+            verify_indexed_distribution(entry, distribution)
             yield _FetchedCandidate(
                 distribution=distribution,
                 identity=InstalledPackageIdentity(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 from pathlib import Path
 import sys
@@ -15,6 +17,9 @@ from hermes_cli.git_source import GitSourceCancelled
 from plugins.workflow.marketplace.git import WorkflowGitFetcher
 from plugins.workflow.marketplace.models import WorkflowMarketplaceSource
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
+
+
+MARKETPLACE_FIXTURE = Path(__file__).parent / "fixtures" / "marketplace" / "repository"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -69,6 +74,200 @@ def _source(url: str, *, ref: str | None = None) -> WorkflowMarketplaceSource:
         "ref": ref,
         "enabled": True,
     })
+
+
+@pytest.fixture
+def indexed_remote(tmp_path: Path) -> tuple[Path, Path, str]:
+    work = tmp_path / "indexed-work"
+    shutil.copytree(MARKETPLACE_FIXTURE, work)
+    _git(work, "init", "--initial-branch=main")
+    _git(work, "config", "user.email", "marketplace@example.test")
+    _git(work, "config", "user.name", "Marketplace Test")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "indexed packages")
+    commit = _git(work, "rev-parse", "head")
+    remote = tmp_path / "indexed-remote.git"
+    _git(tmp_path, "clone", "--bare", str(work), str(remote))
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    return work, remote, commit
+
+
+def test_index_default_expansion_still_materializes_every_package(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, commit = indexed_remote
+
+    checkout = WorkflowGitFetcher().fetch(
+        _source(remote.as_uri()),
+        tmp_path / "default-index-checkout",
+        sparse_paths=(".well-known/hermes-workflows/index.json",),
+    )
+
+    assert checkout.resolved_commit == commit
+    assert checkout.root.joinpath(
+        "packages/inbox-productivity/workflow-package.json"
+    ).is_file()
+    assert checkout.root.joinpath(
+        "packages/laptop-support/workflow-package.json"
+    ).is_file()
+
+
+def test_selected_package_expansion_materializes_only_exact_indexed_path(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, commit = indexed_remote
+
+    checkout = WorkflowGitFetcher().fetch(
+        _source(remote.as_uri()),
+        tmp_path / "selected-index-checkout",
+        sparse_paths=(".well-known/hermes-workflows/index.json",),
+        selected_package_id="laptop-support",
+    )
+
+    assert checkout.resolved_commit == commit
+    assert checkout.root.joinpath(".well-known/hermes-workflows/index.json").is_file()
+    assert checkout.root.joinpath(
+        "packages/laptop-support/workflow-package.json"
+    ).is_file()
+    assert not checkout.root.joinpath("packages/inbox-productivity").exists()
+
+
+def test_selected_package_absence_fails_stably_and_cleans_checkout(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, _commit = indexed_remote
+    destination = tmp_path / "missing-selected-checkout"
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher().fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
+            selected_package_id="missing-package",
+        )
+
+    assert error.value.code == "catalog_package_not_found"
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("index_failure", "expected_code"),
+    [
+        ("duplicate-id", "package_index_invalid"),
+        ("duplicate-path", "package_index_invalid"),
+        ("malformed-entry", "package_index_invalid"),
+        ("nested-root", "package_root_nested"),
+        ("malicious-path", "package_path_traversal"),
+    ],
+)
+def test_selected_package_keeps_strict_index_identity_and_path_validation(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+    index_failure: str,
+    expected_code: str,
+) -> None:
+    work, remote, _commit = indexed_remote
+    index_path = work / ".well-known/hermes-workflows/index.json"
+    payload = json.loads(index_path.read_bytes())
+    if index_failure == "duplicate-id":
+        payload["packages"][0]["id"] = "laptop-support"
+        payload["packages"].sort(key=lambda item: item["id"])
+    elif index_failure == "duplicate-path":
+        payload["packages"][0]["packagePath"] = "packages/laptop-support"
+    elif index_failure == "malformed-entry":
+        del payload["packages"][0]["publisher"]
+    elif index_failure == "nested-root":
+        payload["packages"][0]["packagePath"] = "packages/laptop-support/nested"
+    else:
+        selected = next(
+            item for item in payload["packages"] if item["id"] == "laptop-support"
+        )
+        selected["packagePath"] = "../escape"
+    index_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", f"publish {index_failure}")
+    _git(work, "push", str(remote), "main")
+    destination = tmp_path / f"invalid-{index_failure}-checkout"
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher().fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
+            selected_package_id="laptop-support",
+        )
+
+    assert error.value.code == expected_code
+    assert not destination.exists()
+
+
+def test_selected_package_id_is_validated_before_checkout(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, _commit = indexed_remote
+    destination = tmp_path / "invalid-selected-id-checkout"
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher().fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
+            selected_package_id="../escape",
+        )
+
+    assert error.value.code == "catalog_identifier_invalid"
+    assert not destination.exists()
+
+
+def test_selected_package_expansion_enforces_checkout_budget_and_cleanup(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, _commit = indexed_remote
+    destination = tmp_path / "bounded-selected-checkout"
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher(max_checkout_files=1).fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
+            selected_package_id="laptop-support",
+        )
+
+    assert error.value.code == "source_checkout_file_limit"
+    assert not destination.exists()
+
+
+def test_selected_package_expansion_honors_cancellation_and_cleans_checkout(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, _commit = indexed_remote
+    destination = tmp_path / "cancelled-selected-checkout"
+    selection_complete = False
+
+    class CancelAfterSelection(WorkflowGitFetcher):
+        def _discover_index_paths(self, *args, **kwargs):
+            nonlocal selection_complete
+            paths = super()._discover_index_paths(*args, **kwargs)
+            selection_complete = True
+            return paths
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        CancelAfterSelection().fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
+            selected_package_id="laptop-support",
+            cancelled=lambda: selection_complete,
+        )
+
+    assert error.value.code == "source_cancelled"
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize(
@@ -306,6 +505,7 @@ def test_authentication_failure_is_redacted_and_partial_clone_is_removed(
             _source("https://example.test/company/repo.git"),
             destination,
             sparse_paths=("selected.txt",),
+            selected_package_id="laptop-support",
         )
 
     assert error.value.code == "source_authentication_failed"

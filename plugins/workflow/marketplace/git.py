@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import re
@@ -11,8 +10,6 @@ import shutil
 import stat
 import subprocess
 from typing import Callable, NoReturn
-
-from pydantic import ValidationError
 
 from hermes_cli.git_source import (
     GitSourceCancelled,
@@ -30,9 +27,8 @@ from hermes_cli.git_source import (
     validate_credential_free_git_source,
 )
 
-from .contract import load_package_contract
-from .models import WorkflowMarketplaceSource, WorkflowPackageIndex
-from .package import WorkflowMarketplaceError
+from .models import PACKAGE_ID_PATTERN, WorkflowMarketplaceSource
+from .package import WorkflowMarketplaceError, load_repository_index_document
 
 
 _INDEX_PATH = ".well-known/hermes-workflows/index.json"
@@ -296,93 +292,54 @@ class WorkflowGitFetcher:
         if fallback.returncode != 0:
             raise _classify_git_failure(fallback, clone_url)
 
-    def _discover_index_paths(self, root: Path, checkout_root: Path) -> tuple[str, ...]:
+    def _discover_index_paths(
+        self,
+        root: Path,
+        checkout_root: Path,
+        *,
+        selected_package_id: str | None,
+    ) -> tuple[str, ...]:
         try:
-            relative_root = root.relative_to(checkout_root)
+            root.relative_to(checkout_root)
         except ValueError:
             _fail("package_index_invalid", "repository catalog root escaped checkout")
-        current = checkout_root
-        for component in (
-            *relative_root.parts,
-            ".well-known",
-            "hermes-workflows",
-        ):
-            current /= component
-            try:
-                parent_metadata = current.lstat()
-            except FileNotFoundError:
-                return ()
-            except OSError:
-                _fail(
-                    "package_index_invalid",
-                    "repository marketplace index parent is unreadable",
-                )
-            if stat.S_ISLNK(parent_metadata.st_mode):
-                _fail(
-                    "package_symlink_unsupported",
-                    "repository marketplace index parents must not be symbolic links",
-                )
-            if not stat.S_ISDIR(parent_metadata.st_mode):
-                _fail(
-                    "package_index_invalid",
-                    "repository marketplace index parent is not a directory",
-                )
         index_path = root / _INDEX_PATH
         try:
-            metadata = index_path.lstat()
+            index_path.lstat()
         except FileNotFoundError:
-            return ()
+            if selected_package_id is None:
+                return ()
+            _fail(
+                "package_index_invalid",
+                "repository marketplace index is unavailable",
+            )
         except OSError:
             _fail("package_index_invalid", "repository marketplace index is unreadable")
-        if stat.S_ISLNK(metadata.st_mode):
-            _fail(
-                "package_symlink_unsupported",
-                "repository marketplace index must not be a symbolic link",
-            )
-        if not stat.S_ISREG(metadata.st_mode):
-            _fail("package_index_invalid", "repository marketplace index is not a file")
-        limit = load_package_contract().resource_rules.max_index_bytes
         try:
-            if metadata.st_size > limit:
+            index = load_repository_index_document(root)
+        except WorkflowMarketplaceError as error:
+            # Preserve the Git fetcher's established index-boundary diagnostic:
+            # repository metadata is never a valid sparse package root.
+            if error.code == "package_repository_metadata":
                 _fail(
-                    "package_index_size_limit",
-                    "repository marketplace index exceeds its byte limit",
+                    "package_index_invalid",
+                    "repository marketplace index is invalid",
                 )
-            flags = os.O_RDONLY
-            for option in ("O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW", "O_BINARY"):
-                flags |= getattr(os, option, 0)
-            descriptor = os.open(index_path, flags)
-            try:
-                opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode):
-                    _fail(
-                        "package_index_invalid",
-                        "repository marketplace index is not a regular file",
-                    )
-                with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                    raw = handle.read(limit + 1)
-            finally:
-                os.close(descriptor)
-            if len(raw) > limit:
-                _fail(
-                    "package_index_size_limit",
-                    "repository marketplace index exceeds its byte limit",
-                )
-            decoded = json.loads(raw)
-            if isinstance(decoded, dict) and decoded.get("schemaVersion") not in (
-                None,
-                1,
-            ):
-                _fail(
-                    "package_contract_unsupported",
-                    "repository marketplace index contract version is unsupported",
-                )
-            index = WorkflowPackageIndex.model_validate(decoded)
-        except WorkflowMarketplaceError:
             raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError):
-            _fail("package_index_invalid", "repository marketplace index is invalid")
-        return tuple(entry.package_path for entry in index.packages)
+        if selected_package_id is None:
+            return tuple(entry.package_path for entry in index.packages)
+        matches = [entry for entry in index.packages if entry.id == selected_package_id]
+        if not matches:
+            _fail(
+                "catalog_package_not_found",
+                "selected marketplace package was not found in the repository index",
+            )
+        if len(matches) != 1:
+            _fail(
+                "package_index_invalid",
+                "repository marketplace package identity is ambiguous",
+            )
+        return (matches[0].package_path,)
 
     def _preflight_paths(
         self,
@@ -510,6 +467,7 @@ class WorkflowGitFetcher:
         destination: Path,
         *,
         sparse_paths: tuple[str, ...],
+        selected_package_id: str | None = None,
         cancelled: Cancelled = lambda: False,
     ) -> ResolvedCheckout:
         """Fetch one exact, sanitized checkout without executing package content."""
@@ -525,6 +483,14 @@ class WorkflowGitFetcher:
                 else "source_invalid"
             )
             _fail(code, str(error))
+        if selected_package_id is not None and (
+            not isinstance(selected_package_id, str)
+            or re.fullmatch(PACKAGE_ID_PATTERN, selected_package_id) is None
+        ):
+            _fail(
+                "catalog_identifier_invalid",
+                "selected marketplace package identity is invalid",
+            )
         destination = Path(destination)
         if destination.exists() or destination.is_symlink():
             _fail(
@@ -632,7 +598,11 @@ class WorkflowGitFetcher:
                     "checked-out Git revision does not match the resolved commit",
                 )
             root = destination / subdirectory if subdirectory else destination
-            discovered = self._discover_index_paths(root, destination)
+            discovered = self._discover_index_paths(
+                root,
+                destination,
+                selected_package_id=selected_package_id,
+            )
             if discovered:
                 discovered = tuple(_canonical_sparse_path(path) for path in discovered)
                 expanded = tuple(

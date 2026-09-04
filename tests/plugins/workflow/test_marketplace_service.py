@@ -15,16 +15,16 @@ import pytest
 from pydantic import ValidationError
 import yaml
 
-import plugins.workflow.marketplace.service as marketplace_service_module
 from plugins.workflow.marketplace.models import (
     InstallRequest,
     InstalledPackageIdentity,
     PackageInspection,
     WorkflowMarketplaceSource,
-    WorkflowPackageIndex,
 )
-from plugins.workflow.marketplace.git import ResolvedCheckout
-from plugins.workflow.marketplace.package import WorkflowMarketplaceError
+from plugins.workflow.marketplace.package import (
+    WorkflowMarketplaceError,
+    load_repository_index,
+)
 from plugins.workflow.marketplace.service import WorkflowMarketplaceService
 from plugins.workflow.trust import WorkflowTrustError
 
@@ -452,19 +452,20 @@ def test_inspect_pairs_exact_candidate_with_current_verification_event(
 
 
 @pytest.mark.parametrize(
-    ("field", "stale_value"),
+    ("field", "stale_value", "expected_code"),
     [
-        ("id", "different-package"),
-        ("version", "9.0.0"),
-        ("displayName", "Stale Display Name"),
+        ("id", "different-package", "package_index_invalid"),
+        ("version", "9.0.0", "package_index_invalid"),
+        ("displayName", "Stale Display Name", "package_index_invalid"),
         (
             "description",
             "https://alice:index-secret@example.test/private.git?token=hidden",
+            "package_index_invalid",
         ),
-        ("license", "Apache-2.0"),
-        ("publisher", "different-publisher"),
-        ("tags", ["different-tag"]),
-        ("contractVersion", 2),
+        ("license", "Apache-2.0", "package_index_invalid"),
+        ("publisher", "different-publisher", "package_index_invalid"),
+        ("tags", ["different-tag"], "package_index_invalid"),
+        ("contractVersion", 2, "package_contract_unsupported"),
     ],
 )
 def test_registered_inspect_and_install_reject_every_stale_index_projection(
@@ -472,11 +473,20 @@ def test_registered_inspect_and_install_reject_every_stale_index_projection(
     published_repo: PublishedRepository,
     field: str,
     stale_value: object,
+    expected_code: str,
 ) -> None:
     _add_and_refresh(service, published_repo)
     index_path = published_repo.work / ".well-known/hermes-workflows/index.json"
     index = json.loads(index_path.read_bytes())
-    index["packages"][0][field] = stale_value
+    if field == "id":
+        package_root = published_repo.work / "packages/laptop-support"
+        manifest_path = package_root / "workflow-package.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["id"] = stale_value
+        manifest_path.write_bytes(_json_bytes(manifest))
+        index["packages"][0]["packageDigest"] = _publish(package_root)
+    else:
+        index["packages"][0][field] = stale_value
     index_path.write_bytes(_json_bytes(index))
     _git(published_repo.work, "add", ".")
     _git(published_repo.work, "commit", "-m", f"publish stale {field}")
@@ -490,12 +500,99 @@ def test_registered_inspect_and_install_reject_every_stale_index_projection(
     ):
         with pytest.raises(WorkflowMarketplaceError) as error:
             operation()
-        assert error.value.code == "package_index_invalid"
+        assert error.value.code == expected_code
         rendered = str(error.value)
         assert "index-secret" not in rendered
         assert "alice:" not in rendered
         assert "hidden" not in rendered
         assert "verified" not in rendered.casefold()
+
+
+@pytest.mark.parametrize(
+    ("unrelated_failure", "repository_error"),
+    [
+        ("missing", "package_index_invalid"),
+        ("malformed", "package_manifest_invalid"),
+    ],
+)
+def test_registered_selected_operations_ignore_unrelated_invalid_package(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    unrelated_failure: str,
+    repository_error: str,
+) -> None:
+    _add_and_refresh(service, published_repo)
+    unrelated = published_repo.work / "packages" / "unrelated"
+    _write_package(published_repo.work, "unrelated", version="1.0.0")
+    _write_index(published_repo.work)
+    if unrelated_failure == "missing":
+        shutil.rmtree(unrelated)
+    else:
+        (unrelated / "workflow-package.json").write_bytes(b"{malformed")
+    _git(published_repo.work, "add", "-A")
+    _git(
+        published_repo.work,
+        "commit",
+        "-m",
+        f"publish unrelated {unrelated_failure} package",
+    )
+    _git(published_repo.work, "push", "origin", "main")
+
+    with pytest.raises(WorkflowMarketplaceError) as full_repository_error:
+        load_repository_index(published_repo.work)
+    assert full_repository_error.value.code == repository_error
+
+    detail = service.inspect("company/laptop-support")
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor="alice"
+    )
+
+    assert detail.identifier == "company/laptop-support"
+    assert detail.resolved_commit == _git(published_repo.work, "rev-parse", "head")
+    assert review.identity == InstalledPackageIdentity(
+        sourceKey="company", packageId="laptop-support"
+    )
+    assert review.resolved_commit == detail.resolved_commit
+
+
+@pytest.mark.parametrize(
+    ("selected_failure", "expected_code"),
+    [
+        ("missing", "package_manifest_invalid"),
+        ("malformed", "package_manifest_invalid"),
+    ],
+)
+def test_registered_selected_operations_still_reject_invalid_selected_package(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    selected_failure: str,
+    expected_code: str,
+) -> None:
+    _add_and_refresh(service, published_repo)
+    selected = published_repo.work / "packages" / "laptop-support"
+    _write_index(published_repo.work)
+    if selected_failure == "missing":
+        shutil.rmtree(selected)
+    else:
+        (selected / "workflow-package.json").write_bytes(b"{malformed")
+    _git(published_repo.work, "add", "-A")
+    _git(
+        published_repo.work,
+        "commit",
+        "-m",
+        f"publish selected {selected_failure} package",
+    )
+    _git(published_repo.work, "push", "origin", "main")
+
+    for operation in (
+        lambda: service.inspect("company/laptop-support"),
+        lambda: service.prepare_install(
+            InstallRequest(identifier="company/laptop-support"), actor="alice"
+        ),
+    ):
+        with pytest.raises(WorkflowMarketplaceError) as error:
+            operation()
+        assert error.value.code == expected_code
 
 
 def test_inspect_reports_current_then_update_available_without_mutation(
@@ -594,7 +691,6 @@ def test_inspection_is_strict_bounded_and_sanitizes_candidate_metadata(
 def test_registered_update_rejects_manifest_identity_mismatch_without_mutation(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     installed = _install(service, published_repo)
     destination = service.installed_store.package_root(installed.identity)
@@ -614,22 +710,6 @@ def test_registered_update_rejects_manifest_identity_mismatch_without_mutation(
     _git(published_repo.work, "add", ".")
     _git(published_repo.work, "commit", "-m", "publish mismatched identity")
     _git(published_repo.work, "push", "origin", "main")
-    monkeypatch.setattr(
-        service.catalog.git_fetcher,
-        "fetch",
-        lambda *_args, **_kwargs: ResolvedCheckout(
-            root=published_repo.work,
-            repository_url=published_repo.remote.as_uri(),
-            resolved_commit=_git(published_repo.work, "rev-parse", "head"),
-        ),
-    )
-    raw_index = json.loads(index_path.read_bytes())
-    monkeypatch.setattr(
-        marketplace_service_module,
-        "load_repository_index",
-        lambda _root: WorkflowPackageIndex.model_validate(raw_index),
-    )
-
     with pytest.raises(WorkflowMarketplaceError) as error:
         service.prepare_update(installed.identity, actor="alice")
 

@@ -621,6 +621,44 @@ def test_repository_index_verifies_two_nonoverlapping_sibling_packages(
         assert distribution.manifest.id == entry.id
 
 
+def test_repository_index_document_does_not_open_unrelated_package_roots(
+    repository_root: Path,
+) -> None:
+    index_path = repository_root / ".well-known/hermes-workflows/index.json"
+    payload = json.loads(index_path.read_bytes())
+    payload["packages"][0]["packagePath"] = "packages/missing"
+    _write_json(index_path, payload)
+
+    index = package_module.load_repository_index_document(repository_root)
+
+    assert [entry.id for entry in index.packages] == [
+        "inbox-productivity",
+        "laptop-support",
+    ]
+    assert index.packages[0].package_path == "packages/missing"
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        load_repository_index(repository_root)
+    _assert_code(error, "package_index_invalid")
+
+
+def test_selected_entry_verifier_reuses_full_repository_metadata_parity(
+    repository_root: Path,
+) -> None:
+    index = package_module.load_repository_index_document(repository_root)
+    entry = next(item for item in index.packages if item.id == "laptop-support")
+    distribution = load_distribution(
+        repository_root / entry.package_path,
+        expected_digest=entry.package_digest,
+    )
+
+    package_module.verify_indexed_distribution(entry, distribution)
+
+    stale = entry.model_copy(update={"display_name": "Stale display name"})
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        package_module.verify_indexed_distribution(stale, distribution)
+    _assert_code(error, "package_index_invalid")
+
+
 def test_repository_index_rejects_intermediate_symlink_escape(
     repository_root: Path,
     tmp_path: Path,
