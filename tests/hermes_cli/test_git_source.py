@@ -94,20 +94,37 @@ def test_safe_git_error_removes_embedded_credentials_and_query_tokens():
     assert "token=abc" not in rendered
 
 
-def test_safe_git_error_strips_credential_urls_without_source_hint():
+def test_safe_git_error_scrubs_every_http_url_and_preserves_delimiters():
     result = _completed(
         stderr=(
-            "fatal: redirect to "
-            "https://bob:redirect-secret@mirror.example/repo.git?access_token=redirect-token"
+            "fatal: redirect from "
+            "(https://alice:first-secret@origin.example/repo.git"
+            "?private_token=opaque-secret#opaque-fragment), to "
+            "[https://bob:second-secret@mirror.example/repo.git"
+            "?sig=opaque-signature#other-fragment]. retry later"
         )
     )
 
     rendered = safe_git_error(result)
 
-    assert "redirect-secret" not in rendered
-    assert "redirect-token" not in rendered
-    assert "bob:***@mirror.example" in rendered
-    assert "access_token=***" in rendered
+    assert rendered == (
+        "fatal: redirect from (https://origin.example/repo.git), to "
+        "[https://mirror.example/repo.git]. retry later"
+    )
+
+
+def test_safe_git_error_preserves_ssh_usernames_and_unrelated_text():
+    result = _completed(
+        stderr=(
+            "fatal: ssh://git@gitlab.example/team/repo.git and "
+            "git@github.example:team/repo.git were unavailable"
+        )
+    )
+
+    assert safe_git_error(result) == (
+        "fatal: ssh://git@gitlab.example/team/repo.git and "
+        "git@github.example:team/repo.git were unavailable"
+    )
 
 
 def test_canonical_git_source_never_contains_http_credentials_or_query_tokens():

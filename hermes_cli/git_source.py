@@ -39,6 +39,8 @@ class ResolvedGitSource:
 
 
 EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_TRAILING_URL_DELIMITERS = ".,;:!?)]}"
 
 _GITHUB_BROWSER_SEGMENTS = {
     "actions",
@@ -164,11 +166,19 @@ def safe_git_error(
     error = (result.stderr or result.stdout or "").strip()
     if source_url:
         error = error.replace(source_url, scrub_git_url(source_url))
+    error = _HTTP_URL_RE.sub(_scrub_embedded_http_url, error)
     return redact_sensitive_text(
         error,
         force=True,
-        redact_url_credentials=True,
     )
+
+
+def _scrub_embedded_http_url(match: re.Match[str]) -> str:
+    value = match.group(0)
+    end = len(value)
+    while end and value[end - 1] in _TRAILING_URL_DELIMITERS:
+        end -= 1
+    return f"{scrub_git_url(value[:end])}{value[end:]}"
 
 
 def git_head_revision(repo: Path, git_exe: str) -> str:
