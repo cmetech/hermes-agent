@@ -27,6 +27,7 @@ No duplicate-dependency admission change was made. The pre-existing raw string r
 | LGR-005 | Raw structural work arithmetic again matches the merge base, restoring `archon_retry_invalid` issue paths and CLI envelopes for boolean, negative, and fractional retry values while retaining normalized work bounds. |
 | LGR-006 | The contract publishes structured tri-state lookup/terminal metadata and the corpus includes the two ambiguous accepted schemas, exercised by an independent public-contract interpreter and the Hermes compiler. |
 | LGR-007 | The conformance module now resolves authoring resources from the source tree when present and otherwise from `sys.prefix`, matching the wheel data-file layout. A real ordinary-venv installed-console regression removes `PYTHONPATH`, proves module/resource origins, and compares deterministic Archon corpus bytes with the source authority. |
+| FCR-001 | The shared work selector treats a retry mapping as explicit only when `retry.max_attempts` is present. Partial command/prompt mappings use the sealed AI default of two retries, and the contract publishes the exact presence predicate. Work admission, capacity admission, and executable semantics now agree. |
 
 ## Review corrections
 
@@ -44,6 +45,13 @@ module/resource origins, and reports each subprocess failure independently.
 The scoped re-review passed both findings with no new Critical or Important
 breakage.
 
+The complete-branch reviewer then found FCR-001. Its focused probe showed
+1,400 admitted versus 4,200 executable attempts for fourteen partial-retry AI
+children over 100 iterations. A separate TDD fix added command/prompt partial
+mapping coverage, 3,900/4,200 boundary coverage, and a public
+`retry.max_attempts` presence predicate. The final scoped re-review marked the
+finding addressed with no new Critical or Important issue.
+
 ## Verification evidence
 
 The final implementer-owned verification reported:
@@ -56,6 +64,8 @@ The final implementer-owned verification reported:
 - The final LGR-007 controller-owned verification passed 5 installed-
   distribution integration tests, 16 language-conformance tests, and 5
   schema-corpus CLI tests; focused Ruff and `git diff --check` passed.
+- The final FCR-001 controller-owned four-file battery passed 852 tests; its
+  final scoped reviewer independently passed 20 focused behavior tests.
 - The Archon contract measured 283,440 bytes against its unchanged 284,000-byte usable ceiling.
 - The corpus measured 48 cases and 126,533 compact JSON bytes against its 64-case and 160,000-byte limits.
 - The legacy golden decoded to 226,976 bytes with SHA-256 `f4de08444f110fb8c4e2b36d9246df4194b8a70dde8bae495a381d757fdf6e07`.

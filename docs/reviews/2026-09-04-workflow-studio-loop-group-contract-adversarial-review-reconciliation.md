@@ -147,3 +147,23 @@ behavior-first regression tests, focused verification passes, a fresh code
 review accepts the remediation, and the complete branch receives final
 verification. The review artifacts themselves do not authorize merging,
 pushing, or beginning Workflow Studio Phase B.
+
+## Post-reconciliation complete-branch finding
+
+The final whole-branch reviewer found FCR-001 after LGR-001 through LGR-007
+were closed. A command or prompt with a retry mapping that omitted
+`max_attempts` was published and admitted as one attempt even though sealed
+execution semantics supply the existing AI default of two retries/three total
+attempts. Fourteen such children over 100 group iterations could therefore be
+admitted as 1,400 attempts while representing 4,200 executable attempts.
+
+The controller ruled that publishing the pre-existing undercount as a
+normative Studio work formula made it candidate-caused and authorized the
+smallest admission correction under the user's direction to resolve confirmed
+adversarial findings. The shared selector now takes the explicit retry branch
+only when `retry.max_attempts` is present; partial command/prompt mappings fall
+through to the AI default. The contract publishes the machine-readable
+predicate, and behavior tests cover command/prompt partial mappings, sealed
+retry semantics, work/capacity agreement, 3,900 admission, 4,200 rejection,
+and the retained malformed-value paths. Scoped final re-review marked FCR-001
+addressed with no new Critical or Important breakage.
