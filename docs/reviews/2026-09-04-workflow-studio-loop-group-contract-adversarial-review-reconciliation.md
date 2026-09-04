@@ -11,12 +11,18 @@ Date: 2026-09-04
 - Range: 11 commits, 17 files, +3,886/-135
 - Codex review: `2026-09-04-workflow-studio-loop-group-contract-adversarial-review-codex-5-6.md`
 - Claude Fable review: `2026-09-04-workflow-studio-loop-group-contract-adversarial-review-fable-5.md`
+- Authenticated Claude Fable rerun:
+  `2026-09-04-workflow-studio-loop-group-contract-adversarial-review-fable-5-authenticated.md`
 
 The reviewers worked in separate detached worktrees pinned to the candidate commit. Neither reviewer read the other's report. The controller then assigned the findings to two independent validation agents, which traced the relevant production call paths and compared bounded probes against the merge base. No finding below is accepted merely because a reviewer asserted it.
 
 ## Consolidated verdict
 
-The candidate does not yet pass review. Six unique candidate-caused defects are confirmed: five Important and one Minor. One additional duplicate-dependency concern is real but pre-existing and outside the approved Hermes Phase A runtime-change boundary.
+The original candidate does not pass review. Seven unique candidate-caused
+defects are confirmed: six Important and one Minor. The authenticated Claude
+Fable rerun added one installed-distribution defect after the first
+reconciliation. One additional duplicate-dependency concern is real but
+pre-existing and outside the approved Hermes Phase A runtime-change boundary.
 
 | Consolidated ID | Source finding | Severity | Ruling | Required disposition |
 |---|---|---:|---|---|
@@ -26,6 +32,7 @@ The candidate does not yet pass review. Six unique candidate-caused defects are 
 | LGR-004 | Codex LGC-004; Fable LGWF-2 | Important | Confirmed and deduplicated | Keep pre-v6/legacy rule descriptors byte-identical; add `kind` only to the Phase 6 projection and guard the legacy bytes/digest. |
 | LGR-005 | Fable LGWF-1 | Important | Confirmed | Stop applying strict loop-work arithmetic to raw, not-yet-normalized retry values; restore baseline diagnostics without default substitution or broader validation-order changes. |
 | LGR-006 | Fable LGWF-3 | Minor | Confirmed | Publish structured tri-state evaluation order and terminal `$ref` behavior; add public-corpus cases for the two ambiguous accepted forms. |
+| LGR-007 | Authenticated Fable WS-1 | Important | Confirmed by independent live reproduction on the remediated branch | Resolve packaged Jira authoring resources from the source tree or `sys.prefix`; test an ordinary wheel-installed venv console with `PYTHONPATH` absent. |
 | LGR-D01 | Codex duplicate dependency concern | Deferred | Pre-existing | Do not change Hermes admission in Phase A. Workflow Studio must prevent creation of duplicate visual dependencies while preserving imported YAML. |
 
 ## Evidence and remediation boundaries
@@ -73,9 +80,47 @@ The public policy names the individual strategies but does not state their compo
 
 The repair must publish structured evaluation metadata for object lookup order, terminal handling, and `$ref` applicability. Both forms must be accepted conformance-corpus cases exercised through an independent public-contract interpreter rather than private `_v3_*` functions.
 
+### LGR-007 — an ordinary installed console cannot resolve the Archon corpus resource
+
+The authenticated Claude Fable rerun traced the Archon-only Jira fixture from
+`plugins/workflow/language_conformance.py` into the wheel packaging layout.
+The module originally assumed `Path(__file__).resolve().parents[2]` was always
+the repository root. In an ordinary virtual environment that expression is
+`site-packages`, while setuptools installs the `capabilities/**` data files
+under `sys.prefix`.
+
+An independent Codex validator built the current branch from a clean archive,
+installed the wheel into a fresh venv, removed `PYTHONPATH`, and ran the
+installed console from a non-repository directory. It reproduced exit 1,
+zero stdout, and an uncaught `FileNotFoundError` below
+`site-packages/capabilities`; the actual Jira YAML existed below
+`sys.prefix/capabilities`. The earlier installed-distribution test masked the
+defect by importing from a flattened sibling `--target` install through
+`PYTHONPATH`.
+
+The repair must keep source checkout behavior, fall back to `sys.prefix` for
+wheel data files, retain the early dependency-neutral read-only boundary, and
+prove the normal installed module/resource origins without borrowing the
+source tree or target install. It must not duplicate or regenerate the Jira
+workflow.
+
 ## Reviewer disagreements
 
-Fable did not report LGR-001 through LGR-003 and described its scoped-reference checks as passing. That absence is not a rebuttal: independent validation reproduced the incomplete publication and over-broad slash classifier. Codex did not report LGR-005 or LGR-006; independent validation reproduced both. The reviewers agreed independently on LGR-004, although Codex rated it Important and Fable rated it Minor. The consolidated severity is Important because byte-identical legacy output is an explicit compatibility requirement.
+The first Fable report did not report LGR-001 through LGR-003 and described its
+scoped-reference checks as passing. That absence is not a rebuttal: independent
+validation reproduced the incomplete publication and over-broad slash
+classifier. Codex did not report LGR-005 or LGR-006; independent validation
+reproduced both. The first reviewers agreed independently on LGR-004, although
+Codex rated it Important and Fable rated it Minor. The consolidated severity
+is Important because byte-identical legacy output is an explicit compatibility
+requirement.
+
+The authenticated Fable rerun found LGR-007 but missed several already
+reproduced candidate defects and interpreted the legacy byte-identity
+requirement too loosely. Those omissions do not reverse the earlier evidence.
+Conversely, LGR-007 is not rejected merely because neither first report found
+it: the independent normal-venv reproduction confirms its production path and
+wrong observable result.
 
 ## Deferred duplicate-dependency concern
 
@@ -83,10 +128,22 @@ Both candidate and merge base accept `depends_on: [a, a]`. Changing Hermes admis
 
 ## Verification record and limitations
 
-Fable's detached candidate checkout completed the required 11-file focused battery with 1,192 passing tests, the installed-distribution integration with 1 passing test, and Ruff successfully with one pre-existing warning. Codex's sandboxed test attempts encountered environment-specific macOS `sysctl` and cache restrictions; those are not counted as candidate failures or passes. `git diff --check` passed for the immutable range.
+The first Fable detached checkout completed the required 11-file focused
+battery with 1,192 passing tests, the installed-distribution integration with
+1 passing test, and Ruff successfully with one pre-existing warning. Codex's
+sandboxed test attempts encountered environment-specific macOS `sysctl` and
+cache restrictions; those are not counted as candidate failures or passes.
+The authenticated Fable rerun could inspect Git and source but its permission
+harness denied Python, the test runner, Ruff, and the Windows audit; none of
+those denied commands is counted as a pass. `git diff --check` passed for the
+immutable range.
 
 No native Windows verification was performed. No report or reconciliation result represents Windows installed-distribution behavior as passing.
 
 ## Remediation gate
 
-The branch may proceed only after all six confirmed defects have behavior-first regression tests, focused verification passes, a fresh code review accepts the remediation, and the complete branch receives final verification. The review artifacts themselves do not authorize merging, pushing, or beginning Workflow Studio Phase B.
+The branch may proceed only after all seven confirmed defects have
+behavior-first regression tests, focused verification passes, a fresh code
+review accepts the remediation, and the complete branch receives final
+verification. The review artifacts themselves do not authorize merging,
+pushing, or beginning Workflow Studio Phase B.
