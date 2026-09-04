@@ -416,6 +416,11 @@ def test_marketplace_public_review_and_request_models_are_strict() -> None:
         "https://example.com/company/workflows.git?authToken=secret",
         "https://example.com/company/workflows.git?authorizationToken=secret",
         "https://example.com/company/workflows.git?clientSecret=secret",
+        "https://example.com/company/workflows.git?apikey=secret",
+        "https://example.com/company/workflows.git?accesstoken=secret",
+        "https://example.com/company/workflows.git?privatekey=secret",
+        "https://example.com/company/workflows.git?secretkey=secret",
+        "https://example.com/company/workflows.git?securitytoken=secret",
     ],
 )
 @pytest.mark.parametrize("model_name", ["source", "direct_install", "provenance"])

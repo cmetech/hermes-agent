@@ -44,6 +44,32 @@ _CREDENTIAL_PARAMETER_WORDS = frozenset({
     "signature",
     "token",
 })
+_CREDENTIAL_COMPOUND_QUALIFIERS = (
+    "access",
+    "api",
+    "auth",
+    "authorization",
+    "aws",
+    "azure",
+    "client",
+    "deploy",
+    "github",
+    "gitlab",
+    "google",
+    "oauth",
+    "private",
+    "secret",
+    "security",
+)
+_CREDENTIAL_COMPOUND_SUFFIXES = (
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "secret",
+    "signature",
+    "token",
+)
 
 BoundedText = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=256)]
@@ -76,6 +102,30 @@ def _parameter_name_words(name: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", separated.casefold()))
 
 
+def _is_credential_qualifier_sequence(value: str) -> bool:
+    reachable = {0}
+    for start in range(len(value)):
+        if start not in reachable:
+            continue
+        reachable.update(
+            start + len(qualifier)
+            for qualifier in _CREDENTIAL_COMPOUND_QUALIFIERS
+            if value.startswith(qualifier, start)
+        )
+    return bool(value) and len(value) in reachable
+
+
+def _parameter_name_contains_credentials(name: str) -> bool:
+    if _parameter_name_words(name) & _CREDENTIAL_PARAMETER_WORDS:
+        return True
+    compact_name = re.sub(r"[^a-z0-9]+", "", name.casefold())
+    return any(
+        compact_name.endswith(suffix)
+        and _is_credential_qualifier_sequence(compact_name[: -len(suffix)])
+        for suffix in _CREDENTIAL_COMPOUND_SUFFIXES
+    )
+
+
 def _require_credential_free_repository_identity(value: str) -> str:
     value = _require_clean_text(value, label="repository identity")
     try:
@@ -88,7 +138,7 @@ def _require_credential_free_repository_identity(value: str) -> str:
         raise ValueError("repository identity must not contain credentials")
     for parameters in (parsed.params, parsed.query, parsed.fragment):
         for name, _ in parse_qsl(parameters, keep_blank_values=True):
-            if _parameter_name_words(name) & _CREDENTIAL_PARAMETER_WORDS:
+            if _parameter_name_contains_credentials(name):
                 raise ValueError("repository identity must not contain credentials")
     return value
 
