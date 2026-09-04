@@ -2395,7 +2395,8 @@ def _interpolation_values(
                 yield from _interpolation_values(item, tail, (*concrete, index))
         return
     if isinstance(value, Mapping) and field in value:
-        yield from _interpolation_values(value[field], tail, (*concrete, field))
+        mapping = cast(Mapping[str, object], value)
+        yield from _interpolation_values(mapping[field], tail, (*concrete, field))
 
 
 def _interpolation_strings(

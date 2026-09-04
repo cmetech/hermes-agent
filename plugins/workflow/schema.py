@@ -808,8 +808,8 @@ def _loop_group_work_bounds(
             node.value,
             node.options,
         )
-        multiplier: Any = raw_multiplier
-        retries: Any = raw_retries
+        multiplier = cast(Any, raw_multiplier)
+        retries = cast(Any, raw_retries)
         executions += multiplier
         attempts += multiplier * (int(retries) + 1)
     return (
