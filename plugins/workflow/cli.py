@@ -156,15 +156,20 @@ class _WorkflowArgumentParser(argparse.ArgumentParser):
         return parsed, extras
 
     def error(self, message: str) -> None:
+        safe_message = "workflow command arguments are invalid"
         if not self._machine_mode:
-            argparse.ArgumentParser.error(self, message)
+            self.print_usage(sys.stderr)
+            self.exit(
+                EXIT_INVOCATION,
+                f"{self.prog}: error: {safe_message}\n",
+            )
         parts = self.prog.split()
         action = (
             " ".join(parts[-2:])
             if len(parts) >= 2 and parts[-2] == "showcase"
             else parts[-1]
         )
-        error = MachineError("invalid_request", message)
+        error = MachineError("invalid_request", safe_message)
         # The top-level CLI first probes subcommand parsing with stderr replaced
         # by a StringIO, then retries failures with the normal parser settings.
         # Keep that discarded probe's machine envelope on the discarded stream

@@ -18,6 +18,9 @@ from plugins.workflow.marketplace.models import (
     InstalledPackageIdentity,
     InstallReview,
     PackageReviewAssessment,
+    PackageDiagnostic,
+    PackageInspection,
+    PackageInspectionResource,
     RemoveReview,
     RequirementChanges,
     StringSetChange,
@@ -25,8 +28,10 @@ from plugins.workflow.marketplace.models import (
     UpdateCheck,
     UpdateReview,
     WorkflowCompatibilityChanges,
+    WorkflowCompatibilityIdentity,
     WorkflowMarketplaceSource,
     WorkflowRiskChanges,
+    WorkflowRiskIdentity,
     WorkflowTrustReviewItem,
 )
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
@@ -149,6 +154,58 @@ def _installed(
     )
 
 
+def _inspection(*, installed: bool = True) -> PackageInspection:
+    installed_package = _installed() if installed else None
+    return PackageInspection(
+        identifier="company/laptop-support",
+        identity=_identity(),
+        sourceName="company",
+        repositoryUrl="ssh://git@example.test/team/workflows.git",
+        configuredRef="main",
+        resolvedCommit=_COMMIT,
+        verifiedAt=_NOW,
+        verified=True,
+        sourceState="fresh",
+        id="laptop-support",
+        version="1.0.0",
+        displayName="Laptop Support",
+        description="Diagnostic and repair workflows",
+        license="MIT",
+        publisher="Example Company",
+        tags=["diagnostics", "support"],
+        packagePath="packages/laptop-support",
+        contractVersion=1,
+        packageDigest=_DIGEST,
+        workflows=[_rich_workflow_review()],
+        resources=[
+            PackageInspectionResource(path="commands/diagnose.md", types=["command"]),
+            PackageInspectionResource(path="mcp/support.yaml", types=["mcp"]),
+            PackageInspectionResource(path="scripts/collect.py", types=["script"]),
+            PackageInspectionResource(path="workflow-package.json", types=["other"]),
+            PackageInspectionResource(
+                path="workflows/laptop-diagnostic.hermes.yaml",
+                types=["workflow_companion"],
+            ),
+            PackageInspectionResource(
+                path="workflows/laptop-diagnostic.yaml",
+                types=["workflow_definition"],
+            ),
+        ],
+        externalRequirements=_rich_requirements(),
+        blockers=[],
+        advisories=[
+            PackageDiagnostic(
+                code="missing_runtime",
+                message="destination needs python",
+                severity="advisory",
+            )
+        ],
+        installStatus="installed" if installed else "not_installed",
+        updateStatus="current" if installed else "not_applicable",
+        installed=installed_package,
+    )
+
+
 def _empty_changes() -> StringSetChange:
     return StringSetChange(added=[], removed=[])
 
@@ -221,6 +278,172 @@ def _trust_review() -> TrustReview:
             "workflows/laptop-diagnostic.yaml",
         ],
         workflows=[_workflow_review()],
+    )
+
+
+def _rich_requirements() -> ExternalRequirements:
+    return ExternalRequirements(
+        runtimes=["python"],
+        tools=["git"],
+        providers=["anthropic"],
+        services=["ticketing"],
+        secrets=["SUPPORT_TOKEN"],
+    )
+
+
+def _rich_workflow_review() -> WorkflowTrustReviewItem:
+    return _workflow_review().model_copy(
+        update={
+            "companion_path": "workflows/laptop-diagnostic.hermes.yaml",
+            "shell_or_script_nodes": ["collect"],
+            "command_nodes": ["diagnose"],
+            "approval_nodes": ["approve-fix"],
+            "command_resources": ["commands/diagnose.md"],
+            "script_resources": ["scripts/collect.py"],
+            "mcp_resources": ["mcp/support.yaml"],
+            "requested_tools": ["git"],
+            "requested_skills": ["support-triage"],
+            "local_mcp_servers": ["local-support"],
+            "remote_mcp_servers": ["remote-support"],
+            "providers": ["anthropic"],
+            "outward_action_nodes": ["open-ticket"],
+            "required_secrets": ["SUPPORT_TOKEN"],
+            "external_requirements": _rich_requirements(),
+            "compatibility": [
+                PackageDiagnostic(
+                    code="provider_authority_missing",
+                    message="provider access must be configured",
+                    severity="advisory",
+                )
+            ],
+        }
+    )
+
+
+def _rich_assessment() -> PackageReviewAssessment:
+    return _assessment().model_copy(
+        update={
+            "blockers": [
+                PackageDiagnostic(
+                    code="workflow_contract_blocked",
+                    message="contract review blocker",
+                    severity="blocker",
+                )
+            ],
+            "advisories": [
+                PackageDiagnostic(
+                    code="missing_runtime",
+                    message="destination needs python",
+                    severity="advisory",
+                )
+            ],
+            "external_requirements": _rich_requirements(),
+            "package_resources": [
+                "commands/diagnose.md",
+                "mcp/support.yaml",
+                "scripts/collect.py",
+                "workflow-package.json",
+                "workflows/laptop-diagnostic.hermes.yaml",
+                "workflows/laptop-diagnostic.yaml",
+            ],
+        }
+    )
+
+
+def _rich_install_review() -> InstallReview:
+    return _install_review().model_copy(
+        update={
+            "assessment": _rich_assessment(),
+            "workflow_reviews": [_rich_workflow_review()],
+            "file_changes": [
+                FileDigestChange(
+                    path="workflow-package.json",
+                    kind="added",
+                    candidateDigest=_DIGEST,
+                )
+            ],
+        }
+    )
+
+
+def _rich_update_review() -> UpdateReview:
+    return _update_review().model_copy(
+        update={
+            "file_changes": [
+                FileDigestChange(
+                    path="added.txt", kind="added", candidateDigest="7" * 64
+                ),
+                FileDigestChange(
+                    path="modified.txt",
+                    kind="modified",
+                    oldDigest="8" * 64,
+                    candidateDigest="9" * 64,
+                ),
+                FileDigestChange(
+                    path="removed.txt", kind="removed", oldDigest="a" * 64
+                ),
+                FileDigestChange(
+                    path="renamed-new.txt",
+                    kind="renamed",
+                    oldPath="renamed-old.txt",
+                    oldDigest="b" * 64,
+                    candidateDigest="b" * 64,
+                ),
+            ],
+            "workflow_changes": StringSetChange(
+                added=["new-workflow"], removed=["old-workflow"]
+            ),
+            "requirement_changes": RequirementChanges(
+                runtimes=StringSetChange(added=["python"], removed=["node"]),
+                tools=StringSetChange(added=["git"], removed=[]),
+                providers=StringSetChange(added=["anthropic"], removed=[]),
+                services=StringSetChange(added=["ticketing"], removed=[]),
+                secrets=StringSetChange(added=["SUPPORT_TOKEN"], removed=[]),
+            ),
+            "risk_changes": WorkflowRiskChanges(
+                added=[
+                    WorkflowRiskIdentity(
+                        workflowName="new-workflow",
+                        packageDigest="c" * 64,
+                        riskDigest="d" * 64,
+                    )
+                ],
+                removed=[
+                    WorkflowRiskIdentity(
+                        workflowName="old-workflow",
+                        packageDigest="e" * 64,
+                        riskDigest="f" * 64,
+                    )
+                ],
+            ),
+            "compatibility_changes": WorkflowCompatibilityChanges(
+                added=[
+                    WorkflowCompatibilityIdentity(
+                        workflowName="new-workflow",
+                        code="missing_provider",
+                        severity="advisory",
+                    )
+                ],
+                removed=[
+                    WorkflowCompatibilityIdentity(
+                        workflowName="old-workflow",
+                        code="old_blocker",
+                        severity="blocker",
+                    )
+                ],
+            ),
+            "assessment": _rich_assessment(),
+            "workflow_reviews": [_rich_workflow_review()],
+        }
+    )
+
+
+def _rich_trust_review() -> TrustReview:
+    return _trust_review().model_copy(
+        update={
+            "package_resources": _rich_assessment().package_resources,
+            "workflows": [_rich_workflow_review()],
+        }
     )
 
 
@@ -300,7 +523,7 @@ class FakeMarketplaceService:
 
     def inspect(self, identifier: str):
         self._record("inspect", identifier)
-        return self.search("", source="company")[0]
+        return _inspection()
 
     def installed_packages(self):
         self._record("installed_packages")
@@ -644,6 +867,193 @@ def test_interactive_install_shows_review_before_real_confirmation(
     ]
 
 
+def test_interactive_install_review_is_informed_and_decline_does_not_mutate(
+    service, capsys, monkeypatch
+) -> None:
+    review = _rich_install_review()
+    monkeypatch.setattr(
+        service,
+        "prepare_install",
+        lambda request, *, actor: (
+            service._record("prepare_install", request, actor) or review
+        ),
+    )
+    shown = []
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr(
+        "plugins.workflow.marketplace.cli._read_confirmation",
+        lambda _prompt: shown.append(capsys.readouterr().out) or False,
+    )
+
+    code, _, _ = _run(_parser(), capsys, "install", "company/laptop-support")
+
+    assert code == 0
+    rendered = shown[0]
+    for detail in (
+        "Source: company",
+        "Destination identity: company/laptop-support",
+        "Candidate version: 1.0.0",
+        f"Candidate commit: {_COMMIT}",
+        f"Candidate digest: {_DIGEST}",
+        "Package path: packages/laptop-support",
+        "File changes (1)",
+        "added: workflow-package.json",
+        "Candidate workflow risks (1)",
+        f"package={_DIGEST}",
+        f"risk={_RISK_DIGEST}",
+        "External requirements",
+        "runtimes: python",
+        "Blockers (1)",
+        "workflow_contract_blocked",
+        "Advisories (1)",
+        "missing_runtime",
+    ):
+        assert detail in rendered
+    assert [call[0] for call in service.calls] == ["prepare_install"]
+
+
+def test_interactive_update_review_renders_every_change_and_decline_is_read_only(
+    service, capsys, monkeypatch
+) -> None:
+    review = _rich_update_review()
+    monkeypatch.setattr(
+        service,
+        "prepare_update",
+        lambda identity, *, actor: (
+            service._record("prepare_update", identity, actor) or review
+        ),
+    )
+    shown = []
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr(
+        "plugins.workflow.marketplace.cli._read_confirmation",
+        lambda _prompt: shown.append(capsys.readouterr().out) or False,
+    )
+
+    code, _, _ = _run(_parser(), capsys, "update", "company/laptop-support")
+
+    assert code == 0
+    rendered = shown[0]
+    for detail in (
+        "Old version: 1.0.0",
+        "Candidate version: 2.0.0",
+        "Old commit:",
+        f"Candidate commit: {_COMMIT}",
+        "Old digest:",
+        f"Candidate digest: {_DIGEST}",
+        "added: added.txt",
+        "modified: modified.txt",
+        "removed: removed.txt",
+        "renamed: renamed-old.txt -> renamed-new.txt",
+        "Workflow membership changes",
+        "+ new-workflow",
+        "- old-workflow",
+        "Requirement changes",
+        "runtimes + python",
+        "runtimes - node",
+        "Risk changes",
+        "new-workflow",
+        "Compatibility changes",
+        "missing_provider",
+        "Blockers (1)",
+        "Advisories (1)",
+    ):
+        assert detail in rendered
+    assert [call[0] for call in service.calls] == ["prepare_update"]
+
+
+def test_interactive_remove_review_names_provenance_and_trust_scope_before_decline(
+    service, capsys, monkeypatch
+) -> None:
+    review = _remove_review()
+    monkeypatch.setattr(
+        service,
+        "prepare_remove",
+        lambda identity, *, actor: (
+            service._record("prepare_remove", identity, actor) or review
+        ),
+    )
+    shown = []
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr(
+        "plugins.workflow.marketplace.cli._read_confirmation",
+        lambda _prompt: shown.append(capsys.readouterr().out) or False,
+    )
+
+    code, _, _ = _run(_parser(), capsys, "uninstall", "company/laptop-support")
+
+    assert code == 0
+    rendered = shown[0]
+    for detail in (
+        "Installed identity: company/laptop-support",
+        "Current version: 1.0.0",
+        f"Current commit: {_COMMIT}",
+        f"Distribution digest: {_DIGEST}",
+        "Installed provenance removed: company/laptop-support",
+        "Trust origin removed: marketplace:company/laptop-support",
+        "Workflows removed (1)",
+        "laptop-diagnostic",
+    ):
+        assert detail in rendered
+    assert [call[0] for call in service.calls] == ["prepare_remove"]
+
+
+def test_interactive_trust_review_shows_complete_risk_surface_before_decline(
+    service, capsys, monkeypatch
+) -> None:
+    review = _rich_trust_review()
+    monkeypatch.setattr(
+        service,
+        "review_trust",
+        lambda identity, *, actor, workflow_name=None: (
+            service._record("review_trust", identity, actor, workflow_name) or review
+        ),
+    )
+    shown = []
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr(
+        "plugins.workflow.marketplace.cli._read_confirmation",
+        lambda _prompt: shown.append(capsys.readouterr().out) or False,
+    )
+
+    code, _, _ = _run(_parser(), capsys, "trust", "company/laptop-support")
+
+    assert code == 0
+    rendered = shown[0]
+    for detail in (
+        "Source: company",
+        "Version: 1.0.0",
+        f"Exact commit: {_COMMIT}",
+        f"Distribution digest: {_DIGEST}",
+        "Package-owned resources (6)",
+        "commands/diagnose.md",
+        "Workflow: laptop-diagnostic",
+        "Definition: workflows/laptop-diagnostic.yaml",
+        "Companion: workflows/laptop-diagnostic.hermes.yaml",
+        f"Effective package digest: {_DIGEST}",
+        f"Risk digest: {_RISK_DIGEST}",
+        "Package resource set: package (see shared table above)",
+        "Shell/script nodes: collect",
+        "Command nodes: diagnose",
+        "Approval nodes: approve-fix",
+        "Command resources: commands/diagnose.md",
+        "Script resources: scripts/collect.py",
+        "MCP resources: mcp/support.yaml",
+        "Local MCP servers: local-support",
+        "Remote MCP servers: remote-support",
+        "Requested tools: git",
+        "Requested skills: support-triage",
+        "Providers: anthropic",
+        "Outward action nodes: open-ticket",
+        "Required secrets: SUPPORT_TOKEN",
+        "runtimes: python",
+        "Compatibility findings (1)",
+        "provider_authority_missing",
+    ):
+        assert detail in rendered
+    assert [call[0] for call in service.calls] == ["review_trust"]
+
+
 def test_non_tty_interactive_mutation_refuses_without_preparing(
     service, capsys
 ) -> None:
@@ -725,6 +1135,115 @@ def test_source_search_inspect_installed_and_check_commands_are_deterministic(
         "company",
         "zulu",
     ]
+
+
+def test_human_inspect_renders_complete_deterministic_package_detail(
+    service, capsys
+) -> None:
+    code, captured, _ = _run(_parser(), capsys, "inspect", "company/laptop-support")
+
+    assert code == 0
+    assert captured.err == ""
+    for detail in (
+        "Package: company/laptop-support",
+        "Display name: Laptop Support",
+        "Source: company",
+        "Publisher: Example Company",
+        "Version: 1.0.0",
+        "Description: Diagnostic and repair workflows",
+        "Tags: diagnostics, support",
+        "License: MIT",
+        "Repository: ssh://git@example.test/team/workflows.git",
+        "Configured ref: main",
+        f"Exact commit: {_COMMIT}",
+        f"Verified at: {_NOW}",
+        "Verified: yes",
+        "Source status: fresh",
+        "Package path: packages/laptop-support",
+        "Contract version: 1",
+        f"Distribution digest: {_DIGEST}",
+        "Install status: installed",
+        "Update status: current",
+        "Package resources (6)",
+        "commands/diagnose.md [command]",
+        "mcp/support.yaml [mcp]",
+        "Workflow: laptop-diagnostic",
+        "Definition: workflows/laptop-diagnostic.yaml",
+        "Companion: workflows/laptop-diagnostic.hermes.yaml",
+        "Current trust: untrusted",
+        "Compatibility findings (1)",
+        "provider_authority_missing",
+        "External requirements",
+        "runtimes: python",
+        "Advisories (1)",
+        "missing_runtime",
+        "Installed provenance",
+        "Installed version: 1.0.0",
+        f"Installed commit: {_COMMIT}",
+        "Installed actor: cli",
+    ):
+        assert detail in captured.out
+    assert (
+        captured.out.index("commands/diagnose.md [command]")
+        < captured.out.index("mcp/support.yaml [mcp]")
+        < captured.out.index("scripts/collect.py [script]")
+    )
+
+
+def test_human_inspect_handles_empty_optional_detail(
+    service, capsys, monkeypatch
+) -> None:
+    inspection = _inspection(installed=False).model_copy(
+        update={
+            "configured_ref": None,
+            "workflows": [_workflow_review()],
+            "external_requirements": _requirements(),
+            "advisories": [],
+        }
+    )
+    monkeypatch.setattr(service, "inspect", lambda _identifier: inspection)
+
+    code, captured, _ = _run(_parser(), capsys, "inspect", "company/laptop-support")
+
+    assert code == 0
+    assert "Configured ref: default" in captured.out
+    assert "Companion: none" in captured.out
+    assert "Install status: not_installed" in captured.out
+    assert "Update status: not_applicable" in captured.out
+    assert "Advisories (0)" in captured.out
+    assert "Installed provenance: none" in captured.out
+
+
+def test_human_inspect_sanitizes_defensive_source_and_provenance_text(
+    service, capsys, monkeypatch
+) -> None:
+    payload = _inspection().model_dump(mode="json")
+    payload["repository_url"] = (
+        "https://alice:supersecret@example.test/private.git?token=hidden"
+    )
+    payload["description"] = "password swordfish at /Users/alice/private/staging"
+    payload["package_path"] = "/private/tmp/marketplace-staging"
+    payload["installed"]["actor"] = "api-key ultra-secret"
+    payload["advisories"][0]["message"] = "token leaked-value"
+    monkeypatch.setattr(service, "inspect", lambda _identifier: payload)
+
+    code, captured, _ = _run(_parser(), capsys, "inspect", "company/laptop-support")
+
+    assert code == 0
+    rendered = captured.out + captured.err
+    for secret in (
+        "alice:",
+        "supersecret",
+        "hidden",
+        "swordfish",
+        "/Users/alice/private/staging",
+        "/private/tmp/marketplace-staging",
+        "ultra-secret",
+        "leaked-value",
+    ):
+        assert secret not in rendered
+    assert "example.test/private.git" in rendered
+    assert "[REDACTED_PATH]" in rendered
 
 
 def test_source_add_refresh_one_refresh_all_and_remove_delegate_to_service(
@@ -1143,6 +1662,122 @@ def test_legacy_loose_workflow_paths_with_slashes_keep_their_original_routing(
 
     assert args.func(args) == 29
     assert calls == ["/tmp/workflows/sample.yaml"]
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("action", "extra_arguments", "legacy_handler"),
+    [
+        ("trust", ["--digest", _DIGEST], "_cmd_trust"),
+        ("untrust", [], "_cmd_untrust"),
+    ],
+)
+def test_existing_extensionless_relative_file_routes_to_legacy_workflow_command(
+    action,
+    extra_arguments,
+    legacy_handler,
+    tmp_path,
+    monkeypatch,
+    service,
+) -> None:
+    workflow = tmp_path / "directory" / "workflow"
+    workflow.parent.mkdir()
+    workflow.write_text("legacy bytes", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        f"plugins.workflow.cli.{legacy_handler}",
+        lambda args: calls.append(args.name) or 29,
+    )
+
+    args = _parser().parse_args([action, "directory/workflow", *extra_arguments])
+
+    assert args.func(args) == 29
+    assert calls == ["directory/workflow"]
+    assert service.calls == []
+
+
+def test_existing_extensionless_symlink_matches_legacy_resolver_semantics(
+    tmp_path, monkeypatch, service
+) -> None:
+    target = tmp_path / "workflow-target"
+    target.write_text("legacy bytes", encoding="utf-8")
+    link = tmp_path / "directory" / "workflow-link"
+    link.parent.mkdir()
+    link.symlink_to(target)
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_untrust",
+        lambda args: calls.append(args.name) or 29,
+    )
+
+    args = _parser().parse_args(["untrust", "directory/workflow-link"])
+
+    assert args.func(args) == 29
+    assert calls == ["directory/workflow-link"]
+    assert service.calls == []
+
+
+def test_nonexistent_slash_target_defaults_to_marketplace_identity(
+    service, capsys
+) -> None:
+    code, _, envelope = _run(
+        _parser(), capsys, "untrust", "directory/workflow", "--json"
+    )
+
+    assert code == 0
+    assert envelope["result"]["identity"] == {
+        "source_key": "directory",
+        "package_id": "workflow",
+    }
+    assert service.calls == [("revoke_trust", _identity("directory", "workflow"), None)]
+
+
+def test_explicit_installed_package_overrides_existing_path_collision(
+    tmp_path, monkeypatch, service, capsys
+) -> None:
+    collision = tmp_path / "company" / "laptop-support"
+    collision.parent.mkdir()
+    collision.write_text("legacy bytes", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    code, _, envelope = _run(
+        _parser(),
+        capsys,
+        "untrust",
+        "company/laptop-support",
+        "--installed-package",
+        "--json",
+    )
+
+    assert code == 0
+    assert envelope["result"]["status"] == "untrusted"
+    assert service.calls == [("revoke_trust", _identity(), None)]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp/workflows/extensionless",
+        "./directory/extensionless",
+        "../directory/extensionless",
+        "directory/workflow.yaml",
+        "directory/workflow.yml",
+    ],
+)
+def test_legacy_path_syntax_parity_does_not_require_file_existence(
+    path, monkeypatch, service
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "plugins.workflow.cli._cmd_untrust",
+        lambda args: calls.append(args.name) or 29,
+    )
+    args = _parser().parse_args(["untrust", path])
+
+    assert args.func(args) == 29
+    assert calls == [path]
     assert service.calls == []
 
 

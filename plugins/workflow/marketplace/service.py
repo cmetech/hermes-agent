@@ -54,6 +54,9 @@ from .models import (
     InstalledPackageProvenance,
     InstallReview,
     PackageDiagnostic,
+    PackageInspection,
+    PackageInspectionResource,
+    PackageInspectionResourceType,
     PackageReviewAssessment,
     RemoveReview,
     RequirementChanges,
@@ -93,6 +96,10 @@ _TRUST_TOKEN_LIMIT = 256
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,4096}$", re.ASCII)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _DIRECT_PREFIX = "direct-"
+_CREDENTIAL_VALUE = re.compile(
+    r"(?i)\b(token|password|secret|authorization|api[_-]?key)\b"
+    r"(\s*(?::|=|\bis\b)?\s+)([^\s,;]+)"
+)
 _DESTINATION_ADVISORY_CODES = frozenset({
     "execution_environment_unavailable",
     "mcp_isolation",
@@ -135,6 +142,7 @@ def _safe_message(message: object, repository_url: str = "") -> str:
         args=(), returncode=1, stdout="", stderr=str(message)
     )
     rendered = safe_git_error(result, repository_url).strip()
+    rendered = _CREDENTIAL_VALUE.sub(r"\1 [REDACTED]", rendered)
     if not rendered:
         rendered = "workflow marketplace operation failed"
     return rendered.encode("utf-8")[:4000].decode("utf-8", errors="ignore")
@@ -655,8 +663,153 @@ class WorkflowMarketplaceService:
     ) -> tuple[CatalogPackage, ...]:
         return self.catalog.search(query, source=source, limit=limit)
 
-    def inspect(self, identifier: str) -> CatalogPackage:
-        return self.catalog.inspect(identifier)
+    def inspect(
+        self,
+        identifier: str,
+        *,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> PackageInspection:
+        cached = self.catalog.inspect(identifier)
+        with self._fetch_registered(
+            cached.source_name,
+            cached.id,
+            cancelled=cancelled,
+        ) as fetched:
+            workflows, blockers = self._assess_distribution(
+                fetched.distribution,
+                fetched.identity,
+                fetched.source_name,
+            )
+            assessment = self._assessment(
+                fetched.distribution,
+                workflows,
+                blockers,
+                review_digest=fetched.distribution.digest,
+            )
+            installed = self._optional_installed(fetched.identity)
+            installed_projection = None
+            update_status: Literal["not_applicable", "current", "update_available"] = (
+                "not_applicable"
+            )
+            if installed is not None:
+                installed_distribution = load_distribution(
+                    self.installed_store.package_root(installed.identity),
+                    expected_digest=installed.distribution_digest,
+                )
+                candidate_version = fetched.distribution.manifest.version
+                installed_version = installed_distribution.manifest.version
+                candidate_key = _semver_key(candidate_version)
+                installed_key = _semver_key(installed_version)
+                if candidate_key < installed_key:
+                    _fail(
+                        "package_version_regression",
+                        "candidate package version is older than the installed version",
+                    )
+                if (
+                    candidate_key == installed_key
+                    and fetched.distribution.digest != installed_distribution.digest
+                ):
+                    _fail(
+                        "package_version_conflict",
+                        "candidate changed bytes without advancing package version",
+                    )
+                update_status = (
+                    "current"
+                    if fetched.distribution.digest == installed_distribution.digest
+                    else "update_available"
+                )
+                projected = self._installed_projection(installed)
+                installed_projection = projected.model_copy(
+                    update={
+                        "configured_ref": (
+                            _safe_message(
+                                projected.configured_ref,
+                                projected.repository_url,
+                            )
+                            if projected.configured_ref is not None
+                            else None
+                        ),
+                        "actor": _safe_message(
+                            projected.actor,
+                            projected.repository_url,
+                        ),
+                    }
+                )
+            manifest = fetched.distribution.manifest
+            return PackageInspection.model_validate({
+                "identifier": f"{fetched.source_name}/{manifest.id}",
+                "identity": fetched.identity,
+                "sourceName": fetched.source_name,
+                "repositoryUrl": fetched.repository_url,
+                "configuredRef": (
+                    _safe_message(fetched.configured_ref, fetched.repository_url)
+                    if fetched.configured_ref is not None
+                    else None
+                ),
+                "resolvedCommit": fetched.resolved_commit,
+                "verifiedAt": cached.verified_at,
+                "verified": True,
+                "sourceState": cached.state,
+                "id": manifest.id,
+                "version": manifest.version,
+                "displayName": _safe_message(
+                    manifest.display_name, fetched.repository_url
+                ),
+                "description": _safe_message(
+                    manifest.description, fetched.repository_url
+                ),
+                "license": _safe_message(manifest.license, fetched.repository_url),
+                "publisher": _safe_message(manifest.publisher, fetched.repository_url),
+                "tags": sorted(manifest.tags),
+                "packagePath": fetched.package_path,
+                "contractVersion": 1,
+                "packageDigest": fetched.distribution.digest,
+                "workflows": workflows,
+                "resources": self._inspection_resources(
+                    fetched.distribution,
+                    workflows,
+                ),
+                "externalRequirements": assessment.external_requirements,
+                "blockers": assessment.blockers,
+                "advisories": assessment.advisories,
+                "installStatus": (
+                    "installed" if installed is not None else "not_installed"
+                ),
+                "updateStatus": update_status,
+                "installed": installed_projection,
+            })
+
+    @staticmethod
+    def _inspection_resources(
+        distribution: WorkflowDistribution,
+        workflows: list[WorkflowTrustReviewItem],
+    ) -> list[PackageInspectionResource]:
+        roles: dict[str, set[PackageInspectionResourceType]] = {}
+
+        def add(paths: Iterable[str], role: PackageInspectionResourceType) -> None:
+            for path in paths:
+                roles.setdefault(path, set()).add(role)
+
+        add((item.definition_path for item in workflows), "workflow_definition")
+        add(
+            (
+                item.companion_path
+                for item in workflows
+                if item.companion_path is not None
+            ),
+            "workflow_companion",
+        )
+        for item in workflows:
+            add(item.command_resources, "command")
+            add(item.script_resources, "script")
+            add(item.mcp_resources, "mcp")
+        return [
+            PackageInspectionResource(
+                path=path,
+                types=sorted(roles.get(path, {"other"})),
+            )
+            for path in sorted(distribution.covered_paths)
+        ]
 
     def installed_packages(self) -> tuple[InstalledPackage, ...]:
         return tuple(

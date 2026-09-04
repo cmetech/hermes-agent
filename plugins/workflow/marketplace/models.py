@@ -48,6 +48,14 @@ TagName = Annotated[
     str,
     StringConstraints(min_length=1, max_length=64, pattern=TAG_PATTERN),
 ]
+PackageInspectionResourceType = Literal[
+    "command",
+    "mcp",
+    "other",
+    "script",
+    "workflow_companion",
+    "workflow_definition",
+]
 
 
 class StrictMarketplaceModel(BaseModel):
@@ -730,6 +738,171 @@ class InstalledPackage(StrictMarketplaceModel):
         return _require_credential_free_repository_identity(value)
 
 
+class PackageInspectionResource(StrictMarketplaceModel):
+    """One package-owned path and its statically determined resource roles."""
+
+    path: str = Field(
+        min_length=1,
+        max_length=1024,
+        json_schema_extra={"pattern": CANONICAL_RELATIVE_PATH_PATTERN},
+    )
+    types: list[PackageInspectionResourceType] = Field(min_length=1, max_length=6)
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        return _require_canonical_relative_path(value)
+
+    @field_validator("types")
+    @classmethod
+    def validate_types(cls, value: list[str]) -> list[str]:
+        if value != sorted(value) or len(value) != len(set(value)):
+            raise ValueError("inspection resource types must be unique and sorted")
+        return value
+
+
+class PackageInspection(StrictMarketplaceModel):
+    """Verified exact-byte package detail safe for CLI and API inspection."""
+
+    identifier: str = Field(min_length=3, max_length=129)
+    identity: InstalledPackageIdentity
+    source_name: str = Field(
+        alias="sourceName", min_length=1, max_length=64, pattern=SOURCE_NAME_PATTERN
+    )
+    repository_url: str = Field(alias="repositoryUrl", min_length=1, max_length=4096)
+    configured_ref: str | None = Field(
+        default=None, alias="configuredRef", min_length=1, max_length=1024
+    )
+    resolved_commit: str = Field(alias="resolvedCommit", pattern=r"^[0-9a-f]{40}$")
+    verified_at: str = Field(alias="verifiedAt", min_length=20, max_length=64)
+    verified: Literal[True]
+    source_state: Literal[
+        "fresh",
+        "stale",
+        "disabled",
+        "authentication-failed",
+        "malformed",
+        "incompatible",
+        "unavailable",
+        "cancelled",
+    ] = Field(alias="sourceState")
+    id: str = Field(min_length=1, max_length=64, pattern=PACKAGE_ID_PATTERN)
+    version: str = Field(
+        min_length=1,
+        max_length=128,
+        json_schema_extra={"pattern": SEMANTIC_VERSION_PATTERN},
+    )
+    display_name: ShortText = Field(alias="displayName")
+    description: BoundedText
+    license: ShortText
+    publisher: ShortText
+    tags: list[TagName] = Field(min_length=1, max_length=64)
+    package_path: str = Field(
+        alias="packagePath",
+        min_length=1,
+        max_length=1024,
+        json_schema_extra={"pattern": CANONICAL_RELATIVE_PATH_PATTERN},
+    )
+    contract_version: Literal[1] = Field(alias="contractVersion")
+    package_digest: str = Field(alias="packageDigest", pattern=SHA256_PATTERN)
+    workflows: list[WorkflowTrustReviewItem] = Field(min_length=1, max_length=512)
+    resources: list[PackageInspectionResource] = Field(max_length=512)
+    external_requirements: ExternalRequirements = Field(alias="externalRequirements")
+    blockers: list[PackageDiagnostic] = Field(max_length=512)
+    advisories: list[PackageDiagnostic] = Field(max_length=512)
+    install_status: Literal["not_installed", "installed"] = Field(alias="installStatus")
+    update_status: Literal["not_applicable", "current", "update_available"] = Field(
+        alias="updateStatus"
+    )
+    installed: InstalledPackage | None = None
+
+    @field_validator("repository_url")
+    @classmethod
+    def validate_repository_url(cls, value: str) -> str:
+        return _require_credential_free_repository_identity(value)
+
+    @field_validator("configured_ref")
+    @classmethod
+    def validate_configured_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_clean_text(value, label="configured ref")
+
+    @field_validator("version")
+    @classmethod
+    def validate_version(cls, value: str) -> str:
+        if _SEMANTIC_VERSION.fullmatch(value) is None:
+            raise ValueError("version must be a semantic version")
+        return value
+
+    @field_validator("display_name", "description", "license", "publisher")
+    @classmethod
+    def validate_metadata(cls, value: str) -> str:
+        return _require_clean_text(value, label="inspection metadata")
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: list[str]) -> list[str]:
+        if value != sorted(value) or len(value) != len(set(value)):
+            raise ValueError("inspection tags must be unique and sorted")
+        return value
+
+    @field_validator("package_path")
+    @classmethod
+    def validate_package_path(cls, value: str) -> str:
+        return _require_canonical_relative_path(value)
+
+    @field_validator("workflows")
+    @classmethod
+    def validate_workflows(
+        cls, value: list[WorkflowTrustReviewItem]
+    ) -> list[WorkflowTrustReviewItem]:
+        names = [item.workflow_name for item in value]
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise ValueError("inspection workflows must be unique and sorted")
+        return value
+
+    @field_validator("resources")
+    @classmethod
+    def validate_resources(
+        cls, value: list[PackageInspectionResource]
+    ) -> list[PackageInspectionResource]:
+        paths = [item.path for item in value]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("inspection resources must be unique and sorted")
+        return value
+
+    @field_validator("blockers", "advisories")
+    @classmethod
+    def validate_diagnostics(
+        cls, value: list[PackageDiagnostic]
+    ) -> list[PackageDiagnostic]:
+        keys = [(item.code, item.message, item.severity) for item in value]
+        if keys != sorted(keys) or len(keys) != len(set(keys)):
+            raise ValueError("inspection diagnostics must be unique and sorted")
+        return value
+
+    @model_validator(mode="after")
+    def validate_identity_and_status(self) -> "PackageInspection":
+        expected = f"{self.source_name}/{self.id}"
+        if (
+            self.identifier != expected
+            or self.identity.source_key != self.source_name
+            or self.identity.package_id != self.id
+        ):
+            raise ValueError("inspection package identity is inconsistent")
+        if self.install_status == "not_installed":
+            if self.installed is not None or self.update_status != "not_applicable":
+                raise ValueError("uninstalled inspection status is inconsistent")
+        elif (
+            self.installed is None
+            or self.installed.identity != self.identity
+            or self.update_status == "not_applicable"
+        ):
+            raise ValueError("installed inspection status is inconsistent")
+        return self
+
+
 class InstallReview(StrictMarketplaceModel):
     operation: Literal["install"]
     result: Literal["review_required"] = "review_required"
@@ -857,6 +1030,9 @@ __all__ = [
     "InstalledPackage",
     "InstalledPackageIdentity",
     "InstalledPackageProvenance",
+    "PackageInspection",
+    "PackageInspectionResource",
+    "PackageInspectionResourceType",
     "PackageDiagnostic",
     "PackageReviewAssessment",
     "FileDigestChange",

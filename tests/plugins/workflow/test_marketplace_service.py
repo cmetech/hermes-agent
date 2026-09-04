@@ -12,12 +12,14 @@ import subprocess
 import threading
 
 import pytest
+from pydantic import ValidationError
 import yaml
 
 import plugins.workflow.marketplace.service as marketplace_service_module
 from plugins.workflow.marketplace.models import (
     InstallRequest,
     InstalledPackageIdentity,
+    PackageInspection,
     WorkflowMarketplaceSource,
     WorkflowPackageIndex,
 )
@@ -153,6 +155,58 @@ def _write_index(repository: Path) -> None:
     path = repository / ".well-known" / "hermes-workflows" / "index.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_json_bytes({"schemaVersion": 1, "packages": entries}))
+
+
+def _write_inspection_resources(repository: Path) -> None:
+    root = repository / "packages" / "laptop-support"
+    manifest = json.loads((root / "workflow-package.json").read_bytes())
+    for member in manifest["workflows"]:
+        definition = Path(member["definition"])
+        companion = definition.with_name(f"{definition.stem}.hermes.yaml")
+        member["companion"] = companion.as_posix()
+        (root / companion).write_text(
+            "language_compatibility: archon-2026-07\n", encoding="utf-8"
+        )
+    (root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    (root / "workflows" / "diagnostic.yaml").write_bytes(
+        yaml.safe_dump(
+            {
+                "name": "diagnostic",
+                "description": "Command workflow",
+                "nodes": [{"id": "diagnose", "command": "guide"}],
+            },
+            sort_keys=False,
+        ).encode()
+    )
+    (root / "workflows" / "repair.yaml").write_bytes(
+        yaml.safe_dump(
+            {
+                "name": "repair",
+                "description": "Script and MCP workflow",
+                "nodes": [
+                    {
+                        "id": "repair",
+                        "script": "never-run.py",
+                        "runtime": "uv",
+                        "mcp": "mixed.yaml",
+                    }
+                ],
+            },
+            sort_keys=False,
+        ).encode()
+    )
+    (root / "mcp").mkdir(exist_ok=True)
+    (root / "mcp" / "mixed.yaml").write_text(
+        "mcp_servers:\n"
+        "  local_support:\n"
+        "    command: python\n"
+        "    args: [scripts/never-run.py]\n"
+        "  remote_support:\n"
+        "    url: https://mcp.example.test/events\n"
+        "    transport: sse\n",
+        encoding="utf-8",
+    )
+    _publish(root)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -293,6 +347,157 @@ def test_registered_install_uses_fresh_repository_bytes_not_cached_listing(
 
     assert review.candidate_version == "2.0.0"
     assert review.resolved_commit == current_commit
+
+
+def test_inspect_refetches_complete_verified_detail_without_executing_content(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    _write_inspection_resources(published_repo.work)
+    published_repo.publish("publish typed inspection resources")
+    _add_and_refresh(service, published_repo)
+    cached = service.catalog.inspect("company/laptop-support")
+    root = published_repo.work / "packages" / "laptop-support"
+    manifest = json.loads((root / "workflow-package.json").read_bytes())
+    manifest["version"] = "2.0.0"
+    manifest["displayName"] = "Laptop Support Exact"
+    (root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    candidate_digest = _publish(root)
+    current_commit = published_repo.publish("publish exact inspection candidate")
+
+    detail = service.inspect("company/laptop-support")
+
+    assert isinstance(detail, PackageInspection)
+    assert detail.identifier == "company/laptop-support"
+    assert detail.identity == InstalledPackageIdentity(
+        sourceKey="company", packageId="laptop-support"
+    )
+    assert detail.source_name == "company"
+    assert detail.repository_url == published_repo.remote.as_uri()
+    assert detail.configured_ref is None
+    assert detail.resolved_commit == current_commit
+    assert detail.resolved_commit != cached.resolved_commit
+    assert detail.verified_at == cached.verified_at
+    assert detail.verified is True
+    assert detail.source_state == "fresh"
+    assert detail.version == "2.0.0"
+    assert detail.display_name == "Laptop Support Exact"
+    assert detail.description == "laptop-support package"
+    assert detail.license == "MIT"
+    assert detail.publisher == "example-company"
+    assert detail.tags == ["support"]
+    assert detail.contract_version == 1
+    assert detail.package_path == "packages/laptop-support"
+    assert detail.package_digest == candidate_digest
+    assert [item.workflow_name for item in detail.workflows] == [
+        "diagnostic",
+        "repair",
+    ]
+    resources = {item.path: item.types for item in detail.resources}
+    assert resources["commands/guide.md"] == ["command"]
+    assert resources["scripts/never-run.py"] == ["script"]
+    assert resources["mcp/mixed.yaml"] == ["mcp"]
+    assert resources["workflows/diagnostic.yaml"] == ["workflow_definition"]
+    assert resources["workflow-package.json"] == ["other"]
+    assert detail.external_requirements.runtimes == ["uv"]
+    assert {item.code for item in detail.advisories} >= {
+        "missing_runtime",
+        "missing_tool",
+        "missing_secret",
+    }
+    assert detail.install_status == "not_installed"
+    assert detail.update_status == "not_applicable"
+    assert detail.installed is None
+    assert not (service.home / "executed").exists()
+
+
+def test_inspect_reports_current_then_update_available_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    destination = service.installed_store.package_root(installed.identity)
+    before_package = _snapshot(destination)
+    before_provenance = service.installed_store.get(installed.identity)
+
+    current = service.inspect("company/laptop-support")
+
+    assert current.install_status == "installed"
+    assert current.update_status == "current"
+    assert current.installed == installed
+    _write_package(published_repo.work, "laptop-support", version="2.0.0")
+    published_repo.publish("publish inspect update")
+
+    available = service.inspect("company/laptop-support")
+
+    assert available.install_status == "installed"
+    assert available.update_status == "update_available"
+    assert available.version == "2.0.0"
+    assert available.installed == installed
+    assert _snapshot(destination) == before_package
+    assert service.installed_store.get(installed.identity) == before_provenance
+
+
+def test_inspect_rejects_invalid_exact_candidate_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    destination = service.installed_store.package_root(installed.identity)
+    before_package = _snapshot(destination)
+    before_provenance = service.installed_store.get(installed.identity)
+    root = published_repo.work / "packages" / "laptop-support"
+    manifest = json.loads((root / "workflow-package.json").read_bytes())
+    manifest["version"] = "2.0.0"
+    (root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    (root / "workflows" / "diagnostic.yaml").write_text(
+        "name: diagnostic\nnodes: [not-a-node]\n", encoding="utf-8"
+    )
+    _publish(root)
+    published_repo.publish("publish invalid inspect candidate")
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.inspect("company/laptop-support")
+
+    assert error.value.code == "package_workflow_invalid"
+    assert _snapshot(destination) == before_package
+    assert service.installed_store.get(installed.identity) == before_provenance
+
+
+def test_inspection_is_strict_bounded_and_sanitizes_candidate_metadata(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    root = published_repo.work / "packages" / "laptop-support"
+    manifest = json.loads((root / "workflow-package.json").read_bytes())
+    manifest["description"] = (
+        "See https://alice:supersecret@example.test/private.git?token=hidden"
+    )
+    (root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    _publish(root)
+    published_repo.publish("publish sensitive metadata")
+    _add_and_refresh(service, published_repo)
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"),
+        actor="password actor-secret",
+    )
+    service.confirm_install(review.confirmation_token, actor="password actor-secret")
+
+    detail = service.inspect("company/laptop-support")
+    rendered = detail.model_dump_json()
+
+    assert "supersecret" not in rendered
+    assert "alice:" not in rendered
+    assert "hidden" not in rendered
+    assert "actor-secret" not in rendered
+    payload = detail.model_dump(mode="json", by_alias=True)
+    payload["resources"] = [payload["resources"][0]] * 513
+    with pytest.raises(ValidationError):
+        PackageInspection.model_validate(payload)
+    payload = detail.model_dump(mode="json", by_alias=True)
+    payload["unexpected"] = True
+    with pytest.raises(ValidationError):
+        PackageInspection.model_validate(payload)
 
 
 def test_registered_update_rejects_manifest_identity_mismatch_without_mutation(

@@ -1206,6 +1206,91 @@ def test_packaged_marketplace_json_parse_error_is_one_stdout_envelope(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "secrets"),
+    [
+        (
+            [
+                "workflow",
+                "install",
+                "company/laptop-support",
+                "--confirmation-t0ken",
+                "raw-confirmation-capability",
+                "--json",
+            ],
+            ("raw-confirmation-capability",),
+        ),
+        (
+            [
+                "workflow",
+                "installed",
+                "https://alice:private-password@example.test/repository.git",
+                "--json",
+            ],
+            ("alice", "private-password", "example.test"),
+        ),
+        (
+            ["workflow", "installed", "positional-private-value", "--json"],
+            ("positional-private-value",),
+        ),
+        (
+            ["workflow", "installed", "--password-hunter2", "--json"],
+            ("password-hunter2",),
+        ),
+        (
+            [
+                "workflow",
+                "doctor",
+                "sample",
+                "--mode",
+                "private-mode-choice",
+                "--json",
+            ],
+            ("private-mode-choice",),
+        ),
+    ],
+    ids=[
+        "misspelled-token-option",
+        "credential-url",
+        "positional",
+        "secret-option-name",
+        "choice",
+    ],
+)
+def test_packaged_workflow_json_parse_errors_never_echo_argument_values(
+    tmp_path, arguments, secrets
+) -> None:
+    completed, _before, _after, _home, _hermes_home = _run_packaged_schema(
+        tmp_path, arguments
+    )
+
+    assert completed.returncode == machine_contract.EXIT_INVOCATION
+    assert completed.stderr == ""
+    envelope = json.loads(completed.stdout)
+    assert envelope["error"] == {
+        "code": "invalid_request",
+        "details": {},
+        "message": envelope["error"]["message"],
+        "retryable": False,
+    }
+    assert envelope["error"]["message"].startswith(
+        "workflow command arguments are invalid"
+    )
+    for secret in secrets:
+        assert secret not in completed.stdout
+
+
+def test_human_workflow_parse_error_does_not_echo_positional_secret(capsys) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _parser().parse_args(["installed", "positional-private-value"])
+
+    assert exited.value.code == machine_contract.EXIT_INVOCATION
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "workflow command arguments are invalid" in output.err
+    assert "positional-private-value" not in output.err
+
+
+@pytest.mark.parametrize(
     ("arguments", "expected_profile"),
     [
         (

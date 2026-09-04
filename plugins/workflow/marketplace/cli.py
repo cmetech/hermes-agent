@@ -419,41 +419,448 @@ def _review_payload(review: object) -> dict[str, object]:
     return value
 
 
-def _render_review(review: object, *, reveal_token: bool) -> None:
+def _review_mapping(value: object) -> dict[str, object]:
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def _review_identity(value: object) -> str:
+    identity = _review_mapping(value)
+    source = identity.get("source_key")
+    package = identity.get("package_id")
+    return f"{source}/{package}" if source and package else "package"
+
+
+def _review_text(value: object, args: argparse.Namespace) -> str:
+    return _sanitize_message(value, args)
+
+
+def _render_values(
+    label: str,
+    values: object,
+    args: argparse.Namespace,
+    *,
+    indent: str = "",
+) -> None:
+    items = (
+        sorted(_review_text(item, args) for item in values)
+        if isinstance(values, list)
+        else []
+    )
+    print(f"{indent}{label}: {', '.join(items) if items else 'none'}")
+
+
+def _render_requirements(
+    requirements: object,
+    args: argparse.Namespace,
+    *,
+    title: str = "External requirements",
+    indent: str = "",
+) -> None:
+    fields = _review_mapping(requirements)
+    print(f"{indent}{title}")
+    for field in ("runtimes", "tools", "providers", "services", "secrets"):
+        _render_values(field, fields.get(field), args, indent=f"{indent}  ")
+
+
+def _render_diagnostics(
+    label: str,
+    diagnostics: object,
+    args: argparse.Namespace,
+    *,
+    indent: str = "",
+) -> None:
+    items = (
+        [_review_mapping(item) for item in diagnostics if isinstance(item, Mapping)]
+        if isinstance(diagnostics, list)
+        else []
+    )
+    items.sort(
+        key=lambda item: (str(item.get("code", "")), str(item.get("message", "")))
+    )
+    print(f"{indent}{label} ({len(items)})")
+    for item in items:
+        code = _review_text(item.get("code", "diagnostic"), args)
+        severity = _review_text(item.get("severity", "finding"), args)
+        message = _review_text(item.get("message", "finding"), args)
+        print(f"{indent}- {code} [{severity}]: {message}")
+
+
+def _render_file_changes(changes: object, args: argparse.Namespace) -> None:
+    items = (
+        [_review_mapping(item) for item in changes if isinstance(item, Mapping)]
+        if isinstance(changes, list)
+        else []
+    )
+    items.sort(
+        key=lambda item: (
+            str(item.get("kind", "")),
+            str(item.get("path", "")),
+            str(item.get("old_path", "")),
+        )
+    )
+    print(f"File changes ({len(items)})")
+    for item in items:
+        kind = _review_text(item.get("kind", "change"), args)
+        path = _review_text(item.get("path", "resource"), args)
+        old_path = item.get("old_path")
+        display_path = (
+            f"{_review_text(old_path, args)} -> {path}"
+            if isinstance(old_path, str)
+            else path
+        )
+        metadata = []
+        for key, label in (
+            ("old_digest", "old_digest"),
+            ("candidate_digest", "candidate_digest"),
+        ):
+            digest = item.get(key)
+            if isinstance(digest, str):
+                metadata.append(f"{label}={_review_text(digest, args)}")
+        suffix = f"; {'; '.join(metadata)}" if metadata else ""
+        print(f"- {kind}: {display_path}{suffix}")
+
+
+def _render_set_changes(
+    title: str,
+    changes: object,
+    args: argparse.Namespace,
+    *,
+    fields: tuple[str, ...] | None = None,
+) -> None:
+    mapping = _review_mapping(changes)
+    print(title)
+    names = fields or ("",)
+    for field in names:
+        values = _review_mapping(mapping.get(field)) if field else mapping
+        prefix = f"{field} " if field else ""
+        for operation, marker in (("added", "+"), ("removed", "-")):
+            members = values.get(operation)
+            if isinstance(members, list):
+                for member in sorted(_review_text(item, args) for item in members):
+                    print(f"- {prefix}{marker} {member}")
+
+
+def _render_structured_changes(
+    title: str,
+    changes: object,
+    args: argparse.Namespace,
+    *,
+    compatibility: bool,
+) -> None:
+    mapping = _review_mapping(changes)
+    print(title)
+    rows = []
+    for operation, marker in (("added", "+"), ("removed", "-")):
+        values = mapping.get(operation)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            item = _review_mapping(value)
+            workflow = _review_text(item.get("workflow_name", "workflow"), args)
+            if compatibility:
+                detail = (
+                    f"code={_review_text(item.get('code', 'finding'), args)} "
+                    f"severity={_review_text(item.get('severity', 'finding'), args)}"
+                )
+            else:
+                detail = (
+                    f"package={_review_text(item.get('package_digest', ''), args)} "
+                    f"risk={_review_text(item.get('risk_digest', ''), args)}"
+                )
+            rows.append((workflow, marker, detail))
+    for workflow, marker, detail in sorted(rows):
+        print(f"- {marker} {workflow} {detail}")
+
+
+def _render_candidate_workflows(workflows: object, args: argparse.Namespace) -> None:
+    items = (
+        [_review_mapping(item) for item in workflows if isinstance(item, Mapping)]
+        if isinstance(workflows, list)
+        else []
+    )
+    items.sort(key=lambda item: str(item.get("workflow_name", "")))
+    print(f"Candidate workflow risks ({len(items)})")
+    for item in items:
+        name = _review_text(item.get("workflow_name", "workflow"), args)
+        package = _review_text(item.get("package_digest", ""), args)
+        risk = _review_text(item.get("risk_digest", ""), args)
+        print(f"- {name} package={package} risk={risk}")
+
+
+def _render_lifecycle_review(
+    value: Mapping[str, object],
+    args: argparse.Namespace,
+    *,
+    operation: str,
+    target: str,
+) -> None:
+    print(
+        f"Source: {_review_text(value.get('source_name', target.split('/')[0]), args)}"
+    )
+    repository = value.get("repository_url")
+    if isinstance(repository, str):
+        print(f"Repository: {_review_text(repository, args)}")
+    configured_ref = value.get("configured_ref")
+    print(
+        "Configured ref: "
+        f"{_review_text(configured_ref, args) if configured_ref else 'default'}"
+    )
+    print(f"Destination identity: {target}")
+    package_path = value.get("package_path")
+    if isinstance(package_path, str):
+        print(f"Package path: {_review_text(package_path, args)}")
+    if operation == "install":
+        print(
+            f"Candidate version: {_review_text(value.get('candidate_version'), args)}"
+        )
+        print(f"Candidate commit: {_review_text(value.get('resolved_commit'), args)}")
+        print(f"Candidate digest: {_review_text(value.get('candidate_digest'), args)}")
+    else:
+        for key, label in (
+            ("old_version", "Old version"),
+            ("candidate_version", "Candidate version"),
+            ("old_commit", "Old commit"),
+            ("candidate_commit", "Candidate commit"),
+            ("old_digest", "Old digest"),
+            ("candidate_digest", "Candidate digest"),
+        ):
+            print(f"{label}: {_review_text(value.get(key), args)}")
+    _render_file_changes(value.get("file_changes"), args)
+    assessment = _review_mapping(value.get("assessment"))
+    if operation == "update":
+        _render_set_changes(
+            "Workflow membership changes", value.get("workflow_changes"), args
+        )
+        _render_set_changes(
+            "Requirement changes",
+            value.get("requirement_changes"),
+            args,
+            fields=("runtimes", "tools", "providers", "services", "secrets"),
+        )
+        _render_structured_changes(
+            "Risk changes", value.get("risk_changes"), args, compatibility=False
+        )
+        _render_structured_changes(
+            "Compatibility changes",
+            value.get("compatibility_changes"),
+            args,
+            compatibility=True,
+        )
+    else:
+        _render_values("Workflow membership", assessment.get("workflow_names"), args)
+    _render_candidate_workflows(value.get("workflow_reviews"), args)
+    _render_requirements(assessment.get("external_requirements"), args)
+    _render_diagnostics("Blockers", assessment.get("blockers"), args)
+    _render_diagnostics("Advisories", assessment.get("advisories"), args)
+
+
+def _render_remove_review(
+    value: Mapping[str, object], args: argparse.Namespace, *, target: str
+) -> None:
+    print(f"Installed identity: {target}")
+    print(f"Current version: {_review_text(value.get('current_version'), args)}")
+    print(f"Current commit: {_review_text(value.get('current_commit'), args)}")
+    print(
+        f"Distribution digest: {_review_text(value.get('distribution_digest'), args)}"
+    )
+    print(f"Installed provenance removed: {target}")
+    print(f"Trust origin removed: marketplace:{target}")
+    workflows = value.get("workflow_names")
+    items = (
+        sorted(_review_text(item, args) for item in workflows)
+        if isinstance(workflows, list)
+        else []
+    )
+    print(f"Workflows removed ({len(items)})")
+    for item in items:
+        print(f"- {item}")
+
+
+def _render_trust_review(
+    value: Mapping[str, object], args: argparse.Namespace, *, target: str
+) -> None:
+    print(f"Source: {_review_text(value.get('source_name'), args)}")
+    print(f"Installed identity: {target}")
+    print(f"Version: {_review_text(value.get('version'), args)}")
+    print(f"Exact commit: {_review_text(value.get('resolved_commit'), args)}")
+    print(
+        f"Distribution digest: {_review_text(value.get('distribution_digest'), args)}"
+    )
+    resources = value.get("package_resources")
+    resource_items = (
+        sorted(_review_text(item, args) for item in resources)
+        if isinstance(resources, list)
+        else []
+    )
+    print(f"Package-owned resources ({len(resource_items)})")
+    for resource in resource_items:
+        print(f"- {resource}")
+    _render_workflow_details(value.get("workflows"), args)
+
+
+def _render_workflow_details(workflow_values: object, args: argparse.Namespace) -> None:
+    workflows = (
+        [_review_mapping(item) for item in workflow_values if isinstance(item, Mapping)]
+        if isinstance(workflow_values, list)
+        else []
+    )
+    workflows.sort(key=lambda item: str(item.get("workflow_name", "")))
+    for workflow in workflows:
+        print(f"Workflow: {_review_text(workflow.get('workflow_name'), args)}")
+        print(f"  Definition: {_review_text(workflow.get('definition_path'), args)}")
+        companion = workflow.get("companion_path")
+        print(f"  Companion: {_review_text(companion, args) if companion else 'none'}")
+        print(
+            "  Effective package digest: "
+            f"{_review_text(workflow.get('package_digest'), args)}"
+        )
+        print(f"  Risk digest: {_review_text(workflow.get('risk_digest'), args)}")
+        print(f"  Current trust: {_review_text(workflow.get('trust_state'), args)}")
+        print(
+            "  Package resource set: "
+            f"{_review_text(workflow.get('package_resource_set'), args)} "
+            "(see shared table above)"
+        )
+        for key, label in (
+            ("shell_or_script_nodes", "Shell/script nodes"),
+            ("command_nodes", "Command nodes"),
+            ("approval_nodes", "Approval nodes"),
+            ("command_resources", "Command resources"),
+            ("script_resources", "Script resources"),
+            ("mcp_resources", "MCP resources"),
+            ("local_mcp_servers", "Local MCP servers"),
+            ("remote_mcp_servers", "Remote MCP servers"),
+            ("requested_tools", "Requested tools"),
+            ("requested_skills", "Requested skills"),
+            ("providers", "Providers"),
+            ("outward_action_nodes", "Outward action nodes"),
+            ("required_secrets", "Required secrets"),
+        ):
+            _render_values(label, workflow.get(key), args, indent="  ")
+        _render_requirements(workflow.get("external_requirements"), args, indent="  ")
+        _render_diagnostics(
+            "Compatibility findings",
+            workflow.get("compatibility"),
+            args,
+            indent="  ",
+        )
+
+
+def _render_inspection(package: Mapping[str, object], args: argparse.Namespace) -> None:
+    identity = _review_mapping(package.get("identity"))
+    identifier = package.get("identifier") or _review_identity(identity)
+    print(f"Package: {_review_text(identifier, args)}")
+    for key, label in (
+        ("display_name", "Display name"),
+        ("source_name", "Source"),
+        ("publisher", "Publisher"),
+        ("version", "Version"),
+        ("description", "Description"),
+    ):
+        print(f"{label}: {_review_text(package.get(key), args)}")
+    _render_values("Tags", package.get("tags"), args)
+    print(f"License: {_review_text(package.get('license'), args)}")
+    print(f"Repository: {_review_text(package.get('repository_url'), args)}")
+    configured_ref = package.get("configured_ref")
+    print(
+        "Configured ref: "
+        f"{_review_text(configured_ref, args) if configured_ref else 'default'}"
+    )
+    print(f"Verified: {'yes' if package.get('verified') is True else 'no'}")
+    for key, label in (
+        ("resolved_commit", "Exact commit"),
+        ("verified_at", "Verified at"),
+        ("source_state", "Source status"),
+        ("package_path", "Package path"),
+        ("contract_version", "Contract version"),
+        ("package_digest", "Distribution digest"),
+        ("install_status", "Install status"),
+        ("update_status", "Update status"),
+    ):
+        print(f"{label}: {_review_text(package.get(key), args)}")
+
+    resource_values = package.get("resources")
+    resources = (
+        [_review_mapping(item) for item in resource_values if isinstance(item, Mapping)]
+        if isinstance(resource_values, list)
+        else []
+    )
+    resources.sort(key=lambda item: str(item.get("path", "")))
+    print(f"Package resources ({len(resources)})")
+    for resource in resources:
+        path = _review_text(resource.get("path", "resource"), args)
+        types = resource.get("types")
+        labels = (
+            sorted(_review_text(item, args) for item in types)
+            if isinstance(types, list)
+            else []
+        )
+        print(f"- {path} [{', '.join(labels) if labels else 'other'}]")
+
+    workflows = package.get("workflows")
+    count = len(workflows) if isinstance(workflows, list) else 0
+    print(f"Workflows ({count})")
+    _render_workflow_details(workflows, args)
+    _render_requirements(package.get("external_requirements"), args)
+    _render_diagnostics("Blockers", package.get("blockers"), args)
+    _render_diagnostics("Advisories", package.get("advisories"), args)
+
+    installed = package.get("installed")
+    if not isinstance(installed, Mapping):
+        print("Installed provenance: none")
+        return
+    provenance = cast(Mapping[str, object], installed)
+    print("Installed provenance")
+    for key, label in (
+        ("source_name", "Installed source"),
+        ("repository_url", "Installed repository"),
+        ("configured_ref", "Installed configured ref"),
+        ("resolved_commit", "Installed commit"),
+        ("package_path", "Installed package path"),
+        ("version", "Installed version"),
+        ("contract_version", "Installed contract version"),
+        ("distribution_digest", "Installed digest"),
+        ("installed_at", "Installed at"),
+        ("actor", "Installed actor"),
+        ("orphaned_source", "Orphaned source"),
+    ):
+        value = provenance.get(key)
+        if key == "configured_ref" and value is None:
+            value = "default"
+        print(f"{label}: {_review_text(value, args)}")
+    _render_values("Installed workflows", provenance.get("workflow_paths"), args)
+
+
+def _render_review(
+    review: object,
+    *,
+    args: argparse.Namespace,
+    reveal_token: bool,
+) -> None:
     value = _review_payload(review)
     operation = str(value.get("operation") or "trust")
-    identity = value.get("identity")
-    target = "package"
-    if isinstance(identity, Mapping):
-        identity_mapping = cast(Mapping[str, object], identity)
-        target = (
-            f"{identity_mapping.get('source_key')}/{identity_mapping.get('package_id')}"
-        )
+    target = _review_identity(value.get("identity"))
     print(f"Review required: {operation} {target}")
-    version = (
-        value.get("candidate_version")
-        or value.get("current_version")
-        or value.get("version")
-    )
-    if version:
-        print(f"Version: {version}")
-    changes = value.get("file_changes")
-    if isinstance(changes, list):
-        print(f"File changes: {len(changes)}")
-    workflows = value.get("workflow_reviews") or value.get("workflows")
-    if isinstance(workflows, list):
-        print(f"Workflows: {len(workflows)}")
+    if operation in {"install", "update"}:
+        _render_lifecycle_review(value, args, operation=operation, target=target)
+    elif operation == "remove":
+        _render_remove_review(value, args, target=target)
+    else:
+        _render_trust_review(value, args, target=target)
     token = value.get("confirmation_token")
     if reveal_token and isinstance(token, str):
         print(f"Confirmation token: {token}")
 
 
-def _render_human(result: Mapping[str, object]) -> None:
-    status = str(result.get("status", "ok"))
+def _render_human(result: Mapping[str, object], args: argparse.Namespace) -> None:
+    status = _review_text(result.get("status", "ok"), args)
     print(status.replace("_", " ").title())
     package = result.get("package")
     if isinstance(package, Mapping):
         package_projection = cast(Mapping[str, object], package)
+        if "resources" in package_projection and "workflows" in package_projection:
+            _render_inspection(package_projection, args)
+            package_projection = {}
         identity = package_projection.get("identity")
         if isinstance(identity, Mapping):
             identity_projection = cast(Mapping[str, object], identity)
@@ -481,7 +888,13 @@ def _render_human(result: Mapping[str, object]) -> None:
             print(f"- {identity or 'item'}{f' ({suffix})' if suffix else ''}")
 
 
-def _emit_result(command: str, result: Mapping[str, object], *, as_json: bool) -> int:
+def _emit_result(
+    command: str,
+    result: Mapping[str, object],
+    *,
+    args: argparse.Namespace,
+    as_json: bool,
+) -> int:
     if as_json:
         print(
             json.dumps(
@@ -494,9 +907,9 @@ def _emit_result(command: str, result: Mapping[str, object], *, as_json: bool) -
         )
     else:
         if result.get("status") == "review_required":
-            _render_review(result, reveal_token=True)
+            _render_review(result, args=args, reveal_token=True)
         else:
-            _render_human(result)
+            _render_human(result, args)
     return 0
 
 
@@ -558,7 +971,7 @@ def _confirmable(
         return review, False
     if getattr(args, "yes", False):
         return confirm(token), True
-    _render_review(review, reveal_token=False)
+    _render_review(review, args=args, reveal_token=False)
     if not _read_confirmation(f"Confirm {operation}? [y/N] "):
         return {"status": "cancelled", "operation": operation}, False
     return confirm(token), True
@@ -801,11 +1214,12 @@ def _invoke_trust(args: argparse.Namespace, service) -> dict[str, object]:
 
 
 def _looks_like_loose_workflow_path(value: str) -> bool:
-    path = Path(value)
+    path = Path(value).expanduser()
     return bool(
         path.is_absolute()
         or value.startswith(("./", "../"))
         or path.suffix.lower() in {".yaml", ".yml"}
+        or path.is_file()
     )
 
 
@@ -935,7 +1349,12 @@ def dispatch_marketplace_command(args: argparse.Namespace) -> int | None:
             return None
         service = _service_for_args(args)
         result = _invoke(args, service)
-        return _emit_result(command, result, as_json=getattr(args, "json", False))
+        return _emit_result(
+            command,
+            result,
+            args=args,
+            as_json=getattr(args, "json", False),
+        )
     except _MarketplaceCLIError as error:
         return _emit_error(command, error, args=args)
     except WorkflowMarketplaceError as error:
