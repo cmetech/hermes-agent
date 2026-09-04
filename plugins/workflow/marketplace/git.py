@@ -42,32 +42,15 @@ _DEFAULT_CHECKOUT_FILES = 2_100_000
 _DEFAULT_CHECKOUT_BYTES = 34 * 1024 * 1024 * 1024
 _DEFAULT_TEMPORARY_BYTES = 36 * 1024 * 1024 * 1024
 _DEFAULT_TRAVERSAL_ENTRIES = 4_300_000
-_FILTER_REJECTION_MARKERS = (
+_FILTER_REJECTION_MESSAGES = frozenset({
     "server does not support filter",
+    "server does not support filter capability",
     "server does not support partial clone",
     "filter capability is not supported",
     "filtering is not supported by server",
     "unsupported filter capability",
-)
-_FILTER_FALLBACK_DISQUALIFIERS = (
-    "authentication",
-    "authorization",
-    "could not read username",
-    "permission denied",
-    "publickey",
-    "http 401",
-    "http 403",
-    "returned error: 401",
-    "returned error: 403",
-    "network",
-    "connection",
-    "could not resolve",
-    "could not connect",
-    "timed out",
-    "tls",
-    "ssl",
-    "proxy",
-)
+})
+_GIT_DIAGNOSTIC_PREFIX = re.compile(r"^(?:(?:fatal|error|remote):\s*)+")
 
 Cancelled = Callable[[], bool]
 
@@ -155,6 +138,7 @@ def _classify_git_failure(
         for marker in (
             "authentication failed",
             "authorization failed",
+            "invalid credentials",
             "permission denied",
             "could not read username",
             "publickey",
@@ -169,10 +153,16 @@ def _classify_git_failure(
 
 
 def _filter_was_explicitly_rejected(result: subprocess.CompletedProcess[str]) -> bool:
-    output = f"{result.stderr or ''}\n{result.stdout or ''}".casefold()
-    return any(marker in output for marker in _FILTER_REJECTION_MARKERS) and not any(
-        marker in output for marker in _FILTER_FALLBACK_DISQUALIFIERS
-    )
+    lines = [
+        line.strip().casefold()
+        for output in (result.stderr or "", result.stdout or "")
+        for line in output.splitlines()
+        if line.strip()
+    ]
+    if len(lines) != 1:
+        return False
+    message = _GIT_DIAGNOSTIC_PREFIX.sub("", lines[0]).removesuffix(".")
+    return message in _FILTER_REJECTION_MESSAGES
 
 
 class WorkflowGitFetcher:

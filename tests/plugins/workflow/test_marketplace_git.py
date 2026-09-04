@@ -201,6 +201,20 @@ def test_generic_clone_failure_does_not_trigger_unfiltered_fallback(
             "fatal: returned error: 403; server does not support filter capability",
             "source_authentication_failed",
         ),
+        (
+            "fatal: invalid credentials; server does not support filter capability",
+            "source_authentication_failed",
+        ),
+        (
+            "fatal: server does not support filter capability\n"
+            "fatal: arbitrary repository failure",
+            "source_unavailable",
+        ),
+        (
+            "error: arbitrary transport failure\n"
+            "fatal: server does not support filter capability",
+            "source_unavailable",
+        ),
     ],
 )
 def test_mixed_filter_and_auth_or_network_failure_never_retries_unfiltered(
@@ -225,6 +239,44 @@ def test_mixed_filter_and_auth_or_network_failure_never_retries_unfiltered(
         )
 
     assert error.value.code == code
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "fatal: server does not support filter capability",
+        "fatal: server does not support partial clone",
+        "error: filter capability is not supported.",
+        "remote: filtering is not supported by server",
+        "fatal: unsupported filter capability",
+    ],
+)
+def test_pure_recognized_filter_negotiation_failures_retry_unfiltered(
+    tmp_path: Path,
+    versioned_remote: tuple[Path, dict[str, str]],
+    diagnostic: str,
+) -> None:
+    remote, commits = versioned_remote
+
+    class RejectFilterOnce(WorkflowGitFetcher):
+        retries = 0
+
+        def _run_git(self, arguments, **kwargs):
+            if arguments[1] == "clone" and "--filter=blob:none" in arguments:
+                return subprocess.CompletedProcess(arguments, 128, "", diagnostic)
+            if arguments[1] == "clone":
+                self.retries += 1
+            return super()._run_git(arguments, **kwargs)
+
+    fetcher = RejectFilterOnce()
+    checkout = fetcher.fetch(
+        _source(remote.as_uri()),
+        tmp_path / "checkout",
+        sparse_paths=("selected.txt",),
+    )
+
+    assert fetcher.retries == 1
+    assert checkout.resolved_commit == commits["main"]
 
 
 def test_authentication_failure_is_redacted_and_partial_clone_is_removed(

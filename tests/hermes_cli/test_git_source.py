@@ -140,6 +140,60 @@ def test_credential_free_source_validation_preserves_supported_auth_seams():
     )
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "fatal: https://git@example.test/team/repo.git was rejected",
+            True,
+        ),
+        (
+            "fatal: https://example.test/team/repo.git?token=status-secret failed",
+            True,
+        ),
+        (
+            "fatal: https://example.test/team/repo.git#access_token=status-secret failed",
+            True,
+        ),
+        (
+            "fatal: ssh://git:status-secret@example.test/team/repo.git failed",
+            True,
+        ),
+        (
+            "fatal: ssh://git@example.test/team/repo.git?token=status-secret failed",
+            True,
+        ),
+        (
+            "fatal: git@example.test:team/repo.git#access_token=status-secret failed",
+            True,
+        ),
+        (
+            "fatal: alice:status-secret@example.test/team/repo.git failed",
+            True,
+        ),
+        (
+            "fatal: owner/repo?private_token=status-secret failed",
+            True,
+        ),
+        ("fatal: api_key=status-secret", True),
+        (
+            "fatal: ssh://git@example.test/team/repo.git was unavailable",
+            False,
+        ),
+        (
+            "fatal: git@example.test:team/repo.git was unavailable",
+            False,
+        ),
+        ("repository unavailable; retry later", False),
+    ],
+)
+def test_persisted_git_message_credential_predicate_is_strict_and_unambiguous(
+    message,
+    expected,
+):
+    assert git_source.git_text_contains_credentials(message) is expected
+
+
 def test_safe_git_error_removes_embedded_credentials_and_query_tokens():
     source = "https://alice:secret@example.test/repo.git?token=abc"
     result = _completed(stderr=f"fatal: unable to access '{source}': denied")

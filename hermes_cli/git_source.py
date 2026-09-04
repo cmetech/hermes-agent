@@ -30,6 +30,7 @@ __all__ = [
     "canonical_git_source",
     "checkout_exact_revision",
     "git_head_revision",
+    "git_text_contains_credentials",
     "is_exact_revision",
     "noninteractive_git_env",
     "resolve_git_executable",
@@ -75,6 +76,12 @@ class ResolvedGitSource:
 
 EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_GIT_ABSOLUTE_URL_RE = re.compile(r"(?:https?|ssh|file)://[^\s<>\"']+", re.IGNORECASE)
+_USER_PASSWORD_AUTHORITY_RE = re.compile(
+    r"(?<![A-Za-z0-9._-])[A-Za-z0-9._-]+:[^@\s/]+@[A-Za-z0-9.-]+",
+    re.ASCII,
+)
+_CREDENTIAL_PARAMETER_RE = re.compile(r"[?#&;]([A-Za-z0-9_.~+%\-]+)=")
 _TRAILING_URL_DELIMITERS = ".,;:!?)]}"
 _DEFAULT_BOUNDED_OUTPUT_BYTES = 64 * 1024
 _CREDENTIAL_PARAMETER_WORDS = frozenset({
@@ -228,6 +235,13 @@ def is_exact_revision(ref: object) -> bool:
 
 
 def _parameter_name_words(name: str) -> set[str]:
+    decoded = name
+    for _ in range(3):
+        next_value = urllib.parse.unquote_plus(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    name = decoded
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
     separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", separated)
     return set(re.findall(r"[a-z0-9]+", separated.casefold()))
@@ -257,11 +271,32 @@ def _parameter_name_contains_credentials(name: str) -> bool:
     )
 
 
-def _parameters_contain_credentials(parameters: str) -> bool:
-    return any(
-        _parameter_name_contains_credentials(name)
-        for name, _ in urllib.parse.parse_qsl(parameters, keep_blank_values=True)
-    )
+def git_text_contains_credentials(value: str) -> bool:
+    """Return whether display text contains credentials unsafe to persist."""
+
+    from agent.redact import redact_sensitive_text
+
+    if redact_sensitive_text(value, force=True) != value:
+        return True
+    if _USER_PASSWORD_AUTHORITY_RE.search(value):
+        return True
+    if any(
+        _parameter_name_contains_credentials(match.group(1))
+        for match in _CREDENTIAL_PARAMETER_RE.finditer(value)
+    ):
+        return True
+    for match in _GIT_ABSOLUTE_URL_RE.finditer(value):
+        candidate = match.group(0).rstrip(_TRAILING_URL_DELIMITERS)
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+        except ValueError:
+            return True
+        if parsed.scheme.casefold() in {"http", "https", "file"}:
+            if parsed.username is not None or parsed.password is not None:
+                return True
+        elif parsed.scheme.casefold() == "ssh" and parsed.password is not None:
+            return True
+    return False
 
 
 def validate_credential_free_git_source(identifier: str) -> str:
@@ -281,26 +316,17 @@ def validate_credential_free_git_source(identifier: str) -> str:
     except ValueError as error:
         raise GitSourceError(invalid_message) from error
     scheme = parsed.scheme.casefold()
-    if any(
-        _parameters_contain_credentials(parameters)
-        for parameters in (parsed.query, parsed.fragment)
-    ):
-        raise GitSourceError(credential_message)
-    if scheme in {"http", "https"}:
-        if parsed.username is not None or parsed.password is not None:
-            raise GitSourceError(credential_message)
-    elif scheme in {"ssh", "file"}:
-        if parsed.password is not None or parsed.query:
-            raise GitSourceError(credential_message)
-    elif identifier.startswith("git@"):
+    supported_scheme = scheme in {"http", "https", "ssh", "file"}
+    if not supported_scheme and identifier.startswith("git@"):
         if re.fullmatch(r"git@[^@\s/:]+:.+", identifier) is None:
             raise GitSourceError(invalid_message)
-        _, _, fragment = identifier.partition("#")
-        if "?" in identifier.partition("#")[0] or _parameters_contain_credentials(
-            fragment
-        ):
-            raise GitSourceError(credential_message)
-    elif scheme or "@" in identifier:
+    elif not supported_scheme and (scheme or "@" in identifier):
+        raise GitSourceError(invalid_message)
+    if git_text_contains_credentials(identifier):
+        raise GitSourceError(credential_message)
+    if scheme in {"ssh", "file"} and parsed.query:
+        raise GitSourceError(invalid_message)
+    if identifier.startswith("git@") and "?" in identifier.partition("#")[0]:
         raise GitSourceError(invalid_message)
     try:
         resolve_git_source(identifier)

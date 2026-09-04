@@ -25,6 +25,7 @@ from pydantic import (
 from hermes_cli.git_source import (
     GitSourceError,
     canonical_git_source,
+    git_text_contains_credentials,
     resolve_git_source,
     safe_git_error,
     validate_credential_free_git_source,
@@ -128,7 +129,10 @@ class SourceRefreshStatus(_StateModel):
         completed = subprocess.CompletedProcess(
             args=(), returncode=1, stdout="", stderr=value
         )
-        if safe_git_error(completed).strip() != value:
+        if (
+            git_text_contains_credentials(value)
+            or safe_git_error(completed).strip() != value
+        ):
             raise ValueError("refresh status message must be canonically redacted")
         return value
 
@@ -352,7 +356,7 @@ def _redacted_error(error: WorkflowMarketplaceError, repository_url: str) -> str
         args=(), returncode=1, stdout="", stderr=str(error)
     )
     rendered = safe_git_error(completed, repository_url).strip()
-    if not rendered:
+    if not rendered or git_text_contains_credentials(rendered):
         rendered = "marketplace source refresh failed"
     encoded = rendered.encode("utf-8")[:_MAX_ERROR_BYTES]
     return encoded.decode("utf-8", errors="ignore")

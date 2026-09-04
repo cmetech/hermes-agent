@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 
 import pytest
@@ -129,6 +131,32 @@ def test_failed_refresh_preserves_last_verified_catalog_and_redacts_error(
     assert "token-secret" not in repr(second)
     assert "token-user" not in catalog.source_store.catalog_path.read_text()
     assert "token-secret" not in catalog.source_store.catalog_path.read_text()
+
+
+def test_failed_refresh_replaces_ssh_password_diagnostic_before_persistence(
+    tmp_path: Path,
+) -> None:
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+
+    class AuthenticationFailure:
+        def fetch(self, *args, **kwargs):
+            raise WorkflowMarketplaceError(
+                "source_authentication_failed",
+                (
+                    "authentication failed for "
+                    "ssh://git:status-secret@example.test/team/repo.git"
+                ),
+            )
+
+    catalog.git_fetcher = AuthenticationFailure()
+    result = catalog.refresh_source("company")
+
+    assert result.state == "authentication-failed"
+    assert result.message == "marketplace source refresh failed"
+    assert "status-secret" not in repr(result)
+    assert "status-secret" not in catalog.source_store.catalog_path.read_text()
 
 
 def test_oversized_failed_status_encoding_preserves_verified_cache(
@@ -383,6 +411,86 @@ def test_tampered_cache_metadata_fails_closed_without_rewrite_or_secret_display(
     assert error.value.code == "catalog_state_invalid"
     assert "status-secret" not in str(error.value)
     assert catalog.source_store.catalog_path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "authentication failed for ssh://git:status-secret@example.test/repo.git",
+        "authentication failed for alice:status-secret@example.test/repo.git",
+        "authentication failed for owner/repo?token=status-secret",
+    ],
+)
+def test_tampered_credential_bearing_status_forms_fail_without_rewrite(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    catalog.refresh_source("company")
+    raw = json.loads(catalog.source_store.catalog_path.read_bytes())
+    raw["statuses"][0].update({
+        "state": "stale",
+        "diagnosticCode": "source_authentication_failed",
+        "message": message,
+    })
+    tampered = (json.dumps(raw, sort_keys=True) + "\n").encode()
+    catalog.source_store.catalog_path.write_bytes(tampered)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        catalog.search("")
+
+    assert error.value.code == "catalog_state_invalid"
+    assert "status-secret" not in str(error.value)
+    assert catalog.source_store.catalog_path.read_bytes() == tampered
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_read_only_credential_bearing_status_fails_without_chmod_or_rewrite(
+    tmp_path: Path,
+) -> None:
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    catalog.refresh_source("company")
+    raw = json.loads(catalog.source_store.catalog_path.read_bytes())
+    raw["statuses"][0].update({
+        "state": "stale",
+        "diagnosticCode": "source_authentication_failed",
+        "message": (
+            "authentication failed for ssh://git:status-secret@example.test/repo.git"
+        ),
+    })
+    tampered = (json.dumps(raw, sort_keys=True) + "\n").encode()
+    catalog.source_store.catalog_path.write_bytes(tampered)
+    catalog.source_store.catalog_path.chmod(0o400)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        catalog.search("")
+
+    assert error.value.code == "catalog_state_invalid"
+    assert "status-secret" not in str(error.value)
+    assert catalog.source_store.catalog_path.read_bytes() == tampered
+    assert stat.S_IMODE(catalog.source_store.catalog_path.stat().st_mode) == 0o400
+
+
+def test_sanitized_ssh_username_status_remains_valid(tmp_path: Path) -> None:
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    catalog.refresh_source("company")
+    raw = json.loads(catalog.source_store.catalog_path.read_bytes())
+    raw["statuses"][0].update({
+        "state": "stale",
+        "diagnosticCode": "source_unavailable",
+        "message": "fatal: ssh://git@example.test/team/repo.git was unavailable",
+    })
+    catalog.source_store.catalog_path.write_text(
+        json.dumps(raw, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    assert catalog.search("")[0].state == "stale"
 
 
 def test_source_removed_during_refresh_cannot_publish_orphaned_cache(
