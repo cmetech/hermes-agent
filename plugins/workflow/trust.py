@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -1190,8 +1191,9 @@ class WorkflowTrustStore:
     def revoke_origin(self, origin: str) -> int:
         normalized_origin = _validated_trust_origin(origin)
         with _locked(self.lock_path):
-            payload = self._read(mutation=True)
-            records = payload["records"]
+            original = self._read(mutation=True)
+            intended = deepcopy(original)
+            records = intended["records"]
             assert isinstance(records, dict)
             revoked = 0
             empty_records: list[str] = []
@@ -1206,8 +1208,58 @@ class WorkflowTrustStore:
             for package_digest in empty_records:
                 del records[package_digest]
             if revoked:
-                self._write(payload)
+                self._write_revocation(original, intended)
             return revoked
+
+    def _write_revocation(
+        self,
+        original: _TrustPayload,
+        intended: _TrustPayload,
+    ) -> None:
+        """Resolve a writer error only from the exact normalized store state."""
+
+        try:
+            self._write(intended)
+        except Exception as error:
+            try:
+                current = self._read(mutation=True)
+            except WorkflowTrustError as read_error:
+                raise WorkflowTrustError(
+                    "workflow trust revocation state is indeterminate"
+                ) from read_error
+            if current == intended:
+                return
+            if current == original:
+                raise
+            raise WorkflowTrustError(
+                "workflow trust revocation state is indeterminate"
+            ) from error
+
+    def revoke_origin_for_digest(self, package_digest: str, origin: str) -> bool:
+        """Remove one exact origin grant without affecting sibling grants."""
+
+        if (
+            not isinstance(package_digest, str)
+            or _SHA256.fullmatch(package_digest) is None
+        ):
+            raise WorkflowTrustError("package digest must be a SHA-256 hex value")
+        normalized_origin = _validated_trust_origin(origin)
+        with _locked(self.lock_path):
+            original = self._read(mutation=True)
+            intended = deepcopy(original)
+            records = intended["records"]
+            assert isinstance(records, dict)
+            record = records.get(package_digest)
+            if not isinstance(record, dict):
+                return False
+            grants = record["grants"]
+            assert isinstance(grants, dict)
+            if grants.pop(normalized_origin, None) is None:
+                return False
+            if not grants:
+                del records[package_digest]
+            self._write_revocation(original, intended)
+            return True
 
     def check(
         self, package_digest: str, *, risk_digest: str | None = None

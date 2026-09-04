@@ -26,6 +26,7 @@ from plugins.workflow.marketplace.transactions import (
     PreparedTransaction,
     TransactionCandidate,
 )
+from plugins.workflow.trust import WorkflowTrustStore
 
 
 FIXTURE_PACKAGES = (
@@ -493,6 +494,190 @@ def test_atomic_install_places_verified_copy_and_exact_provenance(
     assert list(store.staging_root.iterdir()) == []
     assert list(store.quarantine_root.iterdir()) == []
     assert store.list_journals() == ()
+
+
+def test_atomic_install_rejects_noncanonical_or_mismatched_trust_origin(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store = MarketplaceTransactionStore(tmp_path)
+    consumed = _consume(store, candidate)
+
+    for origin in ("marketplace:other/laptop-support", "unsafe origin"):
+        with pytest.raises(WorkflowMarketplaceError) as error:
+            store.atomic_install(
+                consumed,
+                review_digest=REVIEW,
+                trust_origin=origin,
+            )
+        assert error.value.code == "transaction_trust_origin_invalid"
+
+    assert not candidate.destination.exists()
+
+
+def test_old_consumed_journal_without_trust_origin_retains_legacy_behavior(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store = MarketplaceTransactionStore(tmp_path)
+    consumed = _consume(store, candidate)
+    state = json.loads(store.journal_path.read_bytes())
+    state["journals"][0].pop("trustOrigin", None)
+    store.journal_path.write_text(json.dumps(state), encoding="utf-8")
+
+    installed = store.atomic_install(consumed, review_digest=REVIEW)
+
+    assert installed.package_version == "1.0.0"
+    assert store.list_journals() == ()
+
+
+def test_install_recovery_replays_identity_bound_pending_trust_revocation(
+    tmp_path: Path,
+) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    first = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    second = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+    _install(store, first)
+    origin = "marketplace:company/laptop-support"
+    digest = "1" * 64
+    risk = "a" * 64
+    store.trust_store.trust_origin(
+        digest, actor="marketplace", risk_digest=risk, origin=origin
+    )
+    store.trust_store.trust(digest, actor="manual", risk_digest=risk)
+
+    def crash(point: str) -> None:
+        if point == "after_trust_revoke_pending":
+            raise SimulatedCrash(point)
+
+    with pytest.raises(SimulatedCrash):
+        store.atomic_install(
+            _consume(store, second),
+            review_digest=REVIEW,
+            trust_origin=origin,
+            fault=crash,
+        )
+    assert (
+        origin
+        in store.trust_store.snapshot_read_only(max_bytes=1024 * 1024)["records"][
+            digest
+        ]["grants"]
+    )
+
+    store.recover_transactions()
+    store.recover_transactions()
+
+    grants = store.trust_store.snapshot_read_only(max_bytes=1024 * 1024)["records"][
+        digest
+    ]["grants"]
+    assert set(grants) == {"manual"}
+    assert store.installed_store.get(first.identity).package_version == "2.0.0"
+    assert store.list_journals() == ()
+
+
+def test_post_trust_commit_failure_never_rolls_back_package_or_provenance(
+    tmp_path: Path,
+) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    first = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    second = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+    _install(store, first)
+    origin = "marketplace:company/laptop-support"
+    digest = "1" * 64
+    risk = "a" * 64
+    store.trust_store.trust_origin(
+        digest, actor="marketplace", risk_digest=risk, origin=origin
+    )
+    store.trust_store.trust(digest, actor="manual", risk_digest=risk)
+
+    def fail_after_trust_commit(point: str) -> None:
+        if point == "after_trust_revoke":
+            raise OSError("journal replacement unavailable")
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.atomic_install(
+            _consume(store, second),
+            review_digest=REVIEW,
+            trust_origin=origin,
+            fault=fail_after_trust_commit,
+        )
+    assert error.value.code == "transaction_rollback_failed"
+    assert store.installed_store.get(first.identity).package_version == "2.0.0"
+    grants = store.trust_store.snapshot_read_only(max_bytes=1024 * 1024)["records"][
+        digest
+    ]["grants"]
+    assert set(grants) == {"manual"}
+    assert store.list_journals()
+
+    store.recover_transactions()
+
+    assert store.installed_store.get(first.identity).package_version == "2.0.0"
+    assert store.list_journals() == ()
+
+
+def test_remove_recovery_replays_identity_bound_pending_trust_revocation(
+    tmp_path: Path,
+) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = _install(store, candidate)
+    origin = "marketplace:company/laptop-support"
+    digest = "1" * 64
+    risk = "a" * 64
+    store.trust_store.trust_origin(
+        digest, actor="marketplace", risk_digest=risk, origin=origin
+    )
+    _candidate_value, removal = _authorize_remove(store, installed)
+
+    def crash(point: str) -> None:
+        if point == "after_trust_revoke_pending":
+            raise SimulatedCrash(point)
+
+    with pytest.raises(SimulatedCrash):
+        store.atomic_remove(
+            removal,
+            review_digest=REVIEW,
+            trust_origin=origin,
+            fault=crash,
+        )
+
+    store.recover_transactions()
+
+    assert not candidate.destination.exists()
+    assert store.trust_store.check_read_only(digest, risk_digest=risk) == "untrusted"
+    assert store.list_journals() == ()
+
+
+@pytest.mark.parametrize(
+    "tampered_origin",
+    ["marketplace:other/laptop-support", "unsafe origin"],
+)
+def test_recovery_rejects_mismatched_journal_trust_origin_before_revocation(
+    tmp_path: Path,
+    tampered_origin: str,
+) -> None:
+    now = [datetime(2026, 9, 3, tzinfo=timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    consumed = _consume(store, candidate)
+    state = json.loads(store.journal_path.read_bytes())
+    state["journals"][0]["trustOrigin"] = tampered_origin
+    store.journal_path.write_text(json.dumps(state), encoding="utf-8")
+    now[0] += timedelta(minutes=6)
+    store.trust_store.trust_origin(
+        "1" * 64,
+        actor="marketplace",
+        risk_digest="a" * 64,
+        origin="marketplace:company/laptop-support",
+    )
+    before = store.trust_store.snapshot_read_only(max_bytes=1024 * 1024)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.recover_transactions()
+
+    assert error.value.code == "transaction_state_invalid"
+    assert store.trust_store.snapshot_read_only(max_bytes=1024 * 1024) == before
+    assert not consumed.destination.exists()
 
 
 def test_atomic_install_keeps_same_package_id_from_two_sources_separate(

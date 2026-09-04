@@ -40,6 +40,7 @@ from plugins.workflow.trust import (
     WORKFLOW_RESOURCE_MAX_FILES,
     WORKFLOW_RESOURCE_MAX_TOTAL_BYTES,
     WorkflowResourceReadBudget,
+    WorkflowTrustError,
     WorkflowTrustStore,
     compute_package_digest,
 )
@@ -613,3 +614,189 @@ def test_loose_workflow_binding_preserves_existing_digest_without_distribution_r
         )
         is base
     )
+
+
+def test_revoke_one_origin_digest_preserves_other_grants_and_other_digests(
+    tmp_path: Path,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    first = "1" * 64
+    second = "2" * 64
+    risk = "a" * 64
+    origin = "marketplace:company/package"
+    store.trust_origin(first, actor="marketplace", risk_digest=risk, origin=origin)
+    store.trust_origin(second, actor="marketplace", risk_digest=risk, origin=origin)
+    store.trust(first, actor="manual", risk_digest=risk)
+    store.trust_origin(
+        first,
+        actor="other",
+        risk_digest=risk,
+        origin="marketplace:other/package",
+    )
+
+    assert store.revoke_origin_for_digest(first, origin) is True
+    payload = store.snapshot_read_only(max_bytes=1024 * 1024)
+
+    assert set(payload["records"][first]["grants"]) == {
+        "manual",
+        "marketplace:other/package",
+    }
+    assert origin in payload["records"][second]["grants"]
+
+
+def test_revoke_one_origin_digest_missing_pair_does_not_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    store.trust_origin(
+        "1" * 64,
+        actor="marketplace",
+        risk_digest="a" * 64,
+        origin="marketplace:company/package",
+    )
+    writes = 0
+    original = store._write
+
+    def recording_write(payload):
+        nonlocal writes
+        writes += 1
+        return original(payload)
+
+    monkeypatch.setattr(store, "_write", recording_write)
+
+    assert (
+        store.revoke_origin_for_digest("1" * 64, "marketplace:missing/package") is False
+    )
+    assert store.revoke_origin_for_digest("2" * 64, "manual") is False
+    assert writes == 0
+
+
+@pytest.mark.parametrize(
+    ("digest", "origin"),
+    [("not-a-digest", "manual"), ("1" * 64, "unsafe origin")],
+)
+def test_revoke_one_origin_digest_rejects_malformed_identity(
+    tmp_path: Path,
+    digest: str,
+    origin: str,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+
+    with pytest.raises(WorkflowTrustError):
+        store.revoke_origin_for_digest(digest, origin)
+
+
+def test_revoke_one_origin_digest_rejects_corrupt_store(tmp_path: Path) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(WorkflowTrustError, match="corrupt"):
+        store.revoke_origin_for_digest("1" * 64, "marketplace:company/package")
+
+
+def test_origin_revoke_treats_commit_then_raise_as_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    digest = "1" * 64
+    risk = "a" * 64
+    origin = "marketplace:company/package"
+    store.trust_origin(digest, actor="marketplace", risk_digest=risk, origin=origin)
+    store.trust(digest, actor="manual", risk_digest=risk)
+    store.trust_origin(
+        digest,
+        actor="other",
+        risk_digest=risk,
+        origin="marketplace:other/package",
+    )
+    original_write = store._write
+
+    def commit_then_raise(payload):
+        original_write(payload)
+        raise OSError("directory fsync failed after replacement")
+
+    monkeypatch.setattr(store, "_write", commit_then_raise)
+
+    assert store.revoke_origin(origin) == 1
+    payload = store.snapshot_read_only(max_bytes=1024 * 1024)
+    assert set(payload["records"][digest]["grants"]) == {
+        "manual",
+        "marketplace:other/package",
+    }
+
+
+def test_exact_origin_digest_revoke_treats_commit_then_raise_as_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    first = "1" * 64
+    second = "2" * 64
+    risk = "a" * 64
+    origin = "marketplace:company/package"
+    store.trust_origin(first, actor="marketplace", risk_digest=risk, origin=origin)
+    store.trust_origin(second, actor="marketplace", risk_digest=risk, origin=origin)
+    original_write = store._write
+
+    def commit_then_raise(payload):
+        original_write(payload)
+        raise OSError("directory fsync failed after replacement")
+
+    monkeypatch.setattr(store, "_write", commit_then_raise)
+
+    assert store.revoke_origin_for_digest(first, origin) is True
+    payload = store.snapshot_read_only(max_bytes=1024 * 1024)
+    assert first not in payload["records"]
+    assert origin in payload["records"][second]["grants"]
+
+
+def test_origin_revoke_propagates_precommit_failure_without_changing_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    digest = "1" * 64
+    risk = "a" * 64
+    origin = "marketplace:company/package"
+    store.trust_origin(digest, actor="marketplace", risk_digest=risk, origin=origin)
+    before = store.snapshot_read_only(max_bytes=1024 * 1024)
+
+    def fail_before_commit(_payload):
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(store, "_write", fail_before_commit)
+
+    with pytest.raises(OSError, match="replacement failed"):
+        store.revoke_origin(origin)
+    assert store.snapshot_read_only(max_bytes=1024 * 1024) == before
+
+
+def test_origin_revoke_fails_closed_when_post_error_state_is_indeterminate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    digest = "1" * 64
+    risk = "a" * 64
+    origin = "marketplace:company/package"
+    store.trust_origin(digest, actor="marketplace", risk_digest=risk, origin=origin)
+    store.trust(digest, actor="manual", risk_digest=risk)
+    original_write = store._write
+
+    def write_conflicting_state_then_raise(payload):
+        conflicting = json.loads(json.dumps(payload))
+        conflicting["records"][digest]["grants"]["marketplace:concurrent/package"] = {
+            "actor": "concurrent",
+            "risk_digest": risk,
+            "trusted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        original_write(conflicting)
+        raise OSError("directory fsync failed after conflicting replacement")
+
+    monkeypatch.setattr(store, "_write", write_conflicting_state_then_raise)
+
+    with pytest.raises(WorkflowTrustError, match="revocation state is indeterminate"):
+        store.revoke_origin(origin)

@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from hermes_constants import get_hermes_home
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
+from plugins.workflow.trust import WorkflowTrustError, WorkflowTrustStore
 from utils import _is_reparse_point, atomic_write_text
 
 from .models import InstalledPackageIdentity, InstalledPackageProvenance
@@ -46,6 +47,7 @@ _MAX_MARKER_BYTES = 32 * 1024
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,256}$", re.ASCII)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _TRANSACTION_ID = re.compile(r"^[0-9a-f]{32}$", re.ASCII)
+_TRUST_ORIGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}", re.ASCII)
 _OWNER = "hermes-workflow-marketplace"
 _CONFIRMATION_DOMAIN = b"hermes.workflow-marketplace.confirmation.v1\0"
 _CONSUMED_LEASE_SECONDS = 300
@@ -55,11 +57,13 @@ JournalPhase = Literal[
     "install_backup_move_pending",
     "install_candidate_swap_pending",
     "install_provenance_write_pending",
+    "install_trust_revoke_pending",
     "install_retire_pending",
     "install_rollback_pending",
     "remove_consumed",
     "remove_backup_move_pending",
     "remove_provenance_write_pending",
+    "remove_trust_revoke_pending",
     "remove_retire_pending",
     "remove_rollback_pending",
 ]
@@ -250,6 +254,12 @@ class _JournalRecord(_StateModel):
     previous_provenance: InstalledPackageProvenance | None = Field(
         default=None, alias="previousProvenance"
     )
+    trust_origin: str | None = Field(
+        default=None,
+        alias="trustOrigin",
+        max_length=256,
+        pattern=_TRUST_ORIGIN.pattern,
+    )
 
     @model_validator(mode="after")
     def require_operation_shape(self) -> "_JournalRecord":
@@ -261,6 +271,11 @@ class _JournalRecord(_StateModel):
             self.candidate_provenance is not None or self.previous_provenance is None
         ):
             raise ValueError("remove journal requires only prior provenance")
+        expected_origin = _marketplace_trust_origin(self.identity)
+        if self.trust_origin is not None and self.trust_origin != expected_origin:
+            raise ValueError("journal trust origin does not match its identity")
+        if self.phase.endswith("_trust_revoke_pending") and self.trust_origin is None:
+            raise ValueError("trust revocation phase requires an exact origin")
         consumed_at = _parse_timestamp(self.consumed_at)
         consumed_expires_at = _parse_timestamp(self.consumed_expires_at)
         if not (
@@ -349,6 +364,25 @@ def _clean_identity_text(value: object, *, label: str, limit: int) -> str:
     ):
         _fail("transaction_candidate_invalid", f"{label} is invalid")
     return value
+
+
+def _marketplace_trust_origin(identity: InstalledPackageIdentity) -> str:
+    return f"marketplace:{identity.source_key}/{identity.package_id}"
+
+
+def _validated_trust_origin(
+    identity: InstalledPackageIdentity,
+    trust_origin: str | None,
+) -> str | None:
+    if trust_origin is None:
+        return None
+    expected = _marketplace_trust_origin(identity)
+    if _TRUST_ORIGIN.fullmatch(trust_origin) is None or trust_origin != expected:
+        _fail(
+            "transaction_trust_origin_invalid",
+            "trust origin does not match the installed package identity",
+        )
+    return trust_origin
 
 
 def _fsync_directory(path: Path) -> None:
@@ -469,6 +503,7 @@ class MarketplaceTransactionStore:
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(32),
         lock_timeout_seconds: float = 5.0,
+        trust_store: WorkflowTrustStore | None = None,
     ):
         self.home = _absolute(
             Path(hermes_home) if hermes_home is not None else get_hermes_home()
@@ -484,6 +519,7 @@ class MarketplaceTransactionStore:
             self.home,
             lock_timeout_seconds=lock_timeout_seconds,
         )
+        self.trust_store = trust_store or WorkflowTrustStore(self.home)
         self._shared_store = shared
         self.clock = clock
         self.token_factory = token_factory
@@ -1549,12 +1585,14 @@ class MarketplaceTransactionStore:
         prepared: PreparedTransaction,
         *,
         review_digest: str,
+        trust_origin: str | None = None,
         provenance_writer: Callable[[InstalledPackageProvenance], object] | None = None,
         fault: Callable[[str], None] = lambda _point: None,
     ) -> InstalledPackageProvenance:
         """Install a consumed candidate with provenance inside one rollback boundary."""
 
         prepared = self._require_authorization(prepared, "install")
+        trust_origin = _validated_trust_origin(prepared.identity, trust_origin)
         self._ensure_workflow_roots()
         destination = prepared.destination
         writer = provenance_writer or self.installed_store.put
@@ -1591,6 +1629,7 @@ class MarketplaceTransactionStore:
                 update={
                     "phase": "install_backup_move_pending",
                     "previous_provenance": previous,
+                    "trust_origin": trust_origin,
                 }
             )
             try:
@@ -1629,7 +1668,16 @@ class MarketplaceTransactionStore:
                         "provenance writer did not persist candidate identity",
                     )
                 fault("after_provenance_write")
+                if trust_origin is not None:
+                    journal = journal.model_copy(
+                        update={"phase": "install_trust_revoke_pending"}
+                    )
+                    self._replace_journal(journal, parent_identity=parent_identity)
+                    fault("after_trust_revoke_pending")
+                    self.trust_store.revoke_origin(trust_origin)
                 journal = journal.model_copy(update={"phase": "install_retire_pending"})
+                if trust_origin is not None:
+                    fault("after_trust_revoke")
                 self._replace_journal(journal, parent_identity=parent_identity)
                 if previous is not None:
                     quarantine_envelope = quarantine.parent
@@ -1724,12 +1772,14 @@ class MarketplaceTransactionStore:
         prepared: PreparedTransaction,
         *,
         review_digest: str,
+        trust_origin: str | None = None,
         provenance_remover: Callable[[InstalledPackageIdentity], object] | None = None,
         fault: Callable[[str], None] = lambda _point: None,
     ) -> InstalledPackageProvenance:
         """Remove one package authorized by an exact consumed confirmation."""
 
         prepared = self._require_authorization(prepared, "remove")
+        trust_origin = _validated_trust_origin(prepared.identity, trust_origin)
         self._ensure_workflow_roots()
         destination = prepared.destination
         remover = provenance_remover or self.installed_store.remove
@@ -1750,6 +1800,7 @@ class MarketplaceTransactionStore:
             journal = consumed.model_copy(
                 update={
                     "phase": "remove_backup_move_pending",
+                    "trust_origin": trust_origin,
                 }
             )
             try:
@@ -1778,7 +1829,16 @@ class MarketplaceTransactionStore:
                         "provenance remover did not remove installed identity",
                     )
                 fault("after_provenance_remove")
+                if trust_origin is not None:
+                    journal = journal.model_copy(
+                        update={"phase": "remove_trust_revoke_pending"}
+                    )
+                    self._replace_journal(journal, parent_identity=parent_identity)
+                    fault("after_trust_revoke_pending")
+                    self.trust_store.revoke_origin(trust_origin)
                 journal = journal.model_copy(update={"phase": "remove_retire_pending"})
+                if trust_origin is not None:
+                    fault("after_trust_revoke")
                 self._replace_journal(journal, parent_identity=parent_identity)
                 quarantine_envelope = quarantine.parent
                 if _entry(quarantine_envelope) is not None and not (
@@ -1903,6 +1963,8 @@ class MarketplaceTransactionStore:
             and destination_digest == candidate.distribution_digest
         )
         if committed:
+            if journal.trust_origin is not None:
+                self.trust_store.revoke_origin(journal.trust_origin)
             return self._finish_install_cleanup(journal)
         previous = journal.previous_provenance
         if previous is None:
@@ -1950,6 +2012,8 @@ class MarketplaceTransactionStore:
             and current is None
             and _entry(destination) is None
         ):
+            if journal.trust_origin is not None:
+                self.trust_store.revoke_origin(journal.trust_origin)
             return _entry(quarantine.parent) is None or self._remove_owned_envelope(
                 quarantine.parent,
                 transaction_id=journal.transaction_id,
@@ -2086,7 +2150,7 @@ class MarketplaceTransactionStore:
                         completed = self._recover_install(journal)
                     else:
                         completed = self._recover_remove(journal)
-                except (OSError, WorkflowMarketplaceError):
+                except (OSError, WorkflowMarketplaceError, WorkflowTrustError):
                     completed = False
                 if completed:
                     recovered.append(journal.transaction_id)

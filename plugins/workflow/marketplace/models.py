@@ -528,15 +528,264 @@ class InstalledPackageProvenance(StrictMarketplaceModel):
         return paths
 
 
+class StringSetChange(StrictMarketplaceModel):
+    """One bounded sorted set difference used by lifecycle reviews."""
+
+    added: list[ShortText] = Field(max_length=512)
+    removed: list[ShortText] = Field(max_length=512)
+
+    @field_validator("added", "removed")
+    @classmethod
+    def validate_values(cls, value: list[str]) -> list[str]:
+        if value != sorted(value) or len(value) != len(set(value)):
+            raise ValueError("review set changes must be unique and sorted")
+        return value
+
+
+class RequirementChanges(StrictMarketplaceModel):
+    runtimes: StringSetChange
+    tools: StringSetChange
+    providers: StringSetChange
+    services: StringSetChange
+    secrets: StringSetChange
+
+
+class FileDigestChange(StrictMarketplaceModel):
+    """A bounded digest/path change; reviews never carry textual file diffs."""
+
+    path: str = Field(min_length=1, max_length=1024)
+    kind: Literal["added", "modified", "removed", "renamed"]
+    old_path: str | None = Field(default=None, alias="oldPath", max_length=1024)
+    old_digest: str | None = Field(
+        default=None, alias="oldDigest", pattern=SHA256_PATTERN
+    )
+    candidate_digest: str | None = Field(
+        default=None, alias="candidateDigest", pattern=SHA256_PATTERN
+    )
+
+    @field_validator("path", "old_path")
+    @classmethod
+    def validate_paths(cls, value: str | None) -> str | None:
+        return None if value is None else _require_canonical_relative_path(value)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "FileDigestChange":
+        if self.kind == "added" and (
+            self.old_path is not None
+            or self.old_digest is not None
+            or self.candidate_digest is None
+        ):
+            raise ValueError("added file review is inconsistent")
+        if self.kind == "removed" and (
+            self.old_path is not None
+            or self.old_digest is None
+            or self.candidate_digest is not None
+        ):
+            raise ValueError("removed file review is inconsistent")
+        if self.kind == "modified" and (
+            self.old_path is not None
+            or self.old_digest is None
+            or self.candidate_digest is None
+        ):
+            raise ValueError("modified file review is inconsistent")
+        if self.kind == "renamed" and (
+            self.old_path is None
+            or self.old_digest is None
+            or self.candidate_digest is None
+            or self.old_digest != self.candidate_digest
+        ):
+            raise ValueError("renamed file review is inconsistent")
+        return self
+
+
+class WorkflowTrustReviewItem(StrictMarketplaceModel):
+    """Exact per-workflow risk and trust identity rendered before a grant."""
+
+    workflow_name: ShortText = Field(alias="workflowName")
+    definition_path: str = Field(alias="definitionPath", max_length=1024)
+    companion_path: str | None = Field(
+        default=None, alias="companionPath", max_length=1024
+    )
+    package_digest: str = Field(alias="packageDigest", pattern=SHA256_PATTERN)
+    risk_digest: str = Field(alias="riskDigest", pattern=SHA256_PATTERN)
+    trust_state: Literal["trusted", "untrusted"] = Field(alias="trustState")
+    shell_or_script_nodes: list[ShortText] = Field(
+        alias="shellOrScriptNodes", max_length=512
+    )
+    command_nodes: list[ShortText] = Field(alias="commandNodes", max_length=512)
+    approval_nodes: list[ShortText] = Field(alias="approvalNodes", max_length=512)
+    command_resources: list[str] = Field(alias="commandResources", max_length=512)
+    script_resources: list[str] = Field(alias="scriptResources", max_length=512)
+    mcp_resources: list[str] = Field(alias="mcpResources", max_length=512)
+    requested_tools: list[ShortText] = Field(alias="requestedTools", max_length=512)
+    requested_skills: list[ShortText] = Field(alias="requestedSkills", max_length=512)
+    local_mcp_servers: list[ShortText] = Field(alias="localMcpServers", max_length=512)
+    remote_mcp_servers: list[ShortText] = Field(
+        alias="remoteMcpServers", max_length=512
+    )
+    providers: list[ShortText] = Field(max_length=512)
+    outward_action_nodes: list[ShortText] = Field(
+        alias="outwardActionNodes", max_length=512
+    )
+    required_secrets: list[ShortText] = Field(alias="requiredSecrets", max_length=512)
+    external_requirements: ExternalRequirements = Field(alias="externalRequirements")
+    package_resources: list[str] = Field(alias="packageResources", max_length=512)
+    compatibility: list[PackageDiagnostic] = Field(max_length=512)
+
+    @field_validator(
+        "definition_path",
+        "companion_path",
+        "command_resources",
+        "script_resources",
+        "mcp_resources",
+        "package_resources",
+    )
+    @classmethod
+    def validate_resource_paths(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            paths = [_require_canonical_relative_path(path) for path in value]
+            if paths != sorted(paths) or len(paths) != len(set(paths)):
+                raise ValueError("review resource paths must be unique and sorted")
+            return paths
+        return _require_canonical_relative_path(value)
+
+
+class InstalledPackage(StrictMarketplaceModel):
+    identity: InstalledPackageIdentity
+    source_name: str = Field(alias="sourceName", min_length=1, max_length=64)
+    repository_url: str = Field(alias="repositoryUrl", min_length=1, max_length=4096)
+    configured_ref: str | None = Field(default=None, alias="configuredRef")
+    resolved_commit: str = Field(alias="resolvedCommit", pattern=r"^[0-9a-f]{40}$")
+    package_path: str = Field(alias="packagePath", min_length=1, max_length=1024)
+    version: str = Field(pattern=SEMANTIC_VERSION_PATTERN)
+    contract_version: Literal[1] = Field(alias="contractVersion")
+    distribution_digest: str = Field(alias="distributionDigest", pattern=SHA256_PATTERN)
+    installed_at: str = Field(alias="installedAt", min_length=20, max_length=64)
+    actor: str = Field(min_length=1, max_length=256)
+    workflow_paths: list[str] = Field(alias="workflowPaths", max_length=512)
+    orphaned_source: bool = Field(alias="orphanedSource")
+
+    @field_validator("repository_url")
+    @classmethod
+    def validate_repository_url(cls, value: str) -> str:
+        return _require_credential_free_repository_identity(value)
+
+
+class InstallReview(StrictMarketplaceModel):
+    operation: Literal["install"]
+    result: Literal["review_required"] = "review_required"
+    confirmation_token: str = Field(
+        alias="confirmationToken", min_length=1, max_length=4096
+    )
+    review_digest: str = Field(alias="reviewDigest", pattern=SHA256_PATTERN)
+    identity: InstalledPackageIdentity
+    source_name: str = Field(alias="sourceName", min_length=1, max_length=64)
+    repository_url: str = Field(alias="repositoryUrl", min_length=1, max_length=4096)
+    configured_ref: str | None = Field(default=None, alias="configuredRef")
+    resolved_commit: str = Field(alias="resolvedCommit", pattern=r"^[0-9a-f]{40}$")
+    package_path: str = Field(alias="packagePath", min_length=1, max_length=1024)
+    candidate_version: str = Field(
+        alias="candidateVersion", pattern=SEMANTIC_VERSION_PATTERN
+    )
+    candidate_digest: str = Field(alias="candidateDigest", pattern=SHA256_PATTERN)
+    assessment: PackageReviewAssessment
+    file_changes: list[FileDigestChange] = Field(alias="fileChanges", max_length=1024)
+    workflow_reviews: list[WorkflowTrustReviewItem] = Field(
+        alias="workflowReviews", max_length=512
+    )
+
+
+class UpdateReview(StrictMarketplaceModel):
+    operation: Literal["update"]
+    result: Literal["review_required", "update_available", "unchanged"]
+    confirmation_token: str | None = Field(
+        default=None, alias="confirmationToken", max_length=4096
+    )
+    review_digest: str = Field(alias="reviewDigest", pattern=SHA256_PATTERN)
+    identity: InstalledPackageIdentity
+    source_name: str = Field(alias="sourceName", min_length=1, max_length=64)
+    repository_url: str = Field(alias="repositoryUrl", min_length=1, max_length=4096)
+    configured_ref: str | None = Field(default=None, alias="configuredRef")
+    old_version: str = Field(alias="oldVersion", pattern=SEMANTIC_VERSION_PATTERN)
+    candidate_version: str = Field(
+        alias="candidateVersion", pattern=SEMANTIC_VERSION_PATTERN
+    )
+    old_commit: str = Field(alias="oldCommit", pattern=r"^[0-9a-f]{40}$")
+    candidate_commit: str = Field(alias="candidateCommit", pattern=r"^[0-9a-f]{40}$")
+    old_digest: str = Field(alias="oldDigest", pattern=SHA256_PATTERN)
+    candidate_digest: str = Field(alias="candidateDigest", pattern=SHA256_PATTERN)
+    file_changes: list[FileDigestChange] = Field(alias="fileChanges", max_length=1024)
+    workflow_changes: StringSetChange = Field(alias="workflowChanges")
+    requirement_changes: RequirementChanges = Field(alias="requirementChanges")
+    risk_changes: StringSetChange = Field(alias="riskChanges")
+    compatibility_changes: StringSetChange = Field(alias="compatibilityChanges")
+    assessment: PackageReviewAssessment
+    workflow_reviews: list[WorkflowTrustReviewItem] = Field(
+        alias="workflowReviews", max_length=512
+    )
+
+
+class RemoveReview(StrictMarketplaceModel):
+    operation: Literal["remove"]
+    result: Literal["review_required"] = "review_required"
+    confirmation_token: str = Field(
+        alias="confirmationToken", min_length=1, max_length=4096
+    )
+    review_digest: str = Field(alias="reviewDigest", pattern=SHA256_PATTERN)
+    identity: InstalledPackageIdentity
+    current_version: str = Field(
+        alias="currentVersion", pattern=SEMANTIC_VERSION_PATTERN
+    )
+    current_commit: str = Field(alias="currentCommit", pattern=r"^[0-9a-f]{40}$")
+    distribution_digest: str = Field(alias="distributionDigest", pattern=SHA256_PATTERN)
+    workflow_names: list[ShortText] = Field(alias="workflowNames", max_length=512)
+
+
+class TrustReview(StrictMarketplaceModel):
+    confirmation_token: str = Field(
+        alias="confirmationToken", min_length=1, max_length=4096
+    )
+    review_digest: str = Field(alias="reviewDigest", pattern=SHA256_PATTERN)
+    identity: InstalledPackageIdentity
+    source_name: str = Field(alias="sourceName", min_length=1, max_length=64)
+    version: str = Field(pattern=SEMANTIC_VERSION_PATTERN)
+    resolved_commit: str = Field(alias="resolvedCommit", pattern=r"^[0-9a-f]{40}$")
+    distribution_digest: str = Field(alias="distributionDigest", pattern=SHA256_PATTERN)
+    workflows: list[WorkflowTrustReviewItem] = Field(min_length=1, max_length=512)
+
+
+class UpdateCheck(StrictMarketplaceModel):
+    identity: InstalledPackageIdentity
+    status: Literal["current", "update_available", "orphaned"]
+    installed_version: str = Field(
+        alias="installedVersion", pattern=SEMANTIC_VERSION_PATTERN
+    )
+    candidate_version: str | None = Field(
+        default=None, alias="candidateVersion", pattern=SEMANTIC_VERSION_PATTERN
+    )
+
+
 __all__ = [
     "CompatibilityRules",
     "DigestRules",
     "ExternalRequirements",
     "InstallRequest",
+    "InstallReview",
+    "InstalledPackage",
     "InstalledPackageIdentity",
     "InstalledPackageProvenance",
     "PackageDiagnostic",
     "PackageReviewAssessment",
+    "FileDigestChange",
+    "RemoveReview",
+    "RequirementChanges",
+    "StringSetChange",
+    "TrustReview",
+    "UpdateCheck",
+    "UpdateReview",
+    "WorkflowTrustReviewItem",
     "PathRules",
     "ResourceRules",
     "WorkflowMarketplaceSource",
