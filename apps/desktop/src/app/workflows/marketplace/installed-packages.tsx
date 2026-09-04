@@ -121,7 +121,7 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   })
 
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
-  const packages = installed.isSuccess ? installed.data.packages : []
+  const packages = installed.data?.packages ?? []
 
   const notice = capabilities.isPending ? (
     <InstalledProvenanceNotice context="installed" kind="loading" />

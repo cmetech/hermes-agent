@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import type { ReactNode } from 'react'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { WorkflowMarketplaceApiError } from '@/api/workflow-marketplace'
 import { I18nProvider } from '@/i18n'
 import type {
   WorkflowMarketplaceCatalogPackage,
@@ -188,12 +189,12 @@ function packageDetail(overrides: Partial<WorkflowMarketplacePackageDetail> = {}
   }
 }
 
-function succeededDetail(detail = packageDetail()): WorkflowMarketplaceOperation {
+function succeededDetail(detail = packageDetail(), id = OPERATION_ID): WorkflowMarketplaceOperation {
   return {
     created_at: NOW,
     error: null,
     finished_at: NOW,
-    id: OPERATION_ID,
+    id,
     kind: 'package_detail',
     phase: 'completed',
     profile: 'support',
@@ -206,12 +207,12 @@ function succeededDetail(detail = packageDetail()): WorkflowMarketplaceOperation
   }
 }
 
-function pendingDetail(): WorkflowMarketplaceOperation {
+function pendingDetail(id = OPERATION_ID): WorkflowMarketplaceOperation {
   return {
     created_at: NOW,
     error: null,
     finished_at: null,
-    id: OPERATION_ID,
+    id,
     kind: 'package_detail',
     phase: 'queued',
     profile: 'support',
@@ -468,6 +469,38 @@ describe('WorkflowMarketplaceView', () => {
     expect(api.installed).not.toHaveBeenCalled()
   })
 
+  it('retains cached installed card provenance through a background failure and replaces it after retry', async () => {
+    api.installed
+      .mockResolvedValueOnce({ packages: [installedPackage()], profile: 'support' })
+      .mockRejectedValueOnce(
+        new WorkflowMarketplaceApiError(
+          'marketplace_network_error',
+          0,
+          'access_token=secret /private/tmp/installed-cache'
+        )
+      )
+      .mockResolvedValueOnce({
+        packages: [installedPackage({ version: '1.2.0' })],
+        profile: 'support'
+      })
+
+    const rendered = renderMarketplace()
+    expect(await screen.findByText('Installed v1.1.0')).toBeTruthy()
+
+    await act(async () => {
+      await rendered.client.refetchQueries({ queryKey: marketplaceKeys.installed('remote-a::support') })
+    })
+
+    const warning = await screen.findByRole('alert', { name: 'Installed package status unavailable' })
+    expect(screen.getByText('Installed v1.1.0')).toBeTruthy()
+    expect(screen.getByRole('option', { name: /Laptop Support/ })).toBeTruthy()
+    expect(within(warning).queryByText(/access_token|private\/tmp/)).toBeNull()
+
+    fireEvent.click(within(warning).getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('Installed v1.2.0')).toBeTruthy()
+    expect(screen.queryByText('Installed v1.1.0')).toBeNull()
+  })
+
   it('preserves backend ordering, reports stale partial results, filters sources, and pages within API bounds', async () => {
     const first = packageItem({ display_name: 'Zeta Support', identifier: 'company/zeta', id: 'zeta' })
 
@@ -613,7 +646,9 @@ describe('WorkflowMarketplaceView', () => {
 
   it('stops a rejected detail poll and retries that operation without leaking its error', async () => {
     api.inspect.mockResolvedValue(pendingDetail())
-    api.getOperation.mockRejectedValue(new Error('access_token=secret /private/tmp/operation'))
+    api.getOperation.mockRejectedValue(
+      new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'access_token=secret /private/tmp/operation')
+    )
 
     renderMarketplace()
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
@@ -632,6 +667,33 @@ describe('WorkflowMarketplaceView', () => {
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
     expect(api.inspect).toHaveBeenCalledTimes(1)
     expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure + 1)
+  })
+
+  it('starts a new inspection when the pending detail operation was evicted', async () => {
+    const replacementOperationId = `wmop_${'e'.repeat(12)}_${'f'.repeat(32)}`
+
+    api.inspect.mockResolvedValueOnce(pendingDetail()).mockResolvedValueOnce(pendingDetail(replacementOperationId))
+    api.getOperation.mockImplementation((id: string) =>
+      id === OPERATION_ID
+        ? Promise.reject(
+            new WorkflowMarketplaceApiError(
+              'marketplace_operation_not_found',
+              404,
+              'Workflow marketplace request failed.'
+            )
+          )
+        : Promise.resolve(succeededDetail(packageDetail(), replacementOperationId))
+    )
+
+    renderMarketplace()
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+
+    expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    expect(api.inspect).toHaveBeenCalledTimes(2)
+    expect(api.getOperation.mock.calls.map(([id]) => id)).toEqual([OPERATION_ID, replacementOperationId])
   })
 
   it('sanitizes detail failures and retries a fresh inspection', async () => {
@@ -875,9 +937,53 @@ describe('browse presentation components', () => {
     expect(screen.getByText('Loose profile workflow')).toBeTruthy()
     const alert = await screen.findByRole('alert', { name: title })
     expect(within(alert).queryByText(/operator:secret|private\/tmp|token=secret/)).toBeNull()
+    expect(screen.queryByRole('region', { name: 'Installed marketplace packages' })).toBeNull()
 
     fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
     expect(await screen.findByText('company/laptop-support')).toBeTruthy()
+  })
+
+  it('retains cached installed groups through a background failure and replaces them after retry', async () => {
+    api.installed
+      .mockResolvedValueOnce({ packages: [installedPackage()], profile: 'support' })
+      .mockRejectedValueOnce(
+        new WorkflowMarketplaceApiError(
+          'marketplace_network_error',
+          0,
+          'access_token=secret /private/tmp/installed-cache'
+        )
+      )
+      .mockResolvedValueOnce({
+        packages: [
+          installedPackage({
+            version: '1.2.0',
+            workflow_paths: ['workflows/laptop-diagnostic-v2.yml']
+          })
+        ],
+        profile: 'support'
+      })
+
+    const rendered = renderWithProviders(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose profile workflow</div>
+      </InstalledPackages>
+    )
+
+    expect(await screen.findByText('workflows/laptop-diagnostic.yml')).toBeTruthy()
+
+    await act(async () => {
+      await rendered.client.refetchQueries({ queryKey: marketplaceKeys.installed('remote-a::support') })
+    })
+
+    const warning = await screen.findByRole('alert', { name: 'Could not load installed package provenance' })
+    expect(screen.getByText('workflows/laptop-diagnostic.yml')).toBeTruthy()
+    expect(screen.getByText('Loose profile workflow')).toBeTruthy()
+    expect(within(warning).queryByText(/access_token|private\/tmp/)).toBeNull()
+
+    fireEvent.click(within(warning).getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('workflows/laptop-diagnostic-v2.yml')).toBeTruthy()
+    expect(screen.getByText('v1.2.0')).toBeTruthy()
+    expect(screen.queryByText('workflows/laptop-diagnostic.yml')).toBeNull()
   })
 
   it('keeps the loose workflow catalog available when installed-package capability detection is unsupported', async () => {

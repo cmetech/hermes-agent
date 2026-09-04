@@ -79,6 +79,10 @@ function operationNeedsPolling(operation: WorkflowMarketplaceOperation | undefin
   return operation?.state === 'pending' || operation?.state === 'running'
 }
 
+function operationWasLost(error: unknown): boolean {
+  return errorCode(error) === 'marketplace_operation_not_found'
+}
+
 export interface WorkflowMarketplaceViewProps {
   scope: WorkflowMarketplaceScope
 }
@@ -274,7 +278,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   }
 
   const retryDetail = () => {
-    if (needsDetailPolling && detailOperation.isError) {
+    if (needsDetailPolling && detailOperation.isError && !operationWasLost(detailOperation.error)) {
       void detailOperation.refetch()
     } else {
       void detailRequest.refetch()
