@@ -1014,6 +1014,127 @@ def test_refresh_auth_failure_projection_redacts_credentials_and_local_paths(
     assert "server\\\\share" not in encoded
 
 
+def test_refresh_preserves_schema_valid_local_repository_identity(api) -> None:
+    client, service, _context, _home, _profile = api
+
+    def local_refresh(name, *, cancelled):
+        return SourceRefreshResult(
+            source_name=name,
+            repository_url="file:///private/tmp/repository.git",
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+
+    service.refresh_source = local_refresh
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    assert terminal["state"] == "succeeded"
+    assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
+    assert "/private/tmp" not in json.dumps(terminal)
+
+
+def test_package_detail_and_installed_list_preserve_ordinary_local_source(api) -> None:
+    client, service, _context, _home, _profile = api
+    local_url = "file:///Volumes/WorkflowMarket/repository.git"
+    inspection = _inspection().model_copy(update={"repository_url": local_url})
+    installed = _installed().model_copy(update={"repository_url": local_url})
+    service.inspect = lambda identifier, *, cancelled: inspection
+    service.installed_packages = lambda: (installed,)
+
+    detail_started = client.get(
+        "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+        headers=_headers("read"),
+    )
+    detail = _wait_operation(client, detail_started.json()["id"], authority="read")
+    listed = client.get(
+        "/api/plugins/workflow/marketplace/installed",
+        headers=_headers("read"),
+    )
+
+    assert detail["state"] == "succeeded"
+    assert detail["result"]["value"]["repository_url"] == local_url
+    assert listed.status_code == 200
+    assert listed.json()["packages"][0]["repository_url"] == local_url
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:///C:/Users/alice/AppData/Local/Temp/repository.git",
+        "file://server/share/repository.git",
+        "file:///var/cache/hermes/.staging/repository.git",
+    ],
+)
+def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
+    api, local_url
+) -> None:
+    client, service, _context, _home, _profile = api
+    installed = _installed().model_copy(update={"repository_url": local_url})
+
+    def confirm(token, *, actor, cancelled, enter_atomic):
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return installed
+
+    service.confirm_install = confirm
+    started = client.post(
+        "/api/plugins/workflow/marketplace/install/confirm",
+        json={"confirmationToken": _TOKEN},
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    assert terminal["state"] == "succeeded"
+    assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
+    assert "Users" not in json.dumps(terminal)
+    assert "server" not in json.dumps(terminal)
+    assert ".staging" not in json.dumps(terminal)
+
+
+@pytest.mark.parametrize(
+    "repository_url",
+    [
+        "file://user:password@localhost/private/tmp/repository.git",
+        "https://user:secret@example.test/repository.git",
+    ],
+)
+def test_credential_bearing_result_identities_fail_without_leaking(
+    api, repository_url
+) -> None:
+    client, service, _context, _home, _profile = api
+
+    def unsafe_refresh(name, *, cancelled):
+        return SourceRefreshResult(
+            source_name=name,
+            repository_url=repository_url,
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+
+    service.refresh_source = unsafe_refresh
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    encoded = json.dumps(terminal)
+    assert terminal["state"] == "failed"
+    assert terminal["result"] is None
+    assert "password" not in encoded
+    assert "secret" not in encoded
+
+
 def test_prepare_reports_progress_and_enforces_same_profile_single_flight(api) -> None:
     client, service, _context, _home, _profile = api
     entered = threading.Event()

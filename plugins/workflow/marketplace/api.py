@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from typing import Literal, Protocol, TypeVar
+import urllib.parse
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import (
@@ -80,6 +81,7 @@ _SECRET_KEY = re.compile(
     r"^secret$|^clientsecret$|^credentials?$|^confirmationtoken$",
     re.ASCII,
 )
+_REDACTED_REPOSITORY_URL = "file:///REDACTED"
 
 
 class _Authority(Protocol):
@@ -598,6 +600,31 @@ def _safe_public_text(value: str) -> str:
     return sanitized[:4096]
 
 
+def _safe_repository_url(value: str) -> str:
+    """Preserve a typed Git identity or replace sensitive local identity paths."""
+
+    try:
+        validate_credential_free_git_source(value)
+    except GitSourceError:
+        return _REDACTED_REPOSITORY_URL
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme.casefold() != "file":
+        return value
+    decoded_path = parsed.path
+    for _ in range(3):
+        next_path = urllib.parse.unquote(decoded_path)
+        if next_path == decoded_path:
+            break
+        decoded_path = next_path
+    if (
+        parsed.netloc not in {"", "localhost"}
+        or re.match(r"^/[A-Za-z]:/", decoded_path) is not None
+        or _LOCAL_PATH.search(decoded_path) is not None
+    ):
+        return _REDACTED_REPOSITORY_URL
+    return value
+
+
 def _sanitize_result(
     value: object,
     *,
@@ -605,6 +632,8 @@ def _sanitize_result(
     key: str = "",
 ) -> object:
     normalized_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+    if normalized_key == "repositoryurl" and isinstance(value, str):
+        return _safe_repository_url(value)
     if _SECRET_KEY.fullmatch(normalized_key) is not None:
         if (
             normalized_key == "confirmationtoken"
