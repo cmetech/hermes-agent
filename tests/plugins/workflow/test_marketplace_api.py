@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import urllib.parse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
@@ -722,6 +723,44 @@ def test_source_list_projection_canonically_redacts_punctuated_and_encoded_diagn
     projected = response.json()["sources"][0]["message"]
     assert projected != message
     assert message not in json.dumps(response.json())
+
+
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["nested"]["unsafe"])
+@pytest.mark.parametrize("layers", range(1, 9))
+def test_source_list_projection_redacts_http_adjacent_identity_at_every_decode_layer(
+    api,
+    message: str,
+    layers: int,
+) -> None:
+    client, service, _context, _home, _profile = api
+    encoded = message
+    for _ in range(layers):
+        encoded = urllib.parse.quote(encoded, safe="")
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=encoded,
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["sources"][0]["message"]
+        == "workflow marketplace source refresh failed"
+    )
 
 
 def test_source_list_projection_canonicalizes_control_bearing_diagnostics(api) -> None:

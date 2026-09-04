@@ -54,7 +54,7 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     r"\b(access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b(\s*[=:])\s*\S+",
     re.IGNORECASE,
 )
-_HTTP_DIAGNOSTIC_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_HTTP_DIAGNOSTIC_START = re.compile(r"https?://", re.IGNORECASE)
 _LOCAL_PATH = re.compile(
     r"(?:"
     r"file:/+[^\s\"'<>()[\]{},;]+|"
@@ -89,9 +89,137 @@ def _diagnostic_contains_control(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
+def _is_ascii_alphanumeric(character: str) -> bool:
+    return "a" <= character <= "z" or "A" <= character <= "Z" or "0" <= character <= "9"
+
+
+def _diagnostic_identity_has_boundary(value: str, index: int) -> bool:
+    if index == 0:
+        return True
+    previous = value[index - 1]
+    return previous not in "/-._~%" and not previous.isalnum()
+
+
+def _diagnostic_http_authority_is_safe(value: str) -> bool:
+    """Validate the bounded authority syntax that permits URL path masking."""
+
+    if not value or "@" in value:
+        return False
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing <= 1 or "[" in value[1:] or "]" in value[closing + 1 :]:
+            return False
+        address = value[1:closing]
+        suffix = value[closing + 1 :]
+        return all(
+            not character.isspace() and character not in "/[]@" for character in address
+        ) and (
+            not suffix
+            or (
+                suffix.startswith(":") and suffix[1:].isascii() and suffix[1:].isdigit()
+            )
+        )
+
+    if value.count(":") > 1:
+        return False
+    host, separator, port = value.rpartition(":")
+    if not separator:
+        host = value
+    elif not port.isascii() or not port.isdigit():
+        return False
+    return bool(host) and all(
+        _is_ascii_alphanumeric(character)
+        or (not character.isascii() and character.isalnum())
+        or character in ".-_~%"
+        for character in host
+    )
+
+
+def _diagnostic_local_identity_starts_at(value: str, index: int) -> bool:
+    return _diagnostic_identity_has_boundary(value, index) and (
+        _LOCAL_PATH.match(value, index) is not None
+    )
+
+
+def _diagnostic_http_scheme_slashes_start_at(value: str, index: int) -> bool:
+    prefix = value[max(0, index - 6) : index].casefold()
+    return prefix.endswith("http:") or prefix.endswith("https:")
+
+
+def _diagnostic_http_scheme_length_at(value: str, index: int) -> int:
+    candidate = value[index : index + len("https://")].casefold()
+    if candidate.startswith("https://"):
+        return len("https://")
+    if candidate.startswith("http://"):
+        return len("http://")
+    return 0
+
+
+def _diagnostic_http_scheme_has_boundary(value: str, index: int) -> bool:
+    if index == 0:
+        return True
+    previous = value[index - 1]
+    return previous != "/" and not previous.isalnum()
+
+
+def _mask_safe_http_diagnostic_urls(value: str) -> str:
+    """Mask only the URL span before an adjacent, independently rooted identity."""
+
+    masked = list(value)
+    consumed_until = 0
+    for match in _HTTP_DIAGNOSTIC_START.finditer(value):
+        if match.start() < consumed_until:
+            continue
+
+        token_end = match.end()
+        while token_end < len(value):
+            character = value[token_end]
+            if character.isspace() or character in "<>\"'":
+                break
+            if _diagnostic_http_scheme_length_at(
+                value, token_end
+            ) and _diagnostic_http_scheme_has_boundary(value, token_end):
+                break
+            token_end += 1
+
+        authority_end = token_end
+        for delimiter in "/?#":
+            candidate = value.find(delimiter, match.end(), token_end)
+            if candidate >= 0:
+                authority_end = min(authority_end, candidate)
+        authority = value[match.end() : authority_end]
+        if not _diagnostic_http_authority_is_safe(authority):
+            masked[match.start() : authority_end] = " " * (
+                authority_end - match.start()
+            )
+            consumed_until = authority_end
+            continue
+
+        first_path_slash = (
+            authority_end
+            if authority_end < token_end and value[authority_end] == "/"
+            else -1
+        )
+        safe_end = token_end
+        for index in range(match.end(), token_end):
+            if index == first_path_slash or _diagnostic_http_scheme_slashes_start_at(
+                value, index
+            ):
+                continue
+            if _diagnostic_local_identity_starts_at(value, index):
+                safe_end = index
+                break
+
+        masked[match.start() : safe_end] = " " * (safe_end - match.start())
+        consumed_until = token_end
+
+    return "".join(masked)
+
+
 def _diagnostic_contains_local_path(value: str) -> bool:
-    without_http_urls = _HTTP_DIAGNOSTIC_URL.sub("", value)
-    return _LOCAL_PATH.search(without_http_urls.replace("\\", "/")) is not None
+    normalized = value.replace("\\", "/")
+    without_http_urls = _mask_safe_http_diagnostic_urls(normalized)
+    return _LOCAL_PATH.search(without_http_urls) is not None
 
 
 def redact_source_refresh_message(value: str, repository_url: str | None = None) -> str:
@@ -102,6 +230,7 @@ def redact_source_refresh_message(value: str, repository_url: str | None = None)
     )
     redacted = _canonical_diagnostic_line(safe_git_error(completed, repository_url))
     redacted = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED]", redacted)
+    redacted = redacted[:_MAX_ERROR_BYTES]
     if _diagnostic_contains_local_path(redacted):
         return _GENERIC_REFRESH_FAILURE
 
@@ -127,7 +256,7 @@ def redact_source_refresh_message(value: str, repository_url: str | None = None)
         if _PERCENT_ESCAPE.search(probe) is not None:
             return _GENERIC_REFRESH_FAILURE
 
-    return redacted[:_MAX_ERROR_BYTES]
+    return redacted
 
 
 def source_refresh_message_is_safe(value: str) -> bool:

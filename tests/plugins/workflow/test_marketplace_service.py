@@ -27,7 +27,10 @@ from plugins.workflow.marketplace.package import (
     load_repository_index,
 )
 from plugins.workflow.marketplace.service import WorkflowMarketplaceService
-from plugins.workflow.marketplace.source_store import SourceRefreshStatus
+from plugins.workflow.marketplace.source_store import (
+    SourceRefreshStatus,
+    redact_source_refresh_message,
+)
 from plugins.workflow.trust import WorkflowTrustError
 
 
@@ -1018,6 +1021,52 @@ def test_refresh_diagnostics_reject_bounded_nested_encoded_absolute_paths(
         )
 
 
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["nested"]["unsafe"])
+@pytest.mark.parametrize("layers", range(1, 9))
+def test_refresh_diagnostics_reject_http_adjacent_local_identity_at_every_decode_layer(
+    message: str,
+    layers: int,
+) -> None:
+    encoded = message
+    for _ in range(layers):
+        encoded = urllib.parse.quote(encoded, safe="")
+
+    assert (
+        redact_source_refresh_message(encoded)
+        == "workflow marketplace source refresh failed"
+    )
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=encoded,
+        )
+
+
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["nested"]["safe"])
+@pytest.mark.parametrize("layers", range(1, 9))
+def test_refresh_diagnostics_accept_safe_url_and_prose_at_every_decode_layer(
+    message: str,
+    layers: int,
+) -> None:
+    encoded = message
+    for _ in range(layers):
+        encoded = urllib.parse.quote(encoded, safe="")
+
+    assert (
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=encoded,
+        ).message
+        == encoded
+    )
+
+
 def test_refresh_diagnostic_message_enforces_its_exact_size_bound() -> None:
     common = {
         "sourceName": "company",
@@ -1032,6 +1081,15 @@ def test_refresh_diagnostic_message_enforces_its_exact_size_bound() -> None:
     assert SourceRefreshStatus(**common, message="😀" * 4096).message == "😀" * 4096
     with pytest.raises(ValidationError):
         SourceRefreshStatus(**common, message="😀" * 4097)
+
+
+def test_refresh_diagnostic_redactor_bounds_before_local_identity_scan() -> None:
+    persisted_prefix = "x" * 4096
+
+    assert (
+        redact_source_refresh_message(f"{persisted_prefix};/root/operator/secret.txt")
+        == persisted_prefix
+    )
 
 
 def test_refresh_diagnostics_canonicalize_controls_before_persistence_and_reject_raw_state(

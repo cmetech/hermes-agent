@@ -773,6 +773,71 @@ describe('workflow marketplace codec', () => {
     ).toBeNull()
   })
 
+  it.each(diagnosticCorpus.nested.unsafe)(
+    'rejects an HTTP-adjacent local identity at every supported decode layer: %s',
+    unsafe => {
+      for (let layers = 1; layers <= 8; layers += 1) {
+        let message = unsafe
+
+        for (let layer = 0; layer < layers; layer += 1) {
+          message = encodeURIComponent(message)
+        }
+
+        expect(
+          decodeWorkflowMarketplaceSourceList({
+            profile: 'support',
+            sources: [
+              {
+                attempted_at: NOW,
+                diagnostic_code: 'source_unavailable',
+                enabled: true,
+                message,
+                name: 'company',
+                ref: null,
+                refresh_state: 'unavailable',
+                repository_url: 'https://example.test/team/workflows.git',
+                resolved_commit: null,
+                verified_at: null,
+                verified_package_count: 0
+              }
+            ]
+          })
+        ).toBeNull()
+      }
+    }
+  )
+
+  it.each(diagnosticCorpus.nested.safe)('accepts safe URL and prose at every supported decode layer: %s', safe => {
+    for (let layers = 1; layers <= 8; layers += 1) {
+      let message = safe
+
+      for (let layer = 0; layer < layers; layer += 1) {
+        message = encodeURIComponent(message)
+      }
+
+      expect(
+        decodeWorkflowMarketplaceSourceList({
+          profile: 'support',
+          sources: [
+            {
+              attempted_at: NOW,
+              diagnostic_code: 'source_unavailable',
+              enabled: true,
+              message,
+              name: 'company',
+              ref: null,
+              refresh_state: 'unavailable',
+              repository_url: 'https://example.test/team/workflows.git',
+              resolved_commit: null,
+              verified_at: null,
+              verified_package_count: 0
+            }
+          ]
+        })
+      ).not.toBeNull()
+    }
+  })
+
   it('enforces the exact source diagnostic size bound', () => {
     const response = (message: string) => ({
       profile: 'support',
