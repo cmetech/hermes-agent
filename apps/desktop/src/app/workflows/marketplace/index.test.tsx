@@ -284,13 +284,15 @@ function renderMarketplace(scope = scopeA) {
 }
 
 function deferred<T>() {
+  let reject!: (reason?: unknown) => void
   let resolve!: (value: T) => void
 
-  const promise = new Promise<T>(onResolve => {
+  const promise = new Promise<T>((onResolve, onReject) => {
+    reject = onReject
     resolve = onResolve
   })
 
-  return { promise, resolve }
+  return { promise, reject, resolve }
 }
 
 beforeEach(() => {
@@ -645,6 +647,8 @@ describe('WorkflowMarketplaceView', () => {
   )
 
   it('stops a rejected detail poll and retries that operation without leaking its error', async () => {
+    const statusRetry = deferred<WorkflowMarketplaceOperation>()
+
     api.inspect.mockResolvedValue(pendingDetail())
     api.getOperation.mockRejectedValue(
       new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'access_token=secret /private/tmp/operation')
@@ -661,18 +665,25 @@ describe('WorkflowMarketplaceView', () => {
     await new Promise(resolve => setTimeout(resolve, 600))
     expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure)
 
-    api.getOperation.mockResolvedValue(succeededDetail())
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    api.getOperation.mockReturnValue(statusRetry.promise)
+    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement
+    fireEvent.click(retry)
+    fireEvent.click(retry)
+
+    expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure + 1)
+    expect(await screen.findByRole('status', { name: 'Loading workflow package details' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
+    statusRetry.resolve(succeededDetail())
 
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
     expect(api.inspect).toHaveBeenCalledTimes(1)
-    expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure + 1)
   })
 
-  it('starts a new inspection when the pending detail operation was evicted', async () => {
+  it('serializes a replacement inspection when the pending detail operation was evicted', async () => {
     const replacementOperationId = `wmop_${'e'.repeat(12)}_${'f'.repeat(32)}`
+    const replacement = deferred<WorkflowMarketplaceOperation>()
 
-    api.inspect.mockResolvedValueOnce(pendingDetail()).mockResolvedValueOnce(pendingDetail(replacementOperationId))
+    api.inspect.mockResolvedValueOnce(pendingDetail()).mockReturnValue(replacement.promise)
     api.getOperation.mockImplementation((id: string) =>
       id === OPERATION_ID
         ? Promise.reject(
@@ -689,11 +700,101 @@ describe('WorkflowMarketplaceView', () => {
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
     expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement
+    fireEvent.click(retry)
+    fireEvent.click(retry)
+
+    expect(api.inspect).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(retry.disabled).toBe(true))
+    expect(retry.getAttribute('aria-busy')).toBe('true')
+
+    replacement.resolve(pendingDetail(replacementOperationId))
 
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
-    expect(api.inspect).toHaveBeenCalledTimes(2)
     expect(api.getOperation.mock.calls.map(([id]) => id)).toEqual([OPERATION_ID, replacementOperationId])
+  })
+
+  it('re-enables an evicted-operation Retry after its replacement inspection fails', async () => {
+    const replacement = deferred<WorkflowMarketplaceOperation>()
+
+    api.inspect
+      .mockResolvedValueOnce(pendingDetail())
+      .mockReturnValueOnce(replacement.promise)
+      .mockResolvedValueOnce(succeededDetail())
+    api.getOperation.mockRejectedValue(
+      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'Workflow marketplace request failed.')
+    )
+
+    renderMarketplace()
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+
+    const retry = (await screen.findByRole('button', { name: 'Retry' })) as HTMLButtonElement
+    fireEvent.click(retry)
+    await waitFor(() => expect(retry.disabled).toBe(true))
+
+    replacement.reject(
+      new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'Workflow marketplace request failed.')
+    )
+
+    const retryAgain = (await screen.findByRole('button', { name: 'Retry' })) as HTMLButtonElement
+    await waitFor(() => expect(retryAgain.disabled).toBe(false))
+    fireEvent.click(retryAgain)
+
+    expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    expect(api.inspect).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not let an in-flight replacement block recovery after the scope changes', async () => {
+    const oldReplacement = deferred<WorkflowMarketplaceOperation>()
+
+    const newDetail = packageDetail({
+      display_name: 'New backend package',
+      id: 'new',
+      identifier: 'other/new',
+      identity: { package_id: 'new', source_key: 'other' },
+      source_name: 'other'
+    })
+
+    api.search.mockImplementation((_query: string, scope: typeof scopeA) =>
+      scope.connectionId === 'remote-a'
+        ? Promise.resolve(page([packageItem()]))
+        : Promise.resolve(
+            page([
+              packageItem({
+                display_name: 'New backend package',
+                id: 'new',
+                identifier: 'other/new',
+                source_name: 'other'
+              })
+            ])
+          )
+    )
+    api.inspect
+      .mockResolvedValueOnce(pendingDetail())
+      .mockReturnValueOnce(oldReplacement.promise)
+      .mockResolvedValueOnce(terminalDetail('failed'))
+      .mockResolvedValueOnce(succeededDetail(newDetail))
+    api.getOperation.mockRejectedValue(
+      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'Workflow marketplace request failed.')
+    )
+
+    const rendered = renderMarketplace()
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+
+    rendered.rerender(
+      <I18nProvider configClient={null} initialLocale="en">
+        <QueryClientProvider client={rendered.client}>
+          <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'other' }} />
+        </QueryClientProvider>
+      </I18nProvider>
+    )
+
+    fireEvent.click(await screen.findByRole('option', { name: /New backend package/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+
+    expect(await screen.findByRole('region', { name: 'New backend package package details' })).toBeTruthy()
+    expect(api.inspect).toHaveBeenCalledTimes(4)
   })
 
   it('sanitizes detail failures and retries a fresh inspection', async () => {

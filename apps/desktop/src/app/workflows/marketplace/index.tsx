@@ -43,6 +43,10 @@ interface ScopedSelection extends MarketplacePackageSelection {
   scopeKey: string
 }
 
+interface DetailRetryAttempt extends MarketplacePackageSelection {
+  scopeKey: string
+}
+
 function errorStatus(error: unknown): null | number {
   if (typeof error !== 'object' || error === null || !('status' in error)) {
     return null
@@ -96,9 +100,11 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const searchRef = useRef<HTMLInputElement>(null)
   const backButtonRef = useRef<HTMLButtonElement>(null)
   const selectionOriginRef = useRef<HTMLButtonElement | null>(null)
+  const detailRetryRef = useRef<DetailRetryAttempt | null>(null)
   const previousScopeKeyRef = useRef(scopeKey)
   const [filterState, setFilterState] = useState<ScopedFilters>({ offset: 0, query: '', scopeKey, source: null })
   const [selectionState, setSelectionState] = useState<null | ScopedSelection>(null)
+  const [detailRetryState, setDetailRetryState] = useState<DetailRetryAttempt | null>(null)
 
   const filters = filterState.scopeKey === scopeKey ? filterState : { offset: 0, query: '', scopeKey, source: null }
 
@@ -181,11 +187,19 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
 
   const detailFailed =
     detailRequest.isError ||
-    detailOperation.isError ||
+    (needsDetailPolling && detailOperation.isError) ||
     effectiveOperation?.state === 'failed' ||
     effectiveOperation?.state === 'cancelled'
 
   const detailLoading = selection !== null && !detail && !detailFailed
+
+  const selectedRetryInFlight =
+    selection !== null &&
+    detailRetryState?.scopeKey === scopeKey &&
+    detailRetryState.sourceName === selection.sourceName &&
+    detailRetryState.packageId === selection.packageId
+
+  const detailRetrying = detailRequest.isFetching || detailOperation.isFetching || selectedRetryInFlight
   const items = packages.data?.items ?? []
   const installedPackages = installed.data?.packages ?? []
   const selectedStillVisible = selection ? items.some(item => item.identifier === selection.identifier) : false
@@ -278,10 +292,37 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   }
 
   const retryDetail = () => {
+    if (!selection) {
+      return
+    }
+
+    const activeRetry = detailRetryRef.current
+
+    if (
+      activeRetry?.scopeKey === scopeKey &&
+      activeRetry.sourceName === selection.sourceName &&
+      activeRetry.packageId === selection.packageId
+    ) {
+      return
+    }
+
+    const retry = { packageId: selection.packageId, scopeKey, sourceName: selection.sourceName }
+
+    const release = () => {
+      if (detailRetryRef.current === retry) {
+        detailRetryRef.current = null
+      }
+
+      setDetailRetryState(current => (current === retry ? null : current))
+    }
+
+    detailRetryRef.current = retry
+    setDetailRetryState(retry)
+
     if (needsDetailPolling && detailOperation.isError && !operationWasLost(detailOperation.error)) {
-      void detailOperation.refetch()
+      void detailOperation.refetch().finally(release)
     } else {
-      void detailRequest.refetch()
+      void detailRequest.refetch().finally(release)
     }
   }
 
@@ -374,7 +415,14 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
             description={copy.workflowMarketplaceDetailErrorDescription}
             title={copy.workflowMarketplaceDetailErrorTitle}
           >
-            <Button onClick={retryDetail} size="sm" type="button" variant="secondary">
+            <Button
+              aria-busy={detailRetrying}
+              disabled={detailRetrying}
+              onClick={retryDetail}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
               {copy.workflowCatalogRetry}
             </Button>
           </ErrorState>
