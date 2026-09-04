@@ -30,7 +30,6 @@ from plugins.workflow.marketplace.models import (
     InstalledPackageProvenance,
     PackageReviewAssessment,
     WorkflowMarketplaceSource,
-    WorkflowPackageDigestRecord,
     WorkflowPackageDigests,
     WorkflowPackageIndex,
     WorkflowPackageManifest,
@@ -414,6 +413,9 @@ def test_marketplace_public_review_and_request_models_are_strict() -> None:
         "https://token@example.com/company/workflows.git",
         "https://example.com/company/workflows.git?access_token=secret",
         "https://example.com/company/workflows.git?apiKey=secret",
+        "https://example.com/company/workflows.git?authToken=secret",
+        "https://example.com/company/workflows.git?authorizationToken=secret",
+        "https://example.com/company/workflows.git?clientSecret=secret",
     ],
 )
 @pytest.mark.parametrize("model_name", ["source", "direct_install", "provenance"])
@@ -438,6 +440,27 @@ def test_persistable_repository_identities_reject_embedded_credentials(
 
     with pytest.raises(ValidationError, match="credentials"):
         model.model_validate(value)
+
+
+@pytest.mark.parametrize("model_name", ["source", "direct_install", "provenance"])
+def test_repository_identities_accept_ordinary_query_parameters(
+    model_name: str,
+) -> None:
+    repository_url = "https://example.com/company/workflows.git?ref=main&depth=1"
+    if model_name == "source":
+        WorkflowMarketplaceSource.model_validate({
+            "name": "company",
+            "repositoryUrl": repository_url,
+            "ref": "main",
+            "enabled": True,
+        })
+    elif model_name == "direct_install":
+        InstallRequest.model_validate({"identifier": repository_url, "ref": "main"})
+    else:
+        InstalledPackageProvenance.model_validate({
+            **valid_provenance(),
+            "repositoryUrl": repository_url,
+        })
 
 
 def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
@@ -528,12 +551,40 @@ def test_shared_vectors_cover_exact_bytes_paths_and_all_boundaries() -> None:
             files = _materialize_package(recipe)
             paths = [path for path, _ in files]
             assert len(paths) == len(set(paths))
-            for path in paths:
-                WorkflowPackageDigestRecord.model_validate({
+            records = [
+                {
                     "path": path,
-                    "size": 0,
-                    "sha256": SHA256_A,
-                })
+                    "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+                for path, content in sorted(files)
+            ]
+            package_digest = _composite_digest(files)
+            assert package_digest == vector["expected"]["packageDigest"]
+            digest_document = {
+                "contractVersion": 1,
+                "algorithm": "sha256",
+                "files": records,
+                "packageDigest": package_digest,
+            }
+
+            structurally_valid = (
+                len(files) <= PACKAGE_MAX_FILES
+                and max(len(content) for _, content in files) <= PACKAGE_MAX_FILE_BYTES
+            )
+            if structurally_valid:
+                parsed_digests = WorkflowPackageDigests.model_validate(digest_document)
+                assert [record.path for record in parsed_digests.files] == sorted(paths)
+                for record, (path, content) in zip(
+                    parsed_digests.files, sorted(files), strict=True
+                ):
+                    assert record.path == path
+                    assert record.size == len(content)
+                    assert record.sha256 == hashlib.sha256(content).hexdigest()
+                assert parsed_digests.package_digest == package_digest
+            else:
+                with pytest.raises(ValidationError):
+                    WorkflowPackageDigests.model_validate(digest_document)
 
             observed = {
                 "max_files": len(files),

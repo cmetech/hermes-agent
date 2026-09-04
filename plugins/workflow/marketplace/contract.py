@@ -211,6 +211,38 @@ def _byte_boundary(
     }
 
 
+def _materialize_content_recipe(recipe: dict[str, Any]) -> bytes:
+    if recipe["encoding"] == "base64":
+        return base64.b64decode(recipe["value"], validate=True)
+    if recipe["encoding"] == "utf-8":
+        if "repeat" in recipe:
+            return (recipe["repeat"] * recipe["count"]).encode("utf-8")
+        return recipe["value"].encode("utf-8")
+    raise ValueError(f"unsupported content recipe encoding: {recipe['encoding']}")
+
+
+def _materialize_package_recipe(
+    recipe: dict[str, Any],
+) -> list[tuple[str, bytes]]:
+    package_files = [
+        (item["path"], _materialize_content_recipe(item["content"]))
+        for item in recipe["files"]
+    ]
+    for group in recipe["generatedFiles"]:
+        content = _materialize_content_recipe(group["content"])
+        package_files.extend(
+            (
+                group["pathTemplate"].format(index=index),
+                content,
+            )
+            for index in range(
+                group["startIndex"],
+                group["startIndex"] + group["count"],
+            )
+        )
+    return package_files
+
+
 def _package_boundary(
     name: str,
     *,
@@ -218,23 +250,25 @@ def _package_boundary(
     observed: int,
     limit: int,
     diagnostic_code: str,
-    files: list[dict[str, object]] | None = None,
-    generated_files: list[dict[str, object]] | None = None,
+    files: list[dict[str, Any]] | None = None,
+    generated_files: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     accepted = observed <= limit
+    recipe = {
+        "kind": "packageFiles",
+        "files": files or [],
+        "generatedFiles": generated_files or [],
+    }
     return {
         "name": name,
         "limit": limit_name,
-        "recipe": {
-            "kind": "packageFiles",
-            "files": files or [],
-            "generatedFiles": generated_files or [],
-        },
+        "recipe": recipe,
         "expected": {
             "accepted": accepted,
             "diagnosticCode": None if accepted else diagnostic_code,
             "limit": limit,
             "observed": observed,
+            "packageDigest": _distribution_digest(_materialize_package_recipe(recipe)),
         },
     }
 

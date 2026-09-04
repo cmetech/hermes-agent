@@ -33,7 +33,7 @@ CANONICAL_RELATIVE_PATH_PATTERN = r"^(?!/)(?!.*(?:^|/)\.\.?(/|$))(?!.*\\)(?!.*\x
 
 _SEMANTIC_VERSION = re.compile(SEMANTIC_VERSION_PATTERN, re.ASCII)
 _TAG = re.compile(TAG_PATTERN, re.ASCII)
-_CREDENTIAL_PARAMETER_PARTS = frozenset({
+_CREDENTIAL_PARAMETER_WORDS = frozenset({
     "auth",
     "authorization",
     "credential",
@@ -43,13 +43,6 @@ _CREDENTIAL_PARAMETER_PARTS = frozenset({
     "secret",
     "signature",
     "token",
-})
-_CREDENTIAL_PARAMETER_COMPACT_NAMES = frozenset({
-    "accesstoken",
-    "apikey",
-    "privatekey",
-    "secretkey",
-    "securitytoken",
 })
 
 BoundedText = Annotated[str, StringConstraints(min_length=1, max_length=4096)]
@@ -77,6 +70,12 @@ def _require_clean_text(value: str, *, label: str) -> str:
     return value
 
 
+def _parameter_name_words(name: str) -> set[str]:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", separated)
+    return set(re.findall(r"[a-z0-9]+", separated.casefold()))
+
+
 def _require_credential_free_repository_identity(value: str) -> str:
     value = _require_clean_text(value, label="repository identity")
     try:
@@ -89,12 +88,7 @@ def _require_credential_free_repository_identity(value: str) -> str:
         raise ValueError("repository identity must not contain credentials")
     for parameters in (parsed.params, parsed.query, parsed.fragment):
         for name, _ in parse_qsl(parameters, keep_blank_values=True):
-            parts = set(re.findall(r"[a-z0-9]+", name.casefold()))
-            compact_name = re.sub(r"[^a-z0-9]+", "", name.casefold())
-            if (
-                parts & _CREDENTIAL_PARAMETER_PARTS
-                or compact_name in _CREDENTIAL_PARAMETER_COMPACT_NAMES
-            ):
+            if _parameter_name_words(name) & _CREDENTIAL_PARAMETER_WORDS:
                 raise ValueError("repository identity must not contain credentials")
     return value
 

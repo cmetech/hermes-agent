@@ -5,7 +5,8 @@
         "accepted": true,
         "diagnosticCode": null,
         "limit": 512,
-        "observed": 512
+        "observed": 512,
+        "packageDigest": "f1a2c7d5fe899628a34fe02a764b6b317c0105425e5d250ed7808f389becb7f0"
       },
       "limit": "max_files",
       "name": "file_count_exact",
@@ -30,7 +31,8 @@
         "accepted": false,
         "diagnosticCode": "package_file_count_limit",
         "limit": 512,
-        "observed": 513
+        "observed": 513,
+        "packageDigest": "b00c12a4458c1ec1262d9e56b0cfe4d91dad2b05a6a587eaafdc1f83a7125f45"
       },
       "limit": "max_files",
       "name": "file_count_over",
@@ -55,7 +57,8 @@
         "accepted": true,
         "diagnosticCode": null,
         "limit": 1048576,
-        "observed": 1048576
+        "observed": 1048576,
+        "packageDigest": "cadd527b93afa733b954ab39349401b805963886993452e03c7b94a576661e72"
       },
       "limit": "max_file_bytes",
       "name": "file_bytes_exact",
@@ -79,7 +82,8 @@
         "accepted": false,
         "diagnosticCode": "package_file_size_limit",
         "limit": 1048576,
-        "observed": 1048577
+        "observed": 1048577,
+        "packageDigest": "f9e6defe79806182362d067898d4d86be0aa08f3e74ea2b00190a53f8396e6bd"
       },
       "limit": "max_file_bytes",
       "name": "file_bytes_over",
@@ -103,7 +107,8 @@
         "accepted": true,
         "diagnosticCode": null,
         "limit": 8388608,
-        "observed": 8388608
+        "observed": 8388608,
+        "packageDigest": "4959bf984a608143a26ebe5d16a2a25e1b7479a1074ada3c4d84ae22962e29f6"
       },
       "limit": "max_total_bytes",
       "name": "total_bytes_exact",
@@ -129,7 +134,8 @@
         "accepted": false,
         "diagnosticCode": "package_total_size_limit",
         "limit": 8388608,
-        "observed": 8388609
+        "observed": 8388609,
+        "packageDigest": "f94a0b0ed6c202095c5c67449b8b45e3b0f2d40c8e78a531a89192684ceff040"
       },
       "limit": "max_total_bytes",
       "name": "total_bytes_over",
