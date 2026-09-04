@@ -2089,9 +2089,35 @@ export interface Translations {
     workflowMarketplaceCurrent: string
     workflowMarketplaceInstalled: string
     workflowMarketplaceInstalledVersion: (version: string) => string
+    workflowMarketplaceInstalledStatusLoading: string
+    workflowMarketplaceInstalledStatusUnavailableTitle: string
+    workflowMarketplaceInstalledStatusUnsupportedDescription: string
+    workflowMarketplaceInstalledStatusAuthTitle: string
+    workflowMarketplaceInstalledStatusAuthDescription: string
+    workflowMarketplaceInstalledStatusErrorDescription: string
+    workflowMarketplaceInstalledProvenanceLoading: string
+    workflowMarketplaceInstalledProvenanceUnavailableTitle: string
+    workflowMarketplaceInstalledProvenanceUnsupportedDescription: string
+    workflowMarketplaceInstalledProvenanceAuthTitle: string
+    workflowMarketplaceInstalledProvenanceAuthDescription: string
+    workflowMarketplaceInstalledProvenanceErrorTitle: string
+    workflowMarketplaceInstalledProvenanceErrorDescription: string
     workflowMarketplaceUpdateAvailable: string
     workflowMarketplacePublisher: string
     workflowMarketplaceLicense: string
+    workflowMarketplaceCandidateIdentity: string
+    workflowMarketplacePackageDigest: string
+    workflowMarketplacePackagePath: string
+    workflowMarketplaceInstalledProvenance: string
+    workflowMarketplaceInstalledIdentity: string
+    workflowMarketplaceInstalledVersionLabel: string
+    workflowMarketplaceInstalledSource: string
+    workflowMarketplaceInstalledRepository: string
+    workflowMarketplaceInstalledRef: string
+    workflowMarketplaceInstalledCommit: string
+    workflowMarketplaceDistributionDigest: string
+    workflowMarketplaceInstalledAt: string
+    workflowMarketplaceInstalledPackagePath: string
     workflowMarketplaceRepository: string
     workflowMarketplaceRef: string
     workflowMarketplaceDefaultRef: string

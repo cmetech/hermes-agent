@@ -3,7 +3,12 @@ import type { ReactNode } from 'react'
 
 import { profileScopeKey } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
-import { getWorkflowMarketplaceCapabilities, listInstalledWorkflowPackages } from '@/hermes'
+import { Button } from '@/components/ui/button'
+import {
+  getWorkflowMarketplaceCapabilities,
+  isWorkflowMarketplaceUnsupportedError,
+  listInstalledWorkflowPackages
+} from '@/hermes'
 import type { WorkflowMarketplaceScope } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
@@ -14,6 +19,87 @@ import { marketplaceKeys } from './query-keys'
 export interface InstalledPackagesProps {
   children: ReactNode
   scope: WorkflowMarketplaceScope
+}
+
+type InstalledProvenanceContext = 'browse' | 'installed'
+type InstalledProvenanceNoticeKind = 'auth' | 'error' | 'loading' | 'unsupported'
+
+export interface InstalledProvenanceNoticeProps {
+  context: InstalledProvenanceContext
+  kind: InstalledProvenanceNoticeKind
+  onRetry?: () => void
+}
+
+function errorStatus(error: unknown): null | number {
+  if (typeof error !== 'object' || error === null || !('status' in error)) {
+    return null
+  }
+
+  return typeof error.status === 'number' ? error.status : null
+}
+
+export function installedProvenanceErrorKind(error: unknown): 'auth' | 'error' | 'unsupported' {
+  if (isWorkflowMarketplaceUnsupportedError(error)) {
+    return 'unsupported'
+  }
+
+  return errorStatus(error) === 401 || errorStatus(error) === 403 ? 'auth' : 'error'
+}
+
+export function InstalledProvenanceNotice({ context, kind, onRetry }: InstalledProvenanceNoticeProps) {
+  const { t } = useI18n()
+  const copy = t.operations
+  const browse = context === 'browse'
+
+  if (kind === 'loading') {
+    const label = browse
+      ? copy.workflowMarketplaceInstalledStatusLoading
+      : copy.workflowMarketplaceInstalledProvenanceLoading
+
+    return (
+      <p aria-label={label} className="text-xs text-(--ui-text-tertiary)" role="status">
+        {label}
+      </p>
+    )
+  }
+
+  const title = browse
+    ? kind === 'auth'
+      ? copy.workflowMarketplaceInstalledStatusAuthTitle
+      : copy.workflowMarketplaceInstalledStatusUnavailableTitle
+    : kind === 'auth'
+      ? copy.workflowMarketplaceInstalledProvenanceAuthTitle
+      : kind === 'error'
+        ? copy.workflowMarketplaceInstalledProvenanceErrorTitle
+        : copy.workflowMarketplaceInstalledProvenanceUnavailableTitle
+
+  const description = browse
+    ? kind === 'auth'
+      ? copy.workflowMarketplaceInstalledStatusAuthDescription
+      : kind === 'error'
+        ? copy.workflowMarketplaceInstalledStatusErrorDescription
+        : copy.workflowMarketplaceInstalledStatusUnsupportedDescription
+    : kind === 'auth'
+      ? copy.workflowMarketplaceInstalledProvenanceAuthDescription
+      : kind === 'error'
+        ? copy.workflowMarketplaceInstalledProvenanceErrorDescription
+        : copy.workflowMarketplaceInstalledProvenanceUnsupportedDescription
+
+  return (
+    <div
+      aria-label={title}
+      className="rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary) px-3 py-2 text-xs"
+      role={kind === 'unsupported' ? 'status' : 'alert'}
+    >
+      <p className="font-medium text-(--ui-text-primary)">{title}</p>
+      <p className="mt-0.5 text-(--ui-text-secondary)">{description}</p>
+      {onRetry && kind !== 'unsupported' ? (
+        <Button className="mt-2" onClick={onRetry} size="sm" type="button" variant="secondary">
+          {copy.workflowCatalogRetry}
+        </Button>
+      ) : null}
+    </div>
+  )
 }
 
 export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
@@ -34,10 +120,32 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
     retry: false
   })
 
-  const packages = installed.data?.packages ?? []
+  const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
+  const packages = installed.isSuccess ? installed.data.packages : []
+
+  const notice = capabilities.isPending ? (
+    <InstalledProvenanceNotice context="installed" kind="loading" />
+  ) : capabilities.isError ? (
+    <InstalledProvenanceNotice
+      context="installed"
+      kind={installedProvenanceErrorKind(capabilities.error)}
+      onRetry={() => void capabilities.refetch()}
+    />
+  ) : !supportsInstalled ? (
+    <InstalledProvenanceNotice context="installed" kind="unsupported" />
+  ) : installed.isPending ? (
+    <InstalledProvenanceNotice context="installed" kind="loading" />
+  ) : installed.isError ? (
+    <InstalledProvenanceNotice
+      context="installed"
+      kind={installedProvenanceErrorKind(installed.error)}
+      onRetry={() => void installed.refetch()}
+    />
+  ) : null
 
   return (
     <div className="space-y-5">
+      {notice}
       {packages.length ? (
         <section aria-label={copy.workflowMarketplaceInstalledPackages}>
           <h2 className="text-sm font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceInstalledPackages}</h2>

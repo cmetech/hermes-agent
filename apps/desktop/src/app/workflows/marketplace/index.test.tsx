@@ -224,6 +224,37 @@ function pendingDetail(): WorkflowMarketplaceOperation {
   }
 }
 
+function terminalDetail(state: 'cancelled' | 'failed'): WorkflowMarketplaceOperation {
+  const base = {
+    created_at: NOW,
+    finished_at: NOW,
+    id: OPERATION_ID,
+    kind: 'package_detail',
+    profile: 'support',
+    progress: 50,
+    result: null,
+    schema_version: 1,
+    started_at: NOW,
+    updated_at: NOW
+  } as const
+
+  if (state === 'failed') {
+    return {
+      ...base,
+      error: { code: 'inspection_failed', message: 'Workflow marketplace operation failed.' },
+      phase: 'failed',
+      state: 'failed'
+    }
+  }
+
+  return {
+    ...base,
+    error: null,
+    phase: 'cancelled',
+    state: 'cancelled'
+  }
+}
+
 function page(
   items: WorkflowMarketplaceCatalogPackage[],
   nextOffset: null | number = null,
@@ -378,6 +409,65 @@ describe('WorkflowMarketplaceView', () => {
     expect(screen.queryByText('secret raw payload')).toBeNull()
   })
 
+  it('keeps browsing visible while installed package status is loading', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof api.installed>>>()
+    api.installed.mockReturnValueOnce(pending.promise)
+
+    renderMarketplace()
+
+    expect(await screen.findByRole('option', { name: /Laptop Support/ })).toBeTruthy()
+    expect(screen.getByRole('status', { name: 'Loading installed package status' })).toBeTruthy()
+    expect(screen.queryByText(/Installed v/)).toBeNull()
+
+    pending.resolve({ packages: [installedPackage()], profile: 'support' })
+    expect(await screen.findByText('Installed v1.1.0')).toBeTruthy()
+  })
+
+  it.each([
+    [
+      { code: '401', message: 'https://operator:secret@example.test/repo.git', status: 401 },
+      'Sign in to compare installed packages'
+    ],
+    [
+      { code: 'marketplace_network_error', message: '/private/tmp/checkout', status: 0 },
+      'Installed package status unavailable'
+    ],
+    [
+      { code: 'marketplace_invalid_response', message: 'token=secret', status: 502 },
+      'Installed package status unavailable'
+    ]
+  ])('keeps browsing visible when installed provenance fails with %#', async (error, title) => {
+    api.installed.mockRejectedValueOnce(error).mockResolvedValueOnce({
+      packages: [installedPackage()],
+      profile: 'support'
+    })
+
+    renderMarketplace()
+
+    expect(await screen.findByRole('option', { name: /Laptop Support/ })).toBeTruthy()
+    const warning = screen.getByRole('alert', { name: title })
+    expect(within(warning).queryByText(/operator:secret|private\/tmp|token=secret/)).toBeNull()
+    expect(screen.queryByText(/Installed v/)).toBeNull()
+
+    fireEvent.click(within(warning).getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('Installed v1.1.0')).toBeTruthy()
+  })
+
+  it('distinguishes an unavailable installed capability from a provenance query failure', async () => {
+    api.capabilities.mockResolvedValueOnce({
+      capabilities: ['sources', 'search', 'operations'],
+      profile: 'support',
+      schema_version: 1
+    })
+
+    renderMarketplace()
+
+    expect(await screen.findByRole('option', { name: /Laptop Support/ })).toBeTruthy()
+    const notice = screen.getByRole('status', { name: 'Installed package status unavailable' })
+    expect(within(notice).queryByRole('button', { name: 'Retry' })).toBeNull()
+    expect(api.installed).not.toHaveBeenCalled()
+  })
+
   it('preserves backend ordering, reports stale partial results, filters sources, and pages within API bounds', async () => {
     const first = packageItem({ display_name: 'Zeta Support', identifier: 'company/zeta', id: 'zeta' })
 
@@ -457,13 +547,14 @@ describe('WorkflowMarketplaceView', () => {
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
     const detail = await screen.findByRole('region', { name: 'Laptop Support package details' })
-    expect(within(detail).getByText('company/laptop-support')).toBeTruthy()
-    expect(within(detail).getByText('Example Company')).toBeTruthy()
-    expect(within(detail).getByText('MIT')).toBeTruthy()
-    expect(within(detail).getByText('main')).toBeTruthy()
-    expect(within(detail).getByText(COMMIT)).toBeTruthy()
-    expect(within(detail).getByText(NOW)).toBeTruthy()
-    expect(within(detail).getByRole('link', { name: /example\.test\/company\/workflows\.git/ })).toBeTruthy()
+    const candidate = within(detail).getByRole('region', { name: 'Candidate package identity' })
+    expect(within(detail).getAllByText('company/laptop-support')).toHaveLength(2)
+    expect(within(candidate).getByText('Example Company')).toBeTruthy()
+    expect(within(candidate).getByText('MIT')).toBeTruthy()
+    expect(within(candidate).getByText('main')).toBeTruthy()
+    expect(within(candidate).getByText(COMMIT)).toBeTruthy()
+    expect(within(candidate).getByText(NOW)).toBeTruthy()
+    expect(within(candidate).getByRole('link', { name: /example\.test\/company\/workflows\.git/ })).toBeTruthy()
     expect(within(detail).getByText('Update available')).toBeTruthy()
     expect(within(detail).getByText('Laptop diagnostic')).toBeTruthy()
     expect(within(detail).getByText('workflows/laptop-diagnostic.companion.yml')).toBeTruthy()
@@ -492,10 +583,55 @@ describe('WorkflowMarketplaceView', () => {
 
     for (const repository_url of ['ssh://git@example.test/team/repo.git', 'git@example.test:team/repo.git']) {
       cleanup()
-      renderWithProviders(<MarketplacePackageDetail detail={packageDetail({ repository_url })} />)
-      expect(screen.getByText(repository_url)).toBeTruthy()
+      renderWithProviders(
+        <MarketplacePackageDetail
+          detail={packageDetail({ installed: installedPackage({ repository_url }), repository_url })}
+        />
+      )
+      expect(screen.getAllByText(repository_url)).toHaveLength(2)
       expect(screen.queryByRole('link', { name: repository_url })).toBeNull()
     }
+  })
+
+  it.each(['failed', 'cancelled'] as const)(
+    'treats an initially %s detail operation as terminal without polling',
+    async state => {
+      api.inspect.mockResolvedValueOnce(terminalDetail(state)).mockResolvedValueOnce(succeededDetail())
+
+      renderMarketplace()
+      fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+
+      expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
+      expect(screen.queryByRole('status', { name: 'Loading workflow package details' })).toBeNull()
+      expect(api.getOperation).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+      expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+      expect(api.getOperation).not.toHaveBeenCalled()
+    }
+  )
+
+  it('stops a rejected detail poll and retries that operation without leaking its error', async () => {
+    api.inspect.mockResolvedValue(pendingDetail())
+    api.getOperation.mockRejectedValue(new Error('access_token=secret /private/tmp/operation'))
+
+    renderMarketplace()
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+
+    expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
+    expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
+    expect(screen.queryByRole('status', { name: 'Loading workflow package details' })).toBeNull()
+    const callsAfterFailure = api.getOperation.mock.calls.length
+
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure)
+
+    api.getOperation.mockResolvedValue(succeededDetail())
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    expect(api.inspect).toHaveBeenCalledTimes(1)
+    expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure + 1)
   })
 
   it('sanitizes detail failures and retries a fresh inspection', async () => {
@@ -627,17 +763,123 @@ describe('WorkflowMarketplaceView', () => {
     packageOption.focus()
     fireEvent.click(packageOption)
 
-    expect(await screen.findByRole('button', { name: 'Back to packages' })).toBeTruthy()
+    const back = await screen.findByRole('button', { name: 'Back to packages' })
+    await waitFor(() => expect(window.document.activeElement).toBe(back))
     expect(screen.queryByRole('listbox', { name: 'Workflow packages' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Back to packages' }))
+    fireEvent.click(back)
 
     const restoredOption = await screen.findByRole('option', { name: /Laptop Support/ })
     await waitFor(() => expect(window.document.activeElement).toBe(restoredOption))
     expect(screen.getByRole('listbox', { name: 'Workflow packages' })).toBeTruthy()
   })
+
+  it('focuses narrow detail after keyboard selection and Escape returns focus to the package', async () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      addEventListener: vi.fn(),
+      matches: query.includes('max-width'),
+      media: query,
+      removeEventListener: vi.fn()
+    }))
+
+    renderMarketplace()
+    const packageOption = await screen.findByRole('option', { name: /Laptop Support/ })
+    packageOption.focus()
+    fireEvent.keyDown(packageOption, { key: 'Enter' })
+
+    const back = await screen.findByRole('button', { name: 'Back to packages' })
+    await waitFor(() => expect(window.document.activeElement).toBe(back))
+    fireEvent.keyDown(back, { key: 'Escape' })
+
+    const restoredOption = await screen.findByRole('option', { name: /Laptop Support/ })
+    await waitFor(() => expect(window.document.activeElement).toBe(restoredOption))
+  })
+
+  it('returns narrow focus to search when the selected package disappears', async () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      addEventListener: vi.fn(),
+      matches: query.includes('max-width'),
+      media: query,
+      removeEventListener: vi.fn()
+    }))
+    api.search.mockResolvedValueOnce(page([packageItem()])).mockResolvedValueOnce(page([]))
+
+    const rendered = renderMarketplace()
+    const packageOption = await screen.findByRole('option', { name: /Laptop Support/ })
+    fireEvent.click(packageOption)
+    const back = await screen.findByRole('button', { name: 'Back to packages' })
+    await waitFor(() => expect(window.document.activeElement).toBe(back))
+
+    await act(async () => {
+      await rendered.client.refetchQueries({
+        queryKey: marketplaceKeys.search('remote-a::support', {
+          limit: 50,
+          offset: 0,
+          query: '',
+          source: null
+        })
+      })
+    })
+
+    expect(await screen.findByText('No workflow packages available')).toBeTruthy()
+    await waitFor(() =>
+      expect(window.document.activeElement).toBe(screen.getByRole('searchbox', { name: 'Search workflow packages' }))
+    )
+  })
 })
 
 describe('browse presentation components', () => {
+  it('keeps loose workflows visible while installed provenance loads', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof api.installed>>>()
+    api.installed.mockReturnValueOnce(pending.promise)
+
+    renderWithProviders(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose profile workflow</div>
+      </InstalledPackages>
+    )
+
+    expect(screen.getByText('Loose profile workflow')).toBeTruthy()
+    expect(await screen.findByRole('status', { name: 'Loading installed package provenance' })).toBeTruthy()
+
+    pending.resolve({ packages: [], profile: 'support' })
+    await waitFor(() =>
+      expect(screen.queryByRole('status', { name: 'Loading installed package provenance' })).toBeNull()
+    )
+  })
+
+  it.each([
+    [
+      { code: '401', message: 'https://operator:secret@example.test/repo.git', status: 401 },
+      'Sign in to load installed package provenance'
+    ],
+    [
+      { code: 'marketplace_network_error', message: '/private/tmp/checkout', status: 0 },
+      'Could not load installed package provenance'
+    ],
+    [
+      { code: 'marketplace_invalid_response', message: 'token=secret', status: 502 },
+      'Could not load installed package provenance'
+    ]
+  ])('keeps loose workflows visible and retries installed provenance failure %#', async (error, title) => {
+    api.installed.mockRejectedValueOnce(error).mockResolvedValueOnce({
+      packages: [installedPackage()],
+      profile: 'support'
+    })
+
+    renderWithProviders(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose profile workflow</div>
+      </InstalledPackages>
+    )
+
+    expect(screen.getByText('Loose profile workflow')).toBeTruthy()
+    const alert = await screen.findByRole('alert', { name: title })
+    expect(within(alert).queryByText(/operator:secret|private\/tmp|token=secret/)).toBeNull()
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('company/laptop-support')).toBeTruthy()
+  })
+
   it('keeps the loose workflow catalog available when installed-package capability detection is unsupported', async () => {
     api.capabilities.mockRejectedValueOnce({ code: 'marketplace_unsupported' })
 
@@ -649,6 +891,8 @@ describe('browse presentation components', () => {
 
     expect(screen.getByText('Loose profile workflow')).toBeTruthy()
     await waitFor(() => expect(api.capabilities).toHaveBeenCalledWith(scopeA))
+    expect(await screen.findByRole('status', { name: 'Installed package provenance unavailable' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
     expect(api.installed).not.toHaveBeenCalled()
   })
 
@@ -679,6 +923,65 @@ describe('browse presentation components', () => {
     expect(screen.getByText('Installed v1.0.0')).toBeTruthy()
     expect(screen.queryByText('Current')).toBeNull()
     expect(screen.queryByText('Update available')).toBeNull()
+  })
+
+  it('never infers Current from equal stale catalog and installed provenance', () => {
+    renderWithProviders(
+      <MarketplacePackageList
+        installedPackages={[installedPackage()]}
+        items={[packageItem({ state: 'stale' })]}
+        onSelect={vi.fn()}
+        selectedIdentifier={null}
+      />
+    )
+
+    expect(screen.getByText('Installed v1.1.0')).toBeTruthy()
+    expect(screen.getByText('Stale source')).toBeTruthy()
+    expect(screen.queryByText('Current')).toBeNull()
+    expect(screen.queryByText('Update available')).toBeNull()
+    expect(api.inspect).not.toHaveBeenCalled()
+  })
+
+  it('distinguishes exact candidate identity from installed provenance without exposing actor data', () => {
+    const installedCommit = 'c'.repeat(40)
+    const installedDigest = 'd'.repeat(64)
+
+    renderWithProviders(
+      <MarketplacePackageDetail
+        detail={packageDetail({
+          installed: installedPackage({
+            actor: '/private/tmp/operator-secret',
+            configured_ref: 'release-1',
+            distribution_digest: installedDigest,
+            identity: { package_id: 'laptop-support', source_key: 'legacy-company' },
+            installed_at: '2026-08-01T12:00:00Z',
+            package_path: 'packages/installed-laptop-support',
+            repository_url: 'https://installed.example.test/company/workflows.git',
+            resolved_commit: installedCommit,
+            source_name: 'legacy-company',
+            version: '1.0.0'
+          })
+        })}
+      />
+    )
+
+    const candidate = screen.getByRole('region', { name: 'Candidate package identity' })
+    expect(within(candidate).getByText(DIGEST)).toBeTruthy()
+    expect(within(candidate).getByText('packages/laptop-support')).toBeTruthy()
+
+    const installed = screen.getByRole('region', { name: 'Installed package provenance' })
+    expect(within(installed).getByText('legacy-company/laptop-support')).toBeTruthy()
+    expect(within(installed).getByText('1.0.0')).toBeTruthy()
+    expect(within(installed).getByText('legacy-company')).toBeTruthy()
+    expect(
+      within(installed).getByRole('link', { name: 'https://installed.example.test/company/workflows.git' })
+    ).toBeTruthy()
+    expect(within(installed).getByText('release-1')).toBeTruthy()
+    expect(within(installed).getByText(installedCommit)).toBeTruthy()
+    expect(within(installed).getByText(installedDigest)).toBeTruthy()
+    expect(within(installed).getByText('2026-08-01T12:00:00Z')).toBeTruthy()
+    expect(within(installed).getByText('packages/installed-laptop-support')).toBeTruthy()
+    expect(screen.queryByText('/private/tmp/operator-secret')).toBeNull()
   })
 
   it('renders bounded decoded collections and never renders hidden raw content', () => {

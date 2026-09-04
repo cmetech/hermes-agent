@@ -23,6 +23,7 @@ import { useI18n } from '@/i18n'
 import { ChevronLeft } from '@/lib/icons'
 import type { WorkflowMarketplaceOperation, WorkflowMarketplacePackageDetail } from '@/types/hermes'
 
+import { installedProvenanceErrorKind, InstalledProvenanceNotice } from './installed-packages'
 import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList, type MarketplacePackageSelection } from './package-list'
 import { marketplaceKeys } from './query-keys'
@@ -74,6 +75,10 @@ function capabilityErrorKind(error: unknown): 'auth' | 'error' | 'unsupported' {
   return errorStatus(error) === 401 || errorStatus(error) === 403 ? 'auth' : 'error'
 }
 
+function operationNeedsPolling(operation: WorkflowMarketplaceOperation | undefined): boolean {
+  return operation?.state === 'pending' || operation?.state === 'running'
+}
+
 export interface WorkflowMarketplaceViewProps {
   scope: WorkflowMarketplaceScope
 }
@@ -85,6 +90,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const narrow = useMediaQuery(NARROW_MARKETPLACE_QUERY)
   const rootRef = useRef<HTMLElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
+  const backButtonRef = useRef<HTMLButtonElement>(null)
   const selectionOriginRef = useRef<HTMLButtonElement | null>(null)
   const previousScopeKeyRef = useRef(scopeKey)
   const [filterState, setFilterState] = useState<ScopedFilters>({ offset: 0, query: '', scopeKey, source: null })
@@ -145,12 +151,17 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   })
 
   const operationId = detailRequest.data?.id ?? null
+  const needsDetailPolling = operationNeedsPolling(detailRequest.data)
 
   const detailOperation = useQuery({
-    enabled: Boolean(operationId && detailRequest.data?.state !== 'succeeded'),
+    enabled: Boolean(operationId && needsDetailPolling),
     queryFn: () => getWorkflowMarketplaceOperation(operationId!, scope),
     queryKey: marketplaceKeys.operation(scopeKey, operationId ?? 'none'),
     refetchInterval: query => {
+      if (query.state.status === 'error') {
+        return false
+      }
+
       const operation = query.state.data
 
       return operation &&
@@ -161,11 +172,14 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     retry: false
   })
 
-  const effectiveOperation = detailRequest.data?.state === 'succeeded' ? detailRequest.data : detailOperation.data
+  const effectiveOperation = needsDetailPolling ? (detailOperation.data ?? detailRequest.data) : detailRequest.data
   const detail = detailFrom(effectiveOperation)
 
   const detailFailed =
-    detailRequest.isError || effectiveOperation?.state === 'failed' || effectiveOperation?.state === 'cancelled'
+    detailRequest.isError ||
+    detailOperation.isError ||
+    effectiveOperation?.state === 'failed' ||
+    effectiveOperation?.state === 'cancelled'
 
   const detailLoading = selection !== null && !detail && !detailFailed
   const items = packages.data?.items ?? []
@@ -220,6 +234,12 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     }
   }, [filters.query, filters.source, scopeKey, sources.data])
 
+  useEffect(() => {
+    if (narrow && selection) {
+      backButtonRef.current?.focus()
+    }
+  }, [narrow, selection])
+
   const selectPackage = (next: MarketplacePackageSelection, origin: HTMLButtonElement) => {
     const item = items.find(candidate => candidate.source_name === next.sourceName && candidate.id === next.packageId)
 
@@ -251,6 +271,14 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         searchRef.current?.focus()
       }
     })
+  }
+
+  const retryDetail = () => {
+    if (needsDetailPolling && detailOperation.isError) {
+      void detailOperation.refetch()
+    } else {
+      void detailRequest.refetch()
+    }
   }
 
   if (capabilities.isPending) {
@@ -308,10 +336,22 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
           ? copy.workflowMarketplaceSourceUnavailable
           : copy.workflowMarketplaceCatalogErrorTitle
 
+  const installedNotice = !supportsInstalled ? (
+    <InstalledProvenanceNotice context="browse" kind="unsupported" />
+  ) : installed.isPending ? (
+    <InstalledProvenanceNotice context="browse" kind="loading" />
+  ) : installed.isError ? (
+    <InstalledProvenanceNotice
+      context="browse"
+      kind={installedProvenanceErrorKind(installed.error)}
+      onRetry={() => void installed.refetch()}
+    />
+  ) : null
+
   const detailPanel = selection ? (
     <div className="min-h-0 overflow-y-auto px-4 py-3 [scrollbar-gutter:stable]">
       {narrow ? (
-        <Button onClick={backToPackages} size="sm" type="button" variant="secondary">
+        <Button onClick={backToPackages} ref={backButtonRef} size="sm" type="button" variant="secondary">
           <ChevronLeft />
           {copy.workflowMarketplaceBack}
         </Button>
@@ -330,7 +370,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
             description={copy.workflowMarketplaceDetailErrorDescription}
             title={copy.workflowMarketplaceDetailErrorTitle}
           >
-            <Button onClick={() => void detailRequest.refetch()} size="sm" type="button" variant="secondary">
+            <Button onClick={retryDetail} size="sm" type="button" variant="secondary">
               {copy.workflowCatalogRetry}
             </Button>
           </ErrorState>
@@ -403,6 +443,8 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
           {copy.workflowMarketplaceStaleDescription}
         </p>
       ) : null}
+
+      {installedNotice && !(narrow && selection) ? <div className="mb-3">{installedNotice}</div> : null}
 
       {narrow && selection ? (
         <div className="min-h-0 flex-1">{detailPanel}</div>

@@ -94,6 +94,11 @@ export function MarketplacePackageDetail({ detail }: MarketplacePackageDetailPro
   const { t } = useI18n()
   const copy = t.operations
   const repositoryHref = marketplaceWebRepositoryHref(detail.repository_url)
+
+  const installedRepositoryHref = detail.installed
+    ? marketplaceWebRepositoryHref(detail.installed.repository_url)
+    : null
+
   const commands = resourcesWithType(detail.resources, ['command'])
   const scripts = resourcesWithType(detail.resources, ['script'])
   const mcp = resourcesWithType(detail.resources, ['mcp', 'mcp_resource'])
@@ -137,28 +142,73 @@ export function MarketplacePackageDetail({ detail }: MarketplacePackageDetailPro
         </div>
       </header>
 
-      <dl className="grid grid-cols-[minmax(6rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplacePublisher}</dt>
-        <dd>{detail.publisher}</dd>
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceLicense}</dt>
-        <dd>{detail.license}</dd>
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceSource}</dt>
-        <dd>{detail.source_name}</dd>
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceRepository}</dt>
-        <dd className="min-w-0 break-all">
-          {repositoryHref ? (
-            <ExternalLink href={repositoryHref}>{detail.repository_url}</ExternalLink>
-          ) : (
-            detail.repository_url
-          )}
-        </dd>
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceRef}</dt>
-        <dd className="break-all font-mono">{detail.configured_ref ?? copy.workflowMarketplaceDefaultRef}</dd>
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceCommit}</dt>
-        <dd className="break-all font-mono">{detail.resolved_commit}</dd>
-        <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceVerified}</dt>
-        <dd>{detail.verified_at}</dd>
-      </dl>
+      <section aria-label={copy.workflowMarketplaceCandidateIdentity} role="region">
+        <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceCandidateIdentity}</h3>
+        <dl className="mt-1 grid grid-cols-[minmax(6rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplacePublisher}</dt>
+          <dd>{detail.publisher}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceLicense}</dt>
+          <dd>{detail.license}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceSource}</dt>
+          <dd>{detail.source_name}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceRepository}</dt>
+          <dd className="min-w-0 break-all">
+            {repositoryHref ? (
+              <ExternalLink href={repositoryHref}>{detail.repository_url}</ExternalLink>
+            ) : (
+              detail.repository_url
+            )}
+          </dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceRef}</dt>
+          <dd className="break-all font-mono">{detail.configured_ref ?? copy.workflowMarketplaceDefaultRef}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceCommit}</dt>
+          <dd className="break-all font-mono">{detail.resolved_commit}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplacePackageDigest}</dt>
+          <dd className="break-all font-mono">{detail.package_digest}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplacePackagePath}</dt>
+          <dd className="break-all font-mono">{detail.package_path}</dd>
+          <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceVerified}</dt>
+          <dd>{detail.verified_at}</dd>
+        </dl>
+      </section>
+
+      {detail.installed ? (
+        <section aria-label={copy.workflowMarketplaceInstalledProvenance} role="region">
+          <h3 className="text-xs font-medium text-(--ui-text-primary)">
+            {copy.workflowMarketplaceInstalledProvenance}
+          </h3>
+          <dl className="mt-1 grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledIdentity}</dt>
+            <dd className="break-all font-mono">
+              {detail.installed.identity.source_key}/{detail.installed.identity.package_id}
+            </dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledVersionLabel}</dt>
+            <dd>{detail.installed.version}</dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledSource}</dt>
+            <dd>{detail.installed.source_name}</dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledRepository}</dt>
+            <dd className="min-w-0 break-all">
+              {installedRepositoryHref ? (
+                <ExternalLink href={installedRepositoryHref}>{detail.installed.repository_url}</ExternalLink>
+              ) : (
+                detail.installed.repository_url
+              )}
+            </dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledRef}</dt>
+            <dd className="break-all font-mono">
+              {detail.installed.configured_ref ?? copy.workflowMarketplaceDefaultRef}
+            </dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledCommit}</dt>
+            <dd className="break-all font-mono">{detail.installed.resolved_commit}</dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceDistributionDigest}</dt>
+            <dd className="break-all font-mono">{detail.installed.distribution_digest}</dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledAt}</dt>
+            <dd>{detail.installed.installed_at}</dd>
+            <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledPackagePath}</dt>
+            <dd className="break-all font-mono">{detail.installed.package_path}</dd>
+          </dl>
+        </section>
+      ) : null}
 
       {detail.blockers.length ? (
         <section aria-label={copy.workflowMarketplaceBlockers}>

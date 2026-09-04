@@ -61,11 +61,6 @@ export function MarketplacePackageList({
         const selected = item.identifier === selectedIdentifier
         const installed = installedFor(item, installedPackages)
 
-        const current =
-          installed !== undefined &&
-          installed.version === item.version &&
-          installed.distribution_digest === item.package_digest
-
         return (
           <RowButton
             aria-label={`${item.display_name} ${item.identifier}`}
@@ -110,9 +105,7 @@ export function MarketplacePackageList({
                 </Badge>
               ))}
               {item.state === 'stale' ? <Badge variant="warn">{copy.workflowMarketplaceStale}</Badge> : null}
-              {current ? (
-                <Badge variant="default">{copy.workflowMarketplaceCurrent}</Badge>
-              ) : installed ? (
+              {installed ? (
                 <Badge variant="muted">{copy.workflowMarketplaceInstalledVersion(installed.version)}</Badge>
               ) : null}
             </span>
