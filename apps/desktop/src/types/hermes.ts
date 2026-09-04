@@ -902,7 +902,7 @@ export interface WorkflowNodeProjection {
   state: string
 }
 
-export type WorkflowRunView = 'workflows' | 'board' | 'history' | 'archive'
+export type WorkflowRunView = 'workflows' | 'marketplace' | 'board' | 'history' | 'archive'
 export type WorkflowRunListView = 'board' | 'history' | 'archive'
 
 export interface WorkflowStartResult {

@@ -42,4 +42,22 @@ describe('SearchField', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Search' }), { target: { value: 'run' } })
     expect(onChange).toHaveBeenCalledWith('run')
   })
+
+  it('forwards an explicit searchbox role without changing the default textbox role', () => {
+    const { rerender } = render(
+      <I18nProvider configClient={null} initialLocale="en">
+        <SearchField onChange={vi.fn()} placeholder="Search packages" role="searchbox" value="" />
+      </I18nProvider>
+    )
+
+    expect(screen.getByRole('searchbox', { name: 'Search packages' })).toBeTruthy()
+
+    rerender(
+      <I18nProvider configClient={null} initialLocale="en">
+        <SearchField onChange={vi.fn()} placeholder="Search workflows" value="" />
+      </I18nProvider>
+    )
+
+    expect(screen.getByRole('textbox', { name: 'Search workflows' })).toBeTruthy()
+  })
 })

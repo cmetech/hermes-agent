@@ -6,8 +6,8 @@
 // fall back to English while new keys remain type-checked.
 
 import type { ModelEligibilityReasonKey } from '@/lib/model-eligibility'
-import type { ModelCapabilityCatalogStatus } from '@/types/hermes'
 import type { TipId } from '@/lib/tips/catalog'
+import type { ModelCapabilityCatalogStatus } from '@/types/hermes'
 
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
 
@@ -2049,6 +2049,71 @@ export interface Translations {
   operations: {
     workflows: string
     workflowViews: string
+    workflowInstalled: string
+    workflowMarketplace: string
+    workflowMarketplaceCapabilityLoading: string
+    workflowMarketplaceUpgradeTitle: string
+    workflowMarketplaceUpgradeDescription: string
+    workflowMarketplaceAuthTitle: string
+    workflowMarketplaceAuthDescription: string
+    workflowMarketplaceErrorTitle: string
+    workflowMarketplaceErrorDescription: string
+    workflowMarketplaceSearch: string
+    workflowMarketplaceSource: string
+    workflowMarketplaceAllSources: string
+    workflowMarketplaceDisabledSource: (source: string) => string
+    workflowMarketplaceLoading: string
+    workflowMarketplaceCatalogErrorTitle: string
+    workflowMarketplaceCatalogErrorDescription: string
+    workflowMarketplaceSourceAuthTitle: string
+    workflowMarketplaceSourceDisabledTitle: string
+    workflowMarketplaceEmptyTitle: string
+    workflowMarketplaceEmptyDescription: string
+    workflowMarketplaceNoMatchTitle: string
+    workflowMarketplaceNoMatchDescription: string
+    workflowMarketplaceStale: string
+    workflowMarketplaceStaleLabel: string
+    workflowMarketplaceStaleDescription: string
+    workflowMarketplacePackages: string
+    workflowMarketplacePagination: string
+    workflowMarketplacePreviousPage: string
+    workflowMarketplaceNextPage: string
+    workflowMarketplacePage: (page: number) => string
+    workflowMarketplaceSelectTitle: string
+    workflowMarketplaceSelectDescription: string
+    workflowMarketplaceBack: string
+    workflowMarketplaceDetailLoading: string
+    workflowMarketplaceDetailErrorTitle: string
+    workflowMarketplaceDetailErrorDescription: string
+    workflowMarketplaceDetailLabel: (name: string) => string
+    workflowMarketplaceCurrent: string
+    workflowMarketplaceInstalled: string
+    workflowMarketplaceInstalledVersion: (version: string) => string
+    workflowMarketplaceUpdateAvailable: string
+    workflowMarketplacePublisher: string
+    workflowMarketplaceLicense: string
+    workflowMarketplaceRepository: string
+    workflowMarketplaceRef: string
+    workflowMarketplaceDefaultRef: string
+    workflowMarketplaceCommit: string
+    workflowMarketplaceVerified: string
+    workflowMarketplaceBlockers: string
+    workflowMarketplaceAdvisories: string
+    workflowMarketplaceCompatibility: string
+    workflowMarketplaceWorkflowCount: (count: number) => string
+    workflowMarketplaceCommands: string
+    workflowMarketplaceScripts: string
+    workflowMarketplaceMcpResources: string
+    workflowMarketplaceOtherResources: string
+    workflowMarketplaceRequirements: string
+    workflowMarketplaceProviders: string
+    workflowMarketplaceRuntimes: string
+    workflowMarketplaceSecrets: string
+    workflowMarketplaceServices: string
+    workflowMarketplaceTools: string
+    workflowMarketplaceNoRequirements: string
+    workflowMarketplaceInstalledPackages: string
+    workflowMarketplaceSourceUnavailable: string
     workflowCatalog: string
     workflowCatalogLoading: string
     workflowCatalogErrorTitle: string

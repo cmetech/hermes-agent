@@ -27,6 +27,10 @@ const preflightWorkflow = vi.fn()
 const mutateWorkflowRun = vi.fn()
 const previewWorkflowCleanup = vi.fn()
 const executeWorkflowCleanup = vi.fn()
+const getWorkflowMarketplaceCapabilities = vi.fn()
+const listInstalledWorkflowPackages = vi.fn()
+const listWorkflowMarketplaceSources = vi.fn()
+const searchWorkflowPackages = vi.fn()
 const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null }))
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 const workflowCopy = TRANSLATIONS.en.operations
@@ -34,16 +38,25 @@ const workflowCopy = TRANSLATIONS.en.operations
 vi.mock('@/hermes', () => ({
   cancelWorkflowArtifactDownload: vi.fn().mockResolvedValue({ cancelled: true }),
   downloadWorkflowArtifact: vi.fn().mockResolvedValue({ status: 'cancelled' }),
+  getApiRequestConnection: () => 'remote-a',
   getApiRequestProfile: () => apiRequestState.profile,
+  getWorkflowMarketplaceCapabilities: (...args: unknown[]) => getWorkflowMarketplaceCapabilities(...args),
+  getWorkflowMarketplaceOperation: vi.fn(),
   getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args),
   getWorkflowEvidence: (...args: unknown[]) => getWorkflowEvidence(...args),
   getWorkflowRun: (...args: unknown[]) => getWorkflowRun(...args),
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
   listWorkflowEvents: (...args: unknown[]) => listWorkflowEvents(...args),
+  listInstalledWorkflowPackages: (...args: unknown[]) => listInstalledWorkflowPackages(...args),
+  listWorkflowMarketplaceSources: (...args: unknown[]) => listWorkflowMarketplaceSources(...args),
   listWorkflowRuns: (...args: unknown[]) => listWorkflowRuns(...args),
   mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args),
   previewWorkflowCleanup: (...args: unknown[]) => previewWorkflowCleanup(...args),
-  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args)
+  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args),
+  inspectWorkflowPackage: vi.fn(),
+  isWorkflowMarketplaceUnsupportedError: (error: unknown) =>
+    typeof error === 'object' && error !== null && 'code' in error && error.code === 'marketplace_unsupported',
+  searchWorkflowPackages: (...args: unknown[]) => searchWorkflowPackages(...args)
 }))
 
 vi.mock('@/lib/hermes-api', () => ({
@@ -167,7 +180,11 @@ beforeEach(() => {
     preflightWorkflow,
     mutateWorkflowRun,
     previewWorkflowCleanup,
-    executeWorkflowCleanup
+    executeWorkflowCleanup,
+    getWorkflowMarketplaceCapabilities,
+    listInstalledWorkflowPackages,
+    listWorkflowMarketplaceSources,
+    searchWorkflowPackages
   ]) {
     mock.mockReset()
   }
@@ -195,6 +212,22 @@ beforeEach(() => {
   listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
   listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
   preflightWorkflow.mockRejectedValue(new Error('detail unavailable'))
+  getWorkflowMarketplaceCapabilities.mockResolvedValue({
+    capabilities: ['sources', 'search', 'installed', 'updates', 'transactions', 'trust', 'operations'],
+    profile: 'default',
+    schema_version: 1
+  })
+  listInstalledWorkflowPackages.mockResolvedValue({ packages: [], profile: 'default' })
+  listWorkflowMarketplaceSources.mockResolvedValue({ profile: 'default', sources: [] })
+  searchWorkflowPackages.mockResolvedValue({
+    items: [],
+    limit: 50,
+    next_offset: null,
+    offset: 0,
+    profile: 'default',
+    query: '',
+    source: null
+  })
 })
 
 afterEach(() => {
@@ -293,6 +326,23 @@ describe('WorkflowsView', () => {
 
     expect(screen.queryByRole('textbox', { name: 'Filter workflow runs' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Run filters coming soon' })).toBeNull()
+  })
+
+  it('shows Installed and Marketplace without disturbing the established run views', async () => {
+    $workflowSelectedRunId.set(null)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    expect(screen.getByRole('tab', { name: 'Installed' }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tab', { name: 'Active board' })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'History' })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'Archive' })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Marketplace' }))
+
+    expect(await screen.findByRole('searchbox', { name: 'Search workflow packages' })).toBeTruthy()
+    expect(listWorkflowRuns).not.toHaveBeenCalled()
   })
 
   it('keeps navigation mounted around a bounded initial run-list loader', async () => {
@@ -553,7 +603,7 @@ describe('WorkflowsView', () => {
     await renderView(client, 'workflows')
 
     const tabs = await screen.findAllByRole('tab')
-    expect(tabs.map(tab => tab.textContent)).toEqual(['Workflows', 'Active board', 'History', 'Archive'])
+    expect(tabs.map(tab => tab.textContent)).toEqual(['Installed', 'Marketplace', 'Active board', 'History', 'Archive'])
     expect(tabs[0]?.getAttribute('aria-selected')).toBe('true')
     const table = await screen.findByRole('table', { name: 'Workflow catalog' })
     expect(

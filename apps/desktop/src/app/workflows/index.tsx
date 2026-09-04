@@ -9,6 +9,7 @@ import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import {
   executeWorkflowCleanup,
+  getApiRequestConnection,
   getApiRequestProfile,
   getWorkflowRun,
   listWorkflowAttention,
@@ -24,6 +25,7 @@ import { ensureGatewayProfile } from '@/store/profile'
 import type {
   WorkflowDefinition,
   WorkflowEventPage,
+  WorkflowRunListView,
   WorkflowRunPage,
   WorkflowRunSnapshot,
   WorkflowRunView
@@ -35,6 +37,7 @@ import { workflowBoardModel } from './adapter'
 import { AttentionInbox } from './attention-inbox'
 import { WorkflowCatalog } from './catalog'
 import { cancelPendingWorkflowDetailQuery } from './detail-query'
+import { InstalledPackages, WorkflowMarketplaceView } from './marketplace'
 import { ReviewRunDialog } from './review-run-dialog'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
 import { ViewWorkflowDialog } from './view-workflow-dialog'
@@ -76,9 +79,13 @@ interface WorkflowRunMutation {
   stateVersion: number
 }
 
+function isWorkflowRunListView(view: WorkflowRunView): view is WorkflowRunListView {
+  return view === 'board' || view === 'history' || view === 'archive'
+}
+
 export function loadWorkflowRunPage(view: WorkflowRunView, cursor?: string): Promise<WorkflowRunPage> {
-  if (view === 'workflows') {
-    return Promise.reject(new Error('The workflows catalog view does not list workflow runs.'))
+  if (!isWorkflowRunListView(view)) {
+    return Promise.reject(new Error('The selected workflow view does not list workflow runs.'))
   }
 
   return listWorkflowRuns(cursor, view)
@@ -88,6 +95,7 @@ export function WorkflowsView() {
   const { t } = useI18n()
   const requestProfile = getApiRequestProfile()
   const profile = requestProfile ?? 'default'
+  const marketplaceScope = { connectionId: getApiRequestConnection(), profile: requestProfile }
   const queryClient = useQueryClient()
   const selectedRunId = useStore($workflowSelectedRunId)
   const paneVisible = usePaneVisible()
@@ -102,6 +110,7 @@ export function WorkflowsView() {
   const [isVisible, setIsVisible] = useState(() => document.visibilityState === 'visible')
   const [runQuery, setRunQuery] = useState('')
   const [view, setView] = useState<WorkflowRunView>('workflows')
+  const runListView = isWorkflowRunListView(view)
 
   paneVisibleRef.current = paneVisible
 
@@ -184,7 +193,7 @@ export function WorkflowsView() {
   }, [])
 
   const runs = useInfiniteQuery({
-    enabled: view !== 'workflows',
+    enabled: runListView,
     getNextPageParam: (page: WorkflowRunPage) => page.next_cursor ?? undefined,
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam }) => loadWorkflowRunPage(view, pageParam as string | undefined),
@@ -193,14 +202,14 @@ export function WorkflowsView() {
   })
 
   const attention = useQuery({
-    enabled: view !== 'workflows',
+    enabled: runListView,
     queryFn: listWorkflowAttention,
     queryKey: ['workflow-attention', profile],
     refetchInterval: () => (isVisible ? 20_000 : false)
   })
 
   const selected = useQuery({
-    enabled: view !== 'workflows' && Boolean(selectedRunId),
+    enabled: runListView && Boolean(selectedRunId),
     queryFn: () => getWorkflowRun(selectedRunId!),
     queryKey: ['workflow-run', profile, selectedRunId],
     refetchInterval: () => (isVisible ? 20_000 : false)
@@ -209,7 +218,7 @@ export function WorkflowsView() {
   const eventQueryKey = useMemo(() => ['workflow-events', profile, selectedRunId] as const, [profile, selectedRunId])
 
   const events = useQuery({
-    enabled: view !== 'workflows' && Boolean(selectedRunId) && isVisible,
+    enabled: runListView && Boolean(selectedRunId) && isVisible,
     queryFn: async () => {
       const previous = queryClient.getQueryData<WorkflowEventPage>(eventQueryKey)
       const page = await listWorkflowEvents(selectedRunId!, previous?.next_cursor ?? 0)
@@ -388,7 +397,7 @@ export function WorkflowsView() {
     setView(next)
   }
 
-  if (view !== 'workflows' && runs.isError && !runs.data) {
+  if (runListView && runs.isError && !runs.data) {
     return <p className={PAGE_INSET_X}>{t.operations.workflowUnavailable}</p>
   }
 
@@ -415,7 +424,13 @@ export function WorkflowsView() {
       />
       {view === 'workflows' ? (
         <div className="mt-4 min-h-0 flex-1 overflow-y-auto">
-          <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} requestProfile={requestProfile} />
+          <InstalledPackages scope={marketplaceScope}>
+            <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} requestProfile={requestProfile} />
+          </InstalledPackages>
+        </div>
+      ) : view === 'marketplace' ? (
+        <div className="mt-4 min-h-0 flex-1 overflow-hidden">
+          <WorkflowMarketplaceView scope={marketplaceScope} />
         </div>
       ) : (
         <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>
@@ -476,7 +491,7 @@ export function WorkflowsView() {
           )}
         </div>
       )}
-      {view !== 'workflows' && selectedRunId ? (
+      {runListView && selectedRunId ? (
         <WorkflowRunDrawer
           actionsDisabled={actionPending || mutation.isPending || selected.isError}
           error={selected.error}

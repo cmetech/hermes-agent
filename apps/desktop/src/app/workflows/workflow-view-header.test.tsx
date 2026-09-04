@@ -25,7 +25,8 @@ describe('WorkflowViewHeader', () => {
     )
 
     expect(screen.getAllByRole('tab').map(tab => tab.textContent)).toEqual([
-      'Workflows',
+      'Installed',
+      'Marketplace',
       'Active board',
       'History',
       'Archive'
