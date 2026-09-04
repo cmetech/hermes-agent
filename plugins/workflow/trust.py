@@ -1001,7 +1001,11 @@ def _normalize_trust_payload(payload: object) -> _TrustPayload:
         raise ValueError("unsupported trust-store shape")
     version = raw_payload.get("version")
     records = raw_payload.get("records")
-    if version not in {1, 2} or not isinstance(records, Mapping):
+    if (
+        type(version) is not int
+        or version not in {1, 2}
+        or not isinstance(records, Mapping)
+    ):
         raise ValueError("unsupported trust-store shape")
     raw_records = cast(Mapping[object, object], records)
     if len(raw_records) > WORKFLOW_TRUST_MAX_RECORDS:

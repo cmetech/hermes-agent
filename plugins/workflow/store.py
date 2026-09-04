@@ -6606,6 +6606,7 @@ class RunStore:
                     compilation.composite_digest,
                     compilation.covered_relative_paths,
                 )
+                snapshot_resource_digest = expected_package_digest
                 package_digest = expected_package_digest
                 if (
                     trusted_package_digest is not None
@@ -6639,9 +6640,42 @@ class RunStore:
                     package_digest = trusted_package_digest
                 snapshot_format_version = 2
             else:
-                package_digest = trusted_package_digest or compute_package_digest(
-                    package, read_budget=resource_read_budget
-                )
+                marketplace_binding = package.marketplace_binding
+                if marketplace_binding is None:
+                    package_digest = trusted_package_digest or compute_package_digest(
+                        package, read_budget=resource_read_budget
+                    )
+                    snapshot_resource_digest = package_digest
+                else:
+                    snapshot_resource_digest = compute_package_digest(
+                        package, read_budget=resource_read_budget
+                    )
+                    package_digest = snapshot_resource_digest
+                    if trusted_package_digest is not None:
+                        from plugins.workflow.marketplace.trust_binding import (
+                            effective_marketplace_digest,
+                        )
+
+                        expected_effective_digest = effective_marketplace_digest(
+                            distribution_digest=(
+                                marketplace_binding.distribution_digest
+                            ),
+                            workflow_relative_path=(
+                                marketplace_binding.workflow_relative_path
+                            ),
+                            closure_digest=snapshot_resource_digest.sha256,
+                        )
+                        if (
+                            trusted_package_digest.sha256
+                            != expected_effective_digest
+                            or not set(
+                                snapshot_resource_digest.covered_relative_paths
+                            ).issubset(trusted_package_digest.covered_relative_paths)
+                        ):
+                            raise InputSnapshotError(
+                                "trusted workflow identity differs from its package"
+                            )
+                        package_digest = trusted_package_digest
             language = make_language_snapshot(package, package_digest.sha256).to_dict()
             phase5 = supports_phase5_semantics(
                 package.language.effective_profile,
@@ -6797,9 +6831,33 @@ class RunStore:
                     if package.sidecar_path is not None
                     else None
                 )
-                for relative in package_digest.covered_relative_paths:
+                reserved_snapshot_root_identities = frozenset({
+                    ".lock",
+                    ".snapshot-owner.json",
+                    "definition.yaml",
+                    "dependencies.json",
+                    "events.jsonl",
+                    "inputs",
+                    "inputs.json",
+                    "node-agent-skills",
+                    "node-skills",
+                    "nodes",
+                    "policy.yaml",
+                    "provider-resolution.json",
+                    "publications",
+                    "resources.json",
+                    "run.json",
+                })
+                for relative in snapshot_resource_digest.covered_relative_paths:
                     if relative in {workflow_relative, sidecar_relative}:
                         continue
+                    if (
+                        relative.split("/", 1)[0].casefold()
+                        in reserved_snapshot_root_identities
+                    ):
+                        raise InputSnapshotError(
+                            "workflow resource collides with a reserved snapshot path"
+                        )
                     source = package.root / relative
                     target = staging / relative
                     target.parent.mkdir(parents=True, exist_ok=True)

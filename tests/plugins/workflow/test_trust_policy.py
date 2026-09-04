@@ -515,6 +515,40 @@ def test_corrupt_read_only_trust_check_fails_closed_without_rewriting_store(tmp_
     assert not store.lock_path.exists()
 
 
+@pytest.mark.parametrize("version", [True, 1.0], ids=("boolean", "float"))
+def test_non_integer_trust_store_version_fails_closed_without_replacement(
+    tmp_path, version
+):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.path.parent.mkdir(parents=True)
+    malformed = {
+        "version": version,
+        "records": {
+            "a" * 64: {
+                "actor": "legacy-operator",
+                "risk_digest": "b" * 64,
+                "trusted_at": "2026-09-03T12:00:00+00:00",
+            }
+        },
+    }
+    original = json.dumps(malformed, sort_keys=True).encode("utf-8")
+    store.path.write_bytes(original)
+
+    assert store.check_read_only("a" * 64, risk_digest="b" * 64) == "untrusted"
+    assert store.path.read_bytes() == original
+    assert not store.lock_path.exists()
+
+    with pytest.raises(WorkflowTrustError, match="corrupt"):
+        store.trust_origin(
+            "c" * 64,
+            risk_digest="d" * 64,
+            actor="desktop",
+            origin="marketplace:company/package",
+        )
+
+    assert store.path.read_bytes() == original
+
+
 def test_any_matching_origin_grant_trusts_and_manual_revoke_preserves_others(
     tmp_path,
 ):

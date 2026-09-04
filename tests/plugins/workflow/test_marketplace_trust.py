@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -22,7 +23,9 @@ from plugins.workflow.api_admission import (
 import plugins.workflow.api_admission as api_admission_module
 import plugins.workflow.catalog_api as catalog_api
 from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
+from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow.entitlement import AIEntitlementResolution
+from plugins.workflow.language import supports_phase4_semantics
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
 from plugins.workflow.models import WorkflowMarketplaceBinding
 from plugins.workflow.runner_binding import (
@@ -31,7 +34,7 @@ from plugins.workflow.runner_binding import (
     execution_capability_context,
 )
 from plugins.workflow.schema import parse_workflow_source_bytes
-from plugins.workflow.store import RunStore
+from plugins.workflow.store import InputSnapshotError, RunStore
 from plugins.workflow.trust import (
     WORKFLOW_RESOURCE_MAX_FILE_BYTES,
     WORKFLOW_RESOURCE_MAX_FILES,
@@ -157,6 +160,16 @@ def _compile_member(root: Path, digest: str, relative_path: str):
     return compile_workflow(source, WorkflowCatalogSnapshot.capture((source,)))
 
 
+def _add_root_definition_member(root: Path) -> tuple[bytes, str]:
+    decoy = _workflow_bytes("marketplace-root-decoy")
+    (root / "definition.yaml").write_bytes(decoy)
+    manifest_path = root / "workflow-package.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["workflows"].append({"definition": "definition.yaml"})
+    manifest_path.write_bytes(_json_bytes(manifest))
+    return decoy, _publish(root)
+
+
 def _context():
     runtime = classify_execution_runtime(
         provider="openrouter",
@@ -199,6 +212,21 @@ def _connector_snapshot() -> ConnectorCapabilitySnapshot:
         available_tools=frozenset(),
         fingerprint="0" * 64,
     )
+
+
+def _healthy_coordinator(store: RunStore) -> None:
+    acquired = CoordinatorStore(store.database).try_acquire(
+        CoordinatorIdentity(
+            owner_id="marketplace-trust-test",
+            host_kind="web",
+            host_instance_id="marketplace-trust-test",
+            pid=1,
+            process_start_time=None,
+        ),
+        now=datetime.now(timezone.utc),
+        lease_seconds=60,
+    )
+    assert acquired.is_leader
 
 
 def test_effective_marketplace_digest_uses_exact_domain_separated_identity():
@@ -374,6 +402,108 @@ def test_api_admission_maps_mismatched_provenance_to_stable_blocker(
 
     assert error.value.code == "workflow_package_changed"
     assert error.value.status_code == 409
+
+
+def test_legacy_marketplace_api_stages_selected_member_not_root_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root, _initial_digest = _package(tmp_path / "package")
+    decoy, distribution_digest = _add_root_definition_member(root)
+    compilation = _compile_member(root, distribution_digest, "workflows/alpha.yaml")
+    assert not supports_phase4_semantics(
+        compilation.package.language.effective_profile,
+        compilation.package.language.normalizer_version,
+    )
+    assessment = assess_workflow_admission(
+        compilation, _context(), read_budget=_budget()
+    )
+    assert assessment.package_digest.sha256 != compilation.composite_digest
+    assert assessment.risk.package_digest == assessment.package_digest.sha256
+    home = tmp_path / "home"
+    store = RunStore(home)
+    WorkflowTrustStore(home).trust_origin(
+        assessment.package_digest.sha256,
+        risk_digest=assessment.risk.risk_digest,
+        actor="desktop",
+        origin="marketplace:company/package",
+    )
+    _healthy_coordinator(store)
+    monkeypatch.setattr(
+        api_admission_module,
+        "_catalog_compilation",
+        lambda *_args, **_kwargs: compilation,
+    )
+
+    admitted = start_api_run(
+        store,
+        hermes_home=home,
+        workdir=tmp_path,
+        user_home=tmp_path,
+        workflow_name="marketplace-alpha",
+        values={},
+        idempotency_key="marketplace-root-definition",
+        concurrency_policy="queue",
+        authority=ApiAdmissionAuthority(
+            principal="operator",
+            namespace="operator",
+            operator_scope=None,
+            source_instance="desktop:test",
+            assurance="local_admin_claim",
+        ),
+        catalog_source="profile",
+        runner_binding=_runner_binding(),
+    )
+
+    run_id = str(admitted["run_id"])
+    run_directory = store.run_directory(run_id)
+    assert (run_directory / "definition.yaml").read_bytes() == (
+        root / "workflows" / "alpha.yaml"
+    ).read_bytes()
+    assert (run_directory / "definition.yaml").read_bytes() != decoy
+    assert store.load_run(run_id)["definition_digest"] == (
+        assessment.package_digest.sha256
+    )
+
+
+def test_legacy_marketplace_snapshot_rejects_reserved_closure_path(
+    tmp_path: Path,
+):
+    root, _initial_digest = _package(tmp_path / "package")
+    _decoy, distribution_digest = _add_root_definition_member(root)
+    (root / "workflows" / "alpha.yaml").write_bytes(
+        yaml.safe_dump(
+            {
+                "name": "marketplace-alpha",
+                "description": "selected workflow",
+                "nodes": [
+                    {
+                        "id": "execute",
+                        "prompt": "use local MCP",
+                        "mcp": "definition.yaml",
+                    }
+                ],
+            },
+            sort_keys=False,
+        ).encode("utf-8")
+    )
+    distribution_digest = _publish(root)
+    compilation = _compile_member(root, distribution_digest, "workflows/alpha.yaml")
+    assert not supports_phase4_semantics(
+        compilation.package.language.effective_profile,
+        compilation.package.language.normalizer_version,
+    )
+    budget = _budget()
+    assessment = assess_workflow_admission(compilation, _context(), read_budget=budget)
+    store = RunStore(tmp_path / "home")
+
+    with pytest.raises(InputSnapshotError, match="reserved snapshot path"):
+        store.prepare_run_snapshot(
+            compilation.package,
+            resource_read_budget=budget,
+            trusted_package_digest=assessment.package_digest,
+        )
+
+    assert list(store.staging_root.iterdir()) == []
 
 
 def test_multi_workflow_package_has_distinct_effective_and_risk_identities(
