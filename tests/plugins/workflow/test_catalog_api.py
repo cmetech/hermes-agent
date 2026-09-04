@@ -23,6 +23,7 @@ from plugins.workflow.catalog_api import (
     resolve_workflow_catalog_compilation,
     workflow_catalog_run_support,
 )
+from plugins.workflow.compilation import WorkflowCompilation
 import plugins.workflow.showcase as showcase_module
 from plugins.workflow.schema import load_workflow
 from plugins.workflow.trust import (
@@ -1350,6 +1351,244 @@ def test_invalid_profile_package_does_not_consume_a_project_precedence_slot(
     )
 
     assert list(snapshot.selected) == ["project-winner"]
+
+
+def test_catalog_limit_does_not_load_later_package_roots(
+    tmp_path, monkeypatch
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+    import plugins.workflow.marketplace.discovery as marketplace_discovery
+
+    home = tmp_path / "home"
+    package_parent = home / "workflows" / "marketplace" / "company"
+    first_root = _install_catalog_package(
+        package_parent / "a-first",
+        "inbox-productivity",
+        ("first-workflow",),
+    )
+    _install_catalog_package(
+        package_parent / "z-later",
+        "inbox-productivity",
+        ("later-workflow",),
+    )
+    loaded_roots: list[Path] = []
+    original_loader = marketplace_discovery.load_distribution
+
+    def recording_loader(root: Path, **kwargs):
+        loaded_roots.append(root.resolve())
+        return original_loader(root, **kwargs)
+
+    monkeypatch.setattr(marketplace_discovery, "load_distribution", recording_loader)
+    monkeypatch.setattr(catalog_api, "CATALOG_LIMIT", 1)
+
+    discovered, truncated = catalog_api._discover_catalog_compilations(
+        tmp_path / "repo",
+        home,
+    )
+
+    assert truncated is True
+    assert [
+        item.package.definition.name
+        for item in discovered
+        if isinstance(item, WorkflowCompilation)
+    ] == ["first-workflow"]
+    assert loaded_roots == [first_root.resolve()]
+
+
+def test_catalog_limit_orders_package_subtrees_against_loose_paths(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workflow_root = home / "workflows"
+    _install_catalog_package(
+        workflow_root / "a",
+        "inbox-productivity",
+        ("packaged-after",),
+    )
+    workflow_writer(
+        workflow_root,
+        name="loose-before",
+        filename="a-.yaml",
+    )
+    monkeypatch.setattr(catalog_api, "CATALOG_LIMIT", 1)
+
+    discovered, truncated = catalog_api._discover_catalog_compilations(
+        tmp_path / "repo",
+        home,
+    )
+
+    assert truncated is True
+    assert [
+        item.package.definition.name
+        for item in discovered
+        if isinstance(item, WorkflowCompilation)
+    ] == ["loose-before"]
+
+
+def test_catalog_limit_does_not_hide_an_earlier_package_failure(
+    tmp_path, monkeypatch, workflow_writer
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    workflow_root = home / "workflows"
+    invalid = _install_catalog_package(
+        workflow_root / "a",
+        "inbox-productivity",
+        ("must-not-leak",),
+    )
+    (invalid / "workflow-package.json").write_text("{", encoding="utf-8")
+    workflow_writer(
+        workflow_root,
+        name="loose-after-failure",
+        filename="a-.yaml",
+    )
+    monkeypatch.setattr(catalog_api, "CATALOG_LIMIT", 1)
+
+    discovered, truncated = catalog_api._discover_catalog_compilations(
+        tmp_path / "repo",
+        home,
+    )
+
+    assert truncated is True
+    assert list(discovered) == [
+        {
+            "name": "a",
+            "error": "invalid_definition",
+            "source": "profile",
+            "precedence": 2,
+        }
+    ]
+
+
+def test_catalog_shared_package_read_exhaustion_is_bounded_capacity(
+    tmp_path, monkeypatch
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    package_parent = home / "workflows" / "marketplace" / "company"
+    first_root = _install_catalog_package(
+        package_parent / "a-first",
+        "inbox-productivity",
+        ("first-workflow",),
+    )
+    _install_catalog_package(
+        package_parent / "z-capacity",
+        "inbox-productivity",
+        ("must-not-load",),
+    )
+    first_distribution_bytes = sum(
+        path.stat().st_size
+        for path in first_root.rglob("*")
+        if path.is_file() and path.name != "digests.json"
+    )
+    monkeypatch.setattr(
+        catalog_api,
+        "CATALOG_MAX_RESOURCE_TOTAL_BYTES",
+        first_distribution_bytes,
+    )
+
+    discovered, truncated = catalog_api._discover_catalog_compilations(
+        tmp_path / "repo",
+        home,
+    )
+
+    assert truncated is True
+    assert [
+        item.package.definition.name
+        for item in discovered
+        if isinstance(item, WorkflowCompilation)
+    ] == ["first-workflow"]
+    assert [item for item in discovered if isinstance(item, dict)] == [
+        {
+            "name": "z-capacity",
+            "error": "catalog_capacity",
+            "source": "profile",
+            "precedence": 2,
+        }
+    ]
+
+
+@pytest.mark.parametrize("failure_kind", ["package", "definition"])
+def test_catalog_invalid_profile_rows_do_not_match_project_detail(
+    tmp_path, failure_kind
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    home = tmp_path / "home"
+    root = _install_catalog_package(
+        home / "workflows" / "marketplace" / "company" / "broken",
+        "inbox-productivity",
+        ("broken",),
+    )
+    if failure_kind == "package":
+        (root / "workflow-package.json").write_text("{", encoding="utf-8")
+    else:
+        (root / "workflows" / "triage.yaml").write_text(
+            "name: broken\ndescription: broken\nnodes: []\n",
+            encoding="utf-8",
+        )
+        _republish_marketplace_package(root)
+    requested_name = "broken" if failure_kind == "package" else "triage"
+
+    with pytest.raises(catalog_api.WorkflowDetailNotFoundError):
+        catalog_api.build_workflow_detail(
+            requested_name,
+            hermes_home=home,
+            workdir=tmp_path / "repo",
+            catalog_source="project",
+        )
+    with pytest.raises(catalog_api.WorkflowCatalogInvalidDefinitionError):
+        catalog_api.build_workflow_detail(
+            requested_name,
+            hermes_home=home,
+            workdir=tmp_path / "repo",
+            catalog_source="profile",
+        )
+
+    items, _truncated = catalog_api.build_workflow_catalog(
+        hermes_home=home,
+        workdir=tmp_path / "repo",
+    )
+    assert [item for item in items if item.get("name") == requested_name] == [
+        {"name": requested_name, "error": "invalid_definition"}
+    ]
+
+
+def test_source_specific_resolution_skips_a_valid_other_source_before_failure(
+    tmp_path, workflow_writer
+) -> None:
+    import plugins.workflow.catalog_api as catalog_api
+
+    workdir = tmp_path / "repo"
+    home = tmp_path / "home"
+    invalid = _install_catalog_package(
+        workdir / ".hermes" / "workflows" / "shared",
+        "inbox-productivity",
+        ("must-not-leak",),
+    )
+    (invalid / "workflow-package.json").write_text("{", encoding="utf-8")
+    workflow_writer(home / "workflows", name="shared", filename="shared.yaml")
+
+    profile = catalog_api.resolve_workflow_catalog_compilation(
+        "shared",
+        hermes_home=home,
+        workdir=workdir,
+        catalog_source="profile",
+    )
+
+    assert profile is not None
+    assert profile.package.source == "profile"
+    with pytest.raises(catalog_api.WorkflowCatalogInvalidDefinitionError):
+        catalog_api.resolve_workflow_catalog_compilation(
+            "shared",
+            hermes_home=home,
+            workdir=workdir,
+            catalog_source="project",
+        )
 
 
 def test_workflow_catalog_tamper_invalidates_cache_and_omits_entire_bundle(

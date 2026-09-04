@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 
@@ -248,6 +249,53 @@ def test_invalid_package_manifest_fails_closed_instead_of_exposing_inner_yaml(
 
     with pytest.raises(WorkflowMarketplaceError) as error:
         enumerate_workflow_candidates(tmp_path / "packages")
+
+    assert error.value.code == "package_manifest_invalid"
+
+
+def test_case_variant_package_marker_fails_closed_instead_of_exposing_inner_yaml(
+    tmp_path: Path,
+) -> None:
+    root, _digest = _install_package(
+        tmp_path / "packages" / "invalid",
+        "inbox-productivity",
+        ("must-not-leak",),
+    )
+    manifest_path = root / "workflow-package.json"
+    temporary_path = root / "manifest-temporary.json"
+    manifest_path.rename(temporary_path)
+    temporary_path.rename(root / "Workflow-Package.Json")
+    _publish(root)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        enumerate_workflow_candidates(tmp_path / "packages")
+
+    assert error.value.code == "package_manifest_invalid"
+
+
+def test_explicit_case_variant_package_marker_fails_closed_on_case_sensitive_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _digest = _install_package(
+        tmp_path / "invalid",
+        "inbox-productivity",
+        ("must-not-leak",),
+    )
+    manifest_path = root / "workflow-package.json"
+    temporary_path = root / "manifest-temporary.json"
+    manifest_path.rename(temporary_path)
+    temporary_path.rename(root / "Workflow-Package.Json")
+    _publish(root)
+    monkeypatch.setattr(os.path, "lexists", lambda _path: False)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        discover_workflows(
+            tmp_path / "repo",
+            tmp_path / "profile",
+            tmp_path / "home",
+            explicit_path=root,
+        )
 
     assert error.value.code == "package_manifest_invalid"
 

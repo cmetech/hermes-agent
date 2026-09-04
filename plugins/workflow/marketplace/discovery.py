@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import heapq
 import os
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from plugins.workflow.models import WorkflowMarketplaceBinding
+from plugins.workflow.trust import WorkflowResourceReadBudget
 
 from .package import WorkflowMarketplaceError, load_distribution
 
 
 _MANIFEST_NAME = "workflow-package.json"
 _YAML_SUFFIXES = frozenset({".yaml", ".yml"})
+_CATALOG_CAPACITY_CODES = frozenset({
+    "package_file_count_limit",
+    "package_file_size_limit",
+    "package_total_size_limit",
+    "package_traversal_limit",
+})
 
 
 class _DirectoryEntry(Protocol):
@@ -73,6 +82,7 @@ class WorkflowCandidateFailure:
 
     package_root: Path
     error: WorkflowMarketplaceError
+    catalog_capacity: bool = False
 
 
 def _directory_entries(directory: Path) -> Iterable[_DirectoryEntry]:
@@ -82,6 +92,15 @@ def _directory_entries(directory: Path) -> Iterable[_DirectoryEntry]:
 
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(path))
+
+
+def _is_package_marker(name: str) -> bool:
+    return unicodedata.normalize("NFC", name).casefold() == _MANIFEST_NAME
+
+
+def _contains_workflow_package_marker(location: Path) -> bool:
+    with os.scandir(location) as entries:
+        return any(_is_package_marker(entry.name) for entry in entries)
 
 
 def _is_yaml_definition(path: Path) -> bool:
@@ -129,7 +148,7 @@ def _scan_location(
             if directory == location and entry.name in excluded_top_level:
                 continue
             path = Path(entry.path)
-            if entry.name == _MANIFEST_NAME:
+            if _is_package_marker(entry.name):
                 package_roots.add(directory)
                 continue
             if entry.is_dir(follow_symlinks=False):
@@ -156,17 +175,21 @@ def _outer_package_roots(package_roots: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(outer)
 
 
-def enumerate_workflow_candidates_isolated(
+def _enumerate_workflow_candidate_records(
     location: Path,
     *,
-    excluded_top_level: frozenset[str] = frozenset(),
-    binding_resolver: WorkflowBindingResolver | None = None,
-    consume_entry: Callable[[], None] | None = None,
-    directory_entries: Callable[[Path], Iterable[_DirectoryEntry]] = _directory_entries,
-    follow_file_symlinks: bool = True,
-) -> tuple[WorkflowCandidate | WorkflowCandidateFailure, ...]:
-    """Return candidates while representing each invalid package independently."""
-
+    excluded_top_level: frozenset[str],
+    binding_resolver: WorkflowBindingResolver | None,
+    consume_entry: Callable[[], None] | None,
+    directory_entries: Callable[[Path], Iterable[_DirectoryEntry]],
+    follow_file_symlinks: bool,
+    result_limit: int | None,
+    read_budget: WorkflowResourceReadBudget | None,
+) -> tuple[tuple[WorkflowCandidate | WorkflowCandidateFailure, ...], bool]:
+    if result_limit is not None and (
+        isinstance(result_limit, bool) or result_limit < 0
+    ):
+        raise ValueError("workflow candidate result limit must be non-negative")
     absolute_location = _absolute(Path(location).expanduser())
     package_roots, yaml_paths = _scan_location(
         absolute_location,
@@ -176,12 +199,42 @@ def enumerate_workflow_candidates_isolated(
         follow_file_symlinks=follow_file_symlinks,
     )
     outer_roots = _outer_package_roots(package_roots)
+    loose_paths = tuple(
+        path
+        for path in yaml_paths
+        if not any(_is_within(path, package_root) for package_root in outer_roots)
+    )
+    entries: list[tuple[str, int, Path, WorkflowCandidate | None]] = [
+        (package_root.as_posix(), 0, package_root, None) for package_root in outer_roots
+    ]
+    entries.extend(
+        (
+            path.as_posix(),
+            1,
+            path,
+            WorkflowCandidate(workflow_path=path),
+        )
+        for path in loose_paths
+    )
+    heapq.heapify(entries)
     results: list[WorkflowCandidate | WorkflowCandidateFailure] = []
-    for package_root in outer_roots:
+    while entries:
+        if result_limit is not None and len(results) >= result_limit:
+            return tuple(results), True
+        _sort_path, entry_kind, path, candidate = heapq.heappop(entries)
+        if entry_kind == 1:
+            assert candidate is not None
+            results.append(candidate)
+            continue
+        package_root = path
         try:
-            distribution = load_distribution(package_root)
+            distribution = load_distribution(package_root, read_budget=read_budget)
             files = {item.relative_path: item for item in distribution.files}
-            for member in distribution.manifest.workflows:
+            package_entries: list[tuple[str, int, Path, WorkflowCandidate | None]] = []
+            for member in sorted(
+                distribution.manifest.workflows,
+                key=lambda item: item.definition,
+            ):
                 binding = (
                     binding_resolver(distribution.root, member.definition)
                     if binding_resolver is not None
@@ -197,36 +250,85 @@ def enumerate_workflow_candidates_isolated(
                 companion = (
                     files[member.companion] if member.companion is not None else None
                 )
-                results.append(
-                    WorkflowCandidate(
-                        workflow_path=definition.path,
-                        package_root=distribution.root,
-                        definition_bytes=definition.content,
-                        sidecar_path=companion.path if companion is not None else None,
-                        sidecar_bytes=(
-                            companion.content if companion is not None else None
-                        ),
-                        marketplace_binding=binding,
-                    )
+                workflow_candidate = WorkflowCandidate(
+                    workflow_path=definition.path,
+                    package_root=distribution.root,
+                    definition_bytes=definition.content,
+                    sidecar_path=companion.path if companion is not None else None,
+                    sidecar_bytes=companion.content if companion is not None else None,
+                    marketplace_binding=binding,
                 )
+                pending_entry: tuple[str, int, Path, WorkflowCandidate | None] = (
+                    definition.path.as_posix(),
+                    1,
+                    definition.path,
+                    workflow_candidate,
+                )
+                package_entries.append(pending_entry)
+            entries.extend(package_entries)
+            heapq.heapify(entries)
         except WorkflowMarketplaceError as exc:
+            catalog_capacity = exc.code in _CATALOG_CAPACITY_CODES
             results.append(
-                WorkflowCandidateFailure(package_root=package_root, error=exc)
+                WorkflowCandidateFailure(
+                    package_root=package_root,
+                    error=exc,
+                    catalog_capacity=catalog_capacity,
+                )
             )
+            if read_budget is not None and exc.message.startswith(
+                "shared package resource"
+            ):
+                return tuple(results), True
+    return tuple(results), False
 
-    for path in yaml_paths:
-        if any(_is_within(path, package_root) for package_root in outer_roots):
-            continue
-        results.append(WorkflowCandidate(workflow_path=path))
-    return tuple(
-        sorted(
-            results,
-            key=lambda item: (
-                item.workflow_path.as_posix()
-                if isinstance(item, WorkflowCandidate)
-                else item.package_root.as_posix()
-            ),
-        )
+
+def enumerate_workflow_candidates_isolated(
+    location: Path,
+    *,
+    excluded_top_level: frozenset[str] = frozenset(),
+    binding_resolver: WorkflowBindingResolver | None = None,
+    consume_entry: Callable[[], None] | None = None,
+    directory_entries: Callable[[Path], Iterable[_DirectoryEntry]] = _directory_entries,
+    follow_file_symlinks: bool = True,
+) -> tuple[WorkflowCandidate | WorkflowCandidateFailure, ...]:
+    """Return candidates while representing each invalid package independently."""
+
+    results, truncated = _enumerate_workflow_candidate_records(
+        location,
+        excluded_top_level=excluded_top_level,
+        binding_resolver=binding_resolver,
+        consume_entry=consume_entry,
+        directory_entries=directory_entries,
+        follow_file_symlinks=follow_file_symlinks,
+        result_limit=None,
+        read_budget=None,
+    )
+    assert truncated is False
+    return results
+
+
+def _enumerate_workflow_candidates_for_catalog(
+    location: Path,
+    *,
+    excluded_top_level: frozenset[str],
+    result_limit: int,
+    read_budget: WorkflowResourceReadBudget,
+    consume_entry: Callable[[], None],
+    directory_entries: Callable[[Path], Iterable[_DirectoryEntry]],
+    follow_file_symlinks: bool,
+) -> tuple[tuple[WorkflowCandidate | WorkflowCandidateFailure, ...], bool]:
+    """Return a bounded catalog batch without loading later package roots."""
+
+    return _enumerate_workflow_candidate_records(
+        location,
+        excluded_top_level=excluded_top_level,
+        binding_resolver=None,
+        consume_entry=consume_entry,
+        directory_entries=directory_entries,
+        follow_file_symlinks=follow_file_symlinks,
+        result_limit=result_limit,
+        read_budget=read_budget,
     )
 
 

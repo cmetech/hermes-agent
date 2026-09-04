@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 
 from plugins.workflow.compilation import (
@@ -14,6 +13,7 @@ from plugins.workflow.compilation import (
 from plugins.workflow.marketplace.discovery import (
     WorkflowBindingResolver,
     WorkflowCandidate,
+    _contains_workflow_package_marker,
     enumerate_workflow_candidates,
 )
 from plugins.workflow.models import (
@@ -128,7 +128,7 @@ def discover_workflows(
         if (
             source == "explicit"
             and location.is_dir()
-            and not os.path.lexists(location / "workflow-package.json")
+            and not _contains_workflow_package_marker(location)
             and (location / "workflows").is_dir()
         ):
             scan_location = location / "workflows"
