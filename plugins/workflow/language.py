@@ -21,6 +21,7 @@ from agent.structured_output import (
 from plugins.workflow.models import (
     CompatibilityFinding,
     CompatibilityLevel,
+    LOOP_GROUP_WORK_LIMIT,
     WorkflowDefinition,
     WorkflowLanguageMetadata,
     WorkflowLanguageProfile,
@@ -1795,7 +1796,7 @@ def _read_node_semantics(
                 NodeExecutionContext.__dataclass_fields__["max_artifact_bytes"].default
             )
             journal_unit = TerminalJournalReserve.for_projection(
-                4096
+                LOOP_GROUP_WORK_LIMIT
             ).terminal_reserve_bytes
             execution_limits = RunExecutionLimits()
             if (
@@ -1816,10 +1817,10 @@ def _read_node_semantics(
                 or not isinstance(loop_group["signal_completes"], bool)
                 or isinstance(loop_group["child_executions"], bool)
                 or not isinstance(loop_group["child_executions"], int)
-                or not 1 <= loop_group["child_executions"] <= 4096
+                or not 1 <= loop_group["child_executions"] <= LOOP_GROUP_WORK_LIMIT
                 or isinstance(loop_group["child_attempts"], bool)
                 or not isinstance(loop_group["child_attempts"], int)
-                or not 1 <= loop_group["child_attempts"] <= 4096
+                or not 1 <= loop_group["child_attempts"] <= LOOP_GROUP_WORK_LIMIT
                 or loop_group["child_attempts"] < loop_group["child_executions"]
                 or not isinstance(capacity, Mapping)
                 or set(capacity)

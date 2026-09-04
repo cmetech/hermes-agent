@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import base64
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
 from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import zlib
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -47,6 +49,16 @@ def _node_property(schema: dict[str, object], node_type: str, field: str) -> dic
 
 def _descriptor_definition(contract: dict, descriptor: dict) -> dict:
     return contract["field_definitions"][descriptor["definition_ref"]]
+
+
+def _node_kind_semantic_definition(contract: dict, descriptor: dict) -> dict:
+    reference = descriptor["semantic_ref"]
+    node_kind = next(
+        item
+        for item in contract["node_kinds"]
+        if item["id"] == reference["node_kind"]
+    )
+    return node_kind["semantic_definitions"][reference["definition"]]
 
 
 def test_archon_authoring_contract_is_bounded_and_versioned():
@@ -138,6 +150,498 @@ def test_explicit_v6_contract_derives_bounded_loop_group_surface():
             "max_iterations": 3,
         }
     ]
+
+
+def test_explicit_v6_contract_publishes_scoped_graph_semantics():
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    contract = workflow_authoring_contract(profile, normalizer_version=6)
+    rules = {rule["kind"]: rule for rule in contract["semantic_rules"]}
+
+    assert {
+        "scoped-dag-topology-v1",
+        "scoped-output-reference-v1",
+        "loop-group-work-product-v1",
+    } <= set(rules)
+    scoped = rules["scoped-dag-topology-v1"]
+    assert scoped["group_kind"] == "loop_group"
+    assert scoped["body_path"] == ["loop_group", "nodes"]
+    assert scoped["node_id_field"] == "id"
+    assert scoped["depends_on_field"] == "depends_on"
+    assert scoped["allowed_node_kinds"] == [
+        "command",
+        "prompt",
+        "bash",
+        "script",
+        "loop",
+        "approval",
+        "cancel",
+    ]
+    assert scoped["forbidden_node_kinds"] == [
+        "include",
+        "workflow",
+        "loop_group",
+    ]
+    assert scoped["forbidden_group_fields"] == ["retry"]
+    assert scoped["group_fields"] == sorted(loop_group_field_names())
+    assert scoped["required_group_fields"] == [
+        "nodes",
+        "until",
+        "max_iterations",
+    ]
+    assert scoped["min_nodes"] == 1
+    assert scoped["max_depth"] == 1
+    assert scoped["max_nodes"] == 512
+    assert scoped["max_edges"] == 4096
+    assert scoped["min_iterations"] == 1
+    assert scoped["max_iterations"] == 100
+    assert scoped["primary_sink"] == "first-terminal-in-definition-order"
+    assert scoped["validation_codes"] == {
+        "topology": "loop_group_topology_invalid",
+        "visibility": "loop_group_scope_invalid",
+        "nesting": "loop_group_shape_invalid",
+        "capacity": "loop_group_product_limit",
+        "work_product": "loop_group_product_limit",
+    }
+
+    references = rules["scoped-output-reference-v1"]
+    assert references["current_scope"] == {
+        "applies_to": ["nodes[].loop_group.nodes[]"],
+        "producer_scope": "body-sibling",
+        "requires_direct_dependency": True,
+    }
+    assert references["outer_scope"] == {
+        "applies_to": [
+            "nodes[].loop_group.nodes[]",
+            "nodes[].loop_group.until_bash",
+            "nodes[].loop_group.gate_message",
+        ],
+        "producer_scope": "outer-node",
+        "requires_group_dependency": True,
+    }
+    assert references["previous_iteration"] == {
+        "applies_to": [
+            "nodes[].loop_group.nodes[]",
+            "nodes[].loop_group.until_bash",
+        ],
+        "producer_scope": "body-node",
+        "prefix": "$LOOP_PREV.",
+        "requires_direct_dependency": False,
+        "first_iteration": {
+            "known_whole_output": {
+                "result": "resolved",
+                "rendered_text": "",
+            },
+            "known_structured_path": {
+                "result": "error",
+                "code": "output_reference_missing",
+            },
+        },
+    }
+    assert references["unqualified_producer_resolution"] == {
+        "order": ["body-sibling", "outer-node"],
+        "collision_precedence": "body-sibling",
+    }
+    assert references["interpolation_surface_v1"] == {
+        "fields": [
+            {
+                "field_path": "nodes[].loop_group.nodes[].when",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].prompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].bash",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].script",
+                "template_source": "inline-or-authenticated-script-body",
+                "authored_value": (
+                    "reference-template-if-inline-otherwise-literal-resource-name"
+                ),
+                "value_discriminator": "script-inline-v1",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.prompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.until_bash",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.gate_message",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.command",
+                "template_source": "authenticated-command-body",
+                "authored_value": "literal-resource-name",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].approval.message",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].approval.on_reject.prompt"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].command",
+                "template_source": "authenticated-command-body",
+                "authored_value": "literal-resource-name",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].systemPrompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].agents.*.description"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].agents.*.prompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response.systemMessage"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response.stopReason"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response."
+                    "hookSpecificOutput.permissionDecisionReason"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response."
+                    "hookSpecificOutput.additionalContext"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.until_bash",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.gate_message",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+        ],
+        "value_discriminators_v1": {
+            "script-inline-v1": {
+                "operation": "contains-listed-codepoint",
+                "codepoint_ranges": [
+                    [9, 13],
+                    [28, 32],
+                    [133, 133],
+                    [160, 160],
+                    [5760, 5760],
+                    [8192, 8202],
+                    [8232, 8233],
+                    [8239, 8239],
+                    [8287, 8287],
+                    [12288, 12288],
+                ],
+                "characters": ";(){}&|<>$`\"'",
+                "match": "reference-template",
+                "otherwise": "literal-resource-name",
+            }
+        },
+        "unlisted_authored_string_fields": "literal",
+    }
+    assert references["semantic_ref"] == {
+        "node_kind": "loop_group",
+        "definition": "scoped-output-reference-v1",
+    }
+    reference_details = _node_kind_semantic_definition(contract, references)
+    assert reference_details["group_until_bash"] == {
+        "field_path": ["loop_group", "until_bash"],
+        "current_scope": "all-body-nodes",
+    }
+    assert reference_details["companion_node_paths"] == {
+        "format": "group/child",
+        "field_paths": ["sidecar.outward_action_nodes[]"],
+        "validation_code": "unknown_sidecar_node",
+    }
+    structured_details = reference_details["structured_path_constraint_v1"]
+    assert structured_details["syntax_rule"] == "strict-output-reference"
+    assert structured_details["producer_schema_resolution_v1"] == {
+        "ordinary": ["output_format"],
+        "loop_group": [
+            "scoped-dag-topology-v1.primary_sink",
+            "output_format",
+        ],
+    }
+    proof = structured_details["conservative_tristate_v1"]
+    assert proof["accept"] == ["possible", "unknown"]
+    assert proof["reject"] == "impossible"
+    assert proof["modes"] == {
+        "ascii-decimal": "all(object,array)",
+        "other": "object",
+    }
+    assert proof["strategies"] == {
+        "schema": "false=impossible;true|nonmap=unknown",
+        "type": "exclude-mode",
+        "properties": "exact-child",
+        "patternProperties": "nonempty-unknown",
+        "additionalProperties": "false-impossible/schema-tail/unknown",
+        "maxItems": "index>=impossible",
+        "prefixItems": "index-first",
+        "items": "schema-or-index",
+        "additionalItems": "list-overflow",
+        "allOf": "any-impossible",
+        "union": ["anyOf", "oneOf", "nonempty-all-impossible"],
+        "unlisted": "ignored=unknown",
+    }
+    assert proof["evaluation_v1"] == {
+        "$ref_resolution": {
+            "schema_scope": "current-schema-only",
+            "when": "path-segments-remain",
+            "terminal_child": "not-resolved",
+        },
+        "object_lookup": {
+            "order": [
+                "properties",
+                "patternProperties",
+                "additionalProperties",
+            ],
+            "stop_after_first_applicable": True,
+            "applicability": {
+                "properties": "exact-key-match",
+                "patternProperties": "nonempty-map",
+                "additionalProperties": "fallback",
+            },
+        },
+        "terminal_child": {
+            "when": "no-path-segments-remain",
+            "false": "impossible",
+            "otherwise": "possible",
+            "$ref": "not-resolved",
+        },
+    }
+    assert proof["$ref"] == (
+        "local-pointer(map/array,~0/~1);false|impossible=>impossible;"
+        "unresolved|nonlocal|cycle=>unknown"
+    )
+    assert proof["dotted_key"] == (
+        "after=impossible;joined-tail=literal-key;"
+        "walk=$ref(map)/combinators(any)/properties/array-items;"
+        "type=capable"
+    )
+    assert structured_details["diagnostic_table"] == {
+        "codes": {
+            "L": "loop_group_scope_invalid",
+            "D": "output_reference_not_declared_dependency",
+            "U": "output_reference_path_unsupported",
+            "F": "structured_output_field_impossible",
+        },
+        "cols": ["when", "semantic", "body", "until", "gate"],
+        "rows": [
+            [
+                "dep",
+                "scoped-reference-missing-dependency",
+                "L",
+                "D",
+                "D",
+            ],
+            [
+                "prev",
+                "scoped-reference-unknown-producer",
+                "L",
+                "L",
+                None,
+            ],
+            [
+                "companion",
+                "scoped-companion-reference-unknown-node",
+                None,
+                None,
+                None,
+            ],
+            [
+                "no_schema",
+                "scoped-reference-producer-schema-required",
+                "L",
+                "L",
+                "U",
+            ],
+            [
+                "impossible",
+                "scoped-reference-structured-path-impossible",
+                "L",
+                "L",
+                "F",
+            ],
+            [
+                "dotted",
+                "scoped-reference-structured-path-impossible",
+                "L",
+                "L",
+                "U",
+            ],
+        ],
+    }
+
+    work = rules["loop-group-work-product-v1"]
+    assert work["limit"] == 4096
+    assert work["accumulators"] == ["executions", "attempts"]
+    assert work["semantic_ref"] == {
+        "node_kind": "loop_group",
+        "definition": "loop-group-work-product-v1",
+    }
+    formula = _node_kind_semantic_definition(contract, work)
+    assert formula["expression_format"] == "prefix-v1"
+    assert formula["expressions"] == {
+        "executions": [
+            "*",
+            "group_iterations",
+            ["sum", "body_nodes", "ordinary_loop_multiplier"],
+        ],
+        "attempts": [
+            "*",
+            "group_iterations",
+            [
+                "sum",
+                "body_nodes",
+                [
+                    "*",
+                    "ordinary_loop_multiplier",
+                    ["+", "selected_retries", 1],
+                ],
+            ],
+        ],
+    }
+    assert work["group_iterations_path"] == ["loop_group", "max_iterations"]
+    assert work["ordinary_loop_multiplier_path"] == ["loop", "max_iterations"]
+    assert work["retry_max_attempts_path"] == ["retry", "max_attempts"]
+    assert work["approval_max_attempts_path"] == [
+        "approval",
+        "on_reject",
+        "max_attempts",
+    ]
+    assert work["ordinary_loop_default_multiplier"] == 1
+    assert work["command_prompt_default_retries"] == 2
+    assert work["other_default_retries"] == 0
+    assert work["approval_default_max_attempts"] == 3
+    assert formula["retry_precedence"] == (
+        "approval>retry>command|prompt>default"
+    )
+    loop_group_topic = next(
+        topic
+        for topic in contract["documentation"]["topics"]
+        if topic["id"] == "durable-loop-groups"
+    )
+    assert loop_group_topic == {
+        "id": "durable-loop-groups",
+        "title": "Durable bounded loop groups",
+        "description": "One immutable nested body with bounded iterations.",
+        "field_paths": [
+            "nodes[].loop_group.nodes",
+            "nodes[].loop_group.until",
+            "nodes[].loop_group.max_iterations",
+            "nodes[].loop_group.fresh_context",
+            "nodes[].loop_group.until_bash",
+            "nodes[].loop_group.interactive",
+            "nodes[].loop_group.signal_completes",
+            "nodes[].loop_group.gate_message",
+        ],
+        "applicability": {
+            "profiles": ["archon-2026-07"],
+            "documents": ["definition"],
+        },
+        "parameters": {
+            "body_depth": 1,
+            "body_nodes": {"minimum": 1, "maximum": 512},
+            "body_edges": {"maximum": 4096},
+            "max_iterations": {"minimum": 1, "maximum": 100},
+            "primary_sink": "first_terminal_in_definition_order",
+            "group_fields": [
+                "fresh_context",
+                "gate_message",
+                "interactive",
+                "max_iterations",
+                "nodes",
+                "signal_completes",
+                "until",
+                "until_bash",
+            ],
+            "reference_scopes": {
+                "current_body": "direct_sibling_dependency",
+                "outer": "direct_group_dependency",
+                "previous_body": "immediately_previous_iteration",
+            },
+            "effective_interactive_requires": [
+                "workflow.interactive",
+                "loop_group.interactive",
+            ],
+            "rejected": [
+                "include",
+                "nested_loop_group",
+                "runtime_workflow",
+                "group_retry",
+                "returns",
+            ],
+        },
+    }
+    assert json.loads(json.dumps(rules, sort_keys=True)) == rules
+
+
+@pytest.mark.parametrize(
+    ("profile", "normalizer_version"),
+    [
+        (WorkflowLanguageProfile.HERMES_LEGACY, 2),
+        (WorkflowLanguageProfile.ARCHON_2026_07, 5),
+    ],
+)
+def test_profiles_without_loop_groups_omit_scoped_graph_semantics(
+    profile, normalizer_version
+):
+    rules = workflow_authoring_contract(
+        profile,
+        normalizer_version=normalizer_version,
+    )["semantic_rules"]
+
+    scoped_kinds = {
+        "scoped-dag-topology-v1",
+        "scoped-output-reference-v1",
+        "loop-group-work-product-v1",
+    }
+    assert scoped_kinds.isdisjoint(rule["id"] for rule in rules)
+    assert all("kind" not in rule for rule in rules)
 
 
 @pytest.mark.parametrize(
@@ -389,6 +893,40 @@ def test_legacy_authoring_contract_preserves_supported_versions(
     }
 
 
+def test_legacy_contract_is_byte_identical_to_declared_merge_base():
+    fixture_path = (
+        Path(__file__).with_name("fixtures")
+        / "legacy-contract-c1dc7a23.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert fixture["merge_base"] == (
+        "c1dc7a23e1e987f7f64a1bee89b224af4d4adf5d"
+    )
+    golden = zlib.decompress(
+        base64.b85decode(
+            "".join(fixture["canonical_zlib_base85"].splitlines())
+        )
+    )
+    assert len(golden) == fixture["canonical_bytes"]
+    assert sha256(golden).hexdigest() == fixture["canonical_sha256"]
+
+    current = language_schema.canonical_contract_json(
+        workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    ).encode("utf-8")
+
+    assert current == golden
+
+
+def test_phase6_semantic_rules_retain_kind_projection():
+    rules = language_schema.semantic_rule_descriptors(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+
+    assert rules
+    assert all(rule["kind"] == rule["id"] for rule in rules)
+
+
 def test_archon_contract_reserves_growth_headroom_and_section_budgets():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
@@ -438,7 +976,14 @@ def test_contract_section_bounds_accept_exact_boundaries_and_reject_overflow(sec
     boundary_section = _padded_contract_value(
         {}, language_schema.CONTRACT_SECTION_MAX_BYTES[section]
     )
-    boundary = {**contract, section: boundary_section}
+    boundary = {
+        **contract,
+        **{
+            bounded_section: {}
+            for bounded_section in language_schema.CONTRACT_SECTION_MAX_BYTES
+        },
+        section: boundary_section,
+    }
 
     language_schema._require_contract_bounds(boundary)
     with pytest.raises(ValueError, match=f"{section} exceeds"):

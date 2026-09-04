@@ -347,6 +347,54 @@ class ValidationIssue:
     source_line: int | None = None
 
 
+SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE = (
+    "scoped-reference-missing-dependency"
+)
+SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE = (
+    "scoped-reference-unknown-producer"
+)
+SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE = (
+    "scoped-reference-producer-schema-required"
+)
+SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE = (
+    "scoped-reference-structured-path-impossible"
+)
+SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE = (
+    "scoped-companion-reference-unknown-node"
+)
+LOOP_GROUP_WORK_LIMIT = 4_096
+STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES = MappingProxyType({
+    "type": "exclude-mode",
+    "properties": "exact-child",
+    "patternProperties": "nonempty-unknown",
+    "additionalProperties": "false-impossible/schema-tail/unknown",
+    "maxItems": "index>=impossible",
+    "prefixItems": "index-first",
+    "items": "schema-or-index",
+    "additionalItems": "list-overflow",
+    "allOf": "any-impossible",
+    "anyOf": "nonempty-all-impossible",
+    "oneOf": "nonempty-all-impossible",
+})
+STRUCTURED_PATH_UNION_KEYWORDS = ("anyOf", "oneOf")
+STRUCTURED_PATH_COMBINATOR_KEYWORDS = ("allOf", *STRUCTURED_PATH_UNION_KEYWORDS)
+STRUCTURED_PATH_DOTTED_TRAVERSAL_KEYWORDS = (
+    "$ref",
+    *STRUCTURED_PATH_COMBINATOR_KEYWORDS,
+    "properties",
+    "prefixItems",
+    "items",
+    "additionalItems",
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkflowSemanticValidationIssue(ValidationIssue):
+    """A validation issue with additive branch-specific semantic authority."""
+
+    semantic_code: str
+
+
 class WorkflowValidationError(ValueError):
     """Raised when a portable package cannot be normalized safely."""
 

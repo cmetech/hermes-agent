@@ -21,6 +21,49 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
 
 
+def _installed_console_path(prefix: Path) -> Path:
+    candidates = (
+        prefix / "bin" / "hermes",
+        prefix / "Scripts" / "hermes.exe",
+        prefix / "Scripts" / "hermes",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        "installed hermes console was not found under bin/ or Scripts/"
+    )
+
+
+def _venv_python_path(prefix: Path) -> Path:
+    candidates = (
+        prefix / "bin" / "python",
+        prefix / "Scripts" / "python.exe",
+        prefix / "Scripts" / "python",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        "virtual-environment Python was not found under bin/ or Scripts/"
+    )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (Path("bin/hermes"), Path("Scripts/hermes.exe")),
+    ids=("posix", "windows-native"),
+)
+def test_installed_console_resolver_supports_native_schemes(
+    tmp_path: Path, relative_path: Path
+) -> None:
+    expected = tmp_path / relative_path
+    expected.parent.mkdir(parents=True)
+    expected.write_text("installed console\n", encoding="utf-8")
+
+    assert _installed_console_path(tmp_path) == expected
+
+
 def _temporary_source_vendor(build_source: Path) -> None:
     """Stage approved connector bytes into an isolated wheel-build tree."""
     source = resolve_ericsson_connector_source(repo_root=build_source)
@@ -160,6 +203,28 @@ def installed_distribution(tmp_path_factory):
     )
     assert install.returncode == 0, f"wheel extraction failed:\n{install.stderr}"
 
+    console_root = root / "console-install"
+    console_install = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--prefix",
+            str(console_root),
+            "--no-deps",
+            str(wheels[0]),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert console_install.returncode == 0, (
+        f"wheel console install failed:\n{console_install.stderr}"
+    )
+
     env = os.environ.copy()
     env["PYTHONPATH"] = str(site)
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
@@ -260,6 +325,204 @@ def test_installed_distribution_contains_complete_sharepoint_connector(
         "workflow_present": True,
         "workflow_sidecar_present": True,
     }
+
+
+@pytest.mark.integration
+def test_installed_distribution_exposes_deterministic_workflow_schema_corpus(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, env, _wheels = installed_distribution
+    console = _installed_console_path(site.parent / "console-install")
+    command = [
+        str(console),
+        "workflow",
+        "schema-corpus",
+        "--profile",
+        "archon-2026-07",
+        "--json",
+    ]
+
+    first = subprocess.run(
+        command,
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+    second = subprocess.run(
+        command,
+        cwd=tmp_path,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert first.returncode == second.returncode == 0, first.stderr.decode("utf-8")
+    assert first.stderr == second.stderr == b""
+    assert first.stdout == second.stdout
+    assert len(first.stdout) <= 160_001
+    corpus = json.loads(first.stdout.decode("utf-8"))
+    assert corpus["format_version"] == 1
+    assert corpus["profile"] == "archon-2026-07"
+    assert corpus["normalizer_version"] == 6
+    assert corpus["contract"]["normalizer"] == (
+        "plugins.workflow.language.normalize_workflow"
+    )
+    assert corpus["contract"]["contract_digest"].startswith("sha256:")
+    assert (site / "plugins/workflow/language_conformance.py").is_file()
+
+
+@pytest.mark.integration
+def test_wheel_installed_venv_console_resolves_archon_corpus_resources(
+    tmp_path: Path,
+    installed_distribution,
+) -> None:
+    site, _masked_env, wheels = installed_distribution
+    venv = tmp_path / "wheel-installed-venv"
+    create_venv = subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert create_venv.returncode == 0, create_venv.stderr
+
+    venv_python = _venv_python_path(venv)
+    install_dependencies = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--offline",
+            "--python",
+            str(venv_python),
+            str(wheels[0]),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert install_dependencies.returncode == 0, install_dependencies.stderr
+    install = subprocess.run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--force-reinstall",
+            "--no-deps",
+            str(wheels[0]),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert install.returncode == 0, install.stderr
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
+    env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
+    outside_source = tmp_path / "outside-source"
+    outside_source.mkdir()
+    probe = subprocess.run(
+        [
+            venv_python,
+            "-c",
+            (
+                "import json, sys, sysconfig; from pathlib import Path; "
+                "import plugins.workflow.language_conformance as conformance; "
+                "print(json.dumps({'module': str(Path(conformance.__file__).resolve()), "
+                "'resource': str(conformance._JIRA_DEFINITION.resolve()), "
+                "'site_packages': sysconfig.get_paths()['purelib'], "
+                "'prefix': sys.prefix}))"
+            ),
+        ],
+        cwd=outside_source,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert probe.returncode == 0, probe.stderr
+    origins = json.loads(probe.stdout)
+    module = Path(origins["module"]).resolve()
+    resource = Path(origins["resource"]).resolve()
+    site_packages = Path(origins["site_packages"]).resolve()
+    prefix = Path(origins["prefix"]).resolve()
+    expected_resource = (
+        prefix
+        / "capabilities"
+        / "workflow-packages"
+        / "ericsson"
+        / "workflows"
+        / "jira-defect-loop.yaml"
+    )
+    assert module.is_relative_to(site_packages)
+    assert not module.is_relative_to(REPO_ROOT)
+    assert not module.is_relative_to(site.resolve())
+    assert prefix == venv.resolve()
+    assert expected_resource.is_file()
+
+    command = [
+        str(_installed_console_path(venv)),
+        "workflow",
+        "schema-corpus",
+        "--profile",
+        "archon-2026-07",
+        "--json",
+    ]
+    first = subprocess.run(
+        command,
+        cwd=outside_source,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+    second = subprocess.run(
+        command,
+        cwd=outside_source,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+    source = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "workflow",
+            "schema-corpus",
+            "--profile",
+            "archon-2026-07",
+            "--json",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert first.returncode == 0, first.stderr.decode("utf-8")
+    assert second.returncode == 0, second.stderr.decode("utf-8")
+    assert source.returncode == 0, source.stderr.decode("utf-8")
+    assert first.stderr == second.stderr == source.stderr == b""
+    assert first.stdout == second.stdout == source.stdout
+    assert resource == expected_resource
+    assert len(first.stdout) <= 160_001
+    corpus = json.loads(first.stdout.decode("utf-8"))
+    assert corpus["format_version"] == 1
+    assert corpus["profile"] == "archon-2026-07"
+    assert corpus["normalizer_version"] == 6
+    assert corpus["contract"]["normalizer"] == (
+        "plugins.workflow.language.normalize_workflow"
+    )
+    assert corpus["contract"]["contract_digest"].startswith("sha256:")
 
 
 @pytest.mark.integration
