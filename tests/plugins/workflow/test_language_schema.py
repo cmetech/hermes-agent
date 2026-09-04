@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import base64
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
 from hashlib import sha256
 import json
 from pathlib import Path
 import re
+import zlib
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -224,6 +226,162 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
         "producer_scope": "body-node",
         "prefix": "$LOOP_PREV.",
         "requires_direct_dependency": False,
+        "first_iteration": {
+            "known_whole_output": {
+                "result": "resolved",
+                "rendered_text": "",
+            },
+            "known_structured_path": {
+                "result": "error",
+                "code": "output_reference_missing",
+            },
+        },
+    }
+    assert references["unqualified_producer_resolution"] == {
+        "order": ["body-sibling", "outer-node"],
+        "collision_precedence": "body-sibling",
+    }
+    assert references["interpolation_surface_v1"] == {
+        "fields": [
+            {
+                "field_path": "nodes[].loop_group.nodes[].when",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].prompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].bash",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].script",
+                "template_source": "inline-or-authenticated-script-body",
+                "authored_value": (
+                    "reference-template-if-inline-otherwise-literal-resource-name"
+                ),
+                "value_discriminator": "script-inline-v1",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.prompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.until_bash",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.gate_message",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].loop.command",
+                "template_source": "authenticated-command-body",
+                "authored_value": "literal-resource-name",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].approval.message",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].approval.on_reject.prompt"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].command",
+                "template_source": "authenticated-command-body",
+                "authored_value": "literal-resource-name",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].systemPrompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].agents.*.description"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.nodes[].agents.*.prompt",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response.systemMessage"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response.stopReason"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response."
+                    "hookSpecificOutput.permissionDecisionReason"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": (
+                    "nodes[].loop_group.nodes[].hooks.*[].response."
+                    "hookSpecificOutput.additionalContext"
+                ),
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.until_bash",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+            {
+                "field_path": "nodes[].loop_group.gate_message",
+                "template_source": "authored-value",
+                "authored_value": "reference-template",
+            },
+        ],
+        "value_discriminators_v1": {
+            "script-inline-v1": {
+                "operation": "contains-listed-codepoint",
+                "codepoint_ranges": [
+                    [9, 13],
+                    [28, 32],
+                    [133, 133],
+                    [160, 160],
+                    [5760, 5760],
+                    [8192, 8202],
+                    [8232, 8233],
+                    [8239, 8239],
+                    [8287, 8287],
+                    [12288, 12288],
+                ],
+                "characters": ";(){}&|<>$`\"'",
+                "match": "reference-template",
+                "otherwise": "literal-resource-name",
+            }
+        },
+        "unlisted_authored_string_fields": "literal",
     }
     assert references["semantic_ref"] == {
         "node_kind": "loop_group",
@@ -268,6 +426,32 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
         "allOf": "any-impossible",
         "union": ["anyOf", "oneOf", "nonempty-all-impossible"],
         "unlisted": "ignored=unknown",
+    }
+    assert proof["evaluation_v1"] == {
+        "$ref_resolution": {
+            "schema_scope": "current-schema-only",
+            "when": "path-segments-remain",
+            "terminal_child": "not-resolved",
+        },
+        "object_lookup": {
+            "order": [
+                "properties",
+                "patternProperties",
+                "additionalProperties",
+            ],
+            "stop_after_first_applicable": True,
+            "applicability": {
+                "properties": "exact-key-match",
+                "patternProperties": "nonempty-map",
+                "additionalProperties": "fallback",
+            },
+        },
+        "terminal_child": {
+            "when": "no-path-segments-remain",
+            "false": "impossible",
+            "otherwise": "possible",
+            "$ref": "not-resolved",
+        },
     }
     assert proof["$ref"] == (
         "local-pointer(map/array,~0/~1);false|impossible=>impossible;"
@@ -456,7 +640,8 @@ def test_profiles_without_loop_groups_omit_scoped_graph_semantics(
         "scoped-output-reference-v1",
         "loop-group-work-product-v1",
     }
-    assert scoped_kinds.isdisjoint(rule["kind"] for rule in rules)
+    assert scoped_kinds.isdisjoint(rule["id"] for rule in rules)
+    assert all("kind" not in rule for rule in rules)
 
 
 @pytest.mark.parametrize(
@@ -708,6 +893,40 @@ def test_legacy_authoring_contract_preserves_supported_versions(
     }
 
 
+def test_legacy_contract_is_byte_identical_to_declared_merge_base():
+    fixture_path = (
+        Path(__file__).with_name("fixtures")
+        / "legacy-contract-c1dc7a23.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert fixture["merge_base"] == (
+        "c1dc7a23e1e987f7f64a1bee89b224af4d4adf5d"
+    )
+    golden = zlib.decompress(
+        base64.b85decode(
+            "".join(fixture["canonical_zlib_base85"].splitlines())
+        )
+    )
+    assert len(golden) == fixture["canonical_bytes"]
+    assert sha256(golden).hexdigest() == fixture["canonical_sha256"]
+
+    current = language_schema.canonical_contract_json(
+        workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    ).encode("utf-8")
+
+    assert current == golden
+
+
+def test_phase6_semantic_rules_retain_kind_projection():
+    rules = language_schema.semantic_rule_descriptors(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+
+    assert rules
+    assert all(rule["kind"] == rule["id"] for rule in rules)
+
+
 def test_archon_contract_reserves_growth_headroom_and_section_budgets():
     contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
 
@@ -757,7 +976,14 @@ def test_contract_section_bounds_accept_exact_boundaries_and_reject_overflow(sec
     boundary_section = _padded_contract_value(
         {}, language_schema.CONTRACT_SECTION_MAX_BYTES[section]
     )
-    boundary = {**contract, section: boundary_section}
+    boundary = {
+        **contract,
+        **{
+            bounded_section: {}
+            for bounded_section in language_schema.CONTRACT_SECTION_MAX_BYTES
+        },
+        section: boundary_section,
+    }
 
     language_schema._require_contract_bounds(boundary)
     with pytest.raises(ValueError, match=f"{section} exceeds"):

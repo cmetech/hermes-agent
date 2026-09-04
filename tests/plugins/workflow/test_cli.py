@@ -679,6 +679,52 @@ def test_json_load_failures_preserve_typed_workflow_issue_codes(
     assert envelope["error"]["details"]["issues"][0]["code"] == expected_code
 
 
+@pytest.mark.parametrize("max_attempts", (True, -1, 1.5))
+def test_json_validate_preserves_raw_loop_child_retry_issue_envelope(
+    workflow_writer, tmp_path, capsys, max_attempts
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="invalid-loop-child-retry",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "done",
+                    "max_iterations": 1,
+                    "nodes": [
+                        {
+                            "id": "retrying",
+                            "prompt": "Retry.",
+                            "retry": {"max_attempts": max_attempts},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "archon_retry_invalid"
+    assert envelope["error"]["details"]["issues"][0] == {
+        "blocking": True,
+        "code": "archon_retry_invalid",
+        "path": "nodes[0].retry.max_attempts",
+        "severity": "error",
+    }
+
+
 def test_json_load_failure_exposes_additive_semantic_issue_code(
     workflow_writer, tmp_path, capsys
 ):

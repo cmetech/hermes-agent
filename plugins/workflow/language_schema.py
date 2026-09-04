@@ -533,6 +533,32 @@ class WorkflowFieldSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class InterpolationValueDiscriminatorSpec:
+    """Portable authored-string discriminator consumed by runtime and clients."""
+
+    id: str
+    operation: str
+    codepoint_ranges: tuple[tuple[int, int], ...]
+    characters: str
+    match: str
+    otherwise: str
+
+
+@dataclass(frozen=True, slots=True)
+class InterpolationSurfaceSpec:
+    """One runtime-rendered string surface and its authored-value role."""
+
+    field_path: tuple[str, ...]
+    node_types: frozenset[str]
+    value_source: str
+    authored_value: str
+    lookup_path: tuple[str, ...] = ()
+    phase4_only: bool = False
+    value_discriminator: InterpolationValueDiscriminatorSpec | None = None
+    ordered_leaf_paths: tuple[tuple[str, ...], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StructuralRequirement:
     """A JSON-Schema requirement derived from loader structure."""
 
@@ -2124,6 +2150,308 @@ FIELD_INVENTORY = (
     *_SIDECAR_FIELDS,
 )
 
+
+_SCRIPT_INLINE_VALUE_DISCRIMINATOR = InterpolationValueDiscriminatorSpec(
+    id="script-inline-v1",
+    operation="contains-listed-codepoint",
+    codepoint_ranges=(
+        (9, 13),
+        (28, 32),
+        (133, 133),
+        (160, 160),
+        (5760, 5760),
+        (8192, 8202),
+        (8232, 8233),
+        (8239, 8239),
+        (8287, 8287),
+        (12288, 12288),
+    ),
+    characters=";(){}&|<>$`\"'",
+    match="reference-template",
+    otherwise="literal-resource-name",
+)
+
+
+_INTERPOLATION_SURFACE_INVENTORY = (
+    InterpolationSurfaceSpec(
+        ("when",),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("when",),
+    ),
+    InterpolationSurfaceSpec(
+        ("prompt",), frozenset({"prompt"}), "authored-value", "reference-template"
+    ),
+    InterpolationSurfaceSpec(
+        ("bash",), frozenset({"bash"}), "authored-value", "reference-template"
+    ),
+    InterpolationSurfaceSpec(
+        ("script",),
+        frozenset({"script"}),
+        "inline-or-authenticated-script-body",
+        "reference-template-if-inline-otherwise-literal-resource-name",
+        value_discriminator=_SCRIPT_INLINE_VALUE_DISCRIMINATOR,
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "prompt"),
+        frozenset({"loop"}),
+        "authored-value",
+        "reference-template",
+        ("prompt",),
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "until_bash"),
+        frozenset({"loop"}),
+        "authored-value",
+        "reference-template",
+        ("until_bash",),
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "gate_message"),
+        frozenset({"loop"}),
+        "authored-value",
+        "reference-template",
+        ("gate_message",),
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "command"),
+        frozenset({"loop"}),
+        "authenticated-command-body",
+        "literal-resource-name",
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("approval", "message"),
+        frozenset({"approval"}),
+        "authored-value",
+        "reference-template",
+        ("message",),
+    ),
+    InterpolationSurfaceSpec(
+        ("approval", "on_reject", "prompt"),
+        frozenset({"approval"}),
+        "authored-value",
+        "reference-template",
+        ("on_reject", "prompt"),
+    ),
+    InterpolationSurfaceSpec(
+        ("command",),
+        frozenset({"command"}),
+        "authenticated-command-body",
+        "literal-resource-name",
+    ),
+    InterpolationSurfaceSpec(
+        ("loop_group", "until_bash"),
+        frozenset({"loop_group"}),
+        "authored-value",
+        "reference-template",
+        ("until_bash",),
+    ),
+    InterpolationSurfaceSpec(
+        ("loop_group", "gate_message"),
+        frozenset({"loop_group"}),
+        "authored-value",
+        "reference-template",
+        ("gate_message",),
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("systemPrompt",),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("systemPrompt",),
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("agents", "*"),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("agents", "*"),
+        phase4_only=True,
+        ordered_leaf_paths=(("description",), ("prompt",)),
+    ),
+    InterpolationSurfaceSpec(
+        ("hooks", "*", "[]", "response"),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("hooks", "*", "[]", "response"),
+        phase4_only=True,
+        ordered_leaf_paths=(
+            ("systemMessage",),
+            ("stopReason",),
+            ("hookSpecificOutput", "permissionDecisionReason"),
+            ("hookSpecificOutput", "additionalContext"),
+        ),
+    ),
+)
+
+
+def _interpolation_path_text(path: tuple[str | int, ...]) -> str:
+    rendered = ""
+    for part in path:
+        if part == "[]":
+            rendered += "[]"
+        elif isinstance(part, int):
+            rendered += f"[{part}]"
+        else:
+            rendered += ("." if rendered else "") + part
+    return rendered
+
+
+def _interpolation_values(
+    value: object,
+    path: tuple[str, ...],
+    concrete: tuple[str | int, ...] = (),
+) -> Iterator[tuple[tuple[str | int, ...], object]]:
+    if not path:
+        yield concrete, value
+        return
+    field, *remaining = path
+    tail = tuple(remaining)
+    if field == "*":
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                yield from _interpolation_values(item, tail, (*concrete, str(key)))
+        return
+    if field == "[]":
+        if isinstance(value, tuple | list):
+            for index, item in enumerate(value):
+                yield from _interpolation_values(item, tail, (*concrete, index))
+        return
+    if isinstance(value, Mapping) and field in value:
+        yield from _interpolation_values(value[field], tail, (*concrete, field))
+
+
+def _interpolation_strings(
+    value: object,
+    path: tuple[str, ...],
+    concrete: tuple[str | int, ...] = (),
+) -> Iterator[tuple[tuple[str | int, ...], str]]:
+    for resolved_path, resolved_value in _interpolation_values(
+        value, path, concrete
+    ):
+        if isinstance(resolved_value, str):
+            yield resolved_path, resolved_value
+
+
+def script_value_is_inline(value: str) -> bool:
+    """Match the portable inline-vs-named script rule."""
+    discriminator = _SCRIPT_INLINE_VALUE_DISCRIMINATOR
+    return any(
+        character in discriminator.characters
+        or any(
+            lower <= ord(character) <= upper
+            for lower, upper in discriminator.codepoint_ranges
+        )
+        for character in value
+    )
+
+
+def iter_interpolation_surface_templates(
+    node_type: str,
+    value: object,
+    options: Mapping[str, object],
+    *,
+    node_id: str,
+    command_bodies: Mapping[str, str] | None,
+    named_script_bodies: Mapping[str, str] | None = None,
+    include_phase4_templates: bool = False,
+) -> Iterator[tuple[str, str]]:
+    """Yield runtime templates from the declarative interpolation authority."""
+    for surface in _INTERPOLATION_SURFACE_INVENTORY:
+        if node_type not in surface.node_types or (
+            surface.phase4_only and not include_phase4_templates
+        ):
+            continue
+        if surface.value_source == "authenticated-command-body":
+            template = (
+                command_bodies.get(node_id) if command_bodies is not None else None
+            )
+            if isinstance(template, str):
+                yield _interpolation_path_text(surface.field_path), template
+            continue
+        if surface.value_source == "inline-or-authenticated-script-body":
+            if isinstance(value, str) and script_value_is_inline(value):
+                yield _interpolation_path_text(surface.field_path), value
+            elif include_phase4_templates and named_script_bodies is not None:
+                template = named_script_bodies.get(node_id)
+                if isinstance(template, str):
+                    yield _interpolation_path_text(surface.field_path), template
+            continue
+        root = (
+            options
+            if surface.field_path == ("when",)
+            or surface.field_path[0] in {"systemPrompt", "agents", "hooks"}
+            else value
+        )
+        prefix_length = len(surface.field_path) - len(surface.lookup_path)
+        prefix = surface.field_path[:prefix_length]
+        if surface.ordered_leaf_paths:
+            for concrete, container in _interpolation_values(
+                root, surface.lookup_path, prefix
+            ):
+                for leaf_path in surface.ordered_leaf_paths:
+                    yield from (
+                        (_interpolation_path_text(path), template)
+                        for path, template in _interpolation_strings(
+                            container, leaf_path, concrete
+                        )
+                    )
+            continue
+        for concrete, template in _interpolation_strings(root, surface.lookup_path):
+            yield _interpolation_path_text(
+                (*surface.field_path[:prefix_length], *concrete)
+            ), template
+
+
+def phase6_interpolation_surface() -> dict[str, object]:
+    """Project exact Phase 6 interpolation paths and literal-value boundaries."""
+    fields: list[dict[str, object]] = []
+    discriminators: dict[str, dict[str, object]] = {}
+    surfaces = sorted(
+        _INTERPOLATION_SURFACE_INVENTORY,
+        key=lambda surface: surface.field_path[0] == "loop_group",
+    )
+    for surface in surfaces:
+        if surface.field_path[0] == "loop_group":
+            prefix = "nodes[]"
+        elif surface.node_types & frozenset(NODE_TYPES):
+            prefix = "nodes[].loop_group.nodes[]"
+        else:
+            continue
+        for leaf_path in surface.ordered_leaf_paths or ((),):
+            field: dict[str, object] = {
+                "field_path": (
+                    f"{prefix}."
+                    f"{_interpolation_path_text((*surface.field_path, *leaf_path))}"
+                ),
+                "template_source": surface.value_source,
+                "authored_value": surface.authored_value,
+            }
+            if surface.value_discriminator is not None:
+                discriminator = surface.value_discriminator
+                field["value_discriminator"] = discriminator.id
+                discriminators[discriminator.id] = {
+                    "operation": discriminator.operation,
+                    "codepoint_ranges": [
+                        list(bounds) for bounds in discriminator.codepoint_ranges
+                    ],
+                    "characters": discriminator.characters,
+                    "match": discriminator.match,
+                    "otherwise": discriminator.otherwise,
+                }
+            fields.append(field)
+    return {
+        "fields": fields,
+        "value_discriminators_v1": discriminators,
+        "unlisted_authored_string_fields": "literal",
+    }
+
 STRUCTURAL_REQUIREMENTS = (
     StructuralRequirement(
         scope="loop",
@@ -3266,6 +3594,32 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
                         ],
                         "unlisted": "ignored=unknown",
                     },
+                    "evaluation_v1": {
+                        "$ref_resolution": {
+                            "schema_scope": "current-schema-only",
+                            "when": "path-segments-remain",
+                            "terminal_child": "not-resolved",
+                        },
+                        "object_lookup": {
+                            "order": [
+                                "properties",
+                                "patternProperties",
+                                "additionalProperties",
+                            ],
+                            "stop_after_first_applicable": True,
+                            "applicability": {
+                                "properties": "exact-key-match",
+                                "patternProperties": "nonempty-map",
+                                "additionalProperties": "fallback",
+                            },
+                        },
+                        "terminal_child": {
+                            "when": "no-path-segments-remain",
+                            "false": "impossible",
+                            "otherwise": "possible",
+                            "$ref": "not-resolved",
+                        },
+                    },
                     "$ref": (
                         "local-pointer(map/array,~0/~1);"
                         "false|impossible=>impossible;"
@@ -3516,7 +3870,22 @@ def _phase6_scoped_semantic_descriptors(
                 "producer_scope": "body-node",
                 "prefix": "$LOOP_PREV.",
                 "requires_direct_dependency": False,
+                "first_iteration": {
+                    "known_whole_output": {
+                        "result": "resolved",
+                        "rendered_text": "",
+                    },
+                    "known_structured_path": {
+                        "result": "error",
+                        "code": "output_reference_missing",
+                    },
+                },
             },
+            "unqualified_producer_resolution": {
+                "order": ["body-sibling", "outer-node"],
+                "collision_precedence": "body-sibling",
+            },
+            "interpolation_surface_v1": phase6_interpolation_surface(),
             "semantic_ref": {
                 "node_kind": "loop_group",
                 "definition": "scoped-output-reference-v1",
@@ -3745,7 +4114,9 @@ def semantic_rule_descriptors(
             else []
         ),
     ]
-    return [{**rule, "kind": rule["id"]} for rule in rules]
+    if phase6:
+        return [{**rule, "kind": rule["id"]} for rule in rules]
+    return rules
 
 
 def contract_documentation(

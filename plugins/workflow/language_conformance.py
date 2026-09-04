@@ -918,6 +918,168 @@ def _archon_loop_group_cases(
         ),
         _case(
             profile,
+            "loop-group-body-outer-collision-body-field-valid",
+            _group_definition(
+                "loop-group-body-outer-collision-body-field-valid",
+                """        - id: producer
+          prompt: Produce body value.
+          output_format:
+            type: object
+            properties:
+              body_only: {type: string}
+            additionalProperties: false
+        - id: consumer
+          depends_on: [producer]
+          prompt: Use $producer.output.body_only""",
+                outer_nodes="""  - id: producer
+    prompt: Produce outer value.
+    output_format:
+      type: object
+      properties:
+        outer_only: {type: string}
+      additionalProperties: false""",
+                group_options="    depends_on: [producer]",
+            ),
+            features=(
+                "reference:current-body",
+                "reference:outer",
+                "reference:producer-collision",
+                "reference:structured-path",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-body-outer-collision-outer-field-impossible",
+            _group_definition(
+                "loop-group-body-outer-collision-outer-field-impossible",
+                """        - id: producer
+          prompt: Produce body value.
+          output_format:
+            type: object
+            properties:
+              body_only: {type: string}
+            additionalProperties: false
+        - id: consumer
+          depends_on: [producer]
+          prompt: Use $producer.output.outer_only""",
+                outer_nodes="""  - id: producer
+    prompt: Produce outer value.
+    output_format:
+      type: object
+      properties:
+        outer_only: {type: string}
+      additionalProperties: false""",
+                group_options="    depends_on: [producer]",
+            ),
+            diagnostics=issue(
+                "loop_group_scope_invalid",
+                "nodes[1].loop_group.nodes[1].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                ),
+            ),
+            features=(
+                "invalid:structured-path-impossible",
+                "reference:current-body",
+                "reference:outer",
+                "reference:producer-collision",
+                "reference:structured-path",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-first-iteration-previous-output",
+            _group_definition(
+                "loop-group-first-iteration-previous-output",
+                """        - id: producer
+          prompt: Use $LOOP_PREV.producer.output and $LOOP_PREV.producer.output.status
+          output_format:
+            type: object
+            properties:
+              status: {type: string}
+            additionalProperties: false""",
+            ),
+            features=(
+                "reference:loop-prev",
+                "reference:structured-path",
+            ),
+            projection={
+                "first_iteration": {
+                    "known_whole_output": {
+                        "result": "resolved",
+                        "rendered_text": "",
+                    },
+                    "known_structured_path": {
+                        "result": "error",
+                        "code": "output_reference_missing",
+                    },
+                }
+            },
+        ),
+        _case(
+            profile,
+            "loop-group-pattern-fallback-conservative",
+            _group_definition(
+                "loop-group-pattern-fallback-conservative",
+                """        - id: producer
+          prompt: Produce.
+          output_format:
+            type: object
+            properties:
+              known: {type: string}
+            patternProperties:
+              ^zzz: {type: string}
+            additionalProperties: false
+        - id: consumer
+          depends_on: [producer]
+          prompt: Use $producer.output.unmatched""",
+            ),
+            features=(
+                "reference:current-body",
+                "reference:structured-path",
+                "schema-proof:pattern-fallback-conservative",
+            ),
+            projection={
+                "public_contract_proof": {
+                    "producer_id": "producer",
+                    "path": ["unmatched"],
+                    "outcome": "unknown",
+                }
+            },
+        ),
+        _case(
+            profile,
+            "loop-group-terminal-ref-false-conservative",
+            _group_definition(
+                "loop-group-terminal-ref-false-conservative",
+                """        - id: producer
+          prompt: Produce.
+          output_format:
+            $defs:
+              a/b: false
+            type: object
+            properties:
+              value: {$ref: '#/$defs/a~1b'}
+            additionalProperties: false
+        - id: consumer
+          depends_on: [producer]
+          prompt: Use $producer.output.value""",
+            ),
+            features=(
+                "reference:current-body",
+                "reference:structured-path",
+                "schema-proof:terminal-ref-conservative",
+            ),
+            projection={
+                "public_contract_proof": {
+                    "producer_id": "producer",
+                    "path": ["value"],
+                    "outcome": "possible",
+                }
+            },
+        ),
+        _case(
+            profile,
             "loop-group-first-terminal-primary",
             _group_definition(
                 "loop-group-primary-sink",

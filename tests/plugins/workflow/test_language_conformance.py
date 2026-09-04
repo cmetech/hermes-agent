@@ -17,6 +17,8 @@ from plugins.workflow.models import (
     WorkflowNode,
     WorkflowValidationError,
 )
+from plugins.workflow.output_resolution import WorkflowOutputReferenceError
+from plugins.workflow.resources import VariableContext
 from plugins.workflow.schema import (
     _compile_workflow_source_document,
     parse_workflow_source_bytes,
@@ -181,6 +183,15 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
     assert cases["loop-group-promoted-schema-unsupported-conservative"][
         "valid"
     ] is True
+    assert cases["loop-group-body-outer-collision-body-field-valid"][
+        "valid"
+    ] is True
+    assert cases["loop-group-body-outer-collision-outer-field-impossible"][
+        "codes"
+    ] == ["scoped-reference-structured-path-impossible"]
+    assert cases["loop-group-first-iteration-previous-output"]["valid"] is True
+    assert cases["loop-group-pattern-fallback-conservative"]["valid"] is True
+    assert cases["loop-group-terminal-ref-false-conservative"]["valid"] is True
     assert {
         "loop-group-all-body-kinds-valid",
         "loop-group-empty-body",
@@ -209,6 +220,11 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-promoted-schema-body-impossible",
         "loop-group-promoted-schema-gate-impossible",
         "loop-group-promoted-schema-unsupported-conservative",
+        "loop-group-body-outer-collision-body-field-valid",
+        "loop-group-body-outer-collision-outer-field-impossible",
+        "loop-group-first-iteration-previous-output",
+        "loop-group-pattern-fallback-conservative",
+        "loop-group-terminal-ref-false-conservative",
         "loop-group-first-terminal-primary",
         "loop-group-companion-child-reference-valid",
         "loop-group-companion-child-reference-unknown",
@@ -217,6 +233,172 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-unknown-field-preserved",
         "jira-defect-loop-distributed",
     } <= set(cases)
+
+
+def test_first_iteration_previous_output_case_matches_runtime_resolution():
+    case = _cases(WorkflowLanguageProfile.ARCHON_2026_07)[
+        "loop-group-first-iteration-previous-output"
+    ]
+    expected = _mapping(_mapping(case["projection"])["first_iteration"])
+    variables = VariableContext(
+        previous_body_outputs={"producer": None},
+        normalizer_version=6,
+    )
+
+    whole = variables.previous_output_reference("producer")
+    assert {
+        "result": "resolved",
+        "rendered_text": whole.rendered_text,
+    } == expected["known_whole_output"]
+    with pytest.raises(WorkflowOutputReferenceError) as exc_info:
+        variables.previous_output_reference("producer", ("status",))
+    assert {
+        "result": "error",
+        "code": exc_info.value.code,
+    } == expected["known_structured_path"]
+
+
+def _public_contract_path_outcome(
+    policy: Mapping[str, object], schema: object, path: tuple[str, ...]
+) -> str:
+    evaluation = _mapping(policy["evaluation_v1"])
+    ref_policy = _mapping(evaluation["$ref_resolution"])
+    lookup = _mapping(evaluation["object_lookup"])
+    terminal = _mapping(evaluation["terminal_child"])
+    strategies = _mapping(policy["strategies"])
+    assert ref_policy == {
+        "schema_scope": "current-schema-only",
+        "when": "path-segments-remain",
+        "terminal_child": "not-resolved",
+    }
+    assert lookup["stop_after_first_applicable"] is True
+    assert terminal["when"] == "no-path-segments-remain"
+    assert terminal["$ref"] == "not-resolved"
+
+    def resolve_local(root: object, reference: object) -> object:
+        if not isinstance(reference, str) or not reference.startswith("#/"):
+            return None
+        current = root
+        for encoded in reference[2:].split("/"):
+            segment = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(current, Mapping) and segment in current:
+                current = current[segment]
+            else:
+                return None
+        return current
+
+    def terminal_outcome(child: object) -> str:
+        return _text(terminal["false"] if child is False else terminal["otherwise"])
+
+    def visit(
+        current: object,
+        remaining: tuple[str, ...],
+        root: object,
+        resolving: frozenset[str],
+    ) -> str:
+        if current is False:
+            return "impossible"
+        if current is True or not isinstance(current, Mapping):
+            return "unknown"
+        reference = current.get("$ref")
+        if isinstance(reference, str) and reference not in resolving:
+            target = resolve_local(root, reference)
+            if target is False:
+                return "impossible"
+            if target is not None:
+                outcome = visit(
+                    target,
+                    remaining,
+                    root,
+                    resolving | frozenset({reference}),
+                )
+                if outcome == "impossible":
+                    return outcome
+
+        segment, *tail = remaining
+        applicability = _mapping(lookup["applicability"])
+        for keyword in _string_list(lookup["order"]):
+            if keyword == "properties":
+                assert applicability[keyword] == "exact-key-match"
+                properties = current.get(keyword)
+                if not isinstance(properties, Mapping) or segment not in properties:
+                    continue
+                child = properties[segment]
+                return (
+                    visit(child, tuple(tail), root, resolving)
+                    if tail
+                    else terminal_outcome(child)
+                )
+            if keyword == "patternProperties":
+                assert applicability[keyword] == "nonempty-map"
+                patterns = current.get(keyword)
+                if isinstance(patterns, Mapping) and patterns:
+                    assert strategies[keyword] == "nonempty-unknown"
+                    return "unknown"
+                continue
+            assert keyword == "additionalProperties"
+            assert applicability[keyword] == "fallback"
+            additional = current.get(keyword, True)
+            if additional is False:
+                return "impossible"
+            if tail and isinstance(additional, Mapping):
+                return visit(additional, tuple(tail), root, resolving)
+            return "unknown"
+        raise AssertionError("published object lookup has no terminal fallback")
+
+    assert path
+    return visit(schema, path, schema, frozenset())
+
+
+def test_public_contract_interpreter_accepts_ambiguous_schema_corpus_cases():
+    cases = _cases(WorkflowLanguageProfile.ARCHON_2026_07)
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    rule = next(
+        item
+        for item in _mapping_list(contract["semantic_rules"])
+        if item["id"] == "scoped-output-reference-v1"
+    )
+    semantic_ref = _mapping(rule["semantic_ref"])
+    kind = next(
+        item
+        for item in _mapping_list(contract["node_kinds"])
+        if item["id"] == semantic_ref["node_kind"]
+    )
+    definitions = _mapping(kind["semantic_definitions"])
+    definition = _mapping(definitions[_text(semantic_ref["definition"])])
+    constraint = _mapping(definition["structured_path_constraint_v1"])
+    policy = _mapping(constraint["conservative_tristate_v1"])
+
+    for case_id in (
+        "loop-group-pattern-fallback-conservative",
+        "loop-group-terminal-ref-false-conservative",
+    ):
+        case = cases[case_id]
+        authored = _mapping(yaml.safe_load(_text(case["definition_yaml"])))
+        proof = _mapping(_mapping(case["projection"])["public_contract_proof"])
+        authored_nodes = _mapping_list(authored["nodes"])
+        nested_nodes = [
+            child
+            for node in authored_nodes
+            if isinstance(node.get("loop_group"), Mapping)
+            for child in _mapping_list(
+                _mapping(node["loop_group"])["nodes"]
+            )
+        ]
+        producer = next(
+            node
+            for node in [*authored_nodes, *nested_nodes]
+            if node["id"] == proof["producer_id"]
+        )
+        outcome = _public_contract_path_outcome(
+            policy,
+            producer["output_format"],
+            tuple(_string_list(proof["path"])),
+        )
+
+        assert case["valid"] is True
+        assert outcome == proof["outcome"]
+        assert outcome in _string_list(policy["accept"])
 
 
 def test_archon_work_one_over_uses_exact_4097_authority_value():

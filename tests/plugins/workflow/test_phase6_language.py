@@ -20,10 +20,12 @@ from plugins.workflow.language_schema import workflow_authoring_contract
 from plugins.workflow.models import (
     LoopGroupChildScope,
     WorkflowLanguageProfile,
+    WorkflowNode,
     WorkflowValidationError,
 )
 from plugins.workflow.schema import (
     _compile_workflow_source_document,
+    _interpolated_node_templates,
     load_workflow,
     load_workflow_snapshot,
     parse_workflow_source_bytes,
@@ -66,6 +68,17 @@ def _normalize_v6_without_admission(path):
         path,
         workflow_bytes=path.read_bytes(),
         sidecar_bytes=sidecar,
+        source="project",
+        precedence=1,
+    )
+    return _compile_workflow_source_document(source, normalizer_version=6)
+
+
+def _normalize_v6_with_sidecar(path, sidecar: str):
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.encode("utf-8"),
         source="project",
         precedence=1,
     )
@@ -196,6 +209,601 @@ def _structured_path_constraint():
     return cast(
         dict[str, object],
         definitions[reference["definition"]]["structured_path_constraint_v1"],
+    )
+
+
+def _scoped_reference_rule():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    return next(
+        item
+        for item in cast(list[dict[str, object]], contract["semantic_rules"])
+        if item["id"] == "scoped-output-reference-v1"
+    )
+
+
+def _published_interpolation_path(path: str, node_type: str) -> str:
+    prefix = "nodes[]" if node_type == "loop_group" else "nodes[].loop_group.nodes[]"
+    path = path.replace("nodes[0]", prefix)
+    path = path.replace(".agents.reviewer.", ".agents.*.")
+    return path.replace(".hooks.PreToolUse[0].", ".hooks.*[].")
+
+
+def _classify_script_value_from_public_contract(value: str) -> str:
+    surface = cast(
+        dict[str, object], _scoped_reference_rule()["interpolation_surface_v1"]
+    )
+    fields = cast(list[dict[str, object]], surface["fields"])
+    script = next(
+        field
+        for field in fields
+        if field["field_path"] == "nodes[].loop_group.nodes[].script"
+    )
+    discriminators = cast(
+        dict[str, dict[str, object]], surface["value_discriminators_v1"]
+    )
+    discriminator = discriminators[cast(str, script["value_discriminator"])]
+    assert discriminator["operation"] == "contains-listed-codepoint"
+    ranges = cast(list[list[int]], discriminator["codepoint_ranges"])
+    characters = cast(str, discriminator["characters"])
+    matches = any(
+        character in characters
+        or any(lower <= ord(character) <= upper for lower, upper in ranges)
+        for character in value
+    )
+    return cast(str, discriminator["match" if matches else "otherwise"])
+
+
+def _script_discriminator_examples():
+    whitespace = (
+        "\t\n\v\f\r\x1c\x1d\x1e\x1f "
+        "\x85\xa0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000"
+    )
+    metacharacters = ";(){}&|<>$`\"'"
+    literal_boundary_characters = (
+        "\x08\x0e\x1b!\x84\x86\x9f\xa1\u167f\u1681"
+        "\u1fff\u200b\u2027\u202a\u202e\u2030\u205e\u2060\u2fff\u3001"
+    )
+    return (
+        [*whitespace, *metacharacters],
+        ["", "named-script", *literal_boundary_characters],
+    )
+
+
+def test_v6_public_contract_alone_classifies_exact_script_values():
+    inline_values, literal_values = _script_discriminator_examples()
+
+    assert all(
+        _classify_script_value_from_public_contract(value)
+        == "reference-template"
+        for value in inline_values
+    )
+    assert all(
+        _classify_script_value_from_public_contract(value)
+        == "literal-resource-name"
+        for value in literal_values
+    )
+
+
+def test_v6_public_script_discriminator_matches_runtime_enumeration():
+    inline_values, literal_values = _script_discriminator_examples()
+    for value in (*inline_values, *literal_values):
+        node = WorkflowNode("script", "script", value, (), 0, None, {})
+        observed = list(
+            _interpolated_node_templates(
+                node,
+                command_bodies={},
+                include_phase4_templates=False,
+            )
+        )
+        assert bool(observed) is (
+            _classify_script_value_from_public_contract(value)
+            == "reference-template"
+        )
+
+
+@pytest.mark.parametrize(
+    ("include_phase4_templates", "expected_paths"),
+    [
+        (
+            False,
+            [
+                "nodes[7].when",
+                "nodes[7].loop.prompt",
+                "nodes[7].loop.until_bash",
+            ],
+        ),
+        (
+            True,
+            [
+                "nodes[7].when",
+                "nodes[7].loop.prompt",
+                "nodes[7].loop.until_bash",
+                "nodes[7].loop.gate_message",
+                "nodes[7].loop.command",
+            ],
+        ),
+    ],
+)
+def test_loop_interpolation_enumeration_preserves_starting_head_order(
+    include_phase4_templates, expected_paths
+):
+    node = WorkflowNode(
+        "repeat",
+        "loop",
+        {
+            "prompt": "prompt $source",
+            "until_bash": "test $source",
+            "gate_message": "continue $source",
+            "command": "repeat-command",
+        },
+        (),
+        7,
+        None,
+        {"when": "$source.output == 'ready'"},
+    )
+
+    observed = list(
+        _interpolated_node_templates(
+            node,
+            command_bodies={"repeat": "command $source"},
+            include_phase4_templates=include_phase4_templates,
+        )
+    )
+
+    assert [path for path, _template in observed] == expected_paths
+
+
+def test_phase4_agent_and_hook_interpolation_preserves_container_major_order():
+    node = WorkflowNode(
+        "subject",
+        "command",
+        "subject-command",
+        (),
+        4,
+        None,
+        {
+            "when": "$source.output == 'ready'",
+            "systemPrompt": "system",
+            "agents": {
+                "first": {
+                    "description": "first-description",
+                    "prompt": "first-prompt",
+                },
+                "second": {
+                    "description": "second-description",
+                    "prompt": "second-prompt",
+                },
+            },
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "response": {
+                            "systemMessage": "pre-zero-system",
+                            "stopReason": "pre-zero-stop",
+                            "hookSpecificOutput": {
+                                "permissionDecisionReason": "pre-zero-reason",
+                                "additionalContext": "pre-zero-context",
+                            },
+                        }
+                    },
+                    {
+                        "response": {
+                            "systemMessage": "pre-one-system",
+                            "stopReason": "pre-one-stop",
+                            "hookSpecificOutput": {
+                                "permissionDecisionReason": "pre-one-reason",
+                                "additionalContext": "pre-one-context",
+                            },
+                        }
+                    },
+                ],
+                "PostToolUse": [
+                    {
+                        "response": {
+                            "systemMessage": "post-zero-system",
+                            "stopReason": "post-zero-stop",
+                            "hookSpecificOutput": {
+                                "permissionDecisionReason": "post-zero-reason",
+                                "additionalContext": "post-zero-context",
+                            },
+                        }
+                    }
+                ],
+            },
+        },
+    )
+
+    observed = list(
+        _interpolated_node_templates(
+            node,
+            command_bodies={"subject": "authenticated-command"},
+            include_phase4_templates=True,
+        )
+    )
+
+    assert observed == [
+        ("nodes[4].when", "$source.output == 'ready'"),
+        ("nodes[4].command", "authenticated-command"),
+        ("nodes[4].systemPrompt", "system"),
+        ("nodes[4].agents.first.description", "first-description"),
+        ("nodes[4].agents.first.prompt", "first-prompt"),
+        ("nodes[4].agents.second.description", "second-description"),
+        ("nodes[4].agents.second.prompt", "second-prompt"),
+        (
+            "nodes[4].hooks.PreToolUse[0].response.systemMessage",
+            "pre-zero-system",
+        ),
+        ("nodes[4].hooks.PreToolUse[0].response.stopReason", "pre-zero-stop"),
+        (
+            "nodes[4].hooks.PreToolUse[0].response."
+            "hookSpecificOutput.permissionDecisionReason",
+            "pre-zero-reason",
+        ),
+        (
+            "nodes[4].hooks.PreToolUse[0].response."
+            "hookSpecificOutput.additionalContext",
+            "pre-zero-context",
+        ),
+        (
+            "nodes[4].hooks.PreToolUse[1].response.systemMessage",
+            "pre-one-system",
+        ),
+        ("nodes[4].hooks.PreToolUse[1].response.stopReason", "pre-one-stop"),
+        (
+            "nodes[4].hooks.PreToolUse[1].response."
+            "hookSpecificOutput.permissionDecisionReason",
+            "pre-one-reason",
+        ),
+        (
+            "nodes[4].hooks.PreToolUse[1].response."
+            "hookSpecificOutput.additionalContext",
+            "pre-one-context",
+        ),
+        (
+            "nodes[4].hooks.PostToolUse[0].response.systemMessage",
+            "post-zero-system",
+        ),
+        ("nodes[4].hooks.PostToolUse[0].response.stopReason", "post-zero-stop"),
+        (
+            "nodes[4].hooks.PostToolUse[0].response."
+            "hookSpecificOutput.permissionDecisionReason",
+            "post-zero-reason",
+        ),
+        (
+            "nodes[4].hooks.PostToolUse[0].response."
+            "hookSpecificOutput.additionalContext",
+            "post-zero-context",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("include_phase4_templates", (False, True))
+@pytest.mark.parametrize(
+    ("node_type", "value", "phase2_paths", "phase4_paths"),
+    [
+        (
+            "command",
+            "subject-command",
+            ("nodes[4].when", "nodes[4].command"),
+            ("nodes[4].when", "nodes[4].command"),
+        ),
+        (
+            "prompt",
+            "prompt",
+            ("nodes[4].when", "nodes[4].prompt"),
+            ("nodes[4].when", "nodes[4].prompt"),
+        ),
+        (
+            "bash",
+            "printf ok",
+            ("nodes[4].when", "nodes[4].bash"),
+            ("nodes[4].when", "nodes[4].bash"),
+        ),
+        (
+            "script",
+            "print('$source')",
+            ("nodes[4].when", "nodes[4].script"),
+            ("nodes[4].when", "nodes[4].script"),
+        ),
+        (
+            "loop",
+            {
+                "prompt": "prompt",
+                "until_bash": "test done",
+                "gate_message": "continue",
+                "command": "subject-command",
+            },
+            (
+                "nodes[4].when",
+                "nodes[4].loop.prompt",
+                "nodes[4].loop.until_bash",
+            ),
+            (
+                "nodes[4].when",
+                "nodes[4].loop.prompt",
+                "nodes[4].loop.until_bash",
+                "nodes[4].loop.gate_message",
+                "nodes[4].loop.command",
+            ),
+        ),
+        (
+            "approval",
+            {"message": "review", "on_reject": {"prompt": "revise"}},
+            (
+                "nodes[4].when",
+                "nodes[4].approval.message",
+                "nodes[4].approval.on_reject.prompt",
+            ),
+            (
+                "nodes[4].when",
+                "nodes[4].approval.message",
+                "nodes[4].approval.on_reject.prompt",
+            ),
+        ),
+        (
+            "cancel",
+            "stop",
+            ("nodes[4].when",),
+            ("nodes[4].when",),
+        ),
+        (
+            "loop_group",
+            {"until_bash": "test done", "gate_message": "continue", "nodes": ()},
+            ("nodes[4].when", "nodes[4].loop_group.until_bash"),
+            (
+                "nodes[4].when",
+                "nodes[4].loop_group.until_bash",
+                "nodes[4].loop_group.gate_message",
+            ),
+        ),
+    ],
+)
+def test_interpolation_order_matches_starting_head_for_every_node_type(
+    node_type,
+    value,
+    phase2_paths,
+    phase4_paths,
+    include_phase4_templates,
+):
+    options = {
+        "when": "$source.output == 'ready'",
+        "systemPrompt": "system",
+        "agents": {
+            "only": {"description": "description", "prompt": "prompt"}
+        },
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "response": {
+                        "systemMessage": "hook-system",
+                        "stopReason": "hook-stop",
+                        "hookSpecificOutput": {
+                            "permissionDecisionReason": "hook-reason",
+                            "additionalContext": "hook-context",
+                        },
+                    }
+                }
+            ]
+        },
+    }
+    node = WorkflowNode("subject", node_type, value, (), 4, None, options)
+
+    observed = list(
+        _interpolated_node_templates(
+            node,
+            command_bodies={"subject": "authenticated-command"},
+            named_script_bodies={"subject": "authenticated-script"},
+            include_phase4_templates=include_phase4_templates,
+        )
+    )
+
+    expected_paths = phase2_paths
+    if include_phase4_templates:
+        expected_paths = (
+            *phase4_paths,
+            "nodes[4].systemPrompt",
+            "nodes[4].agents.only.description",
+            "nodes[4].agents.only.prompt",
+            "nodes[4].hooks.PreToolUse[0].response.systemMessage",
+            "nodes[4].hooks.PreToolUse[0].response.stopReason",
+            "nodes[4].hooks.PreToolUse[0].response."
+            "hookSpecificOutput.permissionDecisionReason",
+            "nodes[4].hooks.PreToolUse[0].response."
+            "hookSpecificOutput.additionalContext",
+        )
+    assert tuple(path for path, _template in observed) == expected_paths
+
+
+def test_v6_runtime_interpolation_enumeration_matches_published_surface():
+    reference = "$producer.output"
+    prompt_options = {
+        "when": f"{reference} == 'ready'",
+        "systemPrompt": reference,
+        "model": reference,
+        "agents": {
+            "reviewer": {
+                "description": reference,
+                "prompt": reference,
+                "model": reference,
+            }
+        },
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "response": {
+                        "systemMessage": reference,
+                        "stopReason": reference,
+                        "hookSpecificOutput": {
+                            "permissionDecisionReason": reference,
+                            "additionalContext": reference,
+                        },
+                    }
+                }
+            ]
+        },
+    }
+    nodes = [
+        WorkflowNode("prompt", "prompt", reference, (), 0, None, prompt_options),
+        WorkflowNode("bash", "bash", reference, (), 0, None, {}),
+        WorkflowNode("inline", "script", f"print('{reference}')", (), 0, None, {}),
+        WorkflowNode("named", "script", "named-script", (), 0, None, {}),
+        WorkflowNode(
+            "loop-prompt",
+            "loop",
+            {
+                "prompt": reference,
+                "until_bash": reference,
+                "gate_message": reference,
+            },
+            (),
+            0,
+            None,
+            {},
+        ),
+        WorkflowNode(
+            "loop-command",
+            "loop",
+            {"command": "loop-command", "until_bash": reference},
+            (),
+            0,
+            None,
+            {},
+        ),
+        WorkflowNode(
+            "approval",
+            "approval",
+            {"message": reference, "on_reject": {"prompt": reference}},
+            (),
+            0,
+            None,
+            {},
+        ),
+        WorkflowNode("command", "command", "command", (), 0, None, {}),
+        WorkflowNode(
+            "group",
+            "loop_group",
+            {
+                "until_bash": reference,
+                "gate_message": reference,
+                "nodes": (),
+            },
+            (),
+            0,
+            None,
+            {},
+        ),
+    ]
+    command_bodies = {
+        "command": reference,
+        "loop-command": reference,
+    }
+    named_script_bodies = {"named": reference}
+    observed = {
+        _published_interpolation_path(path, node.node_type)
+        for node in nodes
+        for path, template in _interpolated_node_templates(
+            node,
+            command_bodies=command_bodies,
+            named_script_bodies=named_script_bodies,
+            include_phase4_templates=True,
+        )
+        if reference in template
+    }
+    surface = cast(
+        dict[str, object], _scoped_reference_rule()["interpolation_surface_v1"]
+    )
+    fields = cast(list[dict[str, str]], surface["fields"])
+
+    assert observed == {field["field_path"] for field in fields}
+    assert surface["unlisted_authored_string_fields"] == "literal"
+    assert "nodes[].loop_group.nodes[].model" not in observed
+    assert "nodes[].loop_group.nodes[].agents.*.model" not in observed
+
+
+def test_v6_companion_accepts_exact_known_group_child_reference(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group([{"id": "child", "prompt": "Act."}])],
+    )
+
+    package = _normalize_v6_with_sidecar(
+        path,
+        "language_compatibility: archon-2026-07\n"
+        "outward_action_nodes: [process-items/child]\n",
+    )
+
+    assert package.sidecar["outward_action_nodes"] == ("process-items/child",)
+
+
+@pytest.mark.parametrize(
+    ("authored_id", "semantic_code"),
+    [
+        (
+            "group/missing",
+            "scoped-companion-reference-unknown-node",
+        ),
+        ("missing", None),
+        ("group/child/extra", None),
+        ("/child", None),
+        ("group/", None),
+        ("group/child.dot", None),
+    ],
+    ids=(
+        "unknown-valid",
+        "no-slash",
+        "multi-slash",
+        "empty-group",
+        "empty-child",
+        "unsafe-segment",
+    ),
+)
+def test_v6_companion_scoped_semantic_code_requires_exact_group_child_syntax(
+    tmp_path, workflow_writer, authored_id, semantic_code
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group([{"id": "child", "prompt": "Act."}])],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_with_sidecar(
+            path,
+            "language_compatibility: archon-2026-07\n"
+            f"outward_action_nodes: [{authored_id!r}]\n",
+        )
+
+    issue = raised.value.issues[0]
+    assert (issue.code, issue.path, getattr(issue, "semantic_code", None)) == (
+        "unknown_sidecar_node",
+        "sidecar.outward_action_nodes",
+        semantic_code,
+    )
+
+
+def test_v6_assignment_group_child_syntax_does_not_gain_scoped_semantic_code(
+    tmp_path, workflow_writer
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group([{"id": "child", "prompt": "Act."}])],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_with_sidecar(
+            path,
+            "language_compatibility: archon-2026-07\n"
+            "assignments:\n"
+            "  group/missing:\n"
+            "    endpoint: hermes://local/reviewer\n",
+        )
+
+    issue = raised.value.issues[0]
+    assert (issue.code, issue.path, getattr(issue, "semantic_code", None)) == (
+        "unknown_sidecar_node",
+        "sidecar.assignments.group/missing",
+        None,
     )
 
 
@@ -810,6 +1418,33 @@ def test_v6_rejects_more_than_4096_body_edges(tmp_path, workflow_writer):
         path,
         "loop_group_product_limit",
         "nodes[0].loop_group.nodes",
+    )
+
+
+@pytest.mark.parametrize("max_attempts", (True, -1, 1.5))
+def test_v6_raw_loop_child_retry_preserves_phase3_diagnostic(
+    tmp_path, workflow_writer, max_attempts
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            _group([
+                {
+                    "id": "retrying",
+                    "prompt": "Retry.",
+                    "retry": {"max_attempts": max_attempts},
+                }
+            ])
+        ],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_without_admission(path)
+
+    issue = raised.value.issues[0]
+    assert (issue.code, issue.path) == (
+        "archon_retry_invalid",
+        "nodes[0].retry.max_attempts",
     )
 
 

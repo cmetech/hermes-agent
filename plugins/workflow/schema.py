@@ -64,12 +64,13 @@ from plugins.workflow.language_schema import (
     hook_specific_field_names,
     contains_output_reference,
     is_reference_safe_node_id,
+    iter_interpolation_surface_templates,
     iter_loop_previous_output_references,
     iter_output_references,
     loop_field_names,
-    loop_group_node_work_factors,
     loop_group_field_names,
     retry_field_names,
+    script_value_is_inline,
     sidecar_field_names,
     structural_node_field_names,
     WorkflowReferenceSyntaxError,
@@ -168,7 +169,6 @@ _CONTROL_OR_ANSI = re.compile(r"[\x00-\x1f\x7f-\x9f]|\x1b\[")
 _SAFE_NAME = re.compile(r"^[^\s/\\]+$")
 _WHEN_REFERENCE = re.compile(WHEN_REFERENCE_PATTERN, re.UNICODE)
 _WHEN_EXPRESSION = re.compile(WHEN_EXPRESSION_PATTERN, re.UNICODE)
-_INLINE_SCRIPT_METACHAR = re.compile(r"[\s;(){}&|<>$`\"']")
 _LITERAL_INCLUDE_NAME = re.compile(r"^[^\s/\\:$?#{}`()]+$")
 _ASSIGNMENT_FIELDS = frozenset({
     "endpoint",
@@ -288,7 +288,7 @@ def _validate_thinking(value: Any, path: str) -> None:
 
 def is_inline_script(value: str) -> bool:
     """Match the portable inline-vs-named script rule."""
-    return bool(_INLINE_SCRIPT_METACHAR.search(value))
+    return script_value_is_inline(value)
 
 
 def _validate_identifier(value: Any, path: str, *, max_length: int = 128) -> str:
@@ -802,11 +802,23 @@ def _loop_group_work_bounds(
     executions = 0
     attempts = 0
     for node in nodes:
-        multiplier, retries = loop_group_node_work_factors(
-            node.node_type,
-            node.value,
-            node.options,
+        multiplier = (
+            node.value.get("max_iterations", 1)
+            if node.node_type == "loop" and isinstance(node.value, Mapping)
+            else 1
         )
+        retry = node.options.get("retry")
+        approval_rework = (
+            node.value.get("on_reject")
+            if node.node_type == "approval" and isinstance(node.value, Mapping)
+            else None
+        )
+        if isinstance(approval_rework, Mapping):
+            retries = approval_rework.get("max_attempts", 3)
+        elif isinstance(retry, Mapping):
+            retries = retry.get("max_attempts", 0)
+        else:
+            retries = 2 if node.node_type in {"command", "prompt"} else 0
         executions += multiplier
         attempts += multiplier * (int(retries) + 1)
     return (
@@ -845,18 +857,23 @@ def _loop_group_capacity_bounds(
     artifact_executions = 0
     process_executions = 0
     for node in nodes:
-        raw_multiplier, raw_retries = loop_group_node_work_factors(
-            node.node_type,
-            node.value,
-            node.options,
+        multiplier = (
+            int(node.value.get("max_iterations", 1))
+            if node.node_type == "loop" and isinstance(node.value, Mapping)
+            else 1
         )
-        multiplier = int(raw_multiplier)
+        retry = node.options.get("retry")
         approval_rework = (
             node.value.get("on_reject")
             if node.node_type == "approval" and isinstance(node.value, Mapping)
             else None
         )
-        retries = int(raw_retries)
+        if isinstance(approval_rework, Mapping):
+            retries = int(approval_rework.get("max_attempts", 3))
+        elif isinstance(retry, Mapping):
+            retries = int(retry.get("max_attempts", 0))
+        else:
+            retries = 2 if node.node_type in {"command", "prompt"} else 0
         executions = _checked_work_product(max_iterations, multiplier)
         attempts = _checked_work_product(executions, retries + 1)
         is_approval_rework = isinstance(approval_rework, Mapping)
@@ -2142,101 +2159,16 @@ def _interpolated_node_templates(
 ) -> Iterable[tuple[str, str]]:
     """Yield only fields rendered by the Phase 2 runtime variable adapter."""
     prefix = _logical_node_path(node)
-    when = node.options.get("when")
-    if isinstance(when, str):
-        yield f"{prefix}.when", when
-    if node.node_type in {"bash", "prompt"} and isinstance(node.value, str):
-        yield f"{prefix}.{node.node_type}", node.value
-    elif (
-        node.node_type == "script"
-        and isinstance(node.value, str)
-        and is_inline_script(node.value)
+    for relative_path, template in iter_interpolation_surface_templates(
+        node.node_type,
+        node.value,
+        node.options,
+        node_id=node.id,
+        command_bodies=command_bodies,
+        named_script_bodies=named_script_bodies,
+        include_phase4_templates=include_phase4_templates,
     ):
-        yield f"{prefix}.script", node.value
-    elif node.node_type == "loop" and isinstance(node.value, Mapping):
-        for field in ("prompt", "until_bash"):
-            value = node.value.get(field)
-            if isinstance(value, str):
-                yield f"{prefix}.loop.{field}", value
-        gate_message = node.value.get("gate_message")
-        if include_phase4_templates and isinstance(gate_message, str):
-            yield f"{prefix}.loop.gate_message", gate_message
-        command_body = (
-            command_bodies.get(node.id) if command_bodies is not None else None
-        )
-        if include_phase4_templates and isinstance(command_body, str):
-            yield f"{prefix}.loop.command", command_body
-    elif node.node_type == "loop_group" and isinstance(node.value, Mapping):
-        until_bash = node.value.get("until_bash")
-        if isinstance(until_bash, str):
-            yield f"{prefix}.loop_group.until_bash", until_bash
-        gate_message = node.value.get("gate_message")
-        if include_phase4_templates and isinstance(gate_message, str):
-            yield f"{prefix}.loop_group.gate_message", gate_message
-    elif node.node_type == "approval" and isinstance(node.value, Mapping):
-        message = node.value.get("message")
-        if isinstance(message, str):
-            yield f"{prefix}.approval.message", message
-        on_reject = node.value.get("on_reject")
-        if isinstance(on_reject, Mapping):
-            prompt = on_reject.get("prompt")
-            if isinstance(prompt, str):
-                yield f"{prefix}.approval.on_reject.prompt", prompt
-    elif node.node_type == "command" and command_bodies is not None:
-        body = command_bodies.get(node.id)
-        if isinstance(body, str):
-            yield f"{prefix}.command", body
-    elif (
-        include_phase4_templates
-        and node.node_type == "script"
-        and named_script_bodies is not None
-    ):
-        body = named_script_bodies.get(node.id)
-        if isinstance(body, str):
-            yield f"{prefix}.script", body
-    if not include_phase4_templates:
-        return
-    system_prompt = node.options.get("systemPrompt")
-    if isinstance(system_prompt, str):
-        yield f"{prefix}.systemPrompt", system_prompt
-    agents = node.options.get("agents")
-    if isinstance(agents, Mapping):
-        for agent_id, raw_agent in agents.items():
-            if not isinstance(raw_agent, Mapping):
-                continue
-            for field in ("description", "prompt"):
-                template = raw_agent.get(field)
-                if isinstance(template, str):
-                    yield f"{prefix}.agents.{agent_id}.{field}", template
-    hooks = node.options.get("hooks")
-    if isinstance(hooks, Mapping):
-        for event, entries in hooks.items():
-            if not isinstance(entries, tuple | list):
-                continue
-            for index, entry in enumerate(entries):
-                if not isinstance(entry, Mapping):
-                    continue
-                response = entry.get("response")
-                if not isinstance(response, Mapping):
-                    continue
-                for field in ("systemMessage", "stopReason"):
-                    template = response.get(field)
-                    if isinstance(template, str):
-                        yield (
-                            f"{prefix}.hooks.{event}[{index}].response.{field}",
-                            template,
-                        )
-                specific = response.get("hookSpecificOutput")
-                if not isinstance(specific, Mapping):
-                    continue
-                for field in ("permissionDecisionReason", "additionalContext"):
-                    template = specific.get(field)
-                    if isinstance(template, str):
-                        yield (
-                            f"{prefix}.hooks.{event}[{index}].response."
-                            f"hookSpecificOutput.{field}",
-                            template,
-                        )
+        yield f"{prefix}.{relative_path}", template
 
 
 def validate_authenticated_command_references(
@@ -2743,7 +2675,9 @@ def _expand_root_sidecar_node_references(
                 f"outward_action_nodes references unknown node: {authored_id}",
                 semantic_code=(
                     SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE
-                    if allow_scoped and "/" in authored_id
+                    if allow_scoped
+                    and len(parts := authored_id.split("/")) == 2
+                    and all(is_reference_safe_node_id(part) for part in parts)
                     else None
                 ),
             )
