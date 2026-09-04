@@ -15,7 +15,12 @@ import yaml
 from plugins import workflow as workflow_plugin
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.admission_service import assess_production_workflow_admission
-from plugins.workflow.cli import _resolve_compilation, _runtime_config, register_cli
+from plugins.workflow.cli import (
+    _resolve_compilation,
+    _runtime_config,
+    register_cli,
+    workflow_command,
+)
 from plugins.workflow.compilation import WorkflowCompilation
 from plugins.workflow.coordinator_store import CoordinatorIdentity, CoordinatorStore
 from plugins.workflow import machine_contract
@@ -35,6 +40,18 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     register_cli(parser)
     return parser
+
+
+def test_workflow_usage_advertises_marketplace_entry_points(capsys) -> None:
+    assert workflow_command(argparse.Namespace(workflow_action=None)) == 2
+
+    usage = capsys.readouterr().err
+    assert "source" in usage
+    assert "search" in usage
+    assert "install" in usage
+    assert "installed" in usage
+    assert "update" in usage
+    assert "uninstall" in usage
 
 
 def test_explicit_phase4_path_resolves_includes_from_bounded_catalog(
@@ -1163,6 +1180,29 @@ def test_packaged_schema_parse_errors_are_single_and_read_only(
     assert before == after == ((), ())
     assert not home.exists()
     assert not hermes_home.exists()
+
+
+def test_packaged_marketplace_json_parse_error_is_one_stdout_envelope(
+    tmp_path,
+) -> None:
+    completed, _before, _after, _home, _hermes_home = _run_packaged_schema(
+        tmp_path,
+        [
+            "workflow",
+            "install",
+            "company/laptop-support",
+            "--yes",
+            "--prepare-only",
+            "--json",
+        ],
+    )
+
+    assert completed.returncode == machine_contract.EXIT_INVOCATION
+    assert completed.stderr == ""
+    envelope = json.loads(completed.stdout)
+    assert envelope["ok"] is False
+    assert envelope["command"] == "workflow install"
+    assert envelope["error"]["code"] == "invalid_request"
 
 
 @pytest.mark.parametrize(
