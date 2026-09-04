@@ -10,66 +10,72 @@ rendered with Rich Markdown.  Otherwise a default confirmation is shown.
 from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
-import functools
 import importlib.metadata
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.config import cfg_get
+from hermes_cli.git_source import (
+    EXACT_COMMIT_RE as _EXACT_COMMIT_RE,
+    GitSourceError,
+    canonical_git_source as _canonical_source,
+    checkout_exact_revision,
+    git_head_revision,
+    noninteractive_git_env,
+    normalize_exact_revision,
+    resolve_git_executable as _resolve_git_executable,
+    resolve_git_source,
+    safe_git_error as _safe_git_error,
+    scrub_cloned_origin,
+)
 from hermes_cli.secret_prompt import masked_secret_prompt
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
 
-@functools.lru_cache(maxsize=1)
-def _resolve_git_executable() -> Optional[str]:
-    """Resolve a git binary for subprocess use when ``PATH`` may be minimal.
-
-    Matches other Hermes subprocess resolution: :func:`shutil.which` first,
-    then common Git for Windows install paths and POSIX defaults.
-    """
-    found = shutil.which("git")
-    if found:
-        return found
-    if os.name == "nt":
-        prog = os.environ.get("ProgramFiles", r"C:\Program Files")
-        prog_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        local = os.environ.get("LOCALAPPDATA", "")
-        candidates = [
-            os.path.join(prog, "Git", "cmd", "git.exe"),
-            os.path.join(prog, "Git", "bin", "git.exe"),
-            os.path.join(prog_x86, "Git", "cmd", "git.exe"),
-            os.path.join(prog_x86, "Git", "bin", "git.exe"),
-        ]
-        if local:
-            candidates.extend(
-                (
-                    os.path.join(local, "Programs", "Git", "cmd", "git.exe"),
-                    os.path.join(local, "Programs", "Git", "bin", "git.exe"),
-                )
-            )
-    else:
-        candidates = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
-    for c in candidates:
-        if c and os.path.isfile(c):
-            return c
-    return None
-
-
-class PluginOperationError(Exception):
+class PluginOperationError(GitSourceError):
     """Recoverable plugin install/update failure (CLI exits; HTTP maps to 4xx)."""
+
+
+def _as_plugin_error(exc: GitSourceError) -> PluginOperationError:
+    return PluginOperationError(str(exc))
+
+
+def _normalize_exact_revision(ref: str) -> str:
+    try:
+        return normalize_exact_revision(ref)
+    except GitSourceError as exc:
+        raise _as_plugin_error(exc) from exc
+
+
+def _git_head_revision(repo: Path, git_exe: str) -> str:
+    try:
+        return git_head_revision(repo, git_exe)
+    except GitSourceError as exc:
+        raise _as_plugin_error(exc) from exc
+
+
+def _checkout_exact_revision(repo: Path, git_exe: str, revision: str) -> None:
+    try:
+        checkout_exact_revision(repo, git_exe, revision)
+    except GitSourceError as exc:
+        raise _as_plugin_error(exc) from exc
+
+
+def _scrub_cloned_origin(repo: Path, git_exe: str, git_url: str) -> None:
+    try:
+        scrub_cloned_origin(repo, git_exe, git_url)
+    except GitSourceError as exc:
+        raise _as_plugin_error(exc) from exc
 
 
 class PluginScanBlocked(PluginOperationError):
@@ -209,20 +215,6 @@ def _sanitize_plugin_name(
     return target
 
 
-_GITHUB_BROWSER_SEGMENTS = {
-    "actions",
-    "blob",
-    "commit",
-    "commits",
-    "issues",
-    "pull",
-    "pulls",
-    "releases",
-    "tree",
-    "wiki",
-}
-
-
 def _resolve_git_url(identifier: str) -> tuple[str, Optional[str]]:
     """Turn an identifier into a cloneable Git URL and optional subdirectory.
 
@@ -249,45 +241,15 @@ def _resolve_git_url(identifier: str) -> tuple[str, Optional[str]]:
     NOTE: ``http://`` and ``file://`` schemes are accepted but will trigger a
     security warning at install time.
     """
-    # Already a URL.
-    if identifier.startswith(("https://", "http://", "git@", "ssh://", "file://")):
-        if identifier.startswith("https://github.com/"):
-            path = identifier[len("https://github.com/") :]
-            path = path.split("?", 1)[0].split("#", 1)[0].strip("/")
-            parts = path.split("/")
-            if len(parts) >= 3 and all(parts[:2]) and parts[2] in _GITHUB_BROWSER_SEGMENTS:
-                repo = parts[1].removesuffix(".git")
-                subdir = None
-                if parts[2] == "tree" and len(parts) >= 5:
-                    subdir = "/".join(p for p in parts[4:] if p).strip("/") or None
-                return f"https://github.com/{parts[0]}/{repo}.git", subdir
-
-        # Explicit ``#subdir`` fragment — unambiguous for any scheme.
-        if "#" in identifier:
-            git_url, _, frag = identifier.partition("#")
-            return git_url, (frag.strip("/") or None)
-        # Natural ``.git/`` boundary (GitHub-style URLs).
-        marker = ".git/"
-        idx = identifier.find(marker)
-        if idx != -1:
-            git_url = identifier[: idx + len(".git")]
-            subdir = identifier[idx + len(marker) :].strip("/")
-            return git_url, (subdir or None)
-        return identifier, None
-
-    # owner/repo[/subdir...] shorthand
-    parts = [p for p in identifier.strip("/").split("/") if p]
-    if len(parts) >= 2:
-        owner, repo = parts[0], parts[1]
-        subdir = "/".join(parts[2:]).strip("/")
-        git_url = f"https://github.com/{owner}/{repo}.git"
-        return git_url, (subdir or None)
-
-    raise ValueError(
-        f"Invalid plugin identifier: '{identifier}'. "
-        "Use a Git URL or 'owner/repo' shorthand (optionally with a subdirectory: "
-        "'owner/repo/path/to/plugin')."
-    )
+    try:
+        resolved = resolve_git_source(identifier)
+    except GitSourceError as exc:
+        raise ValueError(
+            f"Invalid plugin identifier: '{identifier}'. "
+            "Use a Git URL or 'owner/repo' shorthand (optionally with a subdirectory: "
+            "'owner/repo/path/to/plugin')."
+        ) from exc
+    return resolved.clone_url, resolved.subdirectory
 
 
 def _resolve_subdir_within(clone_root: Path, subdir: str) -> Path:
@@ -557,7 +519,6 @@ def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
 # ---------------------------------------------------------------------------
 
 
-_EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _INSTALL_METADATA_FILE = ".install-metadata.json"
 
 def _install_metadata_path() -> Path:
@@ -586,130 +547,6 @@ def _write_install_metadata(metadata: dict[str, dict[str, object]]) -> None:
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         tmp_prefix=f"{path.name}.tmp-",
     )
-
-
-def _normalize_exact_revision(ref: str) -> str:
-    if not isinstance(ref, str) or not _EXACT_COMMIT_RE.fullmatch(ref):
-        raise PluginOperationError("--ref must be a full 40-character commit SHA.")
-    return ref.lower()
-
-
-def _safe_git_error(result: subprocess.CompletedProcess, source_url: str = "") -> str:
-    """Return diagnosable Git output without echoing embedded credentials."""
-    from agent.redact import redact_sensitive_text
-
-    error = (result.stderr or result.stdout or "").strip()
-    if source_url:
-        error = error.replace(source_url, _scrub_git_url(source_url))
-    return redact_sensitive_text(error)
-
-
-def _git_head_revision(repo: Path, git_exe: str) -> str:
-    result = subprocess.run(
-        [git_exe, "rev-parse", "HEAD"],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        stdin=subprocess.DEVNULL,
-        env=noninteractive_git_env(),
-    )
-    if result.returncode != 0:
-        err = _safe_git_error(result)
-        raise PluginOperationError(f"Could not determine installed Git revision:\n{err}")
-    return result.stdout.strip().lower()
-
-
-def _checkout_exact_revision(repo: Path, git_exe: str, revision: str) -> None:
-    """Fetch and detach at one immutable commit, then verify the resulting HEAD."""
-    try:
-        fetched = subprocess.run(
-            [git_exe, "fetch", "--depth", "1", "origin", revision],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            stdin=subprocess.DEVNULL,
-            env=noninteractive_git_env(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise PluginOperationError(
-            f"Git fetch of commit '{revision}' timed out after 60 seconds."
-        ) from exc
-    if fetched.returncode != 0:
-        err = _safe_git_error(fetched)
-        raise PluginOperationError(
-            f"Git commit '{revision}' could not be fetched:\n{err}"
-        )
-    try:
-        checked_out = subprocess.run(
-            [git_exe, "checkout", "--detach", revision],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            stdin=subprocess.DEVNULL,
-            env=noninteractive_git_env(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise PluginOperationError(
-            f"Git checkout of commit '{revision}' timed out after 60 seconds."
-        ) from exc
-    if checked_out.returncode != 0:
-        err = _safe_git_error(checked_out)
-        raise PluginOperationError(
-            f"Git checkout of commit '{revision}' failed:\n{err}"
-        )
-    actual = _git_head_revision(repo, git_exe)
-    if actual != revision:
-        raise PluginOperationError(
-            f"Checked-out revision '{actual}' does not match requested commit '{revision}'."
-        )
-
-
-def _scrub_git_url(git_url: str) -> str:
-    """Strip credentials and query/fragment data from an HTTP Git URL."""
-    parsed = urllib.parse.urlsplit(git_url)
-    if parsed.scheme in {"http", "https"} and parsed.hostname:
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        return urllib.parse.urlunsplit(
-            (parsed.scheme, host, parsed.path, "", "")
-        )
-    return git_url
-
-
-def _canonical_source(git_url: str, subdir: Optional[str]) -> str:
-    scrubbed = _scrub_git_url(git_url)
-    return f"{scrubbed}#{subdir}" if subdir else scrubbed
-
-
-def _scrub_cloned_origin(repo: Path, git_exe: str, git_url: str) -> None:
-    """Ensure credentials used for cloning do not survive in ``.git/config``."""
-    scrubbed = _scrub_git_url(git_url)
-    if scrubbed == git_url:
-        return
-    result = subprocess.run(
-        [git_exe, "remote", "set-url", "origin", scrubbed],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        stdin=subprocess.DEVNULL,
-        env=noninteractive_git_env(),
-    )
-    if result.returncode != 0:
-        err = _safe_git_error(result, git_url)
-        raise PluginOperationError(f"Could not sanitize installed Git remote:\n{err}")
 
 
 def _install_plugin_core(

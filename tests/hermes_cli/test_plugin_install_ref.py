@@ -57,20 +57,20 @@ def test_parser_accepts_only_explicit_install_ref_option():
 
 
 def test_canonical_source_never_persists_http_credentials():
-    from hermes_cli.plugins_cmd import _canonical_source
+    from hermes_cli.git_source import canonical_git_source
 
     assert (
-        _canonical_source("https://user:token@example.com/owner/repo.git", None)
+        canonical_git_source("https://user:token@example.com/owner/repo.git", None)
         == "https://example.com/owner/repo.git"
     )
     assert (
-        _canonical_source("https://example.com/owner/repo.git?token=secret", None)
+        canonical_git_source("https://example.com/owner/repo.git?token=secret", None)
         == "https://example.com/owner/repo.git"
     )
 
 
 def test_cloned_origin_never_persists_http_credentials(tmp_path):
-    from hermes_cli.plugins_cmd import _scrub_cloned_origin
+    from hermes_cli.git_source import scrub_cloned_origin
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -83,7 +83,7 @@ def test_cloned_origin_never_persists_http_credentials(tmp_path):
         "https://user:secret@example.com/owner/repo.git?token=secret",
     )
 
-    _scrub_cloned_origin(
+    scrub_cloned_origin(
         repo,
         "git",
         "https://user:secret@example.com/owner/repo.git?token=secret",
@@ -96,7 +96,7 @@ def test_cloned_origin_never_persists_http_credentials(tmp_path):
 
 
 def test_git_errors_never_echo_source_credentials():
-    from hermes_cli.plugins_cmd import _safe_git_error
+    from hermes_cli.git_source import safe_git_error
 
     source = "https://user:secret@example.com/owner/repo.git?token=secret"
     result = subprocess.CompletedProcess(
@@ -106,7 +106,7 @@ def test_git_errors_never_echo_source_credentials():
         stderr=f"fatal: unable to access '{source}': connection failed",
     )
 
-    error = _safe_git_error(result, source)
+    error = safe_git_error(result, source)
 
     assert "secret" not in error
     assert "user:" not in error
@@ -294,17 +294,17 @@ def test_failed_force_reinstall_keeps_existing_plugin_and_metadata(
 
 
 def test_checkout_mismatch_is_rejected(monkeypatch, tmp_path):
-    from hermes_cli.plugins_cmd import PluginOperationError, _checkout_exact_revision
+    from hermes_cli.git_source import GitSourceError, checkout_exact_revision
 
     repo, old_sha, new_sha = _plugin_repo(tmp_path)
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", repo.as_uri(), str(clone)], check=True)
     monkeypatch.setattr(
-        "hermes_cli.plugins_cmd._git_head_revision", lambda _repo, _git: new_sha
+        "hermes_cli.git_source.git_head_revision", lambda _repo, _git: new_sha
     )
 
-    with pytest.raises(PluginOperationError, match="does not match requested"):
-        _checkout_exact_revision(clone, "git", old_sha)
+    with pytest.raises(GitSourceError, match="does not match requested"):
+        checkout_exact_revision(clone, "git", old_sha)
 
 
 def test_metadata_write_failure_rolls_back_new_install(monkeypatch, tmp_path):
