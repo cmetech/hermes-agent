@@ -76,9 +76,22 @@ _LOCAL_PATH = re.compile(
     r"(?:/[^\s\"']+)*(?:\.staging|\.quarantine|/cache|/staging|/quarantine)"
     r"(?:/[^\s\"']*)?)"
 )
-_SENSITIVE_REPOSITORY_PATH = re.compile(
-    r"(?i)(?:^|/)(?:tmp|temp|caches?|staging|quarantine|\.staging|\.quarantine)"
-    r"(?:/|$)|^/(?:private/)?var/folders(?:/|$)"
+_REPOSITORY_PATH_DECODE_MAX = 8
+_SENSITIVE_REPOSITORY_SEGMENTS = frozenset({
+    ".cache",
+    ".quarantine",
+    ".staging",
+    "cache",
+    "caches",
+    "quarantine",
+    "staging",
+    "temp",
+    "tmp",
+})
+_INTERNAL_REPOSITORY_PATH_SEQUENCES = (
+    ("marketplace", "workflows"),
+    ("var", "folders"),
+    ("workflows", "marketplace"),
 )
 _SECRET_KEY = re.compile(
     r"^(?:access|refresh)?token$|^api(?:key)?$|^auth(?:orization)?$|^password$|"
@@ -615,12 +628,40 @@ def _safe_repository_url(value: str) -> str:
     if parsed.scheme.casefold() != "file":
         return value
     authority = parsed.netloc.casefold()
-    classification_path = urllib.parse.unquote(parsed.path).replace("\\", "/")
+    classification_path = parsed.path
+    try:
+        for _ in range(_REPOSITORY_PATH_DECODE_MAX):
+            decoded = urllib.parse.unquote(classification_path, errors="strict")
+            if decoded == classification_path:
+                break
+            classification_path = decoded
+        else:
+            if "%" in classification_path:
+                return _REDACTED_REPOSITORY_URL
+    except UnicodeDecodeError:
+        return _REDACTED_REPOSITORY_URL
+    classification_path = classification_path.replace("\\", "/")
+    segments = tuple(
+        segment.casefold() for segment in classification_path.split("/") if segment
+    )
     if (
         authority not in {"", "localhost"}
-        or (not authority and classification_path.startswith("//"))
-        or re.match(r"^/*[A-Za-z]:/", classification_path) is not None
-        or _SENSITIVE_REPOSITORY_PATH.search(classification_path) is not None
+        or not classification_path.startswith("/")
+        or classification_path.startswith("//")
+        or not segments
+        or "%" in classification_path
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in classification_path
+        )
+        or any(segment in {".", ".."} for segment in segments)
+        or re.match(r"^[A-Za-z]:", classification_path.lstrip("/")) is not None
+        or any(segment in _SENSITIVE_REPOSITORY_SEGMENTS for segment in segments)
+        or any(
+            segments[index : index + len(sequence)] == sequence
+            for sequence in _INTERNAL_REPOSITORY_PATH_SEQUENCES
+            for index in range(len(segments) - len(sequence) + 1)
+        )
     ):
         return _REDACTED_REPOSITORY_URL
     return value

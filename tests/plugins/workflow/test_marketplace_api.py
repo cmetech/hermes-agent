@@ -11,9 +11,11 @@ from fastapi.testclient import TestClient
 import pytest
 
 from plugins.workflow.marketplace.api import (
+    MarketplaceSourceRefreshProjection,
     MarketplaceSourceEnabledRequest,
     WorkflowMarketplaceApiContext,
     _body,
+    _operation_result,
     create_marketplace_router,
 )
 from plugins.workflow.marketplace.catalog import CatalogPackage, SourceRefreshResult
@@ -44,6 +46,7 @@ from plugins.workflow.marketplace.operations import (
     MarketplaceOperationRegistryError,
     MarketplaceTrustRevokeOperationResult,
     MarketplaceTrustRevocationValue,
+    validate_marketplace_operation_result,
 )
 from plugins.workflow.marketplace.service import (
     ConfirmationTargetMetadata,
@@ -57,6 +60,13 @@ _REVIEW_DIGEST = "3" * 64
 _COMMIT = "4" * 40
 _TOKEN = "confirmation-token-value-1234567890"
 _NOW = datetime(2026, 9, 4, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _encode_path_syntax(value: str, layers: int) -> str:
+    escapes = {"%": "%25", "/": "%2F", "\\": "%5C", ":": "%3A", ".": "%2E"}
+    for _ in range(layers):
+        value = "".join(escapes.get(character, character) for character in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -1050,6 +1060,9 @@ def test_refresh_preserves_schema_valid_local_repository_identity(api) -> None:
         "file://localhost/Users/operator/repository.git",
         "file://LOCALHOST/Users/operator/repository.git",
         "file://LoCaLhOsT/Users/operator/repository.git",
+        "file:/Users/operator/cacheable/repository.git",
+        "file:/Users/operator/templates/repository.git",
+        "file:/Users/operator/staging-area/repository.git",
     ],
 )
 def test_package_detail_and_installed_list_preserve_ordinary_local_source(
@@ -1084,8 +1097,10 @@ def test_package_detail_and_installed_list_preserve_ordinary_local_source(
         "file:///C:/Users/alice/AppData/Local/Temp/repository.git",
         "file:/C:/Users/alice/repository.git",
         "file:C:/Users/alice/repository.git",
+        "file:C:Users/alice/repository.git",
         "file:/%43%3A/Users/alice/repository.git",
         "file:/C%3A%5CUsers%5Calice%5Crepository.git",
+        "file:/C%253A%255CUsers%255Calice/repository.git",
         "file://localhost/C:/Users/alice/repository.git",
         "file://LOCALHOST/C:/Users/alice/repository.git",
         "file://server/share/repository.git",
@@ -1094,8 +1109,20 @@ def test_package_detail_and_installed_list_preserve_ordinary_local_source(
         r"file:///\\server\share\repository.git",
         "file:/private/tmp/repository.git",
         "file:/%2Fprivate%2Ftmp/repository.git",
+        "file:/%252Fprivate%252Ftmp/repository.git",
         "file:/%5C%5Cserver%5Cshare%5Crepository.git",
         "file:///var/cache/hermes/.staging/repository.git",
+        "file:/home/alice/tmp/repository.git",
+        "file:/home/alice/temp/repository.git",
+        "file:/home/alice/.cache/repository.git",
+        "file:/home/alice/cache/repository.git",
+        "file:/home/alice/caches/repository.git",
+        "file:/home/alice/.staging/repository.git",
+        "file:/home/alice/staging/repository.git",
+        "file:/home/alice/.quarantine/repository.git",
+        "file:/home/alice/quarantine/repository.git",
+        "file:/Users/operator/.hermes/marketplace/workflows/repository.git",
+        "file:/Users/operator/.hermes/workflows/marketplace/repository.git",
         "FILE:/PRIVATE/TMP/repository.git",
         "FiLe://LOCALHOST/%74mp/repository.git",
         "file://LOCALHOST/private/tmp/repository.git",
@@ -1128,6 +1155,127 @@ def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
     assert "server" not in json.dumps(terminal)
     assert ".staging" not in json.dumps(terminal)
     MarketplaceOperation.model_validate(terminal, by_name=True)
+
+
+@pytest.mark.parametrize(
+    ("case", "raw_path"),
+    [
+        ("temp", "/private/tmp/repository.git"),
+        ("dot-cache", "/home/alice/.cache/repository.git"),
+        ("drive", r"C:\Users\alice\repository.git"),
+        ("unc", r"\\server\share\repository.git"),
+    ],
+)
+@pytest.mark.parametrize("layers", range(1, 9))
+def test_nested_encoded_local_source_syntax_is_always_sentinel_redacted(
+    api, case, raw_path, layers
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = f"file:/{_encode_path_syntax(raw_path, layers)}"
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+    public = revalidated.model_dump(mode="json", by_alias=False)
+
+    assert public["value"]["repository_url"] == "file:///REDACTED", case
+    assert "alice" not in json.dumps(public).casefold()
+    assert "server" not in json.dumps(public).casefold()
+
+
+def test_decode_cap_exhaustion_fails_closed_to_a_strict_sentinel(api) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = f"file:/{_encode_path_syntax('/Users/operator/repository.git', 9)}"
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+
+    assert (
+        revalidated.model_dump(mode="json", by_alias=False)["value"]["repository_url"]
+        == "file:///REDACTED"
+    )
+
+
+@pytest.mark.parametrize(
+    "result_type",
+    [
+        "source_refresh",
+        "package_detail",
+        "install_review",
+        "installed_package",
+        "update_review",
+        "updated_package",
+        "removed_package",
+    ],
+)
+def test_redacted_repository_url_revalidates_in_every_repository_result_variant(
+    api, result_type
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = "file:/%252Fprivate%252Ftmp/repository.git"
+    if result_type == "source_refresh":
+        value = MarketplaceSourceRefreshProjection(
+            source_name="company",
+            repository_url=local_url,
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+    elif result_type == "package_detail":
+        value = _inspection().model_copy(update={"repository_url": local_url})
+    elif result_type == "install_review":
+        value = _install_review().model_copy(update={"repository_url": local_url})
+    elif result_type == "update_review":
+        value = _update_review().model_copy(update={"repository_url": local_url})
+    else:
+        value = _installed().model_copy(update={"repository_url": local_url})
+
+    result = _operation_result(result_type, value)
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+    public = revalidated.model_dump(mode="json", by_alias=False)
+
+    assert public["type"] == result_type
+    assert public["value"]["repository_url"] == "file:///REDACTED"
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file://",
+        "file:///",
+        "file:relative/repository.git",
+        "file:/Users/operator/../repository.git",
+        "file:/Users/operator/%2E%2E/repository.git",
+        "file:/Users/operator/%25GG/repository.git",
+        "file:/Users/operator/%00/repository.git",
+        "file:/Users/operator/%09/repository.git",
+        "file:/Users/operator/%FF/repository.git",
+    ],
+)
+def test_ambiguous_shared_validated_file_uri_fails_closed(api, local_url) -> None:
+    _client, _service, _context, _home, _profile = api
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+
+    assert (
+        revalidated.model_dump(mode="json", by_alias=False)["value"]["repository_url"]
+        == "file:///REDACTED"
+    )
 
 
 @pytest.mark.parametrize(
