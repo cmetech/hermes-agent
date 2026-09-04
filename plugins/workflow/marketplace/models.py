@@ -51,6 +51,7 @@ TagName = Annotated[
 PackageInspectionResourceType = Literal[
     "command",
     "mcp",
+    "mcp_resource",
     "other",
     "script",
     "workflow_companion",
@@ -683,6 +684,7 @@ class WorkflowTrustReviewItem(StrictMarketplaceModel):
     command_resources: list[str] = Field(alias="commandResources", max_length=512)
     script_resources: list[str] = Field(alias="scriptResources", max_length=512)
     mcp_resources: list[str] = Field(alias="mcpResources", max_length=512)
+    mcp_resource_files: list[str] = Field(alias="mcpResourceFiles", max_length=512)
     requested_tools: list[ShortText] = Field(alias="requestedTools", max_length=512)
     requested_skills: list[ShortText] = Field(alias="requestedSkills", max_length=512)
     local_mcp_servers: list[ShortText] = Field(alias="localMcpServers", max_length=512)
@@ -704,6 +706,7 @@ class WorkflowTrustReviewItem(StrictMarketplaceModel):
         "command_resources",
         "script_resources",
         "mcp_resources",
+        "mcp_resource_files",
     )
     @classmethod
     def validate_resource_paths(cls, value):
@@ -746,7 +749,7 @@ class PackageInspectionResource(StrictMarketplaceModel):
         max_length=1024,
         json_schema_extra={"pattern": CANONICAL_RELATIVE_PATH_PATTERN},
     )
-    types: list[PackageInspectionResourceType] = Field(min_length=1, max_length=6)
+    types: list[PackageInspectionResourceType] = Field(min_length=1, max_length=7)
 
     @field_validator("path")
     @classmethod
@@ -776,16 +779,7 @@ class PackageInspection(StrictMarketplaceModel):
     resolved_commit: str = Field(alias="resolvedCommit", pattern=r"^[0-9a-f]{40}$")
     verified_at: str = Field(alias="verifiedAt", min_length=20, max_length=64)
     verified: Literal[True]
-    source_state: Literal[
-        "fresh",
-        "stale",
-        "disabled",
-        "authentication-failed",
-        "malformed",
-        "incompatible",
-        "unavailable",
-        "cancelled",
-    ] = Field(alias="sourceState")
+    source_state: Literal["fresh"] = Field(alias="sourceState")
     id: str = Field(min_length=1, max_length=64, pattern=PACKAGE_ID_PATTERN)
     version: str = Field(
         min_length=1,
@@ -900,6 +894,21 @@ class PackageInspection(StrictMarketplaceModel):
             or self.update_status == "not_applicable"
         ):
             raise ValueError("installed inspection status is inconsistent")
+        resource_types = {item.path: set(item.types) for item in self.resources}
+        for workflow in self.workflows:
+            references: tuple[tuple[str | None, PackageInspectionResourceType], ...] = (
+                (workflow.definition_path, "workflow_definition"),
+                (workflow.companion_path, "workflow_companion"),
+                *((path, "command") for path in workflow.command_resources),
+                *((path, "script") for path in workflow.script_resources),
+                *((path, "mcp") for path in workflow.mcp_resources),
+                *((path, "mcp_resource") for path in workflow.mcp_resource_files),
+            )
+            if any(
+                path is not None and role not in resource_types.get(path, set())
+                for path, role in references
+            ):
+                raise ValueError("inspection workflow resource roles are inconsistent")
         return self
 
 

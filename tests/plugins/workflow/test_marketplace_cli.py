@@ -76,6 +76,7 @@ def _workflow_review() -> WorkflowTrustReviewItem:
         commandResources=[],
         scriptResources=["scripts/collect.py"],
         mcpResources=[],
+        mcpResourceFiles=[],
         requestedTools=[],
         requestedSkills=[],
         localMcpServers=[],
@@ -181,6 +182,9 @@ def _inspection(*, installed: bool = True) -> PackageInspection:
             PackageInspectionResource(path="commands/diagnose.md", types=["command"]),
             PackageInspectionResource(path="mcp/support.yaml", types=["mcp"]),
             PackageInspectionResource(path="scripts/collect.py", types=["script"]),
+            PackageInspectionResource(
+                path="scripts/mcp-helper.py", types=["mcp_resource"]
+            ),
             PackageInspectionResource(path="workflow-package.json", types=["other"]),
             PackageInspectionResource(
                 path="workflows/laptop-diagnostic.hermes.yaml",
@@ -301,6 +305,7 @@ def _rich_workflow_review() -> WorkflowTrustReviewItem:
             "command_resources": ["commands/diagnose.md"],
             "script_resources": ["scripts/collect.py"],
             "mcp_resources": ["mcp/support.yaml"],
+            "mcp_resource_files": ["scripts/mcp-helper.py"],
             "requested_tools": ["git"],
             "requested_skills": ["support-triage"],
             "local_mcp_servers": ["local-support"],
@@ -342,6 +347,7 @@ def _rich_assessment() -> PackageReviewAssessment:
                 "commands/diagnose.md",
                 "mcp/support.yaml",
                 "scripts/collect.py",
+                "scripts/mcp-helper.py",
                 "workflow-package.json",
                 "workflows/laptop-diagnostic.hermes.yaml",
                 "workflows/laptop-diagnostic.yaml",
@@ -1025,7 +1031,7 @@ def test_interactive_trust_review_shows_complete_risk_surface_before_decline(
         "Version: 1.0.0",
         f"Exact commit: {_COMMIT}",
         f"Distribution digest: {_DIGEST}",
-        "Package-owned resources (6)",
+        "Package-owned resources (7)",
         "commands/diagnose.md",
         "Workflow: laptop-diagnostic",
         "Definition: workflows/laptop-diagnostic.yaml",
@@ -1039,6 +1045,7 @@ def test_interactive_trust_review_shows_complete_risk_surface_before_decline(
         "Command resources: commands/diagnose.md",
         "Script resources: scripts/collect.py",
         "MCP resources: mcp/support.yaml",
+        "MCP resource files: scripts/mcp-helper.py",
         "Local MCP servers: local-support",
         "Remote MCP servers: remote-support",
         "Requested tools: git",
@@ -1164,9 +1171,10 @@ def test_human_inspect_renders_complete_deterministic_package_detail(
         f"Distribution digest: {_DIGEST}",
         "Install status: installed",
         "Update status: current",
-        "Package resources (6)",
+        "Package resources (7)",
         "commands/diagnose.md [command]",
         "mcp/support.yaml [mcp]",
+        "scripts/mcp-helper.py [mcp_resource]",
         "Workflow: laptop-diagnostic",
         "Definition: workflows/laptop-diagnostic.yaml",
         "Companion: workflows/laptop-diagnostic.hermes.yaml",
@@ -1187,6 +1195,7 @@ def test_human_inspect_renders_complete_deterministic_package_detail(
         captured.out.index("commands/diagnose.md [command]")
         < captured.out.index("mcp/support.yaml [mcp]")
         < captured.out.index("scripts/collect.py [script]")
+        < captured.out.index("scripts/mcp-helper.py [mcp_resource]")
     )
 
 
@@ -1563,6 +1572,7 @@ def test_service_error_codes_map_to_stable_exit_categories(
 
     assert actual == exit_code
     assert envelope["error"]["code"] == code
+    assert "verified" not in json.dumps(envelope["result"]).casefold()
 
 
 def test_error_output_scrubs_credentials_git_diagnostics_and_confirmation_token(

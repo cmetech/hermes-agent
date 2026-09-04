@@ -728,6 +728,7 @@ def _render_workflow_details(workflow_values: object, args: argparse.Namespace) 
             ("command_resources", "Command resources"),
             ("script_resources", "Script resources"),
             ("mcp_resources", "MCP resources"),
+            ("mcp_resource_files", "MCP resource files"),
             ("local_mcp_servers", "Local MCP servers"),
             ("remote_mcp_servers", "Remote MCP servers"),
             ("requested_tools", "Requested tools"),

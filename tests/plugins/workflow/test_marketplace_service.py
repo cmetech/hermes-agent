@@ -200,10 +200,19 @@ def _write_inspection_resources(repository: Path) -> None:
         "mcp_servers:\n"
         "  local_support:\n"
         "    command: python\n"
-        "    args: [scripts/never-run.py]\n"
+        "    args: [scripts/mcp-helper.py, scripts/a-mcp-helper.py, "
+        "scripts/mcp-helper.py]\n"
         "  remote_support:\n"
         "    url: https://mcp.example.test/events\n"
         "    transport: sse\n",
+        encoding="utf-8",
+    )
+    (root / "scripts" / "mcp-helper.py").write_text(
+        "raise RuntimeError('MCP support content executed during review')\n",
+        encoding="utf-8",
+    )
+    (root / "scripts" / "a-mcp-helper.py").write_text(
+        "raise RuntimeError('MCP support content executed during review')\n",
         encoding="utf-8",
     )
     _publish(root)
@@ -377,7 +386,7 @@ def test_inspect_refetches_complete_verified_detail_without_executing_content(
     assert detail.configured_ref is None
     assert detail.resolved_commit == current_commit
     assert detail.resolved_commit != cached.resolved_commit
-    assert detail.verified_at == cached.verified_at
+    assert detail.verified_at != cached.verified_at
     assert detail.verified is True
     assert detail.source_state == "fresh"
     assert detail.version == "2.0.0"
@@ -397,6 +406,8 @@ def test_inspect_refetches_complete_verified_detail_without_executing_content(
     assert resources["commands/guide.md"] == ["command"]
     assert resources["scripts/never-run.py"] == ["script"]
     assert resources["mcp/mixed.yaml"] == ["mcp"]
+    assert resources["scripts/a-mcp-helper.py"] == ["mcp_resource"]
+    assert resources["scripts/mcp-helper.py"] == ["mcp_resource"]
     assert resources["workflows/diagnostic.yaml"] == ["workflow_definition"]
     assert resources["workflow-package.json"] == ["other"]
     assert detail.external_requirements.runtimes == ["uv"]
@@ -408,7 +419,83 @@ def test_inspect_refetches_complete_verified_detail_without_executing_content(
     assert detail.install_status == "not_installed"
     assert detail.update_status == "not_applicable"
     assert detail.installed is None
+    repair = next(item for item in detail.workflows if item.workflow_name == "repair")
+    assert repair.mcp_resource_files == [
+        "scripts/a-mcp-helper.py",
+        "scripts/mcp-helper.py",
+    ]
     assert not (service.home / "executed").exists()
+
+
+def test_inspect_pairs_exact_candidate_with_current_verification_event(
+    tmp_path: Path,
+    published_repo: PublishedRepository,
+) -> None:
+    cached_at = datetime(2026, 9, 3, 10, 0, tzinfo=timezone.utc)
+    inspected_at = datetime(2026, 9, 4, 15, 30, tzinfo=timezone.utc)
+    clock_values = iter((cached_at, inspected_at))
+    exact_service = WorkflowMarketplaceService(
+        tmp_path / "exact-inspection-home",
+        profile="support",
+        clock=lambda: next(clock_values),
+    )
+    _add_and_refresh(exact_service, published_repo)
+    cached = exact_service.catalog.inspect("company/laptop-support")
+
+    detail = exact_service.inspect("company/laptop-support")
+
+    assert cached.verified_at == "2026-09-03T10:00:00Z"
+    assert detail.verified_at == "2026-09-04T15:30:00Z"
+    assert detail.source_state == "fresh"
+    assert detail.verified is True
+    assert detail.resolved_commit == _git(published_repo.work, "rev-parse", "head")
+
+
+@pytest.mark.parametrize(
+    ("field", "stale_value"),
+    [
+        ("id", "different-package"),
+        ("version", "9.0.0"),
+        ("displayName", "Stale Display Name"),
+        (
+            "description",
+            "https://alice:index-secret@example.test/private.git?token=hidden",
+        ),
+        ("license", "Apache-2.0"),
+        ("publisher", "different-publisher"),
+        ("tags", ["different-tag"]),
+        ("contractVersion", 2),
+    ],
+)
+def test_registered_inspect_and_install_reject_every_stale_index_projection(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    field: str,
+    stale_value: object,
+) -> None:
+    _add_and_refresh(service, published_repo)
+    index_path = published_repo.work / ".well-known/hermes-workflows/index.json"
+    index = json.loads(index_path.read_bytes())
+    index["packages"][0][field] = stale_value
+    index_path.write_bytes(_json_bytes(index))
+    _git(published_repo.work, "add", ".")
+    _git(published_repo.work, "commit", "-m", f"publish stale {field}")
+    _git(published_repo.work, "push", "origin", "main")
+
+    for operation in (
+        lambda: service.inspect("company/laptop-support"),
+        lambda: service.prepare_install(
+            InstallRequest(identifier="company/laptop-support"), actor="alice"
+        ),
+    ):
+        with pytest.raises(WorkflowMarketplaceError) as error:
+            operation()
+        assert error.value.code == "package_index_invalid"
+        rendered = str(error.value)
+        assert "index-secret" not in rendered
+        assert "alice:" not in rendered
+        assert "hidden" not in rendered
+        assert "verified" not in rendered.casefold()
 
 
 def test_inspect_reports_current_then_update_available_without_mutation(
@@ -492,6 +579,10 @@ def test_inspection_is_strict_bounded_and_sanitizes_candidate_metadata(
     assert "actor-secret" not in rendered
     payload = detail.model_dump(mode="json", by_alias=True)
     payload["resources"] = [payload["resources"][0]] * 513
+    with pytest.raises(ValidationError):
+        PackageInspection.model_validate(payload)
+    payload = detail.model_dump(mode="json", by_alias=True)
+    payload["workflows"][0]["mcpResourceFiles"] = ["scripts/helper.py"] * 513
     with pytest.raises(ValidationError):
         PackageInspection.model_validate(payload)
     payload = detail.model_dump(mode="json", by_alias=True)
@@ -1045,7 +1136,11 @@ def test_oversized_mcp_review_fails_stably_without_execution(
 
 @pytest.mark.parametrize(
     ("reference", "content"),
-    [("malformed.yaml", "mcp_servers: [\n"), ("../../escape.yaml", None)],
+    [
+        ("malformed.yaml", "mcp_servers: [\n"),
+        ("missing.yaml", None),
+        ("../../escape.yaml", None),
+    ],
 )
 def test_malformed_or_escaping_mcp_resources_fail_stably(
     service: WorkflowMarketplaceService,

@@ -747,9 +747,9 @@ class WorkflowMarketplaceService:
                     else None
                 ),
                 "resolvedCommit": fetched.resolved_commit,
-                "verifiedAt": cached.verified_at,
+                "verifiedAt": _timestamp(self.clock()),
                 "verified": True,
-                "sourceState": cached.state,
+                "sourceState": "fresh",
                 "id": manifest.id,
                 "version": manifest.version,
                 "displayName": _safe_message(
@@ -803,6 +803,7 @@ class WorkflowMarketplaceService:
             add(item.command_resources, "command")
             add(item.script_resources, "script")
             add(item.mcp_resources, "mcp")
+            add(item.mcp_resource_files, "mcp_resource")
         return [
             PackageInspectionResource(
                 path=path,
@@ -1199,6 +1200,11 @@ class WorkflowMarketplaceService:
             mcp_bindings = tuple(
                 binding for binding in bindings if binding.resource_kind == "mcp"
             )
+            mcp_resource_files = sorted({
+                binding.source_relative_path
+                for binding in bindings
+                if binding.resource_kind == "mcp_resource"
+            })
             mcp_resource_paths = {
                 binding.source_relative_path for binding in mcp_bindings
             }
@@ -1231,6 +1237,7 @@ class WorkflowMarketplaceService:
                     commandResources=command_resources,
                     scriptResources=script_resources,
                     mcpResources=mcp_resources,
+                    mcpResourceFiles=mcp_resource_files,
                     requestedTools=sorted(risk.requested_tools),
                     requestedSkills=sorted(risk.requested_skills),
                     localMcpServers=sorted(local_mcp),
