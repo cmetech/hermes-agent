@@ -48,6 +48,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _TRANSACTION_ID = re.compile(r"^[0-9a-f]{32}$", re.ASCII)
 _OWNER = "hermes-workflow-marketplace"
 _CONFIRMATION_DOMAIN = b"hermes.workflow-marketplace.confirmation.v1\0"
+_CONSUMED_LEASE_SECONDS = 300
 
 JournalPhase = Literal[
     "install_consumed",
@@ -106,6 +107,8 @@ class PreparedTransaction:
     profile: str
     created_at: str
     expires_at: str
+    consumed_at: str | None
+    consumed_expires_at: str | None
     installed_provenance: InstalledPackageProvenance | None
 
 
@@ -118,6 +121,8 @@ class TransactionJournal:
     destination: Path
     staging_path: Path
     quarantine_path: Path
+    consumed_at: str
+    consumed_expires_at: str
     candidate_provenance: InstalledPackageProvenance | None
     previous_provenance: InstalledPackageProvenance | None
 
@@ -162,8 +167,13 @@ class _PreparedRecord(_StateModel):
 
     @model_validator(mode="after")
     def require_operation_shape(self) -> "_PreparedRecord":
-        if (self.operation == "remove") != (self.installed_provenance is not None):
+        if self.operation == "remove" and self.installed_provenance is None:
             raise ValueError("prepared transaction operation is inconsistent")
+        if (
+            self.installed_provenance is not None
+            and self.installed_provenance.identity != self.identity
+        ):
+            raise ValueError("prepared installed identity is inconsistent")
         if any(
             value != value.strip() or "\x00" in value
             for value in (self.actor, self.profile)
@@ -195,7 +205,8 @@ class _PreparedRecord(_StateModel):
             "workflowPaths": self.workflow_paths,
         })
         if (
-            self.installed_provenance is not None
+            self.operation == "remove"
+            and self.installed_provenance is not None
             and candidate != self.installed_provenance
         ):
             raise ValueError("removal candidate does not match installed provenance")
@@ -229,6 +240,10 @@ class _JournalRecord(_StateModel):
     destination: str = Field(min_length=1, max_length=4096)
     staging_path: str = Field(alias="stagingPath", min_length=1, max_length=4096)
     quarantine_path: str = Field(alias="quarantinePath", min_length=1, max_length=4096)
+    consumed_at: str = Field(alias="consumedAt", min_length=20, max_length=64)
+    consumed_expires_at: str = Field(
+        alias="consumedExpiresAt", min_length=20, max_length=64
+    )
     candidate_provenance: InstalledPackageProvenance | None = Field(
         default=None, alias="candidateProvenance"
     )
@@ -246,12 +261,22 @@ class _JournalRecord(_StateModel):
             self.candidate_provenance is not None or self.previous_provenance is None
         ):
             raise ValueError("remove journal requires only prior provenance")
+        consumed_at = _parse_timestamp(self.consumed_at)
+        consumed_expires_at = _parse_timestamp(self.consumed_expires_at)
+        if not (
+            consumed_at
+            < consumed_expires_at
+            <= consumed_at + timedelta(seconds=_CONSUMED_LEASE_SECONDS)
+        ):
+            raise ValueError("consumed transaction lease is invalid")
         for provenance in (
             self.candidate_provenance,
             self.previous_provenance,
         ):
             if provenance is not None:
                 _parse_timestamp(provenance.installed_at)
+                if provenance.identity != self.identity:
+                    raise ValueError("journal provenance identity is inconsistent")
         return self
 
 
@@ -400,6 +425,8 @@ def _record_to_prepared(
     *,
     token: str,
     consumed: bool,
+    consumed_at: str | None = None,
+    consumed_expires_at: str | None = None,
 ) -> PreparedTransaction:
     return PreparedTransaction(
         transaction_id=record.transaction_id,
@@ -424,6 +451,8 @@ def _record_to_prepared(
         profile=record.profile,
         created_at=record.created_at,
         expires_at=record.expires_at,
+        consumed_at=consumed_at,
+        consumed_expires_at=consumed_expires_at,
         installed_provenance=record.installed_provenance,
     )
 
@@ -1004,20 +1033,23 @@ class MarketplaceTransactionStore:
                     else None
                 ),
             }
-            try:
-                provisional = _PreparedRecord.model_validate(raw)
-            except ValidationError as error:
-                raise WorkflowMarketplaceError(
-                    "transaction_candidate_invalid",
-                    "transaction candidate metadata is invalid",
-                ) from error
-            record = provisional.model_copy(
-                update={"confirmation_digest": _confirmation_digest(provisional)}
-            )
             with self._locked() as parent_identity:
                 state = self._read_prepared()
-                if candidate.operation == "remove":
-                    current = self._current_provenance(candidate.identity)
+                current = self._current_provenance(candidate.identity)
+                destination_metadata = _entry(destination)
+                if candidate.operation == "install":
+                    if (current is None) != (destination_metadata is None):
+                        _fail(
+                            "transaction_destination_conflict",
+                            "installed package and provenance are inconsistent",
+                        )
+                    if current is not None:
+                        load_distribution(
+                            destination,
+                            expected_digest=current.distribution_digest,
+                        )
+                    installed_provenance = current
+                else:
                     if current != installed_provenance:
                         _fail(
                             "installed_package_changed",
@@ -1027,6 +1059,21 @@ class MarketplaceTransactionStore:
                         destination,
                         expected_digest=distribution.digest,
                     )
+                raw["installedProvenance"] = (
+                    installed_provenance.model_dump(mode="json", by_alias=True)
+                    if installed_provenance is not None
+                    else None
+                )
+                try:
+                    provisional = _PreparedRecord.model_validate(raw)
+                except ValidationError as error:
+                    raise WorkflowMarketplaceError(
+                        "transaction_candidate_invalid",
+                        "transaction candidate metadata is invalid",
+                    ) from error
+                record = provisional.model_copy(
+                    update={"confirmation_digest": _confirmation_digest(provisional)}
+                )
                 if len(state.transactions) >= _MAX_PREPARED:
                     _fail(
                         "transaction_state_size_limit", "too many prepared transactions"
@@ -1081,21 +1128,23 @@ class MarketplaceTransactionStore:
                     or _parse_timestamp(record.expires_at) <= now
                 ):
                     _fail("confirmation_token_invalid", "confirmation token is invalid")
+                consumed_at = _timestamp(now)
+                consumed_expires_at = _timestamp(
+                    now + timedelta(seconds=_CONSUMED_LEASE_SECONDS)
+                )
                 consumed_prepared = _record_to_prepared(
                     record,
                     token=raw_token,
                     consumed=True,
+                    consumed_at=consumed_at,
+                    consumed_expires_at=consumed_expires_at,
                 )
                 candidate_provenance = (
                     self._candidate_provenance(consumed_prepared)
                     if record.operation == "install"
                     else None
                 )
-                previous_provenance = (
-                    record.installed_provenance
-                    if record.operation == "remove"
-                    else None
-                )
+                previous_provenance = record.installed_provenance
                 consumed_journal = _JournalRecord.model_validate({
                     "transactionId": record.transaction_id,
                     "operation": record.operation,
@@ -1106,6 +1155,8 @@ class MarketplaceTransactionStore:
                     "quarantinePath": str(
                         self.quarantine_root / record.transaction_id / "package"
                     ),
+                    "consumedAt": consumed_at,
+                    "consumedExpiresAt": consumed_expires_at,
                     "candidateProvenance": (
                         candidate_provenance.model_dump(mode="json", by_alias=True)
                         if candidate_provenance is not None
@@ -1153,6 +1204,8 @@ class MarketplaceTransactionStore:
             destination=Path(record.destination),
             staging_path=Path(record.staging_path),
             quarantine_path=Path(record.quarantine_path),
+            consumed_at=record.consumed_at,
+            consumed_expires_at=record.consumed_expires_at,
             candidate_provenance=record.candidate_provenance,
             previous_provenance=record.previous_provenance,
         )
@@ -1223,7 +1276,7 @@ class MarketplaceTransactionStore:
         candidate = (
             self._candidate_provenance(prepared) if operation == "install" else None
         )
-        previous = prepared.installed_provenance if operation == "remove" else None
+        previous = prepared.installed_provenance
         if (
             journal is None
             or journal.operation != operation
@@ -1231,8 +1284,17 @@ class MarketplaceTransactionStore:
             or journal.identity != prepared.identity
             or journal.destination != str(prepared.destination)
             or journal.staging_path != str(prepared.staging_path)
+            or journal.consumed_at != prepared.consumed_at
+            or journal.consumed_expires_at != prepared.consumed_expires_at
             or journal.candidate_provenance != candidate
             or journal.previous_provenance != previous
+        ):
+            _fail("confirmation_token_invalid", "confirmation transaction is invalid")
+        now = self.clock()
+        if (
+            not isinstance(now, datetime)
+            or now.tzinfo is None
+            or _parse_timestamp(journal.consumed_expires_at) <= now
         ):
             _fail("confirmation_token_invalid", "confirmation transaction is invalid")
         return journal
@@ -1285,10 +1347,15 @@ class MarketplaceTransactionStore:
         self,
         prepared: PreparedTransaction,
         *,
-        review_digest: str | None,
+        review_digest: str,
     ) -> WorkflowDistribution:
         self._require_authorization(prepared, "install")
-        if review_digest is not None and review_digest != prepared.review_digest:
+        if (
+            not isinstance(review_digest, str)
+            or _SHA256.fullmatch(review_digest) is None
+        ):
+            _fail("transaction_review_invalid", "review digest is invalid")
+        if review_digest != prepared.review_digest:
             _fail("transaction_review_changed", "review changed after confirmation")
         try:
             distribution = load_distribution(
@@ -1321,10 +1388,15 @@ class MarketplaceTransactionStore:
         self,
         prepared: PreparedTransaction,
         *,
-        review_digest: str | None,
+        review_digest: str,
     ) -> tuple[WorkflowDistribution, InstalledPackageProvenance]:
         self._require_authorization(prepared, "remove")
-        if review_digest is not None and review_digest != prepared.review_digest:
+        if (
+            not isinstance(review_digest, str)
+            or _SHA256.fullmatch(review_digest) is None
+        ):
+            _fail("transaction_review_invalid", "review digest is invalid")
+        if review_digest != prepared.review_digest:
             _fail("transaction_review_changed", "review changed after confirmation")
         previous = prepared.installed_provenance
         if previous is None:
@@ -1476,7 +1548,7 @@ class MarketplaceTransactionStore:
         self,
         prepared: PreparedTransaction,
         *,
-        review_digest: str | None = None,
+        review_digest: str,
         provenance_writer: Callable[[InstalledPackageProvenance], object] | None = None,
         fault: Callable[[str], None] = lambda _point: None,
     ) -> InstalledPackageProvenance:
@@ -1495,7 +1567,13 @@ class MarketplaceTransactionStore:
             candidate_provenance = self._candidate_provenance(prepared)
             self._validate_destination_parent(destination)
             previous_snapshot = self.installed_store._snapshot()
-            previous = self._current_provenance(prepared.identity)
+            previous = prepared.installed_provenance
+            current = self._current_provenance(prepared.identity)
+            if current != previous:
+                _fail(
+                    "installed_package_changed",
+                    "installed package changed after confirmation",
+                )
             destination_metadata = _entry(destination)
             if (previous is None) != (destination_metadata is None):
                 _fail(
@@ -1645,7 +1723,7 @@ class MarketplaceTransactionStore:
         self,
         prepared: PreparedTransaction,
         *,
-        review_digest: str | None = None,
+        review_digest: str,
         provenance_remover: Callable[[InstalledPackageIdentity], object] | None = None,
         fault: Callable[[str], None] = lambda _point: None,
     ) -> InstalledPackageProvenance:
@@ -1988,6 +2066,12 @@ class MarketplaceTransactionStore:
             remaining: list[_JournalRecord] = []
             for journal in journals.journals:
                 if journal.transaction_id in active_ids:
+                    remaining.append(journal)
+                    continue
+                if (
+                    journal.phase in {"install_consumed", "remove_consumed"}
+                    and _parse_timestamp(journal.consumed_expires_at) > now
+                ):
                     remaining.append(journal)
                     continue
                 if not self._journal_markers_match(journal):

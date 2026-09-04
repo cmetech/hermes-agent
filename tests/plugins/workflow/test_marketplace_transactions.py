@@ -159,7 +159,7 @@ def _install(
     store: MarketplaceTransactionStore,
     candidate: TransactionCandidate,
 ):
-    return store.atomic_install(_consume(store, candidate))
+    return store.atomic_install(_consume(store, candidate), review_digest=REVIEW)
 
 
 def _removal_candidate(
@@ -356,7 +356,7 @@ def test_changed_staged_candidate_or_review_digest_never_installs(
     (consumed.staging_path / "fixtures" / "sample.json").write_bytes(b"changed")
 
     with pytest.raises(WorkflowMarketplaceError) as changed:
-        store.atomic_install(consumed)
+        store.atomic_install(consumed, review_digest=REVIEW)
     assert changed.value.code == "transaction_candidate_changed"
     assert not candidate.destination.exists()
 
@@ -365,6 +365,61 @@ def test_changed_staged_candidate_or_review_digest_never_installs(
         store.atomic_install(second, review_digest="d" * 64)
     assert review.value.code == "transaction_review_changed"
     assert not candidate.destination.exists()
+
+
+def test_atomic_mutations_require_a_fresh_review_digest(tmp_path: Path) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    install = _consume(store, candidate)
+
+    with pytest.raises(WorkflowMarketplaceError) as install_error:
+        store.atomic_install(install, review_digest=cast(str, None))
+    assert install_error.value.code == "transaction_review_invalid"
+    assert not candidate.destination.exists()
+
+    installed = store.atomic_install(install, review_digest=REVIEW)
+    _candidate_value, remove = _authorize_remove(store, installed)
+
+    with pytest.raises(WorkflowMarketplaceError) as remove_error:
+        store.atomic_remove(remove, review_digest=cast(str, None))
+    assert remove_error.value.code == "transaction_review_invalid"
+    assert candidate.destination.exists()
+    assert store.installed_store.get(candidate.identity) == installed
+
+
+def test_stale_prepared_update_cannot_replace_newer_destination_state(
+    tmp_path: Path,
+) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    first = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    second = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+    third = _candidate(tmp_path, _package(tmp_path, "3.0.0"))
+    _install(store, first)
+    second_review = "2" * 64
+    third_review = "3" * 64
+    second_prepared = store.prepare(
+        second,
+        review_digest=second_review,
+        actor="alice",
+        profile="p1",
+    )
+    third_prepared = store.prepare(
+        third,
+        review_digest=third_review,
+        actor="alice",
+        profile="p1",
+    )
+    stale = store.consume(second_prepared.token, actor="alice", profile="p1")
+    current = store.consume(third_prepared.token, actor="alice", profile="p1")
+    installed = store.atomic_install(current, review_digest=third_review)
+    installed_bytes = _snapshot(third.destination)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.atomic_install(stale, review_digest=second_review)
+
+    assert error.value.code == "installed_package_changed"
+    assert _snapshot(third.destination) == installed_bytes
+    assert store.installed_store.get(third.identity) == installed
 
 
 def test_atomic_mutations_reject_direct_or_unconsumed_authorization(
@@ -381,7 +436,9 @@ def test_atomic_mutations_reject_direct_or_unconsumed_authorization(
 
     for unauthorized in (install_candidate, unconsumed_install):
         with pytest.raises(WorkflowMarketplaceError) as error:
-            store.atomic_install(cast(PreparedTransaction, unauthorized))
+            store.atomic_install(
+                cast(PreparedTransaction, unauthorized), review_digest=REVIEW
+            )
         assert error.value.code == "confirmation_token_invalid"
 
     consumed_install = store.consume(
@@ -390,9 +447,9 @@ def test_atomic_mutations_reject_direct_or_unconsumed_authorization(
         profile="p1",
     )
     with pytest.raises(WorkflowMarketplaceError) as wrong_operation:
-        store.atomic_remove(consumed_install)
+        store.atomic_remove(consumed_install, review_digest=REVIEW)
     assert wrong_operation.value.code == "confirmation_token_invalid"
-    installed = store.atomic_install(consumed_install)
+    installed = store.atomic_install(consumed_install, review_digest=REVIEW)
     remove_candidate = _removal_candidate(store, installed)
     unconsumed_remove = store.prepare(
         remove_candidate,
@@ -403,7 +460,9 @@ def test_atomic_mutations_reject_direct_or_unconsumed_authorization(
 
     for unauthorized in (installed.identity, remove_candidate, unconsumed_remove):
         with pytest.raises(WorkflowMarketplaceError) as error:
-            store.atomic_remove(cast(PreparedTransaction, unauthorized))
+            store.atomic_remove(
+                cast(PreparedTransaction, unauthorized), review_digest=REVIEW
+            )
         assert error.value.code == "confirmation_token_invalid"
 
     consumed_remove = store.consume(
@@ -412,7 +471,7 @@ def test_atomic_mutations_reject_direct_or_unconsumed_authorization(
         profile="p1",
     )
     with pytest.raises(WorkflowMarketplaceError) as wrong_operation:
-        store.atomic_install(consumed_remove)
+        store.atomic_install(consumed_remove, review_digest=REVIEW)
     assert wrong_operation.value.code == "confirmation_token_invalid"
     assert store.installed_store.get(installed.identity) == installed
 
@@ -476,6 +535,7 @@ def test_failed_provenance_write_restores_previous_package_and_provenance(
     with pytest.raises(OSError, match="simulated provenance failure"):
         store.atomic_install(
             _consume(store, second),
+            review_digest=REVIEW,
             provenance_writer=fail_write,
         )
 
@@ -496,6 +556,7 @@ def test_failed_first_install_restores_absent_package_and_provenance_file(
     with pytest.raises(OSError, match="simulated provenance failure"):
         store.atomic_install(
             _consume(store, candidate),
+            review_digest=REVIEW,
             provenance_writer=fail_write,
         )
 
@@ -523,7 +584,10 @@ def test_destination_symlink_fails_without_touching_target(tmp_path: Path) -> No
         pytest.skip("host does not permit directory symlinks")
 
     with pytest.raises(WorkflowMarketplaceError) as error:
-        store.atomic_install(store.consume(prepared.token, actor="alice", profile="p1"))
+        store.atomic_install(
+            store.consume(prepared.token, actor="alice", profile="p1"),
+            review_digest=REVIEW,
+        )
 
     assert error.value.code == "transaction_destination_invalid"
     assert marker.read_text(encoding="utf-8") == "keep"
@@ -581,7 +645,8 @@ def test_interrupted_install_recovers_idempotently_at_every_visibility_boundary(
     crash_point: str,
     expected_version: str,
 ) -> None:
-    store = MarketplaceTransactionStore(tmp_path)
+    now = [datetime(2026, 9, 3, tzinfo=timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
     first = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
     second = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
     _install(store, first)
@@ -594,8 +659,10 @@ def test_interrupted_install_recovers_idempotently_at_every_visibility_boundary(
             raise SimulatedCrash(point)
 
     with pytest.raises(SimulatedCrash):
-        store.atomic_install(_consume(store, second), fault=crash)
+        store.atomic_install(_consume(store, second), review_digest=REVIEW, fault=crash)
 
+    if crash_point == "before_initial_journal":
+        now[0] += timedelta(minutes=6)
     store.recover_transactions()
     first_state = _snapshot(first.destination)
     store.recover_transactions()
@@ -637,6 +704,7 @@ def test_rollback_write_failure_remains_journaled_and_recovery_restores_v1(
     with pytest.raises(WorkflowMarketplaceError) as error:
         store.atomic_install(
             _consume(store, second),
+            review_digest=REVIEW,
             provenance_writer=write_then_fail,
         )
     assert error.value.code == "transaction_rollback_failed"
@@ -665,6 +733,7 @@ def test_atomic_remove_has_matching_rollback_and_success_semantics(
     with pytest.raises(OSError, match="simulated remove failure"):
         store.atomic_remove(
             removal,
+            review_digest=REVIEW,
             provenance_remover=fail_remove,
         )
 
@@ -672,7 +741,7 @@ def test_atomic_remove_has_matching_rollback_and_success_semantics(
     assert InstalledPackageStore(tmp_path).get(candidate.identity) == installed
 
     _remove_candidate_value, removal = _authorize_remove(store, installed)
-    removed = store.atomic_remove(removal)
+    removed = store.atomic_remove(removal, review_digest=REVIEW)
     assert removed == installed
     assert not candidate.destination.exists()
     with pytest.raises(WorkflowMarketplaceError) as error:
@@ -690,7 +759,7 @@ def test_atomic_remove_revalidates_installed_bytes_after_confirmation(
     (candidate.destination / "fixtures" / "sample.json").write_bytes(b"tampered")
 
     with pytest.raises(WorkflowMarketplaceError) as error:
-        store.atomic_remove(removal)
+        store.atomic_remove(removal, review_digest=REVIEW)
 
     assert error.value.code == "transaction_candidate_changed"
     assert candidate.destination.exists()
@@ -723,6 +792,7 @@ def test_interrupted_remove_recovers_idempotently(
     with pytest.raises(SimulatedCrash):
         store.atomic_remove(
             removal,
+            review_digest=REVIEW,
             fault=crash,
         )
 
@@ -739,8 +809,11 @@ def test_interrupted_remove_recovers_idempotently(
     assert store.list_journals() == ()
 
 
-def test_recovery_cleans_only_abandoned_owned_staging(tmp_path: Path) -> None:
-    store = MarketplaceTransactionStore(tmp_path)
+def test_recovery_preserves_live_consumed_authorization_and_unrelated_staging(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 9, 3, tzinfo=timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
     candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
     prepared = store.prepare(
         candidate,
@@ -748,7 +821,7 @@ def test_recovery_cleans_only_abandoned_owned_staging(tmp_path: Path) -> None:
         actor="alice",
         profile="p1",
     )
-    store.consume(prepared.token, actor="alice", profile="p1")
+    consumed = store.consume(prepared.token, actor="alice", profile="p1")
     unrelated_directory = store.staging_root / "unrelated"
     unrelated_directory.mkdir(parents=True)
     (unrelated_directory / "keep").write_text("keep", encoding="utf-8")
@@ -757,9 +830,76 @@ def test_recovery_cleans_only_abandoned_owned_staging(tmp_path: Path) -> None:
 
     store.recover_transactions()
 
-    assert not prepared.staging_path.parent.exists()
+    assert prepared.staging_path.parent.exists()
+    assert len(store.list_journals()) == 1
     assert (unrelated_directory / "keep").read_text(encoding="utf-8") == "keep"
     assert unrelated_file.read_text(encoding="utf-8") == "keep"
+
+    installed = store.atomic_install(consumed, review_digest=REVIEW)
+    assert store.installed_store.get(candidate.identity) == installed
+
+
+def test_recovery_expires_abandoned_consumed_authorization_deterministically(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 9, 3, tzinfo=timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate,
+        review_digest=REVIEW,
+        actor="alice",
+        profile="p1",
+    )
+    consumed = store.consume(prepared.token, actor="alice", profile="p1")
+    now[0] += timedelta(minutes=6)
+
+    assert store.recover_transactions() == (prepared.transaction_id,)
+    assert store.recover_transactions() == ()
+
+    assert not prepared.staging_path.parent.exists()
+    assert store.list_journals() == ()
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.atomic_install(consumed, review_digest=REVIEW)
+    assert error.value.code == "confirmation_token_invalid"
+
+
+@pytest.mark.parametrize(
+    ("operation", "nested_key"),
+    [
+        ("install", "candidateProvenance"),
+        ("remove", "previousProvenance"),
+    ],
+)
+def test_recovery_rejects_nested_journal_provenance_identity_mismatch(
+    tmp_path: Path,
+    operation: Literal["install", "remove"],
+    nested_key: str,
+) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = None
+    if operation == "install":
+        prepared = _consume(store, candidate)
+    else:
+        installed = _install(store, candidate)
+        _candidate_value, prepared = _authorize_remove(store, installed)
+    state = json.loads(store.journal_path.read_bytes())
+    state["journals"][0][nested_key]["identity"]["sourceKey"] = "other"
+    store.journal_path.write_text(json.dumps(state), encoding="utf-8")
+    package_before = _snapshot(candidate.destination)
+    provenance_before = store.installed_store.list_installed()
+    journal_before = store.journal_path.read_bytes()
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.recover_transactions()
+
+    assert error.value.code == "transaction_state_invalid"
+    assert _snapshot(candidate.destination) == package_before
+    assert store.installed_store.list_installed() == provenance_before
+    assert store.journal_path.read_bytes() == journal_before
+    if installed is None:
+        assert prepared.staging_path.parent.exists()
 
 
 def test_recovery_expires_unconsumed_preparation_and_cleans_its_owned_staging(
@@ -798,7 +938,7 @@ def test_recovery_preserves_owned_marker_mismatch_and_ambiguous_swap(
             raise SimulatedCrash(point)
 
     with pytest.raises(SimulatedCrash):
-        store.atomic_install(_consume(store, second), fault=crash)
+        store.atomic_install(_consume(store, second), review_digest=REVIEW, fault=crash)
     journal = store.list_journals()[0]
     marker = journal.quarantine_path.parent / "owner.json"
     marker.write_text('{"schemaVersion":1,"owner":"someone-else"}\n')
