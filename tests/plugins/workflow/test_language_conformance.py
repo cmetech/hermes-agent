@@ -57,6 +57,54 @@ def _integer(value: object) -> int:
     return value
 
 
+def _semantic_diagnostic_codes(value: object) -> set[str]:
+    codes: set[str] = set()
+    if isinstance(value, Mapping):
+        table = value.get("diagnostic_table")
+        if isinstance(table, Mapping):
+            columns = table.get("cols")
+            rows = table.get("rows")
+            if isinstance(columns, list) and "semantic" in columns:
+                semantic_index = columns.index("semantic")
+                if isinstance(rows, list):
+                    codes.update(
+                        row[semantic_index]
+                        for row in rows
+                        if isinstance(row, list)
+                        and len(row) > semantic_index
+                        and isinstance(row[semantic_index], str)
+                    )
+        for item in value.values():
+            codes.update(_semantic_diagnostic_codes(item))
+    elif isinstance(value, list):
+        for item in value:
+            codes.update(_semantic_diagnostic_codes(item))
+    return codes
+
+
+def _contract_field_patterns(value: object) -> set[str]:
+    patterns: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in {"field_path", "field_paths", "fields"}:
+                if isinstance(item, str):
+                    patterns.add(item)
+                elif isinstance(item, list):
+                    patterns.update(value for value in item if isinstance(value, str))
+            patterns.update(_contract_field_patterns(item))
+    elif isinstance(value, list):
+        for item in value:
+            patterns.update(_contract_field_patterns(item))
+    return patterns
+
+
+def _field_pattern_covers_path(pattern: str, path: str) -> bool:
+    if pattern == "*":
+        return True
+    normalized_path = re.sub(r"\[\d+]", "[]", path)
+    return normalized_path == pattern or normalized_path.startswith(f"{pattern}.")
+
+
 def _cases(profile: WorkflowLanguageProfile) -> dict[str, dict[str, object]]:
     corpus = workflow_language_conformance(profile)
     return {
@@ -138,6 +186,55 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
             assert scope == "root" or scope.startswith(
                 "loop-group:"
             )
+
+
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_every_corpus_diagnostic_is_published_by_paired_contract(profile):
+    contract = workflow_authoring_contract(profile)
+    diagnostics = [
+        diagnostic
+        for case in _mapping_list(workflow_language_conformance(profile)["cases"])
+        for diagnostic in _mapping_list(case["diagnostics"])
+    ]
+    compatibility_codes = _mapping(contract["compatibility_codes"])
+    published_codes = set(compatibility_codes) | _semantic_diagnostic_codes(contract)
+    missing_codes = sorted(
+        {
+            _text(diagnostic["code"])
+            for diagnostic in diagnostics
+            if _text(diagnostic["code"]) not in published_codes
+        }
+    )
+
+    assert missing_codes == []
+
+    contract_fields = _contract_field_patterns(contract) - {"*"}
+    for diagnostic in diagnostics:
+        native_entry = compatibility_codes.get(_text(diagnostic["hermes_code"]))
+        if isinstance(native_entry, Mapping):
+            severity = native_entry.get("severity")
+            blocking = native_entry.get("blocking")
+            if native_entry.get("runtime_failure") is True:
+                severity = severity or "error"
+                blocking = True if blocking is None else blocking
+            assert severity == diagnostic["severity"], diagnostic["code"]
+            assert blocking is diagnostic["blocking"], diagnostic["code"]
+            fields = native_entry.get("fields")
+            if "severity" in native_entry and "blocking" in native_entry:
+                assert isinstance(fields, list)
+                assert all(isinstance(field, str) for field in fields)
+                published_fields = cast(list[str], fields)
+            else:
+                published_fields = contract_fields
+        else:
+            assert diagnostic["code"] != diagnostic["hermes_code"]
+            assert diagnostic["severity"] == "error"
+            assert diagnostic["blocking"] is True
+            published_fields = contract_fields
+        assert any(
+            _field_pattern_covers_path(pattern, _text(diagnostic["path"]))
+            for pattern in published_fields
+        ), diagnostic["code"]
 
 
 def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():

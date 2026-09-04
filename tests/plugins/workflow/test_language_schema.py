@@ -893,7 +893,7 @@ def test_legacy_authoring_contract_preserves_supported_versions(
     }
 
 
-def test_legacy_contract_is_byte_identical_to_declared_merge_base():
+def test_legacy_contract_only_adds_declared_rejections_to_merge_base():
     fixture_path = (
         Path(__file__).with_name("fixtures")
         / "legacy-contract-c1dc7a23.json"
@@ -910,11 +910,34 @@ def test_legacy_contract_is_byte_identical_to_declared_merge_base():
     assert len(golden) == fixture["canonical_bytes"]
     assert sha256(golden).hexdigest() == fixture["canonical_sha256"]
 
-    current = language_schema.canonical_contract_json(
-        workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
-    ).encode("utf-8")
+    golden_contract = json.loads(golden)
+    current = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    expected = {
+        "artifacts_version_unsupported": ["nodes[].artifacts"],
+        "loop_group_version_unsupported": ["nodes[].loop_group"],
+    }
+    current_codes = current["compatibility_codes"]
+    assert isinstance(current_codes, dict)
+    for code, fields in expected.items():
+        entry = current_codes.pop(code)
+        assert {
+            "blocking": entry["blocking"],
+            "enforcement_phase": entry["enforcement_phase"],
+            "fields": entry["fields"],
+            "runtime_status": entry["runtime_status"],
+            "severity": entry["severity"],
+            "status": entry["status"],
+        } == {
+            "blocking": True,
+            "enforcement_phase": 6,
+            "fields": fields,
+            "runtime_status": "blocking",
+            "severity": "error",
+            "status": "deferred",
+        }
 
-    assert current == golden
+    assert current.pop("contract_digest") != golden_contract.pop("contract_digest")
+    assert current == golden_contract
 
 
 def test_phase6_semantic_rules_retain_kind_projection():
