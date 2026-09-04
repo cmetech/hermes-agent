@@ -1,0 +1,5 @@
+name: laptop-diagnostic
+nodes:
+  inspect:
+    type: command
+    command: interpret-report
