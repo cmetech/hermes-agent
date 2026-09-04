@@ -208,6 +208,13 @@ class LoopGroupWorkFactorAuthority:
         return (self.retry_field, self.max_attempts_field)
 
     @property
+    def retry_selector_predicate(self) -> dict[str, object]:
+        return {
+            "path": list(self.retry_max_attempts_path),
+            "operator": "present",
+        }
+
+    @property
     def approval_max_attempts_path(self) -> tuple[str, ...]:
         return (
             self.approval_node_type,
@@ -271,7 +278,11 @@ def loop_group_node_work_factors(
                 authority.max_attempts_field,
                 authority.approval_default_max_attempts,
             )
-        if selector == authority.retry_field and isinstance(retry, Mapping):
+        if (
+            selector == authority.retry_field
+            and isinstance(retry, Mapping)
+            and authority.max_attempts_field in retry
+        ):
             return multiplier, cast(Mapping[str, object], retry).get(
                 authority.max_attempts_field,
                 authority.other_default_retries,
@@ -3762,6 +3773,7 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
         "loop-group-work-product-v1": {
             "expression_format": "prefix-v1",
             "retry_precedence": ">".join(work_factors.retry_precedence),
+            "retry_selector_predicate": work_factors.retry_selector_predicate,
             "expressions": {
                 "executions": [
                     "*",
@@ -4013,7 +4025,7 @@ def semantic_rule_descriptors(
         "profiles": [selected.value],
         "documents": ["definition"],
     }
-    rules = [
+    rules = cast(list[dict[str, object]], [
         {
             "id": "dag-topology",
             "label": "DAG topology",
@@ -4189,7 +4201,7 @@ def semantic_rule_descriptors(
             if phase6
             else []
         ),
-    ]
+    ])
     if phase6:
         return [{**rule, "kind": rule["id"]} for rule in rules]
     return rules

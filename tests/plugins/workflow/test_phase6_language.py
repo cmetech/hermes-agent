@@ -17,8 +17,10 @@ from plugins.workflow.language import (
     WorkflowLanguageCompatibilityError,
 )
 from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.execution_semantics import build_phase3_execution_semantics
 from plugins.workflow.models import (
     LoopGroupChildScope,
+    RunExecutionLimits,
     WorkflowLanguageProfile,
     WorkflowNode,
     WorkflowValidationError,
@@ -124,7 +126,13 @@ def _evaluate_contract_selector(name, formula, descriptor, node):
                 if selected is _MISSING
                 else selected
             )
-        if branch == "retry" and isinstance(node.get("retry"), Mapping):
+        retry_predicate = cast(dict[str, object], formula["retry_selector_predicate"])
+        retry_path = cast(list[str], retry_predicate["path"])
+        if (
+            branch == "retry"
+            and retry_predicate["operator"] == "present"
+            and _contract_path_value(node, retry_path) is not _MISSING
+        ):
             selected = _contract_path_value(
                 node, descriptor["retry_max_attempts_path"]
             )
@@ -1462,6 +1470,52 @@ def test_v6_rejects_worst_case_child_attempt_product(tmp_path, workflow_writer):
     )
 
 
+def test_v6_partial_ai_retry_mapping_rejects_executable_work_and_admits_within_bound(
+    tmp_path, workflow_writer
+):
+    rejected = workflow_writer(
+        tmp_path / "rejected",
+        nodes=[
+            _group(
+                [
+                    {
+                        "id": f"prompt{index}",
+                        "prompt": "run",
+                        "retry": {"on_error": "transient"},
+                    }
+                    for index in range(14)
+                ],
+                max_iterations=100,
+            )
+        ],
+    )
+    admitted = workflow_writer(
+        tmp_path / "admitted",
+        nodes=[
+            _group(
+                [
+                    {
+                        "id": f"command{index}",
+                        "command": "run",
+                        "retry": {"delay_ms": 1000},
+                    }
+                    for index in range(13)
+                ],
+                max_iterations=100,
+            )
+        ],
+    )
+
+    _assert_issue(rejected, "loop_group_product_limit", "nodes[0].loop_group")
+    package = _normalize_v6_without_admission(admitted)
+    loop_group = package.language.node_semantics["process-items"]["loop_group"]
+
+    assert (
+        loop_group["child_attempts"],
+        loop_group["capacity"]["output_attempts"],
+    ) == (3900, 3900)
+
+
 def test_v6_counts_approval_rework_in_child_attempt_product(tmp_path, workflow_writer):
     body = [
         {
@@ -1557,6 +1611,92 @@ def test_v6_published_command_prompt_default_drives_runtime_admission(
         semantics["child_attempts"],
         semantics["capacity"]["output_attempts"],
     ) == (1, 5, 5)
+
+
+@pytest.mark.parametrize(
+    ("body_node", "node_type", "scoped_node_id", "expected_retry"),
+    [
+        (
+            {
+                "id": "command",
+                "command": "run",
+                "retry": {"delay_ms": 1000},
+            },
+            "command",
+            "process-items/command",
+            {"delay_ms": 1000, "on_error": "transient"},
+        ),
+        (
+            {
+                "id": "prompt",
+                "prompt": "run",
+                "retry": {"on_error": "transient"},
+            },
+            "prompt",
+            "process-items/prompt",
+            {"delay_ms": 3000, "on_error": "transient"},
+        ),
+    ],
+    ids=("command-delay-only", "prompt-on-error-only"),
+)
+def test_v6_partial_ai_retry_mapping_uses_sealed_ai_default_for_work_and_capacity(
+    tmp_path, workflow_writer, body_node, node_type, scoped_node_id, expected_retry
+):
+    path = workflow_writer(
+        tmp_path,
+        nodes=[_group([body_node], max_iterations=1)],
+    )
+
+    raw_multiplier, raw_retries = language_schema.loop_group_node_work_factors(
+        node_type,
+        body_node[node_type],
+        body_node,
+    )
+    package = _normalize_v6_without_admission(path)
+    loop_group = package.language.node_semantics["process-items"]["loop_group"]
+    execution = build_phase3_execution_semantics(package, RunExecutionLimits())
+
+    assert (raw_multiplier, raw_retries) == (1, 2)
+    assert (
+        loop_group["child_executions"],
+        loop_group["child_attempts"],
+        loop_group["capacity"]["output_attempts"],
+    ) == (1, 3, 3)
+    assert execution.nodes[scoped_node_id]["retry"] == {
+        "explicit": True,
+        "requested_retries": 2,
+        "requested_total_attempts": 3,
+        "effective_total_attempts": 3,
+        "capped": False,
+        **expected_retry,
+    }
+
+
+def test_v6_partial_ai_retry_mapping_publishes_max_attempts_presence_predicate():
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=6,
+    )
+    work = next(
+        rule
+        for rule in cast(list[dict[str, object]], contract["semantic_rules"])
+        if rule.get("kind") == "loop-group-work-product-v1"
+    )
+    reference = cast(dict[str, str], work["semantic_ref"])
+    loop_group_kind = next(
+        item
+        for item in cast(list[dict[str, object]], contract["node_kinds"])
+        if item["id"] == reference["node_kind"]
+    )
+    formula = cast(dict[str, dict[str, object]], loop_group_kind["semantic_definitions"])[
+        reference["definition"]
+    ]
+
+    assert formula["retry_precedence"] == "approval>retry>command|prompt>default"
+    assert formula["retry_selector_predicate"] == {
+        "path": ["retry", "max_attempts"],
+        "operator": "present",
+    }
 
 
 @pytest.mark.parametrize(
