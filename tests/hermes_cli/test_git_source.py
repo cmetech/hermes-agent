@@ -241,6 +241,65 @@ def test_safe_git_error_preserves_ssh_usernames_and_unrelated_text():
     )
 
 
+def test_safe_git_error_preserves_valid_ipv6_http_authorities():
+    result = _completed(
+        stderr=(
+            "fatal: https://[::1] and [https://[2001:db8::1]:8443/repo.git?mode=fast]."
+        )
+    )
+
+    assert safe_git_error(result) == (
+        "fatal: https://[::1] and [https://[2001:db8::1]:8443/repo.git]."
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "source_url"),
+    [
+        ("fatal: failed=https://", ""),
+        ("fatal: failed=https:///root", ""),
+        ("fatal: failed=https://host:bad/root", ""),
+        ("fatal: failed=https://host:", ""),
+        ("fatal: failed=https://[bad/root", ""),
+        ("fatal: failed=https://[2001:db8::1]:", ""),
+        ("fatal: failed=https://[2001:db8::1]:bad/root", ""),
+        ("fatal: repository unavailable", "https://host:bad/root"),
+        ("fatal: repository unavailable", "https://[bad/root"),
+    ],
+)
+def test_safe_git_error_fails_closed_without_raising_for_malformed_http_urls(
+    message,
+    source_url,
+):
+    rendered = safe_git_error(_completed(stderr=message), source_url)
+
+    assert rendered == "Git operation failed."
+    assert "root" not in rendered
+    assert "host" not in rendered
+
+
+def test_safe_git_error_is_total_for_bounded_malformed_http_text_and_identities():
+    alphabet = "abcXYZ019:/[%\\ <>\u017f\u2603"
+
+    for seed in range(64):
+        payload_length = (seed * 193) % 4050
+        payload = "".join(
+            alphabet[(seed + offset * 17) % len(alphabet)]
+            for offset in range(payload_length)
+        )
+        malformed = f"https://[{payload}/root/operator/secret.txt"
+        malformed = malformed[:4096]
+
+        assert (
+            safe_git_error(_completed(stderr=f"fatal: failed={malformed}"))
+            == "Git operation failed."
+        )
+        assert (
+            safe_git_error(_completed(stderr="fatal: unavailable"), malformed)
+            == "Git operation failed."
+        )
+
+
 def test_canonical_git_source_never_contains_http_credentials_or_query_tokens():
     assert (
         canonical_git_source(

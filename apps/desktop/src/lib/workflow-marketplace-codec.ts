@@ -728,16 +728,28 @@ function decodeSource(value: unknown): WorkflowMarketplaceSource | null {
   return { enabled, name, ref, repository_url: repositoryUrl }
 }
 
-const DIAGNOSTIC_CREDENTIAL_ASSIGNMENT =
-  /\b(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]/i
-
-const DIAGNOSTIC_HTTP_START = /https?:\/\//gi
-
-const DIAGNOSTIC_LOCAL_PATH =
-  /(?:file:\/+[^\s"'<>()[\]{},;]+|(?<![A-Za-z0-9/])\/{1,2}(?!\/)(?:[^/\s"'<>()[\]{},;?#=&]+\/)+[^/\s"'<>()[\]{},;?#=&]*|(?<![A-Za-z0-9])[A-Za-z]:\/[^\s"'<>()[\]{},;]*|[^\s"'<>()[\]{},;=]*(?:\/)?\.(?:staging|quarantine)(?:\/[^\s"'<>()[\]{},;]*)?)/i
-
 const DIAGNOSTIC_PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/
 const DIAGNOSTIC_PERCENT_ESCAPE_RUN = /(?:%[0-9A-Fa-f]{2})+/g
+const DIAGNOSTIC_CREDENTIAL_NAMES = new Set([
+  'accesstoken',
+  'apikey',
+  'auth',
+  'authorization',
+  'clientsecret',
+  'confirmationtoken',
+  'credential',
+  'credentials',
+  'password',
+  'refreshtoken',
+  'token'
+])
+const DIAGNOSTIC_TOKEN_BREAKS = new Set(['<', '>', '"', "'"])
+const DIAGNOSTIC_PATH_BREAKS = new Set([...`"'<>()[\\]{},;?#=&/`])
+const DIAGNOSTIC_TRAILING_URL_PUNCTUATION = new Set([...'.,;:!?)]}'])
+const DIAGNOSTIC_URI_ASCII = new Set([
+  ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!$&()*+,;=:@/?#%'
+])
+const HEX_DIGITS = new Set([...'0123456789abcdefABCDEF'])
 
 function isAsciiAlphanumeric(value: string): boolean {
   const code = value.charCodeAt(0)
@@ -749,28 +761,153 @@ function isUnicodeAlphanumeric(value: string): boolean {
   return /^[\p{L}\p{N}]$/u.test(value)
 }
 
-function previousCodePoint(value: string, index: number): string {
-  const trailingUnit = value.charCodeAt(index - 1)
-
-  if (trailingUnit >= 0xdc00 && trailingUnit <= 0xdfff && index >= 2) {
-    const leadingUnit = value.charCodeAt(index - 2)
-
-    if (leadingUnit >= 0xd800 && leadingUnit <= 0xdbff) {
-      return value.slice(index - 2, index)
-    }
-  }
-
-  return value[index - 1]
+function diagnosticCharacterIsWhitespace(value: string): boolean {
+  return /^\p{White_Space}$/u.test(value)
 }
 
-function diagnosticIdentityHasBoundary(value: string, index: number): boolean {
+function diagnosticIdentityHasBoundary(value: readonly string[], index: number): boolean {
   if (index === 0) {
     return true
   }
 
-  const previous = previousCodePoint(value, index)
+  const previous = value[index - 1]
 
-  return !'/-._~%'.includes(previous) && !isAsciiAlphanumeric(previous) && !isUnicodeAlphanumeric(previous)
+  return previous !== '/' && !isAsciiAlphanumeric(previous) && !isUnicodeAlphanumeric(previous)
+}
+
+function diagnosticContainsCredentialAssignment(value: readonly string[]): boolean {
+  let index = 0
+
+  while (index < value.length) {
+    const character = value[index]
+
+    if (!(isAsciiAlphanumeric(character) || character === '_' || character === '-')) {
+      index += 1
+
+      continue
+    }
+
+    const start = index
+
+    while (
+      index < value.length &&
+      (isAsciiAlphanumeric(value[index]) || value[index] === '_' || value[index] === '-')
+    ) {
+      index += 1
+    }
+
+    const compact = value
+      .slice(start, index)
+      .filter(character => character !== '_' && character !== '-')
+      .join('')
+      .toLowerCase()
+    let cursor = index
+
+    while (cursor < value.length && diagnosticCharacterIsWhitespace(value[cursor])) {
+      cursor += 1
+    }
+
+    if (
+      DIAGNOSTIC_CREDENTIAL_NAMES.has(compact) &&
+      cursor < value.length &&
+      (value[cursor] === '=' || value[cursor] === ':')
+    ) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function diagnosticIpv4IsSafe(value: string): boolean {
+  const components = value.split('.')
+
+  return (
+    components.length === 4 &&
+    components.every(
+      component =>
+        component.length > 0 &&
+        [...component].every(character => character >= '0' && character <= '9') &&
+        Number(component) <= 255
+    )
+  )
+}
+
+function diagnosticIpv6IsSafe(value: string): boolean {
+  if (!value || value.includes('%')) {
+    return false
+  }
+
+  const compressedAt = value.indexOf('::')
+
+  if (compressedAt >= 0 && value.indexOf('::', compressedAt + 2) >= 0) {
+    return false
+  }
+
+  const compressed = compressedAt >= 0
+  const left = compressed ? value.slice(0, compressedAt) : value
+  const right = compressed ? value.slice(compressedAt + 2) : ''
+  const parts = [...(left ? left.split(':') : []), ...(right ? right.split(':') : [])]
+
+  if (parts.some(part => part.length === 0)) {
+    return false
+  }
+
+  let slots = 0
+
+  for (const [index, part] of parts.entries()) {
+    if (part.includes('.')) {
+      if (index !== parts.length - 1 || !diagnosticIpv4IsSafe(part)) {
+        return false
+      }
+
+      slots += 2
+    } else {
+      if (part.length < 1 || part.length > 4 || [...part].some(character => !HEX_DIGITS.has(character))) {
+        return false
+      }
+
+      slots += 1
+    }
+  }
+
+  return compressed ? slots < 8 : slots === 8
+}
+
+function diagnosticHostnameIsSafe(value: string): boolean {
+  if (!value || [...value].length > 253) {
+    return false
+  }
+
+  if ([...value].every(character => (character >= '0' && character <= '9') || character === '.')) {
+    return diagnosticIpv4IsSafe(value)
+  }
+
+  const hostname = value.endsWith('.') ? value.slice(0, -1) : value
+
+  if (!hostname) {
+    return false
+  }
+
+  return hostname.split('.').every(label => {
+    const characters = [...label]
+
+    return (
+      characters.length >= 1 &&
+      characters.length <= 63 &&
+      characters[0] !== '-' &&
+      characters.at(-1) !== '-' &&
+      characters.every(
+        character => isAsciiAlphanumeric(character) || isUnicodeAlphanumeric(character) || character === '-'
+      )
+    )
+  })
+}
+
+function diagnosticPortIsSafe(value: string): boolean {
+  return (
+    value.length > 0 && [...value].every(character => character >= '0' && character <= '9') && Number(value) <= 65535
+  )
 }
 
 function diagnosticHttpAuthorityIsSafe(value: string): boolean {
@@ -779,7 +916,7 @@ function diagnosticHttpAuthorityIsSafe(value: string): boolean {
   }
 
   if (value.startsWith('[')) {
-    const closing = value.indexOf(']')
+    const closing = value.indexOf(']', 1)
 
     if (closing <= 1 || value.slice(1).includes('[') || value.slice(closing + 1).includes(']')) {
       return false
@@ -789,12 +926,12 @@ function diagnosticHttpAuthorityIsSafe(value: string): boolean {
     const suffix = value.slice(closing + 1)
 
     return (
-      [...address].every(character => !/\s/.test(character) && !'/[]@'.includes(character)) &&
-      (suffix.length === 0 || /^:\d+$/.test(suffix))
+      diagnosticIpv6IsSafe(address) &&
+      (suffix.length === 0 || (suffix.startsWith(':') && diagnosticPortIsSafe(suffix.slice(1))))
     )
   }
 
-  if ((value.match(/:/g) ?? []).length > 1) {
+  if ([...value].filter(character => character === ':').length > 1) {
     return false
   }
 
@@ -802,134 +939,319 @@ function diagnosticHttpAuthorityIsSafe(value: string): boolean {
   const host = separator < 0 ? value : value.slice(0, separator)
   const port = separator < 0 ? null : value.slice(separator + 1)
 
-  return (
-    host.length > 0 &&
-    [...host].every(
-      character => isAsciiAlphanumeric(character) || isUnicodeAlphanumeric(character) || '.-_~%'.includes(character)
-    ) &&
-    (port === null || /^\d+$/.test(port))
-  )
+  return diagnosticHostnameIsSafe(host) && (port === null || diagnosticPortIsSafe(port))
 }
 
-function diagnosticLocalIdentityStartsAt(value: string, index: number): boolean {
-  if (!diagnosticIdentityHasBoundary(value, index)) {
+function diagnosticPathCharacterIsSafe(character: string): boolean {
+  return !diagnosticCharacterIsWhitespace(character) && !DIAGNOSTIC_PATH_BREAKS.has(character)
+}
+
+function diagnosticMatchesAsciiLiteral(value: readonly string[], index: number, literal: string): boolean {
+  if (index + literal.length > value.length) {
     return false
   }
 
-  const match = DIAGNOSTIC_LOCAL_PATH.exec(value.slice(index))
+  for (let offset = 0; offset < literal.length; offset += 1) {
+    const character = value[index + offset]
+    const expected = literal[offset]
 
-  return match?.index === 0
+    if (character !== expected && !(expected >= 'a' && expected <= 'z' && character === expected.toUpperCase())) {
+      return false
+    }
+  }
+
+  return true
 }
 
-function diagnosticHttpSchemeSlashesStartAt(value: string, index: number): boolean {
-  const prefix = value.slice(Math.max(0, index - 6), index).toLowerCase()
+function diagnosticStagingIdentityStartsAt(value: readonly string[], index: number, insideHttpUrl: boolean): boolean {
+  if (value[index] !== '.') {
+    return false
+  }
 
-  return prefix.endsWith('http:') || prefix.endsWith('https:')
+  let length = 0
+
+  for (const candidate of ['.quarantine', '.staging']) {
+    if (diagnosticMatchesAsciiLiteral(value, index, candidate)) {
+      length = candidate.length
+
+      break
+    }
+  }
+
+  if (length === 0 || (insideHttpUrl && index > 0 && value[index - 1] === '/')) {
+    return false
+  }
+
+  const end = index + length
+
+  return (
+    end === value.length ||
+    value[end] === '/' ||
+    (!isAsciiAlphanumeric(value[end]) && !isUnicodeAlphanumeric(value[end]) && !'._-'.includes(value[end]))
+  )
 }
 
-function diagnosticHttpSchemeLengthAt(value: string, index: number): number {
-  const candidate = value.slice(index, index + 'https://'.length).toLowerCase()
+function diagnosticLocalIdentityStartsAt(value: readonly string[], index: number, insideHttpUrl = false): boolean {
+  if (diagnosticStagingIdentityStartsAt(value, index, insideHttpUrl)) {
+    return true
+  }
 
-  if (candidate.startsWith('https://')) {
+  const hasBoundary = insideHttpUrl
+    ? index === 0 ||
+      (!'/-._~%'.includes(value[index - 1]) &&
+        !isAsciiAlphanumeric(value[index - 1]) &&
+        !isUnicodeAlphanumeric(value[index - 1]))
+    : diagnosticIdentityHasBoundary(value, index)
+
+  if (!hasBoundary) {
+    return false
+  }
+
+  if (diagnosticMatchesAsciiLiteral(value, index, 'file:')) {
+    const cursor = index + 'file:'.length
+
+    return cursor < value.length && !diagnosticCharacterIsWhitespace(value[cursor])
+  }
+
+  if (
+    index + 2 < value.length &&
+    /^[A-Za-z]$/.test(value[index]) &&
+    value[index + 1] === ':' &&
+    value[index + 2] === '/'
+  ) {
+    return true
+  }
+
+  if (value[index] !== '/' || index + 1 >= value.length) {
+    return false
+  }
+
+  let cursor = index
+
+  while (cursor < value.length && value[cursor] === '/') {
+    cursor += 1
+  }
+
+  return cursor < value.length && diagnosticPathCharacterIsSafe(value[cursor])
+}
+
+function diagnosticHttpSchemeLengthAt(value: readonly string[], index: number): number {
+  if (value[index] !== 'h' && value[index] !== 'H') {
+    return 0
+  }
+
+  if (diagnosticMatchesAsciiLiteral(value, index, 'https://')) {
     return 'https://'.length
   }
 
-  if (candidate.startsWith('http://')) {
+  if (diagnosticMatchesAsciiLiteral(value, index, 'http://')) {
     return 'http://'.length
   }
 
   return 0
 }
 
-function diagnosticHttpSchemeHasBoundary(value: string, index: number): boolean {
+function diagnosticHttpSchemeHasBoundary(value: readonly string[], index: number): boolean {
   if (index === 0) {
     return true
   }
 
-  const previous = previousCodePoint(value, index)
+  const previous = value[index - 1]
 
   return previous !== '/' && !isAsciiAlphanumeric(previous) && !isUnicodeAlphanumeric(previous)
 }
 
-// safeDiagnosticText bounds every input to 4,096 code points. Walk each URL
-// token explicitly so punctuation followed by a separately rooted identity
-// terminates the safe span instead of being swallowed by a broad URL regex.
-function maskSafeDiagnosticHttpUrls(value: string): string {
-  const masked = value.split('')
-  let consumedUntil = 0
+function diagnosticHttpTokenEnd(value: readonly string[], schemeEnd: number): number {
+  let tokenEnd = schemeEnd
 
-  for (const match of value.matchAll(DIAGNOSTIC_HTTP_START)) {
-    const start = match.index
+  while (tokenEnd < value.length) {
+    const character = value[tokenEnd]
 
-    if (start < consumedUntil) {
-      continue
+    if (diagnosticCharacterIsWhitespace(character) || DIAGNOSTIC_TOKEN_BREAKS.has(character)) {
+      break
     }
 
-    let tokenEnd = start + match[0].length
-
-    while (tokenEnd < value.length && !/[\s<>"']/.test(value[tokenEnd])) {
-      if (diagnosticHttpSchemeLengthAt(value, tokenEnd) > 0 && diagnosticHttpSchemeHasBoundary(value, tokenEnd)) {
-        break
-      }
-
-      tokenEnd += 1
+    if (diagnosticHttpSchemeLengthAt(value, tokenEnd) > 0 && diagnosticHttpSchemeHasBoundary(value, tokenEnd)) {
+      break
     }
 
-    let authorityEnd = tokenEnd
-
-    for (const delimiter of '/?#') {
-      const candidate = value.indexOf(delimiter, start + match[0].length)
-
-      if (candidate >= 0 && candidate < tokenEnd) {
-        authorityEnd = Math.min(authorityEnd, candidate)
-      }
-    }
-
-    const authority = value.slice(start + match[0].length, authorityEnd)
-
-    if (!diagnosticHttpAuthorityIsSafe(authority)) {
-      masked.fill(' ', start, authorityEnd)
-      consumedUntil = authorityEnd
-
-      continue
-    }
-
-    const firstPathSlash = authorityEnd < tokenEnd && value[authorityEnd] === '/' ? authorityEnd : -1
-    let safeEnd = tokenEnd
-
-    for (let index = start + match[0].length; index < tokenEnd; index += 1) {
-      if (
-        index !== firstPathSlash &&
-        !diagnosticHttpSchemeSlashesStartAt(value, index) &&
-        diagnosticLocalIdentityStartsAt(value, index)
-      ) {
-        safeEnd = index
-
-        break
-      }
-    }
-
-    masked.fill(' ', start, safeEnd)
-    consumedUntil = tokenEnd
+    tokenEnd += 1
   }
 
-  return masked.join('')
+  return tokenEnd
 }
 
-function diagnosticTextContainsLocalPath(value: string): boolean {
-  const normalized = value.replaceAll('\\', '/')
-  const withoutHttpUrls = maskSafeDiagnosticHttpUrls(normalized)
+function diagnosticTrimUrlPunctuation(value: readonly string[], schemeEnd: number, tokenEnd: number): number {
+  let end = tokenEnd
+  const authorityTerminated = value.slice(schemeEnd, tokenEnd).some(character => '/?#'.includes(character))
 
-  return DIAGNOSTIC_LOCAL_PATH.test(withoutHttpUrls)
+  while (end > schemeEnd && DIAGNOSTIC_TRAILING_URL_PUNCTUATION.has(value[end - 1])) {
+    if (value[end - 1] === ':' && !authorityTerminated) {
+      break
+    }
+
+    if (value[end - 1] === ']' && value[schemeEnd] === '[') {
+      const ipv6Closing = value.indexOf(']', schemeEnd + 1)
+
+      if (ipv6Closing === end - 1) {
+        break
+      }
+    }
+
+    end -= 1
+  }
+
+  return end
+}
+
+function diagnosticHttpUrlEnd(
+  original: readonly string[],
+  normalized: readonly string[],
+  start: number,
+  schemeLength: number
+): number | null {
+  const schemeEnd = start + schemeLength
+
+  for (let index = start; index < schemeEnd; index += 1) {
+    if (original[index] !== normalized[index]) {
+      return null
+    }
+  }
+
+  const tokenEnd = diagnosticHttpTokenEnd(normalized, schemeEnd)
+  const end = diagnosticTrimUrlPunctuation(normalized, schemeEnd, tokenEnd)
+
+  if (end <= schemeEnd) {
+    return null
+  }
+
+  let authorityEnd = schemeEnd
+
+  while (authorityEnd < end && !'/?#'.includes(normalized[authorityEnd])) {
+    authorityEnd += 1
+  }
+
+  if (!diagnosticHttpAuthorityIsSafe(normalized.slice(schemeEnd, authorityEnd).join(''))) {
+    return null
+  }
+
+  const firstPathSlash = authorityEnd < end && normalized[authorityEnd] === '/' ? authorityEnd : -1
+  let fragmentSeen = false
+  let index = authorityEnd
+
+  while (index < end) {
+    const character = normalized[index]
+
+    if (original[index] === '\\' || diagnosticHttpSchemeLengthAt(normalized, index) > 0) {
+      return null
+    }
+
+    if (index !== firstPathSlash && diagnosticLocalIdentityStartsAt(normalized, index, true)) {
+      return null
+    }
+
+    if (character === '#') {
+      if (fragmentSeen) {
+        return null
+      }
+
+      fragmentSeen = true
+    }
+
+    if (character === '%') {
+      let encoded = ''
+
+      while (index < end && normalized[index] === '%') {
+        if (index + 2 >= end || !HEX_DIGITS.has(normalized[index + 1]) || !HEX_DIGITS.has(normalized[index + 2])) {
+          return null
+        }
+
+        encoded += normalized.slice(index, index + 3).join('')
+        index += 3
+      }
+
+      let decoded: string
+
+      try {
+        decoded = decodeURIComponent(encoded)
+      } catch {
+        return null
+      }
+
+      if ([...decoded].some(character => containsControl(character) || '/\\%'.includes(character))) {
+        return null
+      }
+
+      continue
+    }
+
+    if (character.codePointAt(0)! <= 0x7f) {
+      if (!DIAGNOSTIC_URI_ASCII.has(character)) {
+        return null
+      }
+    } else if (diagnosticCharacterIsWhitespace(character)) {
+      return null
+    }
+
+    index += 1
+  }
+
+  return end
+}
+
+interface DiagnosticScan {
+  unsafe: boolean
+  unprotectedPercentEscape: boolean
+}
+
+function scanDiagnosticText(value: string): DiagnosticScan {
+  const original = [...value]
+  const normalized = original.map(character => (character === '\\' ? '/' : character))
+  let unprotectedPercentEscape = false
+  let index = 0
+
+  while (index < normalized.length) {
+    const schemeLength = diagnosticHttpSchemeLengthAt(normalized, index)
+
+    if (schemeLength > 0) {
+      const end = diagnosticHttpUrlEnd(original, normalized, index, schemeLength)
+
+      if (end === null) {
+        return { unsafe: true, unprotectedPercentEscape }
+      }
+
+      index = end
+
+      continue
+    }
+
+    if (diagnosticLocalIdentityStartsAt(normalized, index)) {
+      return { unsafe: true, unprotectedPercentEscape }
+    }
+
+    if (
+      normalized[index] === '%' &&
+      index + 2 < normalized.length &&
+      HEX_DIGITS.has(normalized[index + 1]) &&
+      HEX_DIGITS.has(normalized[index + 2])
+    ) {
+      unprotectedPercentEscape = true
+    }
+
+    index += 1
+  }
+
+  return {
+    unsafe:
+      diagnosticContainsCredentialAssignment(original) ||
+      hasCredentialAuthority(value) ||
+      hasCredentialParameter(value),
+    unprotectedPercentEscape
+  }
 }
 
 function diagnosticTextIsUnsafe(value: string): boolean {
-  return (
-    DIAGNOSTIC_CREDENTIAL_ASSIGNMENT.test(value) ||
-    diagnosticTextContainsLocalPath(value) ||
-    hasCredentialAuthority(value) ||
-    hasCredentialParameter(value)
-  )
+  return scanDiagnosticText(value).unsafe
 }
 
 function safeDiagnosticText(value: unknown): string | null {
@@ -974,7 +1296,7 @@ function safeDiagnosticText(value: unknown): string | null {
     probe = next
   }
 
-  return DIAGNOSTIC_PERCENT_ESCAPE.test(probe) ? null : decoded
+  return DIAGNOSTIC_PERCENT_ESCAPE.test(probe) && scanDiagnosticText(probe).unprotectedPercentEscape ? null : decoded
 }
 
 function decodeSourceRecord(value: unknown): WorkflowMarketplaceSourceRecord | null {

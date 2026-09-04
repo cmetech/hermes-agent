@@ -838,6 +838,75 @@ describe('workflow marketplace codec', () => {
     }
   })
 
+  it.each(diagnosticCorpus.invalidHttp)(
+    'rejects an invalid or credential-bearing HTTP diagnostic at raw, one, and eight layers: %s',
+    unsafe => {
+      for (const layers of [0, 1, 8]) {
+        let message = unsafe
+
+        for (let layer = 0; layer < layers; layer += 1) {
+          message = encodeURIComponent(message)
+        }
+
+        expect(
+          decodeWorkflowMarketplaceSourceList({
+            profile: 'support',
+            sources: [
+              {
+                attempted_at: NOW,
+                diagnostic_code: 'source_unavailable',
+                enabled: true,
+                message,
+                name: 'company',
+                ref: null,
+                refresh_state: 'unavailable',
+                repository_url: 'https://example.test/team/workflows.git',
+                resolved_commit: null,
+                verified_at: null,
+                verified_package_count: 0
+              }
+            ]
+          })
+        ).toBeNull()
+      }
+    }
+  )
+
+  it('rejects the generated delimiter by local-identity matrix at raw, one, and eight layers', () => {
+    for (const delimiter of diagnosticCorpus.matrix.delimiters) {
+      for (const identity of diagnosticCorpus.matrix.identities) {
+        for (const layers of [0, 1, 8]) {
+          let message = `${diagnosticCorpus.matrix.prefix}${delimiter}${identity}`
+
+          for (let layer = 0; layer < layers; layer += 1) {
+            message = encodeURIComponent(message)
+          }
+
+          expect(
+            decodeWorkflowMarketplaceSourceList({
+              profile: 'support',
+              sources: [
+                {
+                  attempted_at: NOW,
+                  diagnostic_code: 'source_unavailable',
+                  enabled: true,
+                  message,
+                  name: 'company',
+                  ref: null,
+                  refresh_state: 'unavailable',
+                  repository_url: 'https://example.test/team/workflows.git',
+                  resolved_commit: null,
+                  verified_at: null,
+                  verified_package_count: 0
+                }
+              ]
+            })
+          ).toBeNull()
+        }
+      }
+    }
+  })
+
   it('enforces the exact source diagnostic size bound', () => {
     const response = (message: string) => ({
       profile: 'support',
@@ -863,6 +932,37 @@ describe('workflow marketplace codec', () => {
     expect(decodeWorkflowMarketplaceSourceList(response('😀'.repeat(4096)))).not.toBeNull()
     expect(decodeWorkflowMarketplaceSourceList(response('😀'.repeat(4097)))).toBeNull()
   })
+
+  it('decodes a maximum source batch with adversarial safe diagnostics in bounded time', () => {
+    let encodedTail = '%41'
+
+    for (let layer = 1; layer < 8; layer += 1) {
+      encodedTail = encodeURIComponent(encodedTail)
+    }
+
+    const nearMatch = '/.staginq'
+    const message = `${'x'.repeat(4096 - encodedTail.length - nearMatch.length)}${nearMatch}${encodedTail}`
+    const response = {
+      profile: 'support',
+      sources: Array.from({ length: 128 }, (_, index) => ({
+        attempted_at: NOW,
+        diagnostic_code: 'source_unavailable',
+        enabled: true,
+        message,
+        name: `source-${index.toString().padStart(3, '0')}`,
+        ref: null,
+        refresh_state: 'unavailable',
+        repository_url: 'https://example.test/team/workflows.git',
+        resolved_commit: null,
+        verified_at: null,
+        verified_package_count: 0
+      }))
+    }
+
+    const startedAt = performance.now()
+    expect(decodeWorkflowMarketplaceSourceList(response)).not.toBeNull()
+    expect(performance.now() - startedAt).toBeLessThan(5_000)
+  }, 30_000)
 
   it.each(['fatal:\nretry', 'fatal:\rretry', 'fatal:\tretry', 'fatal:\u007fretry'])(
     'rejects a source diagnostic with noncanonical controls: %s',

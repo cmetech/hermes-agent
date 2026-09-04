@@ -75,7 +75,7 @@ class ResolvedGitSource:
 
 
 EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']*", re.IGNORECASE)
 _GIT_ABSOLUTE_URL_RE = re.compile(r"(?:https?|ssh|file)://[^\s<>\"']+", re.IGNORECASE)
 _USER_PASSWORD_AUTHORITY_RE = re.compile(
     r"(?<![A-Za-z0-9._-])[A-Za-z0-9._-]+:[^@\s/]+@[A-Za-z0-9.-]+",
@@ -83,6 +83,7 @@ _USER_PASSWORD_AUTHORITY_RE = re.compile(
 )
 _CREDENTIAL_PARAMETER_RE = re.compile(r"[?#&;]([A-Za-z0-9_.~+%\-]+)=")
 _TRAILING_URL_DELIMITERS = ".,;:!?)]}"
+_GENERIC_GIT_ERROR = "Git operation failed."
 _DEFAULT_BOUNDED_OUTPUT_BYTES = 64 * 1024
 _CREDENTIAL_PARAMETER_WORDS = frozenset({
     "auth",
@@ -568,9 +569,12 @@ def safe_git_error(
     from agent.redact import redact_sensitive_text
 
     error = (result.stderr or result.stdout or "").strip()
-    if source_url:
-        error = error.replace(source_url, scrub_git_url(source_url))
-    error = _HTTP_URL_RE.sub(_scrub_embedded_http_url, error)
+    try:
+        if source_url:
+            error = error.replace(source_url, scrub_git_url(source_url))
+        error = _HTTP_URL_RE.sub(_scrub_embedded_http_url, error)
+    except ValueError:
+        return _GENERIC_GIT_ERROR
     return redact_sensitive_text(
         error,
         force=True,
@@ -580,7 +584,17 @@ def safe_git_error(
 def _scrub_embedded_http_url(match: re.Match[str]) -> str:
     value = match.group(0)
     end = len(value)
+    scheme_end = value.find("://") + len("://")
+    authority_terminated = any(
+        character in "/?#" for character in value[scheme_end:end]
+    )
     while end and value[end - 1] in _TRAILING_URL_DELIMITERS:
+        if value[end - 1] == ":" and not authority_terminated:
+            break
+        if value[end - 1] == "]" and value[scheme_end] == "[":
+            ipv6_closing = value.find("]", scheme_end + 1, end)
+            if ipv6_closing == end - 1:
+                break
         end -= 1
     return f"{scrub_git_url(value[:end])}{value[end:]}"
 
@@ -738,10 +752,14 @@ def checkout_exact_revision(
 def scrub_git_url(git_url: str) -> str:
     """Strip credentials and query/fragment data from an HTTP Git URL."""
     parsed = urllib.parse.urlsplit(git_url)
-    if parsed.scheme in {"http", "https"} and parsed.hostname:
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
+    if parsed.scheme in {"http", "https"}:
+        hostname = parsed.hostname
+        if not parsed.netloc or not hostname or parsed.netloc.endswith(":"):
+            raise ValueError("HTTP URL authority is invalid")
+        port = parsed.port
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        if port is not None:
+            host = f"{host}:{port}"
         return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
     return git_url
 

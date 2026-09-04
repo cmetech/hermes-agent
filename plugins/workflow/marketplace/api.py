@@ -8,7 +8,6 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import subprocess
 import threading
 import time
 from typing import Literal, Protocol, TypeVar
@@ -28,7 +27,6 @@ from pydantic import (
 
 from hermes_cli.git_source import (
     GitSourceError,
-    safe_git_error,
     validate_credential_free_git_source,
 )
 from hermes_constants import get_hermes_home, hermes_home_key
@@ -68,19 +66,6 @@ _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,4096}$", re.ASCII)
 _OPERATION_ID = re.compile(r"^wmop_[0-9a-f]{12}_[0-9a-f]{32}$", re.ASCII)
 _COMMIT = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$", re.ASCII)
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|auth(?:orization)?|"
-    r"token|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
-)
-_LOCAL_PATH = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:"
-    r"/(?:private|tmp|users|home|var/folders|var/tmp|var/cache)/[^\s\"']*|"
-    r"[A-Z]:\\(?:[^\s\"']+\\)*(?:[^\s\"']*)|"
-    r"\\\\[^\\\s]+\\[^\s\"']+|"
-    r"(?:/[^\s\"']+)*(?:\.staging|\.quarantine|/cache|/staging|/quarantine)"
-    r"(?:/[^\s\"']*)?)"
-)
 _REPOSITORY_PATH_DECODE_MAX = 8
 _SENSITIVE_REPOSITORY_SEGMENTS = frozenset({
     ".cache",
@@ -708,13 +693,10 @@ def _public(value: object) -> object:
 
 
 def _safe_public_text(value: str) -> str:
-    completed = subprocess.CompletedProcess(
-        args=(), returncode=1, stdout="", stderr=value
-    )
-    sanitized = safe_git_error(completed).strip()
-    sanitized = _CREDENTIAL_ASSIGNMENT.sub(r"\1[REDACTED]", sanitized)
-    sanitized = _LOCAL_PATH.sub("[REDACTED_PATH]", sanitized)
-    return sanitized[:4096]
+    sanitized = redact_source_refresh_message(value)
+    if sanitized == "workflow marketplace source refresh failed" and value != sanitized:
+        return "workflow marketplace operation failed"
+    return sanitized
 
 
 def _safe_repository_url(value: str) -> str:

@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import urllib.parse
 
 import pytest
@@ -1067,6 +1068,54 @@ def test_refresh_diagnostics_accept_safe_url_and_prose_at_every_decode_layer(
     )
 
 
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["invalidHttp"])
+@pytest.mark.parametrize("layers", [0, 1, 8])
+def test_refresh_diagnostics_fail_closed_for_invalid_http_at_every_boundary(
+    message: str,
+    layers: int,
+) -> None:
+    encoded = message
+    for _ in range(layers):
+        encoded = urllib.parse.quote(encoded, safe="")
+
+    assert (
+        redact_source_refresh_message(encoded)
+        == "workflow marketplace source refresh failed"
+    )
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=encoded,
+        )
+
+
+@pytest.mark.parametrize("layers", [0, 1, 8])
+def test_refresh_diagnostics_reject_generated_delimiter_identity_matrix(
+    layers: int,
+) -> None:
+    for delimiter in _DIAGNOSTIC_CORPUS["matrix"]["delimiters"]:
+        for identity in _DIAGNOSTIC_CORPUS["matrix"]["identities"]:
+            message = f"{_DIAGNOSTIC_CORPUS['matrix']['prefix']}{delimiter}{identity}"
+            for _ in range(layers):
+                message = urllib.parse.quote(message, safe="")
+
+            assert (
+                redact_source_refresh_message(message)
+                == "workflow marketplace source refresh failed"
+            )
+            with pytest.raises(ValidationError):
+                SourceRefreshStatus(
+                    sourceName="company",
+                    state="unavailable",
+                    attemptedAt="2026-09-04T01:00:00Z",
+                    diagnosticCode="source_unavailable",
+                    message=message,
+                )
+
+
 def test_refresh_diagnostic_message_enforces_its_exact_size_bound() -> None:
     common = {
         "sourceName": "company",
@@ -1081,6 +1130,33 @@ def test_refresh_diagnostic_message_enforces_its_exact_size_bound() -> None:
     assert SourceRefreshStatus(**common, message="😀" * 4096).message == "😀" * 4096
     with pytest.raises(ValidationError):
         SourceRefreshStatus(**common, message="😀" * 4097)
+
+
+def test_refresh_diagnostic_scanning_is_bounded_for_maximum_record_batch() -> None:
+    encoded_tail = "%41"
+    for _ in range(1, 8):
+        encoded_tail = urllib.parse.quote(encoded_tail, safe="")
+    near_match = "/.staginq"
+    message = (
+        f"{'x' * (4096 - len(encoded_tail) - len(near_match))}"
+        f"{near_match}{encoded_tail}"
+    )
+    common = {
+        "state": "unavailable",
+        "attemptedAt": "2026-09-04T01:00:00Z",
+        "diagnosticCode": "source_unavailable",
+        "message": message,
+    }
+
+    started_at = time.perf_counter()
+    statuses = [
+        SourceRefreshStatus(sourceName=f"source-{index:03d}", **common)
+        for index in range(128)
+    ]
+    elapsed = time.perf_counter() - started_at
+
+    assert all(status.message == message for status in statuses)
+    assert elapsed < 5.0
 
 
 def test_refresh_diagnostic_redactor_bounds_before_local_identity_scan() -> None:

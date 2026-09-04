@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import subprocess
 from typing import Callable, Literal, NoReturn
 import unicodedata
 import urllib.parse
@@ -28,7 +27,7 @@ from hermes_cli.git_source import (
     canonical_git_source,
     git_text_contains_credentials,
     resolve_git_source,
-    safe_git_error,
+    scrub_git_url,
     validate_credential_free_git_source,
 )
 from hermes_constants import get_hermes_home
@@ -50,24 +49,30 @@ _MAX_SOURCE_STATE_BYTES = 1024 * 1024
 _MAX_CATALOG_STATE_BYTES = 64 * 1024 * 1024
 _MAX_ERROR_BYTES = 4096
 _SOURCE_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"\b(access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b(\s*[=:])\s*\S+",
-    re.IGNORECASE,
-)
-_HTTP_DIAGNOSTIC_START = re.compile(r"https?://", re.IGNORECASE)
-_LOCAL_PATH = re.compile(
-    r"(?:"
-    r"file:/+[^\s\"'<>()[\]{},;]+|"
-    r"(?<![A-Za-z0-9/])/{1,2}(?!/)(?:[^/\s\"'<>()[\]{},;?#=&]+/)+[^/\s\"'<>()[\]{},;?#=&]*|"
-    r"(?<![A-Za-z0-9])[A-Z]:/[^\s\"'<>()[\]{},;]*|"
-    r"[^\s\"'<>()[\]{},;=]*(?:/)?\.(?:staging|quarantine)(?:/[^\s\"'<>()[\]{},;]*)?"
-    r")",
-    re.IGNORECASE,
-)
 _CONTROL_OR_SPACE_RUN = re.compile(r"[\x00-\x20\x7f]+")
 _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _PATH_DECODE_MAX = 8
 _GENERIC_REFRESH_FAILURE = "workflow marketplace source refresh failed"
+_DIAGNOSTIC_CREDENTIAL_NAMES = frozenset({
+    "accesstoken",
+    "apikey",
+    "auth",
+    "authorization",
+    "clientsecret",
+    "confirmationtoken",
+    "credential",
+    "credentials",
+    "password",
+    "refreshtoken",
+    "token",
+})
+_DIAGNOSTIC_TOKEN_BREAKS = frozenset("<>\"'")
+_DIAGNOSTIC_PATH_BREAKS = frozenset("\"'<>()[\\]{},;?#=&/")
+_DIAGNOSTIC_TRAILING_URL_PUNCTUATION = frozenset(".,;:!?)]}")
+_DIAGNOSTIC_URI_ASCII = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!$&()*+,;=:@/?#%"
+)
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 RefreshState = Literal[
     "fresh",
@@ -89,35 +94,136 @@ def _diagnostic_contains_control(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
-def _is_ascii_alphanumeric(character: str) -> bool:
-    return "a" <= character <= "z" or "A" <= character <= "Z" or "0" <= character <= "9"
+def _diagnostic_matches_ascii_literal(value: str, index: int, literal: str) -> bool:
+    if index + len(literal) > len(value):
+        return False
+    return all(
+        character == expected
+        or ("a" <= expected <= "z" and character == expected.upper())
+        for character, expected in zip(
+            value[index : index + len(literal)],
+            literal,
+            strict=True,
+        )
+    )
 
 
 def _diagnostic_identity_has_boundary(value: str, index: int) -> bool:
     if index == 0:
         return True
     previous = value[index - 1]
-    return previous not in "/-._~%" and not previous.isalnum()
+    return previous != "/" and not previous.isalnum()
+
+
+def _diagnostic_contains_credential_assignment(value: str) -> bool:
+    """Recognize credential-name assignments with one advancing token scan."""
+
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if not (character.isascii() and (character.isalnum() or character in "_-")):
+            index += 1
+            continue
+        start = index
+        while index < len(value):
+            character = value[index]
+            if not (character.isascii() and (character.isalnum() or character in "_-")):
+                break
+            index += 1
+        compact = value[start:index].replace("_", "").replace("-", "").casefold()
+        cursor = index
+        while cursor < len(value) and value[cursor].isspace():
+            cursor += 1
+        if (
+            compact in _DIAGNOSTIC_CREDENTIAL_NAMES
+            and cursor < len(value)
+            and value[cursor] in "=:"
+        ):
+            return True
+    return False
+
+
+def _diagnostic_ipv4_is_safe(value: str) -> bool:
+    components = value.split(".")
+    return len(components) == 4 and all(
+        component
+        and component.isascii()
+        and component.isdigit()
+        and 0 <= int(component) <= 255
+        for component in components
+    )
+
+
+def _diagnostic_ipv6_is_safe(value: str) -> bool:
+    if not value or "%" in value or value.count("::") > 1:
+        return False
+
+    compressed = "::" in value
+    if compressed:
+        left, right = value.split("::")
+    else:
+        left, right = value, ""
+    left_parts = [] if not left else left.split(":")
+    right_parts = [] if not right else right.split(":")
+    parts = [*left_parts, *right_parts]
+    if any(not part for part in parts):
+        return False
+
+    slots = 0
+    for index, part in enumerate(parts):
+        if "." in part:
+            if index != len(parts) - 1 or not _diagnostic_ipv4_is_safe(part):
+                return False
+            slots += 2
+        else:
+            if not 1 <= len(part) <= 4 or any(
+                character not in _HEX_DIGITS for character in part
+            ):
+                return False
+            slots += 1
+    return slots < 8 if compressed else slots == 8
+
+
+def _diagnostic_hostname_is_safe(value: str) -> bool:
+    if not value or len(value) > 253:
+        return False
+    if all(
+        character.isascii() and (character.isdigit() or character == ".")
+        for character in value
+    ):
+        return _diagnostic_ipv4_is_safe(value)
+    hostname = value[:-1] if value.endswith(".") else value
+    if not hostname:
+        return False
+    for label in hostname.split("."):
+        if (
+            not 1 <= len(label) <= 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (character.isalnum() or character == "-") for character in label)
+        ):
+            return False
+    return True
+
+
+def _diagnostic_port_is_safe(value: str) -> bool:
+    return bool(value) and value.isascii() and value.isdigit() and int(value) <= 65535
 
 
 def _diagnostic_http_authority_is_safe(value: str) -> bool:
-    """Validate the bounded authority syntax that permits URL path masking."""
+    """Validate a credential-free DNS, IPv4, or bracketed IPv6 authority."""
 
     if not value or "@" in value:
         return False
     if value.startswith("["):
-        closing = value.find("]")
+        closing = value.find("]", 1)
         if closing <= 1 or "[" in value[1:] or "]" in value[closing + 1 :]:
             return False
         address = value[1:closing]
         suffix = value[closing + 1 :]
-        return all(
-            not character.isspace() and character not in "/[]@" for character in address
-        ) and (
+        return _diagnostic_ipv6_is_safe(address) and (
             not suffix
-            or (
-                suffix.startswith(":") and suffix[1:].isascii() and suffix[1:].isdigit()
-            )
+            or (suffix.startswith(":") and _diagnostic_port_is_safe(suffix[1:]))
         )
 
     if value.count(":") > 1:
@@ -125,32 +231,85 @@ def _diagnostic_http_authority_is_safe(value: str) -> bool:
     host, separator, port = value.rpartition(":")
     if not separator:
         host = value
-    elif not port.isascii() or not port.isdigit():
+    elif not _diagnostic_port_is_safe(port):
         return False
-    return bool(host) and all(
-        _is_ascii_alphanumeric(character)
-        or (not character.isascii() and character.isalnum())
-        or character in ".-_~%"
-        for character in host
+    return _diagnostic_hostname_is_safe(host)
+
+
+def _diagnostic_path_character_is_safe(character: str) -> bool:
+    return not character.isspace() and character not in _DIAGNOSTIC_PATH_BREAKS
+
+
+def _diagnostic_staging_identity_starts_at(
+    value: str,
+    index: int,
+    *,
+    inside_http_url: bool,
+) -> bool:
+    if value[index] != ".":
+        return False
+    length = 0
+    for candidate in (".quarantine", ".staging"):
+        if _diagnostic_matches_ascii_literal(value, index, candidate):
+            length = len(candidate)
+            break
+    if not length:
+        return False
+    if inside_http_url and index > 0 and value[index - 1] == "/":
+        return False
+    end = index + length
+    return (
+        end == len(value)
+        or value[end] == "/"
+        or not (value[end].isalnum() or value[end] in "._-")
     )
 
 
-def _diagnostic_local_identity_starts_at(value: str, index: int) -> bool:
-    return _diagnostic_identity_has_boundary(value, index) and (
-        _LOCAL_PATH.match(value, index) is not None
-    )
-
-
-def _diagnostic_http_scheme_slashes_start_at(value: str, index: int) -> bool:
-    prefix = value[max(0, index - 6) : index].casefold()
-    return prefix.endswith("http:") or prefix.endswith("https:")
+def _diagnostic_local_identity_starts_at(
+    value: str,
+    index: int,
+    *,
+    inside_http_url: bool = False,
+) -> bool:
+    if _diagnostic_staging_identity_starts_at(
+        value,
+        index,
+        inside_http_url=inside_http_url,
+    ):
+        return True
+    if inside_http_url:
+        has_boundary = index == 0 or (
+            value[index - 1] not in "/-._~%" and not value[index - 1].isalnum()
+        )
+    else:
+        has_boundary = _diagnostic_identity_has_boundary(value, index)
+    if not has_boundary:
+        return False
+    if value[index : index + len("file:")].casefold() == "file:":
+        cursor = index + len("file:")
+        return cursor < len(value) and not value[cursor].isspace()
+    if (
+        index + 2 < len(value)
+        and value[index].isascii()
+        and value[index].isalpha()
+        and value[index + 1] == ":"
+        and value[index + 2] == "/"
+    ):
+        return True
+    if value[index] != "/" or index + 1 >= len(value):
+        return False
+    cursor = index
+    while cursor < len(value) and value[cursor] == "/":
+        cursor += 1
+    return cursor < len(value) and _diagnostic_path_character_is_safe(value[cursor])
 
 
 def _diagnostic_http_scheme_length_at(value: str, index: int) -> int:
-    candidate = value[index : index + len("https://")].casefold()
-    if candidate.startswith("https://"):
+    if value[index] not in "hH":
+        return 0
+    if _diagnostic_matches_ascii_literal(value, index, "https://"):
         return len("https://")
-    if candidate.startswith("http://"):
+    if _diagnostic_matches_ascii_literal(value, index, "http://"):
         return len("http://")
     return 0
 
@@ -162,79 +321,163 @@ def _diagnostic_http_scheme_has_boundary(value: str, index: int) -> bool:
     return previous != "/" and not previous.isalnum()
 
 
-def _mask_safe_http_diagnostic_urls(value: str) -> str:
-    """Mask only the URL span before an adjacent, independently rooted identity."""
+def _diagnostic_http_token_end(value: str, scheme_end: int) -> int:
+    token_end = scheme_end
+    while token_end < len(value):
+        character = value[token_end]
+        if character.isspace() or character in _DIAGNOSTIC_TOKEN_BREAKS:
+            break
+        if _diagnostic_http_scheme_length_at(
+            value, token_end
+        ) and _diagnostic_http_scheme_has_boundary(value, token_end):
+            break
+        token_end += 1
+    return token_end
 
-    masked = list(value)
-    consumed_until = 0
-    for match in _HTTP_DIAGNOSTIC_START.finditer(value):
-        if match.start() < consumed_until:
-            continue
 
-        token_end = match.end()
-        while token_end < len(value):
-            character = value[token_end]
-            if character.isspace() or character in "<>\"'":
+def _diagnostic_trim_url_punctuation(
+    value: str,
+    scheme_end: int,
+    token_end: int,
+) -> int:
+    end = token_end
+    authority_terminated = any(
+        value[index] in "/?#" for index in range(scheme_end, token_end)
+    )
+    while end > scheme_end and value[end - 1] in _DIAGNOSTIC_TRAILING_URL_PUNCTUATION:
+        if value[end - 1] == ":" and not authority_terminated:
+            break
+        if value[end - 1] == "]" and value[scheme_end] == "[":
+            ipv6_closing = value.find("]", scheme_end + 1, end)
+            if ipv6_closing == end - 1:
                 break
-            if _diagnostic_http_scheme_length_at(
-                value, token_end
-            ) and _diagnostic_http_scheme_has_boundary(value, token_end):
-                break
-            token_end += 1
+        end -= 1
+    return end
 
-        authority_end = token_end
-        for delimiter in "/?#":
-            candidate = value.find(delimiter, match.end(), token_end)
-            if candidate >= 0:
-                authority_end = min(authority_end, candidate)
-        authority = value[match.end() : authority_end]
-        if not _diagnostic_http_authority_is_safe(authority):
-            masked[match.start() : authority_end] = " " * (
-                authority_end - match.start()
-            )
-            consumed_until = authority_end
-            continue
 
-        first_path_slash = (
-            authority_end
-            if authority_end < token_end and value[authority_end] == "/"
-            else -1
-        )
-        safe_end = token_end
-        for index in range(match.end(), token_end):
-            if index == first_path_slash or _diagnostic_http_scheme_slashes_start_at(
-                value, index
+def _diagnostic_http_url_end(
+    original: str,
+    normalized: str,
+    start: int,
+    scheme_length: int,
+) -> int | None:
+    """Return one proven-safe URL span end, or ``None`` for an unsafe token."""
+
+    scheme_end = start + scheme_length
+    if original[start:scheme_end] != normalized[start:scheme_end]:
+        return None
+    token_end = _diagnostic_http_token_end(normalized, scheme_end)
+    end = _diagnostic_trim_url_punctuation(normalized, scheme_end, token_end)
+    if end <= scheme_end:
+        return None
+
+    authority_end = scheme_end
+    while authority_end < end and normalized[authority_end] not in "/?#":
+        authority_end += 1
+    if not _diagnostic_http_authority_is_safe(normalized[scheme_end:authority_end]):
+        return None
+
+    first_path_slash = (
+        authority_end
+        if authority_end < end and normalized[authority_end] == "/"
+        else -1
+    )
+    fragment_seen = False
+    index = authority_end
+    while index < end:
+        character = normalized[index]
+        if original[index] == "\\":
+            return None
+        if _diagnostic_http_scheme_length_at(normalized, index):
+            return None
+        if index != first_path_slash and _diagnostic_local_identity_starts_at(
+            normalized,
+            index,
+            inside_http_url=True,
+        ):
+            return None
+        if character == "#":
+            if fragment_seen:
+                return None
+            fragment_seen = True
+        if character == "%":
+            encoded = bytearray()
+            while index < end and normalized[index] == "%":
+                if (
+                    index + 2 >= end
+                    or normalized[index + 1] not in _HEX_DIGITS
+                    or normalized[index + 2] not in _HEX_DIGITS
+                ):
+                    return None
+                encoded.append(int(normalized[index + 1 : index + 3], 16))
+                index += 3
+            try:
+                decoded = encoded.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            if any(
+                _diagnostic_contains_control(character) or character in "/\\%"
+                for character in decoded
             ):
-                continue
-            if _diagnostic_local_identity_starts_at(value, index):
-                safe_end = index
-                break
+                return None
+            continue
+        if character.isascii():
+            if character not in _DIAGNOSTIC_URI_ASCII:
+                return None
+        elif character.isspace():
+            return None
+        index += 1
+    return end
 
-        masked[match.start() : safe_end] = " " * (safe_end - match.start())
-        consumed_until = token_end
 
-    return "".join(masked)
+def _scan_diagnostic_text(value: str) -> tuple[bool, bool]:
+    """Return ``(unsafe, unprotected_percent_escape)`` in linear time."""
 
-
-def _diagnostic_contains_local_path(value: str) -> bool:
     normalized = value.replace("\\", "/")
-    without_http_urls = _mask_safe_http_diagnostic_urls(normalized)
-    return _LOCAL_PATH.search(without_http_urls) is not None
+    unprotected_percent_escape = False
+    index = 0
+    while index < len(normalized):
+        scheme_length = _diagnostic_http_scheme_length_at(normalized, index)
+        if scheme_length:
+            end = _diagnostic_http_url_end(value, normalized, index, scheme_length)
+            if end is None:
+                return True, unprotected_percent_escape
+            index = end
+            continue
+        if _diagnostic_local_identity_starts_at(normalized, index):
+            return True, unprotected_percent_escape
+        if (
+            normalized[index] == "%"
+            and index + 2 < len(normalized)
+            and normalized[index + 1] in _HEX_DIGITS
+            and normalized[index + 2] in _HEX_DIGITS
+        ):
+            unprotected_percent_escape = True
+        index += 1
+    return (
+        _diagnostic_contains_credential_assignment(value),
+        unprotected_percent_escape,
+    )
+
+
+def _diagnostic_text_is_unsafe(value: str) -> bool:
+    return _scan_diagnostic_text(value)[0]
 
 
 def redact_source_refresh_message(value: str, repository_url: str | None = None) -> str:
     """Return one bounded diagnostic with credentials and private paths removed."""
 
-    completed = subprocess.CompletedProcess(
-        args=(), returncode=1, stdout="", stderr=value
-    )
-    redacted = _canonical_diagnostic_line(safe_git_error(completed, repository_url))
-    redacted = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED]", redacted)
-    redacted = redacted[:_MAX_ERROR_BYTES]
-    if _diagnostic_contains_local_path(redacted):
+    if not isinstance(value, str) or (
+        repository_url is not None and not isinstance(repository_url, str)
+    ):
+        return _GENERIC_REFRESH_FAILURE
+
+    redacted = _canonical_diagnostic_line(value)[:_MAX_ERROR_BYTES]
+    if _diagnostic_text_is_unsafe(redacted):
         return _GENERIC_REFRESH_FAILURE
 
     probe = redacted
+    decoded_layers = [redacted]
     for _ in range(_PATH_DECODE_MAX):
         if _PERCENT_ESCAPE.search(probe) is None:
             break
@@ -244,18 +487,26 @@ def redact_source_refresh_message(value: str, repository_url: str | None = None)
             return _GENERIC_REFRESH_FAILURE
         if decoded == probe:
             break
-        if (
-            _diagnostic_contains_control(decoded)
-            or _diagnostic_contains_local_path(decoded)
-            or _CREDENTIAL_ASSIGNMENT.search(decoded) is not None
-            or git_text_contains_credentials(decoded)
-        ):
+        if _diagnostic_contains_control(decoded) or _diagnostic_text_is_unsafe(decoded):
             return _GENERIC_REFRESH_FAILURE
         probe = decoded
+        decoded_layers.append(decoded)
     else:
-        if _PERCENT_ESCAPE.search(probe) is not None:
+        if (
+            _PERCENT_ESCAPE.search(probe) is not None
+            and _scan_diagnostic_text(probe)[1]
+        ):
             return _GENERIC_REFRESH_FAILURE
 
+    if git_text_contains_credentials("\n".join(decoded_layers)):
+        return _GENERIC_REFRESH_FAILURE
+
+    if repository_url:
+        try:
+            scrubbed_repository_url = scrub_git_url(repository_url)
+        except ValueError:
+            return _GENERIC_REFRESH_FAILURE
+        redacted = redacted.replace(repository_url, scrubbed_repository_url)
     return redacted
 
 
