@@ -57,25 +57,25 @@ def _integer(value: object) -> int:
     return value
 
 
-def _scoped_semantic_diagnostic_codes(contract: dict[str, object]) -> set[str]:
+def _scoped_reference_contract(contract: dict[str, object]) -> Mapping[str, object]:
     loop_group = next(
         item
         for item in _mapping_list(contract["node_kinds"])
         if item["id"] == "loop_group"
     )
     definitions = _mapping(loop_group["semantic_definitions"])
-    scoped_reference = _mapping(definitions["scoped-output-reference-v1"])
-    constraint = _mapping(scoped_reference["structured_path_constraint_v1"])
-    table = _mapping(constraint["diagnostic_table"])
-    columns = _string_list(table["cols"])
-    semantic_index = columns.index("semantic")
-    rows = table["rows"]
-    assert isinstance(rows, list)
-    assert all(isinstance(row, list) for row in rows)
-    return {
-        _text(row[semantic_index])
-        for row in cast(list[list[object]], rows)
-    }
+    return _mapping(definitions["scoped-output-reference-v1"])
+
+
+def _portable_diagnostic_surface(diagnostic: Mapping[str, object]) -> str:
+    path = _text(diagnostic["path"])
+    if re.match(r"^nodes\[\d+]\.loop_group\.nodes\[\d+]", path):
+        return "body"
+    if re.match(r"^nodes\[\d+]\.loop_group\.(?:until|until_bash)$", path):
+        return "until"
+    if re.match(r"^nodes\[\d+]\.loop_group\.gate_message$", path):
+        return "gate"
+    raise AssertionError(f"portable diagnostic has no declared surface: {path}")
 
 
 def _cases(profile: WorkflowLanguageProfile) -> dict[str, dict[str, object]]:
@@ -162,48 +162,26 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
-def test_every_corpus_diagnostic_is_published_by_paired_contract(profile):
+def test_native_corpus_diagnostics_match_compatibility_catalog(profile):
     contract = workflow_authoring_contract(profile)
     diagnostics = [
         diagnostic
         for case in _mapping_list(workflow_language_conformance(profile)["cases"])
         for diagnostic in _mapping_list(case["diagnostics"])
-    ]
-    compatibility_codes = _mapping(contract["compatibility_codes"])
-    native_diagnostics = [
-        diagnostic
-        for diagnostic in diagnostics
         if diagnostic["code"] == diagnostic["hermes_code"]
     ]
-    portable_diagnostics = [
-        diagnostic
-        for diagnostic in diagnostics
-        if diagnostic["code"] != diagnostic["hermes_code"]
-    ]
-    missing_native_codes = sorted(
+    compatibility_codes = _mapping(contract["compatibility_codes"])
+    missing_codes = sorted(
         {
             _text(diagnostic["hermes_code"])
-            for diagnostic in native_diagnostics
+            for diagnostic in diagnostics
             if _text(diagnostic["hermes_code"]) not in compatibility_codes
         }
     )
-    semantic_codes = (
-        _scoped_semantic_diagnostic_codes(contract)
-        if portable_diagnostics
-        else set()
-    )
-    missing_portable_codes = sorted(
-        {
-            _text(diagnostic["code"])
-            for diagnostic in portable_diagnostics
-            if _text(diagnostic["code"]) not in semantic_codes
-        }
-    )
 
-    assert missing_native_codes == []
-    assert missing_portable_codes == []
+    assert missing_codes == []
 
-    for diagnostic in native_diagnostics:
+    for diagnostic in diagnostics:
         native_entry = _mapping(
             compatibility_codes[_text(diagnostic["hermes_code"])]
         )
@@ -215,6 +193,53 @@ def test_every_corpus_diagnostic_is_published_by_paired_contract(profile):
             assert native_entry["runtime_failure"] is True
             assert diagnostic["severity"] == "error"
             assert diagnostic["blocking"] is True
+
+
+def test_portable_corpus_diagnostics_match_scoped_contract_surfaces():
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    contract = workflow_authoring_contract(profile)
+    diagnostics = [
+        diagnostic
+        for case in _mapping_list(workflow_language_conformance(profile)["cases"])
+        for diagnostic in _mapping_list(case["diagnostics"])
+        if diagnostic["code"] != diagnostic["hermes_code"]
+    ]
+    scoped_reference = _scoped_reference_contract(contract)
+    constraint = _mapping(scoped_reference["structured_path_constraint_v1"])
+    table = _mapping(constraint["diagnostic_table"])
+    code_aliases = _mapping(table["codes"])
+    columns = _string_list(table["cols"])
+    rows_value = table["rows"]
+    assert isinstance(rows_value, list)
+    assert all(isinstance(row, list) for row in rows_value)
+    rows = [
+        dict(zip(columns, cast(list[object], row), strict=True))
+        for row in rows_value
+    ]
+    companion_contract = _mapping(scoped_reference["companion_node_paths"])
+    companion_fields = _string_list(companion_contract["field_paths"])
+
+    for diagnostic in diagnostics:
+        portable_code = _text(diagnostic["code"])
+        matching_rows = [row for row in rows if row["semantic"] == portable_code]
+        assert matching_rows, portable_code
+        if diagnostic["document"] == "companion":
+            assert any(row["when"] == "companion" for row in matching_rows)
+            assert diagnostic["hermes_code"] == companion_contract["validation_code"]
+            assert f"{_text(diagnostic['path'])}[]" in companion_fields
+            continue
+
+        assert diagnostic["document"] == "definition"
+        surface = _portable_diagnostic_surface(diagnostic)
+        mapped_aliases = {
+            row[surface]
+            for row in matching_rows
+            if isinstance(row[surface], str)
+        }
+        assert mapped_aliases, (portable_code, surface)
+        assert _text(diagnostic["hermes_code"]) in {
+            _text(code_aliases[alias]) for alias in mapped_aliases
+        }
 
 
 def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
