@@ -105,6 +105,368 @@ export interface MemoryProviderOAuthStatus {
   state: 'connected' | 'error' | 'idle' | 'pending'
 }
 
+export type WorkflowMarketplaceCapability =
+  'installed' | 'operations' | 'search' | 'sources' | 'transactions' | 'trust' | 'updates'
+
+export interface WorkflowMarketplaceCapabilities {
+  capabilities: WorkflowMarketplaceCapability[]
+  profile: string
+  schema_version: 1
+}
+
+export interface WorkflowMarketplaceSource {
+  enabled: boolean
+  name: string
+  ref: null | string
+  repository_url: string
+}
+
+export interface WorkflowMarketplaceSourceList {
+  profile: string
+  sources: WorkflowMarketplaceSource[]
+}
+
+export interface WorkflowMarketplaceSourceResponse {
+  profile: string
+  source: WorkflowMarketplaceSource
+  status: 'created' | 'disabled' | 'enabled' | 'removed' | 'updated'
+}
+
+export interface WorkflowMarketplacePackageIdentity {
+  package_id: string
+  source_key: string
+}
+
+export interface WorkflowMarketplaceCatalogPackage {
+  configured_ref: null | string
+  contract_version: 1
+  description: string
+  display_name: string
+  id: string
+  identifier: string
+  license: string
+  package_digest: string
+  package_path: string
+  publisher: string
+  repository_url: string
+  resolved_commit: string
+  source_name: string
+  state: 'fresh' | 'stale'
+  tags: string[]
+  verified_at: string
+  version: string
+}
+
+export interface WorkflowMarketplaceSearchPage {
+  items: WorkflowMarketplaceCatalogPackage[]
+  limit: number
+  next_offset: null | number
+  offset: number
+  profile: string
+  query: string
+  source: null | string
+}
+
+export interface WorkflowMarketplaceExternalRequirements {
+  providers: string[]
+  runtimes: string[]
+  secrets: string[]
+  services: string[]
+  tools: string[]
+}
+
+export interface WorkflowMarketplaceDiagnostic {
+  code: string
+  message: string
+  severity: 'advisory' | 'blocker'
+}
+
+export interface WorkflowMarketplaceAssessment {
+  advisories: WorkflowMarketplaceDiagnostic[]
+  blockers: WorkflowMarketplaceDiagnostic[]
+  external_requirements: WorkflowMarketplaceExternalRequirements
+  package_digest: string
+  package_resources: string[]
+  review_digest: string
+  workflow_names: string[]
+}
+
+export interface WorkflowMarketplaceInstalledPackage {
+  actor: string
+  configured_ref: null | string
+  contract_version: 1
+  distribution_digest: string
+  identity: WorkflowMarketplacePackageIdentity
+  installed_at: string
+  orphaned_source: boolean
+  package_path: string
+  repository_url: string
+  resolved_commit: string
+  source_name: string
+  version: string
+  workflow_paths: string[]
+}
+
+export interface WorkflowMarketplaceInstalledPage {
+  packages: WorkflowMarketplaceInstalledPackage[]
+  profile: string
+}
+
+export interface WorkflowMarketplaceTrustReviewItem {
+  approval_nodes: string[]
+  command_nodes: string[]
+  command_resources: string[]
+  companion_path: null | string
+  compatibility: WorkflowMarketplaceDiagnostic[]
+  definition_path: string
+  external_requirements: WorkflowMarketplaceExternalRequirements
+  local_mcp_servers: string[]
+  mcp_resource_files: string[]
+  mcp_resources: string[]
+  outward_action_nodes: string[]
+  package_digest: string
+  package_resource_set: 'package'
+  providers: string[]
+  remote_mcp_servers: string[]
+  requested_skills: string[]
+  requested_tools: string[]
+  required_secrets: string[]
+  risk_digest: string
+  script_resources: string[]
+  shell_or_script_nodes: string[]
+  trust_state: 'trusted' | 'untrusted'
+  workflow_name: string
+}
+
+export type WorkflowMarketplaceResourceType =
+  'command' | 'mcp' | 'mcp_resource' | 'other' | 'script' | 'workflow_companion' | 'workflow_definition'
+
+export interface WorkflowMarketplacePackageResource {
+  path: string
+  types: WorkflowMarketplaceResourceType[]
+}
+
+export interface WorkflowMarketplacePackageDetail {
+  advisories: WorkflowMarketplaceDiagnostic[]
+  blockers: WorkflowMarketplaceDiagnostic[]
+  configured_ref: null | string
+  contract_version: 1
+  description: string
+  display_name: string
+  external_requirements: WorkflowMarketplaceExternalRequirements
+  id: string
+  identifier: string
+  identity: WorkflowMarketplacePackageIdentity
+  install_status: 'installed' | 'not_installed'
+  installed: null | WorkflowMarketplaceInstalledPackage
+  license: string
+  package_digest: string
+  package_path: string
+  publisher: string
+  repository_url: string
+  resolved_commit: string
+  resources: WorkflowMarketplacePackageResource[]
+  source_name: string
+  source_state: 'fresh'
+  tags: string[]
+  update_status: 'current' | 'not_applicable' | 'update_available'
+  verified: true
+  verified_at: string
+  version: string
+  workflows: WorkflowMarketplaceTrustReviewItem[]
+}
+
+export interface WorkflowMarketplaceFileChange {
+  candidate_digest: null | string
+  kind: 'added' | 'modified' | 'removed' | 'renamed'
+  old_digest: null | string
+  old_path: null | string
+  path: string
+}
+
+export interface WorkflowMarketplaceStringSetChange {
+  added: string[]
+  removed: string[]
+}
+
+export interface WorkflowMarketplaceRiskIdentity {
+  package_digest: string
+  risk_digest: string
+  workflow_name: string
+}
+
+export interface WorkflowMarketplaceRiskChanges {
+  added: WorkflowMarketplaceRiskIdentity[]
+  removed: WorkflowMarketplaceRiskIdentity[]
+}
+
+export interface WorkflowMarketplaceCompatibilityIdentity {
+  code: string
+  severity: 'advisory' | 'blocker'
+  workflow_name: string
+}
+
+export interface WorkflowMarketplaceCompatibilityChanges {
+  added: WorkflowMarketplaceCompatibilityIdentity[]
+  removed: WorkflowMarketplaceCompatibilityIdentity[]
+}
+
+export interface WorkflowMarketplaceRequirementChanges {
+  providers: WorkflowMarketplaceStringSetChange
+  runtimes: WorkflowMarketplaceStringSetChange
+  secrets: WorkflowMarketplaceStringSetChange
+  services: WorkflowMarketplaceStringSetChange
+  tools: WorkflowMarketplaceStringSetChange
+}
+
+export interface WorkflowMarketplaceInstallReview {
+  assessment: WorkflowMarketplaceAssessment
+  candidate_digest: string
+  candidate_version: string
+  confirmation_token: string
+  configured_ref: null | string
+  file_changes: WorkflowMarketplaceFileChange[]
+  identity: WorkflowMarketplacePackageIdentity
+  operation: 'install'
+  package_path: string
+  repository_url: string
+  resolved_commit: string
+  result: 'review_required'
+  review_digest: string
+  source_name: string
+  workflow_reviews: WorkflowMarketplaceTrustReviewItem[]
+}
+
+export interface WorkflowMarketplaceUpdateReview {
+  assessment: WorkflowMarketplaceAssessment
+  candidate_commit: string
+  candidate_digest: string
+  candidate_version: string
+  compatibility_changes: WorkflowMarketplaceCompatibilityChanges
+  confirmation_token: null | string
+  configured_ref: null | string
+  file_changes: WorkflowMarketplaceFileChange[]
+  identity: WorkflowMarketplacePackageIdentity
+  old_commit: string
+  old_digest: string
+  old_version: string
+  operation: 'update'
+  repository_url: string
+  requirement_changes: WorkflowMarketplaceRequirementChanges
+  result: 'review_required' | 'unchanged' | 'update_available'
+  review_digest: string
+  risk_changes: WorkflowMarketplaceRiskChanges
+  source_name: string
+  workflow_changes: WorkflowMarketplaceStringSetChange
+  workflow_reviews: WorkflowMarketplaceTrustReviewItem[]
+}
+
+export interface WorkflowMarketplaceRemoveReview {
+  confirmation_token: string
+  current_commit: string
+  current_version: string
+  distribution_digest: string
+  identity: WorkflowMarketplacePackageIdentity
+  operation: 'remove'
+  result: 'review_required'
+  review_digest: string
+  workflow_names: string[]
+}
+
+export interface WorkflowMarketplaceTrustReview {
+  confirmation_token: string
+  distribution_digest: string
+  identity: WorkflowMarketplacePackageIdentity
+  package_resources: string[]
+  resolved_commit: string
+  review_digest: string
+  source_name: string
+  version: string
+  workflows: WorkflowMarketplaceTrustReviewItem[]
+}
+
+export interface WorkflowMarketplaceUpdateCheck {
+  candidate_version: null | string
+  diagnostic_code: null | string
+  identity: WorkflowMarketplacePackageIdentity
+  installed_version: string
+  message: null | string
+  status: 'current' | 'error' | 'orphaned' | 'update_available'
+}
+
+export interface WorkflowMarketplaceSourceRefresh {
+  diagnostic_code: null | string
+  message: null | string
+  package_count: number
+  repository_url: string
+  resolved_commit: null | string
+  source_name: string
+  state:
+    | 'authentication-failed'
+    | 'cancelled'
+    | 'disabled'
+    | 'fresh'
+    | 'incompatible'
+    | 'malformed'
+    | 'stale'
+    | 'unavailable'
+  verified_at: null | string
+}
+
+export interface WorkflowMarketplaceTrustState {
+  state: 'trusted' | 'untrusted'
+  workflow_name: string
+}
+
+export type WorkflowMarketplaceOperationResult =
+  | { type: 'install_review'; value: WorkflowMarketplaceInstallReview }
+  | { type: 'installed_package'; value: WorkflowMarketplaceInstalledPackage }
+  | { type: 'package_detail'; value: WorkflowMarketplacePackageDetail }
+  | { type: 'remove_review'; value: WorkflowMarketplaceRemoveReview }
+  | { type: 'removed_package'; value: WorkflowMarketplaceInstalledPackage }
+  | { type: 'source_refresh'; value: WorkflowMarketplaceSourceRefresh }
+  | { type: 'trust_grant'; value: { workflows: WorkflowMarketplaceTrustState[] } }
+  | { type: 'trust_review'; value: WorkflowMarketplaceTrustReview }
+  | { type: 'trust_revoke'; value: { revoked: number } }
+  | { type: 'update_checks'; value: { checks: WorkflowMarketplaceUpdateCheck[] } }
+  | { type: 'update_review'; value: WorkflowMarketplaceUpdateReview }
+  | { type: 'updated_package'; value: WorkflowMarketplaceInstalledPackage }
+
+export interface WorkflowMarketplaceOperationError {
+  code: string
+  message: 'Workflow marketplace operation failed.'
+}
+
+export type WorkflowMarketplaceOperationState = 'cancelled' | 'failed' | 'pending' | 'running' | 'succeeded'
+
+export interface WorkflowMarketplaceOperation {
+  created_at: string
+  error: null | WorkflowMarketplaceOperationError
+  finished_at: null | string
+  id: string
+  kind: string
+  phase: string
+  profile: string
+  progress: number
+  result: null | WorkflowMarketplaceOperationResult
+  schema_version: 1
+  started_at: null | string
+  state: WorkflowMarketplaceOperationState
+  updated_at: string
+}
+
+export interface WorkflowMarketplaceOperationPage {
+  limit: number
+  offset: number
+  operations: WorkflowMarketplaceOperation[]
+  profile: string
+}
+
+export interface WorkflowMarketplaceErrorEnvelope {
+  code: string
+  message?: string
+}
+
 export interface WorkflowProgress {
   completed_nodes: number
   kind: 'graph'
