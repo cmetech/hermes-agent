@@ -466,6 +466,7 @@ class ValidatedWorkflowResourceBodies:
 _WORKFLOW_SOURCE_METADATA_MAX_CHARS = 4096
 _WORKFLOW_SOURCE_NAME_MAX_CHARS = 128
 _WORKFLOW_EXPANDED_NODE_ID_MAX_CHARS = (4 * _WORKFLOW_SOURCE_NAME_MAX_CHARS) + 6
+_WORKFLOW_MARKETPLACE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _bounded_source_text(value: object, field_name: str, *, limit: int) -> str:
@@ -489,6 +490,44 @@ def _logical_source_location(value: object, field_name: str) -> str:
     ):
         raise ValueError(f"{field_name} must be a contained logical location")
     return candidate.as_posix()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowMarketplaceBinding:
+    """Exact installed distribution identity attached by local provenance."""
+
+    installation_key: str
+    source_name: str
+    package_id: str
+    package_version: str
+    workflow_relative_path: str
+    distribution_digest: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "installation_key",
+            "source_name",
+            "package_id",
+            "package_version",
+        ):
+            _bounded_source_text(
+                getattr(self, field_name),
+                field_name,
+                limit=_WORKFLOW_SOURCE_METADATA_MAX_CHARS,
+            )
+        object.__setattr__(
+            self,
+            "workflow_relative_path",
+            _logical_source_location(
+                self.workflow_relative_path,
+                "workflow_relative_path",
+            ),
+        )
+        if (
+            not isinstance(self.distribution_digest, str)
+            or _WORKFLOW_MARKETPLACE_SHA256.fullmatch(self.distribution_digest) is None
+        ):
+            raise ValueError("distribution_digest must be a lowercase SHA-256 digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,6 +594,7 @@ class WorkflowSourceDocument:
     sidecar_bytes: bytes | None
     definition_location: str
     sidecar_location: str | None
+    marketplace_binding: WorkflowMarketplaceBinding | None = None
     field_lines: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
@@ -583,6 +623,11 @@ class WorkflowSourceDocument:
             raise ValueError("definition_bytes must be immutable bytes")
         if self.sidecar_bytes is not None and not isinstance(self.sidecar_bytes, bytes):
             raise ValueError("sidecar_bytes must be immutable bytes when present")
+        if self.marketplace_binding is not None and not isinstance(
+            self.marketplace_binding,
+            WorkflowMarketplaceBinding,
+        ):
+            raise ValueError("marketplace_binding must be exact installed identity")
         object.__setattr__(self, "nodes", tuple(self.nodes))
         object.__setattr__(self, "options", freeze_value(self.options))
         object.__setattr__(self, "sidecar", freeze_value(self.sidecar))
@@ -844,6 +889,7 @@ class WorkflowPackage:
     language: WorkflowLanguageMetadata
     compatibility_findings: tuple[CompatibilityFinding, ...]
     validation_issues: tuple[ValidationIssue, ...] = ()
+    marketplace_binding: WorkflowMarketplaceBinding | None = None
 
 
 _CONNECTOR_CAPABILITY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
