@@ -24,7 +24,9 @@ from plugins.workflow.conditions import (
     validate_v6_condition_syntax,
 )
 from plugins.workflow.language import (
+    ARTIFACTS_VERSION_UNSUPPORTED_CODE,
     ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE,
+    LOOP_GROUP_VERSION_UNSUPPORTED_CODE,
     UNKNOWN_TOP_LEVEL_FIELD_CODE,
     WorkflowLanguageCompatibilityError,
     WorkflowSemanticNormalizationError,
@@ -1298,7 +1300,11 @@ def _normalize_node(
         if field in node and not phase6:
             _fail(
                 f"{path}.{field}",
-                f"{field}_version_unsupported",
+                (
+                    ARTIFACTS_VERSION_UNSUPPORTED_CODE
+                    if field == "artifacts"
+                    else f"{field}_version_unsupported"
+                ),
                 f"{field} requires Phase 6",
             )
     for field, allowed_types in (
@@ -1315,7 +1321,7 @@ def _normalize_node(
     if node_type == "loop_group" and not phase6:
         _fail(
             f"{path}.loop_group",
-            "loop_group_version_unsupported",
+            LOOP_GROUP_VERSION_UNSUPPORTED_CODE,
             "loop_group requires normalizer version 6",
         )
     if node_type == "loop_group" and "retry" in node:

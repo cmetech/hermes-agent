@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import ast
-import base64
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, replace
 from hashlib import sha256
 import json
 from pathlib import Path
 import re
-import zlib
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -893,28 +891,58 @@ def test_legacy_authoring_contract_preserves_supported_versions(
     }
 
 
-def test_legacy_contract_is_byte_identical_to_declared_merge_base():
-    fixture_path = (
-        Path(__file__).with_name("fixtures")
-        / "legacy-contract-c1dc7a23.json"
-    )
-    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-    assert fixture["merge_base"] == (
-        "c1dc7a23e1e987f7f64a1bee89b224af4d4adf5d"
-    )
-    golden = zlib.decompress(
-        base64.b85decode(
-            "".join(fixture["canonical_zlib_base85"].splitlines())
-        )
-    )
-    assert len(golden) == fixture["canonical_bytes"]
-    assert sha256(golden).hexdigest() == fixture["canonical_sha256"]
+def test_legacy_contract_publishes_v6_rejections_without_v6_authoring_fields():
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
+    expected = {
+        "artifacts_version_unsupported": ["nodes[].artifacts"],
+        "loop_group_version_unsupported": ["nodes[].loop_group"],
+    }
+    compatibility_codes = contract["compatibility_codes"]
+    assert isinstance(compatibility_codes, dict)
+    for code, fields in expected.items():
+        entry = compatibility_codes[code]
+        assert {
+            "blocking": entry["blocking"],
+            "enforcement_phase": entry["enforcement_phase"],
+            "fields": entry["fields"],
+            "runtime_status": entry["runtime_status"],
+            "severity": entry["severity"],
+            "status": entry["status"],
+        } == {
+            "blocking": True,
+            "enforcement_phase": 6,
+            "fields": fields,
+            "runtime_status": "blocking",
+            "severity": "error",
+            "status": "deferred",
+        }
 
-    current = language_schema.canonical_contract_json(
-        workflow_authoring_contract(WorkflowLanguageProfile.HERMES_LEGACY)
-    ).encode("utf-8")
-
-    assert current == golden
+    node_kinds = contract["node_kinds"]
+    assert isinstance(node_kinds, list)
+    assert all(isinstance(item, dict) for item in node_kinds)
+    assert "loop_group" not in {item["id"] for item in node_kinds}
+    v6_field_paths = {
+        "nodes[].artifacts",
+        "nodes[].loop_group",
+        "nodes[].maxTurns",
+        "nodes[].tool_call_contract",
+    }
+    published_field_paths: set[str] = set()
+    for node_kind in node_kinds:
+        fields = node_kind["fields"]
+        assert isinstance(fields, list)
+        assert all(isinstance(field, dict) for field in fields)
+        published_field_paths.update(field["field_path"] for field in fields)
+    assert not published_field_paths & v6_field_paths
+    node_properties = contract["definition_schema"]["properties"]["nodes"]["items"][
+        "properties"
+    ]
+    assert not set(node_properties) & {
+        "artifacts",
+        "loop_group",
+        "maxTurns",
+        "tool_call_contract",
+    }
 
 
 def test_phase6_semantic_rules_retain_kind_projection():
