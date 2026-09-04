@@ -981,6 +981,24 @@ def test_direct_update_check_reports_sanitized_non_destructive_failure(
     assert service.trust_store.snapshot_read_only(max_bytes=1024 * 1024) == before_trust
 
 
+def test_direct_install_aliases_have_one_service_owned_logical_target(
+    service: WorkflowMarketplaceService,
+) -> None:
+    shorthand = service.canonical_install_target(
+        InstallRequest(identifier="example/workflows", ref="main")
+    )
+    explicit = service.canonical_install_target(
+        InstallRequest(
+            identifier="https://github.com/example/workflows.git",
+            ref="main",
+        )
+    )
+
+    assert shorthand == explicit
+    assert "https://" not in shorthand
+    assert "example/workflows" not in shorthand
+
+
 def test_direct_update_check_reports_invalid_candidate_without_mutation(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,
@@ -1418,6 +1436,50 @@ def test_trust_review_is_exact_selectable_and_stale_reviews_fail_closed(
     with pytest.raises(WorkflowMarketplaceError) as stale:
         service.grant_trust(all_review.confirmation_token, actor="alice")
     assert stale.value.code in {"package_digest_mismatch", "trust_review_changed"}
+
+
+def test_trust_mutations_honor_exact_cancellation_boundary(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    review = service.review_trust(installed.identity, actor="alice")
+    metadata = service.confirmation_metadata(
+        review.confirmation_token,
+        actor="alice",
+        operation="trust",
+    )
+    assert metadata.identity == installed.identity
+    with pytest.raises(WorkflowMarketplaceError) as foreign:
+        service.confirmation_metadata(
+            review.confirmation_token,
+            actor="mallory",
+            operation="trust",
+        )
+    assert foreign.value.code == "confirmation_token_invalid"
+
+    with pytest.raises(WorkflowMarketplaceError) as cancelled:
+        service.grant_trust(
+            review.confirmation_token,
+            actor="alice",
+            cancelled=lambda: False,
+            enter_atomic=lambda: False,
+        )
+    assert cancelled.value.code == "marketplace_operation_cancelled"
+    assert set(service.workflow_trust(installed.identity).values()) == {"untrusted"}
+
+    accepted = service.review_trust(installed.identity, actor="alice")
+    service.grant_trust(accepted.confirmation_token, actor="alice")
+    assert set(service.workflow_trust(installed.identity).values()) == {"trusted"}
+
+    with pytest.raises(WorkflowMarketplaceError) as revoke_cancelled:
+        service.revoke_trust(
+            installed.identity,
+            cancelled=lambda: True,
+            enter_atomic=lambda: pytest.fail("cancel must win before trust mutation"),
+        )
+    assert revoke_cancelled.value.code == "marketplace_operation_cancelled"
+    assert set(service.workflow_trust(installed.identity).values()) == {"trusted"}
 
 
 def test_all_workflow_trust_grant_is_one_atomic_write_and_preserves_other_grants(

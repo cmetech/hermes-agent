@@ -11,16 +11,29 @@ import re
 import secrets
 import threading
 from collections.abc import Callable
-from typing import Literal, NoReturn
+from typing import Annotated, Literal, NoReturn, TypeAlias
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    JsonValue,
     StrictInt,
+    TypeAdapter,
     field_validator,
     model_validator,
+)
+
+from hermes_cli.git_source import GitSourceError, validate_credential_free_git_source
+
+from .models import (
+    InstallReview,
+    InstalledPackage,
+    PackageInspection,
+    RemoveReview,
+    SOURCE_NAME_PATTERN,
+    TrustReview,
+    UpdateCheck,
+    UpdateReview,
 )
 
 OperationState = Literal["pending", "running", "succeeded", "failed", "cancelled"]
@@ -34,17 +47,14 @@ class _StrictOperationModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
-class MarketplaceOperationResult(_StrictOperationModel):
-    """One bounded result envelope produced by a strict API adapter."""
-
-    type: str = Field(min_length=1, max_length=64, pattern=_IDENTIFIER.pattern)
-    value: dict[str, JsonValue] = Field(max_length=4096)
+class _OperationResultBase(_StrictOperationModel):
+    """Shared byte bound for one closed operation-result variant."""
 
     @model_validator(mode="after")
-    def require_bounded_json(self) -> "MarketplaceOperationResult":
+    def require_bounded_json(self) -> "_OperationResultBase":
         try:
             rendered = json.dumps(
-                self.value,
+                self.model_dump(mode="json", by_alias=True),
                 ensure_ascii=False,
                 allow_nan=False,
                 sort_keys=True,
@@ -55,6 +65,144 @@ class MarketplaceOperationResult(_StrictOperationModel):
         if len(rendered) > _RESULT_BYTES_MAX:
             raise ValueError("operation result exceeds its byte limit")
         return self
+
+
+class MarketplaceSourceRefreshValue(_StrictOperationModel):
+    source_name: str = Field(min_length=1, max_length=64, pattern=SOURCE_NAME_PATTERN)
+    repository_url: str = Field(min_length=1, max_length=4096)
+    state: Literal[
+        "fresh",
+        "stale",
+        "disabled",
+        "authentication-failed",
+        "malformed",
+        "incompatible",
+        "unavailable",
+        "cancelled",
+    ]
+    resolved_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    verified_at: str | None = Field(default=None, min_length=20, max_length=64)
+    package_count: StrictInt = Field(ge=0, le=4096)
+    diagnostic_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=_IDENTIFIER.pattern,
+    )
+    message: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    @field_validator("repository_url")
+    @classmethod
+    def validate_repository_url(cls, value: str) -> str:
+        try:
+            validate_credential_free_git_source(value)
+        except GitSourceError as error:
+            raise ValueError("repository URL is invalid") from error
+        return value
+
+
+class MarketplaceUpdateChecksValue(_StrictOperationModel):
+    checks: list[UpdateCheck] = Field(max_length=512)
+
+
+class MarketplaceTrustState(_StrictOperationModel):
+    workflow_name: str = Field(min_length=1, max_length=256)
+    state: Literal["trusted", "untrusted"]
+
+
+class MarketplaceTrustStatesValue(_StrictOperationModel):
+    workflows: list[MarketplaceTrustState] = Field(max_length=512)
+
+
+class MarketplaceTrustRevocationValue(_StrictOperationModel):
+    revoked: StrictInt = Field(ge=0, le=512)
+
+
+class MarketplaceSourceRefreshOperationResult(_OperationResultBase):
+    type: Literal["source_refresh"]
+    value: MarketplaceSourceRefreshValue
+
+
+class MarketplacePackageDetailOperationResult(_OperationResultBase):
+    type: Literal["package_detail"]
+    value: PackageInspection
+
+
+class MarketplaceUpdateChecksOperationResult(_OperationResultBase):
+    type: Literal["update_checks"]
+    value: MarketplaceUpdateChecksValue
+
+
+class MarketplaceInstallReviewOperationResult(_OperationResultBase):
+    type: Literal["install_review"]
+    value: InstallReview
+
+
+class MarketplaceInstalledPackageOperationResult(_OperationResultBase):
+    type: Literal["installed_package"]
+    value: InstalledPackage
+
+
+class MarketplaceUpdateReviewOperationResult(_OperationResultBase):
+    type: Literal["update_review"]
+    value: UpdateReview
+
+
+class MarketplaceUpdatedPackageOperationResult(_OperationResultBase):
+    type: Literal["updated_package"]
+    value: InstalledPackage
+
+
+class MarketplaceRemoveReviewOperationResult(_OperationResultBase):
+    type: Literal["remove_review"]
+    value: RemoveReview
+
+
+class MarketplaceRemovedPackageOperationResult(_OperationResultBase):
+    type: Literal["removed_package"]
+    value: InstalledPackage
+
+
+class MarketplaceTrustReviewOperationResult(_OperationResultBase):
+    type: Literal["trust_review"]
+    value: TrustReview
+
+
+class MarketplaceTrustGrantOperationResult(_OperationResultBase):
+    type: Literal["trust_grant"]
+    value: MarketplaceTrustStatesValue
+
+
+class MarketplaceTrustRevokeOperationResult(_OperationResultBase):
+    type: Literal["trust_revoke"]
+    value: MarketplaceTrustRevocationValue
+
+
+MarketplaceOperationResult: TypeAlias = Annotated[
+    MarketplaceSourceRefreshOperationResult
+    | MarketplacePackageDetailOperationResult
+    | MarketplaceUpdateChecksOperationResult
+    | MarketplaceInstallReviewOperationResult
+    | MarketplaceInstalledPackageOperationResult
+    | MarketplaceUpdateReviewOperationResult
+    | MarketplaceUpdatedPackageOperationResult
+    | MarketplaceRemoveReviewOperationResult
+    | MarketplaceRemovedPackageOperationResult
+    | MarketplaceTrustReviewOperationResult
+    | MarketplaceTrustGrantOperationResult
+    | MarketplaceTrustRevokeOperationResult,
+    Field(discriminator="type"),
+]
+_OPERATION_RESULT_ADAPTER = TypeAdapter(MarketplaceOperationResult)
+
+
+def validate_marketplace_operation_result(value: object) -> MarketplaceOperationResult:
+    """Strictly validate and detach one closed result projection."""
+
+    validated = _OPERATION_RESULT_ADAPTER.validate_python(value)
+    return _OPERATION_RESULT_ADAPTER.validate_python(
+        validated.model_dump(mode="json", by_alias=True)
+    )
 
 
 class MarketplaceOperationPublicError(_StrictOperationModel):
@@ -200,13 +348,20 @@ class CancellationToken:
     def begin_atomic(self) -> None:
         """Enter an atomic mutation only if cancellation has not already won."""
 
+        if not self.enter_atomic():
+            _cancelled()
+
+    def enter_atomic(self) -> bool:
+        """Atomically arbitrate cancellation against the durable mutation."""
+
         with self._lock:
             if self._cancel_requested:
-                _cancelled()
+                return False
             if self._atomic_started:
                 raise RuntimeError("atomic marketplace mutation already started")
             self._atomic_started = True
         self._progress("committing", 90)
+        return True
 
     def mark_committed(self) -> None:
         with self._lock:
@@ -545,8 +700,11 @@ class WorkflowMarketplaceOperationRegistry:
         try:
             cancellation.checkpoint()
             result = call(cancellation)
-            if not isinstance(result, MarketplaceOperationResult):
-                raise TypeError("operation returned an invalid result")
+            result = validate_marketplace_operation_result(
+                result.model_dump(mode="json", by_alias=True)
+                if isinstance(result, _OperationResultBase)
+                else result
+            )
             with self._lock:
                 record = self._records.get(operation_id)
                 if record is None or record.state in _TERMINAL_STATES:
@@ -649,8 +807,6 @@ class WorkflowMarketplaceOperationRegistry:
         if wait_timeout < 0 or wait_timeout > 30:
             raise ValueError("operation shutdown timeout is invalid")
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
             futures = []
             for record in tuple(self._records.values()):
@@ -666,6 +822,38 @@ class WorkflowMarketplaceOperationRegistry:
             wait(futures, timeout=float(wait_timeout))
         self._executor.shutdown(wait=False, cancel_futures=True)
 
+    def retire_if_idle(self) -> bool:
+        """Prevent new work if this registry has no pending/running operations."""
+
+        with self._lock:
+            if any(
+                record.state not in _TERMINAL_STATES
+                for record in self._records.values()
+            ):
+                return False
+            if self._closed:
+                return True
+            self._closed = True
+            return True
+
+    def close_retired(self) -> None:
+        """Release an executor after ``retire_if_idle`` won."""
+
+        with self._lock:
+            if not self._closed or any(
+                record.state not in _TERMINAL_STATES
+                for record in self._records.values()
+            ):
+                raise RuntimeError("active marketplace registry cannot be retired")
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def has_in_flight(self) -> bool:
+        with self._lock:
+            return any(
+                record.state not in _TERMINAL_STATES
+                for record in self._records.values()
+            )
+
 
 __all__ = [
     "CancellationToken",
@@ -677,5 +865,23 @@ __all__ = [
     "MarketplaceOperationPublicError",
     "MarketplaceOperationRegistryError",
     "MarketplaceOperationResult",
+    "MarketplaceInstallReviewOperationResult",
+    "MarketplaceInstalledPackageOperationResult",
+    "MarketplacePackageDetailOperationResult",
+    "MarketplaceRemoveReviewOperationResult",
+    "MarketplaceRemovedPackageOperationResult",
+    "MarketplaceSourceRefreshOperationResult",
+    "MarketplaceSourceRefreshValue",
+    "MarketplaceTrustGrantOperationResult",
+    "MarketplaceTrustReviewOperationResult",
+    "MarketplaceTrustRevokeOperationResult",
+    "MarketplaceTrustRevocationValue",
+    "MarketplaceTrustState",
+    "MarketplaceTrustStatesValue",
+    "MarketplaceUpdateChecksOperationResult",
+    "MarketplaceUpdateChecksValue",
+    "MarketplaceUpdateReviewOperationResult",
+    "MarketplaceUpdatedPackageOperationResult",
     "WorkflowMarketplaceOperationRegistry",
+    "validate_marketplace_operation_result",
 ]

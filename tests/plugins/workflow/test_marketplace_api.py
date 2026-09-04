@@ -11,7 +11,9 @@ from fastapi.testclient import TestClient
 import pytest
 
 from plugins.workflow.marketplace.api import (
+    MarketplaceSourceEnabledRequest,
     WorkflowMarketplaceApiContext,
+    _body,
     create_marketplace_router,
 )
 from plugins.workflow.marketplace.catalog import CatalogPackage, SourceRefreshResult
@@ -37,7 +39,15 @@ from plugins.workflow.marketplace.models import (
     WorkflowTrustReviewItem,
 )
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
-from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+from plugins.workflow.marketplace.operations import (
+    MarketplaceOperationRegistryError,
+    MarketplaceTrustRevokeOperationResult,
+    MarketplaceTrustRevocationValue,
+)
+from plugins.workflow.marketplace.service import (
+    ConfirmationTargetMetadata,
+    WorkflowMarketplaceService,
+)
 
 
 _DIGEST = "1" * 64
@@ -283,6 +293,12 @@ class _FakeService:
         self.sources: list[WorkflowMarketplaceSource] = []
         self.confirm_error: WorkflowMarketplaceError | None = None
 
+    def canonical_install_target(self, request):
+        return f"package:{request.identifier}"
+
+    def confirmation_metadata(self, token, *, actor, operation):
+        return ConfirmationTargetMetadata(operation=operation, identity=_identity())
+
     def add_source(self, source):
         self.calls.append(("add_source", source))
         self.sources.append(source)
@@ -371,8 +387,12 @@ class _FakeService:
         self.calls.append(("prepare_install", request, actor, cancelled))
         return _install_review()
 
-    def confirm_install(self, token, *, actor):
+    def confirm_install(self, token, *, actor, cancelled, enter_atomic):
         self.calls.append(("confirm_install", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
         if self.confirm_error is not None:
             raise self.confirm_error
         return _installed()
@@ -381,28 +401,44 @@ class _FakeService:
         self.calls.append(("prepare_update", identity, actor, cancelled))
         return _update_review()
 
-    def confirm_update(self, token, *, actor):
+    def confirm_update(self, token, *, actor, cancelled, enter_atomic):
         self.calls.append(("confirm_update", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
         return _installed(version="2.0.0")
 
     def prepare_remove(self, identity, *, actor):
         self.calls.append(("prepare_remove", identity, actor))
         return _remove_review()
 
-    def confirm_remove(self, token, *, actor):
+    def confirm_remove(self, token, *, actor, cancelled, enter_atomic):
         self.calls.append(("confirm_remove", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
         return _installed()
 
     def review_trust(self, identity, *, actor, workflow_name=None):
         self.calls.append(("review_trust", identity, actor, workflow_name))
         return _trust_review()
 
-    def grant_trust(self, token, *, actor):
+    def grant_trust(self, token, *, actor, cancelled, enter_atomic):
         self.calls.append(("grant_trust", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
         return {"laptop-diagnostic": "trusted"}
 
-    def revoke_trust(self, identity, *, workflow_name=None):
+    def revoke_trust(self, identity, *, workflow_name=None, cancelled, enter_atomic):
         self.calls.append(("revoke_trust", identity, workflow_name))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
         return 1
 
 
@@ -955,7 +991,9 @@ def test_refresh_auth_failure_projection_redacts_credentials_and_local_paths(
             diagnostic_code="source_authentication_failed",
             message=(
                 "https://user:secret@example.test/private "
-                "/private/tmp/marketplace/.staging access_token=secret"
+                "/private/tmp/marketplace/.staging access_token=secret "
+                "clientSecret=hidden C:\\Users\\alice\\AppData\\Local\\Temp\\x "
+                "\\\\server\\share\\quarantine\\package"
             ),
         )
 
@@ -970,7 +1008,10 @@ def test_refresh_auth_failure_projection_redacts_credentials_and_local_paths(
     assert terminal["state"] == "succeeded"
     assert terminal["result"]["value"]["state"] == "authentication-failed"
     assert "secret" not in encoded
+    assert "hidden" not in encoded
     assert "/private/tmp" not in encoded
+    assert "C:\\\\Users" not in encoded
+    assert "server\\\\share" not in encoded
 
 
 def test_prepare_reports_progress_and_enforces_same_profile_single_flight(api) -> None:
@@ -1109,7 +1150,9 @@ def test_cancel_during_atomic_swap_reports_committed_success(api) -> None:
     entered = threading.Event()
     release = threading.Event()
 
-    def blocking_confirm(token, *, actor):
+    def blocking_confirm(token, *, actor, cancelled, enter_atomic):
+        assert not cancelled()
+        assert enter_atomic()
         entered.set()
         release.wait(timeout=5)
         return _installed()
@@ -1132,6 +1175,279 @@ def test_cancel_during_atomic_swap_reports_committed_success(api) -> None:
     assert during.json()["phase"] == "committing"
     assert terminal["state"] == "succeeded"
     assert terminal["result"]["type"] == "installed_package"
+
+
+def test_distinct_confirmation_tokens_for_same_package_are_single_flight(api) -> None:
+    client, service, _context, _home, _profile = api
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_confirm(token, *, actor, cancelled, enter_atomic):
+        entered.set()
+        release.wait(timeout=5)
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return _installed()
+
+    service.confirm_install = blocking_confirm
+    first = client.post(
+        "/api/plugins/workflow/marketplace/install/confirm",
+        json={"confirmationToken": "A" * 40},
+        headers=_headers(),
+    )
+    assert entered.wait(timeout=2)
+    second = client.post(
+        "/api/plugins/workflow/marketplace/install/confirm",
+        json={"confirmationToken": "B" * 40},
+        headers=_headers(),
+    )
+    release.set()
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert second.json()["detail"] == {"code": "marketplace_operation_conflict"}
+    assert "A" * 40 not in first.text
+    assert "B" * 40 not in second.text
+
+
+def test_update_remove_and_trust_mutations_share_package_reservation(api) -> None:
+    client, service, _context, _home, _profile = api
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_update(token, *, actor, cancelled, enter_atomic):
+        entered.set()
+        release.wait(timeout=5)
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return _installed(version="2.0.0")
+
+    service.confirm_update = blocking_update
+    update = client.post(
+        "/api/plugins/workflow/marketplace/update/confirm",
+        json={"confirmationToken": "U" * 40},
+        headers=_headers(),
+    )
+    assert entered.wait(timeout=2)
+    remove = client.post(
+        "/api/plugins/workflow/marketplace/remove/confirm",
+        json={"confirmationToken": "R" * 40},
+        headers=_headers(),
+    )
+    trust = client.post(
+        "/api/plugins/workflow/marketplace/trust/revoke",
+        json={
+            "identity": {
+                "sourceKey": "company",
+                "packageId": "laptop-support",
+            }
+        },
+        headers=_headers(),
+    )
+    release.set()
+
+    assert update.status_code == 202
+    assert remove.status_code == 409
+    assert trust.status_code == 409
+
+
+def _streaming_request(chunks: list[bytes], *, content_length: int | None = None):
+    received = [0]
+
+    async def receive():
+        index = received[0]
+        received[0] += 1
+        if index < len(chunks):
+            return {
+                "type": "http.request",
+                "body": chunks[index],
+                "more_body": index + 1 < len(chunks),
+            }
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    headers = []
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+    return (
+        Request({"type": "http", "method": "POST", "headers": headers}),
+        receive,
+        received,
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_body_stops_at_cumulative_limit_without_trusting_length() -> (
+    None
+):
+    request, receive, received = _streaming_request(
+        [b"x" * 40_000, b"y" * 40_000, b"must-not-be-read"],
+        content_length=1,
+    )
+    request._receive = receive
+
+    with pytest.raises(HTTPException) as error:
+        await _body(request, MarketplaceSourceEnabledRequest)
+
+    assert error.value.status_code == 422
+    assert error.value.detail == {"code": "marketplace_request_invalid"}
+    assert received[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_streaming_body_accepts_exact_byte_boundary() -> None:
+    prefix = b'{"enabled":true}'
+    raw = prefix + b" " * (64 * 1024 - len(prefix))
+    request, receive, _received = _streaming_request([raw])
+    request._receive = receive
+
+    parsed = await _body(request, MarketplaceSourceEnabledRequest)
+
+    assert parsed.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_deep_json_nesting_has_stable_request_invalid_envelope() -> None:
+    raw = b"[" * 1000 + b"]" * 1000
+    request, receive, _received = _streaming_request([raw])
+    request._receive = receive
+
+    with pytest.raises(HTTPException) as error:
+        await _body(request, MarketplaceSourceEnabledRequest)
+
+    assert error.value.status_code == 422
+    assert error.value.detail == {"code": "marketplace_request_invalid"}
+
+
+def _registry_result():
+    return MarketplaceTrustRevokeOperationResult(
+        type="trust_revoke",
+        value=MarketplaceTrustRevocationValue(revoked=0),
+    )
+
+
+def test_profile_context_evicts_idle_lru_and_preserves_result_isolation(
+    tmp_path,
+) -> None:
+    home = [tmp_path / "a"]
+    created = []
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda current, _profile: (
+            created.append(current),
+            _FakeService(),
+        )[1],
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda current: current.name,
+        max_profiles=2,
+    )
+    try:
+        _key_a, _profile_a, _service_a, registry_a = context.current()
+        old = registry_a.start("refresh", lambda _token: _registry_result())
+        _wait_terminal = time.monotonic() + 2
+        while registry_a.get(old.id).state not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            assert time.monotonic() < _wait_terminal
+            time.sleep(0.01)
+        home[0] = tmp_path / "b"
+        _key_b, _profile_b, _service_b, registry_b = context.current()
+        old_b = registry_b.start("refresh", lambda _token: _registry_result())
+        deadline = time.monotonic() + 2
+        while registry_b.get(old_b.id).state not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        home[0] = tmp_path / "a"
+        assert context.registry_for_current_profile() is registry_a
+        home[0] = tmp_path / "c"
+        context.current()
+
+        with pytest.raises(MarketplaceOperationRegistryError):
+            registry_b.start("refresh", lambda _token: _registry_result())
+        home[0] = tmp_path / "b"
+        replacement = context.registry_for_current_profile()
+        assert replacement is not registry_b
+        with pytest.raises(MarketplaceOperationRegistryError):
+            replacement.get(old_b.id)
+        assert len(created) == 4
+    finally:
+        context.close()
+
+
+def test_profile_context_rejects_new_profile_while_capacity_is_active(
+    tmp_path,
+) -> None:
+    home = [tmp_path / "a"]
+    release = threading.Event()
+    created = []
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda current, _profile: (
+            created.append(current),
+            _FakeService(),
+        )[1],
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda current: current.name,
+        max_profiles=1,
+        shutdown_timeout=0.05,
+    )
+    try:
+        registry = context.registry_for_current_profile()
+        registry.start(
+            "refresh",
+            lambda _token: (release.wait(timeout=5), _registry_result())[-1],
+        )
+        home[0] = tmp_path / "b"
+        with pytest.raises(HTTPException) as full:
+            context.current()
+        assert full.value.status_code == 429
+        assert full.value.detail == {"code": "marketplace_operation_capacity"}
+        assert len(created) == 1
+    finally:
+        release.set()
+        context.close()
+
+
+def test_profile_context_shutdown_uses_one_overall_deadline(tmp_path) -> None:
+    home = [tmp_path / "a"]
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda _current, _profile: _FakeService(),
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda current: current.name,
+        max_profiles=2,
+        shutdown_timeout=0.05,
+    )
+    try:
+        for index, name in enumerate(("a", "b")):
+            home[0] = tmp_path / name
+            registry = context.registry_for_current_profile()
+            registry.start(
+                "refresh",
+                lambda _token, marker=entered[index]: (
+                    marker.set(),
+                    release.wait(timeout=5),
+                    _registry_result(),
+                )[-1],
+            )
+        assert all(marker.wait(timeout=2) for marker in entered)
+
+        started_at = time.monotonic()
+        context.close()
+        elapsed = time.monotonic() - started_at
+
+        assert elapsed < 0.2
+    finally:
+        release.set()
+        context.close()
 
 
 def test_sync_service_errors_use_stable_redacted_envelopes(api) -> None:

@@ -7,11 +7,15 @@ import time
 import pytest
 
 from plugins.workflow.marketplace.operations import (
+    MarketplaceTrustGrantOperationResult,
+    MarketplaceTrustState,
+    MarketplaceTrustStatesValue,
+    MarketplaceOperationRegistryError,
     MarketplaceOperationCapacityError,
     MarketplaceOperationConflictError,
     MarketplaceOperationNotFoundError,
-    MarketplaceOperationResult,
     WorkflowMarketplaceOperationRegistry,
+    validate_marketplace_operation_result,
 )
 
 
@@ -30,8 +34,13 @@ def _wait_terminal(
     raise AssertionError("operation did not become terminal")
 
 
-def _result(value: str = "ok") -> MarketplaceOperationResult:
-    return MarketplaceOperationResult(type="test", value={"value": value})
+def _result(value: str = "ok") -> MarketplaceTrustGrantOperationResult:
+    return MarketplaceTrustGrantOperationResult(
+        type="trust_grant",
+        value=MarketplaceTrustStatesValue(
+            workflows=[MarketplaceTrustState(workflow_name=value, state="trusted")]
+        ),
+    )
 
 
 @pytest.fixture
@@ -51,13 +60,74 @@ def test_operation_result_schema_rejects_unknown_nonfinite_and_oversize_values()
     None
 ):
     with pytest.raises(Exception):
-        MarketplaceOperationResult(type="test", value={"value": "ok"}, unexpected=True)
+        MarketplaceTrustGrantOperationResult.model_validate({
+            "type": "trust_grant",
+            "value": {"workflows": []},
+            "unexpected": True,
+        })
     with pytest.raises(Exception):
-        MarketplaceOperationResult(type="test", value={"value": float("nan")})
+        MarketplaceTrustGrantOperationResult.model_validate({
+            "type": "wrong",
+            "value": {"workflows": []},
+        })
     with pytest.raises(Exception):
-        MarketplaceOperationResult(
-            type="test", value={"value": "x" * (2 * 1024 * 1024)}
-        )
+        MarketplaceTrustGrantOperationResult.model_validate({
+            "type": "trust_grant",
+            "value": {
+                "workflows": [
+                    {"workflow_name": "x" * (2 * 1024 * 1024), "state": "trusted"}
+                ]
+            },
+        })
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {"type": "unknown", "value": {}},
+        {
+            "type": "trust_revoke",
+            "value": {"revoked": 1, "accessToken": "must-not-cross"},
+        },
+        {
+            "type": "trust_revoke",
+            "value": {"workflows": []},
+        },
+        {
+            "type": "trust_revoke",
+            "value": {"revoked": 1, "confirmationToken": "A" * 40},
+        },
+        {"type": "trust_revoke", "value": {"revoked": float("nan")}},
+    ],
+)
+def test_operation_result_union_is_closed_and_discriminator_exact(candidate) -> None:
+    with pytest.raises(Exception):
+        validate_marketplace_operation_result(candidate)
+
+
+def test_terminal_result_revalidation_detaches_producer_aliases(registry) -> None:
+    producer_workflows = [
+        MarketplaceTrustState(workflow_name="diagnostic", state="trusted")
+    ]
+    unsafe_value = MarketplaceTrustStatesValue.model_construct(
+        workflows=producer_workflows
+    )
+    unsafe_result = MarketplaceTrustGrantOperationResult.model_construct(
+        type="trust_grant", value=unsafe_value
+    )
+    started = registry.start(
+        "trust_confirm", lambda _token: unsafe_result, actor="operator-a"
+    )
+    terminal = _wait_terminal(registry, started.id)
+
+    producer_workflows.clear()
+
+    assert terminal.state == "succeeded"
+    assert terminal.result is not None
+    assert len(terminal.result.value.workflows) == 1
+    current = registry.get(started.id, actor="operator-a")
+    assert current.result is not None
+    assert len(current.result.value.workflows) == 1
 
 
 def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -> None:
@@ -80,7 +150,8 @@ def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -
     with pytest.raises(Exception):
         terminal.state = "failed"
     assert terminal.result is not None
-    terminal.result.value["value"] = "caller-mutated-copy"
+    with pytest.raises(Exception):
+        terminal.result.value.workflows[0].state = "untrusted"
     assert registry.get(started.id, actor="operator-a").result == _result()
 
 
@@ -462,3 +533,32 @@ def test_concurrent_cancel_and_get_keep_a_valid_terminal_projection(registry) ->
     terminal = _wait_terminal(registry, started.id)
     assert terminal.state == "cancelled"
     assert terminal.result is None
+
+
+def test_idle_registry_can_be_retired_but_active_registry_is_preserved() -> None:
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key="/profiles/support",
+        profile="support",
+        max_workers=1,
+        max_in_flight=1,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    try:
+        started = registry.start(
+            "refresh",
+            lambda _token: (entered.set(), release.wait(timeout=5), _result())[-1],
+            actor="operator-a",
+        )
+        assert entered.wait(timeout=2)
+        assert registry.retire_if_idle() is False
+        release.set()
+        assert _wait_terminal(registry, started.id).state == "succeeded"
+        assert registry.retire_if_idle() is True
+        registry.close_retired()
+        with pytest.raises(MarketplaceOperationRegistryError) as closed:
+            registry.start("refresh", lambda _token: _result())
+        assert closed.value.code == "marketplace_operation_unavailable"
+    finally:
+        release.set()
+        registry.close_retired()

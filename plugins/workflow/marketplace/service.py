@@ -374,6 +374,12 @@ class _TrustAuthorization:
     workflow_paths: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ConfirmationTargetMetadata:
+    operation: Literal["install", "update", "remove", "trust"]
+    identity: InstalledPackageIdentity
+
+
 class _TrustConfirmationStore:
     def __init__(
         self,
@@ -494,6 +500,40 @@ class _TrustConfirmationStore:
                     actor=actor,
                     profile=profile,
                     parent_identity=parent_identity,
+                )
+        except WorkflowLockTimeout as error:
+            _fail("trust_confirmation_lock_timeout", str(error))
+
+    def inspect(self, token: str, *, actor: str, profile: str) -> _TrustAuthorization:
+        """Read a live token binding without consuming or extending it."""
+
+        if not isinstance(token, str) or _TOKEN.fullmatch(token) is None:
+            _fail("confirmation_token_invalid", "confirmation token is invalid")
+        token_digest = hashlib.sha256(token.encode()).hexdigest()
+        try:
+            with self.source_store._locked():
+                now = self.clock()
+                record = next(
+                    (
+                        item
+                        for item in self._read().tokens
+                        if item.token_digest == token_digest
+                        and item.actor == actor
+                        and item.profile == profile
+                        and _parse_timestamp(item.expires_at) > now
+                    ),
+                    None,
+                )
+                if record is None:
+                    _fail(
+                        "confirmation_token_invalid",
+                        "confirmation token is invalid",
+                    )
+                return _TrustAuthorization(
+                    identity=record.identity,
+                    distribution_digest=record.distribution_digest,
+                    review_digest=record.review_digest,
+                    workflow_paths=tuple(record.workflow_paths),
                 )
         except WorkflowLockTimeout as error:
             _fail("trust_confirmation_lock_timeout", str(error))
@@ -647,6 +687,87 @@ class WorkflowMarketplaceService:
 
     def remove_source(self, name: str) -> WorkflowMarketplaceSource:
         return self.catalog.source_store.remove(name)
+
+    def canonical_install_target(self, request: InstallRequest) -> str:
+        """Return a credential-free logical single-flight target for a request."""
+
+        if not isinstance(request, InstallRequest):
+            _fail("install_request_invalid", "install request is invalid")
+        source_name, separator, package_id = request.identifier.partition("/")
+        if separator and package_id and "/" not in package_id:
+            try:
+                self.catalog.source_store.get(source_name)
+            except WorkflowMarketplaceError as error:
+                if error.code != "source_not_found":
+                    raise
+            else:
+                if request.ref is not None or request.package_path is not None:
+                    _fail(
+                        "install_request_conflict",
+                        "registered installs use source package identity",
+                    )
+                identity = InstalledPackageIdentity(
+                    sourceKey=source_name,
+                    packageId=package_id,
+                )
+                return f"package:{identity.source_key}/{identity.package_id}"
+        try:
+            resolved = resolve_git_source(request.identifier)
+            repository_url = canonical_git_source(resolved.clone_url, None)
+            validate_credential_free_git_source(repository_url)
+        except GitSourceError:
+            _fail("source_invalid", "direct marketplace Git source is invalid")
+        embedded_path = resolved.subdirectory
+        if (
+            request.package_path is not None
+            and embedded_path is not None
+            and request.package_path != embedded_path
+        ):
+            _fail(
+                "direct_package_path_conflict",
+                "direct Git URL and request specify different package paths",
+            )
+        scope = json.dumps(
+            {
+                "repository": repository_url,
+                "ref": request.ref,
+                "path": request.package_path or embedded_path,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return (
+            f"package-direct:{direct_source_key(repository_url)}:"
+            f"{hashlib.sha256(scope.encode()).hexdigest()}"
+        )
+
+    def confirmation_metadata(
+        self,
+        token: str,
+        *,
+        actor: str,
+        operation: Literal["install", "update", "remove", "trust"],
+    ) -> ConfirmationTargetMetadata:
+        """Resolve live actor/profile-bound token metadata without consuming it."""
+
+        if operation == "trust":
+            authorization = self._trust_confirmations.inspect(
+                token, actor=actor, profile=self.profile
+            )
+            return ConfirmationTargetMetadata(
+                operation="trust", identity=authorization.identity
+            )
+        prepared = self.transactions.inspect_token(
+            token,
+            actor=actor,
+            profile=self.profile,
+        )
+        if prepared.operation != operation:
+            _fail("confirmation_token_invalid", "confirmation token is invalid")
+        return ConfirmationTargetMetadata(
+            operation=prepared.operation,
+            identity=prepared.identity,
+        )
 
     def refresh_source(
         self,
@@ -1414,7 +1535,14 @@ class WorkflowMarketplaceService:
                 workflowReviews=workflows,
             )
 
-    def confirm_install(self, token: str, *, actor: str) -> InstalledPackage:
+    def confirm_install(
+        self,
+        token: str,
+        *,
+        actor: str,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
+    ) -> InstalledPackage:
         prepared = self.transactions.consume(token, actor=actor, profile=self.profile)
         if prepared.operation != "install" or prepared.installed_provenance is not None:
             _fail("confirmation_token_invalid", "confirmation token is invalid")
@@ -1422,6 +1550,8 @@ class WorkflowMarketplaceService:
             prepared,
             review_digest=prepared.review_digest,
             trust_origin=self._trust_origin(prepared.identity),
+            cancelled=cancelled,
+            enter_atomic=enter_atomic,
         )
         return self._installed_projection(installed)
 
@@ -1580,7 +1710,14 @@ class WorkflowMarketplaceService:
                 workflowReviews=candidate_workflows,
             )
 
-    def confirm_update(self, token: str, *, actor: str) -> InstalledPackage:
+    def confirm_update(
+        self,
+        token: str,
+        *,
+        actor: str,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
+    ) -> InstalledPackage:
         prepared = self.transactions.consume(token, actor=actor, profile=self.profile)
         previous = prepared.installed_provenance
         if prepared.operation != "install" or previous is None:
@@ -1595,6 +1732,8 @@ class WorkflowMarketplaceService:
             review_digest=prepared.review_digest,
             trust_origin=origin,
             provenance_writer=persist_provenance,
+            cancelled=cancelled,
+            enter_atomic=enter_atomic,
         )
         return self._installed_projection(installed)
 
@@ -1758,7 +1897,14 @@ class WorkflowMarketplaceService:
             workflowNames=workflow_names,
         )
 
-    def confirm_remove(self, token: str, *, actor: str) -> InstalledPackage:
+    def confirm_remove(
+        self,
+        token: str,
+        *,
+        actor: str,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
+    ) -> InstalledPackage:
         prepared = self.transactions.consume(token, actor=actor, profile=self.profile)
         if prepared.operation != "remove" or prepared.installed_provenance is None:
             _fail("confirmation_token_invalid", "confirmation token is invalid")
@@ -1774,6 +1920,8 @@ class WorkflowMarketplaceService:
             review_digest=prepared.review_digest,
             trust_origin=origin,
             provenance_remover=remove_provenance,
+            cancelled=cancelled,
+            enter_atomic=enter_atomic,
         )
         return self._installed_projection(removed)
 
@@ -1876,6 +2024,8 @@ class WorkflowMarketplaceService:
         review_or_token: TrustReview | str,
         *,
         actor: str,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
     ) -> dict[str, Literal["trusted", "untrusted"]]:
         token = (
             review_or_token.confirmation_token
@@ -1920,6 +2070,11 @@ class WorkflowMarketplaceService:
                         "installed package changed after trust review",
                     )
                 origin = self._trust_origin(authorization.identity)
+                if cancelled() or not enter_atomic():
+                    _fail(
+                        "marketplace_operation_cancelled",
+                        "marketplace operation was cancelled",
+                    )
                 self.trust_store.trust_origin_many(
                     tuple(
                         (item.package_digest, item.risk_digest) for item in workflows
@@ -1936,15 +2091,43 @@ class WorkflowMarketplaceService:
         identity: InstalledPackageIdentity,
         *,
         workflow_name: str | None = None,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
     ) -> int:
-        _installed, workflows, _review_digest, _package_resources = (
-            self._trust_review_parts(identity, workflow_name=workflow_name)
-        )
-        origin = self._trust_origin(identity)
-        return sum(
-            self.trust_store.revoke_origin_for_digest(item.package_digest, origin)
-            for item in workflows
-        )
+        try:
+            with self.catalog.source_store._locked():
+                _existed, state = self.installed_store._snapshot()
+                installed = next(
+                    (
+                        record.provenance
+                        for record in state.packages
+                        if record.provenance.identity == identity
+                    ),
+                    None,
+                )
+                if installed is None:
+                    _fail("installed_package_not_found", "package is not installed")
+                _installed, workflows, _review_digest, _package_resources = (
+                    self._trust_review_parts(
+                        identity,
+                        workflow_name=workflow_name,
+                        installed=installed,
+                    )
+                )
+                origin = self._trust_origin(identity)
+                if cancelled() or not enter_atomic():
+                    _fail(
+                        "marketplace_operation_cancelled",
+                        "marketplace operation was cancelled",
+                    )
+                return sum(
+                    self.trust_store.revoke_origin_for_digest(
+                        item.package_digest, origin
+                    )
+                    for item in workflows
+                )
+        except WorkflowLockTimeout as error:
+            _fail("trust_confirmation_lock_timeout", str(error))
 
     def workflow_trust(
         self, identity: InstalledPackageIdentity
@@ -1961,4 +2144,4 @@ class WorkflowMarketplaceService:
         }
 
 
-__all__ = ["WorkflowMarketplaceService"]
+__all__ = ["ConfirmationTargetMetadata", "WorkflowMarketplaceService"]

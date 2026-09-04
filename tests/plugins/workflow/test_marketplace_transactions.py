@@ -496,6 +496,86 @@ def test_atomic_install_places_verified_copy_and_exact_provenance(
     assert store.list_journals() == ()
 
 
+def test_atomic_install_cancellation_wins_at_exact_pre_mutation_boundary(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store = MarketplaceTransactionStore(tmp_path)
+    consumed = _consume(store, candidate)
+    entered = []
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.atomic_install(
+            consumed,
+            review_digest=REVIEW,
+            cancelled=lambda: False,
+            enter_atomic=lambda: (entered.append(True), False)[1],
+        )
+
+    assert error.value.code == "marketplace_operation_cancelled"
+    assert entered == [True]
+    assert not candidate.destination.exists()
+    with pytest.raises(WorkflowMarketplaceError):
+        store.installed_store.get(candidate.identity)
+    assert store.list_journals() == ()
+
+
+def test_atomic_install_masks_cancellation_after_boundary_and_commits(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store = MarketplaceTransactionStore(tmp_path)
+    consumed = _consume(store, candidate)
+    cancellation = [False]
+
+    def enter_atomic() -> bool:
+        cancellation[0] = True
+        return True
+
+    installed = store.atomic_install(
+        consumed,
+        review_digest=REVIEW,
+        cancelled=lambda: cancellation[0],
+        enter_atomic=enter_atomic,
+    )
+
+    assert installed.identity == candidate.identity
+    assert candidate.destination.exists()
+    assert store.installed_store.get(candidate.identity) == installed
+
+
+def test_token_metadata_is_read_only_actor_profile_expiry_bound_and_canonical(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 9, 4, tzinfo=timezone.utc)]
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
+    prepared = store.prepare(
+        candidate,
+        review_digest=REVIEW,
+        actor="alice",
+        profile="support",
+    )
+
+    metadata = store.inspect_token(prepared.token, actor="alice", profile="support")
+    assert metadata.operation == "install"
+    assert metadata.identity == candidate.identity
+    assert (
+        store.inspect_token(prepared.token, actor="alice", profile="support")
+        == metadata
+    )
+
+    for actor, profile in (("mallory", "support"), ("alice", "other")):
+        with pytest.raises(WorkflowMarketplaceError) as denied:
+            store.inspect_token(prepared.token, actor=actor, profile=profile)
+        assert denied.value.code == "confirmation_token_invalid"
+
+    now[0] += timedelta(minutes=6)
+    with pytest.raises(WorkflowMarketplaceError) as expired:
+        store.inspect_token(prepared.token, actor="alice", profile="support")
+    assert expired.value.code == "confirmation_token_invalid"
+
+
 def test_atomic_install_rejects_noncanonical_or_mismatched_trust_origin(
     tmp_path: Path,
 ) -> None:
@@ -932,6 +1012,27 @@ def test_atomic_remove_has_matching_rollback_and_success_semantics(
     with pytest.raises(WorkflowMarketplaceError) as error:
         InstalledPackageStore(tmp_path).get(candidate.identity)
     assert error.value.code == "installed_package_not_found"
+
+
+def test_atomic_remove_cancellation_before_boundary_preserves_package(
+    tmp_path: Path,
+) -> None:
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = _install(store, candidate)
+    _remove_candidate_value, removal = _authorize_remove(store, installed)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.atomic_remove(
+            removal,
+            review_digest=REVIEW,
+            cancelled=lambda: True,
+            enter_atomic=lambda: pytest.fail("cancel must win before atomic entry"),
+        )
+
+    assert error.value.code == "marketplace_operation_cancelled"
+    assert candidate.destination.exists()
+    assert store.installed_store.get(candidate.identity) == installed
 
 
 def test_atomic_remove_revalidates_installed_bytes_after_confirmation(

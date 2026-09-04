@@ -117,6 +117,14 @@ class PreparedTransaction:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedTransactionMetadata:
+    """Non-secret logical identity for a live actor/profile-bound token."""
+
+    operation: Literal["install", "update", "remove"]
+    identity: InstalledPackageIdentity
+
+
+@dataclass(frozen=True, slots=True)
 class TransactionJournal:
     transaction_id: str
     operation: Literal["install", "remove"]
@@ -1231,6 +1239,54 @@ class MarketplaceTransactionStore:
         except (TypeError, ValueError):
             _fail("confirmation_token_invalid", "confirmation token is invalid")
 
+    def inspect_token(
+        self,
+        raw_token: str,
+        *,
+        actor: str,
+        profile: str,
+    ) -> PreparedTransactionMetadata:
+        """Read live token metadata without consuming or extending the token."""
+
+        if not isinstance(raw_token, str) or _TOKEN.fullmatch(raw_token) is None:
+            _fail("confirmation_token_invalid", "confirmation token is invalid")
+        digest = hashlib.sha256(raw_token.encode()).hexdigest()
+        try:
+            with self._locked():
+                now = self.clock()
+                record = next(
+                    (
+                        item
+                        for item in self._read_prepared().transactions
+                        if item.token_digest == digest
+                        and item.actor == actor
+                        and item.profile == profile
+                        and _parse_timestamp(item.expires_at) > now
+                    ),
+                    None,
+                )
+                if record is None:
+                    _fail(
+                        "confirmation_token_invalid",
+                        "confirmation token is invalid",
+                    )
+                return PreparedTransactionMetadata(
+                    operation=(
+                        "remove"
+                        if record.operation == "remove"
+                        else (
+                            "update"
+                            if record.installed_provenance is not None
+                            else "install"
+                        )
+                    ),
+                    identity=record.identity,
+                )
+        except WorkflowMarketplaceError:
+            raise
+        except (TypeError, ValueError):
+            _fail("confirmation_token_invalid", "confirmation token is invalid")
+
     def _journal_public(self, record: _JournalRecord) -> TransactionJournal:
         return TransactionJournal(
             transaction_id=record.transaction_id,
@@ -1587,6 +1643,8 @@ class MarketplaceTransactionStore:
         review_digest: str,
         trust_origin: str | None = None,
         provenance_writer: Callable[[InstalledPackageProvenance], object] | None = None,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
         fault: Callable[[str], None] = lambda _point: None,
     ) -> InstalledPackageProvenance:
         """Install a consumed candidate with provenance inside one rollback boundary."""
@@ -1633,6 +1691,11 @@ class MarketplaceTransactionStore:
                 }
             )
             try:
+                if cancelled() or not enter_atomic():
+                    _fail(
+                        "marketplace_operation_cancelled",
+                        "marketplace operation was cancelled",
+                    )
                 fault("before_initial_journal")
                 self._replace_journal(journal, parent_identity=parent_identity)
                 if previous is not None:
@@ -1774,6 +1837,8 @@ class MarketplaceTransactionStore:
         review_digest: str,
         trust_origin: str | None = None,
         provenance_remover: Callable[[InstalledPackageIdentity], object] | None = None,
+        cancelled: Callable[[], bool] = lambda: False,
+        enter_atomic: Callable[[], bool] = lambda: True,
         fault: Callable[[str], None] = lambda _point: None,
     ) -> InstalledPackageProvenance:
         """Remove one package authorized by an exact consumed confirmation."""
@@ -1804,6 +1869,11 @@ class MarketplaceTransactionStore:
                 }
             )
             try:
+                if cancelled() or not enter_atomic():
+                    _fail(
+                        "marketplace_operation_cancelled",
+                        "marketplace operation was cancelled",
+                    )
                 fault("before_initial_journal")
                 self._replace_journal(journal, parent_identity=parent_identity)
                 quarantine = self._prepare_quarantine(
@@ -2192,6 +2262,7 @@ def recover_transactions() -> tuple[str, ...]:
 __all__ = [
     "MarketplaceTransactionStore",
     "PreparedTransaction",
+    "PreparedTransactionMetadata",
     "TransactionCandidate",
     "TransactionJournal",
     "atomic_install",

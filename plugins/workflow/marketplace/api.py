@@ -10,7 +10,8 @@ from pathlib import Path
 import re
 import subprocess
 import threading
-from typing import Any, Literal, Protocol, TypeVar, cast
+import time
+from typing import Literal, Protocol, TypeVar
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import (
@@ -48,24 +49,36 @@ from .operations import (
     MarketplaceOperationRegistryError,
     MarketplaceOperationResult,
     WorkflowMarketplaceOperationRegistry,
+    validate_marketplace_operation_result,
 )
 from .package import WorkflowMarketplaceError
 from .service import WorkflowMarketplaceService
 
 
 _BODY_BYTES_MAX = 64 * 1024
+_JSON_NESTING_MAX = 64
 _UINT = re.compile(r"^(0|[1-9][0-9]*)$", re.ASCII)
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,4096}$", re.ASCII)
 _OPERATION_ID = re.compile(r"^wmop_[0-9a-f]{12}_[0-9a-f]{32}$", re.ASCII)
 _COMMIT = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$", re.ASCII)
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|password|"
-    r"credential|secret)\b\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|auth(?:orization)?|"
+    r"password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _LOCAL_PATH = re.compile(
-    r"(?<![A-Za-z0-9])(?:/(?:private|tmp|Users|home|var/folders)/[^\s\"']+|"
-    r"(?:/[^\s\"']+)*(?:\.staging|\.quarantine)(?:/[^\s\"']*)?)"
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"/(?:private|tmp|users|home|var/folders|var/tmp|var/cache)/[^\s\"']*|"
+    r"[A-Z]:\\(?:[^\s\"']+\\)*(?:[^\s\"']*)|"
+    r"\\\\[^\\\s]+\\[^\s\"']+|"
+    r"(?:/[^\s\"']+)*(?:\.staging|\.quarantine|/cache|/staging|/quarantine)"
+    r"(?:/[^\s\"']*)?)"
+)
+_SECRET_KEY = re.compile(
+    r"^(?:access|refresh)?token$|^api(?:key)?$|^auth(?:orization)?$|^password$|"
+    r"^secret$|^clientsecret$|^credentials?$|^confirmationtoken$",
+    re.ASCII,
 )
 
 
@@ -263,10 +276,11 @@ class MarketplaceOperationPage(_StrictApiModel):
     operations: list[MarketplaceOperation] = Field(max_length=100)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _ProfileServices:
     service: WorkflowMarketplaceService
     registry: WorkflowMarketplaceOperationRegistry
+    last_used: int
 
 
 ServiceFactory = Callable[[Path, str], WorkflowMarketplaceService]
@@ -291,6 +305,8 @@ class WorkflowMarketplaceApiContext:
         home_resolver: Callable[[], Path] = get_hermes_home,
         profile_resolver: ProfileResolver = _default_profile_resolver,
         operation_limits: Mapping[str, int] | None = None,
+        max_profiles: int = 4,
+        shutdown_timeout: float = 5.0,
     ):
         self._service_factory = service_factory
         self._home_resolver = home_resolver
@@ -302,8 +318,20 @@ class WorkflowMarketplaceApiContext:
             "max_terminal",
         }:
             raise ValueError("unknown marketplace operation limit")
+        if (
+            isinstance(max_profiles, bool)
+            or not isinstance(max_profiles, int)
+            or not 1 <= max_profiles <= 16
+            or isinstance(shutdown_timeout, bool)
+            or not isinstance(shutdown_timeout, int | float)
+            or not 0 <= shutdown_timeout <= 30
+        ):
+            raise ValueError("marketplace API context limits are invalid")
+        self._max_profiles = max_profiles
+        self._shutdown_timeout = float(shutdown_timeout)
         self._lock = threading.Lock()
         self._profiles: dict[str, _ProfileServices] = {}
+        self._sequence = 0
         self._closed = False
 
     def _current_identity(self) -> tuple[Path, str, str]:
@@ -322,20 +350,50 @@ class WorkflowMarketplaceApiContext:
 
     def _current(self) -> tuple[str, str, _ProfileServices]:
         home, key, profile = self._current_identity()
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("marketplace API context is closed")
-            services = self._profiles.get(key)
-            if services is None:
-                services = _ProfileServices(
-                    service=self._service_factory(home, profile),
-                    registry=WorkflowMarketplaceOperationRegistry(
-                        profile_key=key,
-                        profile=profile,
-                        **self._operation_limits,
-                    ),
-                )
-                self._profiles[key] = services
+        retired: WorkflowMarketplaceOperationRegistry | None = None
+        try:
+            with self._lock:
+                if self._closed:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"code": "marketplace_operation_unavailable"},
+                    )
+                services = self._profiles.get(key)
+                if services is None:
+                    if len(self._profiles) >= self._max_profiles:
+                        for candidate_key, candidate in sorted(
+                            self._profiles.items(),
+                            key=lambda item: (item[1].last_used, item[0]),
+                        ):
+                            if candidate.registry.retire_if_idle():
+                                retired = candidate.registry
+                                self._profiles.pop(candidate_key)
+                                break
+                        else:
+                            raise HTTPException(
+                                status_code=429,
+                                detail={"code": "marketplace_operation_capacity"},
+                            )
+                    self._sequence += 1
+                    services = _ProfileServices(
+                        service=self._service_factory(home, profile),
+                        registry=WorkflowMarketplaceOperationRegistry(
+                            profile_key=key,
+                            profile=profile,
+                            **self._operation_limits,
+                        ),
+                        last_used=self._sequence,
+                    )
+                    self._profiles[key] = services
+                else:
+                    self._sequence += 1
+                    services.last_used = self._sequence
+        except BaseException:
+            if retired is not None:
+                retired.close_retired()
+            raise
+        if retired is not None:
+            retired.close_retired()
         return key, profile, services
 
     def service_for_current_profile(self) -> WorkflowMarketplaceService:
@@ -359,8 +417,10 @@ class WorkflowMarketplaceApiContext:
             self._closed = True
             services = tuple(self._profiles.values())
             self._profiles.clear()
+        deadline = time.monotonic() + self._shutdown_timeout
         for item in services:
-            item.registry.close()
+            remaining = max(0.0, deadline - time.monotonic())
+            item.registry.close(wait_timeout=remaining)
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -389,6 +449,29 @@ def _reject_constant(_value: str) -> None:
     raise ValueError("non-finite JSON value")
 
 
+def _check_json_nesting(raw: bytes | bytearray) -> None:
+    depth = 0
+    quoted = False
+    escaped = False
+    for byte in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                quoted = False
+            continue
+        if byte == 0x22:
+            quoted = True
+        elif byte in (0x7B, 0x5B):
+            depth += 1
+            if depth > _JSON_NESTING_MAX:
+                raise ValueError("JSON nesting exceeds its limit")
+        elif byte in (0x7D, 0x5D):
+            depth -= 1
+
+
 async def _body(request: Request, model: type[_ModelT]) -> _ModelT:
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -398,17 +481,27 @@ async def _body(request: Request, model: type[_ModelT]) -> _ModelT:
             raise _request_error()
         if parsed_length < 0 or parsed_length > _BODY_BYTES_MAX:
             raise _request_error()
-    raw = await request.body()
-    if not raw or len(raw) > _BODY_BYTES_MAX:
+    raw = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(chunk) > _BODY_BYTES_MAX - len(raw):
+                raise _request_error()
+            raw.extend(chunk)
+    except HTTPException:
+        raise
+    except Exception:
+        raise _request_error()
+    if not raw:
         raise _request_error()
     try:
+        _check_json_nesting(raw)
         value = json.loads(
             raw,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
         )
         return model.model_validate(value)
-    except (UnicodeDecodeError, ValueError, ValidationError):
+    except (RecursionError, UnicodeDecodeError, ValueError, ValidationError):
         raise _request_error()
 
 
@@ -483,7 +576,7 @@ def _authorize(
 
 def _public(value: object) -> object:
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json", by_alias=False)
+        return value.model_dump(mode="json", by_alias=True)
     if is_dataclass(value) and not isinstance(value, type):
         return _public(asdict(value))
     if isinstance(value, Mapping):
@@ -511,9 +604,11 @@ def _sanitize_result(
     allow_confirmation_token: bool,
     key: str = "",
 ) -> object:
-    if key == "confirmation_token":
+    normalized_key = re.sub(r"[^a-z0-9]", "", key.casefold())
+    if _SECRET_KEY.fullmatch(normalized_key) is not None:
         if (
-            allow_confirmation_token
+            normalized_key == "confirmationtoken"
+            and allow_confirmation_token
             and isinstance(value, str)
             and _TOKEN.fullmatch(value) is not None
         ):
@@ -543,15 +638,17 @@ def _sanitize_result(
 
 
 def _operation_result(kind: str, value: object) -> MarketplaceOperationResult:
-    public = _public(value)
-    if not isinstance(public, dict):
-        raise TypeError("marketplace operation result must be an object")
+    validated = validate_marketplace_operation_result({
+        "type": kind,
+        "value": _public(value),
+    })
+    public = validated.model_dump(mode="json", by_alias=True)
     sanitized = _sanitize_result(
         public,
         allow_confirmation_token=kind
         in {"install_review", "update_review", "remove_review", "trust_review"},
     )
-    return MarketplaceOperationResult(type=kind, value=cast(dict[str, Any], sanitized))
+    return validate_marketplace_operation_result(sanitized)
 
 
 def _service_error(error: WorkflowMarketplaceError) -> HTTPException:
@@ -619,18 +716,29 @@ def _start(
         raise _registry_error(error)
 
 
-def _confirmation_target(token: str) -> str:
-    return f"confirmation:{hashlib.sha256(token.encode()).hexdigest()}"
+def _confirmation_target(
+    service: WorkflowMarketplaceService,
+    token: str,
+    *,
+    actor: str,
+    operation: Literal["install", "update", "remove", "trust"],
+) -> str:
+    try:
+        metadata = service.confirmation_metadata(
+            token,
+            actor=actor,
+            operation=operation,
+        )
+    except WorkflowMarketplaceError:
+        # Invalid, expired, or foreign tokens share one non-oracular reservation.
+        return "package:unresolved-confirmation"
+    return _identity_target(metadata.identity)
 
 
-def _request_target(request: InstallRequest) -> str:
-    rendered = json.dumps(
-        request.model_dump(mode="json", by_alias=False),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return f"package-request:{hashlib.sha256(rendered.encode()).hexdigest()}"
+def _request_target(
+    service: WorkflowMarketplaceService, request: InstallRequest
+) -> str:
+    return _service_call(lambda: service.canonical_install_target(request))
 
 
 def _identity_target(identity: InstalledPackageIdentity) -> str:
@@ -639,13 +747,12 @@ def _identity_target(identity: InstalledPackageIdentity) -> str:
 
 def _confirmed_call(
     cancellation: CancellationToken,
-    call: Callable[[], object],
+    call: Callable[[Callable[[], bool], Callable[[], bool]], object],
     *,
     result_type: str,
 ) -> MarketplaceOperationResult:
     cancellation.checkpoint()
-    cancellation.begin_atomic()
-    result = call()
+    result = call(cancellation.is_cancelled, cancellation.enter_atomic)
     cancellation.mark_committed()
     return _operation_result(result_type, result)
 
@@ -900,9 +1007,9 @@ def create_marketplace_router(
             return _operation_result("update_checks", projection)
 
         target = (
-            f"update-check:{_identity_target(body.identity)}"
+            _identity_target(body.identity)
             if body.identity is not None
-            else "update-check:all"
+            else "package:all"
         )
         return _start(registry, "update_check", run, actor=actor, target=target)
 
@@ -934,7 +1041,7 @@ def create_marketplace_router(
             "install_prepare",
             run,
             actor=actor,
-            target=_request_target(body),
+            target=_request_target(service, body),
         )
 
     @router.post(
@@ -953,11 +1060,21 @@ def create_marketplace_router(
             "install_confirm",
             lambda cancellation: _confirmed_call(
                 cancellation,
-                lambda: service.confirm_install(body.confirmation_token, actor=actor),
+                lambda cancelled, enter_atomic: service.confirm_install(
+                    body.confirmation_token,
+                    actor=actor,
+                    cancelled=cancelled,
+                    enter_atomic=enter_atomic,
+                ),
                 result_type="installed_package",
             ),
             actor=actor,
-            target=_confirmation_target(body.confirmation_token),
+            target=_confirmation_target(
+                service,
+                body.confirmation_token,
+                actor=actor,
+                operation="install",
+            ),
         )
 
     @router.post(
@@ -1007,11 +1124,21 @@ def create_marketplace_router(
             "update_confirm",
             lambda cancellation: _confirmed_call(
                 cancellation,
-                lambda: service.confirm_update(body.confirmation_token, actor=actor),
+                lambda cancelled, enter_atomic: service.confirm_update(
+                    body.confirmation_token,
+                    actor=actor,
+                    cancelled=cancelled,
+                    enter_atomic=enter_atomic,
+                ),
                 result_type="updated_package",
             ),
             actor=actor,
-            target=_confirmation_target(body.confirmation_token),
+            target=_confirmation_target(
+                service,
+                body.confirmation_token,
+                actor=actor,
+                operation="update",
+            ),
         )
 
     @router.post(
@@ -1056,11 +1183,21 @@ def create_marketplace_router(
             "remove_confirm",
             lambda cancellation: _confirmed_call(
                 cancellation,
-                lambda: service.confirm_remove(body.confirmation_token, actor=actor),
+                lambda cancelled, enter_atomic: service.confirm_remove(
+                    body.confirmation_token,
+                    actor=actor,
+                    cancelled=cancelled,
+                    enter_atomic=enter_atomic,
+                ),
                 result_type="removed_package",
             ),
             actor=actor,
-            target=_confirmation_target(body.confirmation_token),
+            target=_confirmation_target(
+                service,
+                body.confirmation_token,
+                actor=actor,
+                operation="remove",
+            ),
         )
 
     @router.post(
@@ -1105,8 +1242,13 @@ def create_marketplace_router(
         key, _profile, service, registry = api.current()
         actor = _actor(authority, key)
 
-        def call() -> MarketplaceTrustStatesProjection:
-            states = service.grant_trust(body.confirmation_token, actor=actor)
+        def call(cancelled, enter_atomic) -> MarketplaceTrustStatesProjection:
+            states = service.grant_trust(
+                body.confirmation_token,
+                actor=actor,
+                cancelled=cancelled,
+                enter_atomic=enter_atomic,
+            )
             return MarketplaceTrustStatesProjection(
                 workflows=[
                     MarketplaceTrustState(workflow_name=name, state=states[name])
@@ -1121,7 +1263,12 @@ def create_marketplace_router(
                 cancellation, call, result_type="trust_grant"
             ),
             actor=actor,
-            target=_confirmation_target(body.confirmation_token),
+            target=_confirmation_target(
+                service,
+                body.confirmation_token,
+                actor=actor,
+                operation="trust",
+            ),
         )
 
     @router.post(
@@ -1136,9 +1283,12 @@ def create_marketplace_router(
         key, _profile, service, registry = api.current()
         actor = _actor(authority, key)
 
-        def call() -> MarketplaceTrustRevocationProjection:
+        def call(cancelled, enter_atomic) -> MarketplaceTrustRevocationProjection:
             revoked = service.revoke_trust(
-                body.identity, workflow_name=body.workflow_name
+                body.identity,
+                workflow_name=body.workflow_name,
+                cancelled=cancelled,
+                enter_atomic=enter_atomic,
             )
             return MarketplaceTrustRevocationProjection(revoked=revoked)
 
