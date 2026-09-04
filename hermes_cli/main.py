@@ -101,8 +101,11 @@ _PROFILE_OPTIONAL_VALUE_FLAGS = frozenset({"-c", "--continue"})
 _WORKFLOW_ROOT_VALUE_FLAGS = frozenset({"--workdir", "--hermes-home"})
 
 
-def _workflow_schema_action_index(argv: list[str]) -> int | None:
-    """Resolve the exact top-level ``workflow schema`` action dependency-free."""
+_WORKFLOW_AUTHORING_ACTIONS = frozenset({"schema", "schema-corpus"})
+
+
+def _workflow_authoring_action_index(argv: list[str]) -> int | None:
+    """Resolve an exact read-only workflow authoring action dependency-free."""
     command_index = None
     i = 0
     while i < len(argv):
@@ -143,13 +146,13 @@ def _workflow_schema_action_index(argv: list[str]) -> int | None:
         if arg.startswith("-"):
             i += 1
             continue
-        return i if arg == "schema" else None
+        return i if arg in _WORKFLOW_AUTHORING_ACTIONS else None
     return None
 
 
-def _workflow_schema_owns_early_startup(argv: list[str]) -> bool:
-    """Identify schema-owned startup without importing the normal CLI graph."""
-    action_index = _workflow_schema_action_index(argv)
+def _workflow_authoring_owns_early_startup(argv: list[str]) -> bool:
+    """Identify authoring-data startup without importing the normal CLI graph."""
+    action_index = _workflow_authoring_action_index(argv)
     if action_index is None:
         return False
 
@@ -185,8 +188,9 @@ def _early_readonly_startup_target(argv: list[str]) -> str | None:
     either exact token forms or parsed by their narrow command-owned parser
     before execution later in startup.
     """
-    if _workflow_schema_owns_early_startup(argv):
-        return "workflow-schema"
+    action_index = _workflow_authoring_action_index(argv)
+    if action_index is not None and _workflow_authoring_owns_early_startup(argv):
+        return f"workflow-{argv[action_index]}"
 
     # Migration dry-run is safe to dispatch before normal startup only when
     # the complete argv is exact after removing one supported profile override.
@@ -292,8 +296,8 @@ def _early_readonly_startup_target(argv: list[str]) -> str | None:
 
 
 _EARLY_READONLY_STARTUP_TARGET = _early_readonly_startup_target(sys.argv[1:])
-_WORKFLOW_SCHEMA_OWNS_EARLY_STARTUP = (
-    _EARLY_READONLY_STARTUP_TARGET == "workflow-schema"
+_WORKFLOW_AUTHORING_OWNS_EARLY_STARTUP = (
+    _EARLY_READONLY_STARTUP_TARGET in {"workflow-schema", "workflow-schema-corpus"}
 )
 _EARLY_READONLY_OWNS_STARTUP = _EARLY_READONLY_STARTUP_TARGET is not None
 
@@ -748,9 +752,9 @@ _ensure_project_root_on_path_fast()
 # ---------------------------------------------------------------------------
 
 
-def _parse_workflow_schema_candidate(argv: list[str]):
+def _parse_workflow_authoring_candidate(argv: list[str]):
     """Parse one candidate with the same bounded authorities as normal dispatch."""
-    if _workflow_schema_action_index(argv) is None:
+    if _workflow_authoring_action_index(argv) is None:
         return None
 
     from hermes_cli._parser import build_top_level_parser
@@ -765,6 +769,10 @@ def _parse_workflow_schema_candidate(argv: list[str]):
         "schema", help="Print the workflow authoring contract"
     )
     configure_schema_parser(schema_parser)
+    corpus_parser = actions.add_parser(
+        "schema-corpus", help="Print workflow authoring conformance fixtures"
+    )
+    configure_schema_parser(corpus_parser)
     return parser.parse_args(argv)
 
 
@@ -779,8 +787,9 @@ def _normal_dispatch_target(args) -> str | None:
     command = getattr(args, "command", None)
     if command is None:
         return "chat"
-    if command == "workflow" and getattr(args, "workflow_action", None) == "schema":
-        return "workflow-schema"
+    workflow_action = getattr(args, "workflow_action", None)
+    if command == "workflow" and workflow_action in _WORKFLOW_AUTHORING_ACTIONS:
+        return f"workflow-{workflow_action}"
     return command
 
 
@@ -839,7 +848,7 @@ def _apply_profile_override() -> None:
     # 1. Check for explicit -p / --profile flag. Historically this worked even
     # after the subcommand (`hermes chat -p coder`), so keep scanning broadly.
     # The exception is command-argv passthrough regions such as `mcp add --args`.
-    workflow_schema_index = _workflow_schema_action_index(argv)
+    workflow_authoring_index = _workflow_authoring_action_index(argv)
     from hermes_cli._parser import top_level_value_flag_sets
 
     value_flags, optional_value_flags = top_level_value_flag_sets()
@@ -852,15 +861,15 @@ def _apply_profile_override() -> None:
             break
         if (
             arg == "--profile"
-            and workflow_schema_index is not None
-            and i > workflow_schema_index
+            and workflow_authoring_index is not None
+            and i > workflow_authoring_index
         ):
             i += 2
             continue
         if (
             arg.startswith("--profile=")
-            and workflow_schema_index is not None
-            and i > workflow_schema_index
+            and workflow_authoring_index is not None
+            and i > workflow_authoring_index
         ):
             i += 1
             continue
@@ -1004,16 +1013,17 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
-_WORKFLOW_SCHEMA_EARLY_ARGV = tuple(sys.argv[1:])
-_WORKFLOW_SCHEMA_EARLY_ARGS = _parse_workflow_schema_candidate(sys.argv[1:])
-_WORKFLOW_SCHEMA_READONLY_STARTUP = (
-    _normal_dispatch_target(_WORKFLOW_SCHEMA_EARLY_ARGS) == "workflow-schema"
+_WORKFLOW_AUTHORING_EARLY_ARGV = tuple(sys.argv[1:])
+_WORKFLOW_AUTHORING_EARLY_ARGS = _parse_workflow_authoring_candidate(sys.argv[1:])
+_WORKFLOW_AUTHORING_READONLY_STARTUP = (
+    _normal_dispatch_target(_WORKFLOW_AUTHORING_EARLY_ARGS)
+    in {"workflow-schema", "workflow-schema-corpus"}
 )
 _SECRET_READONLY_EARLY_TARGET = _authorized_early_readonly_startup_target(
     sys.argv[1:]
 )
 _EARLY_READONLY_STARTUP = (
-    _WORKFLOW_SCHEMA_READONLY_STARTUP
+    _WORKFLOW_AUTHORING_READONLY_STARTUP
     or _SECRET_READONLY_EARLY_TARGET
     in {
         "secrets-doctor",
@@ -13519,26 +13529,27 @@ def _advertise_agent_env() -> None:
     os.environ.setdefault("HERMES_AGENT", "true")
 
 
-def _try_workflow_schema_readonly() -> bool:
-    """Serve exact schema introspection before any mutating CLI startup seam."""
+def _try_workflow_authoring_readonly() -> bool:
+    """Serve exact authoring data before any mutating CLI startup seam."""
     current_argv = tuple(sys.argv[1:])
     args = (
-        _WORKFLOW_SCHEMA_EARLY_ARGS
-        if current_argv == _WORKFLOW_SCHEMA_EARLY_ARGV
-        else _parse_workflow_schema_candidate(list(current_argv))
+        _WORKFLOW_AUTHORING_EARLY_ARGS
+        if current_argv == _WORKFLOW_AUTHORING_EARLY_ARGV
+        else _parse_workflow_authoring_candidate(list(current_argv))
     )
-    if _normal_dispatch_target(args) != "workflow-schema":
+    target = _normal_dispatch_target(args)
+    if target not in {"workflow-schema", "workflow-schema-corpus"}:
         return False
 
-    from plugins.workflow.schema_cli import emit_schema
+    from plugins.workflow.schema_cli import emit_schema, emit_schema_corpus
 
-    emit_schema(args)
+    (emit_schema if target == "workflow-schema" else emit_schema_corpus)(args)
     return True
 
 
 def _try_early_readonly() -> int | None:
     """Run exact read-only commands before every mutating startup seam."""
-    if _try_workflow_schema_readonly():
+    if _try_workflow_authoring_readonly():
         return 0
     current_argv = list(sys.argv[1:])
     target = _authorized_early_readonly_startup_target(current_argv)

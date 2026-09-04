@@ -9,7 +9,7 @@ import json
 import math
 import re
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 from plugins.workflow.language import (
     CURRENT_NORMALIZER_BY_PROFILE,
@@ -21,7 +21,18 @@ from plugins.workflow.language import (
     supports_phase5_semantics,
     supports_phase6_semantics,
 )
-from plugins.workflow.models import WorkflowLanguageProfile, WorkflowLanguageSelection
+from plugins.workflow.models import (
+    LOOP_GROUP_WORK_LIMIT,
+    SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
+    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
+    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
+    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+    STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES,
+    STRUCTURED_PATH_UNION_KEYWORDS,
+    WorkflowLanguageProfile,
+    WorkflowLanguageSelection,
+)
 
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -51,6 +62,11 @@ BASH_SPILL_MAX_FILES = 64
 BASH_SPILL_MAX_VALUE_BYTES = 500_000
 WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES = 2_000_000
 BASH_SPILL_MAX_TOTAL_BYTES = WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
+LOOP_GROUP_MAX_EDGES = 4_096
+LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER = 1
+LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES = 2
+LOOP_GROUP_OTHER_DEFAULT_RETRIES = 0
+LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS = 3
 ASSIGNMENT_ENDPOINT_PATTERN = (
     r"^hermes://(?:local|peer/[a-z0-9][a-z0-9_-]{0,63})/"
     r"(?!hermes$|root$|sudo$|test$|tmp$)[a-z0-9][a-z0-9_-]{0,63}$"
@@ -152,6 +168,133 @@ def parse_assignment_deadline(value: object) -> str:
     if not isinstance(value, str) or _ASSIGNMENT_DEADLINE.fullmatch(value) is None:
         raise ValueError("assignment deadline is outside the supported subset")
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class LoopGroupWorkFactorAuthority:
+    """Declarative paths, precedence, and defaults for v6 work selection."""
+
+    ordinary_loop_node_type: str
+    approval_node_type: str
+    command_prompt_node_types: tuple[str, ...]
+    iterations_field: str
+    retry_field: str
+    approval_rework_field: str
+    max_attempts_field: str
+    ordinary_loop_default_multiplier: int
+    command_prompt_default_retries: int
+    other_default_retries: int
+    approval_default_max_attempts: int
+
+    @property
+    def command_prompt_selector(self) -> str:
+        return "|".join(self.command_prompt_node_types)
+
+    @property
+    def retry_precedence(self) -> tuple[str, ...]:
+        return (
+            self.approval_node_type,
+            self.retry_field,
+            self.command_prompt_selector,
+            "default",
+        )
+
+    @property
+    def ordinary_loop_multiplier_path(self) -> tuple[str, ...]:
+        return (self.ordinary_loop_node_type, self.iterations_field)
+
+    @property
+    def retry_max_attempts_path(self) -> tuple[str, ...]:
+        return (self.retry_field, self.max_attempts_field)
+
+    @property
+    def retry_selector_predicate(self) -> dict[str, object]:
+        return {
+            "path": list(self.retry_max_attempts_path),
+            "operator": "present",
+        }
+
+    @property
+    def approval_max_attempts_path(self) -> tuple[str, ...]:
+        return (
+            self.approval_node_type,
+            self.approval_rework_field,
+            self.max_attempts_field,
+        )
+
+
+def _loop_group_work_factor_authority() -> LoopGroupWorkFactorAuthority:
+    return LoopGroupWorkFactorAuthority(
+        ordinary_loop_node_type="loop",
+        approval_node_type="approval",
+        command_prompt_node_types=("command", "prompt"),
+        iterations_field="max_iterations",
+        retry_field="retry",
+        approval_rework_field="on_reject",
+        max_attempts_field="max_attempts",
+        ordinary_loop_default_multiplier=(
+            LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER
+        ),
+        command_prompt_default_retries=(
+            LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES
+        ),
+        other_default_retries=LOOP_GROUP_OTHER_DEFAULT_RETRIES,
+        approval_default_max_attempts=(
+            LOOP_GROUP_APPROVAL_DEFAULT_MAX_ATTEMPTS
+        ),
+    )
+
+
+def loop_group_node_work_factors(
+    node_type: str,
+    value: object,
+    options: Mapping[str, object],
+) -> tuple[object, object]:
+    """Select raw v6 work factors without pre-empting authored-value validation."""
+    authority = _loop_group_work_factor_authority()
+    value_mapping = (
+        cast(Mapping[str, object], value) if isinstance(value, Mapping) else None
+    )
+    multiplier = (
+        value_mapping.get(
+            authority.iterations_field,
+            authority.ordinary_loop_default_multiplier,
+        )
+        if node_type == authority.ordinary_loop_node_type
+        and value_mapping is not None
+        else authority.ordinary_loop_default_multiplier
+    )
+    retry = options.get(authority.retry_field)
+    approval_rework = (
+        value_mapping.get(authority.approval_rework_field)
+        if node_type == authority.approval_node_type and value_mapping is not None
+        else None
+    )
+    for selector in authority.retry_precedence:
+        if selector == authority.approval_node_type and isinstance(
+            approval_rework, Mapping
+        ):
+            return multiplier, cast(Mapping[str, object], approval_rework).get(
+                authority.max_attempts_field,
+                authority.approval_default_max_attempts,
+            )
+        if (
+            selector == authority.retry_field
+            and isinstance(retry, Mapping)
+            and authority.max_attempts_field in retry
+        ):
+            return multiplier, cast(Mapping[str, object], retry).get(
+                authority.max_attempts_field,
+                authority.other_default_retries,
+            )
+        if (
+            selector == authority.command_prompt_selector
+            and node_type in authority.command_prompt_node_types
+        ):
+            return multiplier, authority.command_prompt_default_retries
+        if selector == "default":
+            return multiplier, authority.other_default_retries
+    raise RuntimeError("loop-group retry precedence requires a default selector")
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +612,32 @@ class WorkflowFieldSpec:
     default_value: object
     pattern: str | None
     max_length: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class InterpolationValueDiscriminatorSpec:
+    """Portable authored-string discriminator consumed by runtime and clients."""
+
+    id: str
+    operation: str
+    codepoint_ranges: tuple[tuple[int, int], ...]
+    characters: str
+    match: str
+    otherwise: str
+
+
+@dataclass(frozen=True, slots=True)
+class InterpolationSurfaceSpec:
+    """One runtime-rendered string surface and its authored-value role."""
+
+    field_path: tuple[str, ...]
+    node_types: frozenset[str]
+    value_source: str
+    authored_value: str
+    lookup_path: tuple[str, ...] = ()
+    phase4_only: bool = False
+    value_discriminator: InterpolationValueDiscriminatorSpec | None = None
+    ordered_leaf_paths: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2063,6 +2232,309 @@ FIELD_INVENTORY = (
     *_SIDECAR_FIELDS,
 )
 
+
+_SCRIPT_INLINE_VALUE_DISCRIMINATOR = InterpolationValueDiscriminatorSpec(
+    id="script-inline-v1",
+    operation="contains-listed-codepoint",
+    codepoint_ranges=(
+        (9, 13),
+        (28, 32),
+        (133, 133),
+        (160, 160),
+        (5760, 5760),
+        (8192, 8202),
+        (8232, 8233),
+        (8239, 8239),
+        (8287, 8287),
+        (12288, 12288),
+    ),
+    characters=";(){}&|<>$`\"'",
+    match="reference-template",
+    otherwise="literal-resource-name",
+)
+
+
+_INTERPOLATION_SURFACE_INVENTORY = (
+    InterpolationSurfaceSpec(
+        ("when",),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("when",),
+    ),
+    InterpolationSurfaceSpec(
+        ("prompt",), frozenset({"prompt"}), "authored-value", "reference-template"
+    ),
+    InterpolationSurfaceSpec(
+        ("bash",), frozenset({"bash"}), "authored-value", "reference-template"
+    ),
+    InterpolationSurfaceSpec(
+        ("script",),
+        frozenset({"script"}),
+        "inline-or-authenticated-script-body",
+        "reference-template-if-inline-otherwise-literal-resource-name",
+        value_discriminator=_SCRIPT_INLINE_VALUE_DISCRIMINATOR,
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "prompt"),
+        frozenset({"loop"}),
+        "authored-value",
+        "reference-template",
+        ("prompt",),
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "until_bash"),
+        frozenset({"loop"}),
+        "authored-value",
+        "reference-template",
+        ("until_bash",),
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "gate_message"),
+        frozenset({"loop"}),
+        "authored-value",
+        "reference-template",
+        ("gate_message",),
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("loop", "command"),
+        frozenset({"loop"}),
+        "authenticated-command-body",
+        "literal-resource-name",
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("approval", "message"),
+        frozenset({"approval"}),
+        "authored-value",
+        "reference-template",
+        ("message",),
+    ),
+    InterpolationSurfaceSpec(
+        ("approval", "on_reject", "prompt"),
+        frozenset({"approval"}),
+        "authored-value",
+        "reference-template",
+        ("on_reject", "prompt"),
+    ),
+    InterpolationSurfaceSpec(
+        ("command",),
+        frozenset({"command"}),
+        "authenticated-command-body",
+        "literal-resource-name",
+    ),
+    InterpolationSurfaceSpec(
+        ("loop_group", "until_bash"),
+        frozenset({"loop_group"}),
+        "authored-value",
+        "reference-template",
+        ("until_bash",),
+    ),
+    InterpolationSurfaceSpec(
+        ("loop_group", "gate_message"),
+        frozenset({"loop_group"}),
+        "authored-value",
+        "reference-template",
+        ("gate_message",),
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("systemPrompt",),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("systemPrompt",),
+        phase4_only=True,
+    ),
+    InterpolationSurfaceSpec(
+        ("agents", "*"),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("agents", "*"),
+        phase4_only=True,
+        ordered_leaf_paths=(("description",), ("prompt",)),
+    ),
+    InterpolationSurfaceSpec(
+        ("hooks", "*", "[]", "response"),
+        frozenset(EXECUTABLE_NODE_TYPES),
+        "authored-value",
+        "reference-template",
+        ("hooks", "*", "[]", "response"),
+        phase4_only=True,
+        ordered_leaf_paths=(
+            ("systemMessage",),
+            ("stopReason",),
+            ("hookSpecificOutput", "permissionDecisionReason"),
+            ("hookSpecificOutput", "additionalContext"),
+        ),
+    ),
+)
+
+
+def _interpolation_path_text(path: tuple[str | int, ...]) -> str:
+    rendered = ""
+    for part in path:
+        if part == "[]":
+            rendered += "[]"
+        elif isinstance(part, int):
+            rendered += f"[{part}]"
+        else:
+            rendered += ("." if rendered else "") + part
+    return rendered
+
+
+def _interpolation_values(
+    value: object,
+    path: tuple[str, ...],
+    concrete: tuple[str | int, ...] = (),
+) -> Iterator[tuple[tuple[str | int, ...], object]]:
+    if not path:
+        yield concrete, value
+        return
+    field, *remaining = path
+    tail = tuple(remaining)
+    if field == "*":
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                yield from _interpolation_values(item, tail, (*concrete, str(key)))
+        return
+    if field == "[]":
+        if isinstance(value, tuple | list):
+            for index, item in enumerate(value):
+                yield from _interpolation_values(item, tail, (*concrete, index))
+        return
+    if isinstance(value, Mapping) and field in value:
+        mapping = cast(Mapping[str, object], value)
+        yield from _interpolation_values(mapping[field], tail, (*concrete, field))
+
+
+def _interpolation_strings(
+    value: object,
+    path: tuple[str, ...],
+    concrete: tuple[str | int, ...] = (),
+) -> Iterator[tuple[tuple[str | int, ...], str]]:
+    for resolved_path, resolved_value in _interpolation_values(
+        value, path, concrete
+    ):
+        if isinstance(resolved_value, str):
+            yield resolved_path, resolved_value
+
+
+def script_value_is_inline(value: str) -> bool:
+    """Match the portable inline-vs-named script rule."""
+    discriminator = _SCRIPT_INLINE_VALUE_DISCRIMINATOR
+    return any(
+        character in discriminator.characters
+        or any(
+            lower <= ord(character) <= upper
+            for lower, upper in discriminator.codepoint_ranges
+        )
+        for character in value
+    )
+
+
+def iter_interpolation_surface_templates(
+    node_type: str,
+    value: object,
+    options: Mapping[str, object],
+    *,
+    node_id: str,
+    command_bodies: Mapping[str, str] | None,
+    named_script_bodies: Mapping[str, str] | None = None,
+    include_phase4_templates: bool = False,
+) -> Iterator[tuple[str, str]]:
+    """Yield runtime templates from the declarative interpolation authority."""
+    for surface in _INTERPOLATION_SURFACE_INVENTORY:
+        if node_type not in surface.node_types or (
+            surface.phase4_only and not include_phase4_templates
+        ):
+            continue
+        if surface.value_source == "authenticated-command-body":
+            template = (
+                command_bodies.get(node_id) if command_bodies is not None else None
+            )
+            if isinstance(template, str):
+                yield _interpolation_path_text(surface.field_path), template
+            continue
+        if surface.value_source == "inline-or-authenticated-script-body":
+            if isinstance(value, str) and script_value_is_inline(value):
+                yield _interpolation_path_text(surface.field_path), value
+            elif include_phase4_templates and named_script_bodies is not None:
+                template = named_script_bodies.get(node_id)
+                if isinstance(template, str):
+                    yield _interpolation_path_text(surface.field_path), template
+            continue
+        root = (
+            options
+            if surface.field_path == ("when",)
+            or surface.field_path[0] in {"systemPrompt", "agents", "hooks"}
+            else value
+        )
+        prefix_length = len(surface.field_path) - len(surface.lookup_path)
+        prefix = surface.field_path[:prefix_length]
+        if surface.ordered_leaf_paths:
+            for concrete, container in _interpolation_values(
+                root, surface.lookup_path, prefix
+            ):
+                for leaf_path in surface.ordered_leaf_paths:
+                    yield from (
+                        (_interpolation_path_text(path), template)
+                        for path, template in _interpolation_strings(
+                            container, leaf_path, concrete
+                        )
+                    )
+            continue
+        for concrete, template in _interpolation_strings(root, surface.lookup_path):
+            yield _interpolation_path_text(
+                (*surface.field_path[:prefix_length], *concrete)
+            ), template
+
+
+def phase6_interpolation_surface() -> dict[str, object]:
+    """Project exact Phase 6 interpolation paths and literal-value boundaries."""
+    fields: list[dict[str, object]] = []
+    discriminators: dict[str, dict[str, object]] = {}
+    surfaces = sorted(
+        _INTERPOLATION_SURFACE_INVENTORY,
+        key=lambda surface: surface.field_path[0] == "loop_group",
+    )
+    for surface in surfaces:
+        if surface.field_path[0] == "loop_group":
+            prefix = "nodes[]"
+        elif surface.node_types & frozenset(NODE_TYPES):
+            prefix = "nodes[].loop_group.nodes[]"
+        else:
+            continue
+        for leaf_path in surface.ordered_leaf_paths or ((),):
+            field: dict[str, object] = {
+                "field_path": (
+                    f"{prefix}."
+                    f"{_interpolation_path_text((*surface.field_path, *leaf_path))}"
+                ),
+                "template_source": surface.value_source,
+                "authored_value": surface.authored_value,
+            }
+            if surface.value_discriminator is not None:
+                discriminator = surface.value_discriminator
+                field["value_discriminator"] = discriminator.id
+                discriminators[discriminator.id] = {
+                    "operation": discriminator.operation,
+                    "codepoint_ranges": [
+                        list(bounds) for bounds in discriminator.codepoint_ranges
+                    ],
+                    "characters": discriminator.characters,
+                    "match": discriminator.match,
+                    "otherwise": discriminator.otherwise,
+                }
+            fields.append(field)
+    return {
+        "fields": fields,
+        "value_discriminators_v1": discriminators,
+        "unlisted_authored_string_fields": "literal",
+    }
+
 STRUCTURAL_REQUIREMENTS = (
     StructuralRequirement(
         scope="loop",
@@ -3160,6 +3632,172 @@ def _node_example(node_type: str) -> dict[str, object]:
     return example
 
 
+def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
+    work_factors = _loop_group_work_factor_authority()
+    return {
+        "scoped-output-reference-v1": {
+            "group_until_bash": {
+                "field_path": ["loop_group", "until_bash"],
+                "current_scope": "all-body-nodes",
+            },
+            "companion_node_paths": {
+                "format": "group/child",
+                "field_paths": ["sidecar.outward_action_nodes[]"],
+                "validation_code": "unknown_sidecar_node",
+            },
+            "structured_path_constraint_v1": {
+                "syntax_rule": "strict-output-reference",
+                "producer_schema_resolution_v1": {
+                    "ordinary": ["output_format"],
+                    "loop_group": [
+                        "scoped-dag-topology-v1.primary_sink",
+                        "output_format",
+                    ],
+                },
+                "conservative_tristate_v1": {
+                    "accept": ["possible", "unknown"],
+                    "reject": "impossible",
+                    "modes": {
+                        "ascii-decimal": "all(object,array)",
+                        "other": "object",
+                    },
+                    "strategies": {
+                        "schema": (
+                            "false=impossible;true|nonmap=unknown"
+                        ),
+                        **{
+                            keyword: strategy
+                            for keyword, strategy in (
+                                STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES.items()
+                            )
+                            if keyword not in STRUCTURED_PATH_UNION_KEYWORDS
+                        },
+                        "union": [
+                            *STRUCTURED_PATH_UNION_KEYWORDS,
+                            STRUCTURED_PATH_PROOF_KEYWORD_STRATEGIES["anyOf"],
+                        ],
+                        "unlisted": "ignored=unknown",
+                    },
+                    "evaluation_v1": {
+                        "$ref_resolution": {
+                            "schema_scope": "current-schema-only",
+                            "when": "path-segments-remain",
+                            "terminal_child": "not-resolved",
+                        },
+                        "object_lookup": {
+                            "order": [
+                                "properties",
+                                "patternProperties",
+                                "additionalProperties",
+                            ],
+                            "stop_after_first_applicable": True,
+                            "applicability": {
+                                "properties": "exact-key-match",
+                                "patternProperties": "nonempty-map",
+                                "additionalProperties": "fallback",
+                            },
+                        },
+                        "terminal_child": {
+                            "when": "no-path-segments-remain",
+                            "false": "impossible",
+                            "otherwise": "possible",
+                            "$ref": "not-resolved",
+                        },
+                    },
+                    "$ref": (
+                        "local-pointer(map/array,~0/~1);"
+                        "false|impossible=>impossible;"
+                        "unresolved|nonlocal|cycle=>unknown"
+                    ),
+                    "dotted_key": (
+                        "after=impossible;joined-tail=literal-key;"
+                        "walk=$ref(map)/combinators(any)/properties/array-items;"
+                        "type=capable"
+                    ),
+                },
+                "diagnostic_table": {
+                    "codes": {
+                        "L": "loop_group_scope_invalid",
+                        "D": "output_reference_not_declared_dependency",
+                        "U": "output_reference_path_unsupported",
+                        "F": "structured_output_field_impossible",
+                    },
+                    "cols": ["when", "semantic", "body", "until", "gate"],
+                    "rows": [
+                        [
+                            "dep",
+                            SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                            "L",
+                            "D",
+                            "D",
+                        ],
+                        [
+                            "prev",
+                            SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+                            "L",
+                            "L",
+                            None,
+                        ],
+                        [
+                            "companion",
+                            SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
+                            None,
+                            None,
+                            None,
+                        ],
+                        [
+                            "no_schema",
+                            SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
+                            "L",
+                            "L",
+                            "U",
+                        ],
+                        [
+                            "impossible",
+                            SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
+                            "L",
+                            "L",
+                            "F",
+                        ],
+                        [
+                            "dotted",
+                            SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
+                            "L",
+                            "L",
+                            "U",
+                        ],
+                    ],
+                },
+            },
+        },
+        "loop-group-work-product-v1": {
+            "expression_format": "prefix-v1",
+            "retry_precedence": ">".join(work_factors.retry_precedence),
+            "retry_selector_predicate": work_factors.retry_selector_predicate,
+            "expressions": {
+                "executions": [
+                    "*",
+                    "group_iterations",
+                    ["sum", "body_nodes", "ordinary_loop_multiplier"],
+                ],
+                "attempts": [
+                    "*",
+                    "group_iterations",
+                    [
+                        "sum",
+                        "body_nodes",
+                        [
+                            "*",
+                            "ordinary_loop_multiplier",
+                            ["+", "selected_retries", 1],
+                        ],
+                    ],
+                ],
+            },
+        },
+    }
+
+
 def node_kind_descriptors(
     profile: WorkflowLanguageProfile,
     *,
@@ -3215,7 +3853,7 @@ def node_kind_descriptors(
             )
         )
         fields.sort(key=lambda item: (item["order"], item["field_path"]))
-        descriptors.append({
+        descriptor: dict[str, object] = {
             "id": node_type,
             "label": _humanize(node_type),
             "description": f"Author a Hermes {node_type} workflow node.",
@@ -3231,8 +3869,145 @@ def node_kind_descriptors(
             "status": _editor_status(_field_status(payload, selected).status),
             "examples": [_node_example(node_type)],
             "fields": fields,
-        })
+        }
+        if node_type == "loop_group":
+            descriptor["semantic_definitions"] = (
+                _phase6_node_kind_semantic_definitions()
+            )
+        descriptors.append(descriptor)
     return descriptors
+
+
+def _phase6_scoped_semantic_descriptors(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> list[dict[str, object]]:
+    """Project the v6 body schema and durable codes as scoped editor rules."""
+    work_factors = _loop_group_work_factor_authority()
+    group_schema = _object_schema(
+        "loop_group",
+        profile,
+        normalizer_version=normalizer_version,
+    )
+    group_properties = group_schema["properties"]
+    body_schema = group_properties["nodes"]
+    iteration_schema = group_properties["max_iterations"]
+    durable_codes = phase6_durable_code_catalog()
+    validation_codes = {
+        "topology": "loop_group_topology_invalid",
+        "visibility": "loop_group_scope_invalid",
+        "nesting": "loop_group_shape_invalid",
+        "capacity": "loop_group_product_limit",
+        "work_product": "loop_group_product_limit",
+    }
+    if not set(validation_codes.values()) <= set(durable_codes):
+        raise RuntimeError("scoped semantic rules require registered Phase 6 codes")
+
+    rules: list[dict[str, object]] = [
+        {
+            "id": "scoped-dag-topology-v1",
+            "group_kind": "loop_group",
+            "body_path": ["loop_group", "nodes"],
+            "node_id_field": "id",
+            "depends_on_field": "depends_on",
+            "allowed_node_kinds": list(NODE_TYPES),
+            "forbidden_node_kinds": [
+                *COMPILE_DIRECTIVE_TYPES,
+                "workflow",
+                *(
+                    node_kind
+                    for node_kind in EXECUTABLE_NODE_TYPES
+                    if node_kind not in NODE_TYPES
+                ),
+            ],
+            "forbidden_group_fields": ["retry"],
+            "group_fields": sorted(group_properties),
+            "required_group_fields": list(group_schema["required"]),
+            "min_nodes": body_schema["minItems"],
+            "max_depth": 1,
+            "max_nodes": body_schema["maxItems"],
+            "max_edges": LOOP_GROUP_MAX_EDGES,
+            "min_iterations": iteration_schema["minimum"],
+            "max_iterations": iteration_schema["maximum"],
+            "primary_sink": "first-terminal-in-definition-order",
+            "validation_codes": validation_codes,
+        },
+        {
+            "id": "scoped-output-reference-v1",
+            "current_scope": {
+                "applies_to": ["nodes[].loop_group.nodes[]"],
+                "producer_scope": "body-sibling",
+                "requires_direct_dependency": True,
+            },
+            "outer_scope": {
+                "applies_to": [
+                    "nodes[].loop_group.nodes[]",
+                    "nodes[].loop_group.until_bash",
+                    "nodes[].loop_group.gate_message",
+                ],
+                "producer_scope": "outer-node",
+                "requires_group_dependency": True,
+            },
+            "previous_iteration": {
+                "applies_to": [
+                    "nodes[].loop_group.nodes[]",
+                    "nodes[].loop_group.until_bash",
+                ],
+                "producer_scope": "body-node",
+                "prefix": "$LOOP_PREV.",
+                "requires_direct_dependency": False,
+                "first_iteration": {
+                    "known_whole_output": {
+                        "result": "resolved",
+                        "rendered_text": "",
+                    },
+                    "known_structured_path": {
+                        "result": "error",
+                        "code": "output_reference_missing",
+                    },
+                },
+            },
+            "unqualified_producer_resolution": {
+                "order": ["body-sibling", "outer-node"],
+                "collision_precedence": "body-sibling",
+            },
+            "interpolation_surface_v1": phase6_interpolation_surface(),
+            "semantic_ref": {
+                "node_kind": "loop_group",
+                "definition": "scoped-output-reference-v1",
+            },
+        },
+        {
+            "id": "loop-group-work-product-v1",
+            "limit": LOOP_GROUP_WORK_LIMIT,
+            "accumulators": ["executions", "attempts"],
+            "group_iterations_path": ["loop_group", "max_iterations"],
+            "ordinary_loop_multiplier_path": list(
+                work_factors.ordinary_loop_multiplier_path
+            ),
+            "retry_max_attempts_path": list(
+                work_factors.retry_max_attempts_path
+            ),
+            "approval_max_attempts_path": list(
+                work_factors.approval_max_attempts_path
+            ),
+            "ordinary_loop_default_multiplier": (
+                work_factors.ordinary_loop_default_multiplier
+            ),
+            "command_prompt_default_retries": (
+                work_factors.command_prompt_default_retries
+            ),
+            "other_default_retries": work_factors.other_default_retries,
+            "approval_default_max_attempts": (
+                work_factors.approval_default_max_attempts
+            ),
+            "semantic_ref": {
+                "node_kind": "loop_group",
+                "definition": "loop-group-work-product-v1",
+            },
+        },
+    ]
+    return rules
 
 
 def semantic_rule_descriptors(
@@ -3245,11 +4020,12 @@ def semantic_rule_descriptors(
     selected_version = _authoring_normalizer_version(selected, normalizer_version)
     archon_v3 = supports_phase3_semantics(selected, selected_version)
     phase4 = supports_phase4_semantics(selected, selected_version)
+    phase6 = supports_phase6_semantics(selected, selected_version)
     definition_applicability = {
         "profiles": [selected.value],
         "documents": ["definition"],
     }
-    return [
+    rules = cast(list[dict[str, object]], [
         {
             "id": "dag-topology",
             "label": "DAG topology",
@@ -3417,7 +4193,18 @@ def semantic_rule_descriptors(
             },
             "examples": [["publish"]],
         },
-    ]
+        *(
+            _phase6_scoped_semantic_descriptors(
+                selected,
+                selected_version,
+            )
+            if phase6
+            else []
+        ),
+    ])
+    if phase6:
+        return [{**rule, "kind": rule["id"]} for rule in rules]
+    return rules
 
 
 def contract_documentation(
@@ -3549,7 +4336,7 @@ def contract_documentation(
                 "parameters": {
                     "body_depth": 1,
                     "body_nodes": {"minimum": 1, "maximum": 512},
-                    "body_edges": {"maximum": 4_096},
+                    "body_edges": {"maximum": LOOP_GROUP_MAX_EDGES},
                     "max_iterations": {"minimum": 1, "maximum": 100},
                     "primary_sink": "first_terminal_in_definition_order",
                     "group_fields": sorted(LOOP_GROUP_FIELDS),

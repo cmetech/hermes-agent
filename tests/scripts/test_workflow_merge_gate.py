@@ -23,6 +23,9 @@ PHASE_1_LANGUAGE_BACKEND_SUITES = (
     "tests/plugins/workflow/test_language_schema.py",
     "tests/plugins/workflow/test_workflow_language_desktop_e2e.py",
 )
+TASK_2_LANGUAGE_CONFORMANCE_SUITES = (
+    "tests/plugins/workflow/test_language_conformance.py",
+)
 PHASE_1_LANGUAGE_DESKTOP_SUITES = (
     "src/app/workflows/index.test.tsx",
     "src/app/workflows/view-workflow-dialog.test.tsx",
@@ -314,6 +317,23 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     assert not (workflow_inventory - selected_workflow - opted_out)
 
 
+def test_task_2_language_conformance_is_pinned_once_in_base_gate(
+    tmp_path: Path,
+) -> None:
+    result, commands = _exercise_base_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    selected_python = [
+        path
+        for command in commands
+        if command[0] == "run_tests"
+        for path in command[1:]
+        if path.endswith(".py")
+    ]
+    for path in TASK_2_LANGUAGE_CONFORMANCE_SUITES:
+        assert selected_python.count(path) == 1
+
+
 def _portability_matrix() -> dict:
     return yaml.safe_load(CI.read_text())["jobs"]["workflow-portability"]["strategy"][
         "matrix"
@@ -368,6 +388,13 @@ def test_phase_1_language_contracts_are_pinned_in_native_matrix() -> None:
     portable_files = _portability_files()
 
     for path in PHASE_1_LANGUAGE_BACKEND_SUITES:
+        assert portable_files.count(path) == 1
+
+
+def test_task_2_language_conformance_is_pinned_once_in_native_matrix() -> None:
+    portable_files = _portability_files()
+
+    for path in TASK_2_LANGUAGE_CONFORMANCE_SUITES:
         assert portable_files.count(path) == 1
 
 
