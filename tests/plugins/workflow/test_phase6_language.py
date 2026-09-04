@@ -610,10 +610,34 @@ def test_v6_accepts_exact_4096_child_attempt_product(tmp_path, workflow_writer):
     ]
     path = workflow_writer(tmp_path, nodes=[_group(body, max_iterations=64)])
 
-    assert (
-        _normalize_v6_without_admission(path).definition.nodes[0].node_type
-        == "loop_group"
+    package = _normalize_v6_without_admission(path)
+    snapshot = make_language_snapshot(package, "a" * 64).to_dict()
+    node_semantics = cast(dict[str, dict[str, object]], snapshot["node_semantics"])
+    process_semantics = cast(
+        dict[str, object], node_semantics["process-items"]["loop_group"]
     )
+
+    assert package.definition.nodes[0].node_type == "loop_group"
+    assert process_semantics["child_attempts"] == 4096
+    round_trip = read_language_snapshot(snapshot)
+    assert round_trip is not None
+    assert round_trip.to_dict() == snapshot
+    assert workflow_language.LOOP_GROUP_WORK_LIMIT == (
+        language_schema.LOOP_GROUP_WORK_LIMIT
+    )
+
+    for field in ("child_executions", "child_attempts"):
+        over_limit = deepcopy(snapshot)
+        node_semantics = cast(dict[str, dict[str, object]], over_limit["node_semantics"])
+        process_semantics = cast(
+            dict[str, object], node_semantics["process-items"]["loop_group"]
+        )
+        process_semantics[field] = 4097
+        with pytest.raises(
+            WorkflowLanguageCompatibilityError,
+            match="workflow language snapshot node semantics are invalid",
+        ):
+            read_language_snapshot(over_limit)
 
 
 def test_v6_work_product_descriptor_matches_normalized_admission_arithmetic(
@@ -807,6 +831,245 @@ def test_v6_validates_group_control_template_references(
     )
 
     _assert_issue(path, code, f"nodes[1].loop_group.{field}")
+
+
+def test_v6_group_gate_missing_dependency_has_branch_local_semantic_code(
+    tmp_path, workflow_writer
+):
+    group = _group(gate_message="Review $outer.output")
+    path = workflow_writer(
+        tmp_path,
+        nodes=[{"id": "outer", "prompt": "prepare"}, group],
+    )
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_without_admission(path)
+
+    issue = raised.value.issues[0]
+    assert (
+        issue.code,
+        issue.path,
+        getattr(issue, "semantic_code", None),
+    ) == (
+        "output_reference_not_declared_dependency",
+        "nodes[1].loop_group.gate_message",
+        "scoped-reference-missing-dependency",
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "scope",
+        "surface",
+        "producer_schema",
+        "path_part",
+        "native_code",
+        "semantic_code",
+        "condition",
+    ),
+    [
+        (
+            "current",
+            "body",
+            None,
+            "status",
+            "loop_group_scope_invalid",
+            "scoped-reference-producer-schema-required",
+            "producer_schema_missing",
+        ),
+        (
+            "outer",
+            "body",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            "missing",
+            "loop_group_scope_invalid",
+            "scoped-reference-structured-path-impossible",
+            "path_proven_impossible",
+        ),
+        (
+            "previous_iteration",
+            "body",
+            None,
+            "status",
+            "loop_group_scope_invalid",
+            "scoped-reference-producer-schema-required",
+            "producer_schema_missing",
+        ),
+        (
+            "current",
+            "until_bash",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            "missing",
+            "loop_group_scope_invalid",
+            "scoped-reference-structured-path-impossible",
+            "path_proven_impossible",
+        ),
+        (
+            "outer",
+            "gate_message",
+            None,
+            "status",
+            "output_reference_path_unsupported",
+            "scoped-reference-producer-schema-required",
+            "producer_schema_missing",
+        ),
+        (
+            "outer",
+            "gate_message",
+            {
+                "type": "object",
+                "properties": {"record.status": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "record.status",
+            "output_reference_path_unsupported",
+            "scoped-reference-structured-path-impossible",
+            "path_targets_unaddressable_dotted_key",
+        ),
+    ],
+)
+def test_v6_scoped_structured_reference_diagnostics_are_branch_local(
+    tmp_path,
+    workflow_writer,
+    scope,
+    surface,
+    producer_schema,
+    path_part,
+    native_code,
+    semantic_code,
+    condition,
+):
+    producer = {"id": "producer", "prompt": "produce"}
+    if producer_schema is not None:
+        producer["output_format"] = producer_schema
+    outer_nodes = []
+    body = []
+    group_dependencies = []
+    group_options = {}
+    if scope == "outer":
+        outer_nodes.append(producer)
+        group_dependencies.append("producer")
+        reference = f"$producer.output.{path_part}"
+        body.append({
+            "id": "consumer",
+            "prompt": reference if surface == "body" else "consume",
+        })
+        body_index = 0
+    else:
+        body.append(producer)
+        prefix = "$LOOP_PREV." if scope == "previous_iteration" else "$"
+        reference = f"{prefix}producer.output.{path_part}"
+        body.append({
+            "id": "consumer",
+            "depends_on": ["producer"],
+            "prompt": reference if surface == "body" else "consume",
+        })
+        body_index = 1
+    if surface == "until_bash":
+        group_options["until_bash"] = f"test -n '{reference}'"
+    elif surface == "gate_message":
+        group_options["gate_message"] = reference
+    group = _group(body, **group_options)
+    group["depends_on"] = group_dependencies
+    path = workflow_writer(tmp_path, nodes=[*outer_nodes, group])
+
+    with pytest.raises(WorkflowValidationError) as raised:
+        _normalize_v6_without_admission(path)
+
+    issue = raised.value.issues[0]
+    group_index = 1 if outer_nodes else 0
+    expected_path = (
+        f"nodes[{group_index}].loop_group.nodes[{body_index}].prompt"
+        if surface == "body"
+        else f"nodes[{group_index}].loop_group.{surface}"
+    )
+    assert (issue.code, issue.path, getattr(issue, "semantic_code", None)) == (
+        native_code,
+        expected_path,
+        semantic_code,
+    )
+    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    semantic_rules = cast(list[dict[str, object]], contract["semantic_rules"])
+    reference_rule = next(
+        rule
+        for rule in semantic_rules
+        if rule["id"] == "scoped-output-reference-v1"
+    )
+    semantic_ref = cast(dict[str, str], reference_rule["semantic_ref"])
+    node_kinds = cast(list[dict[str, object]], contract["node_kinds"])
+    loop_group_kind = next(
+        kind
+        for kind in node_kinds
+        if kind["id"] == semantic_ref["node_kind"]
+    )
+    semantic_definitions = cast(
+        dict[str, dict[str, object]], loop_group_kind["semantic_definitions"]
+    )
+    reference_definition = semantic_definitions[semantic_ref["definition"]]
+    constraint = cast(
+        dict[str, object], reference_definition["structured_path_constraint_v1"]
+    )
+    table = cast(dict[str, list[object]], constraint["diagnostic_table"])
+    columns = cast(list[str], table["columns"])
+    rows = cast(list[list[str]], table["rows"])
+    diagnostic = next(
+        dict(zip(columns, row, strict=True))
+        for row in rows
+        if row[0] == condition
+    )
+    assert diagnostic["semantic_code"] == getattr(issue, "semantic_code")
+    descriptor_surface = {
+        "body": "body",
+        "until_bash": "group_until_bash",
+        "gate_message": "group_gate_message",
+    }[surface]
+    assert diagnostic[descriptor_surface] == issue.code
+
+
+def test_v6_accepts_structured_paths_on_all_scoped_reference_surfaces(
+    tmp_path, workflow_writer
+):
+    schema = {
+        "type": "object",
+        "properties": {"status": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    path = workflow_writer(
+        tmp_path,
+        nodes=[
+            {"id": "outer", "prompt": "prepare", "output_format": schema},
+            {
+                **_group(
+                    [
+                        {
+                            "id": "producer",
+                            "prompt": "produce",
+                            "output_format": schema,
+                        },
+                        {
+                            "id": "consumer",
+                            "depends_on": ["producer"],
+                            "prompt": (
+                                "$producer.output.status "
+                                "$outer.output.status "
+                                "$LOOP_PREV.producer.output.status"
+                            ),
+                        },
+                    ],
+                    until_bash=(
+                        'test "$producer.output.status $outer.output.status '
+                        '$LOOP_PREV.producer.output.status" = expected'
+                    ),
+                    gate_message="Review $outer.output.status",
+                ),
+                "depends_on": ["outer"],
+            },
+        ],
+    )
+
+    assert _normalize_v6_without_admission(path).definition.nodes[1].node_type == (
+        "loop_group"
+    )
 
 
 def test_v6_admits_all_group_until_bash_reference_scopes(

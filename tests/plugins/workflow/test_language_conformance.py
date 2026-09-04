@@ -146,6 +146,15 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
     assert cases["loop-group-current-ref-needs-dependency"]["codes"] == [
         "scoped-reference-missing-dependency"
     ]
+    assert cases["loop-group-gate-ref-needs-dependency"]["codes"] == [
+        "scoped-reference-missing-dependency"
+    ]
+    assert cases["loop-group-structured-schema-required"]["codes"] == [
+        "scoped-reference-producer-schema-required"
+    ]
+    assert cases["loop-group-structured-path-impossible"]["codes"] == [
+        "scoped-reference-structured-path-impossible"
+    ]
     assert {
         "loop-group-all-body-kinds-valid",
         "loop-group-empty-body",
@@ -166,6 +175,10 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-outer-ref-needs-dependency",
         "loop-group-loop-prev-valid",
         "loop-group-loop-prev-unknown-producer",
+        "loop-group-gate-ref-needs-dependency",
+        "loop-group-structured-paths-valid",
+        "loop-group-structured-schema-required",
+        "loop-group-structured-path-impossible",
         "loop-group-first-terminal-primary",
         "loop-group-companion-child-reference-valid",
         "loop-group-companion-child-reference-unknown",

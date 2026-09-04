@@ -244,6 +244,7 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
             "visibility": "output_reference_not_declared_dependency",
             "structured_output": "loop_group_scope_invalid",
         },
+        "group_gate_message": "output_reference_not_declared_dependency",
     }
     assert reference_details["semantic_codes"] == {
         "current_scope_missing_dependency": "scoped-reference-missing-dependency",
@@ -254,6 +255,45 @@ def test_explicit_v6_contract_publishes_scoped_graph_semantics():
             "scoped-reference-unknown-producer"
         ),
         "companion_unknown_node": "scoped-companion-reference-unknown-node",
+    }
+
+    structured_details = reference_details["structured_path_constraint_v1"]
+    assert structured_details == {
+        "syntax_rule": "strict-output-reference",
+        "producer_schema_field": "output_format",
+        "applies_to": "scoped-output-reference-v1",
+        "diagnostic_table": {
+            "columns": [
+                "condition",
+                "semantic_code",
+                "body",
+                "group_until_bash",
+                "group_gate_message",
+            ],
+            "rows": [
+                [
+                    "producer_schema_missing",
+                    "scoped-reference-producer-schema-required",
+                    "loop_group_scope_invalid",
+                    "loop_group_scope_invalid",
+                    "output_reference_path_unsupported",
+                ],
+                [
+                    "path_proven_impossible",
+                    "scoped-reference-structured-path-impossible",
+                    "loop_group_scope_invalid",
+                    "loop_group_scope_invalid",
+                    "structured_output_field_impossible",
+                ],
+                [
+                    "path_targets_unaddressable_dotted_key",
+                    "scoped-reference-structured-path-impossible",
+                    "loop_group_scope_invalid",
+                    "loop_group_scope_invalid",
+                    "output_reference_path_unsupported",
+                ],
+            ],
+        },
     }
 
     work = rules["loop-group-work-product-v1"]

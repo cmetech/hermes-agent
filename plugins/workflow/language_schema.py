@@ -22,8 +22,11 @@ from plugins.workflow.language import (
     supports_phase6_semantics,
 )
 from plugins.workflow.models import (
+    LOOP_GROUP_WORK_LIMIT,
     SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
     SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
+    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
     SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
     WorkflowLanguageProfile,
     WorkflowLanguageSelection,
@@ -58,7 +61,6 @@ BASH_SPILL_MAX_VALUE_BYTES = 500_000
 WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES = 2_000_000
 BASH_SPILL_MAX_TOTAL_BYTES = WORKFLOW_PROCESS_INPUT_MAX_TOTAL_BYTES
 LOOP_GROUP_MAX_EDGES = 4_096
-LOOP_GROUP_WORK_LIMIT = 4_096
 LOOP_GROUP_ORDINARY_LOOP_DEFAULT_MULTIPLIER = 1
 LOOP_GROUP_COMMAND_PROMPT_DEFAULT_RETRIES = 2
 LOOP_GROUP_OTHER_DEFAULT_RETRIES = 0
@@ -3234,6 +3236,7 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
                     "visibility": "output_reference_not_declared_dependency",
                     "structured_output": "loop_group_scope_invalid",
                 },
+                "group_gate_message": "output_reference_not_declared_dependency",
             },
             "semantic_codes": {
                 "current_scope_missing_dependency": (
@@ -3248,6 +3251,43 @@ def _phase6_node_kind_semantic_definitions() -> dict[str, object]:
                 "companion_unknown_node": (
                     SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE
                 ),
+            },
+            "structured_path_constraint_v1": {
+                "syntax_rule": "strict-output-reference",
+                "producer_schema_field": "output_format",
+                "applies_to": "scoped-output-reference-v1",
+                "diagnostic_table": {
+                    "columns": [
+                        "condition",
+                        "semantic_code",
+                        "body",
+                        "group_until_bash",
+                        "group_gate_message",
+                    ],
+                    "rows": [
+                        [
+                            "producer_schema_missing",
+                            SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
+                            "loop_group_scope_invalid",
+                            "loop_group_scope_invalid",
+                            "output_reference_path_unsupported",
+                        ],
+                        [
+                            "path_proven_impossible",
+                            SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
+                            "loop_group_scope_invalid",
+                            "loop_group_scope_invalid",
+                            "structured_output_field_impossible",
+                        ],
+                        [
+                            "path_targets_unaddressable_dotted_key",
+                            SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
+                            "loop_group_scope_invalid",
+                            "loop_group_scope_invalid",
+                            "output_reference_path_unsupported",
+                        ],
+                    ],
+                },
             },
         },
         "loop-group-work-product-v1": {

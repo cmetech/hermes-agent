@@ -77,6 +77,8 @@ from plugins.workflow.language_schema import (
 from plugins.workflow.models import (
     SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
     SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
+    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
     SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
     ValidationIssue,
     ValidatedWorkflowResourceBodies,
@@ -1834,6 +1836,11 @@ def _validate_v3_static_output_references(
             named_script_bodies=named_script_bodies,
             include_phase4_templates=phase4_templates,
         ):
+            scoped_group_gate = (
+                normalizer_version >= 6
+                and node.node_type == "loop_group"
+                and surface_path.endswith(".loop_group.gate_message")
+            )
             if (
                 normalizer_version >= 6
                 and node.node_type == "loop_group"
@@ -1868,6 +1875,11 @@ def _validate_v3_static_output_references(
                             "output_reference_not_declared_dependency",
                             f"output reference {reference.node_id} must be listed directly in depends_on for node {node.id}",
                             line=node.source_line,
+                            semantic_code=(
+                                SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                                if scoped_group_gate
+                                else None
+                            ),
                         )
                     )
                     continue
@@ -1882,6 +1894,11 @@ def _validate_v3_static_output_references(
                             "output_reference_path_unsupported",
                             f"output field reference requires a structured output contract on node {reference.node_id}",
                             line=node.source_line,
+                            semantic_code=(
+                                SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE
+                                if scoped_group_gate
+                                else None
+                            ),
                         )
                     )
                     continue
@@ -1901,6 +1918,11 @@ def _validate_v3_static_output_references(
                             code,
                             message,
                             line=node.source_line,
+                            semantic_code=(
+                                SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                                if scoped_group_gate
+                                else None
+                            ),
                         )
                     )
     if issues:
@@ -2001,15 +2023,28 @@ def _validate_v6_loop_group_references(
                 if reference.path:
                     output = structured_outputs.get(f"{group.id}/{producer_id}")
                     schema = getattr(output, "canonical_schema", None)
-                    if not isinstance(schema, Mapping) or _v3_output_path_impossible(
-                        schema, reference.path
-                    ):
+                    if not isinstance(schema, Mapping):
                         issues.append(
                             _issue(
                                 nested_path,
                                 "loop_group_scope_invalid",
                                 "previous-iteration field requires a compatible structured output",
                                 line=line,
+                                semantic_code=(
+                                    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE
+                                ),
+                            )
+                        )
+                    elif _v3_output_path_impossible(schema, reference.path):
+                        issues.append(
+                            _issue(
+                                nested_path,
+                                "loop_group_scope_invalid",
+                                "previous-iteration field requires a compatible structured output",
+                                line=line,
+                                semantic_code=(
+                                    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                                ),
                             )
                         )
             for reference in references:
@@ -2039,15 +2074,28 @@ def _validate_v6_loop_group_references(
                 if reference.path:
                     output = structured_outputs.get(output_id)
                     schema = getattr(output, "canonical_schema", None)
-                    if not isinstance(schema, Mapping) or _v3_output_path_impossible(
-                        schema, reference.path
-                    ):
+                    if not isinstance(schema, Mapping):
                         issues.append(
                             _issue(
                                 nested_path,
                                 "loop_group_scope_invalid",
                                 "loop-group field reference is incompatible with its structured output",
                                 line=line,
+                                semantic_code=(
+                                    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE
+                                ),
+                            )
+                        )
+                    elif _v3_output_path_impossible(schema, reference.path):
+                        issues.append(
+                            _issue(
+                                nested_path,
+                                "loop_group_scope_invalid",
+                                "loop-group field reference is incompatible with its structured output",
+                                line=line,
+                                semantic_code=(
+                                    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                                ),
                             )
                         )
 

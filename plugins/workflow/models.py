@@ -353,9 +353,16 @@ SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE = (
 SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE = (
     "scoped-reference-unknown-producer"
 )
+SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE = (
+    "scoped-reference-producer-schema-required"
+)
+SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE = (
+    "scoped-reference-structured-path-impossible"
+)
 SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE = (
     "scoped-companion-reference-unknown-node"
 )
+LOOP_GROUP_WORK_LIMIT = 4_096
 
 
 @dataclass(frozen=True, kw_only=True)

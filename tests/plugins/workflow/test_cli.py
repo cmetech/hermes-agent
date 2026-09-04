@@ -721,6 +721,47 @@ def test_json_load_failure_exposes_additive_semantic_issue_code(
     }
 
 
+def test_json_gate_message_failure_exposes_branch_local_semantic_issue_code(
+    workflow_writer, tmp_path, capsys
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="semantic-gate-load-error",
+        nodes=[
+            {"id": "outer", "prompt": "produce"},
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "done",
+                    "max_iterations": 1,
+                    "gate_message": "Review $outer.output",
+                    "nodes": [{"id": "consumer", "prompt": "consume"}],
+                },
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    issue = _json_envelope(capsys)["error"]["details"]["issues"][0]
+    assert issue == {
+        "blocking": True,
+        "code": "output_reference_not_declared_dependency",
+        "path": "nodes[1].loop_group.gate_message",
+        "semantic_code": "scoped-reference-missing-dependency",
+        "severity": "error",
+    }
+
+
 def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
     workflow_writer, tmp_path, capsys
 ):

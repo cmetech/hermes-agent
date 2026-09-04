@@ -10,6 +10,8 @@ from plugins.workflow.language_schema import workflow_authoring_contract
 from plugins.workflow.models import (
     SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
     SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE,
+    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE,
     SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
     WorkflowLanguageProfile,
 )
@@ -675,6 +677,113 @@ def _archon_loop_group_cases(
                 ),
             ),
             features=("reference:loop-prev", "invalid:unknown-producer"),
+        ),
+        _case(
+            profile,
+            "loop-group-gate-ref-needs-dependency",
+            _group_definition(
+                "loop-group-gate-ref-needs-dependency",
+                "        - id: consumer\n          prompt: Consume.",
+                outer_nodes="  - id: outer\n    prompt: Produce.",
+                group_fields="      gate_message: Review $outer.output",
+            ),
+            diagnostics=issue(
+                "output_reference_not_declared_dependency",
+                "nodes[1].loop_group.gate_message",
+                semantic_code=(
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE
+                ),
+            ),
+            features=("reference:outer", "surface:group-gate-message"),
+        ),
+        _case(
+            profile,
+            "loop-group-structured-paths-valid",
+            _group_definition(
+                "loop-group-structured-paths-valid",
+                """        - id: producer
+          prompt: Produce.
+          output_format:
+            type: object
+            properties:
+              status: {type: string}
+            additionalProperties: false
+        - id: consumer
+          depends_on: [producer]
+          prompt: Use $producer.output.status $outer.output.status $LOOP_PREV.producer.output.status""",
+                outer_nodes="""  - id: outer
+    prompt: Produce.
+    output_format:
+      type: object
+      properties:
+        status: {type: string}
+      additionalProperties: false""",
+                group_fields="""      until_bash: test "$producer.output.status $outer.output.status $LOOP_PREV.producer.output.status" = expected
+      gate_message: Review $outer.output.status""",
+                group_options="    depends_on: [outer]",
+            ),
+            features=(
+                "reference:current-body",
+                "reference:loop-prev",
+                "reference:outer",
+                "reference:structured-path",
+                "surface:group-gate-message",
+                "surface:group-until-bash",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-structured-schema-required",
+            _group_definition(
+                "loop-group-structured-schema-required",
+                """        - id: producer
+          prompt: Produce.
+        - id: consumer
+          depends_on: [producer]
+          prompt: Use $producer.output.status""",
+            ),
+            diagnostics=issue(
+                "loop_group_scope_invalid",
+                "nodes[0].loop_group.nodes[1].prompt",
+                semantic_code=(
+                    SCOPED_REFERENCE_PRODUCER_SCHEMA_REQUIRED_SEMANTIC_CODE
+                ),
+            ),
+            features=(
+                "invalid:producer-schema-required",
+                "reference:current-body",
+                "reference:structured-path",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-structured-path-impossible",
+            _group_definition(
+                "loop-group-structured-path-impossible",
+                """        - id: producer
+          prompt: Produce.
+          output_format:
+            type: object
+            properties:
+              status: {type: string}
+            additionalProperties: false""",
+                group_fields=(
+                    "      until_bash: test -n '$LOOP_PREV.producer.output.missing'"
+                ),
+            ),
+            diagnostics=issue(
+                "loop_group_scope_invalid",
+                "nodes[0].loop_group.until_bash",
+                semantic_code=(
+                    SCOPED_REFERENCE_STRUCTURED_PATH_IMPOSSIBLE_SEMANTIC_CODE
+                ),
+            ),
+            features=(
+                "invalid:structured-path-impossible",
+                "reference:loop-prev",
+                "reference:structured-path",
+                "surface:group-until-bash",
+            ),
         ),
         _case(
             profile,
