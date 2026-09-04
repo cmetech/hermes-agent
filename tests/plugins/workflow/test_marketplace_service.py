@@ -26,6 +26,7 @@ from plugins.workflow.marketplace.package import (
     load_repository_index,
 )
 from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+from plugins.workflow.marketplace.source_store import SourceRefreshStatus
 from plugins.workflow.trust import WorkflowTrustError
 
 
@@ -934,6 +935,68 @@ def test_source_list_records_preserve_verified_cache_after_failure_and_fail_clos
     )
     with pytest.raises(WorkflowMarketplaceError):
         service.list_source_records()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "failed(/private/tmp/secret)",
+        "at=/private/tmp/secret",
+        'failed["/Users/operator/work"]',
+        r"at=C:\Users\operator\secret",
+        r"at=\\server\share\secret",
+        "failed(/tmp/repo/.staging/secret)",
+        "failed(%2Fprivate%2Ftmp%2Fsecret)",
+        "failed(%252Fprivate%252Ftmp%252Fsecret)",
+    ],
+)
+def test_refresh_diagnostics_redact_assignment_punctuation_and_encoded_local_paths_before_persistence(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    message: str,
+) -> None:
+    configured = service.add_source(
+        WorkflowMarketplaceSource(
+            name="private",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+
+    service.catalog.source_store.record_failed_refresh(
+        configured,
+        WorkflowMarketplaceError("source_unavailable", message),
+        attempted_at="2026-09-04T01:00:00Z",
+        state="unavailable",
+    )
+
+    persisted = service.catalog.source_store.catalog_path.read_text()
+    status = service.list_source_records()[0]
+    assert message not in persisted
+    assert status.message != message
+    assert status.message is not None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "workflow marketplace source refresh failed",
+        "See /docs/authoring for recovery",
+        "See https://example.test/private/tmp for repository documentation",
+        "failed at [REDACTED_PATH]",
+    ],
+)
+def test_refresh_diagnostics_accept_canonical_generic_and_nonlocal_slash_prose(
+    message: str,
+) -> None:
+    status = SourceRefreshStatus(
+        sourceName="company",
+        state="unavailable",
+        attemptedAt="2026-09-04T01:00:00Z",
+        diagnosticCode="source_unavailable",
+        message=message,
+    )
+
+    assert status.message == message
 
 
 def test_source_list_records_report_auth_failure_without_inventing_cache(

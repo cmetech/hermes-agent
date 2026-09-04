@@ -732,19 +732,47 @@ const DIAGNOSTIC_CREDENTIAL_ASSIGNMENT =
   /\b(?:access[_-]?token|refresh[_-]?token|token|api[_-]?key|auth(?:orization)?|password|credentials?|client[_-]?secret|confirmation[_-]?token)\b\s*[=:]/i
 
 const DIAGNOSTIC_LOCAL_PATH =
-  /(?:^|\s)(?:\/(?:private|tmp|users|home|var\/folders|var\/tmp|var\/cache)\/|[A-Za-z]:\\|\\\\[^\\\s]+\\|[^\s]*(?:\.staging|\.quarantine)(?:\/|\\))/i
+  /(?<![A-Za-z0-9])(?:\/(?:private|tmp|users|home|var\/(?:folders|tmp|cache))(?:[\\/][^\s"'<>()[\]{},;]*)?|[A-Za-z]:\\[^\s"'<>()[\]{},;]*|\\\\[^\\\s"'<>()[\]{},;]+\\[^\s"'<>()[\]{},;]*|[^\s"'<>()[\]{},;=]*(?:[\\/])?\.(?:staging|quarantine)(?:[\\/][^\s"'<>()[\]{},;]*)?)/i
+
+function diagnosticTextIsUnsafe(value: string): boolean {
+  return (
+    DIAGNOSTIC_CREDENTIAL_ASSIGNMENT.test(value) ||
+    DIAGNOSTIC_LOCAL_PATH.test(value) ||
+    hasCredentialAuthority(value) ||
+    hasCredentialParameter(value)
+  )
+}
 
 function safeDiagnosticText(value: unknown): string | null {
   const decoded = cleanText(value, 1, 4096)
 
-  return decoded !== null &&
-    !containsControl(decoded) &&
-    !DIAGNOSTIC_CREDENTIAL_ASSIGNMENT.test(decoded) &&
-    !DIAGNOSTIC_LOCAL_PATH.test(decoded) &&
-    !hasCredentialAuthority(decoded) &&
-    !hasCredentialParameter(decoded)
-    ? decoded
-    : null
+  if (decoded === null || containsControl(decoded) || diagnosticTextIsUnsafe(decoded)) {
+    return null
+  }
+
+  let probe = decoded
+
+  for (let layer = 0; layer < 8; layer += 1) {
+    let next: string
+
+    try {
+      next = decodeURIComponent(probe)
+    } catch {
+      return null
+    }
+
+    if (next === probe) {
+      return decoded
+    }
+
+    if (diagnosticTextIsUnsafe(next)) {
+      return null
+    }
+
+    probe = next
+  }
+
+  return probe.includes('%') ? null : decoded
 }
 
 function decodeSourceRecord(value: unknown): WorkflowMarketplaceSourceRecord | null {
@@ -2651,6 +2679,10 @@ export function decodeMarketplaceOperation(value: unknown): WorkflowMarketplaceO
       error !== null ||
       progress !== 100
     ) {
+      return null
+    }
+
+    if (kind === 'refresh' && result.type === 'source_refresh' && result.value.source_name !== sourceName) {
       return null
     }
 

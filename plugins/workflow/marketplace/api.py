@@ -55,6 +55,10 @@ from .operations import (
 )
 from .package import WorkflowMarketplaceError
 from .service import WorkflowMarketplaceService
+from .source_store import (
+    redact_source_refresh_message,
+    source_refresh_message_is_safe,
+)
 
 
 _BODY_BYTES_MAX = 64 * 1024
@@ -180,6 +184,13 @@ class MarketplaceSourceListItem(_StrictApiModel):
             raise ValueError("timestamp is invalid") from error
         if parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") != value:
             raise ValueError("timestamp is invalid")
+        return value
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str | None) -> str | None:
+        if value is not None and not source_refresh_message_is_safe(value):
+            raise ValueError("source diagnostic is not canonically redacted")
         return value
 
     @model_validator(mode="after")
@@ -969,15 +980,22 @@ def create_marketplace_router(
         _authorize(verified_operator, request, "read")
         _key, profile, service, _registry = api.current()
         source_records = _service_call(service.list_source_records)
-        sources = [
-            MarketplaceSourceListItem.model_validate(
-                _sanitize_result(
-                    _public(source),
-                    allow_confirmation_token=False,
+        sources = []
+        for source in source_records:
+            public = _public(source)
+            if not isinstance(public, dict):
+                raise TypeError("marketplace source projection is invalid")
+            message = public.get("message")
+            if isinstance(message, str):
+                public["message"] = redact_source_refresh_message(message)
+            sources.append(
+                MarketplaceSourceListItem.model_validate(
+                    _sanitize_result(
+                        public,
+                        allow_confirmation_token=False,
+                    )
                 )
             )
-            for source in source_records
-        ]
         return MarketplaceSourceListResponse(
             profile=profile,
             sources=sorted(sources, key=lambda item: item.name),

@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { profileScopeKey } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -27,7 +27,7 @@ import { Pencil, Plus, RefreshCw, Trash2 } from '@/lib/icons'
 import type { WorkflowMarketplaceSourceRecord } from '@/types/hermes'
 
 import { marketplaceKeys } from './query-keys'
-import type { MarketplaceOperationController } from './use-marketplace-operation'
+import type { MarketplaceOperationController, MarketplaceOperationOrigin } from './use-marketplace-operation'
 
 interface SourceDraft {
   enabled: boolean
@@ -37,6 +37,15 @@ interface SourceDraft {
 }
 
 type ActionError = 'auth' | 'generic'
+
+interface ScopedActionError {
+  kind: ActionError
+  scopeKey: string
+}
+
+interface ScopedRemoval extends MarketplaceOperationOrigin {
+  name: string
+}
 
 const EMPTY_DRAFT: SourceDraft = { enabled: true, name: '', ref: '', repositoryUrl: '' }
 
@@ -48,11 +57,7 @@ function errorCode(error: unknown): null | string {
 
 function sourceStatus(
   source: WorkflowMarketplaceSourceRecord
-): 'auth' | 'disabled' | 'fresh' | 'never' | 'stale' | 'unavailable' {
-  if (!source.enabled) {
-    return 'disabled'
-  }
-
+): 'auth' | 'fresh' | 'incompatible' | 'malformed' | 'never' | 'stale' | 'unavailable' {
   if (source.refresh_state === 'fresh') {
     return 'fresh'
   }
@@ -67,6 +72,14 @@ function sourceStatus(
 
   if (source.refresh_state === 'stale') {
     return 'stale'
+  }
+
+  if (source.refresh_state === 'malformed') {
+    return 'malformed'
+  }
+
+  if (source.refresh_state === 'incompatible') {
+    return 'incompatible'
   }
 
   return 'unavailable'
@@ -94,13 +107,68 @@ export function ManageWorkflowSourcesDialog({
   const addButtonRef = useRef<HTMLButtonElement>(null)
   const actionGuardsRef = useRef(new Set<string>())
   const retryRef = useRef<null | (() => Promise<void>)>(null)
+  const mountedRef = useRef(true)
+  const actionGenerationRef = useRef(0)
+  const renderedScopeKeyRef = useRef(scopeKey)
+  const wasOpenRef = useRef(open)
+  const refreshAllGuardRef = useRef<null | MarketplaceOperationOrigin>(null)
   const [draft, setDraft] = useState<SourceDraft>(EMPTY_DRAFT)
   const [editing, setEditing] = useState<null | string>(null)
   const [formOpen, setFormOpen] = useState(false)
-  const [removeName, setRemoveName] = useState<null | string>(null)
+  const [formScopeKey, setFormScopeKey] = useState<null | string>(null)
+  const [removeSource, setRemoveSource] = useState<null | ScopedRemoval>(null)
   const [busy, setBusy] = useState<null | string>(null)
-  const [refreshAllBusy, setRefreshAllBusy] = useState(false)
-  const [actionError, setActionError] = useState<null | ActionError>(null)
+  const [refreshAllBusyScope, setRefreshAllBusyScope] = useState<null | string>(null)
+  const [actionError, setActionError] = useState<null | ScopedActionError>(null)
+
+  if (renderedScopeKeyRef.current !== scopeKey) {
+    renderedScopeKeyRef.current = scopeKey
+    actionGenerationRef.current += 1
+    actionGuardsRef.current.clear()
+    retryRef.current = null
+    refreshAllGuardRef.current = null
+  }
+
+  const currentActionOrigin = (): MarketplaceOperationOrigin => ({
+    generation: actionGenerationRef.current,
+    scopeKey
+  })
+
+  const actionOriginIsCurrent = (origin: MarketplaceOperationOrigin) =>
+    mountedRef.current &&
+    renderedScopeKeyRef.current === origin.scopeKey &&
+    actionGenerationRef.current === origin.generation
+
+  // eslint-disable-next-line no-restricted-syntax -- resets ephemeral dialog state at an exact backend scope boundary
+  useEffect(() => {
+    setDraft(EMPTY_DRAFT)
+    setEditing(null)
+    setFormOpen(false)
+    setFormScopeKey(null)
+    setRemoveSource(null)
+    setBusy(null)
+    setRefreshAllBusyScope(null)
+    setActionError(null)
+  }, [scopeKey])
+
+  useEffect(
+    () => () => {
+      mountedRef.current = false
+      actionGenerationRef.current += 1
+      actionGuardsRef.current.clear()
+      retryRef.current = null
+      refreshAllGuardRef.current = null
+    },
+    []
+  )
+
+  // eslint-disable-next-line no-restricted-syntax -- detects a closed-to-open transition so persisted operations reconcile on reopen
+  useEffect(() => {
+    if (open && !wasOpenRef.current && supported) {
+      operations.reconcile()
+    }
+    wasOpenRef.current = open
+  }, [open, operations, supported])
 
   const sources = useQuery({
     enabled: open && supported,
@@ -109,38 +177,70 @@ export function ManageWorkflowSourcesDialog({
     retry: false
   })
 
-  const invalidate = async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: marketplaceKeys.sources(scopeKey) }),
-      queryClient.invalidateQueries({ queryKey: marketplaceKeys.searchRoot(scopeKey) })
-    ])
-  }
-
-  const runAction = async (identity: string, action: () => Promise<unknown>): Promise<void> => {
-    if (actionGuardsRef.current.has(identity)) {
+  const invalidate = async (origin: MarketplaceOperationOrigin) => {
+    if (!actionOriginIsCurrent(origin)) {
       return
     }
 
-    actionGuardsRef.current.add(identity)
-    setBusy(identity)
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: marketplaceKeys.sources(origin.scopeKey) }),
+      queryClient.invalidateQueries({ queryKey: marketplaceKeys.searchRoot(origin.scopeKey) })
+    ])
+  }
+
+  const runAction = async (
+    identity: string,
+    action: () => Promise<unknown>,
+    origin: MarketplaceOperationOrigin = currentActionOrigin()
+  ): Promise<boolean> => {
+    const scopedIdentity = `${origin.scopeKey}:${origin.generation}:${identity}`
+
+    if (!actionOriginIsCurrent(origin) || actionGuardsRef.current.has(scopedIdentity)) {
+      return false
+    }
+
+    actionGuardsRef.current.add(scopedIdentity)
+    setBusy(scopedIdentity)
     setActionError(null)
-    retryRef.current = () => runAction(identity, action)
+    retryRef.current = () => runAction(identity, action, origin).then(() => undefined)
 
     try {
+      if (!actionOriginIsCurrent(origin)) {
+        return false
+      }
+
       await action()
+
+      if (!actionOriginIsCurrent(origin)) {
+        return false
+      }
+
       retryRef.current = null
-      await invalidate()
+      await invalidate(origin)
+
+      return actionOriginIsCurrent(origin)
     } catch (error) {
-      setActionError(errorCode(error) === 'source_authentication_failed' ? 'auth' : 'generic')
+      if (actionOriginIsCurrent(origin)) {
+        setActionError({
+          kind: errorCode(error) === 'source_authentication_failed' ? 'auth' : 'generic',
+          scopeKey: origin.scopeKey
+        })
+      }
+
+      return false
     } finally {
-      actionGuardsRef.current.delete(identity)
-      setBusy(current => (current === identity ? null : current))
+      actionGuardsRef.current.delete(scopedIdentity)
+
+      if (actionOriginIsCurrent(origin)) {
+        setBusy(current => (current === scopedIdentity ? null : current))
+      }
     }
   }
 
   const beginAdd = () => {
     setEditing(null)
     setDraft(EMPTY_DRAFT)
+    setFormScopeKey(scopeKey)
     setFormOpen(true)
   }
 
@@ -152,6 +252,7 @@ export function ManageWorkflowSourcesDialog({
       ref: source.ref ?? '',
       repositoryUrl: source.repository_url
     })
+    setFormScopeKey(scopeKey)
     setFormOpen(true)
   }
 
@@ -179,9 +280,9 @@ export function ManageWorkflowSourcesDialog({
             scope
           )
 
-    await runAction(`save:${editing ?? draft.name}`, action)
+    const saved = await runAction(`save:${editing ?? draft.name}`, action)
 
-    if (retryRef.current === null) {
+    if (saved) {
       setFormOpen(false)
     }
   }
@@ -191,32 +292,50 @@ export function ManageWorkflowSourcesDialog({
   }
 
   const refreshAll = async () => {
-    if (refreshAllBusy) {
+    const origin = operations.captureOrigin()
+
+    if (refreshAllGuardRef.current !== null || !operations.originIsCurrent(origin)) {
       return
     }
 
-    setRefreshAllBusy(true)
+    refreshAllGuardRef.current = origin
+    setRefreshAllBusyScope(scopeKey)
+    const enabledSources = (sources.data?.sources ?? []).filter(source => source.enabled)
 
     try {
-      for (const source of sources.data?.sources ?? []) {
-        if (source.enabled) {
-          await refreshOne(source.name)
+      for (const source of enabledSources) {
+        if (!operations.originIsCurrent(origin) || renderedScopeKeyRef.current !== scopeKey) {
+          break
+        }
+
+        await operations.start(source.name, () => refreshWorkflowMarketplaceSource(source.name, scope), origin)
+
+        if (!operations.originIsCurrent(origin) || renderedScopeKeyRef.current !== scopeKey) {
+          break
         }
       }
     } finally {
-      setRefreshAllBusy(false)
+      if (refreshAllGuardRef.current === origin) {
+        refreshAllGuardRef.current = null
+      }
+
+      if (operations.originIsCurrent(origin) && renderedScopeKeyRef.current === scopeKey) {
+        setRefreshAllBusyScope(null)
+      }
     }
   }
+
+  const refreshAllBusy = refreshAllBusyScope === scopeKey
+  const visibleActionError = actionError?.scopeKey === scopeKey ? actionError.kind : null
+  const visibleFormOpen = formOpen && formScopeKey === scopeKey
+  const visibleRemoval = removeSource?.scopeKey === scopeKey ? removeSource : null
+  const actionBusy = (identity: string) => busy === `${scopeKey}:${actionGenerationRef.current}:${identity}`
 
   const statusLabel = (source: WorkflowMarketplaceSourceRecord) => {
     const status = sourceStatus(source)
 
     if (status === 'fresh') {
       return copy.workflowMarketplaceFresh
-    }
-
-    if (status === 'disabled') {
-      return copy.workflowMarketplaceDisabled
     }
 
     if (status === 'auth') {
@@ -229,6 +348,14 @@ export function ManageWorkflowSourcesDialog({
 
     if (status === 'stale') {
       return copy.workflowMarketplaceStale
+    }
+
+    if (status === 'malformed') {
+      return copy.workflowMarketplaceMalformed
+    }
+
+    if (status === 'incompatible') {
+      return copy.workflowMarketplaceIncompatible
     }
 
     return copy.workflowMarketplaceUnavailable
@@ -271,7 +398,7 @@ export function ManageWorkflowSourcesDialog({
                 </Button>
               </div>
 
-              {formOpen ? (
+              {visibleFormOpen ? (
                 <form
                   className="grid gap-3 rounded-lg border border-(--ui-stroke-tertiary) p-3 sm:grid-cols-2"
                   onSubmit={event => {
@@ -315,7 +442,7 @@ export function ManageWorkflowSourcesDialog({
                     {copy.workflowMarketplaceEnabled}
                   </label>
                   <div className="flex gap-2 sm:col-span-2">
-                    <Button disabled={busy?.startsWith('save:')} size="sm" type="submit">
+                    <Button disabled={actionBusy(`save:${editing ?? draft.name}`)} size="sm" type="submit">
                       {copy.workflowMarketplaceSaveSource}
                     </Button>
                     <Button onClick={() => setFormOpen(false)} size="sm" type="button" variant="ghost">
@@ -325,14 +452,14 @@ export function ManageWorkflowSourcesDialog({
                 </form>
               ) : null}
 
-              {actionError ? (
+              {visibleActionError ? (
                 <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs" role="alert">
                   <p className="font-medium">
-                    {actionError === 'auth'
+                    {visibleActionError === 'auth'
                       ? copy.workflowMarketplaceSourceAuthTitle
                       : copy.workflowMarketplaceSafeError}
                   </p>
-                  {actionError === 'auth' ? <p>{copy.workflowMarketplaceAuthGuidance}</p> : null}
+                  {visibleActionError === 'auth' ? <p>{copy.workflowMarketplaceAuthGuidance}</p> : null}
                   <Button onClick={() => void retryRef.current?.()} size="sm" type="button" variant="secondary">
                     {copy.workflowCatalogRetry}
                   </Button>
@@ -377,6 +504,11 @@ export function ManageWorkflowSourcesDialog({
                       >
                         <div className="flex min-w-0 flex-wrap items-center gap-2">
                           <strong>{source.name}</strong>
+                          {!source.enabled ? (
+                            <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
+                              {copy.workflowMarketplaceDisabled}
+                            </span>
+                          ) : null}
                           <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{statusLabel(source)}</span>
                           {active && (active.state === 'pending' || active.state === 'running') ? (
                             <span role="status">{`${active.phase} ${active.progress}%`}</span>
@@ -422,7 +554,11 @@ export function ManageWorkflowSourcesDialog({
                                 : copy.workflowMarketplaceRefreshStatusUnavailable}
                             </span>
                             <Button
-                              onClick={() => void refreshOne(source.name)}
+                              onClick={() =>
+                                void (recovery === 'status' && active
+                                  ? operations.retry(active.id)
+                                  : refreshOne(source.name))
+                              }
                               size="sm"
                               type="button"
                               variant="secondary"
@@ -434,7 +570,7 @@ export function ManageWorkflowSourcesDialog({
                         {active?.state === 'failed' || active?.state === 'cancelled' ? (
                           <div className="flex items-center gap-2 text-xs" role="status">
                             <span>
-                              {active.state === 'failed' ? t.common.failed : copy.workflowMarketplaceUnavailable}
+                              {active.state === 'failed' ? t.common.failed : copy.workflowMarketplaceCancelled}
                             </span>
                             <Button
                               onClick={() => void refreshOne(source.name)}
@@ -482,7 +618,7 @@ export function ManageWorkflowSourcesDialog({
                                 ? copy.workflowMarketplaceDisableSource(source.name)
                                 : copy.workflowMarketplaceEnableSource(source.name)
                             }
-                            disabled={busy === `enabled:${source.name}`}
+                            disabled={actionBusy(`enabled:${source.name}`)}
                             onClick={() =>
                               void runAction(`enabled:${source.name}`, () =>
                                 setWorkflowMarketplaceSourceEnabled(source.name, !source.enabled, scope)
@@ -496,7 +632,7 @@ export function ManageWorkflowSourcesDialog({
                           </Button>
                           <Button
                             aria-label={copy.workflowMarketplaceRemoveSource(source.name)}
-                            onClick={() => setRemoveName(source.name)}
+                            onClick={() => setRemoveSource({ ...currentActionOrigin(), name: source.name })}
                             size="sm"
                             type="button"
                             variant="ghost"
@@ -524,20 +660,24 @@ export function ManageWorkflowSourcesDialog({
         description={copy.workflowMarketplaceRemoveDescription}
         destructive
         dismissOnConfirm
-        onClose={() => setRemoveName(null)}
+        onClose={() => setRemoveSource(null)}
         onConfirm={async () => {
-          if (removeName === null) {
+          if (visibleRemoval === null || !actionOriginIsCurrent(visibleRemoval)) {
             return
           }
 
-          await runAction(`remove:${removeName}`, () => removeWorkflowMarketplaceSource(removeName, scope))
+          const removed = await runAction(
+            `remove:${visibleRemoval.name}`,
+            () => removeWorkflowMarketplaceSource(visibleRemoval.name, scope),
+            visibleRemoval
+          )
 
-          if (retryRef.current !== null) {
+          if (!removed && actionOriginIsCurrent(visibleRemoval)) {
             throw new Error(copy.workflowMarketplaceSafeError)
           }
         }}
-        open={removeName !== null}
-        title={copy.workflowMarketplaceRemoveTitle(removeName ?? '')}
+        open={visibleRemoval !== null}
+        title={copy.workflowMarketplaceRemoveTitle(visibleRemoval?.name ?? '')}
       />
     </>
   )

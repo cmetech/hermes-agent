@@ -2166,10 +2166,15 @@ export interface Translations {
     workflowMarketplacePackageCount: (count: number) => string
     workflowMarketplaceFresh: string
     workflowMarketplaceAuthenticationRequired: string
+    workflowMarketplaceCancelled: string
+    workflowMarketplaceIncompatible: string
+    workflowMarketplaceMalformed: string
     workflowMarketplaceUnavailable: string
     workflowMarketplaceNeverRefreshed: string
     workflowMarketplaceRefreshStatusUnavailable: string
     workflowMarketplaceOperationEvicted: string
+    workflowMarketplaceRefreshResultsLabel: string
+    workflowMarketplaceRefreshResult: (source: string, state: string) => string
     workflowMarketplaceAuthGuidance: string
     workflowMarketplaceSafeError: string
     workflowMarketplaceRemoveTitle: (source: string) => string

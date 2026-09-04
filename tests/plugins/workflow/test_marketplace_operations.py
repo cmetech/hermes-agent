@@ -7,6 +7,8 @@ import time
 import pytest
 
 from plugins.workflow.marketplace.operations import (
+    MarketplaceSourceRefreshOperationResult,
+    MarketplaceSourceRefreshValue,
     MarketplaceTrustGrantOperationResult,
     MarketplaceTrustState,
     MarketplaceTrustStatesValue,
@@ -39,6 +41,20 @@ def _result(value: str = "ok") -> MarketplaceTrustGrantOperationResult:
         type="trust_grant",
         value=MarketplaceTrustStatesValue(
             workflows=[MarketplaceTrustState(workflow_name=value, state="trusted")]
+        ),
+    )
+
+
+def _refresh_result(source_name: str) -> MarketplaceSourceRefreshOperationResult:
+    return MarketplaceSourceRefreshOperationResult(
+        type="source_refresh",
+        value=MarketplaceSourceRefreshValue(
+            source_name=source_name,
+            repository_url="https://example.test/workflows.git",
+            state="fresh",
+            resolved_commit="c" * 40,
+            verified_at="2026-09-04T00:00:00Z",
+            package_count=1,
         ),
     )
 
@@ -156,6 +172,21 @@ def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -
     assert registry.get(started.id, actor="operator-a").result == _result()
     assert registry.list(actor="operator-a")[0].source_name == "company"
     assert "target" not in started.model_dump(mode="json", by_alias=False)
+
+
+def test_succeeded_refresh_rejects_a_result_for_a_different_source(registry) -> None:
+    started = registry.start(
+        "refresh",
+        lambda _cancellation: _refresh_result("other"),
+        actor="operator-a",
+        target="source:company",
+    )
+
+    terminal = _wait_terminal(registry, started.id)
+
+    assert terminal.source_name == "company"
+    assert terminal.state == "failed"
+    assert terminal.result is None
 
 
 def test_operation_source_identity_is_refresh_only_and_target_derived(registry) -> None:

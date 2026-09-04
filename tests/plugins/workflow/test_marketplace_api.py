@@ -686,6 +686,49 @@ def test_source_list_projection_redacts_local_repository_and_diagnostic_secrets(
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        "failed(/private/tmp/secret)",
+        "at=/private/tmp/secret",
+        r"at=C:\Users\operator\secret",
+        r"at=\\server\share\secret",
+        "failed(/tmp/repo/.quarantine/secret)",
+        "failed(%2Fprivate%2Ftmp%2Fsecret)",
+        "failed(%252Fprivate%252Ftmp%252Fsecret)",
+    ],
+)
+def test_source_list_projection_canonically_redacts_punctuated_and_encoded_diagnostics(
+    api,
+    message: str,
+) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=message,
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    projected = response.json()["sources"][0]["message"]
+    assert projected != message
+    assert message not in json.dumps(response.json())
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         b'{"enabled":true,"enabled":false}',
@@ -997,6 +1040,33 @@ def test_operation_lookup_and_cancel_do_not_cross_actor_or_profile_scope(api) ->
 
     assert other_profile.status_code == 404
     assert other_profile.json()["detail"] == {"code": "marketplace_operation_not_found"}
+
+
+def test_refresh_operation_fails_closed_when_service_result_names_another_source(
+    api,
+) -> None:
+    client, service, _context, _home, _profile = api
+
+    def mismatched_refresh(_name, *, cancelled):
+        return SourceRefreshResult(
+            source_name="other",
+            repository_url="https://example.test/workflows.git",
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+
+    service.refresh_source = mismatched_refresh
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    assert terminal["source_name"] == "company"
+    assert terminal["state"] == "failed"
+    assert terminal["result"] is None
 
 
 def test_operation_lookup_and_cancel_are_indistinguishable_across_actors(api) -> None:

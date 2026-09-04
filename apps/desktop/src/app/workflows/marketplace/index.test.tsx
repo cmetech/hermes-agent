@@ -264,6 +264,31 @@ function succeededRefresh(sourceName: string): WorkflowMarketplaceOperation {
   }
 }
 
+function pendingRefresh(sourceName: string): WorkflowMarketplaceOperation {
+  return {
+    ...succeededRefresh(sourceName),
+    error: null,
+    finished_at: null,
+    phase: 'queued',
+    progress: 0,
+    result: null,
+    started_at: null,
+    state: 'pending'
+  }
+}
+
+function unsuccessfulRefresh(state: 'cancelled' | 'failed'): WorkflowMarketplaceOperation {
+  return {
+    ...succeededRefresh('company'),
+    error:
+      state === 'failed' ? { code: 'source_unavailable', message: 'Workflow marketplace operation failed.' } : null,
+    phase: state,
+    progress: 40,
+    result: null,
+    state
+  } as WorkflowMarketplaceOperation
+}
+
 function terminalDetail(state: 'cancelled' | 'failed'): WorkflowMarketplaceOperation {
   const base = {
     created_at: NOW,
@@ -383,6 +408,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -452,6 +478,103 @@ describe('WorkflowMarketplaceView', () => {
     await waitFor(() => expect(order).toEqual(['company']))
     expect(api.refreshSource).toHaveBeenCalledWith('company', scopeA)
     expect(api.refreshSource).not.toHaveBeenCalledWith('disabled-source', expect.anything())
+  })
+
+  it.each([
+    ['failed', 'Failed'],
+    ['cancelled', 'Cancelled']
+  ] as const)('keeps a %s toolbar refresh visible with a path to exact recovery', async (state, label) => {
+    api.refreshSource.mockResolvedValue(unsuccessfulRefresh(state))
+    renderMarketplace()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
+
+    const results = await screen.findByRole('status', { name: 'Workflow source refresh results' })
+    expect(within(results).getByText(`company: ${label}`)).toBeTruthy()
+    expect(within(results).getByRole('button', { name: 'Manage Sources' })).toBeTruthy()
+  })
+
+  it('keeps an evicted toolbar refresh visible with a path to exact recovery', async () => {
+    api.refreshSource.mockResolvedValue(pendingRefresh('company'))
+    api.getOperation.mockRejectedValue(
+      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'Operation not found.')
+    )
+    renderMarketplace()
+
+    const refresh = await screen.findByRole('button', { name: 'Refresh' })
+    vi.useFakeTimers()
+    fireEvent.click(refresh)
+    await act(async () => vi.advanceTimersByTimeAsync(500))
+
+    const results = screen.getByRole('status', { name: 'Workflow source refresh results' })
+    expect(
+      within(results).getByText('company: Refresh status expired. Source data has been reconciled; retry if needed.')
+    ).toBeTruthy()
+    expect(within(results).getByRole('button', { name: 'Manage Sources' })).toBeTruthy()
+  })
+
+  it('aborts an old-scope Refresh sequence before admitting its next source', async () => {
+    const first = deferred<WorkflowMarketplaceOperation>()
+    api.sources.mockResolvedValue({
+      profile: 'support',
+      sources: [
+        {
+          attempted_at: NOW,
+          diagnostic_code: null,
+          enabled: true,
+          message: null,
+          name: 'company',
+          ref: 'main',
+          refresh_state: 'fresh',
+          repository_url: 'https://example.test/company/workflows.git',
+          resolved_commit: COMMIT,
+          verified_at: NOW,
+          verified_package_count: 1
+        },
+        {
+          attempted_at: null,
+          diagnostic_code: null,
+          enabled: true,
+          message: null,
+          name: 'team',
+          ref: null,
+          refresh_state: null,
+          repository_url: 'https://example.test/team/workflows.git',
+          resolved_commit: null,
+          verified_at: null,
+          verified_package_count: 0
+        }
+      ]
+    })
+    api.refreshSource.mockImplementation((name: string) =>
+      name === 'company' ? first.promise : Promise.resolve(succeededRefresh(name))
+    )
+    const view = renderMarketplace(scopeA)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(api.refreshSource).toHaveBeenCalledWith('company', scopeA))
+
+    view.rerender(
+      <I18nProvider configClient={null} initialLocale="en">
+        <QueryClientProvider client={view.client}>
+          <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
+        </QueryClientProvider>
+      </I18nProvider>
+    )
+
+    const newScopeRefresh = await screen.findByRole('button', { name: 'Refresh' })
+    expect(newScopeRefresh.getAttribute('aria-busy')).toBe('false')
+    fireEvent.click(newScopeRefresh)
+    await waitFor(() =>
+      expect(api.refreshSource).toHaveBeenCalledWith('company', {
+        connectionId: 'remote-b',
+        profile: 'support'
+      })
+    )
+    await act(async () => first.resolve(succeededRefresh('company')))
+
+    expect(api.refreshSource).not.toHaveBeenCalledWith('team', scopeA)
+    expect(api.refreshSource).toHaveBeenCalledWith('team', { connectionId: 'remote-b', profile: 'support' })
   })
   it('feature-detects before search and shows upgrade guidance for an older backend', async () => {
     const probe = deferred<never>()

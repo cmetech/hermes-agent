@@ -2544,10 +2544,15 @@ export const en: Translations = {
     workflowMarketplacePackageCount: count => `${count} verified ${count === 1 ? 'package' : 'packages'}`,
     workflowMarketplaceFresh: 'Fresh',
     workflowMarketplaceAuthenticationRequired: 'Authentication required',
+    workflowMarketplaceCancelled: 'Cancelled',
+    workflowMarketplaceIncompatible: 'Incompatible',
+    workflowMarketplaceMalformed: 'Malformed',
     workflowMarketplaceUnavailable: 'Unavailable',
     workflowMarketplaceNeverRefreshed: 'Never refreshed',
     workflowMarketplaceRefreshStatusUnavailable: 'Refresh status unavailable',
     workflowMarketplaceOperationEvicted: 'Refresh status expired. Source data has been reconciled; retry if needed.',
+    workflowMarketplaceRefreshResultsLabel: 'Workflow source refresh results',
+    workflowMarketplaceRefreshResult: (source, state) => `${source}: ${state}`,
     workflowMarketplaceAuthGuidance:
       'Use a Git credential helper, SSH agent/config, gh auth, or supported environment credentials, then Retry.',
     workflowMarketplaceSafeError:

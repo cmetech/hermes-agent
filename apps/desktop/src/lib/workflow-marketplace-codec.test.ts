@@ -479,6 +479,24 @@ describe('workflow marketplace codec', () => {
     expect(decodeMarketplaceOperation({ ...operation('installed_package'), source_name: 'company' })).toBeNull()
   })
 
+  it('rejects a succeeded refresh whose result names a different source', () => {
+    const refresh = operation('source_refresh')
+
+    if (refresh.result?.type !== 'source_refresh') {
+      throw new Error('test fixture must be a source refresh result')
+    }
+
+    expect(
+      decodeMarketplaceOperation({
+        ...refresh,
+        result: {
+          ...refresh.result,
+          value: { ...(refresh.result.value as Record<string, unknown>), source_name: 'other' }
+        }
+      })
+    ).toBeNull()
+  })
+
   it('enforces exact operation state/result/error pairings', () => {
     const pending = {
       ...operation(),
@@ -676,6 +694,66 @@ describe('workflow marketplace codec', () => {
     ]) {
       expect(decodeWorkflowMarketplaceSourceList({ profile: 'support', sources: [sourceRecord] })).toBeNull()
     }
+  })
+
+  it.each([
+    'failed(/private/tmp/secret)',
+    'at=/private/tmp/secret',
+    'failed["/Users/operator/work"]',
+    'at=C:\\Users\\operator\\secret',
+    'at=\\\\server\\share\\secret',
+    'failed(/tmp/repo/.staging/secret)',
+    'failed(%2Fprivate%2Ftmp%2Fsecret)',
+    'failed(%252Fprivate%252Ftmp%252Fsecret)'
+  ])('rejects a noncanonical source diagnostic containing a local path: %s', message => {
+    expect(
+      decodeWorkflowMarketplaceSourceList({
+        profile: 'support',
+        sources: [
+          {
+            attempted_at: NOW,
+            diagnostic_code: 'source_unavailable',
+            enabled: true,
+            message,
+            name: 'company',
+            ref: null,
+            refresh_state: 'unavailable',
+            repository_url: 'https://example.test/team/workflows.git',
+            resolved_commit: null,
+            verified_at: null,
+            verified_package_count: 0
+          }
+        ]
+      })
+    ).toBeNull()
+  })
+
+  it.each([
+    'workflow marketplace source refresh failed',
+    'See /docs/authoring for recovery',
+    'See https://example.test/private/tmp for repository documentation',
+    'failed at [REDACTED_PATH]'
+  ])('accepts a canonical source diagnostic without a sensitive local path: %s', message => {
+    expect(
+      decodeWorkflowMarketplaceSourceList({
+        profile: 'support',
+        sources: [
+          {
+            attempted_at: NOW,
+            diagnostic_code: 'source_unavailable',
+            enabled: true,
+            message,
+            name: 'company',
+            ref: null,
+            refresh_state: 'unavailable',
+            repository_url: 'https://example.test/team/workflows.git',
+            resolved_commit: null,
+            verified_at: null,
+            verified_package_count: 0
+          }
+        ]
+      })
+    ).not.toBeNull()
   })
 
   it.each([

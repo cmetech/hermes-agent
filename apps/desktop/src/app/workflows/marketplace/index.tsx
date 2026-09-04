@@ -29,7 +29,7 @@ import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList, type MarketplacePackageSelection } from './package-list'
 import { marketplaceKeys } from './query-keys'
 import { ManageWorkflowSourcesDialog } from './source-dialog'
-import { useMarketplaceOperation } from './use-marketplace-operation'
+import { type MarketplaceOperationOrigin, useMarketplaceOperation } from './use-marketplace-operation'
 
 const PAGE_LIMIT = 50
 const NARROW_MARKETPLACE_QUERY = '(max-width: 39.999rem)'
@@ -47,6 +47,11 @@ interface ScopedSelection extends MarketplacePackageSelection {
 }
 
 interface DetailRetryAttempt extends MarketplacePackageSelection {
+  scopeKey: string
+}
+
+interface ScopedRefreshAttempt {
+  names: readonly string[]
   scopeKey: string
 }
 
@@ -105,13 +110,14 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const selectionOriginRef = useRef<HTMLButtonElement | null>(null)
   const detailRetryRef = useRef<DetailRetryAttempt | null>(null)
   const manageSourcesRef = useRef<HTMLButtonElement>(null)
-  const refreshAllGuardRef = useRef(false)
+  const refreshAllGuardRef = useRef<null | MarketplaceOperationOrigin>(null)
   const previousScopeKeyRef = useRef(scopeKey)
   const [filterState, setFilterState] = useState<ScopedFilters>({ offset: 0, query: '', scopeKey, source: null })
   const [selectionState, setSelectionState] = useState<null | ScopedSelection>(null)
   const [detailRetryState, setDetailRetryState] = useState<DetailRetryAttempt | null>(null)
   const [sourcesDialogOpen, setSourcesDialogOpen] = useState(false)
-  const [refreshingSources, setRefreshingSources] = useState(false)
+  const [refreshingSourcesScope, setRefreshingSourcesScope] = useState<null | string>(null)
+  const [refreshAttempt, setRefreshAttempt] = useState<null | ScopedRefreshAttempt>(null)
 
   const filters = filterState.scopeKey === scopeKey ? filterState : { offset: 0, query: '', scopeKey, source: null }
 
@@ -130,12 +136,42 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const supportsSourceOperations = supportsSources && supportsOperations
   const sourceOperations = useMarketplaceOperation(scope, supportsSourceOperations)
 
+  if (refreshAllGuardRef.current?.scopeKey !== scopeKey) {
+    refreshAllGuardRef.current = null
+  }
+
   const sources = useQuery({
     enabled: supportsSources,
     queryFn: () => listWorkflowMarketplaceSources(scope),
     queryKey: marketplaceKeys.sources(scopeKey),
     retry: false
   })
+
+  const refreshIssues =
+    refreshAttempt?.scopeKey === scopeKey
+      ? refreshAttempt.names.flatMap(sourceName => {
+          const recovery = sourceOperations.errors[sourceName]
+          const operation = sourceOperations.operationForSource(sourceName)
+
+          if (recovery === 'evicted') {
+            return [{ sourceName, state: copy.workflowMarketplaceOperationEvicted }]
+          }
+
+          if (recovery === 'status') {
+            return [{ sourceName, state: copy.workflowMarketplaceRefreshStatusUnavailable }]
+          }
+
+          if (operation?.state === 'failed') {
+            return [{ sourceName, state: t.common.failed }]
+          }
+
+          if (operation?.state === 'cancelled') {
+            return [{ sourceName, state: copy.workflowMarketplaceCancelled }]
+          }
+
+          return []
+        })
+      : []
 
   const installed = useQuery({
     enabled: supportsInstalled,
@@ -337,24 +373,41 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   }
 
   const refreshAllSources = async () => {
-    if (refreshAllGuardRef.current) {
+    const origin = sourceOperations.captureOrigin()
+
+    if (refreshAllGuardRef.current !== null || !sourceOperations.originIsCurrent(origin)) {
       return
     }
 
-    refreshAllGuardRef.current = true
-    setRefreshingSources(true)
+    refreshAllGuardRef.current = origin
+    setRefreshingSourcesScope(origin.scopeKey)
+    const enabledSources = (sources.data?.sources ?? []).filter(source => source.enabled)
+    setRefreshAttempt({ names: enabledSources.map(source => source.name), scopeKey: origin.scopeKey })
 
     try {
-      for (const source of sources.data?.sources ?? []) {
-        if (source.enabled) {
-          await sourceOperations.start(source.name, () => refreshWorkflowMarketplaceSource(source.name, scope))
+      for (const source of enabledSources) {
+        if (!sourceOperations.originIsCurrent(origin)) {
+          break
+        }
+
+        await sourceOperations.start(source.name, () => refreshWorkflowMarketplaceSource(source.name, scope), origin)
+
+        if (!sourceOperations.originIsCurrent(origin)) {
+          break
         }
       }
     } finally {
-      refreshAllGuardRef.current = false
-      setRefreshingSources(false)
+      if (refreshAllGuardRef.current === origin) {
+        refreshAllGuardRef.current = null
+      }
+
+      if (sourceOperations.originIsCurrent(origin)) {
+        setRefreshingSourcesScope(null)
+      }
     }
   }
+
+  const refreshingSources = refreshingSourcesScope === scopeKey
 
   const closeSources = () => {
     setSourcesDialogOpen(false)
@@ -546,6 +599,21 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
               {copy.workflowMarketplaceUnsupportedSources}
             </span>
           )}
+        </div>
+      ) : null}
+
+      {refreshIssues.length > 0 ? (
+        <div
+          aria-label={copy.workflowMarketplaceRefreshResultsLabel}
+          className="mb-3 flex flex-wrap items-center gap-2 text-xs"
+          role="status"
+        >
+          {refreshIssues.map(issue => (
+            <span key={issue.sourceName}>{copy.workflowMarketplaceRefreshResult(issue.sourceName, issue.state)}</span>
+          ))}
+          <Button onClick={() => setSourcesDialogOpen(true)} size="sm" type="button" variant="secondary">
+            {copy.workflowMarketplaceManageSources}
+          </Button>
         </div>
       ) : null}
 

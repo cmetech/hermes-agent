@@ -254,6 +254,13 @@ class MarketplaceOperation(_StrictOperationModel):
     def validate_state_shape(self) -> "MarketplaceOperation":
         if (self.kind == "refresh") != (self.source_name is not None):
             raise ValueError("operation source identity is inconsistent")
+        if (
+            self.state == "succeeded"
+            and self.kind == "refresh"
+            and isinstance(self.result, MarketplaceSourceRefreshOperationResult)
+            and self.result.value.source_name != self.source_name
+        ):
+            raise ValueError("refresh operation result source is inconsistent")
         if self.state == "pending":
             if (
                 self.started_at is not None
@@ -730,6 +737,13 @@ class WorkflowMarketplaceOperationRegistry:
                 record = self._records.get(operation_id)
                 if record is None or record.state in _TERMINAL_STATES:
                     return
+                if (
+                    record.kind == "refresh"
+                    and isinstance(result, MarketplaceSourceRefreshOperationResult)
+                    and result.value.source_name
+                    != _refresh_source_name(record.kind, record.target)
+                ):
+                    raise ValueError("refresh operation result source is inconsistent")
                 if cancellation.cancellation_requested and not cancellation.committed:
                     self._terminal_locked(record, state="cancelled")
                 elif cancellation.atomic_started and not cancellation.committed:

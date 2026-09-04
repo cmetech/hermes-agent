@@ -12,6 +12,7 @@ import stat
 import subprocess
 from typing import Callable, Literal, NoReturn
 import unicodedata
+import urllib.parse
 
 from pydantic import (
     BaseModel,
@@ -54,9 +55,16 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     re.IGNORECASE,
 )
 _LOCAL_PATH = re.compile(
-    r"(?:^|\s)(?:/(?:private|tmp|users|home|var/folders|var/tmp|var/cache)/\S*|[A-Za-z]:\\\S*|\\\\[^\\\s]+\\\S*|[^\s]*(?:\.staging|\.quarantine)(?:/|\\)\S*)",
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"/(?:private|tmp|users|home|var/(?:folders|tmp|cache))(?:[/\\][^\s\"'<>()[\]{},;]*)?|"
+    r"[A-Z]:\\[^\s\"'<>()[\]{},;]*|"
+    r"\\\\[^\\\s\"'<>()[\]{},;]+\\[^\s\"'<>()[\]{},;]*|"
+    r"[^\s\"'<>()[\]{},;=]*(?:[/\\])?\.(?:staging|quarantine)(?:[/\\][^\s\"'<>()[\]{},;]*)?"
+    r")",
     re.IGNORECASE,
 )
+_PATH_DECODE_MAX = 8
+_GENERIC_REFRESH_FAILURE = "workflow marketplace source refresh failed"
 
 RefreshState = Literal[
     "fresh",
@@ -70,9 +78,42 @@ RefreshState = Literal[
 ]
 
 
-def _redact_sensitive_text(value: str) -> str:
-    redacted = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED]", value)
-    return _LOCAL_PATH.sub(" [REDACTED_PATH]", redacted).strip()
+def redact_source_refresh_message(value: str, repository_url: str | None = None) -> str:
+    """Return one bounded diagnostic with credentials and private paths removed."""
+
+    completed = subprocess.CompletedProcess(
+        args=(), returncode=1, stdout="", stderr=value
+    )
+    redacted = safe_git_error(completed, repository_url).strip()
+    redacted = _CREDENTIAL_ASSIGNMENT.sub(r"\1\2[REDACTED]", redacted)
+    redacted = _LOCAL_PATH.sub("[REDACTED_PATH]", redacted).strip()
+
+    probe = redacted
+    for _ in range(_PATH_DECODE_MAX):
+        try:
+            decoded = urllib.parse.unquote(probe, errors="strict")
+        except UnicodeDecodeError:
+            return _GENERIC_REFRESH_FAILURE
+        if decoded == probe:
+            break
+        if (
+            _LOCAL_PATH.search(decoded) is not None
+            or _CREDENTIAL_ASSIGNMENT.search(decoded) is not None
+            or git_text_contains_credentials(decoded)
+        ):
+            return _GENERIC_REFRESH_FAILURE
+        probe = decoded
+    else:
+        if "%" in probe:
+            return _GENERIC_REFRESH_FAILURE
+
+    return redacted[:_MAX_ERROR_BYTES]
+
+
+def source_refresh_message_is_safe(value: str) -> bool:
+    """Return whether a diagnostic is already in its canonical persisted form."""
+
+    return redact_source_refresh_message(value) == value
 
 
 class _StateModel(BaseModel):
@@ -139,14 +180,7 @@ class SourceRefreshStatus(_StateModel):
     def require_redacted_message(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        completed = subprocess.CompletedProcess(
-            args=(), returncode=1, stdout="", stderr=value
-        )
-        if (
-            git_text_contains_credentials(value)
-            or safe_git_error(completed).strip() != value
-            or _redact_sensitive_text(value) != value
-        ):
+        if not source_refresh_message_is_safe(value):
             raise ValueError("refresh status message must be canonically redacted")
         return value
 
@@ -366,11 +400,7 @@ def _path_entry_exists(path: Path) -> bool:
 
 
 def _redacted_error(error: WorkflowMarketplaceError, repository_url: str) -> str:
-    completed = subprocess.CompletedProcess(
-        args=(), returncode=1, stdout="", stderr=str(error)
-    )
-    rendered = safe_git_error(completed, repository_url).strip()
-    rendered = _redact_sensitive_text(rendered)
+    rendered = redact_source_refresh_message(str(error), repository_url)
     if not rendered or git_text_contains_credentials(rendered):
         rendered = "marketplace source refresh failed"
     encoded = rendered.encode("utf-8")[:_MAX_ERROR_BYTES]

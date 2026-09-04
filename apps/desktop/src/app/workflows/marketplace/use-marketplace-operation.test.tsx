@@ -159,8 +159,83 @@ describe('useMarketplaceOperation', () => {
     const { result } = renderHook(() => useMarketplaceOperation(scopeA), { wrapper: wrapper(client) })
 
     await waitFor(() => expect(result.current.operations.map(item => item.source_name)).toEqual(['team', 'company']))
-    expect(api.list).toHaveBeenCalledWith(scopeA, { limit: 100 })
+    expect(api.list).toHaveBeenCalledWith(scopeA, { limit: 100, offset: 0 })
     expect(result.current.operationForSource('team')?.state).toBe('failed')
+  })
+
+  it('selects the newest eligible source operation instead of Map insertion order', async () => {
+    const older = operation('failed', {
+      created_at: '2026-09-03T00:00:00Z',
+      updated_at: '2026-09-03T00:01:00Z'
+    })
+    const newer = operation('succeeded', {
+      id: `wmop_${'a'.repeat(12)}_${'c'.repeat(32)}`,
+      created_at: '2026-09-04T00:00:00Z',
+      updated_at: '2026-09-04T00:01:00Z'
+    })
+    api.list.mockResolvedValue({ limit: 100, offset: 0, operations: [older, newer], profile: 'support' })
+
+    const { result } = renderHook(() => useMarketplaceOperation(scopeA), { wrapper: wrapper(client) })
+
+    await waitFor(() => expect(result.current.operations).toHaveLength(2))
+    expect(result.current.operationForSource('company')?.id).toBe(newer.id)
+  })
+
+  it('pages the bounded registry projection and reconciles an active refresh beyond the first 100 records', async () => {
+    const terminal = Array.from({ length: 100 }, (_, index) =>
+      operation('succeeded', {
+        id: `wmop_${'a'.repeat(12)}_${index.toString(16).padStart(32, '0')}`,
+        source_name: `source-${index.toString().padStart(3, '0')}`
+      })
+    )
+    const olderActive = operation('running', {
+      id: `wmop_${'a'.repeat(12)}_${'f'.repeat(32)}`,
+      source_name: 'older-active'
+    })
+    api.list.mockImplementation((_scope, options) =>
+      Promise.resolve({
+        limit: 100,
+        offset: options.offset ?? 0,
+        operations: options.offset === 100 ? [olderActive] : terminal,
+        profile: 'support'
+      })
+    )
+    const { result } = renderHook(() => useMarketplaceOperation(scopeA), { wrapper: wrapper(client) })
+
+    await waitFor(() => expect(result.current.operations).toHaveLength(101))
+    expect(api.list).toHaveBeenNthCalledWith(1, scopeA, { limit: 100, offset: 0 })
+    expect(api.list).toHaveBeenNthCalledWith(2, scopeA, { limit: 100, offset: 100 })
+    expect(api.list).toHaveBeenCalledTimes(2)
+    expect(result.current.operationForSource('older-active')?.state).toBe('running')
+  })
+
+  it('invalidates stale source truth once when reconciliation discovers terminal operations', async () => {
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    api.list.mockResolvedValue({
+      limit: 100,
+      offset: 0,
+      operations: [operation('failed'), operation('succeeded', { id: `wmop_${'a'.repeat(12)}_${'c'.repeat(32)}` })],
+      profile: 'support'
+    })
+    renderHook(() => useMarketplaceOperation(scopeA), { wrapper: wrapper(client) })
+
+    await waitFor(() =>
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: marketplaceKeys.sources('remote-a::support') })
+    )
+    expect(
+      invalidate.mock.calls.filter(
+        ([input]) =>
+          JSON.stringify(input?.queryKey).includes('remote-a::support') &&
+          JSON.stringify(input?.queryKey).includes('sources')
+      )
+    ).toHaveLength(1)
+    expect(
+      invalidate.mock.calls.filter(
+        ([input]) =>
+          JSON.stringify(input?.queryKey).includes('remote-a::support') &&
+          JSON.stringify(input?.queryKey).includes('search')
+      )
+    ).toHaveLength(1)
   })
 
   it('accepts an initial terminal result without polling and invalidates only its source scope', async () => {
@@ -247,6 +322,41 @@ describe('useMarketplaceOperation', () => {
     expect(api.get).toHaveBeenCalledTimes(1)
   })
 
+  it('removes every hidden cadence listener across repeated scope changes and unmount', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(globalThis.document, 'visibilityState', 'get').mockReturnValue('hidden')
+    const add = vi.spyOn(globalThis.document, 'addEventListener')
+    const remove = vi.spyOn(globalThis.document, 'removeEventListener')
+    const { result, rerender, unmount } = renderHook(({ scope }) => useMarketplaceOperation(scope), {
+      initialProps: { scope: scopeA },
+      wrapper: wrapper(client)
+    })
+
+    await act(async () => {
+      void result.current.start('company', () => Promise.resolve(operation('pending')))
+      await Promise.resolve()
+    })
+    const firstRegistration = add.mock.calls.find(([event]) => event === 'visibilitychange')
+
+    rerender({ scope: scopeB })
+    await act(async () => {
+      void result.current.start('company', () => Promise.resolve(operation('pending')))
+      await Promise.resolve()
+    })
+    rerender({ scope: scopeA })
+    unmount()
+
+    const registrations = add.mock.calls.filter(([event]) => event === 'visibilitychange')
+    expect(firstRegistration).toBeDefined()
+    expect(registrations).toHaveLength(2)
+    for (const registration of registrations) {
+      expect(remove).toHaveBeenCalledWith('visibilitychange', registration[1])
+    }
+    await vi.runAllTimersAsync()
+    globalThis.document.dispatchEvent(new Event('visibilitychange'))
+    expect(api.get).not.toHaveBeenCalled()
+  })
+
   it('ignores late status from a previous scope and treats eviction as recoverable terminal state', async () => {
     const late = deferred<WorkflowMarketplaceOperation>()
     const invalidate = vi.spyOn(client, 'invalidateQueries')
@@ -271,12 +381,42 @@ describe('useMarketplaceOperation', () => {
       await result.current.start('company', () => Promise.resolve(operation('pending')))
     })
     await waitFor(() => expect(result.current.errors.company).toBe('evicted'))
+    expect(result.current.operationForSource('company')).toBeUndefined()
 
-    api.get.mockResolvedValueOnce(operation('succeeded'))
     await act(async () => {
-      await result.current.retry(ID)
+      expect(await result.current.cancel(ID)).toBeNull()
+    })
+    expect(api.cancel).not.toHaveBeenCalled()
+
+    const replacement = operation('succeeded', { id: `wmop_${'a'.repeat(12)}_${'e'.repeat(32)}` })
+    await act(async () => {
+      await result.current.start('company', () => Promise.resolve(replacement))
     })
     expect(result.current.errors.company).toBeUndefined()
+  })
+
+  it('shares one source identity guard across status Retry, Cancel, and a new start', async () => {
+    const pendingStatus = deferred<WorkflowMarketplaceOperation>()
+    const current = operation('running')
+    api.list.mockResolvedValue({ limit: 100, offset: 0, operations: [current], profile: 'support' })
+    api.get.mockReturnValue(pendingStatus.promise)
+    const request = vi.fn().mockResolvedValue(operation('pending'))
+    const { result } = renderHook(() => useMarketplaceOperation(scopeA), { wrapper: wrapper(client) })
+
+    await waitFor(() => expect(result.current.operationForSource('company')?.id).toBe(ID))
+
+    let retry!: Promise<WorkflowMarketplaceOperation | null>
+    await act(async () => {
+      retry = result.current.retry(ID)
+      expect(await result.current.cancel(ID)).toBeNull()
+      expect(await result.current.start('company', request)).toBeNull()
+    })
+    expect(api.get).toHaveBeenCalledTimes(1)
+    expect(api.cancel).not.toHaveBeenCalled()
+    expect(request).not.toHaveBeenCalled()
+
+    await act(async () => pendingStatus.resolve(operation('succeeded')))
+    await retry
   })
 
   it('contains admission failures and unmount never implies backend cancellation', async () => {
