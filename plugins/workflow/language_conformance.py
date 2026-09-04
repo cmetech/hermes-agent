@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -17,7 +18,18 @@ from plugins.workflow.models import (
 )
 
 
-_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+def _authoring_resource_root() -> Path:
+    source_root = Path(__file__).resolve().parents[2]
+    if (source_root / "capabilities").is_dir():
+        return source_root
+
+    packaged_root = Path(sys.prefix).resolve()
+    if (packaged_root / "capabilities").is_dir():
+        return packaged_root
+    return source_root
+
+
+_REPOSITORY_ROOT = _authoring_resource_root()
 _JIRA_DEFINITION = (
     _REPOSITORY_ROOT
     / "capabilities/workflow-packages/ericsson/workflows/jira-defect-loop.yaml"
