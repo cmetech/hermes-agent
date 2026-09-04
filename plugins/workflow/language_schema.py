@@ -12,8 +12,10 @@ from types import MappingProxyType
 from typing import Any, cast
 
 from plugins.workflow.language import (
+    ARTIFACTS_VERSION_UNSUPPORTED_CODE,
     CURRENT_NORMALIZER_BY_PROFILE,
     DYNAMIC_LANGUAGE_COMPATIBILITY_CODES,
+    LOOP_GROUP_VERSION_UNSUPPORTED_CODE,
     SUPPORTED_NORMALIZER_VERSIONS,
     select_normalizer_version,
     supports_phase3_semantics,
@@ -1205,7 +1207,7 @@ PHASE6_DURABLE_CODES = tuple(
     )
     for code, meaning, area, fields in (
         (
-            "loop_group_version_unsupported",
+            LOOP_GROUP_VERSION_UNSUPPORTED_CODE,
             "loop_group requires the sealed normalizer v6 contract",
             "normalization",
             ("nodes[].loop_group",),
@@ -1760,6 +1762,13 @@ _NODE_FIELDS = (
             f"{node_type}_payload",
             node_types=(node_type,),
             required_node_types=(node_type,),
+            phase=(6 if node_type == "loop_group" else 1),
+            legacy_status=("blocking" if node_type == "loop_group" else "supported"),
+            legacy_code=(
+                LOOP_GROUP_VERSION_UNSUPPORTED_CODE
+                if node_type == "loop_group"
+                else None
+            ),
         )
         for node_type in EXECUTABLE_NODE_TYPES
     ),
@@ -1990,6 +1999,8 @@ _NODE_FIELDS = (
         "boolean",
         node_types=("bash", "script"),
         phase=6,
+        legacy_status="blocking",
+        legacy_code=ARTIFACTS_VERSION_UNSUPPORTED_CODE,
     ),
     _field(
         "node",

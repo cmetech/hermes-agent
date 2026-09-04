@@ -147,6 +147,8 @@ WORKFLOW_LANGUAGE_PROFILE_UNSUPPORTED_CODE = "workflow_language_profile_unsuppor
 WORKFLOW_NORMALIZER_VERSION_UNSUPPORTED_CODE = "workflow_normalizer_version_unsupported"
 UNKNOWN_TOP_LEVEL_FIELD_CODE = "unknown_top_level_field"
 ARCHON_UNKNOWN_TOP_LEVEL_FIELD_CODE = "archon_unknown_top_level_field"
+LOOP_GROUP_VERSION_UNSUPPORTED_CODE = "loop_group_version_unsupported"
+ARTIFACTS_VERSION_UNSUPPORTED_CODE = "artifacts_version_unsupported"
 
 
 class WorkflowLanguageCompatibilityError(ValueError):
