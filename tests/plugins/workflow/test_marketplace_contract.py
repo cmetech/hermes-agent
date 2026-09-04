@@ -427,6 +427,19 @@ def test_marketplace_index_rejects_casefold_and_nested_package_roots() -> None:
     assert len(WorkflowPackageIndex.model_validate(siblings).packages) == 2
 
 
+@pytest.mark.parametrize("path", [".git", "packages/.GIT/workflow"])
+def test_marketplace_index_rejects_repository_metadata_segments(path: str) -> None:
+    value = valid_index()
+    value["packages"][0]["packagePath"] = path
+
+    with pytest.raises(ValidationError, match="repository metadata"):
+        WorkflowPackageIndex.model_validate(value)
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(load_package_contract().marketplace_index_schema).validate(
+            value
+        )
+
+
 def test_marketplace_public_review_and_request_models_are_strict() -> None:
     assessment = PackageReviewAssessment.model_validate({
         "packageDigest": SHA256_A,

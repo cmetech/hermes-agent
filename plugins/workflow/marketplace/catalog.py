@@ -176,6 +176,7 @@ class WorkflowMarketplaceCatalog:
             self.source_store.replace_verified_cache(
                 verified,
                 attempted_at=attempted_at,
+                cancelled=cancelled,
             )
         except WorkflowMarketplaceError as error:
             if error.code == "source_cancelled":
@@ -255,7 +256,12 @@ class WorkflowMarketplaceCatalog:
                 or source.ref != cached.source.ref
             ):
                 continue
-            status = statuses[source.name]
+            status = statuses.get(source.name)
+            if status is None:
+                raise WorkflowMarketplaceError(
+                    "catalog_state_invalid",
+                    "verified marketplace catalog has no refresh status",
+                )
             state: RefreshState = (
                 status.state
                 if status is not None and status.state == "stale"

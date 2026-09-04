@@ -2,27 +2,36 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import Literal, NoReturn
+from typing import Callable, Literal, NoReturn
 import unicodedata
-from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from hermes_cli.git_source import (
     GitSourceError,
     canonical_git_source,
     resolve_git_source,
     safe_git_error,
+    validate_credential_free_git_source,
 )
 from hermes_constants import get_hermes_home
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
-from utils import atomic_write_text
+from utils import _is_reparse_point, atomic_write_text
 
 from .models import (
     WorkflowMarketplaceSource,
@@ -52,16 +61,6 @@ RefreshState = Literal[
 ]
 
 
-def _has_forbidden_repository_credentials(value: str) -> bool:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return True
-    return parsed.password is not None or (
-        parsed.scheme.casefold() not in {"http", "https"} and bool(parsed.query)
-    )
-
-
 class _StateModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -75,13 +74,6 @@ class _SourceState(_StateModel):
         names = [source.name for source in self.sources]
         if names != sorted(names) or len(names) != len(set(names)):
             raise ValueError("sources must be unique and sorted by name")
-        if any(
-            _has_forbidden_repository_credentials(source.repository_url)
-            for source in self.sources
-        ):
-            raise ValueError(
-                "source repository identities must not contain credentials"
-            )
         return self
 
 
@@ -95,8 +87,6 @@ class VerifiedSourceCatalog(_StateModel):
 
     @model_validator(mode="after")
     def require_valid_index_projection(self) -> "VerifiedSourceCatalog":
-        if _has_forbidden_repository_credentials(self.source.repository_url):
-            raise ValueError("source repository identity must not contain credentials")
         WorkflowPackageIndex.model_validate({
             "schemaVersion": 1,
             "packages": [
@@ -106,17 +96,52 @@ class VerifiedSourceCatalog(_StateModel):
         })
         return self
 
+    @field_validator("verified_at")
+    @classmethod
+    def require_canonical_timestamp(cls, value: str) -> str:
+        return _canonical_timestamp(value)
+
 
 class SourceRefreshStatus(_StateModel):
     """Credential-free refresh status retained separately from verified bytes."""
 
-    source_name: str = Field(alias="sourceName", min_length=1, max_length=64)
+    source_name: str = Field(
+        alias="sourceName", min_length=1, max_length=64, pattern=_SOURCE_NAME.pattern
+    )
     state: RefreshState
     attempted_at: str = Field(alias="attemptedAt", min_length=20, max_length=64)
     diagnostic_code: str | None = Field(
         default=None, alias="diagnosticCode", max_length=128
     )
     message: str | None = Field(default=None, max_length=_MAX_ERROR_BYTES)
+
+    @field_validator("attempted_at")
+    @classmethod
+    def require_canonical_timestamp(cls, value: str) -> str:
+        return _canonical_timestamp(value)
+
+    @field_validator("message")
+    @classmethod
+    def require_redacted_message(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        completed = subprocess.CompletedProcess(
+            args=(), returncode=1, stdout="", stderr=value
+        )
+        if safe_git_error(completed).strip() != value:
+            raise ValueError("refresh status message must be canonically redacted")
+        return value
+
+    @model_validator(mode="after")
+    def require_legal_diagnostic_shape(self) -> "SourceRefreshStatus":
+        if self.state == "fresh":
+            if self.diagnostic_code is not None or self.message is not None:
+                raise ValueError("fresh status must not contain a diagnostic")
+        elif self.state in {"disabled", "cancelled"}:
+            raise ValueError("ephemeral refresh states must not be persisted")
+        elif self.diagnostic_code is None or self.message is None:
+            raise ValueError("failed refresh status requires a diagnostic")
+        return self
 
 
 class _CatalogState(_StateModel):
@@ -135,11 +160,43 @@ class _CatalogState(_StateModel):
             or len(status_names) != len(set(status_names))
         ):
             raise ValueError("catalog entries must be unique and sorted by source")
+        verified_names_set = set(verified_names)
+        statuses_by_name = {status.source_name: status for status in self.statuses}
+        if not verified_names_set.issubset(statuses_by_name):
+            raise ValueError("every verified catalog requires refresh status")
+        for name, status in statuses_by_name.items():
+            if name in verified_names_set:
+                if status.state not in {"fresh", "stale"}:
+                    raise ValueError("verified catalogs require fresh or stale status")
+            elif status.state in {"fresh", "stale"}:
+                raise ValueError("fresh or stale status requires a verified catalog")
         return self
+
+
+def _canonical_timestamp(value: str) -> str:
+    if not value.endswith("Z"):
+        raise ValueError("timestamp must be canonical UTC")
+    try:
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError as error:
+        raise ValueError("timestamp must be canonical UTC") from error
+    canonical = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if parsed.tzinfo is None or value != canonical:
+        raise ValueError("timestamp must be canonical UTC")
+    return value
 
 
 def _fail(code: str, message: str) -> NoReturn:
     raise WorkflowMarketplaceError(code, message)
+
+
+def _check_cancelled(cancelled: Callable[[], bool]) -> None:
+    try:
+        cancellation_requested = cancelled()
+    except Exception:
+        cancellation_requested = True
+    if cancellation_requested:
+        _fail("source_cancelled", "workflow marketplace refresh was cancelled")
 
 
 def _normalize_name(name: str) -> str:
@@ -152,20 +209,6 @@ def _normalize_name(name: str) -> str:
             "source name must use 1-64 lowercase letters, digits, '_' or '-'",
         )
     return normalized
-
-
-def _reject_non_http_url_credentials(value: str) -> None:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return
-    if parsed.scheme.casefold() in {"http", "https"}:
-        return
-    if parsed.password is not None or parsed.query:
-        _fail(
-            "source_credentials_forbidden",
-            "marketplace source URLs must not contain credentials",
-        )
 
 
 def _canonical_source(
@@ -191,11 +234,16 @@ def _canonical_source(
                 "marketplace source URLs must not contain credentials",
             )
         _fail("source_invalid", "marketplace source configuration is invalid")
-    _reject_non_http_url_credentials(repository_url)
     try:
+        validate_credential_free_git_source(repository_url)
         resolved = resolve_git_source(repository_url)
     except GitSourceError as error:
-        _fail("source_invalid", str(error))
+        if "credentials" in str(error).casefold():
+            _fail(
+                "source_credentials_forbidden",
+                "marketplace source URLs must not contain credentials",
+            )
+        _fail("source_invalid", "marketplace Git source identity is invalid")
     identity = canonical_git_source(resolved.clone_url, resolved.subdirectory)
     try:
         return WorkflowMarketplaceSource.model_validate({
@@ -237,7 +285,8 @@ def _strict_json(raw: bytes, *, code: str) -> object:
 def _read_bounded(path: Path, *, limit: int, size_code: str) -> bytes:
     invalid_code = size_code.replace("size_limit", "invalid")
     try:
-        if stat.S_ISLNK(path.lstat().st_mode):
+        path_metadata = path.lstat()
+        if stat.S_ISLNK(path_metadata.st_mode) or _is_reparse_point(path_metadata):
             _fail(invalid_code, "state file must not be a symbolic link")
     except FileNotFoundError:
         _fail(invalid_code, "state file disappeared while being read")
@@ -252,7 +301,7 @@ def _read_bounded(path: Path, *, limit: int, size_code: str) -> bytes:
         _fail(invalid_code, "state file is unreadable")
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
+        if _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
             _fail(invalid_code, "state is not a file")
         if metadata.st_size > limit:
             _fail(size_code, "persisted marketplace state exceeds its byte limit")
@@ -265,17 +314,27 @@ def _read_bounded(path: Path, *, limit: int, size_code: str) -> bytes:
         os.close(descriptor)
 
 
-def _render_state(value: BaseModel) -> str:
-    return (
-        json.dumps(
-            value.model_dump(mode="json", by_alias=True),
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
+def _render_state(
+    value: BaseModel,
+    *,
+    limit: int,
+    size_code: str,
+) -> str:
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
+    chunks: list[str] = []
+    encoded_size = 0
+    for chunk in encoder.iterencode(value.model_dump(mode="json", by_alias=True)):
+        encoded_size += len(chunk.encode("utf-8"))
+        if encoded_size + 1 > limit:
+            _fail(size_code, "persisted marketplace state exceeds its byte limit")
+        chunks.append(chunk)
+    chunks.append("\n")
+    return "".join(chunks)
 
 
 def _path_entry_exists(path: Path) -> bool:
@@ -307,36 +366,58 @@ class WorkflowSourceStore:
 
     def __init__(self, hermes_home: Path | None = None):
         home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+        self.home = home
         self.root = home / "marketplace" / "workflows"
         self.path = self.root / "sources.json"
         self.catalog_path = self.root / "catalog.json"
         self.lock_path = self.root / "marketplace.lock"
 
-    def _ensure_private_root(self) -> None:
-        self.root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for directory in (self.root.parent,):
+    def _ensure_private_root(self) -> tuple[int, int]:
+        root_identity: tuple[int, int] | None = None
+        for index, directory in enumerate((self.home, self.root.parent, self.root)):
+            directory.mkdir(parents=index == 0, exist_ok=True, mode=0o700)
             try:
                 metadata = directory.lstat()
             except OSError:
                 _fail("source_state_invalid", "marketplace state directory is invalid")
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse_point(metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
                 _fail(
                     "source_state_invalid",
-                    "marketplace state directory must not be a symbolic link",
+                    "marketplace state directory must not be a link",
                 )
-        self.root.mkdir(parents=False, exist_ok=True, mode=0o700)
-        try:
-            metadata = self.root.lstat()
-        except OSError:
-            _fail("source_state_invalid", "marketplace state directory is invalid")
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            _fail(
-                "source_state_invalid",
-                "marketplace state directory must not be a symbolic link",
-            )
-        if os.name != "nt":
-            os.chmod(self.root.parent, 0o700)
-            os.chmod(self.root, 0o700)
+            if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o222 == 0:
+                _fail(
+                    "source_state_invalid",
+                    "marketplace state directory is read-only",
+                )
+            if (
+                os.name != "nt"
+                and directory != self.home
+                and stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                _fail(
+                    "source_state_invalid",
+                    "marketplace state directory permissions are not private",
+                )
+            if directory == self.root:
+                root_identity = (metadata.st_dev, metadata.st_ino)
+        lock_exists = _path_entry_exists(self.lock_path)
+        if lock_exists:
+            try:
+                lock_metadata = self.lock_path.lstat()
+            except OSError:
+                _fail("source_state_invalid", "marketplace lock file is invalid")
+            if (
+                stat.S_ISLNK(lock_metadata.st_mode)
+                or _is_reparse_point(lock_metadata)
+                or not stat.S_ISREG(lock_metadata.st_mode)
+                or (os.name != "nt" and stat.S_IMODE(lock_metadata.st_mode) != 0o600)
+            ):
+                _fail("source_state_invalid", "marketplace lock file is invalid")
         flags = os.O_CREAT | os.O_APPEND
         for option in ("O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW", "O_BINARY"):
             flags |= getattr(os, option, 0)
@@ -344,23 +425,40 @@ class WorkflowSourceStore:
             descriptor = os.open(self.lock_path, flags, 0o600)
         except OSError:
             _fail("source_state_invalid", "marketplace lock file is invalid")
-        metadata = os.fstat(descriptor)
-        os.close(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            _fail("source_state_invalid", "marketplace lock is not a regular file")
-        if os.name != "nt":
-            os.chmod(self.lock_path, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+                _fail("source_state_invalid", "marketplace lock is not a regular file")
+            if os.name != "nt" and not lock_exists:
+                os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        if root_identity is None:
+            _fail("source_state_invalid", "marketplace state directory is invalid")
+        return root_identity
 
+    @contextmanager
     def _locked(self):
-        self._ensure_private_root()
-        return workflow_lock(self.lock_path)
+        root_identity = self._ensure_private_root()
+        with workflow_lock(self.lock_path):
+            try:
+                metadata = self.root.lstat()
+            except OSError:
+                _fail("source_state_invalid", "marketplace state directory changed")
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse_point(metadata)
+                or (metadata.st_dev, metadata.st_ino) != root_identity
+            ):
+                _fail("source_state_invalid", "marketplace state directory changed")
+            yield root_identity
 
     def _read_sources(self) -> _SourceState:
         if not _path_entry_exists(self.path):
             return _SourceState.model_validate({"schemaVersion": 1, "sources": []})
         raw = _read_bounded(
             self.path,
-            limit=_MAX_SOURCE_STATE_BYTES,
+            limit=self.max_source_state_bytes,
             size_code="source_state_size_limit",
         )
         value = _strict_json(raw, code="source_state_invalid")
@@ -378,7 +476,7 @@ class WorkflowSourceStore:
             })
         raw = _read_bounded(
             self.catalog_path,
-            limit=_MAX_CATALOG_STATE_BYTES,
+            limit=self.max_catalog_state_bytes,
             size_code="catalog_state_size_limit",
         )
         value = _strict_json(raw, code="catalog_state_invalid")
@@ -387,16 +485,32 @@ class WorkflowSourceStore:
         except ValidationError:
             _fail("catalog_state_invalid", "persisted catalog state is invalid")
 
-    def _write(self, path: Path, value: BaseModel) -> None:
+    def _write(
+        self,
+        path: Path,
+        value: BaseModel,
+        *,
+        parent_identity: tuple[int, int],
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        if path == self.path:
+            limit = self.max_source_state_bytes
+            size_code = "source_state_size_limit"
+        else:
+            limit = self.max_catalog_state_bytes
+            size_code = "catalog_state_size_limit"
+        rendered = _render_state(value, limit=limit, size_code=size_code)
+        if cancelled is not None:
+            _check_cancelled(cancelled)
         try:
             atomic_write_text(
                 path,
-                _render_state(value),
+                rendered,
                 tmp_prefix=f"{path.name}.tmp-",
                 create_mode=0o600,
+                no_follow=True,
+                expected_parent_identity=parent_identity,
             )
-            if os.name != "nt":
-                os.chmod(path, 0o600)
         except OSError:
             code = (
                 "source_state_write_failed"
@@ -447,7 +561,7 @@ class WorkflowSourceStore:
                 enabled=enabled,
             )
         try:
-            with self._locked():
+            with self._locked() as parent_identity:
                 state = self._read_sources()
                 if any(item.name == source.name for item in state.sources):
                     _fail(
@@ -463,6 +577,7 @@ class WorkflowSourceStore:
                         "schemaVersion": _SOURCE_STATE_VERSION,
                         "sources": sources,
                     }),
+                    parent_identity=parent_identity,
                 )
         except WorkflowLockTimeout as error:
             _fail("source_lock_timeout", str(error))
@@ -489,7 +604,7 @@ class WorkflowSourceStore:
         if not isinstance(enabled, bool):
             _fail("source_invalid", "source enabled state must be boolean")
         try:
-            with self._locked():
+            with self._locked() as parent_identity:
                 state = self._read_sources()
                 existing = next(
                     (source for source in state.sources if source.name == normalized),
@@ -511,6 +626,7 @@ class WorkflowSourceStore:
                         "schemaVersion": _SOURCE_STATE_VERSION,
                         "sources": sources,
                     }),
+                    parent_identity=parent_identity,
                 )
                 return updated
         except WorkflowLockTimeout as error:
@@ -519,7 +635,7 @@ class WorkflowSourceStore:
     def remove(self, name: str) -> WorkflowMarketplaceSource:
         normalized = _normalize_name(name)
         try:
-            with self._locked():
+            with self._locked() as parent_identity:
                 state = self._read_sources()
                 catalog = self._read_catalog()
                 removed = next(
@@ -531,17 +647,6 @@ class WorkflowSourceStore:
                         "source_not_found",
                         f"marketplace source {normalized!r} was not found",
                     )
-                self._write(
-                    self.path,
-                    _SourceState.model_validate({
-                        "schemaVersion": _SOURCE_STATE_VERSION,
-                        "sources": [
-                            source
-                            for source in state.sources
-                            if source.name != normalized
-                        ],
-                    }),
-                )
                 self._write(
                     self.catalog_path,
                     _CatalogState.model_validate({
@@ -557,6 +662,19 @@ class WorkflowSourceStore:
                             if item.source_name != normalized
                         ],
                     }),
+                    parent_identity=parent_identity,
+                )
+                self._write(
+                    self.path,
+                    _SourceState.model_validate({
+                        "schemaVersion": _SOURCE_STATE_VERSION,
+                        "sources": [
+                            source
+                            for source in state.sources
+                            if source.name != normalized
+                        ],
+                    }),
+                    parent_identity=parent_identity,
                 )
                 return removed
         except WorkflowLockTimeout as error:
@@ -621,6 +739,26 @@ class WorkflowSourceStore:
             with self._locked():
                 sources = tuple(self._read_sources().sources)
                 catalog = self._read_catalog()
+                sources_by_name = {source.name: source for source in sources}
+                if any(
+                    status.source_name not in sources_by_name
+                    for status in catalog.statuses
+                ):
+                    _fail(
+                        "catalog_state_invalid",
+                        "catalog status refers to an unknown source",
+                    )
+                for cached in catalog.verified:
+                    source = sources_by_name.get(cached.source.name)
+                    if (
+                        source is None
+                        or source.repository_url != cached.source.repository_url
+                        or source.ref != cached.source.ref
+                    ):
+                        _fail(
+                            "catalog_state_invalid",
+                            "verified catalog source identity is inconsistent",
+                        )
                 return sources, tuple(catalog.verified), tuple(catalog.statuses)
         except WorkflowLockTimeout as error:
             _fail("source_lock_timeout", str(error))
@@ -630,9 +768,10 @@ class WorkflowSourceStore:
         verified: VerifiedSourceCatalog,
         *,
         attempted_at: str,
+        cancelled: Callable[[], bool] = lambda: False,
     ) -> None:
         try:
-            with self._locked():
+            with self._locked() as parent_identity:
                 self._require_current_source(verified.source)
                 catalog = self._read_catalog()
                 verified_entries = [
@@ -653,15 +792,19 @@ class WorkflowSourceStore:
                         "attemptedAt": attempted_at,
                     })
                 )
+                replacement = _CatalogState.model_validate({
+                    "schemaVersion": _CATALOG_STATE_VERSION,
+                    "verified": sorted(
+                        verified_entries, key=lambda item: item.source.name
+                    ),
+                    "statuses": sorted(statuses, key=lambda item: item.source_name),
+                })
+                _check_cancelled(cancelled)
                 self._write(
                     self.catalog_path,
-                    _CatalogState.model_validate({
-                        "schemaVersion": _CATALOG_STATE_VERSION,
-                        "verified": sorted(
-                            verified_entries, key=lambda item: item.source.name
-                        ),
-                        "statuses": sorted(statuses, key=lambda item: item.source_name),
-                    }),
+                    replacement,
+                    parent_identity=parent_identity,
+                    cancelled=cancelled,
                 )
         except WorkflowLockTimeout as error:
             _fail("source_lock_timeout", str(error))
@@ -676,7 +819,7 @@ class WorkflowSourceStore:
     ) -> VerifiedSourceCatalog | None:
         message = _redacted_error(error, source.repository_url)
         try:
-            with self._locked():
+            with self._locked() as parent_identity:
                 self._require_current_source(source)
                 catalog = self._read_catalog()
                 cached = next(
@@ -708,6 +851,7 @@ class WorkflowSourceStore:
                         "verified": catalog.verified,
                         "statuses": sorted(statuses, key=lambda item: item.source_name),
                     }),
+                    parent_identity=parent_identity,
                 )
                 return cached
         except WorkflowLockTimeout as lock_error:

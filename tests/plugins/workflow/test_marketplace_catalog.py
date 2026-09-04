@@ -131,6 +131,30 @@ def test_failed_refresh_preserves_last_verified_catalog_and_redacts_error(
     assert "token-secret" not in catalog.source_store.catalog_path.read_text()
 
 
+def test_oversized_failed_status_encoding_preserves_verified_cache(
+    tmp_path: Path,
+) -> None:
+    remote, commit = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    catalog.refresh_source("company")
+    before = catalog.source_store.catalog_path.read_bytes()
+    catalog.source_store.max_catalog_state_bytes = len(before) + 8
+
+    class LargeFailure:
+        def fetch(self, *args, **kwargs):
+            raise WorkflowMarketplaceError("source_unavailable", "x" * 4096)
+
+    catalog.git_fetcher = LargeFailure()
+    result = catalog.refresh_source("company")
+
+    assert result.state == "unavailable"
+    assert result.diagnostic_code == "catalog_state_size_limit"
+    assert result.resolved_commit is None
+    assert catalog.source_store.catalog_path.read_bytes() == before
+    assert catalog.search("")[0].resolved_commit == commit
+
+
 def test_cancelled_refresh_preserves_state_and_verified_cache_bytes(
     tmp_path: Path,
 ) -> None:
@@ -186,6 +210,11 @@ def test_refresh_from_a_direct_subdirectory_verifies_that_catalog_root(
             "package_contract_unsupported",
             "incompatible",
         ),
+        (
+            lambda root: _replace_index_path(root, "packages/.git/private"),
+            "package_index_invalid",
+            "malformed",
+        ),
     ],
 )
 def test_missing_malformed_stale_or_incompatible_index_fails_without_cache(
@@ -217,6 +246,13 @@ def _replace_index_version(root: Path, version: int) -> None:
     path = root / ".well-known" / "hermes-workflows" / "index.json"
     value = json.loads(path.read_bytes())
     value["schemaVersion"] = version
+    path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _replace_index_path(root: Path, package_path: str) -> None:
+    path = root / ".well-known" / "hermes-workflows" / "index.json"
+    value = json.loads(path.read_bytes())
+    value["packages"][0]["packagePath"] = package_path
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -297,6 +333,58 @@ def test_tampered_cache_with_duplicate_packages_is_rejected(tmp_path: Path) -> N
     assert catalog.source_store.catalog_path.read_bytes() == tampered
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value["verified"][0].__setitem__("verifiedAt", "tomorrow"),
+        lambda value: value["statuses"][0].__setitem__("attemptedAt", "later"),
+        lambda value: value.__setitem__("statuses", []),
+        lambda value: value["statuses"][0].update({
+            "state": "unavailable",
+            "diagnosticCode": "source_unavailable",
+            "message": "repository unavailable",
+        }),
+        lambda value: value["statuses"][0].update({
+            "state": "stale",
+            "diagnosticCode": "source_authentication_failed",
+            "message": (
+                "authentication failed for "
+                "https://alice:status-secret@example.test/repo.git"
+            ),
+        }),
+        lambda value: value["verified"][0]["source"].__setitem__(
+            "repositoryUrl", "https://example.test/different.git"
+        ),
+        lambda value: value["statuses"].append({
+            "sourceName": "ghost",
+            "state": "unavailable",
+            "attemptedAt": "2026-09-04T12:00:00Z",
+            "diagnosticCode": "source_unavailable",
+            "message": "repository unavailable",
+        }),
+    ],
+)
+def test_tampered_cache_metadata_fails_closed_without_rewrite_or_secret_display(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    catalog.refresh_source("company")
+    raw = json.loads(catalog.source_store.catalog_path.read_bytes())
+    mutation(raw)
+    tampered = (json.dumps(raw, sort_keys=True) + "\n").encode()
+    catalog.source_store.catalog_path.write_bytes(tampered)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        catalog.search("")
+
+    assert error.value.code == "catalog_state_invalid"
+    assert "status-secret" not in str(error.value)
+    assert catalog.source_store.catalog_path.read_bytes() == tampered
+
+
 def test_source_removed_during_refresh_cannot_publish_orphaned_cache(
     tmp_path: Path,
 ) -> None:
@@ -344,3 +432,66 @@ def test_cancellation_after_fetch_but_before_replacement_preserves_empty_cache(
     assert result.state == "cancelled"
     assert not catalog.source_store.catalog_path.exists()
     assert catalog.search("") == ()
+
+
+def test_cancellation_sampled_inside_store_lock_prevents_cache_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    original = catalog.source_store.replace_verified_cache
+    cancellation_requested = False
+    saw_store_token = False
+
+    def flip_at_store_entry(verified, *, attempted_at, **kwargs):
+        nonlocal cancellation_requested, saw_store_token
+        callback = kwargs.get("cancelled")
+        saw_store_token = callback is not None
+        cancellation_requested = True
+        if callback is None:
+            return original(verified, attempted_at=attempted_at)
+        return original(
+            verified,
+            attempted_at=attempted_at,
+            cancelled=callback,
+        )
+
+    monkeypatch.setattr(
+        catalog.source_store,
+        "replace_verified_cache",
+        flip_at_store_entry,
+    )
+
+    result = catalog.refresh_source("company", cancelled=lambda: cancellation_requested)
+
+    assert saw_store_token is True
+    assert result.state == "cancelled"
+    assert not catalog.source_store.catalog_path.exists()
+
+
+def test_cancellation_sampled_after_encoding_before_atomic_cache_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import plugins.workflow.marketplace.source_store as source_store_module
+
+    remote, _ = _bare_repository(tmp_path)
+    catalog = _catalog(tmp_path)
+    catalog.add_source("company", remote.as_uri())
+    original_render = source_store_module._render_state
+    cancellation_requested = False
+
+    def flip_after_render(*args, **kwargs):
+        nonlocal cancellation_requested
+        rendered = original_render(*args, **kwargs)
+        cancellation_requested = True
+        return rendered
+
+    monkeypatch.setattr(source_store_module, "_render_state", flip_after_render)
+
+    result = catalog.refresh_source("company", cancelled=lambda: cancellation_requested)
+
+    assert result.state == "cancelled"
+    assert not catalog.source_store.catalog_path.exists()

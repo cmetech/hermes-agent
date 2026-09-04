@@ -6,30 +6,65 @@ import functools
 import os
 import re
 import shutil
+import stat
 import subprocess
+import threading
+import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Literal
 
-from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli._subprocess_compat import (
+    kill_process_tree,
+    noninteractive_git_env,
+    windows_hide_flags,
+)
 
 __all__ = [
     "GitSourceError",
+    "GitSourceCancelled",
+    "GitSourceResourceLimit",
+    "GitSourceTimeout",
     "ResolvedGitSource",
     "canonical_git_source",
     "checkout_exact_revision",
     "git_head_revision",
+    "is_exact_revision",
     "noninteractive_git_env",
     "resolve_git_executable",
     "resolve_git_source",
+    "run_git_bounded",
     "safe_git_error",
     "scrub_cloned_origin",
     "scrub_git_url",
+    "validate_credential_free_git_source",
 ]
 
 
 class GitSourceError(Exception):
     """Recoverable failure while resolving or operating on a Git source."""
+
+
+class GitSourceCancelled(GitSourceError):
+    """A bounded Git command was cancelled."""
+
+
+class GitSourceTimeout(GitSourceError):
+    """A bounded Git command exceeded its timeout."""
+
+
+class GitSourceResourceLimit(GitSourceError):
+    """A bounded Git command exceeded an output or temporary-storage limit."""
+
+    def __init__(
+        self,
+        kind: Literal["output", "storage"],
+        result: subprocess.CompletedProcess[str],
+    ):
+        self.kind = kind
+        self.result = result
+        super().__init__(f"Git {kind} limit exceeded.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +76,44 @@ class ResolvedGitSource:
 EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _HTTP_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _TRAILING_URL_DELIMITERS = ".,;:!?)]}"
+_DEFAULT_BOUNDED_OUTPUT_BYTES = 64 * 1024
+_CREDENTIAL_PARAMETER_WORDS = frozenset({
+    "auth",
+    "authorization",
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "secret",
+    "signature",
+    "token",
+})
+_CREDENTIAL_COMPOUND_QUALIFIERS = (
+    "access",
+    "api",
+    "auth",
+    "authorization",
+    "aws",
+    "azure",
+    "client",
+    "deploy",
+    "github",
+    "gitlab",
+    "google",
+    "oauth",
+    "private",
+    "secret",
+    "security",
+)
+_CREDENTIAL_COMPOUND_SUFFIXES = (
+    "credential",
+    "credentials",
+    "key",
+    "password",
+    "secret",
+    "signature",
+    "token",
+)
 
 _GITHUB_BROWSER_SEGMENTS = {
     "actions",
@@ -149,9 +222,314 @@ def resolve_git_source(identifier: str) -> ResolvedGitSource:
     )
 
 
+def is_exact_revision(ref: object) -> bool:
+    """Return whether *ref* is one immutable full Git commit SHA."""
+    return isinstance(ref, str) and EXACT_COMMIT_RE.fullmatch(ref) is not None
+
+
+def _parameter_name_words(name: str) -> set[str]:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", separated)
+    return set(re.findall(r"[a-z0-9]+", separated.casefold()))
+
+
+def _is_credential_qualifier_sequence(value: str) -> bool:
+    reachable = {0}
+    for start in range(len(value)):
+        if start not in reachable:
+            continue
+        reachable.update(
+            start + len(qualifier)
+            for qualifier in _CREDENTIAL_COMPOUND_QUALIFIERS
+            if value.startswith(qualifier, start)
+        )
+    return bool(value) and len(value) in reachable
+
+
+def _parameter_name_contains_credentials(name: str) -> bool:
+    if _parameter_name_words(name) & _CREDENTIAL_PARAMETER_WORDS:
+        return True
+    compact_name = re.sub(r"[^a-z0-9]+", "", name.casefold())
+    return any(
+        compact_name.endswith(suffix)
+        and _is_credential_qualifier_sequence(compact_name[: -len(suffix)])
+        for suffix in _CREDENTIAL_COMPOUND_SUFFIXES
+    )
+
+
+def _parameters_contain_credentials(parameters: str) -> bool:
+    return any(
+        _parameter_name_contains_credentials(name)
+        for name, _ in urllib.parse.parse_qsl(parameters, keep_blank_values=True)
+    )
+
+
+def validate_credential_free_git_source(identifier: str) -> str:
+    """Validate a Git source identity without ever echoing rejected input."""
+
+    invalid_message = "Git source identity is invalid."
+    credential_message = "Git source identity contains credentials."
+    if (
+        not isinstance(identifier, str)
+        or not identifier
+        or identifier != identifier.strip()
+        or "\x00" in identifier
+    ):
+        raise GitSourceError(invalid_message)
+    try:
+        parsed = urllib.parse.urlsplit(identifier)
+    except ValueError as error:
+        raise GitSourceError(invalid_message) from error
+    scheme = parsed.scheme.casefold()
+    if any(
+        _parameters_contain_credentials(parameters)
+        for parameters in (parsed.query, parsed.fragment)
+    ):
+        raise GitSourceError(credential_message)
+    if scheme in {"http", "https"}:
+        if parsed.username is not None or parsed.password is not None:
+            raise GitSourceError(credential_message)
+    elif scheme in {"ssh", "file"}:
+        if parsed.password is not None or parsed.query:
+            raise GitSourceError(credential_message)
+    elif identifier.startswith("git@"):
+        if re.fullmatch(r"git@[^@\s/:]+:.+", identifier) is None:
+            raise GitSourceError(invalid_message)
+        _, _, fragment = identifier.partition("#")
+        if "?" in identifier.partition("#")[0] or _parameters_contain_credentials(
+            fragment
+        ):
+            raise GitSourceError(credential_message)
+    elif scheme or "@" in identifier:
+        raise GitSourceError(invalid_message)
+    try:
+        resolve_git_source(identifier)
+    except GitSourceError as error:
+        raise GitSourceError(invalid_message) from error
+    return identifier
+
+
+def _temporary_storage_exceeded(
+    root: Path,
+    *,
+    max_bytes: int,
+    max_entries: int,
+) -> bool:
+    if not root.exists():
+        return False
+    total_bytes = 0
+    entries_seen = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        with entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > max_entries:
+                    return True
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return True
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append(Path(entry.path))
+                else:
+                    total_bytes += metadata.st_size
+                    if total_bytes > max_bytes:
+                        return True
+    return False
+
+
+def run_git_bounded(
+    arguments: list[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    timeout: float,
+    cancelled: Callable[[], bool] = lambda: False,
+    max_output_bytes: int = _DEFAULT_BOUNDED_OUTPUT_BYTES,
+    storage_root: Path | None = None,
+    max_storage_bytes: int | None = None,
+    max_storage_entries: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git with bounded output, storage growth, timeout, and cancellation."""
+
+    if timeout <= 0 or max_output_bytes <= 0:
+        raise ValueError("Git command timeout and output limit must be positive")
+    if storage_root is not None and (
+        max_storage_bytes is None
+        or max_storage_entries is None
+        or max_storage_bytes <= 0
+        or max_storage_entries <= 0
+    ):
+        raise ValueError("Git storage limits must be positive when a root is supplied")
+    try:
+        if cancelled():
+            raise GitSourceCancelled("Git operation was cancelled.")
+    except GitSourceCancelled:
+        raise
+    except Exception as error:
+        raise GitSourceCancelled("Git cancellation check failed.") from error
+
+    try:
+        if os.name == "nt":
+            process = subprocess.Popen(
+                arguments,
+                cwd=str(cwd) if cwd is not None else None,
+                stdin=(
+                    subprocess.PIPE if input_text is not None else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=noninteractive_git_env(),
+                creationflags=windows_hide_flags(),
+            )
+        else:
+            process = subprocess.Popen(
+                arguments,
+                cwd=str(cwd) if cwd is not None else None,
+                stdin=(
+                    subprocess.PIPE if input_text is not None else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=noninteractive_git_env(),
+                process_group=0,
+            )
+    except OSError as error:
+        raise GitSourceError("Could not start Git.") from error
+
+    retained = {"stdout": bytearray(), "stderr": bytearray()}
+    retained_size = 0
+    total_output = 0
+    output_exceeded = threading.Event()
+    output_lock = threading.Lock()
+
+    def read_stream(name: Literal["stdout", "stderr"]) -> None:
+        nonlocal retained_size, total_output
+        stream = getattr(process, name)
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    return
+                with output_lock:
+                    total_output += len(chunk)
+                    remaining = max_output_bytes - retained_size
+                    if remaining > 0:
+                        kept = chunk[:remaining]
+                        retained[name].extend(kept)
+                        retained_size += len(kept)
+                    if total_output > max_output_bytes:
+                        output_exceeded.set()
+        except OSError:
+            return
+
+    readers = [
+        threading.Thread(target=read_stream, args=(name,), daemon=True)
+        for name in ("stdout", "stderr")
+    ]
+    for reader in readers:
+        reader.start()
+
+    if input_text is not None:
+
+        def write_input() -> None:
+            if process.stdin is None:
+                return
+            try:
+                process.stdin.write(input_text.encode("utf-8"))
+                process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=write_input, daemon=True).start()
+
+    deadline = time.monotonic() + timeout
+    failure: Literal["cancelled", "timeout", "output", "storage"] | None = None
+    while process.poll() is None:
+        try:
+            cancellation_requested = cancelled()
+        except Exception:
+            cancellation_requested = True
+        if cancellation_requested:
+            failure = "cancelled"
+            break
+        if output_exceeded.is_set():
+            failure = "output"
+            break
+        if (
+            storage_root is not None
+            and max_storage_bytes is not None
+            and max_storage_entries is not None
+            and _temporary_storage_exceeded(
+                storage_root,
+                max_bytes=max_storage_bytes,
+                max_entries=max_storage_entries,
+            )
+        ):
+            failure = "storage"
+            break
+        if time.monotonic() >= deadline:
+            failure = "timeout"
+            break
+        time.sleep(0.01)
+
+    if failure is not None:
+        kill_process_tree(process)
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        kill_process_tree(process)
+    for reader in readers:
+        reader.join(timeout=0.2)
+    if failure is None and output_exceeded.is_set():
+        failure = "output"
+    if (
+        failure is None
+        and storage_root is not None
+        and max_storage_bytes is not None
+        and max_storage_entries is not None
+        and _temporary_storage_exceeded(
+            storage_root,
+            max_bytes=max_storage_bytes,
+            max_entries=max_storage_entries,
+        )
+    ):
+        failure = "storage"
+    result = subprocess.CompletedProcess(
+        arguments,
+        process.returncode if process.returncode is not None else -1,
+        bytes(retained["stdout"]).decode("utf-8", errors="replace"),
+        bytes(retained["stderr"]).decode("utf-8", errors="replace"),
+    )
+    if failure == "cancelled":
+        raise GitSourceCancelled("Git operation was cancelled.")
+    if failure == "timeout":
+        raise GitSourceTimeout(f"Git operation timed out after {timeout} seconds.")
+    if failure in {"output", "storage"}:
+        raise GitSourceResourceLimit(failure, result)
+    return result
+
+
 def normalize_exact_revision(ref: str) -> str:
     """Require and normalize an immutable, full Git commit SHA."""
-    if not isinstance(ref, str) or not EXACT_COMMIT_RE.fullmatch(ref):
+    if not is_exact_revision(ref):
         raise GitSourceError("--ref must be a full 40-character commit SHA.")
     return ref.lower()
 
@@ -181,66 +559,150 @@ def _scrub_embedded_http_url(match: re.Match[str]) -> str:
     return f"{scrub_git_url(value[:end])}{value[end:]}"
 
 
-def git_head_revision(repo: Path, git_exe: str) -> str:
+def git_head_revision(
+    repo: Path,
+    git_exe: str,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    timeout: float = 15,
+    max_output_bytes: int = _DEFAULT_BOUNDED_OUTPUT_BYTES,
+    storage_root: Path | None = None,
+    max_storage_bytes: int | None = None,
+    max_storage_entries: int | None = None,
+) -> str:
     """Return the exact checked-out Git revision."""
-    result = subprocess.run(
-        [git_exe, "rev-parse", "HEAD"],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        stdin=subprocess.DEVNULL,
-        env=noninteractive_git_env(),
+    use_bounded_runner = (
+        cancelled is not None
+        or timeout != 15
+        or max_output_bytes != _DEFAULT_BOUNDED_OUTPUT_BYTES
+        or storage_root is not None
     )
+    if use_bounded_runner:
+        result = run_git_bounded(
+            [git_exe, "rev-parse", "HEAD"],
+            cwd=repo,
+            timeout=timeout,
+            cancelled=cancelled or (lambda: False),
+            max_output_bytes=max_output_bytes,
+            storage_root=storage_root,
+            max_storage_bytes=max_storage_bytes,
+            max_storage_entries=max_storage_entries,
+        )
+    else:
+        result = subprocess.run(
+            [git_exe, "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            stdin=subprocess.DEVNULL,
+            env=noninteractive_git_env(),
+        )
     if result.returncode != 0:
         error = safe_git_error(result)
         raise GitSourceError(f"Could not determine installed Git revision:\n{error}")
     return result.stdout.strip().lower()
 
 
-def checkout_exact_revision(repo: Path, git_exe: str, revision: str) -> None:
+def checkout_exact_revision(
+    repo: Path,
+    git_exe: str,
+    revision: str,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    timeout: float = 60,
+    max_output_bytes: int = _DEFAULT_BOUNDED_OUTPUT_BYTES,
+    storage_root: Path | None = None,
+    max_storage_bytes: int | None = None,
+    max_storage_entries: int | None = None,
+    before_checkout: Callable[[], None] | None = None,
+) -> None:
     """Fetch and detach at one immutable commit, then verify the resulting HEAD."""
-    try:
-        fetched = subprocess.run(
+    use_bounded_runner = (
+        cancelled is not None
+        or timeout != 60
+        or max_output_bytes != _DEFAULT_BOUNDED_OUTPUT_BYTES
+        or storage_root is not None
+    )
+    if use_bounded_runner:
+        fetched = run_git_bounded(
             [git_exe, "fetch", "--depth", "1", "origin", revision],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            stdin=subprocess.DEVNULL,
-            env=noninteractive_git_env(),
+            cwd=repo,
+            timeout=timeout,
+            cancelled=cancelled or (lambda: False),
+            max_output_bytes=max_output_bytes,
+            storage_root=storage_root,
+            max_storage_bytes=max_storage_bytes,
+            max_storage_entries=max_storage_entries,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise GitSourceError(
-            f"Git fetch of commit '{revision}' timed out after 60 seconds."
-        ) from exc
+    else:
+        try:
+            fetched = subprocess.run(
+                [git_exe, "fetch", "--depth", "1", "origin", revision],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                stdin=subprocess.DEVNULL,
+                env=noninteractive_git_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitSourceError(
+                f"Git fetch of commit '{revision}' timed out after 60 seconds."
+            ) from exc
     if fetched.returncode != 0:
         error = safe_git_error(fetched)
         raise GitSourceError(f"Git commit '{revision}' could not be fetched:\n{error}")
-    try:
-        checked_out = subprocess.run(
+    if before_checkout is not None:
+        before_checkout()
+    if use_bounded_runner:
+        checked_out = run_git_bounded(
             [git_exe, "checkout", "--detach", revision],
-            cwd=str(repo),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            stdin=subprocess.DEVNULL,
-            env=noninteractive_git_env(),
+            cwd=repo,
+            timeout=timeout,
+            cancelled=cancelled or (lambda: False),
+            max_output_bytes=max_output_bytes,
+            storage_root=storage_root,
+            max_storage_bytes=max_storage_bytes,
+            max_storage_entries=max_storage_entries,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise GitSourceError(
-            f"Git checkout of commit '{revision}' timed out after 60 seconds."
-        ) from exc
+    else:
+        try:
+            checked_out = subprocess.run(
+                [git_exe, "checkout", "--detach", revision],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                stdin=subprocess.DEVNULL,
+                env=noninteractive_git_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitSourceError(
+                f"Git checkout of commit '{revision}' timed out after 60 seconds."
+            ) from exc
     if checked_out.returncode != 0:
         error = safe_git_error(checked_out)
         raise GitSourceError(f"Git checkout of commit '{revision}' failed:\n{error}")
-    actual = git_head_revision(repo, git_exe)
+    if use_bounded_runner:
+        actual = git_head_revision(
+            repo,
+            git_exe,
+            cancelled=cancelled or (lambda: False),
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+            storage_root=storage_root,
+            max_storage_bytes=max_storage_bytes,
+            max_storage_entries=max_storage_entries,
+        )
+    else:
+        actual = git_head_revision(repo, git_exe)
     if actual != revision:
         raise GitSourceError(
             f"Checked-out revision '{actual}' does not match requested commit '{revision}'."

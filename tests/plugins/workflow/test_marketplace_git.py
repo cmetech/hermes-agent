@@ -10,6 +10,8 @@ import time
 import pytest
 
 import plugins.workflow.marketplace.git as marketplace_git
+import hermes_cli.git_source as shared_git_source
+from hermes_cli.git_source import GitSourceCancelled
 from plugins.workflow.marketplace.git import WorkflowGitFetcher
 from plugins.workflow.marketplace.models import WorkflowMarketplaceSource
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
@@ -180,6 +182,51 @@ def test_generic_clone_failure_does_not_trigger_unfiltered_fallback(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "code"),
+    [
+        (
+            "fatal: authentication failed; server does not support filter capability",
+            "source_authentication_failed",
+        ),
+        (
+            "fatal: network connection reset; server does not support filter capability",
+            "source_unavailable",
+        ),
+        (
+            "fatal: could not read Username; server does not support filter capability",
+            "source_authentication_failed",
+        ),
+        (
+            "fatal: returned error: 403; server does not support filter capability",
+            "source_authentication_failed",
+        ),
+    ],
+)
+def test_mixed_filter_and_auth_or_network_failure_never_retries_unfiltered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: str,
+    code: str,
+) -> None:
+    class MixedFailure(WorkflowGitFetcher):
+        def _run_git(self, arguments, **kwargs):
+            if "--filter=blob:none" not in arguments:
+                raise AssertionError("mixed failure retried without filtering")
+            return subprocess.CompletedProcess(arguments, 128, "", diagnostic)
+
+    monkeypatch.setattr(marketplace_git, "resolve_git_executable", lambda: "git")
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        MixedFailure().fetch(
+            _source("https://example.test/company/repo.git"),
+            tmp_path / "checkout",
+            sparse_paths=("selected.txt",),
+        )
+
+    assert error.value.code == code
+
+
 def test_authentication_failure_is_redacted_and_partial_clone_is_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,7 +271,12 @@ def test_fetch_rejects_ssh_password_even_when_source_model_was_built_directly(
 
     with pytest.raises(WorkflowMarketplaceError, match="source_credentials_forbidden"):
         CloneMustNotRun().fetch(
-            _source("ssh://git:ssh-secret@example.test/team/repo.git"),
+            WorkflowMarketplaceSource.model_construct(
+                name="company",
+                repository_url="ssh://git:ssh-secret@example.test/team/repo.git",
+                ref=None,
+                enabled=True,
+            ),
             tmp_path / "checkout",
             sparse_paths=("selected.txt",),
         )
@@ -273,13 +325,13 @@ def test_timeout_uses_shared_process_tree_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[int] = []
-    shared_cleanup = marketplace_git.kill_process_tree
+    shared_cleanup = shared_git_source.kill_process_tree
 
     def record_cleanup(process) -> None:
         calls.append(process.pid)
         shared_cleanup(process)
 
-    monkeypatch.setattr(marketplace_git, "kill_process_tree", record_cleanup)
+    monkeypatch.setattr(shared_git_source, "kill_process_tree", record_cleanup)
     fetcher = WorkflowGitFetcher(timeout_seconds=0.05)
 
     with pytest.raises(WorkflowMarketplaceError, match="source_timeout"):
@@ -289,6 +341,140 @@ def test_timeout_uses_shared_process_tree_cleanup(
         )
 
     assert len(calls) == 1
+
+
+def test_fetcher_kills_running_command_at_bounded_output_limit() -> None:
+    fetcher = WorkflowGitFetcher(
+        timeout_seconds=5,
+        max_git_output_bytes=1024,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        fetcher._run_git(
+            [
+                sys.executable,
+                "-c",
+                "import sys; chunk=b'x'*4096;\nwhile True: sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()",
+            ],
+            cancelled=lambda: False,
+        )
+
+    assert error.value.code == "source_output_limit"
+    assert time.monotonic() - started < 1
+
+
+def test_fetcher_kills_running_command_when_temporary_storage_crosses_limit(
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "growing.bin"
+    fetcher = WorkflowGitFetcher(
+        timeout_seconds=5,
+        max_temporary_bytes=1024,
+        max_traversal_entries=16,
+    )
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        fetcher._run_git(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                    "f=p.open('wb'); chunk=b'x'*4096; "
+                    'exec("while True:\\n f.write(chunk); f.flush(); os.fsync(f.fileno()); time.sleep(0.005)")'
+                ),
+                str(payload),
+            ],
+            cancelled=lambda: False,
+            storage_root=tmp_path,
+        )
+
+    size_after_kill = payload.stat().st_size
+    time.sleep(0.05)
+    assert error.value.code == "source_temporary_size_limit"
+    assert payload.stat().st_size == size_after_kill
+
+
+def test_preflight_rejects_selected_blob_before_exact_checkout(
+    tmp_path: Path,
+    versioned_remote: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _ = versioned_remote
+
+    def checkout_must_not_run(*args, **kwargs):
+        raise AssertionError("oversized selected blob reached checkout")
+
+    monkeypatch.setattr(
+        marketplace_git,
+        "checkout_exact_revision",
+        checkout_must_not_run,
+    )
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher(max_checkout_bytes=1).fetch(
+            _source(remote.as_uri()),
+            tmp_path / "checkout",
+            sparse_paths=("selected.txt",),
+        )
+
+    assert error.value.code == "source_checkout_size_limit"
+
+
+def test_exact_sha_is_preflighted_before_worktree_materialization(
+    tmp_path: Path,
+    versioned_remote: tuple[Path, dict[str, str]],
+) -> None:
+    remote, commits = versioned_remote
+    destination = tmp_path / "checkout"
+
+    class StopAtPreflight(WorkflowGitFetcher):
+        def _preflight_paths(self, *args, **kwargs):
+            assert not destination.joinpath("selected.txt").exists()
+            raise WorkflowMarketplaceError("preflight_stop", "stopped at preflight")
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        StopAtPreflight().fetch(
+            _source(remote.as_uri(), ref=commits["first"]),
+            destination,
+            sparse_paths=("selected.txt",),
+        )
+
+    assert error.value.code == "preflight_stop"
+
+
+def test_exact_checkout_receives_fetcher_cancellation_and_limits(
+    tmp_path: Path,
+    versioned_remote: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _ = versioned_remote
+    captured: dict[str, object] = {}
+    cancelled = lambda: False
+
+    def cancel_exact_checkout(_root, _git, _revision, **kwargs):
+        captured.update(kwargs)
+        raise GitSourceCancelled("cancelled")
+
+    monkeypatch.setattr(
+        marketplace_git,
+        "checkout_exact_revision",
+        cancel_exact_checkout,
+    )
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher(timeout_seconds=0.25).fetch(
+            _source(remote.as_uri()),
+            tmp_path / "checkout",
+            sparse_paths=("selected.txt",),
+            cancelled=cancelled,
+        )
+
+    assert error.value.code == "source_cancelled"
+    assert captured["cancelled"] is cancelled
+    assert captured["timeout"] == 0.25
+    assert captured["storage_root"] == tmp_path / "checkout"
 
 
 def test_cancelled_before_clone_does_not_create_checkout(

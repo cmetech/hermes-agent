@@ -10,22 +10,24 @@ import re
 import shutil
 import stat
 import subprocess
-import time
 from typing import Callable, NoReturn
-from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from hermes_cli._subprocess_compat import kill_process_tree, windows_hide_flags
 from hermes_cli.git_source import (
+    GitSourceCancelled,
     GitSourceError,
+    GitSourceResourceLimit,
+    GitSourceTimeout,
     checkout_exact_revision,
     git_head_revision,
-    noninteractive_git_env,
+    is_exact_revision,
     resolve_git_executable,
     resolve_git_source,
+    run_git_bounded,
     safe_git_error,
     scrub_cloned_origin,
+    validate_credential_free_git_source,
 )
 
 from .contract import load_package_contract
@@ -34,8 +36,8 @@ from .package import WorkflowMarketplaceError
 
 
 _INDEX_PATH = ".well-known/hermes-workflows/index.json"
-_EXACT_COMMIT = re.compile(r"^[0-9a-fA-F]{40}$")
 _MAX_GIT_ERROR_BYTES = 4096
+_DEFAULT_GIT_OUTPUT_BYTES = 8 * 1024 * 1024
 _DEFAULT_CHECKOUT_FILES = 2_100_000
 _DEFAULT_CHECKOUT_BYTES = 34 * 1024 * 1024 * 1024
 _DEFAULT_TEMPORARY_BYTES = 36 * 1024 * 1024 * 1024
@@ -46,6 +48,25 @@ _FILTER_REJECTION_MARKERS = (
     "filter capability is not supported",
     "filtering is not supported by server",
     "unsupported filter capability",
+)
+_FILTER_FALLBACK_DISQUALIFIERS = (
+    "authentication",
+    "authorization",
+    "could not read username",
+    "permission denied",
+    "publickey",
+    "http 401",
+    "http 403",
+    "returned error: 401",
+    "returned error: 403",
+    "network",
+    "connection",
+    "could not resolve",
+    "could not connect",
+    "timed out",
+    "tls",
+    "ssl",
+    "proxy",
 )
 
 Cancelled = Callable[[], bool]
@@ -114,23 +135,6 @@ def _check_cancelled(cancelled: Cancelled) -> None:
         _fail("source_cancelled", "workflow marketplace Git operation was cancelled")
 
 
-def _reject_url_credentials(value: str) -> None:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        _fail("source_invalid", "marketplace Git source URL is invalid")
-    if parsed.password is not None:
-        _fail(
-            "source_credentials_forbidden",
-            "marketplace Git source URLs must not contain passwords",
-        )
-    if parsed.scheme.casefold() not in {"http", "https"} and parsed.query:
-        _fail(
-            "source_credentials_forbidden",
-            "marketplace Git source URLs must not contain credential queries",
-        )
-
-
 def _redacted_git_message(
     result: subprocess.CompletedProcess[str], source_url: str
 ) -> str:
@@ -166,7 +170,9 @@ def _classify_git_failure(
 
 def _filter_was_explicitly_rejected(result: subprocess.CompletedProcess[str]) -> bool:
     output = f"{result.stderr or ''}\n{result.stdout or ''}".casefold()
-    return any(marker in output for marker in _FILTER_REJECTION_MARKERS)
+    return any(marker in output for marker in _FILTER_REJECTION_MARKERS) and not any(
+        marker in output for marker in _FILTER_FALLBACK_DISQUALIFIERS
+    )
 
 
 class WorkflowGitFetcher:
@@ -180,6 +186,7 @@ class WorkflowGitFetcher:
         max_checkout_bytes: int = _DEFAULT_CHECKOUT_BYTES,
         max_temporary_bytes: int = _DEFAULT_TEMPORARY_BYTES,
         max_traversal_entries: int = _DEFAULT_TRAVERSAL_ENTRIES,
+        max_git_output_bytes: int = _DEFAULT_GIT_OUTPUT_BYTES,
     ):
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -188,6 +195,7 @@ class WorkflowGitFetcher:
             or max_checkout_bytes <= 0
             or max_temporary_bytes <= 0
             or max_traversal_entries <= 0
+            or max_git_output_bytes <= 0
         ):
             raise ValueError("checkout limits must be positive")
         self.timeout_seconds = timeout_seconds
@@ -195,6 +203,7 @@ class WorkflowGitFetcher:
         self.max_checkout_bytes = max_checkout_bytes
         self.max_temporary_bytes = max_temporary_bytes
         self.max_traversal_entries = max_traversal_entries
+        self.max_git_output_bytes = max_git_output_bytes
 
     def _run_git(
         self,
@@ -203,83 +212,37 @@ class WorkflowGitFetcher:
         cwd: Path | None = None,
         input_text: str | None = None,
         cancelled: Cancelled,
+        storage_root: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        _check_cancelled(cancelled)
         try:
-            if os.name == "nt":
-                process = subprocess.Popen(
-                    arguments,
-                    cwd=str(cwd) if cwd is not None else None,
-                    stdin=(
-                        subprocess.PIPE
-                        if input_text is not None
-                        else subprocess.DEVNULL
-                    ),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=noninteractive_git_env(),
-                    creationflags=windows_hide_flags(),
-                )
-            else:
-                process = subprocess.Popen(
-                    arguments,
-                    cwd=str(cwd) if cwd is not None else None,
-                    stdin=(
-                        subprocess.PIPE
-                        if input_text is not None
-                        else subprocess.DEVNULL
-                    ),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=noninteractive_git_env(),
-                    process_group=0,
-                )
-        except OSError as error:
-            _fail("source_git_unavailable", f"could not start Git: {error}")
-        deadline = time.monotonic() + self.timeout_seconds
-        first_communicate = True
-        while True:
-            try:
-                is_cancelled = cancelled()
-            except Exception:
-                is_cancelled = True
-            if is_cancelled:
-                kill_process_tree(process)
-                try:
-                    process.communicate(timeout=1)
-                except Exception:
-                    pass
-                _fail(
-                    "source_cancelled",
-                    "workflow marketplace Git operation was cancelled",
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                kill_process_tree(process)
-                try:
-                    process.communicate(timeout=1)
-                except Exception:
-                    pass
-                _fail("source_timeout", "workflow marketplace Git operation timed out")
-            try:
-                stdout, stderr = process.communicate(
-                    input=input_text if first_communicate else None,
-                    timeout=min(0.1, remaining),
-                )
-                return subprocess.CompletedProcess(
-                    arguments,
-                    process.returncode,
-                    stdout,
-                    stderr,
-                )
-            except subprocess.TimeoutExpired:
-                first_communicate = False
+            return run_git_bounded(
+                arguments,
+                cwd=cwd,
+                input_text=input_text,
+                timeout=self.timeout_seconds,
+                cancelled=cancelled,
+                max_output_bytes=self.max_git_output_bytes,
+                storage_root=storage_root,
+                max_storage_bytes=(
+                    self.max_temporary_bytes if storage_root is not None else None
+                ),
+                max_storage_entries=(
+                    self.max_traversal_entries if storage_root is not None else None
+                ),
+            )
+        except GitSourceCancelled as error:
+            _fail("source_cancelled", str(error))
+        except GitSourceTimeout as error:
+            _fail("source_timeout", str(error))
+        except GitSourceResourceLimit as error:
+            code = (
+                "source_output_limit"
+                if error.kind == "output"
+                else "source_temporary_size_limit"
+            )
+            _fail(code, str(error))
+        except GitSourceError:
+            _fail("source_git_unavailable", "could not start Git")
 
     def _configure_sparse_checkout(
         self,
@@ -293,6 +256,7 @@ class WorkflowGitFetcher:
             [git_executable, "sparse-checkout", "init", "--no-cone"],
             cwd=destination,
             cancelled=cancelled,
+            storage_root=destination,
         )
         if initialized.returncode != 0:
             raise _classify_git_failure(initialized, "")
@@ -310,6 +274,7 @@ class WorkflowGitFetcher:
             cwd=destination,
             input_text=patterns,
             cancelled=cancelled,
+            storage_root=destination,
         )
         if configured.returncode != 0:
             raise _classify_git_failure(configured, "")
@@ -324,10 +289,10 @@ class WorkflowGitFetcher:
         cancelled: Cancelled,
     ) -> None:
         base = [git_executable, "clone", "--depth", "1", "--no-checkout"]
-        if ref is not None and _EXACT_COMMIT.fullmatch(ref) is None:
+        if ref is not None and not is_exact_revision(ref):
             base.extend(("--branch", ref))
         filtered = [*base, "--filter=blob:none", "--", clone_url, str(destination)]
-        result = self._run_git(filtered, cancelled=cancelled)
+        result = self._run_git(filtered, cancelled=cancelled, storage_root=destination)
         if result.returncode == 0:
             return
         if not _filter_was_explicitly_rejected(result):
@@ -336,6 +301,7 @@ class WorkflowGitFetcher:
         fallback = self._run_git(
             [*base, "--", clone_url, str(destination)],
             cancelled=cancelled,
+            storage_root=destination,
         )
         if fallback.returncode != 0:
             raise _classify_git_failure(fallback, clone_url)
@@ -427,6 +393,45 @@ class WorkflowGitFetcher:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError):
             _fail("package_index_invalid", "repository marketplace index is invalid")
         return tuple(entry.package_path for entry in index.packages)
+
+    def _preflight_paths(
+        self,
+        git_executable: str,
+        destination: Path,
+        revision: str,
+        paths: tuple[str, ...],
+        *,
+        cancelled: Cancelled,
+    ) -> None:
+        result = self._run_git(
+            [git_executable, "ls-tree", "-r", "-l", "-z", revision, "--", *paths],
+            cwd=destination,
+            cancelled=cancelled,
+            storage_root=destination,
+        )
+        if result.returncode != 0:
+            raise _classify_git_failure(result, "")
+        files = 0
+        total_bytes = 0
+        for record in result.stdout.split("\x00"):
+            if not record:
+                continue
+            metadata, separator, _path = record.partition("\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 4 or not fields[3].isdigit():
+                _fail("source_checkout_invalid", "Git tree metadata is malformed")
+            files += 1
+            total_bytes += int(fields[3])
+            if files > self.max_checkout_files:
+                _fail(
+                    "source_checkout_file_limit",
+                    "selected Git tree exceeds its file-count limit",
+                )
+            if total_bytes > self.max_checkout_bytes:
+                _fail(
+                    "source_checkout_size_limit",
+                    "selected Git tree exceeds its byte limit",
+                )
 
     def _enforce_checkout_budget(self, root: Path) -> None:
         files = 0
@@ -521,7 +526,15 @@ class WorkflowGitFetcher:
 
         if not source.enabled:
             _fail("source_disabled", f"marketplace source {source.name!r} is disabled")
-        _reject_url_credentials(source.repository_url)
+        try:
+            validate_credential_free_git_source(source.repository_url)
+        except GitSourceError as error:
+            code = (
+                "source_credentials_forbidden"
+                if "credentials" in str(error).casefold()
+                else "source_invalid"
+            )
+            _fail(code, str(error))
         destination = Path(destination)
         if destination.exists() or destination.is_symlink():
             _fail(
@@ -566,17 +579,63 @@ class WorkflowGitFetcher:
             )
             _check_cancelled(cancelled)
             requested_revision = (
-                source.ref.lower()
-                if source.ref is not None and _EXACT_COMMIT.fullmatch(source.ref)
-                else git_head_revision(destination, git_executable)
+                str(source.ref).lower()
+                if is_exact_revision(source.ref)
+                else git_head_revision(
+                    destination,
+                    git_executable,
+                    cancelled=cancelled,
+                    timeout=self.timeout_seconds,
+                    max_output_bytes=self.max_git_output_bytes,
+                    storage_root=destination,
+                    max_storage_bytes=self.max_temporary_bytes,
+                    max_storage_entries=self.max_traversal_entries,
+                )
             )
+            exact_requested = is_exact_revision(source.ref)
+            if not exact_requested:
+                self._preflight_paths(
+                    git_executable,
+                    destination,
+                    requested_revision,
+                    prefixed_paths,
+                    cancelled=cancelled,
+                )
             checkout_exact_revision(
                 destination,
                 git_executable,
                 requested_revision,
+                cancelled=cancelled,
+                timeout=self.timeout_seconds,
+                max_output_bytes=self.max_git_output_bytes,
+                storage_root=destination,
+                max_storage_bytes=self.max_temporary_bytes,
+                max_storage_entries=self.max_traversal_entries,
+                before_checkout=(
+                    lambda: (
+                        self._preflight_paths(
+                            git_executable,
+                            destination,
+                            requested_revision,
+                            prefixed_paths,
+                            cancelled=cancelled,
+                        )
+                        if exact_requested
+                        else None
+                    )
+                ),
             )
             _check_cancelled(cancelled)
-            resolved_commit = git_head_revision(destination, git_executable)
+            resolved_commit = git_head_revision(
+                destination,
+                git_executable,
+                cancelled=cancelled,
+                timeout=self.timeout_seconds,
+                max_output_bytes=self.max_git_output_bytes,
+                storage_root=destination,
+                max_storage_bytes=self.max_temporary_bytes,
+                max_storage_entries=self.max_traversal_entries,
+            )
             if resolved_commit != requested_revision:
                 _fail(
                     "source_revision_mismatch",
@@ -585,12 +644,20 @@ class WorkflowGitFetcher:
             root = destination / subdirectory if subdirectory else destination
             discovered = self._discover_index_paths(root, destination)
             if discovered:
+                discovered = tuple(_canonical_sparse_path(path) for path in discovered)
                 expanded = tuple(
                     sorted(set((*canonical_paths, *discovered, _INDEX_PATH)))
                 )
                 expanded_prefixed = tuple(
                     f"{subdirectory}/{path}" if subdirectory else path
                     for path in expanded
+                )
+                self._preflight_paths(
+                    git_executable,
+                    destination,
+                    resolved_commit,
+                    expanded_prefixed,
+                    cancelled=cancelled,
                 )
                 self._configure_sparse_checkout(
                     git_executable,
@@ -609,6 +676,20 @@ class WorkflowGitFetcher:
         except WorkflowMarketplaceError:
             _remove_checkout(destination)
             raise
+        except GitSourceCancelled as error:
+            _remove_checkout(destination)
+            _fail("source_cancelled", str(error))
+        except GitSourceTimeout as error:
+            _remove_checkout(destination)
+            _fail("source_timeout", str(error))
+        except GitSourceResourceLimit as error:
+            _remove_checkout(destination)
+            code = (
+                "source_output_limit"
+                if error.kind == "output"
+                else "source_temporary_size_limit"
+            )
+            _fail(code, str(error))
         except GitSourceError as error:
             _remove_checkout(destination)
             completed = subprocess.CompletedProcess(
