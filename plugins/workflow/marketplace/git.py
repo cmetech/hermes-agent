@@ -28,7 +28,10 @@ from hermes_cli.git_source import (
 )
 
 from .models import PACKAGE_ID_PATTERN, WorkflowMarketplaceSource
-from .package import WorkflowMarketplaceError, load_repository_index_document
+from .package import (
+    WorkflowMarketplaceError,
+    load_repository_index_document_if_present,
+)
 
 
 _INDEX_PATH = ".well-known/hermes-workflows/index.json"
@@ -303,20 +306,8 @@ class WorkflowGitFetcher:
             root.relative_to(checkout_root)
         except ValueError:
             _fail("package_index_invalid", "repository catalog root escaped checkout")
-        index_path = root / _INDEX_PATH
         try:
-            index_path.lstat()
-        except FileNotFoundError:
-            if selected_package_id is None:
-                return ()
-            _fail(
-                "package_index_invalid",
-                "repository marketplace index is unavailable",
-            )
-        except OSError:
-            _fail("package_index_invalid", "repository marketplace index is unreadable")
-        try:
-            index = load_repository_index_document(root)
+            index = load_repository_index_document_if_present(root)
         except WorkflowMarketplaceError as error:
             # Preserve the Git fetcher's established index-boundary diagnostic:
             # repository metadata is never a valid sparse package root.
@@ -326,6 +317,13 @@ class WorkflowGitFetcher:
                     "repository marketplace index is invalid",
                 )
             raise
+        if index is None:
+            if selected_package_id is None:
+                return ()
+            _fail(
+                "package_index_invalid",
+                "repository marketplace index is unavailable",
+            )
         if selected_package_id is None:
             return tuple(entry.package_path for entry in index.packages)
         matches = [entry for entry in index.packages if entry.id == selected_package_id]
@@ -379,6 +377,56 @@ class WorkflowGitFetcher:
                     "source_checkout_size_limit",
                     "selected Git tree exceeds its byte limit",
                 )
+
+    def _preflight_index_components(
+        self,
+        git_executable: str,
+        destination: Path,
+        revision: str,
+        index_path: str,
+        *,
+        cancelled: Cancelled,
+    ) -> None:
+        treeish = revision
+        components = index_path.split("/")
+        for position, component in enumerate(components):
+            result = self._run_git(
+                [git_executable, "ls-tree", "-z", treeish, "--", component],
+                cwd=destination,
+                cancelled=cancelled,
+                storage_root=destination,
+            )
+            if result.returncode != 0:
+                raise _classify_git_failure(result, "")
+            records = [record for record in result.stdout.split("\x00") if record]
+            if not records:
+                return
+            if len(records) != 1:
+                _fail("package_index_invalid", "Git index path is ambiguous")
+            metadata, separator, path = records[0].partition("\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 3 or path != component:
+                _fail("package_index_invalid", "Git index path metadata is invalid")
+            mode, entry_type, object_id = fields
+            if mode == "120000":
+                _fail(
+                    "package_symlink_unsupported",
+                    "repository marketplace index paths must not contain links",
+                )
+            is_leaf = position == len(components) - 1
+            if is_leaf:
+                if entry_type != "blob" or not mode.startswith("100"):
+                    _fail(
+                        "package_index_invalid",
+                        "repository marketplace index is invalid",
+                    )
+                return
+            if entry_type != "tree" or mode != "040000":
+                _fail(
+                    "package_index_invalid",
+                    "repository marketplace index parent is invalid",
+                )
+            treeish = object_id
 
     def _enforce_checkout_budget(self, root: Path) -> None:
         files = 0
@@ -499,6 +547,11 @@ class WorkflowGitFetcher:
         canonical_paths = tuple(_canonical_sparse_path(path) for path in sparse_paths)
         if not canonical_paths:
             _fail("source_sparse_path_invalid", "at least one sparse path is required")
+        if selected_package_id is not None and canonical_paths != (_INDEX_PATH,):
+            _fail(
+                "source_sparse_path_invalid",
+                "selected package fetch requires only the marketplace index path",
+            )
         try:
             resolved = resolve_git_source(source.repository_url)
         except GitSourceError as error:
@@ -549,7 +602,19 @@ class WorkflowGitFetcher:
                 )
             )
             exact_requested = is_exact_revision(source.ref)
-            if not exact_requested:
+
+            def preflight_initial_paths() -> None:
+                if _INDEX_PATH in canonical_paths:
+                    index_path = (
+                        f"{subdirectory}/{_INDEX_PATH}" if subdirectory else _INDEX_PATH
+                    )
+                    self._preflight_index_components(
+                        git_executable,
+                        destination,
+                        requested_revision,
+                        index_path,
+                        cancelled=cancelled,
+                    )
                 self._preflight_paths(
                     git_executable,
                     destination,
@@ -557,6 +622,9 @@ class WorkflowGitFetcher:
                     prefixed_paths,
                     cancelled=cancelled,
                 )
+
+            if not exact_requested:
+                preflight_initial_paths()
             checkout_exact_revision(
                 destination,
                 git_executable,
@@ -567,19 +635,7 @@ class WorkflowGitFetcher:
                 storage_root=destination,
                 max_storage_bytes=self.max_temporary_bytes,
                 max_storage_entries=self.max_traversal_entries,
-                before_checkout=(
-                    lambda: (
-                        self._preflight_paths(
-                            git_executable,
-                            destination,
-                            requested_revision,
-                            prefixed_paths,
-                            cancelled=cancelled,
-                        )
-                        if exact_requested
-                        else None
-                    )
-                ),
+                before_checkout=(preflight_initial_paths if exact_requested else None),
             )
             _check_cancelled(cancelled)
             resolved_commit = git_head_revision(
@@ -605,8 +661,12 @@ class WorkflowGitFetcher:
             )
             if discovered:
                 discovered = tuple(_canonical_sparse_path(path) for path in discovered)
-                expanded = tuple(
-                    sorted(set((*canonical_paths, *discovered, _INDEX_PATH)))
+                expanded = (
+                    tuple(sorted((_INDEX_PATH, discovered[0])))
+                    if selected_package_id is not None
+                    else tuple(
+                        sorted(set((*canonical_paths, *discovered, _INDEX_PATH)))
+                    )
                 )
                 expanded_prefixed = tuple(
                     f"{subdirectory}/{path}" if subdirectory else path

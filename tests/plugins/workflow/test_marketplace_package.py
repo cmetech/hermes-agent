@@ -641,6 +641,39 @@ def test_repository_index_document_does_not_open_unrelated_package_roots(
     _assert_code(error, "package_index_invalid")
 
 
+def test_optional_repository_index_absence_rechecks_opened_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    index_parent = repository / ".well-known"
+    index_parent.mkdir(parents=True)
+    real_stat = package_module.os.stat
+    mutated = False
+
+    def mutate_parent_after_missing_child(path, *args, **kwargs):
+        nonlocal mutated
+        try:
+            return real_stat(path, *args, **kwargs)
+        except FileNotFoundError:
+            if path == "hermes-workflows" and not mutated:
+                mutated = True
+                marker = index_parent / "changed-during-read"
+                marker.write_bytes(b"changed")
+            raise
+
+    monkeypatch.setattr(
+        package_module.os,
+        "stat",
+        mutate_parent_after_missing_child,
+    )
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        package_module.load_repository_index_document_if_present(repository)
+
+    _assert_code(error, "package_index_invalid")
+
+
 def test_selected_entry_verifier_reuses_full_repository_metadata_parity(
     repository_root: Path,
 ) -> None:

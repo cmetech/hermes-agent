@@ -555,6 +555,113 @@ def test_registered_selected_operations_ignore_unrelated_invalid_package(
     assert review.resolved_commit == detail.resolved_commit
 
 
+@pytest.mark.parametrize("catalog_state", ["absent", "failed"])
+def test_registered_selected_operations_do_not_require_verified_catalog_cache(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    catalog_state: str,
+) -> None:
+    unrelated = published_repo.work / "packages" / "unrelated"
+    _write_package(published_repo.work, "unrelated", version="1.0.0")
+    _write_index(published_repo.work)
+    shutil.rmtree(unrelated)
+    _git(published_repo.work, "add", "-A")
+    _git(published_repo.work, "commit", "-m", "publish unrelated missing package")
+    _git(published_repo.work, "push", "origin", "main")
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="company",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    if catalog_state == "failed":
+        refresh = service.refresh_source("company")
+        assert refresh.state == "malformed"
+        assert refresh.package_count == 0
+    assert service.search("") == ()
+
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor="alice"
+    )
+    detail = service.inspect(" COMPANY /laptop-support")
+
+    assert review.identity == InstalledPackageIdentity(
+        sourceKey="company", packageId="laptop-support"
+    )
+    assert detail.identifier == "company/laptop-support"
+    assert detail.resolved_commit == _git(published_repo.work, "rev-parse", "head")
+    assert detail.package_digest == review.candidate_digest
+    assert service.search("") == ()
+
+
+def test_registered_selected_operations_use_fresh_index_when_cache_omits_package(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    _write_package(published_repo.work, "unrelated", version="1.0.0")
+    _write_index(published_repo.work)
+    index_path = published_repo.work / ".well-known/hermes-workflows/index.json"
+    cached_index = json.loads(index_path.read_bytes())
+    cached_index["packages"] = [
+        item for item in cached_index["packages"] if item["id"] == "unrelated"
+    ]
+    index_path.write_bytes(_json_bytes(cached_index))
+    _git(published_repo.work, "add", ".")
+    _git(published_repo.work, "commit", "-m", "publish cache without selected")
+    _git(published_repo.work, "push", "origin", "main")
+    _add_and_refresh(service, published_repo)
+    assert service.search("laptop") == ()
+
+    _write_index(published_repo.work)
+    current_commit = published_repo.publish("publish selected package")
+
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor="alice"
+    )
+    detail = service.inspect("company/laptop-support")
+
+    assert review.resolved_commit == current_commit
+    assert detail.resolved_commit == current_commit
+    assert detail.version == "1.0.0"
+    assert service.search("laptop") == ()
+
+
+def test_inspect_uses_source_store_failures_without_catalog_cache(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    with pytest.raises(WorkflowMarketplaceError) as missing:
+        service.inspect("missing/laptop-support")
+    assert missing.value.code == "source_not_found"
+
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="company",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    service.set_source_enabled("company", False)
+    with pytest.raises(WorkflowMarketplaceError) as disabled:
+        service.inspect("company/laptop-support")
+    assert disabled.value.code == "source_disabled"
+
+    service.remove_source("company")
+    with pytest.raises(WorkflowMarketplaceError) as removed:
+        service.inspect("company/laptop-support")
+    assert removed.value.code == "source_not_found"
+
+
+@pytest.mark.parametrize("identifier", ["company", "company/pkg/extra"])
+def test_inspect_rejects_invalid_registered_identifier_without_fetch(
+    service: WorkflowMarketplaceService,
+    identifier: str,
+) -> None:
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.inspect(identifier)
+
+    assert error.value.code == "catalog_identifier_invalid"
+
+
 @pytest.mark.parametrize(
     ("selected_failure", "expected_code"),
     [

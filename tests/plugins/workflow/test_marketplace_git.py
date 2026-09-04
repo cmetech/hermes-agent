@@ -134,6 +134,61 @@ def test_selected_package_expansion_materializes_only_exact_indexed_path(
     assert not checkout.root.joinpath("packages/inbox-productivity").exists()
 
 
+def test_selected_package_rejects_caller_sparse_paths_beyond_index_authority(
+    tmp_path: Path,
+    indexed_remote: tuple[Path, Path, str],
+) -> None:
+    _work, remote, _commit = indexed_remote
+    destination = tmp_path / "extra-selected-checkout"
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher().fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(
+                ".well-known/hermes-workflows/index.json",
+                "packages/inbox-productivity",
+            ),
+            selected_package_id="laptop-support",
+        )
+
+    assert error.value.code == "source_sparse_path_invalid"
+    assert not destination.exists()
+
+
+def test_selected_package_in_repository_subdirectory_materializes_only_selection(
+    tmp_path: Path,
+) -> None:
+    work = tmp_path / "subdirectory-work"
+    catalog_root = work / "catalog"
+    shutil.copytree(MARKETPLACE_FIXTURE, catalog_root)
+    _git(work, "init", "--initial-branch=main")
+    _git(work, "config", "user.email", "marketplace@example.test")
+    _git(work, "config", "user.name", "Marketplace Test")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "subdirectory packages")
+    commit = _git(work, "rev-parse", "head")
+    remote = tmp_path / "subdirectory-remote.git"
+    _git(tmp_path, "clone", "--bare", str(work), str(remote))
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    destination = tmp_path / "subdirectory-checkout"
+
+    checkout = WorkflowGitFetcher().fetch(
+        _source(f"{remote.as_uri()}#catalog"),
+        destination,
+        sparse_paths=(".well-known/hermes-workflows/index.json",),
+        selected_package_id="laptop-support",
+    )
+
+    assert checkout.resolved_commit == commit
+    assert checkout.root == destination / "catalog"
+    assert checkout.root.joinpath(
+        "packages/laptop-support/workflow-package.json"
+    ).is_file()
+    assert not checkout.root.joinpath("packages/inbox-productivity").exists()
+    assert not destination.joinpath("packages").exists()
+
+
 def test_selected_package_absence_fails_stably_and_cleans_checkout(
     tmp_path: Path,
     indexed_remote: tuple[Path, Path, str],
@@ -504,7 +559,7 @@ def test_authentication_failure_is_redacted_and_partial_clone_is_removed(
         FailAuthentication().fetch(
             _source("https://example.test/company/repo.git"),
             destination,
-            sparse_paths=("selected.txt",),
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
             selected_package_id="laptop-support",
         )
 
@@ -781,7 +836,11 @@ def test_temporary_storage_budget_includes_git_objects(
     assert not destination.exists()
 
 
-def test_index_symlink_is_rejected_before_sparse_path_discovery(tmp_path: Path) -> None:
+@pytest.mark.parametrize("selected_package_id", [None, "laptop-support"])
+def test_index_symlink_is_rejected_before_sparse_path_discovery(
+    tmp_path: Path,
+    selected_package_id: str | None,
+) -> None:
     work = tmp_path / "work"
     index_dir = work / ".well-known" / "hermes-workflows"
     index_dir.mkdir(parents=True)
@@ -799,19 +858,30 @@ def test_index_symlink_is_rejected_before_sparse_path_discovery(tmp_path: Path) 
     remote = tmp_path / "remote.git"
     _git(tmp_path, "clone", "--bare", str(work), str(remote))
     destination = tmp_path / "checkout"
+    sparse_paths = (
+        (".well-known/hermes-workflows/index.json",)
+        if selected_package_id is not None
+        else (".well-known",)
+    )
 
-    with pytest.raises(WorkflowMarketplaceError, match="package_symlink_unsupported"):
+    with pytest.raises(
+        WorkflowMarketplaceError, match="package_symlink_unsupported"
+    ) as error:
         WorkflowGitFetcher().fetch(
             _source(remote.as_uri()),
             destination,
-            sparse_paths=(".well-known",),
+            sparse_paths=sparse_paths,
+            selected_package_id=selected_package_id,
         )
 
+    assert str(outside) not in str(error.value)
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("selected_package_id", [None, "laptop-support"])
 def test_index_parent_symlink_is_rejected_before_sparse_path_discovery(
     tmp_path: Path,
+    selected_package_id: str | None,
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
@@ -832,14 +902,67 @@ def test_index_parent_symlink_is_rejected_before_sparse_path_discovery(
     remote = tmp_path / "remote.git"
     _git(tmp_path, "clone", "--bare", str(work), str(remote))
     destination = tmp_path / "checkout"
+    sparse_paths = (
+        (".well-known/hermes-workflows/index.json",)
+        if selected_package_id is not None
+        else (".well-known",)
+    )
 
-    with pytest.raises(WorkflowMarketplaceError, match="package_symlink_unsupported"):
+    with pytest.raises(
+        WorkflowMarketplaceError, match="package_symlink_unsupported"
+    ) as error:
         WorkflowGitFetcher().fetch(
             _source(remote.as_uri()),
             destination,
-            sparse_paths=(".well-known",),
+            sparse_paths=sparse_paths,
+            selected_package_id=selected_package_id,
         )
 
+    assert str(outside) not in str(error.value)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("component", [".well-known", "hermes-workflows"])
+@pytest.mark.parametrize("selected_package_id", [None, "laptop-support"])
+def test_dangling_index_parent_symlink_fails_closed_and_cleans_checkout(
+    tmp_path: Path,
+    component: str,
+    selected_package_id: str | None,
+) -> None:
+    work = tmp_path / f"dangling-{component}-work"
+    work.mkdir()
+    outside = tmp_path / "clone-secret-missing-index"
+    try:
+        if component == ".well-known":
+            (work / ".well-known").symlink_to(outside, target_is_directory=True)
+        else:
+            (work / ".well-known").mkdir()
+            (work / ".well-known" / "hermes-workflows").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+    except OSError:
+        pytest.skip("host does not permit directory symlinks")
+    _git(work, "init", "--initial-branch=main")
+    _git(work, "config", "user.email", "marketplace@example.test")
+    _git(work, "config", "user.name", "Marketplace Test")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", f"dangling {component}")
+    remote = tmp_path / f"dangling-{component}-remote.git"
+    _git(tmp_path, "clone", "--bare", str(work), str(remote))
+    destination = tmp_path / f"dangling-{component}-{selected_package_id}"
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        WorkflowGitFetcher().fetch(
+            _source(remote.as_uri()),
+            destination,
+            sparse_paths=(".well-known/hermes-workflows/index.json",),
+            selected_package_id=selected_package_id,
+        )
+
+    assert error.value.code == "package_symlink_unsupported"
+    assert "clone-secret" not in str(error.value)
+    assert str(outside) not in str(error.value)
     assert not destination.exists()
 
 

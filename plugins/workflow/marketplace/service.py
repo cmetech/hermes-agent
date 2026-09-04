@@ -671,10 +671,20 @@ class WorkflowMarketplaceService:
         *,
         cancelled: Callable[[], bool] = lambda: False,
     ) -> PackageInspection:
-        cached = self.catalog.inspect(identifier)
+        if not isinstance(identifier, str) or len(identifier) > 129:
+            _fail(
+                "catalog_identifier_invalid",
+                "catalog package identifier must be source/package",
+            )
+        source_name, separator, package_id = identifier.partition("/")
+        if not separator or not source_name or not package_id or "/" in package_id:
+            _fail(
+                "catalog_identifier_invalid",
+                "catalog package identifier must be source/package",
+            )
         with self._fetch_registered(
-            cached.source_name,
-            cached.id,
+            source_name,
+            package_id,
             cancelled=cancelled,
         ) as fetched:
             workflows, blockers = self._assess_distribution(

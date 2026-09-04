@@ -1053,16 +1053,61 @@ def _open_directory_chain(
     *,
     code: str,
 ) -> list[tuple[int, str, int, os.stat_result]]:
+    chain = _try_open_directory_chain(
+        root_descriptor,
+        components,
+        code=code,
+        allow_missing=False,
+    )
+    if chain is None:  # pragma: no cover - required mode cannot return absence
+        _fail(code, "repository directory path is unavailable")
+    return chain
+
+
+def _open_optional_directory_chain(
+    root_descriptor: int,
+    components: tuple[str, ...],
+    *,
+    code: str,
+) -> list[tuple[int, str, int, os.stat_result]] | None:
+    return _try_open_directory_chain(
+        root_descriptor,
+        components,
+        code=code,
+        allow_missing=True,
+    )
+
+
+def _try_open_directory_chain(
+    root_descriptor: int,
+    components: tuple[str, ...],
+    *,
+    code: str,
+    allow_missing: bool,
+) -> list[tuple[int, str, int, os.stat_result]] | None:
     chain: list[tuple[int, str, int, os.stat_result]] = []
     directory_descriptor = root_descriptor
     try:
         for component in components:
-            before = _stat_at(
-                directory_descriptor,
-                component,
-                code=code,
-                message="repository directory path is unavailable",
-            )
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                if allow_missing:
+                    _recheck_directory_chain(chain, code=code)
+                    for _, _, descriptor, _ in reversed(chain):
+                        os.close(descriptor)
+                    return None
+                raise WorkflowMarketplaceError(
+                    code, "repository directory path is unavailable"
+                ) from exc
+            except OSError as exc:
+                raise WorkflowMarketplaceError(
+                    code, "repository directory path is unavailable"
+                ) from exc
             if stat.S_ISLNK(before.st_mode) or _is_reparse_point(before):
                 _fail(
                     "package_symlink_unsupported",
@@ -1143,20 +1188,62 @@ def _read_repository_index_at(
     root_opened: os.stat_result,
     contract: WorkflowPackageContract,
 ) -> bytes:
-    chain = _open_directory_chain(
+    content = _read_repository_index_if_present_at(
+        root,
+        root_descriptor,
+        root_opened,
+        contract,
+    )
+    if content is None:
+        _fail(
+            "package_index_invalid",
+            "repository marketplace index is unavailable",
+        )
+    return content
+
+
+def _read_repository_index_if_present_at(
+    root: Path,
+    root_descriptor: int,
+    root_opened: os.stat_result,
+    contract: WorkflowPackageContract,
+) -> bytes | None:
+    chain = _open_optional_directory_chain(
         root_descriptor,
         _INDEX_PATH[:-1],
         code="package_index_invalid",
     )
+    if chain is None:
+        _recheck_root(
+            root,
+            root_descriptor,
+            root_opened,
+            code="package_index_invalid",
+        )
+        return None
     directory_descriptor = chain[-1][2]
     try:
         filename = _INDEX_PATH[-1]
-        index_before = _stat_at(
-            directory_descriptor,
-            filename,
-            code="package_index_invalid",
-            message="repository marketplace index is unavailable",
-        )
+        try:
+            index_before = os.stat(
+                filename,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            _recheck_directory_chain(chain, code="package_index_invalid")
+            _recheck_root(
+                root,
+                root_descriptor,
+                root_opened,
+                code="package_index_invalid",
+            )
+            return None
+        except OSError as exc:
+            raise WorkflowMarketplaceError(
+                "package_index_invalid",
+                "repository marketplace index is unavailable",
+            ) from exc
         if stat.S_ISLNK(index_before.st_mode) or _is_reparse_point(index_before):
             _fail(
                 "package_symlink_unsupported",
@@ -1294,6 +1381,43 @@ def load_repository_index_document(root: Path) -> WorkflowPackageIndex:
         os.close(root_descriptor)
 
 
+def load_repository_index_document_if_present(
+    root: Path,
+) -> WorkflowPackageIndex | None:
+    """Load a bounded index when present without following path components."""
+
+    contract = _contract()
+    absolute_root = _absolute(root)
+    if not _HAS_DESCRIPTOR_WALK:
+        _fail(
+            "package_index_invalid",
+            "descriptor-safe repository traversal is unavailable",
+        )
+    root_descriptor, root_opened = _open_root_descriptor(
+        absolute_root,
+        code="package_index_invalid",
+    )
+    try:
+        content = _read_repository_index_if_present_at(
+            absolute_root,
+            root_descriptor,
+            root_opened,
+            contract,
+        )
+        if content is None:
+            return None
+        index = _parse_index(content, contract)
+        _recheck_root(
+            absolute_root,
+            root_descriptor,
+            root_opened,
+            code="package_index_invalid",
+        )
+        return index
+    finally:
+        os.close(root_descriptor)
+
+
 def verify_indexed_distribution(
     entry: WorkflowPackageIndexEntry,
     distribution: WorkflowDistribution,
@@ -1424,6 +1548,7 @@ __all__ = [
     "load_distribution",
     "load_repository_index",
     "load_repository_index_document",
+    "load_repository_index_document_if_present",
     "scan_package_files",
     "verify_indexed_distribution",
 ]
