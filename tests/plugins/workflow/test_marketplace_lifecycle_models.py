@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -916,6 +917,36 @@ def test_failed_operation_cannot_claim_a_committed_outcome() -> None:
         LifecycleOperation.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        ("transaction_rollback_failed", "rollback_failed"),
+        ("transaction_recovery_ambiguous", "recovery_ambiguous"),
+    ],
+)
+def test_recovery_failure_diagnostic_cannot_claim_unchanged(code, reason) -> None:
+    payload = _operation("update_confirm", "failed")
+    payload["error"]["code"] = code
+    payload["outcome"] = {
+        "type": "known_unchanged",
+        "evidence": "before_mutation",
+        "package_state": None,
+    }
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+    wrong_reason = (
+        "recovery_ambiguous" if reason == "rollback_failed" else "rollback_failed"
+    )
+    payload["outcome"] = {"type": "recovery_required", "reason": wrong_reason}
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+    payload["outcome"] = {"type": "recovery_required", "reason": reason}
+    assert LifecycleOperation.model_validate(payload).outcome is not None
+
+
 def test_cancelled_operation_requires_cancelled_before_commit_outcome() -> None:
     payload = _operation("install_confirm", "cancelled")
     payload["outcome"] = {"type": "outcome_unknown", "reason": "response_lost"}
@@ -930,6 +961,20 @@ def test_rollback_verified_requires_current_package_state() -> None:
         "type": "known_unchanged",
         "evidence": "rollback_verified",
         "package_state": None,
+    }
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+
+def test_rollback_verified_rejects_unconfirmed_recovery_state() -> None:
+    payload = _operation("update_confirm", "failed")
+    state = _absent_state()
+    state.update(state="unconfirmed", recovery="required")
+    payload["outcome"] = {
+        "type": "known_unchanged",
+        "evidence": "rollback_verified",
+        "package_state": state,
     }
 
     with pytest.raises(ValidationError):
@@ -1031,3 +1076,84 @@ def test_strict_models_reject_extra_fields_and_boolean_integer_coercion() -> Non
     state["busy"] = 1
     with pytest.raises(ValidationError):
         PackageState.model_validate(state)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_lifecycle_json_decoder_rejects_duplicate_keys_at_every_depth(nested) -> None:
+    encoded = json.dumps(_operation("install_prepare", "pending"))
+    if nested:
+        encoded = encoded.replace(
+            '"package_id": "laptop-support"',
+            '"package_id": "other", "package_id": "laptop-support"',
+            1,
+        )
+    else:
+        encoded = encoded.replace('"progress": 0', '"progress": 99, "progress": 0', 1)
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate_json(encoded)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "value"),
+    [
+        ("install_confirm", "contract_version", True),
+        ("install_confirm", "package_path", "../escape"),
+        ("install_confirm", "installed_at", "2026-09-04T12:00:00+00:00"),
+        ("inspect", "contract_version", True),
+        ("inspect", "package_path", "../escape"),
+        ("inspect", "verified_at", "2026-09-04T12:00:00+00:00"),
+    ],
+)
+def test_v2_reused_values_enforce_integer_path_and_time_domains(
+    kind, field, value
+) -> None:
+    payload = _operation(kind)
+    payload["result"]["value"][field] = value
+    if kind == "install_confirm":
+        payload["outcome"]["package_state"]["installed"][field] = value
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("configured_ref", " main "),
+        ("actor", " operator "),
+        ("source_name", "other"),
+        ("workflow_paths", ["../escape"]),
+        ("workflow_paths", ["workflows/diagnostic.yaml"] * 2),
+    ],
+)
+def test_v2_installed_projection_enforces_existing_value_domains(field, value) -> None:
+    payload = _operation("install_confirm")
+    payload["result"]["value"][field] = value
+    payload["outcome"]["package_state"]["installed"][field] = value
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+
+def test_v2_reused_identity_requires_canonical_source_key() -> None:
+    payload = _operation("install_confirm")
+    payload["result"]["value"]["identity"]["source_key"] = "Company"
+    payload["outcome"]["package_state"]["identity"]["source_key"] = "Company"
+    payload["outcome"]["package_state"]["installed"]["identity"]["source_key"] = (
+        "Company"
+    )
+    payload["outcome"]["package_state"]["trust"]["identity"]["source_key"] = "Company"
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+
+def test_revoke_selection_must_name_a_member_of_authoritative_full_inventory() -> None:
+    payload = _operation("trust_revoke")
+    selection = {"type": "one", "workflow_name": "not-in-package"}
+    payload["selection"] = selection
+    payload["result"]["value"]["selection"] = selection
+
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)

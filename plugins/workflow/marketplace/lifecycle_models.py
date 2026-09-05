@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import re
 from types import MappingProxyType, UnionType
-from typing import Annotated, Literal, TypeAlias, Union, get_args, get_origin
+from typing import Annotated, Literal, Self, TypeAlias, Union, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -16,6 +16,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     TypeAdapter,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -24,6 +25,7 @@ from .models import (
     ExternalRequirements,
     FileDigestChange,
     InstalledPackage,
+    InstalledPackageIdentity,
     PackageDiagnostic,
     PackageInspection,
     PackageReviewAssessment,
@@ -88,6 +90,57 @@ class StrictLifecycleModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        extra: Literal["allow", "ignore", "forbid"] | None = None,
+        context: object | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Reject duplicate object keys before Pydantic decodes the document."""
+
+        try:
+            json.loads(json_data, object_pairs_hook=_unique_json_object)
+        except _DuplicateJsonKeyError as error:
+            raise ValidationError.from_exception_data(
+                cls.__name__,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": (),
+                        "input": "JSON document",
+                        "ctx": {"error": ValueError("duplicate JSON object key")},
+                    }
+                ],
+                input_type="json",
+                hide_input=True,
+            ) from error
+        return super().model_validate_json(
+            json_data,
+            strict=strict,
+            extra=extra,
+            context=context,
+            by_alias=by_alias,
+            by_name=by_name,
+        )
+
+
+class _DuplicateJsonKeyError(ValueError):
+    """Private sentinel used to preserve a stable public validation error."""
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonKeyError
+        value[key] = item
+    return value
+
 
 def _canonical_utc(value: str | None, *, label: str) -> str | None:
     if value is None:
@@ -118,13 +171,76 @@ def _convert_snake_annotation(annotation: object, value: object) -> object:
     return value
 
 
+def _require_v2_contract_version(value: object) -> None:
+    if type(value) is not int or value != 1:
+        raise ValueError("contract_version must be the integer 1")
+
+
+def _validate_v2_installed_package(value: dict[str, object]) -> None:
+    if "contract_version" in value:
+        _require_v2_contract_version(value["contract_version"])
+    package_path = value.get("package_path")
+    if isinstance(package_path, str):
+        _require_canonical_relative_path(package_path)
+    installed_at = value.get("installed_at")
+    if isinstance(installed_at, str):
+        _canonical_utc(installed_at, label="installed_at")
+    configured_ref = value.get("configured_ref")
+    if isinstance(configured_ref, str):
+        _require_clean_text(configured_ref, label="configured ref")
+    actor = value.get("actor")
+    if isinstance(actor, str):
+        _require_clean_text(actor, label="actor")
+    workflow_paths = value.get("workflow_paths")
+    if isinstance(workflow_paths, list) and all(
+        isinstance(path, str) for path in workflow_paths
+    ):
+        paths = [_require_canonical_relative_path(path) for path in workflow_paths]
+        if len(paths) != len({path.casefold() for path in paths}):
+            raise ValueError("workflow_paths must be unique canonical paths")
+    identity = value.get("identity")
+    source_name = value.get("source_name")
+    if (
+        isinstance(identity, dict)
+        and isinstance(source_name, str)
+        and identity.get("source_key") != source_name
+    ):
+        raise ValueError("installed package identity is inconsistent")
+
+
+def _validate_v2_package_inspection(value: dict[str, object]) -> None:
+    if "contract_version" in value:
+        _require_v2_contract_version(value["contract_version"])
+    verified = value.get("verified")
+    if verified is not None and (type(verified) is not bool or not verified):
+        raise ValueError("verified must be true")
+    verified_at = value.get("verified_at")
+    if isinstance(verified_at, str):
+        _canonical_utc(verified_at, label="verified_at")
+    package_path = value.get("package_path")
+    if isinstance(package_path, str):
+        _require_canonical_relative_path(package_path)
+
+
+def _validate_v2_reused_payload(
+    model: type[BaseModel], value: dict[str, object]
+) -> None:
+    if model is InstalledPackageIdentity:
+        PackageIdentity.model_validate(value)
+    elif model is InstalledPackage:
+        _validate_v2_installed_package(value)
+    elif model is PackageInspection:
+        _validate_v2_package_inspection(value)
+
+
 def _snake_payload_for(model: type[BaseModel], value: object) -> object:
     """Translate an exact snake-case wire object for a reused V1 value model."""
 
     if isinstance(value, model):
-        return value
+        value = value.model_dump(mode="json", by_alias=False)
     if not isinstance(value, dict):
         return value
+    _validate_v2_reused_payload(model, value)
     translated: dict[str, object] = {}
     for key, item in value.items():
         field = model.model_fields.get(key)
@@ -575,6 +691,16 @@ class TrustRevokeValue(StrictLifecycleModel):
     ) -> list[TrustWorkflowState]:
         return _require_unique_trust_workflows(value, label="trust revoke")
 
+    @model_validator(mode="after")
+    def require_selected_inventory_member(self) -> "TrustRevokeValue":
+        if isinstance(
+            self.selection, OneTrustSelection
+        ) and self.selection.workflow_name not in {
+            item.workflow_name for item in self.workflows
+        }:
+            raise ValueError("selected workflow is not in the trust inventory")
+        return self
+
 
 class _LifecycleResult(StrictLifecycleModel):
     @model_validator(mode="after")
@@ -743,6 +869,10 @@ _MUTATION_KINDS = frozenset({
     "remove_confirm",
     "trust_confirm",
     "trust_revoke",
+})
+_RECOVERY_REASON_BY_ERROR_CODE = MappingProxyType({
+    "transaction_rollback_failed": "rollback_failed",
+    "transaction_recovery_ambiguous": "recovery_ambiguous",
 })
 
 
@@ -920,10 +1050,17 @@ class LifecycleOperation(StrictLifecycleModel):
             return
         assert self.outcome is not None
         package_state = getattr(self.outcome, "package_state", None)
-        if isinstance(self.outcome, KnownUnchangedOutcome) and (
-            self.outcome.evidence == "rollback_verified" and package_state is None
+        if (
+            isinstance(self.outcome, KnownUnchangedOutcome)
+            and self.outcome.evidence == "rollback_verified"
         ):
-            raise ValueError("verified rollback requires current package state")
+            if package_state is None or (
+                package_state.state not in {"installed", "absent"}
+                or package_state.recovery != "clear"
+            ):
+                raise ValueError(
+                    "verified rollback requires verified current package state"
+                )
         if package_state is not None:
             if (
                 not isinstance(self.subject, PackageSubject)
@@ -932,6 +1069,13 @@ class LifecycleOperation(StrictLifecycleModel):
             ):
                 raise ValueError("operation outcome package state is inconsistent")
         if self.state == "failed":
+            assert self.error is not None
+            recovery_reason = _RECOVERY_REASON_BY_ERROR_CODE.get(self.error.code)
+            if recovery_reason is not None and not (
+                isinstance(self.outcome, RecoveryRequiredOutcome)
+                and self.outcome.reason == recovery_reason
+            ):
+                raise ValueError("recovery failure requires its exact recovery outcome")
             if isinstance(
                 self.outcome, (CommittedOutcome, CancelledBeforeCommitOutcome)
             ):
