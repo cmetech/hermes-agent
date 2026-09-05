@@ -54,7 +54,7 @@ class AdmittedConfirm:
             profile="support",
             admissions=self.store,
             clock=lambda: self.now,
-            max_workers=1,
+            max_workers=limits.pop("max_workers", 1),
             max_in_flight=4,
             max_terminal=1,
             **limits,
@@ -389,7 +389,7 @@ def test_vault_requires_exact_binding_and_never_restores_consumed_or_expired_aut
         observed = threading.Event()
 
         def observe():
-            fixture.registry.get_lifecycle(operation.id, actor="alice")
+            fixture.registry.list(actor="alice")
             observed.set()
 
         thread = threading.Thread(target=observe)
@@ -758,3 +758,221 @@ def test_invalid_typed_completion_is_terminal_unknown_and_releases_reservation(
     assert "private" not in terminal.model_dump_json()
     replacement = fixture.start(request_id=request_id(2), target="private:target")
     assert replacement.id != operation.id
+
+
+def _start_review_with_authority(
+    fixture, validate_unused, *, confirmation_token="private-raw-token"
+):
+    expiry = "2026-09-04T00:05:00Z"
+    digest = "d" * 64
+    return fixture.registry.start(
+        "remove_prepare",
+        lambda _: operations.LifecycleCompletion(
+            state="succeeded",
+            result=RemoveReviewResult(
+                type="remove_review",
+                value=RemoveReviewProjection(
+                    operation="remove",
+                    review_digest=digest,
+                    identity=SUBJECT.identity,
+                    current_version="1.0.0",
+                    current_commit="c" * 40,
+                    distribution_digest="e" * 64,
+                    workflow_names=["support"],
+                    confirmation_available=True,
+                    expires_at=expiry,
+                ),
+            ),
+            error=None,
+            outcome=KnownUnchangedOutcome(
+                type="known_unchanged", evidence="read_only", package_state=None
+            ),
+            review_token=operations.ReviewTokenMetadata(
+                confirmation_token=confirmation_token,
+                expires_at=expiry,
+                review_digest=digest,
+                subject=SUBJECT,
+                selection=None,
+                validate_unused=validate_unused,
+            ),
+        ),
+        actor="alice",
+        request_id=request_id(),
+        subject=SUBJECT,
+        canonical_body={},
+    )
+
+
+@pytest.mark.parametrize("authority", ["false", "raises", "valid"])
+def test_review_publication_validates_unused_authority_before_vaulting(
+    admitted_confirm, authority
+):
+    fixture = admitted_confirm
+    validations = []
+
+    def validator(token):
+        validations.append(token)
+        if authority == "raises":
+            error = RuntimeError("private-raw-token: private callback failure")
+            error.code = "source_cancelled"
+            raise error
+        return authority == "valid"
+
+    operation = _start_review_with_authority(fixture, validator)
+    fixture.finish(operation)
+    terminal = fixture.registry.get_lifecycle(operation.id, actor="alice")
+    assert validations == ["private-raw-token"]
+    assert "private" not in terminal.model_dump_json()
+    arguments = dict(
+        actor="alice",
+        registry_epoch=EPOCH,
+        review_digest="d" * 64,
+        subject=SUBJECT,
+        selection=None,
+    )
+    if authority == "valid":
+        assert terminal.state == "succeeded"
+        assert terminal.result.value.confirmation_available
+        assert (
+            fixture.registry.review_token(operation.id, **arguments).confirmation_token
+            == "private-raw-token"
+        )
+        assert validations == ["private-raw-token", "private-raw-token"]
+    else:
+        assert terminal.state == "failed" and terminal.result is None
+        assert terminal.outcome.type == "outcome_unknown"
+        assert terminal.error.code == "marketplace_operation_failed"
+        with pytest.raises(operations.MarketplaceOperationRegistryError) as unavailable:
+            fixture.registry.review_token(operation.id, **arguments)
+        assert unavailable.value.code == "marketplace_review_unavailable"
+        assert validations == ["private-raw-token"]
+
+
+@pytest.mark.parametrize("boundary", ["expiry", "cancellation"])
+def test_review_publication_rechecks_expiry_and_cancellation_after_authority(
+    admitted_confirm, boundary
+):
+    fixture = admitted_confirm
+    validating, release_validator = threading.Event(), threading.Event()
+
+    def validator(_token):
+        validating.set()
+        assert release_validator.wait(5)
+        return True
+
+    operation = _start_review_with_authority(fixture, validator)
+    try:
+        assert validating.wait(5)
+        assert (
+            fixture.registry.get_lifecycle(operation.id, actor="alice").state
+            == "running"
+        )
+        if boundary == "expiry":
+            fixture.now += timedelta(minutes=5)
+        else:
+            fixture.registry.cancel(operation.id, actor="alice")
+        release_validator.set()
+        fixture.finish(operation)
+        terminal = fixture.registry.get_lifecycle(operation.id, actor="alice")
+        if boundary == "expiry":
+            assert terminal.state == "failed"
+            assert terminal.outcome.type == "outcome_unknown"
+        else:
+            assert terminal.state == "cancelled"
+            assert terminal.outcome.type == "cancelled_before_commit"
+        assert terminal.result is None
+        with pytest.raises(operations.MarketplaceOperationRegistryError):
+            fixture.registry.review_token(
+                operation.id,
+                actor="alice",
+                registry_epoch=EPOCH,
+                review_digest="d" * 64,
+                subject=SUBJECT,
+                selection=None,
+            )
+    finally:
+        release_validator.set()
+
+
+def test_review_insertion_transaction_lock_allows_real_worker_progress_and_queued_cancellation(
+    tmp_path,
+):
+    from plugins.workflow.marketplace.package import WorkflowMarketplaceError
+    from plugins.workflow.marketplace.transactions import MarketplaceTransactionStore
+
+    fixture = AdmittedConfirm(tmp_path / "profile", max_workers=2)
+    fixture.registry.max_terminal = 4
+    transactions = MarketplaceTransactionStore(
+        tmp_path / "profile", clock=lambda: fixture.now, lock_timeout_seconds=3
+    )
+    held, inspecting, queued_ready = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    queued, observations, inspector_codes = [], [], []
+
+    def holder(cancellation):
+        with transactions._locked():
+            held.set()
+            assert queued_ready.wait(5)
+            assert inspecting.wait(5)
+            assert not inspector_codes
+            cancellation.set_progress("validating", 50)
+            observations.append(
+                fixture.registry.cancel(queued[0].id, actor="alice").state
+            )
+        return operations.LifecycleCompletion(
+            state="failed",
+            result=None,
+            error=LifecyclePublicError(code="confirmation_token_invalid"),
+            outcome=KnownUnchangedOutcome(
+                type="known_unchanged", evidence="before_mutation", package_state=None
+            ),
+        )
+
+    def validator(token):
+        inspecting.set()
+        try:
+            transactions.inspect_token(token, actor="alice", profile="support")
+        except WorkflowMarketplaceError as error:
+            inspector_codes.append(error.code)
+        return False
+
+    try:
+        holder_operation = fixture.registry.start(
+            "remove_confirm",
+            holder,
+            actor="alice",
+            request_id=request_id(2),
+            subject=SUBJECT,
+            canonical_body={},
+        )
+        assert held.wait(5)
+        preparation = _start_review_with_authority(
+            fixture, validator, confirmation_token="p" * 43
+        )
+        assert inspecting.wait(5)
+        queued.append(
+            fixture.registry.start(
+                "update_check",
+                lambda _: None,
+                actor="alice",
+                request_id=request_id(3),
+                subject=AllPackagesSubject(type="all_packages"),
+                canonical_body={},
+            )
+        )
+        queued_ready.set()
+        fixture.finish(holder_operation)
+        fixture.finish(preparation)
+        assert observations == ["cancelled"]
+        assert inspector_codes == ["confirmation_token_invalid"]
+        assert (
+            fixture.registry.get_lifecycle(preparation.id, actor="alice").state
+            == "failed"
+        )
+    finally:
+        queued_ready.set()
+        inspecting.set()
+        fixture.close()

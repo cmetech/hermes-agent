@@ -1046,6 +1046,11 @@ class WorkflowMarketplaceOperationRegistry:
             result = call(cancellation)
             if record.lifecycle:
                 with self._lock:
+                    if (
+                        self._records.get(operation_id) is not record
+                        or record.state != "running"
+                    ):
+                        return
                     if not isinstance(
                         result, LifecycleCompletion
                     ) or result.state not in {"succeeded", "failed"}:
@@ -1053,6 +1058,29 @@ class WorkflowMarketplaceOperationRegistry:
                     cancellation.checkpoint()
                     if result.review_token is not None:
                         self._validate_review_metadata(record, result)
+                # As at retrieval, authoritative inspection can wait on a
+                # transaction lock whose owner needs this registry for progress.
+                authority_valid = True
+                if result.review_token is not None:
+                    metadata = result.review_token
+                    try:
+                        authority_valid = (
+                            metadata.validate_unused(metadata.confirmation_token)
+                            is True
+                        )
+                    except Exception:
+                        authority_valid = False
+                with self._lock:
+                    if (
+                        self._records.get(operation_id) is not record
+                        or record.state != "running"
+                    ):
+                        return
+                    cancellation.checkpoint()
+                    if result.review_token is not None:
+                        self._validate_review_metadata(record, result)
+                        if not authority_valid:
+                            raise ValueError("review authority is unavailable")
                     self._terminal_locked(
                         record,
                         state=result.state,
@@ -1264,6 +1292,8 @@ class WorkflowMarketplaceOperationRegistry:
             or getattr(value, "review_digest", None) != metadata.review_digest
             or getattr(value, "confirmation_available", False) is not True
             or value.expires_at != metadata.expires_at
+            or datetime.fromisoformat(metadata.expires_at.replace("Z", "+00:00"))
+            <= self._now()
             or not isinstance(metadata.confirmation_token, str)
             or not 1 <= len(metadata.confirmation_token) <= 4096
             or not callable(metadata.validate_unused)
