@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-05
 
-**Status:** Design direction approved by the user on 2026-09-05 (“ok approve”). This written contract is awaiting user review before its implementation plan is amended or production fixes resume.
+**Status:** Approved by the user on 2026-09-05 (“approve”). The active recovery plan may now be amended and implementation may resume through its independent review gates.
 
 **Baseline:** `bf9db2e46dd3f10dbb43e8b892a03fc4348bfef2`, branch `feat/workflow-package-marketplace`.
 

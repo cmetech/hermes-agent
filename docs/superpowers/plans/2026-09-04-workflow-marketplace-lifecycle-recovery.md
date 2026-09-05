@@ -8,11 +8,11 @@
 
 **Tech Stack:** Existing Python/Pydantic/FastAPI/transaction locks and Git fixtures; React/TypeScript/Nanostores/TanStack Query/Vitest/Testing Library/Playwright. No new runtime dependency is planned.
 
-**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
+**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), the approved [strict wire parity amendment](../specs/2026-09-05-workflow-marketplace-strict-wire-parity-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
 
 ## Global constraints
 
-- Status: approved by the user on 2026-09-04; implementation may proceed through the task review gates below.
+- Status: lifecycle recovery design approved on 2026-09-04; strict wire parity amendment approved on 2026-09-05; implementation may proceed through the task review gates below.
 - Continue only in `/Users/coreyellis/Developer/personal/github.com/cmetech/hermes-agent/.worktrees/workflow-package-marketplace`, branch `feat/workflow-package-marketplace`.
 - Baseline `c89f36c6b8b23c430432b947e3b4f8417eb974a5` is preserved. Do not revert or delete it. Tasks 1–13 are complete; their historical checkboxes are not a restart queue.
 - This plan replaces remaining Task 14 and Task 15 execution in the September 3 plan. The seven work groups are contract, Desktop parity, supervisor, package lifecycle, separate trust, accessibility, and Task 15. Contract and supervisor groups have smaller independent review gates below.
@@ -22,6 +22,10 @@
 - Existing operation execution/result bounds remain; snapshot lists: at most 100 records/page, 1,088 records/snapshot, four snapshots/profile, 16 MiB aggregate, 30-second expiry.
 - Visible polling: 500 ms, at most three simultaneous operation requests; pause hidden/disconnected; admission timeout 15 seconds. Remove cadence listeners and timers after every settlement.
 - Tokens never enter shared state, query caches/keys, URLs, logs, DOM, or persistence. Token retrieval is explicit and actor/profile/review-bound.
+- Python V2 public models are the sole wire-acceptance authority. Capabilities, evicted admissions, operation pages, and review tokens are strictly revalidated before HTTP publication; malformed values fail with a fixed safe 500 response, never malformed HTTP 200.
+- V2 lifecycle relative paths are NFC, 1–1,024 code points, slash-separated, credential-free values with no control characters, U+2028/U+2029, leading/trailing slash, backslash, NUL, empty/dot/dot-dot/drive-prefix segment, or case-folded `.git` segment. V1 validators and package-contract bytes remain unchanged.
+- Desktop request IDs use a scope/epoch-bound, memory-only server-clock observation. Monotonic elapsed time drives issuance; wall time only detects a negative, nonfinite, over-300-second, or greater-than-1-second divergent observation and forces capability revalidation before POST.
+- Desktop retains only the amendment's closed backend lifecycle error-code set. Unknown, token-shaped, nested, or oversized error bodies become a fixed generic local error and never retain raw backend text.
 - Keep package contract v1 artifacts byte-identical; preserve source sanitizer/U+FEFF parity, source CRUD/Refresh-all, and existing loose workflow/trust/run behavior.
 - Keep package installation and trust separate. Destination requirements remain advisories; malformed/inconsistent package structures block.
 - Use `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh` for Python evidence, never direct pytest. Run Desktop commands from `apps/desktop`; dependencies belong to the existing root workspace install.
@@ -42,20 +46,20 @@ Existing implementations remain the starting point. New names below are delibera
 
 | File | Responsibility / task |
 | --- | --- |
-| `plugins/workflow/marketplace/lifecycle_models.py` | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1 |
+| `plugins/workflow/marketplace/lifecycle_models.py` | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1; V2-only lifecycle relative-path domain, 14B1 |
 | `plugins/workflow/marketplace/admissions.py` | Epoch/ID parsing, canonical private fingerprints, receipt lifetime/replay, 14A2 |
-| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict publication/admission/listing, 14A1–A2; legacy terminal bridge and non-projecting active-package mutation query, 14A3b2 |
+| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict publication/admission/listing, 14A1–A2; legacy terminal bridge and non-projecting active-package mutation query, 14A3b2; strict evicted/page/token envelopes, 14B1 |
 | `plugins/workflow/marketplace/lifecycle_state.py` | Locked package-state projection and domain outcome evidence, 14A3a |
 | `plugins/workflow/marketplace/service.py`, `transactions.py`, `plugins/workflow/trust.py` | Exact commit/rollback evidence, authoritative token metadata, full trust snapshot at the actual write boundary, 14A3a |
 | `plugins/workflow/marketplace/catalog.py`, `source_store.py`, source portion of `lifecycle_state.py` | Source-cache publication evidence, 14A3b1; preserve strict source diagnostics |
-| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3b3 |
+| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3b3; strict capabilities and response-boundary revalidation, 14B1 |
 | `plugins/workflow/marketplace/api.py` | Legacy read/source bridge and preview mutation retirement, 14A3b2; mount V2 and actual profile-context integration, 14A3b3 |
 | `plugins/workflow/marketplace/cli.py` | Read-only package-state and explicit recovery adapters, 14A3c |
-| `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` | Deterministic Python public-model/scenario corpus and check/write modes, 14B |
-| `tests/fixtures/workflow-marketplace-lifecycle-v2.json` | Token-free cross-language operation/state corpus, 14B |
-| `apps/desktop/src/types/workflow-marketplace-lifecycle.ts` | Strict V2 types, 14B |
-| `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.ts` | Strict V2 decoding and cross-field checks, 14B |
-| `apps/desktop/src/api/workflow-marketplace-lifecycle.ts` | Scoped V2 API helpers and requested-ID enforcement, 14B |
+| `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` | Deterministic Python public-model/scenario corpus and check/write modes, 14B; generated domain/error descriptors, 14B1–B2 |
+| `tests/fixtures/workflow-marketplace-lifecycle-v2.json` | Token-free cross-language operation/state corpus, 14B; regenerated strict-wire corpus, 14B2 |
+| `apps/desktop/src/types/workflow-marketplace-lifecycle.ts` | Strict generated V2 types/rules, 14B; regenerated parity, 14B2 |
+| `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.ts` | Strict V2 decoding and cross-field checks, 14B; U+FEFF repository parity and closed error handling, 14B2 |
+| `apps/desktop/src/api/workflow-marketplace-lifecycle.ts` | Scoped V2 API helpers and requested-ID enforcement, 14B; monotonic admission clock observation, 14B2 |
 | `apps/desktop/src/store/workflow-marketplace-supervisor.ts` | Application-lifetime Nanostore records and public methods, 14C1 |
 | `apps/desktop/src/lib/workflow-marketplace-supervision.ts` | Pure transitions, exact correlation, guard/poll scheduling, 14C1 |
 | `apps/desktop/src/lib/workflow-marketplace-reconciliation.ts` | Query invalidation and generation/barrier policy, 14C2 |
@@ -339,6 +343,8 @@ def test_recovery_requires_confirmation(cli_home):
 
 ## Task 14B — Desktop contract parity and backend-generated fixtures
 
+**Historical status:** The initial implementation is preserved at `bf9db2e46d` and is not accepted. Its fresh review found five Important contract defects. Tasks 14B1 and 14B2 below are the approved correction and acceptance path; do not rewrite or squash the historical commit.
+
 **Files:** Create the three V2 Desktop type/codec/API modules in the file map and corresponding `.test.ts` files; create fixture generator, `tests/fixtures/workflow-marketplace-lifecycle-v2.json`, and `tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py`. Modify `apps/desktop/src/hermes.ts` re-exports and existing API tests for exact requested-ID correlation where shared.
 
 **Consumes:** 14A public schemas and real service/API projections.
@@ -370,6 +376,111 @@ return value
 ```
 
 - [ ] Run generator `--check` using the repository interpreter, Python fixture tests via wrapper, Desktop focused GREEN plus existing marketplace codec/API suites, typecheck and changed-file lint/format. Reviewer independently generates fixtures and verifies Python/TS acceptance plus requested-ID rejection. Commit `feat(desktop): validate lifecycle recovery protocol`.
+
+## Task 14B1 — Backend strict-wire correction
+
+**Files:** Modify `plugins/workflow/marketplace/lifecycle_models.py`, `plugins/workflow/marketplace/operations.py`, `plugins/workflow/marketplace/lifecycle_api.py`; modify `tests/plugins/workflow/test_marketplace_lifecycle_models.py`, `tests/plugins/workflow/test_marketplace_operations.py`, and `tests/plugins/workflow/test_marketplace_lifecycle_api.py`. Keep fixture generation and all Desktop files for 14B2.
+
+**Interfaces:**
+
+- **Consumes:** The approved strict wire parity amendment §§3–5 and §§8–11; existing `StrictLifecycleModel`, `LifecycleOperation`, admission store, registry list/token projections, and mounted V2 test app.
+- **Produces:** One Python-authoritative V2 relative-path validator shared by all V2 workflow/package path fields; strict `_Capabilities`, `AdmissionEvicted`, `LifecycleOperationPage`, and `ReviewTokenResponse`; route-boundary response validation that either returns a valid public model or the fixed safe internal-error envelope. These models and their JSON schemas are the sole 14B2 generator inputs.
+
+- [ ] **Step 1: Write failing V2 relative-path tests.** Add table-driven model tests for 1 and 1,024 code points; NFC; U+FEFF acceptance where Python clean text accepts it outside paths; and path rejection for Cc, U+2028/U+2029, leading/trailing slash, backslash, NUL, empty, dot, dot-dot, drive-prefix, and case-folded `.git` segments. Prove newline-terminated inspection `definition_path`, `package_path`, and `workflow_paths` values fail. Add a V1 regression that validates the existing V1 model fixtures and package-contract byte hashes unchanged.
+
+```python
+@pytest.mark.parametrize("path", ["workflows/a.yaml\n", "/workflows/a.yaml", "workflows/.GIT/a.yaml"])
+def test_v2_lifecycle_paths_reject_noncanonical_values(path, valid_inspection_result):
+    payload = valid_inspection_result(path=path)
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+```
+
+- [ ] **Step 2: Write failing strict-envelope tests.** Exercise exact fields and scalar domains for capabilities; exact operation/request/epoch/profile/kind/subject/selection correlations for evicted admissions; 0/1/100/101-item pages, duplicate operation/request IDs, common profile/epoch, cursor format, complete/cursor equivalence, and incomplete-nonempty pages; and exact review-token ID/request/subject/selection/digest/token/expiry fields. Use valid real projections first, then mutate one independent rule at a time.
+
+```python
+def test_operation_page_rejects_duplicate_request_ids(valid_page):
+    payload = valid_page.model_dump(mode="json")
+    payload["items"][1]["request_id"] = payload["items"][0]["request_id"]
+    with pytest.raises(ValidationError):
+        LifecycleOperationPage.model_validate(payload)
+```
+
+- [ ] **Step 3: Write failing real-route publication tests.** Substitute malformed capabilities/admission/page/token producer values behind the mounted V2 router. Assert the route never emits malformed HTTP 200 and returns status 500 with only `{"detail":{"code":"marketplace_internal_error"}}`. Also assert valid get/cancel/list/admission/token responses survive strict revalidation unchanged and contain no confirmation token outside the token route.
+
+```python
+def test_list_route_fails_safe_when_registry_page_is_malformed(client, malformed_registry):
+    response = client.get("/api/workflow-marketplace/v2/operations")
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+```
+
+- [ ] **Step 4: Observe RED.** Run `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_models.py tests/plugins/workflow/test_marketplace_operations.py tests/plugins/workflow/test_marketplace_lifecycle_api.py`. Record the new path/envelope/route tests failing because the current models accept malformed values or a real route publishes them as HTTP 200.
+
+- [ ] **Step 5: Implement the strict backend authority.** Add the V2-only relative-path validator without changing V1 sanitation or package-contract artifacts. Make all four outer models frozen/extra-forbid with the amendment's exact bounds and cross-field validators. At each lifecycle HTTP publication boundary, revalidate through the declared public response model; catch validation failures and return only the fixed safe internal-error envelope. Do not expose a private registry target, raw body, token, exception, or repository secret.
+
+```python
+def _strict_public(model: type[StrictLifecycleModel], value):
+    try:
+        return model.model_validate_json(value.model_dump_json())
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "marketplace_internal_error"},
+        ) from error
+```
+
+- [ ] **Step 6: Verify GREEN and compatibility.** Re-run the focused command from Step 4, then `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py tests/plugins/workflow/test_marketplace_api.py tests/plugins/workflow/test_marketplace_contract.py`. Run changed-file Ruff check/format and `git diff --check`. The existing generated files remain byte-stable in this backend-only unit.
+
+- [ ] **Step 7: Commit and review.** Commit `fix(workflow): enforce strict lifecycle wire envelopes`. A fresh reviewer independently mutates each outer envelope, sends at least one malformed producer through the real route, probes the newline path mismatch, and verifies V1/package-contract bytes remain unchanged. Record acceptance before 14B2.
+
+## Task 14B2 — Desktop strict-wire parity correction and Task 14B acceptance
+
+**Files:** Modify `scripts/generate_workflow_marketplace_lifecycle_fixtures.py`, `tests/fixtures/workflow-marketplace-lifecycle-v2.json`, `tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py`, `apps/desktop/src/types/workflow-marketplace-lifecycle.ts`, `apps/desktop/src/types/workflow-marketplace-lifecycle.test.ts`, `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.ts`, `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.test.ts`, `apps/desktop/src/api/workflow-marketplace-lifecycle.ts`, and `apps/desktop/src/api/workflow-marketplace-lifecycle.test.ts`. Modify shared transport tests only where the real helper boundary requires it.
+
+**Interfaces:**
+
+- **Consumes:** Review-clean 14B1 Python models/schemas and the strict wire parity amendment §§6–11; the unaccepted initial 14B implementation at `bf9db2e46d` remains the edit base for Desktop behavior.
+- **Produces:** Deterministic generated types, schemas, fixtures, domain descriptors, and closed backend error-code set; exact Python/TypeScript wire acceptance; `LifecycleClockObservation` and monotonic `createLifecycleRequestId`; sanitized `LifecycleApiError`. 14C1 may consume these only after this task's fresh review accepts all five original Task 14B findings.
+
+- [ ] **Step 1: Write failing generated-contract and differential tests.** Extend the Python generator test so a fresh temporary-Git generation includes the V2 relative-path descriptor, canonical capability ordering, strict outer-envelope cases, repository U+FEFF positives, and the closed backend code set. Add isolated-rule mutation assertions so changing one rule changes generated output. In TypeScript, run every generated valid/invalid capabilities/admission/page/token/repository case through the real decoder and require exact agreement with Python.
+
+```typescript
+it.each(corpus.outerEnvelopeCases)('$name follows Python acceptance', testCase => {
+  expect(decodeGeneratedEnvelope(testCase.model, testCase.value) !== null).toBe(testCase.accepted)
+})
+```
+
+- [ ] **Step 2: Write failing request-clock tests.** Replace scalar receipt-time inputs in tests with `{registryEpoch, serverTimeMs, wallReceivedMs, monotonicReceivedMs}`. Prove stable elapsed time mints the exact 85-character request ID, while negative/nonfinite elapsed time, either elapsed value over 300,000 ms, absolute wall/monotonic divergence over 1,000 ms, +31-second wall adjustment, scope/epoch change, and application restart refuse before POST with `marketplace_clock_revalidation_required`. Stub only `crypto.getRandomValues`; never persist the observation.
+
+```typescript
+expect(() => createLifecycleRequestId(observation, {
+  wallNowMs: observation.wallReceivedMs + 31_000,
+  monotonicNowMs: observation.monotonicReceivedMs + 1_000
+})).toThrowError(expect.objectContaining({ code: 'marketplace_clock_revalidation_required' }))
+```
+
+- [ ] **Step 3: Write failing error-secrecy tests.** Cover every approved backend code and HTTP status. Feed unknown identifier-shaped, token-shaped, nested, duplicate-key, oversized, and non-JSON bodies through the actual transport helper; assert the result is the fixed generic local code and `JSON.stringify(error)` contains none of the supplied secret. Also preserve the local codes `marketplace_lifecycle_unsupported`, `marketplace_network_error`, `marketplace_invalid_response`, `marketplace_request_failed`, and `marketplace_clock_revalidation_required` only at their defined boundaries.
+
+```typescript
+expect(JSON.stringify(await captureError(tokenShapedBackendError))).not.toContain(secretToken)
+expect((await captureError(tokenShapedBackendError)).code).toBe('marketplace_request_failed')
+```
+
+- [ ] **Step 4: Observe RED in both languages.** Run `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py`, then from `apps/desktop` run `npx vitest run --project ui src/types/workflow-marketplace-lifecycle.test.ts src/lib/workflow-marketplace-lifecycle-codec.test.ts src/api/workflow-marketplace-lifecycle.test.ts`. Record the generator drift plus current U+FEFF, wall-clock, and arbitrary-error retention failures.
+
+- [ ] **Step 5: Regenerate and implement exact parity.** Generate types/corpus from the review-clean Python models; do not hand-relax the generated schema. Make V2 repository validation match Python clean text byte-for-byte, including U+FEFF, without changing V1 repository/source validators. Mint request IDs from floored server time plus monotonic elapsed time and require a fresh capability observation on every discontinuity. Decode backend errors only through the generated closed set and construct fresh bounded safe errors without retaining raw response objects or text.
+
+```typescript
+const monotonicElapsed = now.monotonicNowMs - observation.monotonicReceivedMs
+const wallElapsed = now.wallNowMs - observation.wallReceivedMs
+if (!validElapsed(monotonicElapsed, wallElapsed)) throw clockRevalidationRequired()
+const issuedMs = Math.floor(observation.serverTimeMs + monotonicElapsed)
+```
+
+- [ ] **Step 6: Verify GREEN, generation, and compatibility.** Run the fixture generator in `--write` and then `--check` modes using the repository interpreter. Re-run both Step 4 suites; from `apps/desktop` also run the existing workflow marketplace codec/API transport suites, `npx tsc --noEmit`, changed-file ESLint with zero warnings, and Prettier check. Run `git diff --check`. Confirm generated output has no secret, temporary path, nondeterministic time, or machine-specific content and V1 control cases remain unchanged.
+
+- [ ] **Step 7: Commit and review Task 14B.** Commit `fix(desktop): align lifecycle strict wire parity`. A fresh reviewer regenerates artifacts, authors bounded Python-to-TypeScript mutations, tests a real U+FEFF get/cancel response, +31-second wall movement with stable monotonic time, and token-shaped backend error serialization. Acceptance requires all five original Task 14B findings addressed: V2 repository parity, V2 path authority, monotonic clock observation, closed safe errors, and strict outer-envelope publication. Only then record Task 14B complete and dispatch 14C1.
 
 ## Task 14C1 — Application operation supervisor
 
