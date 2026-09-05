@@ -1,6 +1,6 @@
 # Workflow Marketplace Lifecycle Recovery Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` after user approval. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. This draft does not authorize production implementation.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved this plan and its amendment on 2026-09-04 for implementation in the existing Hermes worktree only.
 
 **Goal:** Finish the existing marketplace branch with truthful, recoverable lifecycle operations and independently reviewed release evidence.
 
@@ -12,7 +12,7 @@
 
 ## Global constraints
 
-- Status: draft pending explicit user approval of the amendment and this plan.
+- Status: approved by the user on 2026-09-04; implementation may proceed through the task review gates below.
 - Continue only in `/Users/coreyellis/Developer/personal/github.com/cmetech/hermes-agent/.worktrees/workflow-package-marketplace`, branch `feat/workflow-package-marketplace`.
 - Baseline `c89f36c6b8b23c430432b947e3b4f8417eb974a5` is preserved. Do not revert or delete it. Tasks 1–13 are complete; their historical checkboxes are not a restart queue.
 - This plan replaces remaining Task 14 and Task 15 execution in the September 3 plan. The seven work groups are contract, Desktop parity, supervisor, package lifecycle, separate trust, accessibility, and Task 15. Contract and supervisor groups have smaller independent review gates below.
@@ -455,4 +455,4 @@ Read the current merge-gate script before invoking it; run only its local test/r
 | I generated fixtures/differential/integration matrix | 14B, each task's independent review, 15 |
 | Compatibility/token privacy/list stability | 14A2–B, 14C1, 15 |
 
-Implementation mode is already selected by the user: subagent-driven, one implementation agent at a time and a fresh reviewer per task. No further mode-selection question is required; the pending decision is approval of this design amendment and remaining-work plan.
+Implementation mode is selected and approved by the user: subagent-driven, one implementation agent at a time and a fresh reviewer per task. No further mode-selection question is required. Integration and publication remain separately approval-gated.

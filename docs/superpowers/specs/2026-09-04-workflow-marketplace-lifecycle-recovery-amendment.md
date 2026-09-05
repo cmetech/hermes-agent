@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-04
 
-**Status:** Draft — requires user approval before implementation.
+**Status:** Approved by the user on 2026-09-04 for implementation in the existing Hermes worktree. This approval does not authorize merge, push, publication, release, worktree deletion, or Workflow Studio changes.
 
 **Baseline:** `c89f36c6b8b23c430432b947e3b4f8417eb974a5`, branch `feat/workflow-package-marketplace`.
 
