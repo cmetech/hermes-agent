@@ -97,6 +97,18 @@ describe('workflow marketplace API', () => {
     Reflect.deleteProperty(window, 'hermesDesktop')
   })
 
+  it.each([getWorkflowMarketplaceOperation, cancelWorkflowMarketplaceOperation])(
+    'rejects a valid neighboring operation returned for an exact ID',
+    async helper => {
+      // Break caught: get/cancel returning another well-formed operation as this watch.
+      apiStructured.mockResolvedValue({
+        ok: true,
+        value: { ...pendingOperation(), id: `wmop_${'a'.repeat(12)}_${'c'.repeat(32)}` }
+      })
+      await expect(helper(OPERATION_ID, scope)).rejects.toThrow('invalid workflow marketplace data')
+    }
+  )
+
   it('routes capabilities and every source endpoint with exact methods and bodies', async () => {
     apiStructured
       .mockResolvedValueOnce({

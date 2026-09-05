@@ -26,6 +26,7 @@ export * from './api/system'
 export * from './api/toolsets'
 export * from './api/workflow-marketplace'
 
+export * from '@/api/workflow-marketplace-lifecycle'
 export type {
   ActionResponse,
   ActionStatusResponse,
@@ -184,3 +185,13 @@ export type {
   WorkflowRunPage,
   WorkflowRunSnapshot
 } from '@/types/hermes'
+export type {
+  AdmissionEvicted as LifecycleAdmissionEvicted,
+  AdmissionFound as LifecycleAdmissionFound,
+  LifecycleCapabilities,
+  LifecycleOperation,
+  LifecycleOperationPage,
+  PackageIdentity as LifecyclePackageIdentity,
+  PackageState as LifecyclePackageState,
+  ReviewTokenResponse as LifecycleReviewTokenResponse
+} from '@/types/workflow-marketplace-lifecycle'

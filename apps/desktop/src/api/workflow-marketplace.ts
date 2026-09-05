@@ -620,7 +620,13 @@ export async function getWorkflowMarketplaceOperation(
     failRequest()
   }
 
-  return operation({ path: `${ROOT}/operations/${encodeURIComponent(id)}` }, scope)
+  const value = await operation({ path: `${ROOT}/operations/${encodeURIComponent(id)}` }, scope)
+
+  if (value.id !== id) {
+    throw new TypeError(INVALID_RESPONSE)
+  }
+
+  return value
 }
 
 export async function cancelWorkflowMarketplaceOperation(
@@ -631,5 +637,11 @@ export async function cancelWorkflowMarketplaceOperation(
     failRequest()
   }
 
-  return operation({ method: 'POST', path: `${ROOT}/operations/${encodeURIComponent(id)}/cancel` }, scope)
+  const value = await operation({ method: 'POST', path: `${ROOT}/operations/${encodeURIComponent(id)}/cancel` }, scope)
+
+  if (value.id !== id) {
+    throw new TypeError(INVALID_RESPONSE)
+  }
+
+  return value
 }
