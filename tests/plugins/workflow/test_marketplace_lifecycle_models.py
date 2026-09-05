@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 
 import pytest
@@ -41,6 +42,142 @@ _STARTED = "2026-09-04T12:00:01Z"
 _FINISHED = "2026-09-04T12:00:02Z"
 _EPOCH = "e" * 32
 _REQUEST_ID = f"wmreq_{_EPOCH}_1788523200000_{'f' * 32}"
+
+
+@pytest.mark.parametrize("path", ["a", "é" * 1024, "workflows/\ufeff日.yaml"])
+def test_v2_relative_paths_preserve_valid_code_points(path):
+    from plugins.workflow.marketplace.lifecycle_models import WorkflowInventoryItem
+
+    value = WorkflowInventoryItem(
+        workflow_name="\ufeffdiagnostic", definition_path=path
+    )
+    assert value.definition_path == path
+    assert value.workflow_name == "\ufeffdiagnostic"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "a" * 1025,
+        "e\u0301",
+        "/a",
+        "a/",
+        "a\\b",
+        "a//b",
+        ".",
+        "..",
+        "a/./b",
+        "a/../b",
+        "C:a",
+        "a/z:b",
+        "a/.GIT/b",
+        "a\u2028b",
+        "a\u2029b",
+    ]
+    + ["a" + chr(code) + "b" for code in [*range(32), *range(127, 160)]],
+)
+def test_v2_inventory_rejects_noncanonical_relative_paths(path):
+    from plugins.workflow.marketplace.lifecycle_models import WorkflowInventoryItem
+
+    with pytest.raises(ValidationError):
+        WorkflowInventoryItem(workflow_name="diagnostic", definition_path=path)
+
+
+@pytest.mark.parametrize(
+    "kind,location",
+    [
+        ("inspect", ("package_path",)),
+        ("inspect", ("workflows", 0, "definition_path")),
+        ("inspect", ("resources", 0, "path")),
+        ("install_confirm", ("workflow_paths", 0)),
+        ("install_prepare", ("assessment", "package_resources", 0)),
+        ("install_prepare", ("file_changes", 0, "path")),
+        ("install_prepare", ("workflow_reviews", 0, "companion_path")),
+        ("install_prepare", ("package_path",)),
+        ("trust_prepare", ("package_resources", 0)),
+    ],
+)
+def test_v2_nested_path_rejects_newline_before_publication(kind, location):
+    payload = _operation(kind)
+    target = payload["result"]["value"]
+    for key in location[:-1]:
+        target = target[key]
+    target[location[-1]] = "workflows/diagnostic.yaml\n"
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate_json(json.dumps(payload))
+
+
+def test_v2_inspection_rejects_newline_even_when_all_resource_references_match():
+    payload = _operation("inspect")
+    value = payload["result"]["value"]
+    value["workflows"][0]["definition_path"] = "workflows/diagnostic.yaml\n"
+    value["resources"][0]["path"] = "workflows/diagnostic.yaml\n"
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate_json(json.dumps(payload))
+
+
+def test_v2_install_request_uses_the_lifecycle_path_domain():
+    from plugins.workflow.marketplace.lifecycle_api import _InstallBody
+
+    with pytest.raises(ValidationError):
+        _InstallBody.model_validate({
+            "identifier": "owner/repository",
+            "package_path": "packages/line\ninside",
+        })
+
+
+def test_v2_schemas_name_nested_path_domain_without_changing_v1_schema():
+    original = PackageInspection.model_json_schema(by_alias=False)
+    schema = LifecycleOperation.model_json_schema(by_alias=False)
+    for model, field, collection in [
+        ("PackageInspection", "package_path", False),
+        ("PackageInspectionResource", "path", False),
+        ("InstalledPackage", "workflow_paths", True),
+        ("WorkflowTrustReviewItem", "definition_path", False),
+        ("PackageReviewAssessment", "package_resources", True),
+        ("FileDigestChange", "path", False),
+        ("WorkflowInventoryItem", "definition_path", False),
+    ]:
+        field_schema = schema["$defs"][model]["properties"][field]
+        if collection:
+            field_schema = field_schema["items"]
+        assert field_schema["x-hermes-domain"] == "lifecycle_relative_path"
+        assert field_schema["minLength"] == 1
+        assert field_schema["maxLength"] == 1024
+    assert PackageInspection.model_json_schema(by_alias=False) == original
+
+
+def test_v1_models_and_package_contract_artifacts_remain_compatible():
+    from plugins.workflow.marketplace.contract import CONTRACT_PATH, VECTOR_PATH
+    from plugins.workflow.marketplace.models import (
+        WorkflowPackageManifest,
+        WorkflowPackageIndex,
+        WorkflowPackageDigests,
+    )
+    from test_marketplace_contract import valid_manifest, valid_index, valid_digests
+
+    for model, payload in [
+        (WorkflowPackageManifest, valid_manifest()),
+        (WorkflowPackageIndex, valid_index()),
+        (WorkflowPackageDigests, valid_digests()),
+    ]:
+        model.model_validate(payload)
+    # V1 retains its historical path acceptance; V2 alone closes the gap.
+    assert _workflow_review(
+        definition_path="workflows/diagnostic.yaml\n"
+    ).definition_path.endswith("\n")
+    for path, expected in [
+        (
+            CONTRACT_PATH,
+            "e728d99608e9186a08fc2b866cdaa9f116d8f51c5cde68930a82ef79d398e30d",
+        ),
+        (
+            VECTOR_PATH,
+            "644055e4234837f3e42ccaa952ed1622cf67edc96db69e983556580fb6ce82ed",
+        ),
+    ]:
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
 
 
 def _identity(

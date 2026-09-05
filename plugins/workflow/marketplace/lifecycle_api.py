@@ -3,10 +3,11 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 import hmac
+import json
 from typing import Generic, Literal, TypeVar
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import Field, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from hermes_cli.git_source import (
@@ -26,10 +27,8 @@ from .api import (
     _body,
     _identity_target,
     _query,
-    _registry_error,
     _request_error,
     _sanitize_result,
-    _service_error,
     _source_name,
     _uint,
 )
@@ -70,7 +69,7 @@ class _EmptyBody(wire.StrictLifecycleModel):
 class _InstallBody(wire.StrictLifecycleModel):
     identifier: str
     ref: str | None = None
-    package_path: str | None = None
+    package_path: wire.LifecycleRelativePath | None = None
 
     def domain(self) -> InstallRequest:
         return InstallRequest(
@@ -121,23 +120,43 @@ class _ReviewTokenBody(wire.StrictLifecycleModel):
     selection: wire.TrustSelection | None
 
 
-class _Capabilities(wire.StrictLifecycleModel):
-    schema_version: Literal[2] = 2
-    profile: str = Field(min_length=1, max_length=256)
-    registry_epoch: str = Field(pattern=r"^[0-9a-f]{32}$")
-    server_time: str
-    capabilities: list[
-        Literal[
-            "operations",
-            "admission_replay",
-            "package_state",
-            "transactions",
-            "updates",
-            "trust",
-            "sources",
-            "inspect",
-        ]
-    ] = Field(max_length=8)
+class _Capabilities(wire.LifecycleCapabilities):
+    """Keep the established schema name while sharing the public authority."""
+
+
+def _internal_error():
+    return HTTPException(status_code=500, detail={"code": "marketplace_internal_error"})
+
+
+_LIFECYCLE_ERROR_STATUS = {
+    "marketplace_admission_not_found": 404,
+    "marketplace_review_unavailable": 410,
+    "marketplace_list_expired": 410,
+    "marketplace_admission_capacity": 503,
+    "marketplace_list_capacity": 503,
+    "marketplace_operation_not_found": 404,
+    "marketplace_operation_capacity": 429,
+    "marketplace_operation_unavailable": 503,
+    "marketplace_operation_conflict": 409,
+    "marketplace_internal_error": 500,
+    "marketplace_epoch_changed": 409,
+    "marketplace_request_conflict": 409,
+    "marketplace_request_expired": 409,
+    "marketplace_request_invalid": 409,
+}
+
+
+def _strict_public(model, value):
+    """Recheck producer instances in JSON mode, including constructed/copied ones."""
+    try:
+        document = (
+            value.model_dump_json(warnings="none")
+            if isinstance(value, BaseModel)
+            else json.dumps(value)
+        )
+        return model.model_validate_json(document)
+    except Exception:
+        raise _internal_error() from None
 
 
 def _domain_identity(identity: wire.PackageIdentity) -> InstalledPackageIdentity:
@@ -156,24 +175,36 @@ def _call(call):
     """Bound errors at HTTP without reflecting bodies, tokens or private paths."""
     try:
         return call()
-    except HTTPException:
-        raise
-    except MarketplaceOperationRegistryError as error:
-        status = {
-            "marketplace_admission_not_found": 404,
-            "marketplace_review_unavailable": 410,
-            "marketplace_list_expired": 410,
-            "marketplace_admission_capacity": 503,
-            "marketplace_list_capacity": 503,
-        }.get(error.code)
-        if status is not None:
+    except HTTPException as error:
+        if (
+            type(error.detail) is dict
+            and set(error.detail) == {"code"}
+            and type(error.detail["code"]) is str
+            and error.detail["code"] in wire.LIFECYCLE_HTTP_ERROR_CODES
+            and type(error.status_code) is int
+            and (
+                error.status_code == _LIFECYCLE_ERROR_STATUS[error.detail["code"]]
+                or (
+                    error.detail["code"] == "marketplace_request_invalid"
+                    and error.status_code == 422
+                )
+            )
+        ):
             raise HTTPException(
-                status_code=status, detail={"code": error.code}
+                status_code=error.status_code, detail={"code": error.detail["code"]}
             ) from None
-        raise _registry_error(error) from None
-    except WorkflowMarketplaceError as error:
-        raise _service_error(error) from None
-    except (ValueError, ValidationError, GitSourceError):
+        raise _internal_error() from None
+    except (MarketplaceOperationRegistryError, WorkflowMarketplaceError) as error:
+        if (
+            type(error.code) is not str
+            or error.code not in wire.LIFECYCLE_HTTP_ERROR_CODES
+        ):
+            raise _internal_error() from None
+        status = _LIFECYCLE_ERROR_STATUS[error.code]
+        raise HTTPException(status_code=status, detail={"code": error.code}) from None
+    except ValidationError:
+        raise _internal_error() from None
+    except (ValueError, GitSourceError):
         raise _request_error() from None
     except Exception:
         raise HTTPException(
@@ -304,25 +335,30 @@ def create_lifecycle_router(
         "/capabilities", response_model=_Capabilities, response_model_by_alias=False
     )
     def capabilities(request: Request):
+        profile, _, registry, _ = scope(request, "read")
+
         def run():
-            profile, _, registry, _ = scope(request, "read")
-            return _Capabilities(
-                profile=profile,
-                registry_epoch=registry.admissions.epoch,
-                server_time=datetime
-                .now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                capabilities=[
-                    "operations",
-                    "admission_replay",
-                    "package_state",
-                    "transactions",
-                    "updates",
-                    "trust",
-                    "sources",
-                    "inspect",
-                ],
+            return _strict_public(
+                wire.LifecycleCapabilities,
+                _Capabilities(
+                    schema_version=2,
+                    profile=profile,
+                    registry_epoch=registry.admissions.epoch,
+                    server_time=datetime
+                    .now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    capabilities=[
+                        "operations",
+                        "admission_replay",
+                        "package_state",
+                        "transactions",
+                        "updates",
+                        "trust",
+                        "sources",
+                        "inspect",
+                    ],
+                ),
             )
 
         return _call(run)
@@ -333,19 +369,22 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     def list_operations(request: Request):
+        _, _, registry, actor = scope(request, "read")
+
         def run():
-            _, _, registry, actor = scope(request, "read")
             query = _query(request, {"cursor", "limit"})
-            return registry.list_snapshot(
-                actor=actor,
-                limit=_uint(query.get("limit"), default=100, maximum=100),
-                cursor=query.get("cursor"),
+            return _strict_public(
+                LifecycleOperationPage,
+                registry.list_snapshot(
+                    actor=actor,
+                    limit=_uint(query.get("limit"), default=100, maximum=100),
+                    cursor=query.get("cursor"),
+                ),
             )
 
         return _call(run)
 
-    def exact(request, operation_id, capability, cancel=False):
-        _, _, registry, actor = scope(request, capability)
+    def exact(registry, actor, operation_id, cancel=False):
         if _OPERATION_ID.fullmatch(operation_id) is None:
             raise HTTPException(
                 status_code=404, detail={"code": "marketplace_operation_not_found"}
@@ -356,8 +395,8 @@ def create_lifecycle_router(
             else registry.get_lifecycle(operation_id, actor=actor)
         )
         if operation.id != operation_id:
-            raise ValueError("operation identity is inconsistent")
-        return wire.LifecycleOperation.model_validate_json(operation.model_dump_json())
+            raise _internal_error()
+        return _strict_public(wire.LifecycleOperation, operation)
 
     @router.get(
         "/operations/{operation_id}",
@@ -365,7 +404,8 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     def get_operation(operation_id: str, request: Request):
-        return _call(lambda: exact(request, operation_id, "read"))
+        _, _, registry, actor = scope(request, "read")
+        return _call(lambda: exact(registry, actor, operation_id))
 
     @router.post(
         "/operations/{operation_id}/cancel",
@@ -373,7 +413,8 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     def cancel_operation(operation_id: str, request: Request):
-        return _call(lambda: exact(request, operation_id, "admin", True))
+        _, _, registry, actor = scope(request, "admin")
+        return _call(lambda: exact(registry, actor, operation_id, True))
 
     @router.get(
         "/admissions/{request_id}",
@@ -381,9 +422,16 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     def admission(request_id: str, request: Request):
+        _, _, registry, actor = scope(request, "read")
+
         def run():
-            _, _, registry, actor = scope(request, "read")
-            return registry.lookup_admission(request_id, actor=actor)
+            value = registry.lookup_admission(request_id, actor=actor)
+            model = (
+                AdmissionFound
+                if isinstance(value, AdmissionFound)
+                else AdmissionEvicted
+            )
+            return _strict_public(model, value)
 
         return _call(run)
 
@@ -393,21 +441,49 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     async def review_token(operation_id: str, request: Request):
-        _authorize(verified_operator, request, "admin")
+        profile, _, registry, actor = scope(request, "admin")
         body = await _body(request, _ReviewTokenBody)
 
         def run():
-            _, _, registry, actor = scope(request, "admin")
             if _OPERATION_ID.fullmatch(operation_id) is None:
                 _unavailable()
-            return registry.review_token(
-                operation_id,
-                actor=actor,
-                registry_epoch=registry.admissions.epoch,
-                review_digest=body.review_digest,
-                subject=body.subject,
-                selection=body.selection,
+            value = _strict_public(
+                ReviewTokenResponse,
+                registry.review_token(
+                    operation_id,
+                    actor=actor,
+                    registry_epoch=registry.admissions.epoch,
+                    review_digest=body.review_digest,
+                    subject=body.subject,
+                    selection=body.selection,
+                ),
             )
+            operation = exact(registry, actor, operation_id)
+            if (
+                operation.profile != profile
+                or operation.registry_epoch != registry.admissions.epoch
+                or operation.kind
+                not in {
+                    "install_prepare",
+                    "update_prepare",
+                    "remove_prepare",
+                    "trust_prepare",
+                }
+                or operation.state != "succeeded"
+                or operation.result is None
+                or not operation.result.value.confirmation_available
+                or value.operation_id != operation.id
+                or value.request_id != operation.request_id
+                or value.subject != operation.subject
+                or value.subject != body.subject
+                or value.selection != operation.selection
+                or value.selection != body.selection
+                or value.review_digest != body.review_digest
+                or value.review_digest != operation.result.value.review_digest
+                or value.expires_at != operation.result.value.expires_at
+            ):
+                raise _internal_error()
+            return value
 
         return await run_in_threadpool(_call, run)
 
@@ -417,8 +493,9 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     def package_state(source_key: str, package_id: str, request: Request):
+        profile, service, registry, _ = scope(request, "read")
+
         def run():
-            profile, service, registry, _ = scope(request, "read")
             expected = wire.PackageIdentity(
                 source_key=source_key, package_id=package_id
             )
@@ -433,13 +510,12 @@ def create_lifecycle_router(
                 state.model_dump(mode="json"), allow_confirmation_token=False
             )
             public["busy"] = state.busy or active
-            return wire.PackageState.model_validate(public)
+            return _strict_public(wire.PackageState, public)
 
         return _call(run)
 
-    def start_operation(request, envelope, kind, *, source_name=None, identity=None):
-        capability = "read" if kind == "inspect" else "admin"
-        _, service, registry, actor = scope(request, capability)
+    def start_operation(scoped, envelope, kind, *, source_name=None, identity=None):
+        _, service, registry, actor = scoped
         body = envelope.body
         selection = None
         direct = None
@@ -571,7 +647,7 @@ def create_lifecycle_router(
                 )
             return _public_completion(completion)
 
-        return registry.start(
+        value = registry.start(
             kind,
             worker,
             actor=actor,
@@ -584,13 +660,19 @@ def create_lifecycle_router(
             if kind.endswith("_confirm")
             else None,
         )
+        model = (
+            AdmissionEvicted
+            if isinstance(value, AdmissionEvicted)
+            else wire.LifecycleOperation
+        )
+        return _strict_public(model, value)
 
     def register_start(path, kind, body_model):
         async def endpoint(request: Request):
-            _authorize(verified_operator, request, "admin")
+            scoped = scope(request, "admin")
             envelope = await _body(request, _StartRequest[body_model])
             return await run_in_threadpool(
-                _call, lambda: start_operation(request, envelope, kind)
+                _call, lambda: start_operation(scoped, envelope, kind)
             )
 
         router.add_api_route(
@@ -624,12 +706,12 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     async def refresh(source_name: str, request: Request):
-        _authorize(verified_operator, request, "admin")
+        scoped = scope(request, "admin")
         envelope = await _body(request, _StartRequest[_EmptyBody])
         return await run_in_threadpool(
             _call,
             lambda: start_operation(
-                request, envelope, "refresh", source_name=source_name
+                scoped, envelope, "refresh", source_name=source_name
             ),
         )
 
@@ -640,12 +722,12 @@ def create_lifecycle_router(
         response_model_by_alias=False,
     )
     async def inspect(source_key: str, package_id: str, request: Request):
-        _authorize(verified_operator, request, "read")
+        scoped = scope(request, "read")
         envelope = await _body(request, _StartRequest[_EmptyBody])
         return await run_in_threadpool(
             _call,
             lambda: start_operation(
-                request,
+                scoped,
                 envelope,
                 "inspect",
                 identity=wire.PackageIdentity(

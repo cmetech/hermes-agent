@@ -162,6 +162,291 @@ def test_capabilities_are_authenticated_and_share_registry_epoch(lifecycle_api):
     )
 
 
+@pytest.mark.parametrize(
+    "boundary", ["capabilities", "admission", "page", "token", "get", "cancel"]
+)
+def test_malformed_producer_never_publishes_success(
+    lifecycle_api, monkeypatch, boundary
+):
+    from plugins.workflow.marketplace import lifecycle_api as routes
+    from plugins.workflow.marketplace.operations import (
+        AdmissionEvicted,
+        LifecycleOperationPage,
+        ReviewTokenResponse,
+    )
+
+    api = lifecycle_api
+    operation = api.review()
+    secret = "SECRET_PRODUCER_VALUE_do_not_publish"
+    if boundary == "capabilities":
+        original = routes._Capabilities
+        monkeypatch.setattr(
+            routes,
+            "_Capabilities",
+            lambda **kwargs: original.model_construct(**{
+                **kwargs,
+                "server_time": secret,
+            }),
+        )
+        response = api.client.get(V2 + "/capabilities")
+    elif boundary == "admission":
+        malformed = AdmissionEvicted.model_construct(
+            state="evicted",
+            operation_id=operation["id"],
+            request_id=operation["request_id"],
+            registry_epoch=api.registry.admissions.epoch,
+            profile="support",
+            kind=secret,
+            subject=operation["subject"],
+            selection=None,
+        )
+        monkeypatch.setattr(
+            api.registry, "lookup_admission", lambda *args, **kwargs: malformed
+        )
+        response = api.client.get(V2 + "/admissions/" + operation["request_id"])
+    elif boundary == "page":
+        malformed = LifecycleOperationPage.model_construct(
+            items=(), next_cursor=secret, complete=True
+        )
+        monkeypatch.setattr(api.registry, "list_snapshot", lambda **kwargs: malformed)
+        response = api.client.get(V2 + "/operations")
+    elif boundary == "token":
+        token = api.token(operation)
+        malformed = ReviewTokenResponse.model_construct(**{
+            **token,
+            "confirmation_token": secret + "!",
+        })
+        monkeypatch.setattr(
+            api.registry, "review_token", lambda *args, **kwargs: malformed
+        )
+        response = api.post(
+            "/operations/" + operation["id"] + "/review-token",
+            {
+                "review_digest": token["review_digest"],
+                "subject": operation["subject"],
+                "selection": None,
+            },
+        )
+    else:
+        malformed = LifecycleOperation.model_validate(operation).model_copy(
+            update={"profile": secret + "\n"}
+        )
+        method = "get_lifecycle" if boundary == "get" else "cancel_lifecycle"
+        monkeypatch.setattr(api.registry, method, lambda *args, **kwargs: malformed)
+        path = V2 + "/operations/" + operation["id"]
+        response = (
+            api.client.get(path)
+            if boundary == "get"
+            else api.client.post(path + "/cancel")
+        )
+    assert response.status_code == 500, response.text
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+    assert secret not in response.text
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [("list_snapshot", "/operations"), ("lookup_admission", "/admissions/request")],
+)
+def test_response_construction_validation_failure_is_safe_internal_error(
+    lifecycle_api, monkeypatch, method, path
+):
+    from plugins.workflow.marketplace.operations import AdmissionEvicted
+
+    def invalid_producer(*args, **kwargs):
+        return AdmissionEvicted.model_validate({"private_target": "SECRET"})
+
+    monkeypatch.setattr(lifecycle_api.registry, method, invalid_producer)
+    response = lifecycle_api.client.get(V2 + path)
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("operation_id", "wmop_" + "1" * 12 + "_" + "2" * 32),
+        ("request_id", "wmreq_" + "e" * 32 + "_1788523200000_" + "f" * 32),
+        ("subject", {"type": "all_packages"}),
+        ("selection", {"type": "all"}),
+        ("review_digest", "a" * 64),
+        ("expires_at", "2026-09-04T12:05:00Z"),
+    ],
+)
+def test_token_route_rejects_valid_but_uncorrelated_producer(
+    lifecycle_api, monkeypatch, field, value
+):
+    from plugins.workflow.marketplace.operations import ReviewTokenResponse
+
+    api = lifecycle_api
+    operation = api.review()
+    token = api.token(operation)
+    altered = ReviewTokenResponse.model_validate({**token, field: value})
+    monkeypatch.setattr(api.registry, "review_token", lambda *args, **kwargs: altered)
+    response = api.post(
+        "/operations/" + operation["id"] + "/review-token",
+        {
+            "review_digest": token["review_digest"],
+            "subject": operation["subject"],
+            "selection": None,
+        },
+    )
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+    assert token["confirmation_token"] not in response.text
+
+
+@pytest.mark.parametrize(
+    "producer", ["registry", "service", "http_code", "http_nested"]
+)
+def test_unknown_producer_errors_publish_only_fixed_internal_failure(
+    lifecycle_api, monkeypatch, producer
+):
+    from fastapi import HTTPException
+    from plugins.workflow.marketplace.operations import (
+        MarketplaceOperationRegistryError,
+    )
+    from plugins.workflow.marketplace.service import WorkflowMarketplaceError
+
+    secret = "token_shaped_" + "x" * 40
+
+    def fail(**kwargs):
+        if producer == "registry":
+            raise MarketplaceOperationRegistryError(secret, secret)
+        if producer == "service":
+            raise WorkflowMarketplaceError(secret, secret)
+        if producer == "http_code":
+            raise HTTPException(status_code=409, detail={"code": secret})
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "marketplace_request_conflict", "body": {"token": secret}},
+        )
+
+    monkeypatch.setattr(lifecycle_api.registry, "list_snapshot", fail)
+    response = lifecycle_api.client.get(V2 + "/operations")
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+    assert secret not in response.text
+
+
+@pytest.mark.parametrize("boundary", ["capabilities", "evicted"])
+def test_outer_route_rejects_missing_required_discriminator(
+    lifecycle_api, monkeypatch, boundary
+):
+    from plugins.workflow.marketplace import lifecycle_api as routes
+
+    api = lifecycle_api
+    if boundary == "capabilities":
+        monkeypatch.setattr(
+            routes,
+            "_Capabilities",
+            lambda **kwargs: {
+                key: value for key, value in kwargs.items() if key != "schema_version"
+            },
+        )
+        response = api.client.get(V2 + "/capabilities")
+    else:
+        operation = api.review()
+        value = {
+            key: operation[key]
+            for key in [
+                "request_id",
+                "registry_epoch",
+                "profile",
+                "kind",
+                "subject",
+                "selection",
+            ]
+        }
+        value["operation_id"] = operation["id"]
+        monkeypatch.setattr(
+            api.registry, "lookup_admission", lambda *args, **kwargs: value
+        )
+        response = api.client.get(V2 + "/admissions/" + operation["request_id"])
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "\ufeffowner/public",
+        "https://example.test/public.git",
+        "http://example.test/public.git",
+        "file:///fixture-example/public.git",
+        "owner/public",
+    ],
+)
+def test_exact_get_cancel_preserve_python_valid_repository_identity(
+    lifecycle_api, monkeypatch, repository
+):
+    api = lifecycle_api
+    operation = api.review()
+    operation["result"]["value"]["repository_url"] = repository
+    value = LifecycleOperation.model_validate(operation)
+    monkeypatch.setattr(api.registry, "get_lifecycle", lambda *args, **kwargs: value)
+    monkeypatch.setattr(api.registry, "cancel_lifecycle", lambda *args, **kwargs: value)
+    for method, suffix in [("get", ""), ("post", "/cancel")]:
+        response = getattr(api.client, method)(
+            V2 + "/operations/" + operation["id"] + suffix
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == operation
+
+
+def test_producer_cannot_publish_known_error_as_http_success(
+    lifecycle_api, monkeypatch
+):
+    from fastapi import HTTPException
+
+    def fail(**kwargs):
+        raise HTTPException(
+            status_code=200, detail={"code": "marketplace_request_conflict"}
+        )
+
+    monkeypatch.setattr(lifecycle_api.registry, "list_snapshot", fail)
+    response = lifecycle_api.client.get(V2 + "/operations")
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+
+
+def test_valid_real_responses_survive_exact_revalidation_and_keep_tokens_private(
+    lifecycle_api,
+):
+    from plugins.workflow.marketplace.lifecycle_api import _Capabilities
+    from plugins.workflow.marketplace.operations import (
+        AdmissionFound,
+        LifecycleOperationPage,
+        ReviewTokenResponse,
+    )
+
+    api = lifecycle_api
+    operation = api.review()
+    token = api.token(operation)
+    for path, model in [
+        ("/capabilities", _Capabilities),
+        ("/operations", LifecycleOperationPage),
+        ("/admissions/" + operation["request_id"], AdmissionFound),
+        ("/operations/" + operation["id"], LifecycleOperation),
+    ]:
+        response = api.client.get(V2 + path)
+        assert response.status_code == 200, response.text
+        assert (
+            model.model_validate_json(response.content).model_dump(mode="json")
+            == response.json()
+        )
+        assert token["confirmation_token"] not in response.text
+    response = api.client.post(V2 + "/operations/" + operation["id"] + "/cancel")
+    assert response.status_code == 200
+    assert response.json() == operation
+    assert (
+        ReviewTokenResponse.model_validate_json(json.dumps(token)).model_dump(
+            mode="json"
+        )
+        == token
+    )
+
+
 def test_replay_after_lost_confirm_response_admits_only_once(lifecycle_api):
     api = lifecycle_api
     review = api.review()

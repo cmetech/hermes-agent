@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import threading
 import time
 
 import pytest
+from pydantic import ValidationError
 
 from plugins.workflow.marketplace.operations import (
     MarketplaceSourceRefreshOperationResult,
@@ -19,6 +21,199 @@ from plugins.workflow.marketplace.operations import (
     WorkflowMarketplaceOperationRegistry,
     validate_marketplace_operation_result,
 )
+
+
+def _wire_envelope(name):
+    from plugins.workflow.marketplace.lifecycle_api import _Capabilities
+    from plugins.workflow.marketplace.operations import (
+        AdmissionEvicted,
+        LifecycleOperationPage,
+        ReviewTokenResponse,
+    )
+    from test_marketplace_lifecycle_models import _operation
+
+    operation = _operation("install_prepare")
+    common = {
+        "operation_id": operation["id"],
+        "request_id": operation["request_id"],
+        "subject": operation["subject"],
+        "selection": None,
+    }
+    if name == "capabilities":
+        return _Capabilities, {
+            "schema_version": 2,
+            "profile": "support",
+            "registry_epoch": operation["registry_epoch"],
+            "server_time": operation["created_at"],
+            "capabilities": [
+                "operations",
+                "admission_replay",
+                "package_state",
+                "transactions",
+                "updates",
+                "trust",
+                "sources",
+                "inspect",
+            ],
+        }
+    if name == "evicted":
+        return AdmissionEvicted, {
+            **common,
+            "state": "evicted",
+            "profile": "support",
+            "registry_epoch": operation["registry_epoch"],
+            "kind": "install_prepare",
+        }
+    if name == "token":
+        return ReviewTokenResponse, {
+            **common,
+            "review_digest": "a" * 64,
+            "confirmation_token": "secret_token_" + "a" * 32,
+            "expires_at": "2026-09-04T12:05:00Z",
+        }
+    return LifecycleOperationPage, {
+        "items": [operation],
+        "next_cursor": None,
+        "complete": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "name,field,value",
+    [
+        ("capabilities", "capabilities", ["inspect", "operations"]),
+        ("capabilities", "capabilities", ["operations", "operations"]),
+        ("capabilities", "capabilities", ["unknown"]),
+        ("capabilities", "schema_version", 2.0),
+        ("capabilities", "profile", " support"),
+        ("capabilities", "profile", ""),
+        ("capabilities", "profile", "a" * 257),
+        ("capabilities", "registry_epoch", "A" * 32),
+        ("capabilities", "server_time", "2026-09-04T12:00:00+00:00"),
+        ("capabilities", "server_time", "yesterday"),
+        ("evicted", "operation_id", "wmop_bad"),
+        ("evicted", "request_id", "bad"),
+        ("evicted", "registry_epoch", "b" * 32),
+        ("evicted", "profile", "support\n"),
+        ("evicted", "kind", "unknown"),
+        ("evicted", "kind", "refresh"),
+        ("evicted", "kind", "trust_prepare"),
+        ("evicted", "selection", {"type": "all"}),
+        ("token", "operation_id", "wmop_bad"),
+        ("token", "request_id", "bad"),
+        (
+            "token",
+            "request_id",
+            "wmreq_" + "e" * 32 + "_1788523200000_" + "f" * 32 + "\n",
+        ),
+        ("token", "review_digest", "A" * 64),
+        ("token", "confirmation_token", "a" * 31),
+        ("token", "confirmation_token", "a" * 257),
+        ("token", "confirmation_token", "a" * 32 + "!"),
+        ("token", "confirmation_token", "a" * 32 + "é"),
+        ("token", "confirmation_token", "a" * 32 + "\n"),
+        ("token", "expires_at", "2026-09-04T12:05:00+00:00"),
+        ("page", "next_cursor", "A" * 32),
+        ("page", "next_cursor", "a" * 31),
+        ("page", "next_cursor", "a" * 32),
+        ("page", "complete", False),
+        ("page", "complete", 1),
+    ],
+)
+def test_strict_outer_envelope_rejects_independent_wire_fault(name, field, value):
+    model, payload = _wire_envelope(name)
+    model.model_validate_json(json.dumps(payload))
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        model.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("name", ["capabilities", "evicted", "token", "page"])
+def test_outer_envelopes_reject_extras_duplicates_and_are_frozen(name):
+    model, payload = _wire_envelope(name)
+    value = model.model_validate_json(json.dumps(payload))
+    with pytest.raises(ValidationError):
+        setattr(value, next(iter(payload)), None)
+    with pytest.raises(ValidationError):
+        model.model_validate_json(json.dumps({**payload, "private_target": "secret"}))
+    key = next(iter(payload))
+    with pytest.raises(ValidationError):
+        model.model_validate_json(json.dumps(payload)[:-1] + f',"{key}":null}}')
+
+
+@pytest.mark.parametrize("name", ["capabilities", "evicted", "token", "page"])
+def test_outer_envelope_requires_every_declared_wire_field(name):
+    model, payload = _wire_envelope(name)
+    for field in payload:
+        incomplete = {key: value for key, value in payload.items() if key != field}
+        with pytest.raises(ValidationError):
+            model.model_validate_json(json.dumps(incomplete))
+
+
+@pytest.mark.parametrize("count", [0, 1, 100, 101])
+def test_operation_page_bound_and_exact_item_correlations(count):
+    from copy import deepcopy
+
+    model, payload = _wire_envelope("page")
+    first = payload["items"][0]
+    payload["items"] = []
+    for index in range(count):
+        item = deepcopy(first)
+        item["id"] = f"wmop_{'1' * 12}_{index:032x}"
+        item["request_id"] = first["request_id"][:-32] + f"{index:032x}"
+        payload["items"].append(item)
+    if count > 100:
+        with pytest.raises(ValidationError):
+            model.model_validate_json(json.dumps(payload))
+    else:
+        assert len(model.model_validate_json(json.dumps(payload)).items) == count
+
+
+@pytest.mark.parametrize(
+    "fault", ["id", "request_id", "profile", "epoch", "incomplete_empty"]
+)
+def test_operation_page_rejects_duplicate_mixed_or_incomplete_items(fault):
+    from copy import deepcopy
+
+    model, payload = _wire_envelope("page")
+    first = payload["items"][0]
+    second = deepcopy(first)
+    second["id"] = f"wmop_{'1' * 12}_{'3' * 32}"
+    second["request_id"] = first["request_id"][:-32] + "3" * 32
+    payload["items"].append(second)
+    model.model_validate_json(json.dumps(payload))
+    if fault in {"id", "request_id"}:
+        second[fault] = first[fault]
+    elif fault == "profile":
+        second["profile"] = "other"
+    elif fault == "epoch":
+        second["registry_epoch"] = "b" * 32
+        second["request_id"] = second["request_id"].replace("e" * 32, "b" * 32)
+    else:
+        payload.update(items=[], next_cursor="a" * 32, complete=False)
+    with pytest.raises(ValidationError):
+        model.model_validate_json(json.dumps(payload))
+
+
+def test_outer_envelope_valid_partial_and_boundary_values_are_preserved():
+    model, payload = _wire_envelope("capabilities")
+    payload.update(profile="\ufeffsupport", capabilities=["operations", "inspect"])
+    assert (
+        model.model_validate_json(json.dumps(payload)).model_dump(mode="json")
+        == payload
+    )
+    model, payload = _wire_envelope("token")
+    for token in ["x" * 32, "_-" * 128]:
+        payload["confirmation_token"] = token
+        value = model.model_validate_json(json.dumps(payload))
+        assert value.model_dump(mode="json") == payload
+        assert token not in repr(value)
+    model, payload = _wire_envelope("page")
+    payload.update(next_cursor="a" * 32, complete=False)
+    assert (
+        model.model_validate_json(json.dumps(payload)).model_dump(mode="json")
+        == payload
+    )
 
 
 def _wait_terminal(

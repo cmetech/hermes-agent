@@ -29,6 +29,7 @@ from hermes_cli.git_source import GitSourceError, validate_credential_free_git_s
 from .lifecycle_models import (
     CancelledBeforeCommitOutcome,
     KnownUnchangedOutcome,
+    LifecycleKind,
     LifecycleOperation,
     LifecycleOutcome,
     LifecyclePublicError,
@@ -41,6 +42,12 @@ from .lifecycle_models import (
     RESULT_TYPE_BY_KIND,
     RUNNING_PHASES_BY_KIND,
     require_result_kind,
+    require_admission_correlations,
+    _canonical_utc,
+    _EPOCH_PATTERN,
+    _OPERATION_ID_PATTERN,
+    _REQUEST_ID,
+    _require_clean_text,
 )
 from .admissions import (
     AdmissionReceipt,
@@ -394,30 +401,69 @@ class AdmissionFound(StrictLifecycleModel):
 
 
 class AdmissionEvicted(StrictLifecycleModel):
-    state: Literal["evicted"] = "evicted"
-    operation_id: str
-    request_id: str
-    registry_epoch: str
-    profile: str
-    kind: str
+    state: Literal["evicted"]
+    operation_id: str = Field(pattern=_OPERATION_ID_PATTERN)
+    request_id: str = Field(min_length=85, max_length=85, pattern=_REQUEST_ID.pattern)
+    registry_epoch: str = Field(pattern=_EPOCH_PATTERN)
+    profile: str = Field(min_length=1, max_length=256)
+    kind: LifecycleKind
     subject: LifecycleSubject
     selection: TrustSelection | None
+
+    @field_validator("profile")
+    @classmethod
+    def validate_profile(cls, value: str) -> str:
+        return _require_clean_text(value, label="profile")
+
+    @model_validator(mode="after")
+    def validate_correlations(self):
+        require_admission_correlations(
+            self.request_id,
+            self.registry_epoch,
+            self.kind,
+            self.subject,
+            self.selection,
+        )
+        return self
 
 
 class LifecycleOperationPage(StrictLifecycleModel):
-    items: tuple[LifecycleOperation, ...]
-    next_cursor: str | None
+    items: tuple[LifecycleOperation, ...] = Field(max_length=100)
+    next_cursor: str | None = Field(pattern=_EPOCH_PATTERN)
     complete: bool
+
+    @model_validator(mode="after")
+    def validate_page(self):
+        if self.complete != (self.next_cursor is None):
+            raise ValueError("page completion and cursor are inconsistent")
+        if not self.complete and not self.items:
+            raise ValueError("incomplete page must contain operations")
+        if len({item.id for item in self.items}) != len(self.items) or len({
+            item.request_id for item in self.items
+        }) != len(self.items):
+            raise ValueError("page operation and request IDs must be unique")
+        if len({(item.profile, item.registry_epoch) for item in self.items}) > 1:
+            raise ValueError("page operation scopes are inconsistent")
+        return self
 
 
 class ReviewTokenResponse(StrictLifecycleModel):
-    operation_id: str
-    request_id: str
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    operation_id: str = Field(pattern=_OPERATION_ID_PATTERN)
+    request_id: str = Field(min_length=85, max_length=85, pattern=_REQUEST_ID.pattern)
     subject: LifecycleSubject
     selection: TrustSelection | None
-    review_digest: str
-    confirmation_token: str = Field(repr=False)
-    expires_at: str
+    review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    confirmation_token: str = Field(
+        repr=False, min_length=32, max_length=256, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+    expires_at: str = Field(min_length=20, max_length=64)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: str) -> str:
+        return _canonical_utc(value, label="review expiry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -728,6 +774,7 @@ class WorkflowMarketplaceOperationRegistry:
         if record is not None:
             return self._project_lifecycle_locked(record)
         return AdmissionEvicted(
+            state="evicted",
             operation_id=receipt.operation_id,
             request_id=receipt.request_id,
             registry_epoch=self.admissions.epoch,

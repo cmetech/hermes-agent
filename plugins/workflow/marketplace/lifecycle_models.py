@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import re
+import unicodedata
 from types import MappingProxyType, UnionType
 from typing import Annotated, Literal, Self, TypeAlias, Union, get_args, get_origin
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -28,6 +30,7 @@ from .models import (
     InstalledPackageIdentity,
     PackageDiagnostic,
     PackageInspection,
+    PackageInspectionResource,
     PackageReviewAssessment,
     RequirementChanges,
     SHA256_PATTERN,
@@ -39,7 +42,6 @@ from .models import (
     WorkflowCompatibilityChanges,
     WorkflowRiskChanges,
     WorkflowTrustReviewItem,
-    _require_canonical_relative_path,
     _require_clean_text,
     _require_credential_free_repository_identity,
 )
@@ -75,9 +77,7 @@ LifecyclePhase = Literal[
 
 _OPERATION_ID_PATTERN = r"^wmop_[0-9a-f]{12}_[0-9a-f]{32}$"
 _EPOCH_PATTERN = r"^[0-9a-f]{32}$"
-_REQUEST_ID = re.compile(
-    r"^wmreq_(?P<epoch>[0-9a-f]{32})_[0-9]{13}_[0-9a-f]{32}$", re.ASCII
-)
+_REQUEST_ID = re.compile(r"^wmreq_([0-9a-f]{32})_[0-9]{13}_[0-9a-f]{32}$", re.ASCII)
 _SOURCE_KEY_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,126}[a-z0-9])?$"
 _PACKAGE_ID_PATTERN = r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
 _IDENTIFIER_PATTERN = r"^[a-z][a-z0-9_]{0,127}$"
@@ -85,10 +85,88 @@ _HEX64_PATTERN = r"^[0-9a-f]{64}$"
 _RESULT_BYTES_MAX = 2 * 1024 * 1024
 
 
+def lifecycle_relative_path(value: str) -> str:
+    """Validate the original V2 path without changing V1 package semantics."""
+    if (
+        not 1 <= len(value) <= 1024
+        or unicodedata.normalize("NFC", value) != value
+        or any(
+            unicodedata.category(char) == "Cc" or char in "\u2028\u2029"
+            for char in value
+        )
+        or "\\" in value
+    ):
+        raise ValueError("path must be a canonical lifecycle-relative path")
+    if any(
+        part in {"", ".", ".."}
+        or re.match(r"[A-Za-z]:", part)
+        or part.casefold() == ".git"
+        for part in value.split("/")
+    ):
+        raise ValueError("path must be a canonical lifecycle-relative path")
+    return value
+
+
+LifecycleRelativePath = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=1024,
+        json_schema_extra={"x-hermes-domain": "lifecycle_relative_path"},
+    ),
+    AfterValidator(lifecycle_relative_path),
+]
+
+# These reused V1 value fields acquire the V2 domain only at the projection
+# boundary. The same inventory marks their schema for downstream generation.
+_REUSED_PATH_FIELDS = {
+    InstalledPackage: {"package_path", "workflow_paths"},
+    PackageInspection: {"package_path"},
+    PackageInspectionResource: {"path"},
+    PackageReviewAssessment: {"package_resources"},
+    FileDigestChange: {"path", "old_path"},
+    WorkflowTrustReviewItem: {
+        "definition_path",
+        "companion_path",
+        "command_resources",
+        "script_resources",
+        "mcp_resources",
+        "mcp_resource_files",
+    },
+}
+
+
+def _mark_path_schema(schema: dict) -> None:
+    if schema.get("type") == "array":
+        _mark_path_schema(schema["items"])
+    elif "anyOf" in schema:
+        for variant in schema["anyOf"]:
+            if variant.get("type") != "null":
+                _mark_path_schema(variant)
+    else:
+        schema.pop("pattern", None)
+        schema.update(minLength=1, maxLength=1024)
+        schema["x-hermes-domain"] = "lifecycle_relative_path"
+
+
 class StrictLifecycleModel(BaseModel):
     """Base for strict immutable snake-case lifecycle wire objects."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        schema = super().model_json_schema(*args, **kwargs)
+        definitions = schema.get("$defs", {})
+        for model, fields in _REUSED_PATH_FIELDS.items():
+            definition = definitions.get(model.__name__, {})
+            properties = definition.get("properties", {})
+            for name in fields:
+                field = model.model_fields[name]
+                key = name if name in properties else field.alias
+                if key in properties:
+                    _mark_path_schema(properties[key])
+        return schema
 
     @classmethod
     def model_validate_json(
@@ -164,6 +242,69 @@ def _canonical_utc(value: str | None, *, label: str) -> str | None:
     return value
 
 
+LifecycleCapability = Literal[
+    "operations",
+    "admission_replay",
+    "package_state",
+    "transactions",
+    "updates",
+    "trust",
+    "sources",
+    "inspect",
+]
+LIFECYCLE_CAPABILITIES = get_args(LifecycleCapability)
+
+LifecycleHttpErrorCode = Literal[
+    "marketplace_admission_capacity",
+    "marketplace_admission_not_found",
+    "marketplace_epoch_changed",
+    "marketplace_internal_error",
+    "marketplace_list_capacity",
+    "marketplace_list_expired",
+    "marketplace_operation_capacity",
+    "marketplace_operation_conflict",
+    "marketplace_operation_not_found",
+    "marketplace_operation_unavailable",
+    "marketplace_request_conflict",
+    "marketplace_request_expired",
+    "marketplace_request_invalid",
+    "marketplace_review_unavailable",
+]
+LIFECYCLE_HTTP_ERROR_CODES = frozenset(get_args(LifecycleHttpErrorCode))
+
+
+class LifecycleCapabilities(StrictLifecycleModel):
+    schema_version: Literal[2]
+    profile: str = Field(min_length=1, max_length=256)
+    registry_epoch: str = Field(pattern=_EPOCH_PATTERN)
+    server_time: str = Field(min_length=20, max_length=64)
+    capabilities: list[LifecycleCapability] = Field(max_length=8)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version(cls, value):
+        if type(value) is not int or value != 2:
+            raise ValueError("schema_version must be the integer 2")
+        return value
+
+    @field_validator("profile")
+    @classmethod
+    def validate_profile(cls, value: str) -> str:
+        return _require_clean_text(value, label="profile")
+
+    @field_validator("server_time")
+    @classmethod
+    def validate_server_time(cls, value: str) -> str:
+        return _canonical_utc(value, label="server time")
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value):
+        if value != [item for item in LIFECYCLE_CAPABILITIES if item in value]:
+            raise ValueError("capabilities must be a unique ordered subsequence")
+        return value
+
+
 def _convert_snake_annotation(annotation: object, value: object) -> object:
     origin = get_origin(annotation)
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
@@ -188,9 +329,6 @@ def _require_v2_contract_version(value: object) -> None:
 def _validate_v2_installed_package(value: dict[str, object]) -> None:
     if "contract_version" in value:
         _require_v2_contract_version(value["contract_version"])
-    package_path = value.get("package_path")
-    if isinstance(package_path, str):
-        _require_canonical_relative_path(package_path)
     installed_at = value.get("installed_at")
     if isinstance(installed_at, str):
         _canonical_utc(installed_at, label="installed_at")
@@ -204,8 +342,7 @@ def _validate_v2_installed_package(value: dict[str, object]) -> None:
     if isinstance(workflow_paths, list) and all(
         isinstance(path, str) for path in workflow_paths
     ):
-        paths = [_require_canonical_relative_path(path) for path in workflow_paths]
-        if len(paths) != len({path.casefold() for path in paths}):
+        if len(workflow_paths) != len({path.casefold() for path in workflow_paths}):
             raise ValueError("workflow_paths must be unique canonical paths")
     identity = value.get("identity")
     source_name = value.get("source_name")
@@ -226,14 +363,16 @@ def _validate_v2_package_inspection(value: dict[str, object]) -> None:
     verified_at = value.get("verified_at")
     if isinstance(verified_at, str):
         _canonical_utc(verified_at, label="verified_at")
-    package_path = value.get("package_path")
-    if isinstance(package_path, str):
-        _require_canonical_relative_path(package_path)
 
 
 def _validate_v2_reused_payload(
     model: type[BaseModel], value: dict[str, object]
 ) -> None:
+    for name in _REUSED_PATH_FIELDS.get(model, ()):
+        paths = value.get(name)
+        for path in paths if isinstance(paths, list) else [paths]:
+            if isinstance(path, str):
+                lifecycle_relative_path(path)
     if model is InstalledPackageIdentity:
         PackageIdentity.model_validate(value)
     elif model is InstalledPackage:
@@ -334,17 +473,12 @@ TrustSelection: TypeAlias = Annotated[
 
 class WorkflowInventoryItem(StrictLifecycleModel):
     workflow_name: ShortText
-    definition_path: str = Field(min_length=1, max_length=1024)
+    definition_path: LifecycleRelativePath
 
     @field_validator("workflow_name")
     @classmethod
     def validate_workflow_name(cls, value: str) -> str:
         return _require_clean_text(value, label="workflow name")
-
-    @field_validator("definition_path")
-    @classmethod
-    def validate_definition_path(cls, value: str) -> str:
-        return _require_canonical_relative_path(value)
 
 
 class TrustWorkflowState(WorkflowInventoryItem):
@@ -496,7 +630,7 @@ class InstallReviewProjection(ReviewAvailability):
     repository_url: str = Field(min_length=1, max_length=4096)
     configured_ref: str | None = Field(default=None, max_length=1024)
     resolved_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
-    package_path: str = Field(min_length=1, max_length=1024)
+    package_path: LifecycleRelativePath
     candidate_version: str = Field(pattern=SEMANTIC_VERSION_PATTERN)
     candidate_digest: str = Field(pattern=SHA256_PATTERN)
     assessment: SnakePackageReviewAssessment
@@ -514,11 +648,6 @@ class InstallReviewProjection(ReviewAvailability):
         if value is None:
             return None
         return _require_clean_text(value, label="configured ref")
-
-    @field_validator("package_path")
-    @classmethod
-    def validate_package_path(cls, value: str) -> str:
-        return _require_canonical_relative_path(value)
 
     @model_validator(mode="after")
     def validate_identity(self) -> "InstallReviewProjection":
@@ -590,14 +719,14 @@ class TrustReviewProjection(ReviewAvailability):
     version: str = Field(pattern=SEMANTIC_VERSION_PATTERN)
     resolved_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
     distribution_digest: str = Field(pattern=SHA256_PATTERN)
-    package_resources: list[str] = Field(max_length=512)
+    package_resources: list[LifecycleRelativePath] = Field(max_length=512)
     package_workflows: list[WorkflowInventoryItem] = Field(min_length=1, max_length=512)
     workflows: list[SnakeWorkflowTrustReviewItem] = Field(min_length=1, max_length=512)
 
     @field_validator("package_resources")
     @classmethod
     def validate_package_resources(cls, value: list[str]) -> list[str]:
-        paths = [_require_canonical_relative_path(path) for path in value]
+        paths = value
         if paths != sorted(paths) or len(paths) != len(set(paths)):
             raise ValueError("trust review resources must be unique and sorted")
         return paths
@@ -833,6 +962,20 @@ SUBJECT_TYPES_BY_KIND = MappingProxyType({
     "trust_revoke": frozenset({"package"}),
 })
 
+
+def require_admission_correlations(
+    request_id, registry_epoch, kind, subject, selection
+):
+    request_match = _REQUEST_ID.fullmatch(request_id)
+    if request_match is None or request_match.group(1) != registry_epoch:
+        raise ValueError("operation request epoch is inconsistent")
+    if subject.type not in SUBJECT_TYPES_BY_KIND[kind]:
+        raise ValueError("operation kind/subject mismatch")
+    trust_kind = kind in {"trust_prepare", "trust_confirm", "trust_revoke"}
+    if trust_kind != (selection is not None):
+        raise ValueError("operation kind/selection mismatch")
+
+
 RUNNING_PHASES_BY_KIND = MappingProxyType({
     "refresh": frozenset({"running", "fetching"}),
     "inspect": frozenset({"running", "fetching", "reviewing"}),
@@ -889,7 +1032,7 @@ class LifecycleOperation(StrictLifecycleModel):
     schema_version: Literal[2]
     id: str = Field(pattern=_OPERATION_ID_PATTERN)
     registry_epoch: str = Field(pattern=_EPOCH_PATTERN)
-    request_id: str = Field(min_length=85, max_length=85)
+    request_id: str = Field(min_length=85, max_length=85, pattern=_REQUEST_ID.pattern)
     kind: LifecycleKind
     subject: LifecycleSubject
     selection: TrustSelection | None
@@ -917,14 +1060,13 @@ class LifecycleOperation(StrictLifecycleModel):
 
     @model_validator(mode="after")
     def validate_relationships(self) -> "LifecycleOperation":
-        request_match = _REQUEST_ID.fullmatch(self.request_id)
-        if request_match is None or request_match.group("epoch") != self.registry_epoch:
-            raise ValueError("operation request epoch is inconsistent")
-        if self.subject.type not in SUBJECT_TYPES_BY_KIND[self.kind]:
-            raise ValueError("operation kind/subject mismatch")
-        trust_kind = self.kind in {"trust_prepare", "trust_confirm", "trust_revoke"}
-        if trust_kind != (self.selection is not None):
-            raise ValueError("operation kind/selection mismatch")
+        require_admission_correlations(
+            self.request_id,
+            self.registry_epoch,
+            self.kind,
+            self.subject,
+            self.selection,
+        )
         self._validate_time_and_state()
         if self.result is not None:
             require_result_kind(self.kind, self.result)
