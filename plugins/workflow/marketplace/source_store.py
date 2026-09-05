@@ -943,6 +943,7 @@ class WorkflowSourceStore:
         *,
         parent_identity: tuple[int, int],
         cancelled: Callable[[], bool] | None = None,
+        verified_publication: VerifiedSourceCatalog | None = None,
     ) -> None:
         if path == self.path:
             limit = self.max_source_state_bytes
@@ -953,6 +954,10 @@ class WorkflowSourceStore:
         rendered = _render_state(value, limit=limit, size_code=size_code)
         if cancelled is not None:
             _check_cancelled(cancelled)
+        if verified_publication is not None:
+            from .lifecycle_state import _source_write_started
+
+            _source_write_started(self, verified_publication)
         try:
             atomic_write_text(
                 path,
@@ -969,6 +974,20 @@ class WorkflowSourceStore:
                 else "catalog_state_write_failed"
             )
             _fail(code, "could not atomically replace marketplace state")
+        if verified_publication is not None:
+            from .lifecycle_state import _source_write_finished
+
+            # The caller still owns the source lock. Require the exact complete
+            # replacement and the same private directory before claiming publication.
+            metadata = self.root.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse_point(metadata)
+                or (metadata.st_dev, metadata.st_ino) != parent_identity
+                or self._read_catalog() != value
+            ):
+                _fail("catalog_state_write_failed", "source publication is unverified")
+            _source_write_finished(self, verified_publication)
 
     def _require_current_source(self, expected: WorkflowMarketplaceSource) -> None:
         current = next(
@@ -1323,6 +1342,7 @@ class WorkflowSourceStore:
                     replacement,
                     parent_identity=parent_identity,
                     cancelled=cancelled,
+                    verified_publication=verified,
                 )
         except WorkflowLockTimeout as error:
             _fail("source_lock_timeout", str(error))

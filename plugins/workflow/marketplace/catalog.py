@@ -12,12 +12,14 @@ from typing import Callable
 from hermes_cli.git_source import safe_git_error
 
 from .git import WorkflowGitFetcher
+from .lifecycle_state import source_refresh
 from .models import WorkflowMarketplaceSource, WorkflowPackageIndexEntry
 from .package import WorkflowMarketplaceError, load_repository_index
 from .source_store import (
     RefreshState,
     VerifiedSourceCatalog,
     WorkflowSourceStore,
+    redact_source_refresh_message,
 )
 
 
@@ -89,7 +91,9 @@ def _safe_failure(error: WorkflowMarketplaceError, source_url: str) -> str:
         args=(), returncode=1, stdout="", stderr=str(error)
     )
     rendered = safe_git_error(result, source_url).strip()
-    return rendered[:4096] or "marketplace source refresh failed"
+    return redact_source_refresh_message(
+        rendered[:4096] or "workflow marketplace source refresh failed", source_url
+    )
 
 
 class WorkflowMarketplaceCatalog:
@@ -121,6 +125,7 @@ class WorkflowMarketplaceCatalog:
             enabled=enabled,
         )
 
+    @source_refresh
     def refresh_source(
         self,
         name: str,

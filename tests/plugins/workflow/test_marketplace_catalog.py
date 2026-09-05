@@ -154,7 +154,8 @@ def test_failed_refresh_replaces_ssh_password_diagnostic_before_persistence(
     result = catalog.refresh_source("company")
 
     assert result.state == "authentication-failed"
-    assert result.message == "marketplace source refresh failed"
+    assert result.message == "workflow marketplace source refresh failed"
+    assert catalog.source_store.status("company").message == result.message
     assert "status-secret" not in repr(result)
     assert "status-secret" not in catalog.source_store.catalog_path.read_text()
 
@@ -417,6 +418,7 @@ def test_tampered_cache_metadata_fails_closed_without_rewrite_or_secret_display(
     "message",
     [
         "authentication failed for ssh://git:status-secret@example.test/repo.git",
+        "fatal: ssh://git@example.test/team/repo.git was unavailable",
         "authentication failed for alice:status-secret@example.test/repo.git",
         "authentication failed for owner/repo?token=status-secret",
     ],
@@ -475,22 +477,29 @@ def test_read_only_credential_bearing_status_fails_without_chmod_or_rewrite(
     assert stat.S_IMODE(catalog.source_store.catalog_path.stat().st_mode) == 0o400
 
 
-def test_sanitized_ssh_username_status_remains_valid(tmp_path: Path) -> None:
+def test_ssh_username_diagnostic_is_sanitized_before_cache_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     remote, _ = _bare_repository(tmp_path)
     catalog = _catalog(tmp_path)
     catalog.add_source("company", remote.as_uri())
     catalog.refresh_source("company")
-    raw = json.loads(catalog.source_store.catalog_path.read_bytes())
-    raw["statuses"][0].update({
-        "state": "stale",
-        "diagnosticCode": "source_unavailable",
-        "message": "fatal: ssh://git@example.test/team/repo.git was unavailable",
-    })
-    catalog.source_store.catalog_path.write_text(
-        json.dumps(raw, sort_keys=True) + "\n", encoding="utf-8"
-    )
 
-    assert catalog.search("")[0].state == "stale"
+    def unavailable(*args, **kwargs):
+        raise WorkflowMarketplaceError(
+            "source_unavailable",
+            "fatal: ssh://git@example.test/team/repo.git was unavailable",
+        )
+
+    monkeypatch.setattr(catalog.git_fetcher, "fetch", unavailable)
+    result = catalog.refresh_source("company")
+    assert result.state == "stale"
+    assert result.message == "workflow marketplace source refresh failed"
+    assert "git@example.test" not in catalog.source_store.catalog_path.read_text()
+
+    reopened = _catalog(tmp_path)
+    assert reopened.search("")[0].state == "stale"
+    assert reopened.source_store.status("company").message == result.message
 
 
 def test_source_removed_during_refresh_cannot_publish_orphaned_cache(

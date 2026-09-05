@@ -46,6 +46,305 @@ def domain():
 
 
 @pytest.fixture
+def source_service(service, published_repo):
+    from plugins.workflow.marketplace.models import WorkflowMarketplaceSource
+
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="company", repositoryUrl=published_repo.remote.as_uri()
+        )
+    )
+    return service
+
+
+def _source_completion(service, *, call=None, source_name="company"):
+    module = importlib.import_module("plugins.workflow.marketplace.lifecycle_state")
+    producer = getattr(module, "complete_source_refresh", None)
+    assert callable(producer), "source publication evidence producer is missing"
+    return producer(
+        service,
+        source_name=source_name,
+        call=call or (lambda: service.refresh_source(source_name)),
+    )
+
+
+def test_source_completion_captures_exact_verified_publication(source_service):
+    completion = _source_completion(source_service)
+    store = source_service.catalog.source_store
+    cached = store.cached(store.get("company"))
+    assert completion.state == "succeeded"
+    assert completion.outcome.type == "committed"
+    assert completion.outcome.package_state is None
+    assert completion.result.type == "source_refresh"
+    assert completion.result.value.source_name == "company"
+    assert completion.result.value.resolved_commit == cached.resolved_commit
+    assert completion.result.value.verified_at == cached.verified_at
+    assert store.status("company").state == "fresh"
+    assert completion.review_token is None
+
+
+def test_source_completion_disabled_makes_no_publication(source_service):
+    source_service.set_source_enabled("company", False)
+    completion = _source_completion(source_service)
+    assert completion.state == "succeeded"
+    assert completion.result.value.state == "disabled"
+    assert completion.outcome.type == "known_unchanged"
+    assert not source_service.catalog.source_store.catalog_path.exists()
+
+
+def test_source_completion_fetch_failure_preserves_verified_cache(
+    source_service, monkeypatch
+):
+    original = source_service.refresh_source("company")
+
+    def unavailable(*args, **kwargs):
+        raise WorkflowMarketplaceError("source_unavailable", "repository unavailable")
+
+    monkeypatch.setattr(source_service.catalog.git_fetcher, "fetch", unavailable)
+    completion = _source_completion(source_service)
+    assert completion.state == "succeeded"
+    assert completion.result.value.state == "stale"
+    assert completion.outcome.type == "known_unchanged"
+    assert completion.result.value.resolved_commit == original.resolved_commit
+    assert source_service.catalog.source_store.status("company").state == "stale"
+
+
+def test_source_completion_encoding_failure_proves_no_publication(source_service):
+    store = source_service.catalog.source_store
+    store.max_catalog_state_bytes = 1
+    completion = _source_completion(source_service)
+    assert completion.state == "succeeded"
+    assert completion.result.value.state == "unavailable"
+    assert completion.outcome.type == "known_unchanged"
+    assert not store.catalog_path.exists()
+
+
+@pytest.mark.parametrize("replace_first", [False, True])
+@pytest.mark.parametrize("fail_status", [False, True])
+def test_source_completion_atomic_uncertainty_survives_fallback_status(
+    source_service, monkeypatch, replace_first, fail_status
+):
+    import plugins.workflow.marketplace.source_store as stores
+
+    store = source_service.catalog.source_store
+    original = stores.atomic_write_text
+    attempted = False
+
+    def fail_publication(path, *args, **kwargs):
+        nonlocal attempted
+        if path == store.catalog_path:
+            if not attempted:
+                attempted = True
+                if replace_first:
+                    original(path, *args, **kwargs)
+                raise OSError("atomic publication outcome unavailable")
+            if fail_status:
+                raise OSError("status publication unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(stores, "atomic_write_text", fail_publication)
+    completion = _source_completion(source_service)
+    assert completion.state == "failed"
+    assert completion.result is None
+    assert completion.outcome.type == "outcome_unknown"
+    cached = store.cached(store.get("company"))
+    assert (cached is not None) is replace_first
+    if cached is not None:
+        assert cached.packages[0].id == "laptop-support"
+
+
+@pytest.mark.parametrize("checkpoint", ["fetch", "encoding"])
+def test_source_completion_cancellation_before_write_is_proven(
+    source_service, monkeypatch, checkpoint
+):
+    import plugins.workflow.marketplace.source_store as stores
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+
+    cancelled = False
+    if checkpoint == "fetch":
+        owner, name = source_service.catalog.git_fetcher, "fetch"
+    else:
+        owner, name = stores, "_render_state"
+    original = getattr(owner, name)
+
+    def cancel_after(*args, **kwargs):
+        nonlocal cancelled
+        result = original(*args, **kwargs)
+        cancelled = True
+        return result
+
+    monkeypatch.setattr(owner, name, cancel_after)
+    with pytest.raises(MarketplaceOperationCancelled):
+        _source_completion(
+            source_service,
+            call=lambda: source_service.refresh_source(
+                "company", cancelled=lambda: cancelled
+            ),
+        )
+    assert not source_service.catalog.source_store.catalog_path.exists()
+
+
+def test_source_completion_late_cancellation_preserves_publication(
+    source_service, monkeypatch
+):
+    import plugins.workflow.marketplace.source_store as stores
+
+    cancelled = False
+    original = stores.atomic_write_text
+
+    def cancel_after_replace(*args, **kwargs):
+        nonlocal cancelled
+        original(*args, **kwargs)
+        cancelled = True
+
+    monkeypatch.setattr(stores, "atomic_write_text", cancel_after_replace)
+    completion = _source_completion(
+        source_service,
+        call=lambda: source_service.refresh_source(
+            "company", cancelled=lambda: cancelled
+        ),
+    )
+    assert completion.state == "succeeded"
+    assert completion.outcome.type == "committed"
+    assert source_service.catalog.source_store.status("company").state == "fresh"
+
+
+def test_source_completion_rejects_retained_result_without_execution(source_service):
+    retained = source_service.refresh_source("company")
+    completion = _source_completion(source_service, call=lambda: retained)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+
+
+@pytest.mark.parametrize(
+    "field,value", [("source_name", "other"), ("package_count", 0)]
+)
+def test_source_completion_rejects_substituted_publication_result(
+    source_service, field, value
+):
+    from dataclasses import replace
+
+    def substituted():
+        result = source_service.refresh_source("company")
+        return replace(result, **{field: value})
+
+    completion = _source_completion(source_service, call=substituted)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert source_service.catalog.source_store.status("company").state == "fresh"
+
+
+def test_source_completion_lost_domain_return_does_not_erase_publication(
+    source_service,
+):
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+
+    def lost_return():
+        source_service.refresh_source("company")
+        raise MarketplaceOperationCancelled("late transport cancellation")
+
+    completion = _source_completion(source_service, call=lost_return)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert source_service.catalog.source_store.status("company").state == "fresh"
+
+
+def test_source_completion_wrong_store_cannot_publish(source_service, tmp_path):
+    from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+
+    other = WorkflowMarketplaceService(tmp_path / "other-home", profile="support")
+    other.add_source(source_service.catalog.source_store.get("company"))
+    completion = _source_completion(
+        source_service, call=lambda: other.refresh_source("company")
+    )
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert not other.catalog.source_store.catalog_path.exists()
+
+
+def test_source_completion_catalog_replacement_cannot_transfer_authority(
+    source_service, tmp_path
+):
+    from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+
+    other = WorkflowMarketplaceService(tmp_path / "other-home", profile="support")
+    other.add_source(source_service.catalog.source_store.get("company"))
+
+    def replace_catalog():
+        source_service.catalog = other.catalog
+        return source_service.refresh_source("company")
+
+    completion = _source_completion(source_service, call=replace_catalog)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert not other.catalog.source_store.catalog_path.exists()
+
+
+def test_source_completion_reuse_retains_uncertainty_after_publication(source_service):
+    def reused():
+        result = source_service.refresh_source("company")
+        with pytest.raises(WorkflowMarketplaceError):
+            source_service.refresh_source("company", cancelled=lambda: True)
+        return result
+
+    completion = _source_completion(source_service, call=reused)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert source_service.catalog.source_store.status("company").state == "fresh"
+
+
+def test_source_completion_unpersisted_diagnostic_uses_canonical_sanitizer(
+    source_service, monkeypatch
+):
+    def cancellation_error(*args, **kwargs):
+        raise WorkflowMarketplaceError(
+            "source_cancelled", "cancelled in /tmp/hermes-private-stage"
+        )
+
+    monkeypatch.setattr(source_service.catalog.git_fetcher, "fetch", cancellation_error)
+    completion = _source_completion(source_service)
+    assert completion.state == "succeeded"
+    assert completion.outcome.type == "known_unchanged"
+    assert (
+        completion.result.value.message == "workflow marketplace source refresh failed"
+    )
+    assert "hermes-private-stage" not in completion.result.model_dump_json()
+
+
+def test_source_completion_rejects_wrong_source_before_write(source_service):
+    completion = _source_completion(
+        source_service,
+        source_name="other",
+        call=lambda: source_service.refresh_source("company"),
+    )
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert not source_service.catalog.source_store.catalog_path.exists()
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_source_completion_copied_context_cannot_publish(source_service, closed):
+    contexts = []
+
+    def call():
+        contexts.append(copy_context())
+        if not closed:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                with pytest.raises(WorkflowMarketplaceError):
+                    pool.submit(
+                        contexts[0].run, source_service.refresh_source, "company"
+                    ).result(timeout=5)
+
+    completion = _source_completion(source_service, call=call)
+    if closed:
+        with pytest.raises(WorkflowMarketplaceError):
+            contexts[0].run(source_service.refresh_source, "company")
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert not source_service.catalog.source_store.catalog_path.exists()
+
+
+@pytest.fixture
 def lifecycle_domain(domain, service, published_repo):
     class Domain:
         identity = InstalledPackageIdentity(

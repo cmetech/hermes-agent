@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import wraps
 import threading
 from typing import TYPE_CHECKING, Literal
@@ -28,6 +28,7 @@ from .operations import (
 from .package import WorkflowMarketplaceError, load_distribution
 
 if TYPE_CHECKING:
+    from .catalog import SourceRefreshResult
     from .service import WorkflowMarketplaceService
 
 
@@ -174,6 +175,180 @@ def _execution():
     except RuntimeError:
         task = None
     return threading.get_ident(), task
+
+
+@dataclass
+class _SourceEvidence:
+    catalog: object
+    store: object
+    source_name: str
+    execution: tuple
+    used: bool = False
+    active: bool = False
+    entered: bool = False
+    published: object = None
+    result: object = None
+    cancelled: bool = False
+    invalid: threading.Event = field(default_factory=threading.Event, repr=False)
+    closed: threading.Event = field(default_factory=threading.Event, repr=False)
+
+
+_source_evidence: ContextVar[_SourceEvidence | None] = ContextVar(
+    "marketplace_source_publication_evidence", default=None
+)
+
+
+def _source_scope(*, catalog=None, store=None):
+    evidence = _source_evidence.get()
+    if evidence is None:
+        return None
+    if (
+        evidence.closed.is_set()
+        or evidence.execution != _execution()
+        or (catalog is not None and evidence.catalog is not catalog)
+        or (store is not None and evidence.store is not store)
+    ):
+        evidence.invalid.set()
+        raise WorkflowMarketplaceError(
+            "marketplace_operation_failed", "source evidence scope is invalid"
+        )
+    return evidence
+
+
+def source_refresh(method):
+    """Observe one real catalog invocation without changing its legacy return."""
+
+    @wraps(method)
+    def wrapped(catalog, name, *, cancelled=lambda: False):
+        evidence = _source_scope(catalog=catalog)
+        if evidence is None:
+            return method(catalog, name, cancelled=cancelled)
+        if evidence.used or name != evidence.source_name:
+            evidence.invalid.set()
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_failed", "source evidence binding is invalid"
+            )
+        evidence.used = evidence.active = True
+
+        def checkpoint():
+            try:
+                requested = cancelled()
+            except Exception:
+                evidence.cancelled = True
+                raise
+            evidence.cancelled |= bool(requested)
+            return requested
+
+        try:
+            evidence.result = method(catalog, name, cancelled=checkpoint)
+            return evidence.result
+        finally:
+            evidence.active = False
+
+    return wrapped
+
+
+def _source_write_started(store, verified):
+    evidence = _source_scope(store=store)
+    if evidence is None:
+        return
+    if (
+        not evidence.active
+        or verified.source.name != evidence.source_name
+        or evidence.entered
+    ):
+        evidence.invalid.set()
+        raise WorkflowMarketplaceError(
+            "marketplace_operation_failed", "source publication binding is invalid"
+        )
+    # Set before entering the atomic helper: it may raise after replacement.
+    # A fallback status write must never clear this uncertainty.
+    evidence.entered = True
+
+
+def _source_write_finished(store, verified):
+    evidence = _source_scope(store=store)
+    if evidence is not None:
+        evidence.published = verified
+
+
+def complete_source_refresh(
+    service: WorkflowMarketplaceService,
+    *,
+    source_name: str,
+    call: Callable[[], SourceRefreshResult],
+) -> LifecycleCompletion:
+    """Project actual source publication evidence, never cached status guesses."""
+    subject = wire.SourceSubject(type="source", source_name=source_name)
+    catalog = service.catalog
+    evidence = _SourceEvidence(
+        catalog, catalog.source_store, subject.source_name, _execution()
+    )
+    previous = _source_evidence.get()
+    if previous is not None:
+        previous.invalid.set()
+        return _unknown()
+    handle = _source_evidence.set(evidence)
+    try:
+        value = call()
+        if (
+            evidence.invalid.is_set()
+            or not evidence.used
+            or value is not evidence.result
+            or value is None
+            or value.source_name != source_name
+        ):
+            return _unknown()
+        if evidence.entered and evidence.published is None:
+            return _unknown()
+        if evidence.cancelled and not evidence.entered and value.state == "cancelled":
+            raise MarketplaceOperationCancelled("source refresh was cancelled")
+        result = _RESULT.validate_python({
+            "type": "source_refresh",
+            "value": asdict(value),
+        })
+        if evidence.published is not None:
+            verified = evidence.published
+            if (
+                value.state != "fresh"
+                or value.repository_url != verified.source.repository_url
+                or value.resolved_commit != verified.resolved_commit
+                or value.verified_at != verified.verified_at
+                or value.package_count != len(verified.packages)
+                or value.diagnostic_code is not None
+                or value.message is not None
+            ):
+                return _unknown()
+            outcome = wire.CommittedOutcome(type="committed", package_state=None)
+        else:
+            if value.state == "fresh":
+                return _unknown()
+            outcome = wire.KnownUnchangedOutcome(
+                type="known_unchanged", evidence="before_mutation", package_state=None
+            )
+        return LifecycleCompletion(
+            state="succeeded", result=result, error=None, outcome=outcome
+        )
+    except MarketplaceOperationCancelled:
+        if (
+            evidence.cancelled
+            and not evidence.entered
+            and not evidence.invalid.is_set()
+        ):
+            raise
+        return _unknown()
+    except Exception as error:
+        if evidence.entered or evidence.invalid.is_set() or not evidence.used:
+            return _unknown(error)
+        return _failure(
+            error,
+            wire.KnownUnchangedOutcome(
+                type="known_unchanged", evidence="before_mutation", package_state=None
+            ),
+        )
+    finally:
+        evidence.closed.set()
+        _source_evidence.reset(handle)
 
 
 @dataclass
