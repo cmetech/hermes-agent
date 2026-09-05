@@ -112,6 +112,8 @@ def require_result_kind(kind, result):
 
 **Produces:** `LifecycleAdmissionStore.reserve(request_id, actor, profile_key, kind, canonical_body, subject, selection)` with found/new/conflict/expired outcomes; registry `start` integration, actor-scoped exact admission lookup, token-free snapshot pagination, and private token vault.
 
+**Staged evidence boundary:** V2 workers supply an explicit typed result/outcome completion; the registry validates and publishes it but never invents mutation evidence from legacy V1 results. Vault insertion requires explicit authoritative expiry, review digest, subject/selection and unused-token validation; 14A3 supplies these from service/transaction internals. V1 read callers can pass safe subject/body and receive internal generated receipt IDs now, while their complete V2 terminal projection bridge belongs to 14A3. Until that bridge exists, a V2 list/get requiring unavailable legacy metadata/evidence must fail closed, not omit records, claim a complete scan, or synthesize success/unchanged. V2 routes are not exposed until 14A3. Test the mechanics through real registry workers supplying explicit typed completions; keep V1 routes functional in their existing shape.
+
 - [ ] Write tests with injected clock/epoch/random and events controlling enqueue/worker execution. Verify concurrent replay, changed body/subject/kind/selection, replay before token revalidation, enqueue failure receipt, capacity, expiry after pruning, epoch change, cross-actor/profile isolation, and profile cache retirement.
 
 ```python
@@ -147,6 +149,8 @@ admissions.require_new_request_window(request_id)
 **Consumes:** 14A1/A2 strict models/receipts.
 
 **Produces:** V2 routes from amendment §§3–5; locked `read_package_state`; exact commit/rollback evidence; `package-state` and `recover-packages` CLI adapters; V1 preview mutation rejection. No new journal schema unless separately amended.
+
+Complete the 14A2 staged interfaces before exposing V2: supply authoritative typed worker outcomes, review-token expiry/digest/selection/unused checks, and V1 refresh/inspect/update-check V2 terminal projections. Mixed legacy/V2 list coverage must be complete or fail closed; no missing-evidence placeholder may escape as a truthful terminal success. Read-only knowledge can prove no package mutation, but source-cache publication requires its own evidence and never a guessed generic failure mapping.
 
 - [ ] Reproduce real transaction candidate-retained failure before adding evidence. Extend `test_post_trust_commit_failure_never_rolls_back_package_or_provenance`, verified rollback, remove failure, trust write/read failure and concurrent trust/update tests. Add state-route probes for mismatched bytes/provenance, ambiguous journals, busy leases, absence, and complete trust state.
 
