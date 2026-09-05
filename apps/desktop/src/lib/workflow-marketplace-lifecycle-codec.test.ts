@@ -5,6 +5,21 @@ import corpus from '../../../../tests/fixtures/workflow-marketplace-lifecycle-v2
 const codec = await import('./workflow-marketplace-lifecycle-codec').catch(() => null)
 
 describe('Python lifecycle acceptance parity', () => {
+  it('reports actual ambiguous publication as unconfirmed recovery, never rollback or success', () => {
+    const operation = corpus.operationCases.find(item => item.name === 'service recovery ambiguous')
+    const state = corpus.packageStateCases.find(item => item.name === 'service ambiguous state')
+    expect(operation).toBeDefined()
+    expect(codec!.decodeLifecycleOperation(operation!.value)).toMatchObject({
+      state: 'failed',
+      result: null,
+      outcome: { type: 'recovery_required', reason: 'recovery_ambiguous' }
+    })
+    expect(codec!.decodeLifecyclePackageState(state!.value)).toMatchObject({
+      state: 'unconfirmed',
+      installed: null,
+      trust: null
+    })
+  })
   it('preserves a Python-valid U+FEFF repository identity', () => {
     const value = structuredClone(corpus.operationCases.find(item => item.name === 'service install confirm')!.value)
 

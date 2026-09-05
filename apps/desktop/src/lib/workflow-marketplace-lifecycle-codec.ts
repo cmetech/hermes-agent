@@ -81,6 +81,137 @@ function canonicalPath(value: string): boolean {
   )
 }
 
+// urllib.parse.unquote_plus decodes ASCII runs with UTF-8 replacement, leaving
+// literal non-ASCII runs untouched. ignoreBOM preserves Python's decoded U+FEFF.
+function pythonUnquotePlus(value: string): string {
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
+
+  // eslint-disable-next-line no-control-regex -- Python's ASCII-run boundary.
+  return value.replaceAll('+', ' ').replace(/[\u0000-\u007f]+/g, run => {
+    const bytes: number[] = []
+
+    for (let index = 0; index < run.length; index++) {
+      if (run[index] === '%' && /^[0-9a-f]{2}$/i.test(run.slice(index + 1, index + 3))) {
+        bytes.push(Number.parseInt(run.slice(index + 1, index + 3), 16))
+        index += 2
+      } else {
+        bytes.push(run.charCodeAt(index))
+      }
+    }
+
+    return decoder.decode(new Uint8Array(bytes))
+  })
+}
+
+// The consumed urllib.parse bracket check uses ipaddress, not WHATWG URL:
+// scope IDs and nonnumeric ports are allowed; bracketed IPv4 is not.
+function pythonIpv6(host: string): boolean {
+  const [address, scope, ...extraScopes] = host.split('%')
+
+  if ((scope !== undefined && !scope) || extraScopes.length || address.length > 45) {
+    return false
+  }
+
+  let parts = address.split(':')
+
+  if (parts.length < 3) {
+    return false
+  }
+
+  if (parts.at(-1)!.includes('.')) {
+    const octets = parts.pop()!.split('.')
+
+    if (octets.length !== 4 || octets.some(part => !/^(0|[1-9][0-9]{0,2})$/.test(part) || Number(part) > 255)) {
+      return false
+    }
+
+    parts.push('0', '0') // An accepted IPv4 suffix occupies exactly two hextets.
+  }
+
+  if (parts.length > 9) {
+    return false
+  }
+
+  const skips = parts.slice(1, -1).filter(part => part === '').length
+
+  if (skips > 1) {
+    return false
+  }
+
+  if (skips === 1) {
+    if ((parts[0] === '' && parts[1] !== '') || (parts.at(-1) === '' && parts.at(-2) !== '')) {
+      return false
+    }
+
+    parts = parts.filter(part => part !== '')
+
+    if (parts.length >= 8) {
+      return false
+    }
+  } else if (parts.length !== 8) {
+    return false
+  }
+
+  return parts.every(part => /^[0-9a-f]{1,4}$/i.test(part))
+}
+
+// Mirror only urlsplit's consumed fields/validation. Do not ask WHATWG URL to
+// canonicalize the repository identity or validate an unconsumed numeric port.
+function pythonUrlsplit(value: string): { scheme: string; authority: string; query: string } | null {
+  // eslint-disable-next-line no-control-regex -- urllib's specified leading C0 set.
+  let rest = value.replace(/^[\u0000-\u0020]+/, '').replace(/[\t\r\n]/g, '')
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(rest)?.[1].toLowerCase() ?? ''
+
+  if (scheme) {
+    rest = rest.slice(scheme.length + 1)
+  }
+
+  let authority = ''
+
+  if (rest.startsWith('//')) {
+    rest = rest.slice(2)
+    const end = rest.search(/[/?#]/)
+    authority = end < 0 ? rest : rest.slice(0, end)
+    rest = end < 0 ? '' : rest.slice(end)
+
+    if (authority.includes('[') !== authority.includes(']')) {
+      return null
+    }
+
+    if (authority.includes('[')) {
+      const hostnameAndPort = authority.slice(authority.lastIndexOf('@') + 1)
+      const open = hostnameAndPort.indexOf('[')
+      let host: string
+
+      if (open >= 0) {
+        const close = hostnameAndPort.indexOf(']', open + 1)
+        const port = hostnameAndPort.slice(close + 1)
+
+        if (open !== 0 || close < 0 || (port && !port.startsWith(':'))) {
+          return null
+        }
+
+        host = hostnameAndPort.slice(open + 1, close)
+      } else {
+        host = hostnameAndPort.split(':')[0]
+      }
+
+      if (host.startsWith('v') ? !/^v[0-9a-f]+\..+$/i.test(host) : !pythonIpv6(host)) {
+        return null
+      }
+    }
+
+    if (/[/?#@:]/.test(authority.replace(/[@:#?]/g, '').normalize('NFKC'))) {
+      return null
+    }
+  }
+
+  const pathAndQuery = rest.split('#')[0]
+  const queryStart = pathAndQuery.indexOf('?')
+
+  return { scheme, authority, query: queryStart < 0 ? '' : pathAndQuery.slice(queryStart + 1) }
+}
+
 function repositoryIdentity(value: unknown): boolean {
   if (typeof value !== 'string' || !clean(value)) {
     return false
@@ -162,11 +293,13 @@ function repositoryIdentity(value: unknown): boolean {
     let name = match[1]
 
     for (let pass = 0; pass < 3; pass++) {
-      try {
-        name = decodeURIComponent(name.replaceAll('+', ' '))
-      } catch {
+      const next = pythonUnquotePlus(name)
+
+      if (next === name) {
         break
       }
+
+      name = next
     }
 
     const words =
@@ -178,7 +311,9 @@ function repositoryIdentity(value: unknown): boolean {
       return false
     }
 
-    const compact = casefold(name).replace(/[^a-z0-9]+/g, '')
+    // The authority's compound-qualifier check consumes the original name;
+    // only its word check above consumes the three-pass decoded name.
+    const compact = casefold(match[1]).replace(/[^a-z0-9]+/g, '')
 
     for (const suffix of facts.credentialSuffixes) {
       if (!compact.endsWith(suffix)) {
@@ -206,8 +341,14 @@ function repositoryIdentity(value: unknown): boolean {
 
   // Python urlsplit does not treat U+FEFF as whitespace. Preserve the original
   // string: an unrecognized prefix is evaluated by the actual shorthand rule.
-  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(value)?.[1].toLowerCase()
-  const supported = scheme !== undefined && ['http', 'https', 'ssh', 'file'].includes(scheme)
+  const parsed = pythonUrlsplit(value)
+
+  if (!parsed) {
+    return false
+  }
+
+  const { scheme } = parsed
+  const supported = ['http', 'https', 'ssh', 'file'].includes(scheme)
 
   if (!supported && value.startsWith('git@')) {
     if (!/^git@[^@\s/:]+:.+$/.test(value)) {
@@ -220,21 +361,14 @@ function repositoryIdentity(value: unknown): boolean {
   for (const match of value.matchAll(/(?:https?|ssh|file):\/\/[^<>"']+/gi)) {
     const characters = [...match[0]]
     const end = characters.findIndex(char => pythonWhitespace.has(char.codePointAt(0)!))
-    const url = (end < 0 ? characters : characters.slice(0, end)).join('')
-    const authority = url.split('://')[1].split(/[/?#]/)[0]
+    const url = (end < 0 ? characters : characters.slice(0, end)).join('').replace(/[.,;:!?)\]}]+$/, '')
+    const candidate = pythonUrlsplit(url)
 
-    // Match urlsplit's netloc normalization guard without normalizing the value.
-    if (/[/?#@:]/.test(authority.replace(/[@:#?]/g, '').normalize('NFKC'))) {
+    if (!candidate) {
       return false
     }
 
-    if (authority.includes('[') || authority.includes(']')) {
-      try {
-        new URL(url)
-      } catch {
-        return false
-      }
-    }
+    const { authority } = candidate
 
     const userinfo = authority.includes('@') ? authority.slice(0, authority.lastIndexOf('@')) : null
 
@@ -243,7 +377,7 @@ function repositoryIdentity(value: unknown): boolean {
     }
   }
 
-  if ((scheme === 'ssh' || scheme === 'file') && value.split('#')[0].includes('?')) {
+  if ((scheme === 'ssh' || scheme === 'file') && parsed.query) {
     return false
   }
 

@@ -523,6 +523,59 @@ def generate_corpus():
             finally:
                 registry.close()
 
+            # Same real-publication fault boundary exercised by the lifecycle
+            # API recovery test: the candidate exists, but its recovery record
+            # is unreadable. Never manufacture a successful/rollback outcome.
+            ambiguous_service = WorkflowMarketplaceService(
+                root / "ambiguous-profile", profile="support", clock=lambda: NOW
+            )
+            ambiguous_service.add_source(
+                WorkflowMarketplaceSource(
+                    name="company",
+                    repositoryUrl="https://fixtures.example/workflows.git",
+                )
+            )
+            ambiguous_review = ambiguous_service.prepare_install(
+                InstallRequest(identifier="company/laptop-support"), actor="alice"
+            )
+
+            def ambiguous_publication():
+                installed = ambiguous_service.confirm_install(
+                    ambiguous_review.confirmation_token, actor="alice"
+                )
+                assert installed.version == "3.0.0"
+                ambiguous_service.transactions.journal_path.write_text("{incomplete")
+                raise WorkflowMarketplaceError(
+                    "transaction_recovery_ambiguous", "private-recovery-location"
+                )
+
+            record(
+                "service recovery ambiguous",
+                "install_confirm",
+                complete_mutation(
+                    ambiguous_service,
+                    kind="install_confirm",
+                    subject=subject,
+                    selection=None,
+                    actor="alice",
+                    call=ambiguous_publication,
+                ),
+            )
+            assert ambiguous_service.installed_packages()[0].version == "3.0.0"
+            ambiguous_state = read_package_state(ambiguous_service, identity)
+            assert ambiguous_state.state == "unconfirmed"
+            assert ambiguous_state.installed is None and ambiguous_state.trust is None
+            states.append(
+                _case(
+                    "service ambiguous state",
+                    _sanitize_result(
+                        ambiguous_state.model_dump(mode="json"),
+                        allow_confirmation_token=False,
+                    ),
+                    wire.PackageState,
+                )
+            )
+
     # Relationships are derived from complete genuine projections. Python decides
     # acceptance; no expected-valid flag bypasses its actual validators.
     genuine = list(operations)
@@ -669,6 +722,12 @@ def generate_corpus():
             "packages/e\u0301",
             "packages/é",
             "packages/line\ninside",
+            "packages/ab:cd",
+            "packages/:cd",
+            "packages/12:34",
+            "packages/普通:文件",
+            "packages/ab::cd",
+            "packages/a:b",
         ],
         "repository_url": [
             "https://example.test/public.git",
@@ -757,6 +816,52 @@ def generate_corpus():
             "https://fixtures.example\uff1aport/public.git",
             "https://fixtures.example/public.git?token=",
             "ftp://fixtures.example/public.git",
+            "https://example.test/repo.git?%fftoken=x",
+            "https://example.test/repo.git?%ff%74oken=x",
+            "https://example.test/repo.git?%FFapi%4Bey=x",
+            "https://example.test/repo.git?%E2%82token=x",
+            "https://example.test/repo.git?%ffbranch=x",
+            "https://example.test/repo.git?%E2%82branch=x",
+            "https://example.test/repo.git?%25ff%2574oken=x",
+            "https://example.test/repo.git?%25252574oken=x",
+            "https://example.test/repo.git?%61pisecret=x",
+            "file:///fixture/repo.git?",
+            "file:///fixture/repo.git?#fragment",
+            "file:///fixture/repo.git?branch=main",
+            "ssh://git@example.test/repo.git?",
+            "ssh://git@example.test/repo.git?branch=main",
+            "https://[v1.host]/repo.git",
+            "https://[V1.host]/repo.git",
+            "https://[v1.]/repo.git",
+            "https://[::1]/repo.git",
+            "https://[fe80::1%scope]/repo.git",
+            "https://[::1]:nonnumeric/repo.git",
+            "https://[192.0.2.1]/repo.git",
+            "https://before[::1]/repo.git",
+            "https://[::1]after/repo.git",
+            "https://[1:2:3:4:5:6:7:8]/repo.git",
+            "https://[1:2:3:4:5:6:7]/repo.git",
+            "https://[1:2:3:4:5:6:7:8:9]/repo.git",
+            "https://[1:2:3:4:5:6:7::]/repo.git",
+            "https://[1:2:3:4:5:6:7:8::]/repo.git",
+            "https://[1::2::3]/repo.git",
+            "https://[:::]/repo.git",
+            "https://[:1:2:3:4:5:6:7]/repo.git",
+            "https://[1:2:3:4:5:6:7:]/repo.git",
+            "https://[::ffff:192.0.2.1]/repo.git",
+            "https://[::ffff:192.0.02.1]/repo.git",
+            "https://[::ffff:256.0.2.1]/repo.git",
+            "https://[fe80::1%]/repo.git",
+            "https://[fe80::1%scope%extra]/repo.git",
+            "https://[vF.host]/repo.git",
+            "https://[vg.host]/repo.git",
+            "https://[::1/repo.git",
+            "https://example.test\uff0fpath/repo.git",
+            "https://example.test\uff20host/repo.git",
+            "https://example.test/repo.git?%EF%BB%BFtoken=x",
+            "https://example.test/repo.git?%C0%AFtoken=x",
+            "https://example.test/repo.git?%ED%A0%80token=x",
+            "https://example.test/repo.git?%zzbranch=x",
         ):
             value = deepcopy(installed_case)
 
@@ -847,7 +952,12 @@ def render(value):
 def generate_domains():
     path_schema = TypeAdapter(wire.LifecycleRelativePath).json_schema()
     forbidden = []
-    for code in list(range(160)) + [0x2028, 0x2029]:
+    # Probe only the authority's character-wide control/separator domain here.
+    # Drive prefixes and backslashes are separate structural path constraints;
+    # rejection of a:b must never imply rejection of ab:cd.
+    for code in [
+        code for code in range(160) if unicodedata.category(chr(code)) == "Cc"
+    ] + [0x2028, 0x2029]:
         try:
             wire.lifecycle_relative_path("a" + chr(code) + "b")
         except ValueError:

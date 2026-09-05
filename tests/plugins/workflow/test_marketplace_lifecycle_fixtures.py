@@ -56,6 +56,24 @@ def test_generator_reproduces_actual_domain_projections():
         "type": "recovery_required",
         "reason": "rollback_failed",
     }
+    ambiguous = by_name.get("service recovery ambiguous")
+    assert ambiguous is not None, (
+        "actual recovery-ambiguous service projection is missing"
+    )
+    assert ambiguous["value"]["state"] == "failed"
+    assert ambiguous["value"]["result"] is None
+    assert ambiguous["value"]["outcome"] == {
+        "type": "recovery_required",
+        "reason": "recovery_ambiguous",
+    }
+    ambiguous_state = next(
+        case["value"]
+        for case in generated["packageStateCases"]
+        if case["name"] == "service ambiguous state"
+    )
+    assert ambiguous_state["state"] == "unconfirmed"
+    assert ambiguous_state["installed"] is None and ambiguous_state["trust"] is None
+    assert "private-recovery-location" not in json.dumps(generated)
     assert "confirmation_token" not in json.dumps(generated)
     found = AdmissionFound.model_validate_json(json.dumps(generated["admissionFound"]))
     evicted = AdmissionEvicted.model_validate_json(
@@ -133,6 +151,7 @@ def test_generator_observes_isolated_authority_rule_changes(monkeypatch):
         wire.LIFECYCLE_HTTP_ERROR_CODES - {"marketplace_list_expired"},
     )
     assert module.generate_types() != before
+
     before = module.generate_types()
     original = wire.lifecycle_relative_path
 
@@ -143,3 +162,19 @@ def test_generator_observes_isolated_authority_rule_changes(monkeypatch):
 
     monkeypatch.setattr(wire, "lifecycle_relative_path", changed)
     assert module.generate_types() != before
+
+
+def test_path_descriptor_does_not_generalize_contextual_drive_prefix():
+    # Break caught: a:b being misclassified as evidence that every colon is invalid.
+    spec = importlib.util.spec_from_file_location(
+        "lifecycle_path_facts",
+        ROOT / "scripts/generate_workflow_marketplace_lifecycle_fixtures.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert (
+        ord(":")
+        not in module.generate_domains()["lifecycle_relative_path"][
+            "forbiddenCodePoints"
+        ]
+    )
