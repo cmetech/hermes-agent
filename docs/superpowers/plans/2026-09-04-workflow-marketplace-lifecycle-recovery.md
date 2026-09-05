@@ -44,12 +44,12 @@ Existing implementations remain the starting point. New names below are delibera
 | --- | --- |
 | `plugins/workflow/marketplace/lifecycle_models.py` | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1 |
 | `plugins/workflow/marketplace/admissions.py` | Epoch/ID parsing, canonical private fingerprints, receipt lifetime/replay, 14A2 |
-| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict publication/admission/listing, 14A1–A2; non-projecting active-package mutation query, 14A3b |
+| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict publication/admission/listing, 14A1–A2; legacy terminal bridge and non-projecting active-package mutation query, 14A3b2 |
 | `plugins/workflow/marketplace/lifecycle_state.py` | Locked package-state projection and domain outcome evidence, 14A3a |
 | `plugins/workflow/marketplace/service.py`, `transactions.py`, `plugins/workflow/trust.py` | Exact commit/rollback evidence, authoritative token metadata, full trust snapshot at the actual write boundary, 14A3a |
-| `plugins/workflow/marketplace/catalog.py`, `source_store.py` | Source-cache publication evidence, 14A3b; preserve strict source diagnostics |
-| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3b |
-| `plugins/workflow/marketplace/api.py` | Mount V2, preserve read compatibility and complete legacy terminal bridge, reject preview V1 package mutations, 14A3b |
+| `plugins/workflow/marketplace/catalog.py`, `source_store.py`, source portion of `lifecycle_state.py` | Source-cache publication evidence, 14A3b1; preserve strict source diagnostics |
+| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3b3 |
+| `plugins/workflow/marketplace/api.py` | Legacy read/source bridge and preview mutation retirement, 14A3b2; mount V2 and actual profile-context integration, 14A3b3 |
 | `plugins/workflow/marketplace/cli.py` | Read-only package-state and explicit recovery adapters, 14A3c |
 | `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` | Deterministic Python public-model/scenario corpus and check/write modes, 14B |
 | `tests/fixtures/workflow-marketplace-lifecycle-v2.json` | Token-free cross-language operation/state corpus, 14B |
@@ -202,15 +202,76 @@ def test_cleanup_failure_has_no_verified_old_version(lifecycle_domain):
 - [ ] Implement token-free read/completion projection and metadata from real token authorities. Read-only outcomes apply only to the explicitly enumerated nonmutating package methods. Mutation completions consume typed evidence; missing evidence fails closed. Metadata cannot reissue/extend a token and must bind the exact review, actor, profile, subject, and selection.
 - [ ] Run the RED command as GREEN, changed-file Ruff check/format, and `git diff --check`. Record exact producer/trust-boundary interface receipts. Commit `feat(workflow): capture authoritative lifecycle state`; fresh reviewer independently tests candidate-retained failure, full selected-trust map, and concurrent trust/state boundaries before 14A3b.
 
-## Task 14A3b — Source evidence and authenticated V2 integration
+## Source/API integration checkpoints (replacement for monolithic 14A3b)
 
-**Files:** Create `plugins/workflow/marketplace/lifecycle_api.py` and `tests/plugins/workflow/test_marketplace_lifecycle_api.py`; modify marketplace `api.py`, `catalog.py`, `source_store.py`, `operations.py`, and `lifecycle_state.py` solely for source completion integration; corresponding `test_marketplace_api.py`, `test_marketplace_catalog.py`, `test_marketplace_sources.py`, `test_marketplace_operations.py`, and lifecycle-state tests. No CLI or Desktop edits.
+The unstarted 14A3b is split into three independently rejectable checkpoints after actual source/context inspection. This is implementation sequencing, not a protocol or persisted-format amendment. Preserve the historical broad b brief/report. 14A3b is accepted only when b1, b2 and b3 have separate independent receipts; V2 remains unmounted until b3 completes the accepted legacy bridge and actual context lifetime checks. No CLI or Desktop edits in these checkpoints.
 
-**Consumes:** Accepted 14A3a producer signatures and interface receipt; 14A1 schemas; 14A2 exact replay/vault/snapshot mechanics.
+## Task 14A3b1 — Source publication evidence and diagnostic regression closure
 
-**Produces:** `create_lifecycle_router(context, verified_operator)` and every amendment §§3–5 V2 route; registry `intersects_active_mutation(identity: InstalledPackageIdentity) -> bool` (profile-wide, actor-nonprojecting); explicit source-cache completion evidence; complete V1 read/source bridge and pre-admission preview-mutation retirement.
+**Files:** Modify `plugins/workflow/marketplace/catalog.py`, `source_store.py`, and `lifecycle_state.py` only for source completion; corresponding `tests/plugins/workflow/test_marketplace_catalog.py`, `test_marketplace_sources.py`, and `test_marketplace_lifecycle_state.py`.
 
-- [ ] Build `lifecycle_api` from actual temporary Git/service fixtures and authenticated router context. Issue real route requests and wait for exact operation IDs. Add lost-response replay, wrong ID/subject/selection, expired/consumed token, cross-actor/profile, capability/authentication, complete snapshot listing with V1 and V2 records, and pre-admission V1 mutation rejection tests.
+**Consumes:** Accepted strict V2 source result/outcome models and `LifecycleCompletion`; existing source-cache atomic replacement and strict persisted status projections.
+
+**Produces:** `complete_source_refresh(service, *, source_name: str, call: Callable[[], SourceRefreshResult]) -> LifecycleCompletion`. The callable runs the actual existing synchronous service refresh. The producer binds exact source/store/execution identity, returns strict token-free source result and truthful outcome, and preserves existing service/catalog method signatures and returns. Private source publication evidence is captured at the real write boundary, never reconstructed from a returned state string or error code. Existing package/trust evidence is unchanged.
+
+- [ ] Write real temporary source/Git/store tests for verified publication, disabled/cancelled-before-publication, retained stale catalog after fetch failure, failure before atomic replace, failure after possible replace, secondary status-write failure, and cancellation observed after cache publication. Assert persisted catalog/status facts and structured outcome, not callback counts.
+
+```python
+def test_uncertain_cache_publication_never_claims_unchanged(source_case):
+    source_case.fail_after_catalog_replacement()
+    completion = complete_source_refresh(
+        source_case.service,
+        source_name="company",
+        call=lambda: source_case.service.refresh_source("company"),
+    )
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert source_case.catalog_contains_candidate()
+```
+
+`source_case` uses the real source store with a temporary Git repository; inject faults only at the atomic filesystem boundary. The assertion requires uncertainty unless a strictly verified publication result can still be captured at the original serialization boundary. Do not infer rollback from failure of a later status write.
+
+- [ ] Observe RED through `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_catalog.py tests/plugins/workflow/test_marketplace_sources.py tests/plugins/workflow/test_marketplace_lifecycle_state.py --tb=short`. Keep pre-existing failures separate from new behavior RED.
+- [ ] Implement the source completion producer and bounded private evidence capture, without holding a registry lock or transferring authority to another execution. Preserve uncertainty monotonically across fallback failure-status persistence; late cancellation cannot erase publication. Disabled/read-only or verified no-publication results use known-unchanged; success with verified cache publication uses committed/null package state. Invalid terminal projection fails closed.
+- [ ] Independently check the two catalog regression assertions against the accepted canonical sanitizer. Resolve obsolete message expectations/raw SSH diagnostic fixtures in tests when supported by real persistence/projection behavior; never weaken production sanitization. Record exact baseline and final results.
+- [ ] Run focused GREEN and the three-file gate, changed-file Ruff/format and diff check. Commit `feat(workflow): capture source publication evidence`; fresh reviewer independently injects before/after publication and fallback-status faults plus late cancellation, and verifies source-name correlation and diagnostic parity before b2.
+
+## Task 14A3b2 — Legacy terminal bridge, preview mutation retirement and busy identity
+
+**Files:** Modify `plugins/workflow/marketplace/api.py`, `operations.py`, and corresponding `tests/plugins/workflow/test_marketplace_api.py`, `test_marketplace_operations.py`. Accepted domain producers stay unchanged unless a separately reviewed defect requires repair.
+
+**Consumes:** `complete_read` and accepted `complete_source_refresh`; strict legacy/V2 result models, admission receipts and snapshots. Preserve the public V1 source-refresh shape and safe source identity.
+
+**Produces:** Complete dual V1/V2 projections for V1 refresh/inspect/update-check starts, V1 preview package/trust routes rejected before admission, and registry `intersects_active_mutation(identity: InstalledPackageIdentity) -> bool` (profile-wide and actor-nonprojecting). No V2 HTTP routes mounted yet.
+
+- [ ] Write real worker/route tests for pending through terminal source refresh/inspect/update-check observed through both the existing V1 response and the internal strict V2 list/get. Include failed/cancelled outcomes and source publication followed by late cancellation. Test all preview mutation routes reject with bounded `409 marketplace_lifecycle_upgrade_required` before any receipt, operation, token consumption or domain write.
+
+```python
+def test_legacy_refresh_remains_visible_at_terminal(legacy_case):
+    operation_id = legacy_case.post_refresh("company").json()["id"]
+    legacy_case.wait_terminal(operation_id)
+    legacy = legacy_case.get_operation(operation_id).json()
+    lifecycle = legacy_case.registry.get_lifecycle(operation_id, actor=legacy_case.actor)
+    assert legacy["source_name"] == "company"
+    assert lifecycle.subject.source_name == "company"
+    assert lifecycle.outcome.type == "committed"
+```
+
+`legacy_case` wraps the existing real authenticated API harness and temporary source fixtures. Use the actual registry's accepted get signature when adapting the harness; do not invent a V2 HTTP route early.
+
+- [ ] Write event-controlled profile-wide busy tests: other-actor pending/running mutation for the same exact identity is busy; unrelated identity and read-only operations are not; no foreign operation identity appears in caller-visible lists. Observe RED with `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_api.py tests/plugins/workflow/test_marketplace_operations.py --tb=short`.
+- [ ] Adapt actual V1 workers to publish both strictly validated projections with authoritative outcomes; do not fake lifecycle mode, omit terminal records, or reinterpret post-publication cancellation. Preserve source CRUD/read and existing workflow/run behavior. Retire only unreleased V1 package/trust prepare/confirm/revoke routes before admission. Implement non-projecting active-mutation identity query under registry lock, with no domain callback there.
+- [ ] Run focused GREEN and API/operation/source regression gates, changed-file Ruff/format and diff check. Commit `feat(workflow): bridge legacy lifecycle observations`; fresh reviewer independently verifies complete mixed terminal listing, pre-admission retirement/no writes and cross-actor busy isolation before b3.
+
+## Task 14A3b3 — Authenticated V2 routes and actual context lifetime
+
+**Files:** Create `plugins/workflow/marketplace/lifecycle_api.py`, `tests/plugins/workflow/test_marketplace_lifecycle_api.py`; modify marketplace `api.py` for router/context integration and `test_marketplace_api.py`. A narrow epoch-secret direct-selector helper may be added to `admissions.py` with `test_marketplace_admissions.py` if needed to avoid duplicating process identity authority; no persisted/public fields change.
+
+**Consumes:** Accepted b1 source completion, b2 legacy bridge and `intersects_active_mutation`, a package/trust producers, A1 strict schemas and A2 replay/vault/snapshot authority.
+
+**Produces:** `create_lifecycle_router(context, verified_operator)` and every amendment §§3–5 V2 route, exact direct-selector/request/token correlations, and real profile-context/service/vault/receipt lifetime integration.
+
+- [ ] Build the V2 route test harness from actual temporary Git/service fixtures and authenticated context. Issue real route requests and wait for exact operation IDs. Add lost-response replay, wrong ID/subject/selection, expired/consumed token, cross-actor/profile, capability/authentication and complete snapshot listing with V1 and V2 records.
 
 ```python
 def test_replay_after_lost_confirm_response_admits_only_once(lifecycle_api):
@@ -228,11 +289,11 @@ def test_selected_grant_returns_complete_map(lifecycle_api):
     assert states == {"A": "trusted", "B": "untrusted"}
 ```
 
-- [ ] Add fault tests before/after source-cache atomic replacement and cadence cancellation, proving published versus known unchanged versus uncertain state without diagnostic guessing. Add other-actor intersecting pending/running mutations to package-state `busy` tests; unrelated identities stay isolated and no foreign operation details escape. Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_api.py tests/plugins/workflow/test_marketplace_api.py tests/plugins/workflow/test_marketplace_catalog.py tests/plugins/workflow/test_marketplace_sources.py tests/plugins/workflow/test_marketplace_operations.py`.
-- [ ] Instrument source-store/catalog publication at its real write boundary, retaining existing caller signatures and strict diagnostics. Return committed source completion only with publication evidence; uncertain publication cannot become known unchanged. Preserve the two recorded catalog-suite failures as explicit unresolved debt unless fixed with independent evidence; never weaken sanitization to satisfy an old test.
-- [ ] Wire exact route-body unions, capability probe, token retrieval, get/cancel/admission/list routes, safe subject construction and preparation/confirmation metadata. Replay lookup precedes token authorization/consumption. Complete V1 refresh/inspect/check V2 terminal projections; no record omission or fake success. Reject V1 package/trust mutations before admission; preserve read/source compatibility.
+- [ ] Prove exact canonical repository/ref/path direct-selector binding to the returned review and resolved package identity through confirm. Prove same-epoch actual profile-context/service lifetime with live receipts, immutable issued-review fingerprints, trust selection and token-vault callbacks; refuse context retirement at capacity rather than lose live authority or grow unbounded state. Missing recreated-service proof fails closed without token reissue or expiry extension; preserve legacy persisted-token confirmation. Read current accepted producer receipts, not original optimistic expectations.
+- [ ] Add route-level candidate-retained rollback-failed/recovery-ambiguous, full selected-workflow trust map, exact operation get/cancel and stale/evicted admission tests. Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_api.py tests/plugins/workflow/test_marketplace_api.py --tb=short`.
+- [ ] Wire exact route-body unions, capability probe, token retrieval, get/cancel/admission/list routes, safe subject construction and preparation/confirmation metadata. Replay lookup precedes token authorization/consumption. Require the accepted complete b2 bridge before mounting V2. No generic-target parsing or latest-operation heuristics.
 - [ ] Compose state-reader lease evidence with `intersects_active_mutation` without holding a registry lock while entering domain locks. Return only a validated `PackageState`; active work from another actor affects `busy`, not visibility of that actor's operation. Test lock ordering with event-controlled real workers.
-- [ ] Run focused GREEN, source/API/operation regressions, changed-file Ruff/format and diff checks. Commit `feat(workflow): expose correlated lifecycle API`; fresh reviewer independently reproduces lost admitted response replay, source publication fault truth, candidate-retained API outcome, selected trust map and mixed legacy/V2 listing before 14A3c.
+- [ ] Run focused GREEN, lifecycle/API/admission/operation/source regressions, changed-file Ruff/format and diff checks. Commit `feat(workflow): expose correlated lifecycle API`; fresh reviewer independently reproduces lost admitted response replay, actual context retention/recreation, direct-selector secrecy/binding, candidate-retained API outcome, selected trust map and mixed legacy/V2 listing. Record all b1/b2/b3 acceptance receipts before 14A3c; b is not complete from route happy paths alone.
 
 ## Task 14A3c — Recovery CLI and complete backend gates
 
