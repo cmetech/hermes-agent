@@ -11,6 +11,7 @@ import re
 import secrets
 import threading
 from collections.abc import Callable
+from types import MappingProxyType
 from typing import Annotated, Literal, NoReturn, TypeAlias
 
 from pydantic import (
@@ -25,6 +26,11 @@ from pydantic import (
 
 from hermes_cli.git_source import GitSourceError, validate_credential_free_git_source
 
+from .lifecycle_models import (
+    RESULT_TYPE_BY_KIND,
+    RUNNING_PHASES_BY_KIND,
+    require_result_kind,
+)
 from .models import (
     InstallReview,
     InstalledPackage,
@@ -41,6 +47,19 @@ _TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 _OPERATION_ID = re.compile(r"^wmop_[0-9a-f]{12}_[0-9a-f]{32}$", re.ASCII)
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$", re.ASCII)
 _RESULT_BYTES_MAX = 2 * 1024 * 1024
+_V1_KIND_ALIASES = MappingProxyType({"package_detail": "inspect"})
+_V1_PHASE_ADDITIONS = MappingProxyType({"refresh": frozenset({"verifying"})})
+
+
+def _lifecycle_kind(kind: str) -> str:
+    return _V1_KIND_ALIASES.get(kind, kind)
+
+
+def _registry_running_phases(kind: str) -> frozenset[str]:
+    lifecycle_kind = _lifecycle_kind(kind)
+    return RUNNING_PHASES_BY_KIND[lifecycle_kind] | _V1_PHASE_ADDITIONS.get(
+        kind, frozenset()
+    )
 
 
 class _StrictOperationModel(BaseModel):
@@ -625,6 +644,8 @@ class WorkflowMarketplaceOperationRegistry:
             record = self._records.get(operation_id)
             if record is None or record.state != "running":
                 return
+            if phase not in _registry_running_phases(record.kind):
+                raise ValueError("operation phase is invalid for its kind")
             if progress < record.progress:
                 raise ValueError("operation progress cannot move backwards")
             record.phase = phase
@@ -640,6 +661,8 @@ class WorkflowMarketplaceOperationRegistry:
         target: str | None = None,
     ) -> MarketplaceOperation:
         kind = _clean_identifier(kind, label="operation kind")
+        if _lifecycle_kind(kind) not in RESULT_TYPE_BY_KIND:
+            raise ValueError("operation kind is invalid")
         actor = _clean_identity(actor, label="operation actor", maximum=256)
         if not callable(call):
             raise TypeError("operation call must be callable")
@@ -725,6 +748,7 @@ class WorkflowMarketplaceOperationRegistry:
             record.started_at = now
             record.updated_at = now
             cancellation = record.cancellation
+            kind = record.kind
         try:
             cancellation.checkpoint()
             result = call(cancellation)
@@ -733,6 +757,7 @@ class WorkflowMarketplaceOperationRegistry:
                 if isinstance(result, _OperationResultBase)
                 else result
             )
+            require_result_kind(kind=_lifecycle_kind(kind), result=result)
             with self._lock:
                 record = self._records.get(operation_id)
                 if record is None or record.state in _TERMINAL_STATES:

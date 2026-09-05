@@ -149,7 +149,7 @@ def test_terminal_result_revalidation_detaches_producer_aliases(registry) -> Non
 def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -> None:
     started = registry.start(
         "refresh",
-        lambda cancellation: _result(),
+        lambda cancellation: _refresh_result("company"),
         actor="operator-a",
         target="source:company",
     )
@@ -162,14 +162,16 @@ def test_operation_success_is_an_immutable_profile_scoped_projection(registry) -
     assert terminal.state == "succeeded"
     assert terminal.phase == "completed"
     assert terminal.progress == 100
-    assert terminal.result == _result()
+    assert terminal.result == _refresh_result("company")
     assert terminal.error is None
     with pytest.raises(Exception):
         terminal.state = "failed"
     assert terminal.result is not None
     with pytest.raises(Exception):
-        terminal.result.value.workflows[0].state = "untrusted"
-    assert registry.get(started.id, actor="operator-a").result == _result()
+        terminal.result.value.source_name = "other"
+    assert registry.get(started.id, actor="operator-a").result == _refresh_result(
+        "company"
+    )
     assert registry.list(actor="operator-a")[0].source_name == "company"
     assert "target" not in started.model_dump(mode="json", by_alias=False)
 
@@ -187,6 +189,95 @@ def test_succeeded_refresh_rejects_a_result_for_a_different_source(registry) -> 
     assert terminal.source_name == "company"
     assert terminal.state == "failed"
     assert terminal.result is None
+
+
+def test_registry_rejects_a_mismatched_result_before_publication_and_releases_target(
+    registry,
+) -> None:
+    started = registry.start(
+        "update_confirm",
+        lambda _cancellation: _result(),
+        actor="operator-a",
+        target="package:company/support",
+    )
+
+    terminal = _wait_terminal(registry, started.id)
+
+    assert terminal.state == "failed"
+    assert terminal.result is None
+    assert terminal.error is not None
+    replacement = registry.start(
+        "update_confirm",
+        lambda _cancellation: _result(),
+        actor="operator-a",
+        target="package:company/support",
+    )
+    assert replacement.id != started.id
+
+
+def test_registry_rejects_an_unknown_kind_before_reserving_a_target(registry) -> None:
+    with pytest.raises(ValueError, match="operation kind"):
+        registry.start(
+            "future_kind",
+            lambda _cancellation: _result(),
+            actor="operator-a",
+            target="package:company/support",
+        )
+
+    admitted = registry.start(
+        "trust_confirm",
+        lambda _cancellation: _result(),
+        actor="operator-a",
+        target="package:company/support",
+    )
+    assert _wait_terminal(registry, admitted.id).state == "succeeded"
+
+
+def test_registry_rejects_a_running_phase_not_allowed_for_the_kind(registry) -> None:
+    def invalid_refresh(cancellation):
+        cancellation.set_progress("committing", 50)
+        return _refresh_result("company")
+
+    started = registry.start(
+        "refresh",
+        invalid_refresh,
+        actor="operator-a",
+        target="source:company",
+    )
+
+    terminal = _wait_terminal(registry, started.id)
+
+    assert terminal.state == "failed"
+    assert terminal.result is None
+    assert terminal.error is not None
+
+
+def test_v1_operation_wire_aliases_remain_unchanged(registry) -> None:
+    started = registry.start(
+        "refresh",
+        lambda _cancellation: _refresh_result("company"),
+        actor="operator-a",
+        target="source:company",
+    )
+
+    public = started.model_dump(mode="json", by_alias=True)
+
+    assert public == {
+        "schemaVersion": 1,
+        "id": started.id,
+        "kind": "refresh",
+        "source_name": "company",
+        "profile": "support",
+        "state": "pending",
+        "phase": "queued",
+        "progress": 0,
+        "createdAt": started.created_at,
+        "startedAt": None,
+        "updatedAt": started.updated_at,
+        "finishedAt": None,
+        "result": None,
+        "error": None,
+    }
 
 
 def test_operation_source_identity_is_refresh_only_and_target_derived(registry) -> None:
@@ -222,7 +313,7 @@ def test_cancelled_fetch_never_reports_a_result(registry) -> None:
     def blocking_fetch(cancellation):
         entered.set()
         release.wait(timeout=5)
-        return _result("must-not-leak")
+        return _refresh_result("company")
 
     started = registry.start(
         "refresh",
@@ -253,7 +344,7 @@ def test_cancellation_during_atomic_commit_reports_committed_success(registry) -
         return _result("committed")
 
     started = registry.start(
-        "install_confirm",
+        "trust_confirm",
         atomic_mutation,
         actor="operator-a",
         target="package:company/support",
@@ -283,7 +374,7 @@ def test_cancellation_immediately_before_atomic_entry_prevents_commit(registry) 
         return _result("must-not-commit")
 
     started = registry.start(
-        "install_confirm",
+        "trust_confirm",
         atomic_mutation,
         actor="operator-a",
         target="package:company/support",
@@ -335,7 +426,7 @@ def test_queued_cancellation_prevents_the_callable_from_running() -> None:
             lambda cancellation: (
                 blocker_entered.set(),
                 release.wait(timeout=5),
-                _result(),
+                _refresh_result("first"),
             )[-1],
             actor="operator-a",
             target="source:first",
@@ -343,7 +434,7 @@ def test_queued_cancellation_prevents_the_callable_from_running() -> None:
         assert blocker_entered.wait(timeout=2)
         queued = registry.start(
             "refresh",
-            lambda cancellation: (queued_ran.set(), _result())[1],
+            lambda cancellation: (queued_ran.set(), _refresh_result("second"))[1],
             actor="operator-a",
             target="source:second",
         )
@@ -371,9 +462,11 @@ def test_registry_bounds_pending_and_active_reservations() -> None:
     try:
         registry.start(
             "refresh",
-            lambda cancellation: (entered.set(), release.wait(timeout=5), _result())[
-                -1
-            ],
+            lambda cancellation: (
+                entered.set(),
+                release.wait(timeout=5),
+                _refresh_result("first"),
+            )[-1],
             actor="operator-a",
             target="source:first",
         )
@@ -405,7 +498,7 @@ def test_same_target_is_single_flight_but_unrelated_targets_can_run() -> None:
     release = threading.Event()
     try:
         first = registry.start(
-            "install_prepare",
+            "trust_confirm",
             lambda cancellation: (entered.set(), release.wait(timeout=5), _result())[
                 -1
             ],
@@ -416,13 +509,13 @@ def test_same_target_is_single_flight_but_unrelated_targets_can_run() -> None:
 
         with pytest.raises(MarketplaceOperationConflictError) as caught:
             registry.start(
-                "update_prepare",
+                "trust_confirm",
                 lambda cancellation: _result(),
                 actor="operator-b",
                 target="package:company/support",
             )
         unrelated = registry.start(
-            "install_prepare",
+            "trust_confirm",
             lambda cancellation: _result("other"),
             actor="operator-b",
             target="package:company/other",
@@ -445,7 +538,7 @@ def test_operation_lookup_is_actor_scoped_and_unknown_is_indistinguishable(
 ) -> None:
     started = registry.start(
         "refresh",
-        lambda cancellation: _result(),
+        lambda cancellation: _refresh_result("company"),
         actor="operator-a",
         target="source:company",
     )
@@ -477,7 +570,7 @@ def test_terminal_eviction_is_deterministic_and_never_evicts_active() -> None:
     try:
         first = registry.start(
             "refresh",
-            lambda cancellation: _result("first"),
+            lambda cancellation: _refresh_result("first"),
             actor="operator-a",
             target="source:first",
         )
@@ -485,9 +578,11 @@ def test_terminal_eviction_is_deterministic_and_never_evicts_active() -> None:
         now[0] += timedelta(seconds=1)
         active = registry.start(
             "refresh",
-            lambda cancellation: (entered.set(), release.wait(timeout=5), _result())[
-                -1
-            ],
+            lambda cancellation: (
+                entered.set(),
+                release.wait(timeout=5),
+                _refresh_result("active"),
+            )[-1],
             actor="operator-a",
             target="source:active",
         )
@@ -495,7 +590,7 @@ def test_terminal_eviction_is_deterministic_and_never_evicts_active() -> None:
         now[0] += timedelta(seconds=1)
         second = registry.start(
             "refresh",
-            lambda cancellation: _result("second"),
+            lambda cancellation: _refresh_result("second"),
             actor="operator-a",
             target="source:second",
         )
@@ -525,7 +620,7 @@ def test_terminal_ttl_evicts_only_expired_terminal_operations() -> None:
     try:
         finished = registry.start(
             "refresh",
-            lambda cancellation: _result(),
+            lambda cancellation: _refresh_result("company"),
             actor="operator-a",
             target="source:company",
         )
@@ -571,7 +666,11 @@ def test_concurrent_cancel_and_get_keep_a_valid_terminal_projection(registry) ->
     release = threading.Event()
     started = registry.start(
         "refresh",
-        lambda cancellation: (entered.set(), release.wait(timeout=5), _result())[-1],
+        lambda cancellation: (
+            entered.set(),
+            release.wait(timeout=5),
+            _refresh_result("company"),
+        )[-1],
         actor="operator-a",
         target="source:company",
     )
@@ -608,7 +707,11 @@ def test_idle_registry_can_be_retired_but_active_registry_is_preserved() -> None
     try:
         started = registry.start(
             "refresh",
-            lambda _token: (entered.set(), release.wait(timeout=5), _result())[-1],
+            lambda _token: (
+                entered.set(),
+                release.wait(timeout=5),
+                _refresh_result("company"),
+            )[-1],
             actor="operator-a",
             target="source:company",
         )
@@ -619,7 +722,11 @@ def test_idle_registry_can_be_retired_but_active_registry_is_preserved() -> None
         assert registry.retire_if_idle() is True
         registry.close_retired()
         with pytest.raises(MarketplaceOperationRegistryError) as closed:
-            registry.start("refresh", lambda _token: _result(), target="source:company")
+            registry.start(
+                "refresh",
+                lambda _token: _refresh_result("company"),
+                target="source:company",
+            )
         assert closed.value.code == "marketplace_operation_unavailable"
     finally:
         release.set()
