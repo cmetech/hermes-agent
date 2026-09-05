@@ -158,6 +158,7 @@ class _RecoveryEntry:
 class _RecoveryInspection:
     entries: tuple[_RecoveryEntry, ...]
     active_writer: bool
+    has_live_preparations: bool
     complete: bool = True
 
 
@@ -2178,23 +2179,53 @@ class MarketplaceTransactionStore:
                 entry.name in active_ids
                 or entry.name in journal_ids
                 or _TRANSACTION_ID.fullmatch(entry.name) is None
-                or not entry.is_dir(follow_symlinks=False)
             ):
                 continue
             envelope = Path(entry.path)
+            if require_complete:
+                _require_existing_directory(
+                    envelope, code="transaction_recovery_inspection_incomplete"
+                )
+            elif not entry.is_dir(follow_symlinks=False):
+                continue
             path = envelope / "owner.json"
             try:
-                marker = _OwnerMarker.model_validate(
-                    _strict_json(
-                        _read_bounded(
-                            path,
-                            limit=_MAX_MARKER_BYTES,
-                            size_code="transaction_marker_size_limit",
-                        ),
-                        code="transaction_marker_invalid",
-                    )
+                value = _strict_json(
+                    _read_bounded(
+                        path,
+                        limit=_MAX_MARKER_BYTES,
+                        size_code="transaction_marker_size_limit",
+                    ),
+                    code="transaction_marker_invalid",
                 )
+                if (
+                    require_complete
+                    and isinstance(value, dict)
+                    and value.get("owner") != _OWNER
+                ):
+                    owner = value.get("owner")
+                    if (
+                        not isinstance(owner, str)
+                        or not 1 <= len(owner) <= 128
+                        or owner != owner.strip()
+                        or not owner.isprintable()
+                    ):
+                        _fail(
+                            "transaction_recovery_inspection_incomplete",
+                            "abandoned transaction ownership could not be verified",
+                        )
+                    # Validate every other field with the unchanged strict schema.
+                    # This classifies explicit foreign data only; it never yields
+                    # a cleanup candidate or grants the normalized value authority.
+                    _OwnerMarker.model_validate({**value, "owner": _OWNER})
+                    continue
+                marker = _OwnerMarker.model_validate(value)
             except (ValidationError, WorkflowMarketplaceError):
+                if require_complete:
+                    _fail(
+                        "transaction_recovery_inspection_incomplete",
+                        "abandoned transaction ownership could not be verified",
+                    )
                 continue
             if (
                 marker.owner == _OWNER
@@ -2213,6 +2244,11 @@ class MarketplaceTransactionStore:
                 is not None
             ):
                 yield envelope, marker
+            elif require_complete:
+                _fail(
+                    "transaction_recovery_inspection_incomplete",
+                    "abandoned transaction ownership could not be verified",
+                )
 
     def _clean_abandoned_staging(
         self,
@@ -2307,6 +2343,7 @@ class MarketplaceTransactionStore:
                     sorted(entries, key=lambda item: (item.transaction_id, item.kind))
                 ),
                 active_writer,
+                bool(active_ids),
             )
 
     def recover_transactions(self) -> tuple[str, ...]:

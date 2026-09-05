@@ -838,17 +838,77 @@ def test_recovery_is_scoped_to_selected_real_profile(recovery_home, capsys):
     assert foreign.service.transactions.list_journals()
 
 
-def test_recovery_live_unused_review_is_preserved_without_writer_refusal(
+def test_recovery_live_unused_review_refuses_unstable_scope_without_claiming_writer(
     recovery_home, capsys
 ):
     home = recovery_home
     review = home.prepare()
     before = home.snapshot()
     code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
-    assert code == 0 and output["result"]["status"] == "clear"
     assert home.snapshot() == before
+    assert code != 0
+    assert output["error"]["code"] == "transaction_recovery_scope_changed"
+    assert output["result"]["status"] == "recovery_required"
     installed = home.service.confirm_install(review.confirmation_token, actor="cli")
     assert installed.version == "1.0.0"
+
+
+@pytest.mark.parametrize("other_recovery", [False, True])
+def test_recovery_never_expands_confirmed_scope_when_live_review_expires(
+    recovery_home, monkeypatch, capsys, other_recovery
+):
+    """Catches cleanup using a newer eligibility time than confirmed inspection."""
+    from plugins.workflow.marketplace import cli
+    from plugins.workflow.marketplace.transactions import MarketplaceTransactionStore
+
+    home = recovery_home
+    review = home.prepare()
+    store = home.service.transactions
+    record = store._read_prepared().transactions[0]
+    if other_recovery:
+        source = home.service.list_sources()[0]
+        home.service.add_source(source.model_copy(update={"name": "neighbor"}))
+        home.service.refresh_source("neighbor")
+        home.journal(identifier="neighbor/laptop-support")
+    expiry = datetime.fromisoformat(record.expires_at.replace("Z", "+00:00"))
+    home.now = expiry - timedelta(microseconds=1)
+    before = home.snapshot()
+    factory = cli._service_for_args
+    inspect = MarketplaceTransactionStore.inspect_recovery
+    count = 0
+
+    def real_service(args):
+        actual = factory(args)
+        actual.transactions.clock = lambda: home.now
+        return actual
+
+    def advance_after_last_inspection(actual):
+        nonlocal count
+        result = inspect(actual)
+        count += 1
+        if count == 2:
+            assert all(
+                entry.transaction_id != record.transaction_id
+                for entry in result.entries
+            )
+            home.now = expiry
+        return result
+
+    monkeypatch.setattr(cli, "_service_for_args", real_service)
+    monkeypatch.setattr(
+        MarketplaceTransactionStore, "inspect_recovery", advance_after_last_inspection
+    )
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert home.snapshot() == before
+    assert (store.staging_root / record.transaction_id).exists()
+    assert any(
+        item.transaction_id == record.transaction_id
+        for item in store._read_prepared().transactions
+    )
+    assert code != 0 and output["error"]["code"] == "transaction_recovery_scope_changed"
+    assert review.confirmation_token not in json.dumps(output)
 
 
 def test_recovery_partial_result_preserves_ambiguous_neighbor(recovery_home, capsys):
@@ -902,6 +962,46 @@ def test_recovery_incomplete_scan_refuses_even_explicit_confirmation(
     assert code != 0
     assert output["error"]["code"] == "transaction_recovery_inspection_incomplete"
     assert home.snapshot() == before
+
+
+@pytest.mark.parametrize("damage", ["malformed", "missing", "symlink"])
+@pytest.mark.parametrize("other_recovery", [False, True])
+def test_recovery_unknown_abandoned_ownership_never_reports_clear(
+    recovery_home, monkeypatch, capsys, damage, other_recovery
+):
+    """Catches a zero/complete CLI result after skipping unreadable owner evidence."""
+    home = recovery_home
+    review = home.prepare()
+    store = home.service.transactions
+    record = store._read_prepared().transactions[0]
+    with store._locked() as parent_identity:
+        store._write_prepared([], parent_identity=parent_identity)
+    envelope = store.staging_root / record.transaction_id
+    marker = envelope / "owner.json"
+    target = home.path.parent / "external-owner.json"
+    if damage == "malformed":
+        marker.write_text("{")
+    else:
+        marker.rename(target)
+        if damage == "symlink":
+            marker.symlink_to(target)
+    if other_recovery:
+        source = home.service.list_sources()[0]
+        home.service.add_source(source.model_copy(update={"name": "neighbor"}))
+        home.service.refresh_source("neighbor")
+        home.journal(identifier="neighbor/laptop-support")
+    before = home.snapshot()
+    target_before = target.read_bytes() if target.exists() else None
+    code, captured, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert home.snapshot() == before and envelope.exists()
+    assert (target.read_bytes() if target.exists() else None) == target_before
+    if damage == "symlink":
+        assert marker.is_symlink()
+    assert code != 0 and output["ok"] is False
+    assert output["error"]["code"] == "transaction_recovery_inspection_incomplete"
+    assert output["result"] is None
+    assert str(home.path) not in captured.out
+    assert review.confirmation_token not in captured.out
 
 
 @pytest.mark.parametrize("answer", ["no", "yes"])

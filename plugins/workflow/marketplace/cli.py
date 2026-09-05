@@ -1365,6 +1365,15 @@ def _require_recovery_idle(service, inspection):
             exit_code=EXIT_CONFLICT,
             result=_recovery_result(service, inspection, status="busy"),
         )
+    if inspection.has_live_preparations:
+        # The lock serializes writers, not time. An unused review could expire
+        # after inspection and expand recovery's pruning/staging cleanup set.
+        _fail(
+            "transaction_recovery_scope_changed",
+            "live package reviews can change recovery scope; complete them or let them expire before retrying",
+            exit_code=EXIT_CONFLICT,
+            result=_recovery_result(service, inspection, status="recovery_required"),
+        )
 
 
 def _invoke_recovery(args: argparse.Namespace, service) -> dict[str, object]:

@@ -266,7 +266,13 @@ def test_recovery_inspection_and_cleanup_share_abandoned_ownership(tmp_path):
         store._write_prepared([], parent_identity=parent_identity)
     unrelated = store.staging_root / ("f" * 32)
     unrelated.mkdir()
-    (unrelated / "owner.json").write_text("{}")
+    foreign_marker = json.loads(
+        (prepared.staging_path.parent / "owner.json").read_bytes()
+    )
+    foreign_marker["owner"] = "foreign-marketplace"
+    foreign_marker["transactionId"] = "f" * 32
+    foreign_bytes = json.dumps(foreign_marker)
+    (unrelated / "owner.json").write_text(foreign_bytes)
     before = _snapshot(tmp_path)
     inspection = store.inspect_recovery()
     assert [(e.transaction_id, e.identity, e.kind) for e in inspection.entries] == [
@@ -275,8 +281,105 @@ def test_recovery_inspection_and_cleanup_share_abandoned_ownership(tmp_path):
     assert _snapshot(tmp_path) == before
     assert store.recover_transactions() == ()
     assert not prepared.staging_path.parent.exists()
-    assert (unrelated / "owner.json").read_text() == "{}"
+    assert (unrelated / "owner.json").read_text() == foreign_bytes
     assert store.inspect_recovery().entries == ()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "malformed",
+        "missing",
+        "symlink",
+        "oversized",
+        "wrong_transaction",
+        "wrong_destination",
+        "unsupported_version",
+        "duplicate_owner",
+        "foreign_empty",
+        "foreign_nonstring",
+        "foreign_oversized",
+        "foreign_invalid_version",
+        "envelope_symlink",
+        "envelope_file",
+    ],
+)
+def test_strict_recovery_inspection_cannot_clear_unknown_abandoned_ownership(
+    tmp_path, damage
+):
+    """Catches strict scans reusing best-effort cleanup's invalid-marker skip."""
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    with store._locked() as parent_identity:
+        store._write_prepared([], parent_identity=parent_identity)
+    envelope = prepared.staging_path.parent
+    marker = envelope / "owner.json"
+    if damage == "malformed":
+        marker.write_text("{")
+    elif damage == "missing":
+        marker.rename(tmp_path / "lost-owner.json")
+    elif damage == "symlink":
+        target = tmp_path / "foreign-owner.json"
+        marker.rename(target)
+        marker.symlink_to(target)
+    elif damage == "oversized":
+        marker.write_text(" " * (32 * 1024 + 1))
+    elif damage in {"envelope_symlink", "envelope_file"}:
+        target = tmp_path / "external-envelope"
+        envelope.rename(target)
+        if damage == "envelope_symlink":
+            envelope.symlink_to(target, target_is_directory=True)
+        else:
+            envelope.write_text("unknown transaction entry")
+    elif damage == "duplicate_owner":
+        marker.write_text('{"owner":"foreign-owner",' + marker.read_text()[1:])
+    else:
+        value = json.loads(marker.read_bytes())
+        if damage == "wrong_transaction":
+            value["transactionId"] = "0" * 32
+        elif damage == "wrong_destination":
+            value["destination"] = str(tmp_path / "unrelated-destination")
+        elif damage.startswith("foreign_"):
+            value["owner"] = {
+                "foreign_empty": "",
+                "foreign_nonstring": 7,
+                "foreign_oversized": "f" * 129,
+                "foreign_invalid_version": "foreign-owner",
+            }[damage]
+            if damage == "foreign_invalid_version":
+                value["schemaVersion"] = 100
+        else:
+            value["schemaVersion"] = 100
+        marker.write_text(json.dumps(value))
+    before = _snapshot(tmp_path)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.inspect_recovery()
+    assert error.value.code == "transaction_recovery_inspection_incomplete"
+    assert _snapshot(tmp_path) == before
+    # The same uncertainty must not widen the legacy deletion authority.
+    assert store.recover_transactions() == ()
+    assert envelope.exists()
+    assert _snapshot(tmp_path) == before
+    if damage == "symlink":
+        assert marker.is_symlink()
+
+
+def test_strict_inspection_preserves_unrelated_names_without_parsing_them(tmp_path):
+    store = MarketplaceTransactionStore(tmp_path)
+    store._ensure_workflow_roots()
+    with store._locked():
+        pass
+    unrelated = store.staging_root / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "owner.json").write_text("{")
+    before = _snapshot(tmp_path)
+    assert store.inspect_recovery().complete
+    assert store.inspect_recovery().entries == ()
+    assert store.recover_transactions() == ()
+    assert _snapshot(tmp_path) == before
 
 
 def test_recovery_inspection_refuses_incomplete_staging_scan_without_writes(tmp_path):
