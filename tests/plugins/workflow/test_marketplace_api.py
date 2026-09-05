@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 import pytest
 
+from test_marketplace_service import published_repo, service  # noqa: F401
+
 from plugins.workflow.marketplace.api import (
     MarketplaceSourceRefreshProjection,
     MarketplaceSourceEnabledRequest,
@@ -70,6 +72,371 @@ _DIAGNOSTIC_CORPUS = json.loads(
         / "fixtures/workflow-marketplace-source-diagnostics.json"
     ).read_text()
 )
+
+
+@pytest.fixture
+def legacy_case(service, published_repo):
+    from plugins.workflow.marketplace.api import _actor
+
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="company", repositoryUrl=published_repo.remote.as_uri()
+        )
+    )
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda _home, _profile: service,
+        home_resolver=lambda: service.home,
+        profile_resolver=lambda _home: "support",
+        operation_limits={"max_workers": 1, "max_in_flight": 8, "max_terminal": 32},
+    )
+    app = FastAPI()
+    app.include_router(
+        create_marketplace_router(_verified_operator, context=context),
+        prefix="/api/plugins/workflow",
+    )
+    try:
+        with TestClient(app) as client:
+            key, _, _, registry = context.current()
+            actor = _actor(_Authority(frozenset({"admin"})), key)
+            yield client, service, registry, actor
+    finally:
+        context.close()
+
+
+_LEGACY_READS = [
+    ("post", "/sources/company/refresh", None, "refresh_source", "refresh"),
+    ("get", "/packages/company/laptop-support", None, "inspect", "inspect"),
+    ("post", "/updates/check", {}, "check_updates", "update_check"),
+    (
+        "post",
+        "/updates/check",
+        {"identity": {"sourceKey": "company", "packageId": "laptop-support"}},
+        "check_updates",
+        "update_check",
+    ),
+]
+
+
+def _install_legacy_test_package(service, actor):
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor=actor
+    )
+    return service.confirm_install(review.confirmation_token, actor=actor)
+
+
+@pytest.mark.parametrize("method,path,body,service_method,kind", _LEGACY_READS)
+@pytest.mark.parametrize("cancel", [False, True])
+def test_legacy_bridge_queued_observation_and_cancellation(
+    legacy_case, monkeypatch, method, path, body, service_method, kind, cancel
+):
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    if service_method == "check_updates":
+        _install_legacy_test_package(service, actor)
+    entered, release, attempted = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    subject = AllPackagesSubject(type="all_packages")
+
+    def blocking(_token):
+        entered.set()
+        assert release.wait(5)
+        return complete_read(
+            service,
+            kind="update_check",
+            subject=subject,
+            selection=None,
+            actor="foreign",
+            call=lambda: [],
+        )
+
+    registry.start(
+        "update_check",
+        blocking,
+        actor="foreign",
+        subject=subject,
+        request_id=registry.admissions.new_request_id(),
+    )
+    assert entered.wait(5)
+    original = getattr(service, service_method)
+
+    def observed(*args, **kwargs):
+        attempted.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, service_method, observed)
+    try:
+        started = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        assert started.status_code == 202
+        operation_id = started.json()["id"]
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert lifecycle.state == started.json()["state"] == "pending"
+        assert lifecycle.phase == "queued" and lifecycle.outcome is None
+        assert registry.list_snapshot(actor=actor).items == (lifecycle,)
+        if cancel:
+            response = client.post(
+                f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+                headers=_headers(),
+            )
+            assert response.json()["state"] == "cancelled"
+        release.set()
+        terminal = _wait_operation(client, operation_id)
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert (
+            lifecycle.state
+            == terminal["state"]
+            == ("cancelled" if cancel else "succeeded")
+        )
+        assert attempted.is_set() is not cancel
+        assert registry.list_snapshot(actor=actor).items == (lifecycle,)
+    finally:
+        release.set()
+
+
+def test_legacy_bridge_mixed_terminal_snapshot_is_complete(legacy_case):
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    _install_legacy_test_package(service, actor)
+    expected = set()
+    for method, path, body, _service_method, _kind in _LEGACY_READS:
+        started = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        operation_id = started.json()["id"]
+        assert _wait_operation(client, operation_id)["state"] == "succeeded"
+        expected.add(operation_id)
+    subject = AllPackagesSubject(type="all_packages")
+    operation = registry.start(
+        "update_check",
+        lambda token: complete_read(
+            service,
+            kind="update_check",
+            subject=subject,
+            selection=None,
+            actor=actor,
+            call=lambda: service.check_updates(cancelled=token.is_cancelled),
+        ),
+        actor=actor,
+        subject=subject,
+        request_id=registry.admissions.new_request_id(),
+    )
+    deadline = time.monotonic() + 5
+    while registry.get_lifecycle(operation.id, actor=actor).state not in {
+        "succeeded",
+        "failed",
+    }:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    expected.add(operation.id)
+    seen = set()
+    page = registry.list_snapshot(actor=actor, limit=2)
+    while True:
+        for item in page.items:
+            assert item.id not in seen
+            assert item.state == "succeeded" and item.outcome is not None
+            seen.add(item.id)
+        if page.complete:
+            break
+        page = registry.list_snapshot(actor=actor, limit=2, cursor=page.next_cursor)
+    assert seen == expected
+    assert (
+        client.get(
+            "/api/plugins/workflow/marketplace/lifecycle/v2/capabilities",
+            headers=_headers(),
+        ).status_code
+        == 404
+    )
+
+
+@pytest.mark.parametrize("method,path,body,service_method,kind", _LEGACY_READS)
+@pytest.mark.parametrize("exit_mode", ["success", "failed", "cancelled"])
+def test_legacy_bridge_running_and_terminal(
+    legacy_case, monkeypatch, method, path, body, service_method, kind, exit_mode
+):
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    if service_method == "check_updates":
+        _install_legacy_test_package(service, actor)
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(service, service_method)
+
+    def controlled(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if exit_mode == "failed":
+            raise WorkflowMarketplaceError("source_unavailable", "private failure")
+        if exit_mode == "cancelled" and service_method != "refresh_source":
+            if kwargs["cancelled"]():
+                raise MarketplaceOperationCancelled()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, service_method, controlled)
+    try:
+        response = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        assert response.status_code == 202, response.text
+        operation_id = response.json()["id"]
+        assert response.json()["state"] == "pending"
+        assert entered.wait(5)
+        running = registry.get_lifecycle(operation_id, actor=actor)
+        assert running.kind == kind and running.state == "running"
+        assert registry.list_snapshot(actor=actor).items[0].id == operation_id
+        if exit_mode == "cancelled":
+            client.post(
+                f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+                headers=_headers(),
+            )
+        release.set()
+        legacy = _wait_operation(client, operation_id)
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert (
+            lifecycle.state
+            == legacy["state"]
+            == {"success": "succeeded", "failed": "failed", "cancelled": "cancelled"}[
+                exit_mode
+            ]
+        )
+        assert lifecycle.outcome is not None
+        page = registry.list_snapshot(actor=actor)
+        assert page.complete and page.items[0] == lifecycle
+        if kind == "refresh":
+            assert legacy["source_name"] == lifecycle.subject.source_name == "company"
+        if exit_mode == "success":
+            assert lifecycle.outcome.type == (
+                "committed" if kind == "refresh" else "known_unchanged"
+            )
+            assert legacy["result"] == lifecycle.result.model_dump(mode="json")
+        elif exit_mode == "cancelled":
+            assert lifecycle.outcome.type == "cancelled_before_commit"
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    "after_publication", ["return", "cancel_error", "ordinary_error"]
+)
+def test_legacy_bridge_publication_survives_late_cancellation(
+    legacy_case, monkeypatch, after_publication
+):
+    client, service, registry, actor = legacy_case
+    published, release = threading.Event(), threading.Event()
+    original = service.refresh_source
+
+    def controlled(*args, **kwargs):
+        result = original(*args, **kwargs)
+        published.set()
+        assert release.wait(5)
+        if after_publication != "return":
+            raise WorkflowMarketplaceError(
+                "source_cancelled"
+                if after_publication == "cancel_error"
+                else "source_unavailable",
+                "private failure after publication",
+            )
+        return result
+
+    monkeypatch.setattr(service, "refresh_source", controlled)
+    try:
+        response = client.post(
+            "/api/plugins/workflow/marketplace/sources/company/refresh",
+            headers=_headers(),
+        )
+        operation_id = response.json()["id"]
+        assert published.wait(5)
+        client.post(
+            f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+            headers=_headers(),
+        )
+        release.set()
+        legacy = _wait_operation(client, operation_id)
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert (
+            lifecycle.state
+            == legacy["state"]
+            == ("succeeded" if after_publication == "return" else "failed")
+        )
+        assert lifecycle.outcome.type == (
+            "committed" if after_publication == "return" else "outcome_unknown"
+        )
+        store = service.catalog.source_store
+        assert store.cached(store.get("company")).packages[0].id == "laptop-support"
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/install/prepare",
+        "/install/confirm",
+        "/update/prepare",
+        "/update/confirm",
+        "/remove/prepare",
+        "/remove/confirm",
+        "/trust/review",
+        "/trust/grant",
+        "/trust/revoke",
+    ],
+)
+def test_preview_retirement_precedes_admission_and_token_consumption(legacy_case, path):
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor=actor
+    )
+    before = {
+        p.relative_to(service.home): p.read_bytes()
+        for p in service.home.rglob("*")
+        if p.is_file()
+    }
+    response = client.post(
+        "/api/plugins/workflow/marketplace" + path,
+        headers=_headers(),
+        json={
+            "confirmationToken": review.confirmation_token,
+            "identifier": "company/laptop-support",
+            "identity": {"sourceKey": "company", "packageId": "laptop-support"},
+        },
+    )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+    }
+    assert registry.list(actor=actor) == ()
+    assert not registry.admissions.has_live_receipts()
+    assert {
+        p.relative_to(service.home): p.read_bytes()
+        for p in service.home.rglob("*")
+        if p.is_file()
+    } == before
+    assert (
+        service.confirmation_metadata(
+            review.confirmation_token, actor=actor, operation="install"
+        ).identity
+        == review.identity
+    )
 
 
 def _encode_path_syntax(value: str, layers: int) -> str:
@@ -564,7 +931,7 @@ def test_marketplace_reads_require_read_and_mutations_require_admin(api) -> None
             json={"identifier": "company/laptop-support"},
             headers=_headers("admin"),
         ).status_code
-        == 202
+        == 409
     )
 
 
@@ -899,19 +1266,17 @@ def test_request_json_rejects_duplicates_nonfinite_values_and_oversize(
         {"confirmationToken": "A" * 40, "unexpected": "secret"},
     ],
 )
-def test_confirmation_requests_are_strict_and_do_not_echo_rejected_values(
-    api, body
-) -> None:
+def test_retired_confirmation_does_not_echo_rejected_values(api, body) -> None:
     client, _service, _context, _home, _profile = api
-
     response = client.post(
         "/api/plugins/workflow/marketplace/install/confirm",
         json=body,
         headers=_headers(),
     )
-
-    assert response.status_code == 422
-    assert response.json()["detail"] == {"code": "marketplace_request_invalid"}
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "marketplace_lifecycle_upgrade_required"
+    }
     assert "too-short" not in response.text
     assert "secret" not in response.text
 
@@ -1025,11 +1390,10 @@ def test_package_detail_installed_and_update_check_have_strict_success_models(
     ],
 )
 def test_legacy_read_starts_supply_safe_receipt_subjects(
-    api, method, path, body, service_method, subject
+    legacy_case, method, path, body, service_method, subject
 ):
-    from plugins.workflow.marketplace.api import _actor
-
-    client, service, context, _home, _profile = api
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
     entered, release = threading.Event(), threading.Event()
     original = getattr(service, service_method)
 
@@ -1048,8 +1412,6 @@ def test_legacy_read_starts_supply_safe_receipt_subjects(
         )
         assert response.status_code == 202
         assert entered.wait(5)
-        key, _, _, registry = context.current()
-        actor = _actor(_Authority(frozenset({"admin"})), key)
         try:
             operation = registry.get_lifecycle(response.json()["id"], actor=actor)
         except MarketplaceOperationRegistryError as error:
@@ -1093,47 +1455,31 @@ def test_update_check_rejects_a_service_projection_with_unknown_fields(api) -> N
     assert "unexpected" not in json.dumps(terminal)
 
 
-def test_prepare_returns_token_only_inside_actor_scoped_prepared_result(api) -> None:
-    client, service, _context, _home, _profile = api
-
-    started = client.post(
+def test_retired_prepare_never_returns_a_token(api) -> None:
+    client, service, context, _home, _profile = api
+    response = client.post(
         "/api/plugins/workflow/marketplace/install/prepare",
         json={"identifier": "company/laptop-support"},
         headers=_headers(),
     )
-    terminal = _wait_operation(client, started.json()["id"])
-
-    assert started.status_code == 202
-    assert "confirmation" not in json.dumps(started.json()).casefold()
-    assert terminal["state"] == "succeeded"
-    assert terminal["result"]["type"] == "install_review"
-    assert terminal["result"]["value"]["confirmation_token"] == _TOKEN
-    call = next(item for item in service.calls if item[0] == "prepare_install")
-    assert call[2].startswith("marketplace:")
-    assert "raw-user-identity" not in call[2]
-    assert callable(call[3])
+    assert response.status_code == 409
+    assert "confirmation" not in response.text
+    assert service.calls == []
+    assert not context.registry_for_current_profile().admissions.has_live_receipts()
 
 
 def test_confirmation_failure_never_echoes_the_raw_token(api) -> None:
     client, service, _context, _home, _profile = api
     secret_token = "A" * 40
-    service.confirm_error = WorkflowMarketplaceError(
-        "confirmation_token_invalid",
-        f"expired token {secret_token} at /tmp/.quarantine",
-    )
-
-    started = client.post(
+    response = client.post(
         "/api/plugins/workflow/marketplace/install/confirm",
         json={"confirmationToken": secret_token},
         headers=_headers(),
     )
-    terminal = _wait_operation(client, started.json()["id"])
-
-    encoded = json.dumps(terminal, sort_keys=True)
-    assert terminal["state"] == "failed"
-    assert terminal["error"]["code"] == "confirmation_token_invalid"
-    assert secret_token not in encoded
-    assert "/tmp" not in encoded
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "marketplace_lifecycle_upgrade_required"
+    assert secret_token not in response.text
+    assert service.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1200,25 +1546,19 @@ def test_confirmation_failure_never_echoes_the_raw_token(api) -> None:
         ),
     ],
 )
-def test_lifecycle_route_groups_are_thin_background_adapters(
+def test_preview_route_groups_reject_valid_old_requests(
     api, path, body, result_type, call_name
 ) -> None:
-    client, service, _context, _home, _profile = api
-
-    started = client.post(
-        f"/api/plugins/workflow/marketplace{path}",
-        json=body,
-        headers=_headers(),
+    client, service, context, _home, _profile = api
+    response = client.post(
+        f"/api/plugins/workflow/marketplace{path}", json=body, headers=_headers()
     )
-    terminal = _wait_operation(client, started.json()["id"])
-
-    assert started.status_code == 202
-    assert started.json()["source_name"] is None
-    assert terminal["state"] == "succeeded"
-    assert terminal["source_name"] is None
-    assert terminal["result"]["type"] == result_type
-    assert "target" not in json.dumps(terminal)
-    assert any(call[0] == call_name for call in service.calls)
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+    }
+    assert service.calls == []
+    assert not context.registry_for_current_profile().has_in_flight()
 
 
 def test_operation_lookup_and_cancel_do_not_cross_actor_or_profile_scope(api) -> None:
@@ -1308,104 +1648,91 @@ def test_operation_lookup_and_cancel_are_indistinguishable_across_actors(api) ->
     assert listed.json()["operations"] == []
 
 
-def test_cancel_during_refresh_git_phase_is_result_free(api) -> None:
-    client, service, _context, _home, _profile = api
-    entered = threading.Event()
+def test_cancel_during_refresh_git_phase_is_result_free(
+    legacy_case, monkeypatch
+) -> None:
+    client, service, registry, actor = legacy_case
+    entered, release = threading.Event(), threading.Event()
+    original = service.catalog.git_fetcher.fetch
 
-    def blocking_refresh(name, *, cancelled):
+    def blocked(*args, **kwargs):
         entered.set()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not cancelled():
-            time.sleep(0.005)
-        return SourceRefreshResult(
-            source_name=name,
-            repository_url="https://example.test/repo.git",
-            state="cancelled",
-            resolved_commit=None,
-            verified_at=None,
-            package_count=0,
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.catalog.git_fetcher, "fetch", blocked)
+    try:
+        started = client.post(
+            "/api/plugins/workflow/marketplace/sources/company/refresh",
+            headers=_headers(),
         )
-
-    service.refresh_source = blocking_refresh
-    started = client.post(
-        "/api/plugins/workflow/marketplace/sources/company/refresh",
-        headers=_headers(),
-    )
-    assert entered.wait(timeout=2)
-
-    cancelled = client.post(
-        f"/api/plugins/workflow/marketplace/operations/{started.json()['id']}/cancel",
-        headers=_headers(),
-    )
-    terminal = _wait_operation(client, started.json()["id"])
-
-    assert cancelled.status_code == 200
-    assert terminal["state"] == "cancelled"
-    assert terminal["result"] is None
+        assert entered.wait(5)
+        cancelled = client.post(
+            f"/api/plugins/workflow/marketplace/operations/{started.json()['id']}/cancel",
+            headers=_headers(),
+        )
+        release.set()
+        terminal = _wait_operation(client, started.json()["id"])
+        assert cancelled.status_code == 200
+        assert terminal["state"] == "cancelled"
+        assert terminal["result"] is None
+        assert (
+            registry.get_lifecycle(started.json()["id"], actor=actor).outcome.type
+            == "cancelled_before_commit"
+        )
+        assert not service.catalog.source_store.catalog_path.exists()
+    finally:
+        release.set()
 
 
 def test_refresh_auth_failure_projection_redacts_credentials_and_local_paths(
-    api,
+    legacy_case, monkeypatch
 ) -> None:
-    client, service, _context, _home, _profile = api
+    client, service, registry, actor = legacy_case
 
-    def failed_refresh(name, *, cancelled):
-        return SourceRefreshResult(
-            source_name=name,
-            repository_url="https://example.test/repo.git",
-            state="authentication-failed",
-            resolved_commit=None,
-            verified_at=None,
-            package_count=0,
-            diagnostic_code="source_authentication_failed",
-            message=(
-                "https://user:secret@example.test/private "
-                "/private/tmp/marketplace/.staging access_token=secret "
-                "clientSecret=hidden C:\\Users\\alice\\AppData\\Local\\Temp\\x "
-                "\\\\server\\share\\quarantine\\package"
-            ),
+    def failed_fetch(*args, **kwargs):
+        raise WorkflowMarketplaceError(
+            "source_authentication_failed",
+            "https://user:secret@example.test/private /private/tmp/marketplace/.staging access_token=secret clientSecret=hidden",
         )
 
-    service.refresh_source = failed_refresh
+    monkeypatch.setattr(service.catalog.git_fetcher, "fetch", failed_fetch)
     started = client.post(
-        "/api/plugins/workflow/marketplace/sources/company/refresh",
-        headers=_headers(),
+        "/api/plugins/workflow/marketplace/sources/company/refresh", headers=_headers()
     )
     terminal = _wait_operation(client, started.json()["id"])
-
     encoded = json.dumps(terminal, sort_keys=True)
     assert terminal["state"] == "succeeded"
     assert terminal["result"]["value"]["state"] == "authentication-failed"
-    assert "secret" not in encoded
-    assert "hidden" not in encoded
-    assert "/private/tmp" not in encoded
-    assert "C:\\\\Users" not in encoded
-    assert "server\\\\share" not in encoded
+    assert (
+        "secret" not in encoded
+        and "hidden" not in encoded
+        and "/private/tmp" not in encoded
+    )
+    lifecycle = registry.get_lifecycle(started.json()["id"], actor=actor)
+    assert lifecycle.outcome.type == "known_unchanged"
+    assert (
+        lifecycle.result.value.message
+        == service.catalog.source_store.status("company").message
+    )
+    assert terminal["result"] == lifecycle.result.model_dump(mode="json")
 
 
-def test_refresh_preserves_schema_valid_local_repository_identity(api) -> None:
-    client, service, _context, _home, _profile = api
-
-    def local_refresh(name, *, cancelled):
-        return SourceRefreshResult(
-            source_name=name,
-            repository_url="file:///private/tmp/repository.git",
-            state="fresh",
-            resolved_commit=_COMMIT,
-            verified_at=_NOW,
-            package_count=1,
-        )
-
-    service.refresh_source = local_refresh
+def test_refresh_preserves_schema_valid_local_repository_identity(legacy_case) -> None:
+    client, service, registry, actor = legacy_case
     started = client.post(
-        "/api/plugins/workflow/marketplace/sources/company/refresh",
-        headers=_headers(),
+        "/api/plugins/workflow/marketplace/sources/company/refresh", headers=_headers()
     )
     terminal = _wait_operation(client, started.json()["id"])
-
     assert terminal["state"] == "succeeded"
     assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
-    assert "/private/tmp" not in json.dumps(terminal)
+    assert str(service.home.parent) not in json.dumps(terminal)
+    assert (
+        registry.get_lifecycle(started.json()["id"], actor=actor).result.model_dump(
+            mode="json"
+        )
+        == terminal["result"]
+    )
     MarketplaceOperation.model_validate(terminal, by_name=True)
 
 
@@ -1491,26 +1818,27 @@ def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
 ) -> None:
     client, service, _context, _home, _profile = api
     installed = _installed().model_copy(update={"repository_url": local_url})
-
-    def confirm(token, *, actor, cancelled, enter_atomic):
-        if cancelled() or not enter_atomic():
-            raise WorkflowMarketplaceError(
-                "marketplace_operation_cancelled", "cancelled"
-            )
-        return installed
-
-    service.confirm_install = confirm
-    started = client.post(
-        "/api/plugins/workflow/marketplace/install/confirm",
-        json={"confirmationToken": _TOKEN},
+    inspection = _inspection().model_copy(
+        update={
+            "installed": installed,
+            "repository_url": local_url,
+            "install_status": "installed",
+            "update_status": "current",
+        }
+    )
+    service.inspect = lambda identifier, *, cancelled: inspection
+    started = client.get(
+        "/api/plugins/workflow/marketplace/packages/company/laptop-support",
         headers=_headers(),
     )
     terminal = _wait_operation(client, started.json()["id"])
-
     assert terminal["state"] == "succeeded"
+    assert (
+        terminal["result"]["value"]["installed"]["repository_url"] == "file:///REDACTED"
+    )
     assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
     assert "Users" not in json.dumps(terminal)
-    assert "server" not in json.dumps(terminal)
+    assert "server" not in json.dumps(terminal["result"]["value"]["installed"])
     assert ".staging" not in json.dumps(terminal)
     MarketplaceOperation.model_validate(terminal, by_name=True)
 
@@ -1756,245 +2084,73 @@ def test_malformed_or_credential_bearing_result_identities_fail_without_leaking(
     assert "secret" not in encoded
 
 
-def test_prepare_reports_progress_and_enforces_same_profile_single_flight(api) -> None:
+def test_read_check_reports_progress_and_same_profile_single_flight(api) -> None:
     client, service, _context, _home, _profile = api
-    entered = threading.Event()
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
+    original = service.check_updates
 
-    def blocking_prepare(request, *, actor, cancelled):
+    def blocked(identity=None, *, cancelled):
         entered.set()
-        release.wait(timeout=5)
-        return _install_review()
+        assert release.wait(5)
+        return original(identity, cancelled=cancelled)
 
-    service.prepare_install = blocking_prepare
-    first = client.post(
-        "/api/plugins/workflow/marketplace/install/prepare",
-        json={"identifier": "company/laptop-support"},
-        headers=_headers(),
-    )
-    assert entered.wait(timeout=2)
-    running = client.get(
-        f"/api/plugins/workflow/marketplace/operations/{first.json()['id']}",
-        headers=_headers(),
-    )
-    conflict = client.post(
-        "/api/plugins/workflow/marketplace/install/prepare",
-        json={"identifier": "company/laptop-support"},
-        headers=_headers(),
-    )
-    release.set()
-    terminal = _wait_operation(client, first.json()["id"])
-
-    assert running.json()["state"] == "running"
-    assert running.json()["phase"] == "fetching"
-    assert running.json()["progress"] == 10
-    assert conflict.status_code == 409
-    assert conflict.json()["detail"] == {"code": "marketplace_operation_conflict"}
-    assert terminal["state"] == "succeeded"
+    service.check_updates = blocked
+    try:
+        first = client.post(
+            "/api/plugins/workflow/marketplace/updates/check",
+            json={},
+            headers=_headers(),
+        )
+        assert entered.wait(5)
+        running = client.get(
+            f"/api/plugins/workflow/marketplace/operations/{first.json()['id']}",
+            headers=_headers(),
+        )
+        conflict = client.post(
+            "/api/plugins/workflow/marketplace/updates/check",
+            json={},
+            headers=_headers(),
+        )
+        assert running.json()["state"] == "running"
+        assert running.json()["phase"] == "fetching"
+        assert running.json()["progress"] == 10
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"] == {"code": "marketplace_operation_conflict"}
+        release.set()
+        assert _wait_operation(client, first.json()["id"])["state"] == "succeeded"
+    finally:
+        release.set()
 
 
 def test_background_operation_reservation_capacity_returns_429(api) -> None:
     client, service, _context, _home, _profile = api
-    entered = threading.Event()
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
+    original = service.inspect
 
-    def blocking_prepare(request, *, actor, cancelled):
+    def blocked(identifier, *, cancelled):
         entered.set()
-        release.wait(timeout=5)
-        return _install_review()
+        assert release.wait(5)
+        return original(identifier, cancelled=cancelled)
 
-    service.prepare_install = blocking_prepare
-    started = [
-        client.post(
-            "/api/plugins/workflow/marketplace/install/prepare",
-            json={"identifier": f"company/package-{index}"},
+    service.inspect = blocked
+    try:
+        started = [
+            client.get(
+                "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+                headers=_headers(),
+            )
+            for _ in range(8)
+        ]
+        assert entered.wait(5)
+        rejected = client.get(
+            "/api/plugins/workflow/marketplace/packages/company/laptop-support",
             headers=_headers(),
         )
-        for index in range(8)
-    ]
-    assert entered.wait(timeout=2)
-    rejected = client.post(
-        "/api/plugins/workflow/marketplace/install/prepare",
-        json={"identifier": "company/over-capacity"},
-        headers=_headers(),
-    )
-    release.set()
-
-    assert all(response.status_code == 202 for response in started)
-    assert rejected.status_code == 429
-    assert rejected.json()["detail"] == {"code": "marketplace_operation_capacity"}
-
-
-def test_cancel_before_transaction_worker_start_never_enters_confirm(tmp_path) -> None:
-    service = _FakeService()
-    entered = threading.Event()
-    release = threading.Event()
-
-    def blocking_refresh(name, *, cancelled):
-        entered.set()
-        release.wait(timeout=5)
-        return SourceRefreshResult(
-            source_name=name,
-            repository_url="https://example.test/repo.git",
-            state="fresh",
-            resolved_commit=_COMMIT,
-            verified_at=_NOW,
-            package_count=1,
-        )
-
-    service.refresh_source = blocking_refresh  # ty: ignore[invalid-assignment]
-    context = WorkflowMarketplaceApiContext(
-        service_factory=lambda _home, _profile: service,
-        home_resolver=lambda: tmp_path / "home",
-        profile_resolver=lambda _home: "support",
-        operation_limits={
-            "max_workers": 1,
-            "max_in_flight": 2,
-            "max_terminal": 4,
-        },
-    )
-    app = FastAPI()
-    app.include_router(
-        create_marketplace_router(_verified_operator, context=context),
-        prefix="/api/plugins/workflow",
-    )
-    try:
-        with TestClient(app) as client:
-            first = client.post(
-                "/api/plugins/workflow/marketplace/sources/company/refresh",
-                headers=_headers(),
-            )
-            assert entered.wait(timeout=2)
-            queued = client.post(
-                "/api/plugins/workflow/marketplace/install/confirm",
-                json={"confirmationToken": _TOKEN},
-                headers=_headers(),
-            )
-            cancelled = client.post(
-                "/api/plugins/workflow/marketplace/operations/"
-                f"{queued.json()['id']}/cancel",
-                headers=_headers(),
-            )
-            release.set()
-            first_terminal = _wait_operation(client, first.json()["id"])
-
-        assert queued.status_code == 202
-        assert cancelled.json()["state"] == "cancelled"
-        assert first_terminal["state"] == "succeeded"
-        assert not any(call[0] == "confirm_install" for call in service.calls)
+        assert all(response.status_code == 202 for response in started)
+        assert rejected.status_code == 429
+        assert rejected.json()["detail"] == {"code": "marketplace_operation_capacity"}
     finally:
         release.set()
-        context.close()
-
-
-def test_cancel_during_atomic_swap_reports_committed_success(api) -> None:
-    client, service, _context, _home, _profile = api
-    entered = threading.Event()
-    release = threading.Event()
-
-    def blocking_confirm(token, *, actor, cancelled, enter_atomic):
-        assert not cancelled()
-        assert enter_atomic()
-        entered.set()
-        release.wait(timeout=5)
-        return _installed()
-
-    service.confirm_install = blocking_confirm
-    started = client.post(
-        "/api/plugins/workflow/marketplace/install/confirm",
-        json={"confirmationToken": _TOKEN},
-        headers=_headers(),
-    )
-    assert entered.wait(timeout=2)
-    during = client.post(
-        f"/api/plugins/workflow/marketplace/operations/{started.json()['id']}/cancel",
-        headers=_headers(),
-    )
-    release.set()
-    terminal = _wait_operation(client, started.json()["id"])
-
-    assert during.json()["state"] == "running"
-    assert during.json()["phase"] == "committing"
-    assert terminal["state"] == "succeeded"
-    assert terminal["result"]["type"] == "installed_package"
-
-
-def test_distinct_confirmation_tokens_for_same_package_are_single_flight(api) -> None:
-    client, service, _context, _home, _profile = api
-    entered = threading.Event()
-    release = threading.Event()
-
-    def blocking_confirm(token, *, actor, cancelled, enter_atomic):
-        entered.set()
-        release.wait(timeout=5)
-        if cancelled() or not enter_atomic():
-            raise WorkflowMarketplaceError(
-                "marketplace_operation_cancelled", "cancelled"
-            )
-        return _installed()
-
-    service.confirm_install = blocking_confirm
-    first = client.post(
-        "/api/plugins/workflow/marketplace/install/confirm",
-        json={"confirmationToken": "A" * 40},
-        headers=_headers(),
-    )
-    assert entered.wait(timeout=2)
-    second = client.post(
-        "/api/plugins/workflow/marketplace/install/confirm",
-        json={"confirmationToken": "B" * 40},
-        headers=_headers(),
-    )
-    release.set()
-
-    assert first.status_code == 202
-    assert second.status_code == 409
-    assert second.json()["detail"] == {"code": "marketplace_operation_conflict"}
-    assert "A" * 40 not in first.text
-    assert "B" * 40 not in second.text
-
-
-def test_update_remove_and_trust_mutations_share_package_reservation(api) -> None:
-    client, service, _context, _home, _profile = api
-    entered = threading.Event()
-    release = threading.Event()
-
-    def blocking_update(token, *, actor, cancelled, enter_atomic):
-        entered.set()
-        release.wait(timeout=5)
-        if cancelled() or not enter_atomic():
-            raise WorkflowMarketplaceError(
-                "marketplace_operation_cancelled", "cancelled"
-            )
-        return _installed(version="2.0.0")
-
-    service.confirm_update = blocking_update
-    update = client.post(
-        "/api/plugins/workflow/marketplace/update/confirm",
-        json={"confirmationToken": "U" * 40},
-        headers=_headers(),
-    )
-    assert entered.wait(timeout=2)
-    remove = client.post(
-        "/api/plugins/workflow/marketplace/remove/confirm",
-        json={"confirmationToken": "R" * 40},
-        headers=_headers(),
-    )
-    trust = client.post(
-        "/api/plugins/workflow/marketplace/trust/revoke",
-        json={
-            "identity": {
-                "sourceKey": "company",
-                "packageId": "laptop-support",
-            }
-        },
-        headers=_headers(),
-    )
-    release.set()
-
-    assert update.status_code == 202
-    assert remove.status_code == 409
-    assert trust.status_code == 409
 
 
 def _streaming_request(chunks: list[bytes], *, content_length: int | None = None):

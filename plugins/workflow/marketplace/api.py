@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -20,6 +20,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -33,16 +34,17 @@ from hermes_constants import get_hermes_home, hermes_home_key
 from .lifecycle_models import (
     AllPackagesSubject,
     LifecycleSubject,
+    LifecycleResult,
+    LifecyclePublicError,
+    OutcomeUnknown,
     PackageIdentity,
     PackageSubject,
     SourceSubject,
 )
 
 from .models import (
-    InstallRequest,
     InstalledPackage,
     InstalledPackageIdentity,
-    PackageInspection,
     SOURCE_NAME_PATTERN,
     PACKAGE_ID_PATTERN,
     SEMANTIC_VERSION_PATTERN,
@@ -52,6 +54,8 @@ from .models import (
 )
 from .operations import (
     CancellationToken,
+    LegacyLifecycleCompletion,
+    LifecycleCompletion,
     MarketplaceOperation,
     MarketplaceOperationRegistryError,
     MarketplaceOperationResult,
@@ -59,6 +63,7 @@ from .operations import (
     validate_marketplace_operation_result,
 )
 from .package import WorkflowMarketplaceError
+from .lifecycle_state import complete_read, complete_source_refresh
 from .service import WorkflowMarketplaceService
 from .source_store import (
     redact_source_refresh_message,
@@ -822,6 +827,38 @@ def _operation_result(kind: str, value: object) -> MarketplaceOperationResult:
     return validate_marketplace_operation_result(sanitized)
 
 
+def _legacy_completion(completion: LifecycleCompletion) -> LegacyLifecycleCompletion:
+    """Sanitize and validate both read projections without changing domain truth."""
+    if completion.state != "succeeded":
+        return LegacyLifecycleCompletion(completion=completion, result=None)
+    try:
+        public = _sanitize_result(
+            completion.result.model_dump(mode="json"), allow_confirmation_token=False
+        )
+        lifecycle_result = TypeAdapter(LifecycleResult).validate_python(public)
+        legacy_result = TypeAdapter(MarketplaceOperationResult).validate_python(
+            public, by_name=True
+        )
+        return LegacyLifecycleCompletion(
+            completion=replace(completion, result=lifecycle_result),
+            result=validate_marketplace_operation_result(
+                legacy_result.model_dump(mode="json", by_alias=True)
+            ),
+        )
+    except Exception:
+        return LegacyLifecycleCompletion(
+            completion=LifecycleCompletion(
+                state="failed",
+                result=None,
+                error=LifecyclePublicError(code="marketplace_operation_failed"),
+                outcome=OutcomeUnknown(
+                    type="outcome_unknown", reason="terminal_invalid"
+                ),
+            ),
+            result=None,
+        )
+
+
 def _service_error(error: WorkflowMarketplaceError) -> HTTPException:
     code = error.code
     if not isinstance(code, str) or _ERROR_CODE.fullmatch(code) is None:
@@ -876,7 +913,9 @@ def _service_call(call: Callable[[], _ValueT]) -> _ValueT:
 def _start(
     registry: WorkflowMarketplaceOperationRegistry,
     kind: str,
-    call: Callable[[CancellationToken], MarketplaceOperationResult],
+    call: Callable[
+        [CancellationToken], MarketplaceOperationResult | LegacyLifecycleCompletion
+    ],
     *,
     actor: str,
     target: str | None = None,
@@ -898,45 +937,8 @@ def _start(
         raise _registry_error(error)
 
 
-def _confirmation_target(
-    service: WorkflowMarketplaceService,
-    token: str,
-    *,
-    actor: str,
-    operation: Literal["install", "update", "remove", "trust"],
-) -> str:
-    try:
-        metadata = service.confirmation_metadata(
-            token,
-            actor=actor,
-            operation=operation,
-        )
-    except WorkflowMarketplaceError:
-        # Invalid, expired, or foreign tokens share one non-oracular reservation.
-        return "package:unresolved-confirmation"
-    return _identity_target(metadata.identity)
-
-
-def _request_target(
-    service: WorkflowMarketplaceService, request: InstallRequest
-) -> str:
-    return _service_call(lambda: service.canonical_install_target(request))
-
-
 def _identity_target(identity: InstalledPackageIdentity) -> str:
     return f"package:{identity.source_key}/{identity.package_id}"
-
-
-def _confirmed_call(
-    cancellation: CancellationToken,
-    call: Callable[[Callable[[], bool], Callable[[], bool]], object],
-    *,
-    result_type: str,
-) -> MarketplaceOperationResult:
-    cancellation.checkpoint()
-    result = call(cancellation.is_cancelled, cancellation.enter_atomic)
-    cancellation.mark_committed()
-    return _operation_result(result_type, result)
 
 
 def create_marketplace_router(
@@ -1081,15 +1083,17 @@ def create_marketplace_router(
         key, _profile, service, registry = api.current()
         actor = _actor(authority, key)
 
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
+        def run(cancellation: CancellationToken) -> LegacyLifecycleCompletion:
             cancellation.set_progress("fetching", 10)
-            value = service.refresh_source(name, cancelled=cancellation.is_cancelled)
-            cancellation.checkpoint()
-            cancellation.set_progress("verifying", 90)
-            projection = MarketplaceSourceRefreshProjection.model_validate(
-                asdict(value)
+            return _legacy_completion(
+                complete_source_refresh(
+                    service,
+                    source_name=name,
+                    call=lambda: service.refresh_source(
+                        name, cancelled=cancellation.is_cancelled
+                    ),
+                )
             )
-            return _operation_result("source_refresh", projection)
 
         return _start(
             registry,
@@ -1153,12 +1157,26 @@ def create_marketplace_router(
         key, _profile, service, registry = api.current()
         actor = _actor(authority, key)
 
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
+        subject = PackageSubject(
+            type="package",
+            identity=PackageIdentity(
+                source_key=identity.source_key, package_id=identity.package_id
+            ),
+        )
+
+        def run(cancellation: CancellationToken) -> LegacyLifecycleCompletion:
             cancellation.set_progress("fetching", 10)
-            value = service.inspect(identifier, cancelled=cancellation.is_cancelled)
-            cancellation.checkpoint()
-            return _operation_result(
-                "package_detail", PackageInspection.model_validate(value)
+            return _legacy_completion(
+                complete_read(
+                    service,
+                    kind="inspect",
+                    subject=subject,
+                    selection=None,
+                    actor=actor,
+                    call=lambda: service.inspect(
+                        identifier, cancelled=cancellation.is_cancelled
+                    ),
+                )
             )
 
         return _start(
@@ -1166,12 +1184,7 @@ def create_marketplace_router(
             "package_detail",
             run,
             actor=actor,
-            subject=PackageSubject(
-                type="package",
-                identity=PackageIdentity(
-                    source_key=identity.source_key, package_id=identity.package_id
-                ),
-            ),
+            subject=subject,
             canonical_body=identity.model_dump(mode="json"),
         )
 
@@ -1207,16 +1220,32 @@ def create_marketplace_router(
         key, _profile, service, registry = api.current()
         actor = _actor(authority, key)
 
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
+        subject = (
+            PackageSubject(
+                type="package",
+                identity=PackageIdentity(
+                    source_key=body.identity.source_key,
+                    package_id=body.identity.package_id,
+                ),
+            )
+            if body.identity
+            else AllPackagesSubject(type="all_packages")
+        )
+
+        def run(cancellation: CancellationToken) -> LegacyLifecycleCompletion:
             cancellation.set_progress("fetching", 10)
-            checks = service.check_updates(
-                body.identity, cancelled=cancellation.is_cancelled
+            return _legacy_completion(
+                complete_read(
+                    service,
+                    kind="update_check",
+                    subject=subject,
+                    selection=None,
+                    actor=actor,
+                    call=lambda: service.check_updates(
+                        body.identity, cancelled=cancellation.is_cancelled
+                    ),
+                )
             )
-            cancellation.checkpoint()
-            projection = MarketplaceUpdateChecksProjection(
-                checks=[UpdateCheck.model_validate(item) for item in checks]
-            )
-            return _operation_result("update_checks", projection)
 
         target = (
             _identity_target(body.identity)
@@ -1229,307 +1258,24 @@ def create_marketplace_router(
             run,
             actor=actor,
             target=target,
-            subject=(
-                PackageSubject(
-                    type="package",
-                    identity=PackageIdentity(
-                        source_key=body.identity.source_key,
-                        package_id=body.identity.package_id,
-                    ),
-                )
-                if body.identity
-                else AllPackagesSubject(type="all_packages")
-            ),
+            subject=subject,
             canonical_body=body.model_dump(mode="json"),
         )
 
-    @router.post(
-        "/install/prepare",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def prepare_install(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, InstallRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
-            cancellation.set_progress("fetching", 10)
-            value = service.prepare_install(
-                body,
-                actor=actor,
-                cancelled=cancellation.is_cancelled,
-            )
-            cancellation.checkpoint()
-            cancellation.set_progress("reviewing", 90)
-            return _operation_result("install_review", value)
-
-        return _start(
-            registry,
-            "install_prepare",
-            run,
-            actor=actor,
-            target=_request_target(service, body),
-        )
-
-    @router.post(
-        "/install/confirm",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def confirm_install(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, MarketplaceConfirmationRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-        return _start(
-            registry,
-            "install_confirm",
-            lambda cancellation: _confirmed_call(
-                cancellation,
-                lambda cancelled, enter_atomic: service.confirm_install(
-                    body.confirmation_token,
-                    actor=actor,
-                    cancelled=cancelled,
-                    enter_atomic=enter_atomic,
-                ),
-                result_type="installed_package",
-            ),
-            actor=actor,
-            target=_confirmation_target(
-                service,
-                body.confirmation_token,
-                actor=actor,
-                operation="install",
-            ),
-        )
-
-    @router.post(
-        "/update/prepare",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def prepare_update(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        identity = await _body(request, MarketplaceIdentityRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
-            cancellation.set_progress("fetching", 10)
-            value = service.prepare_update(
-                identity,
-                actor=actor,
-                cancelled=cancellation.is_cancelled,
-            )
-            cancellation.checkpoint()
-            cancellation.set_progress("reviewing", 90)
-            return _operation_result("update_review", value)
-
-        return _start(
-            registry,
-            "update_prepare",
-            run,
-            actor=actor,
-            target=_identity_target(identity),
-        )
-
-    @router.post(
-        "/update/confirm",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def confirm_update(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, MarketplaceConfirmationRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-        return _start(
-            registry,
-            "update_confirm",
-            lambda cancellation: _confirmed_call(
-                cancellation,
-                lambda cancelled, enter_atomic: service.confirm_update(
-                    body.confirmation_token,
-                    actor=actor,
-                    cancelled=cancelled,
-                    enter_atomic=enter_atomic,
-                ),
-                result_type="updated_package",
-            ),
-            actor=actor,
-            target=_confirmation_target(
-                service,
-                body.confirmation_token,
-                actor=actor,
-                operation="update",
-            ),
-        )
-
-    @router.post(
-        "/remove/prepare",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def prepare_remove(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        identity = await _body(request, MarketplaceIdentityRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
-            cancellation.set_progress("reviewing", 25)
-            value = service.prepare_remove(identity, actor=actor)
-            cancellation.checkpoint()
-            return _operation_result("remove_review", value)
-
-        return _start(
-            registry,
-            "remove_prepare",
-            run,
-            actor=actor,
-            target=_identity_target(identity),
-        )
-
-    @router.post(
-        "/remove/confirm",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def confirm_remove(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, MarketplaceConfirmationRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-        return _start(
-            registry,
-            "remove_confirm",
-            lambda cancellation: _confirmed_call(
-                cancellation,
-                lambda cancelled, enter_atomic: service.confirm_remove(
-                    body.confirmation_token,
-                    actor=actor,
-                    cancelled=cancelled,
-                    enter_atomic=enter_atomic,
-                ),
-                result_type="removed_package",
-            ),
-            actor=actor,
-            target=_confirmation_target(
-                service,
-                body.confirmation_token,
-                actor=actor,
-                operation="remove",
-            ),
-        )
-
-    @router.post(
-        "/trust/review",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def review_trust(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, MarketplaceTrustReviewRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-
-        def run(cancellation: CancellationToken) -> MarketplaceOperationResult:
-            cancellation.set_progress("reviewing", 25)
-            value = service.review_trust(
-                body.identity,
-                actor=actor,
-                workflow_name=body.workflow_name,
-            )
-            cancellation.checkpoint()
-            return _operation_result("trust_review", value)
-
-        return _start(
-            registry,
-            "trust_prepare",
-            run,
-            actor=actor,
-            target=_identity_target(body.identity),
-        )
-
-    @router.post(
-        "/trust/grant",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def grant_trust(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, MarketplaceConfirmationRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-
-        def call(cancelled, enter_atomic) -> MarketplaceTrustStatesProjection:
-            states = service.grant_trust(
-                body.confirmation_token,
-                actor=actor,
-                cancelled=cancelled,
-                enter_atomic=enter_atomic,
-            )
-            return MarketplaceTrustStatesProjection(
-                workflows=[
-                    MarketplaceTrustState(workflow_name=name, state=states[name])
-                    for name in sorted(states)
-                ]
-            )
-
-        return _start(
-            registry,
-            "trust_confirm",
-            lambda cancellation: _confirmed_call(
-                cancellation, call, result_type="trust_grant"
-            ),
-            actor=actor,
-            target=_confirmation_target(
-                service,
-                body.confirmation_token,
-                actor=actor,
-                operation="trust",
-            ),
-        )
-
-    @router.post(
-        "/trust/revoke",
-        status_code=202,
-        response_model=MarketplaceOperation,
-        response_model_by_alias=False,
-    )
-    async def revoke_trust(request: Request):
-        authority = _authorize(verified_operator, request, "admin")
-        body = await _body(request, MarketplaceTrustRevokeRequest)
-        key, _profile, service, registry = api.current()
-        actor = _actor(authority, key)
-
-        def call(cancelled, enter_atomic) -> MarketplaceTrustRevocationProjection:
-            revoked = service.revoke_trust(
-                body.identity,
-                workflow_name=body.workflow_name,
-                cancelled=cancelled,
-                enter_atomic=enter_atomic,
-            )
-            return MarketplaceTrustRevocationProjection(revoked=revoked)
-
-        return _start(
-            registry,
-            "trust_revoke",
-            lambda cancellation: _confirmed_call(
-                cancellation, call, result_type="trust_revoke"
-            ),
-            actor=actor,
-            target=_identity_target(body.identity),
+    @router.post("/install/prepare")
+    @router.post("/install/confirm")
+    @router.post("/update/prepare")
+    @router.post("/update/confirm")
+    @router.post("/remove/prepare")
+    @router.post("/remove/confirm")
+    @router.post("/trust/review")
+    @router.post("/trust/grant")
+    @router.post("/trust/revoke")
+    def retired_preview_mutation(request: Request):
+        _authorize(verified_operator, request, "admin")
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "marketplace_lifecycle_upgrade_required"},
         )
 
     @router.get(

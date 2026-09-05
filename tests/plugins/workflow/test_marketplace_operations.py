@@ -59,6 +59,326 @@ def _refresh_result(source_name: str) -> MarketplaceSourceRefreshOperationResult
     )
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "install_confirm",
+        "update_confirm",
+        "remove_confirm",
+        "trust_confirm",
+        "trust_revoke",
+        "inspect",
+        "update_prepare",
+    ],
+)
+def test_busy_identity_is_profile_wide_without_actor_projection(tmp_path, kind):
+    from plugins.workflow.marketplace.lifecycle_models import (
+        PackageIdentity,
+        PackageSubject,
+        AllTrustSelection,
+    )
+    from plugins.workflow.marketplace.models import InstalledPackageIdentity
+
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support", max_workers=1
+    )
+    entered, release = threading.Event(), threading.Event()
+    subject = PackageSubject(
+        type="package",
+        identity=PackageIdentity(source_key="company", package_id="support"),
+    )
+    identity = InstalledPackageIdentity(sourceKey="company", packageId="support")
+    blocker = registry.start(
+        "refresh",
+        lambda _: (entered.set(), release.wait(5), _refresh_result("other"))[-1],
+        target="source:other",
+    )
+    assert entered.wait(5)
+    second_entered, second_release = threading.Event(), threading.Event()
+    try:
+        operation = registry.start(
+            kind,
+            lambda _: (second_entered.set(), second_release.wait(5), None)[-1],
+            actor="foreign",
+            subject=subject,
+            request_id=registry.admissions.new_request_id(),
+            selection=AllTrustSelection(type="all")
+            if kind.startswith("trust_")
+            else None,
+        )
+        assert operation.state == "pending"
+        busy = getattr(registry, "intersects_active_mutation", None)
+        assert callable(busy), "profile-wide exact mutation query is missing"
+        expected = kind.endswith("confirm") or kind == "trust_revoke"
+        assert busy(identity) is expected
+        assert (
+            busy(InstalledPackageIdentity(sourceKey="other", packageId="support"))
+            is False
+        )
+        assert (
+            busy(InstalledPackageIdentity(sourceKey="company", packageId="different"))
+            is False
+        )
+        assert registry.list_snapshot(actor="caller").items == ()
+        release.set()
+        assert second_entered.wait(5)
+        assert registry.get_lifecycle(operation.id, actor="foreign").state == "running"
+        assert busy(identity) is expected
+        second_release.set()
+        _wait_terminal(registry, operation.id, actor="foreign")
+        assert busy(identity) is False
+    finally:
+        release.set()
+        second_release.set()
+        registry.close()
+
+
+@pytest.mark.parametrize(
+    "outcome_type", ["committed", "outcome_unknown", "recovery_required"]
+)
+def test_typed_terminal_evidence_wins_over_late_registry_cancellation(
+    tmp_path, outcome_type
+):
+    from plugins.workflow.marketplace import lifecycle_models as wire
+    from plugins.workflow.marketplace.operations import LifecycleCompletion
+
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support"
+    )
+    returned, release = threading.Event(), threading.Event()
+    result = wire.SourceRefreshResult.model_validate(
+        _refresh_result("company").model_dump(mode="json")
+    )
+    outcome = {
+        "committed": wire.CommittedOutcome(type="committed", package_state=None),
+        "outcome_unknown": wire.OutcomeUnknown(
+            type="outcome_unknown", reason="terminal_invalid"
+        ),
+        "recovery_required": wire.RecoveryRequiredOutcome(
+            type="recovery_required", reason="state_unverified"
+        ),
+    }[outcome_type]
+
+    def worker(token):
+        completion = LifecycleCompletion(
+            state="succeeded" if outcome_type == "committed" else "failed",
+            result=result if outcome_type == "committed" else None,
+            error=None
+            if outcome_type == "committed"
+            else wire.LifecyclePublicError(code="source_cancelled"),
+            outcome=outcome,
+        )
+        returned.set()
+        assert release.wait(5)
+        return completion
+
+    try:
+        operation = registry.start(
+            "refresh",
+            worker,
+            actor="operator-a",
+            request_id=registry.admissions.new_request_id(),
+            subject=wire.SourceSubject(type="source", source_name="company"),
+        )
+        assert returned.wait(5)
+        registry.cancel(operation.id, actor="operator-a")
+        release.set()
+        terminal = _wait_terminal(registry, operation.id)
+        assert terminal.state == (
+            "succeeded" if outcome_type == "committed" else "failed"
+        )
+        assert terminal.outcome == outcome
+    finally:
+        release.set()
+        registry.close()
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "wrong_source", "untyped", "failed_with_result"]
+)
+@pytest.mark.parametrize("cancel", [False, True])
+def test_legacy_bridge_never_downgrades_invalid_completion_to_success(
+    tmp_path, invalid, cancel
+):
+    from plugins.workflow.marketplace import lifecycle_models as wire
+    from plugins.workflow.marketplace.operations import (
+        LifecycleCompletion,
+        LegacyLifecycleCompletion,
+    )
+
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support"
+    )
+    value = _refresh_result("company").model_dump(mode="json")
+    value["value"].update(
+        state="disabled", resolved_commit=None, verified_at=None, package_count=0
+    )
+    result = wire.SourceRefreshResult.model_validate(value)
+    completion = LifecycleCompletion(
+        state="succeeded",
+        result=result,
+        error=None,
+        outcome=wire.KnownUnchangedOutcome(
+            type="known_unchanged", evidence="before_mutation", package_state=None
+        ),
+    )
+    legacy = {
+        "missing": None,
+        "wrong_source": _refresh_result("other"),
+        "untyped": object(),
+        "failed_with_result": _refresh_result("company"),
+    }[invalid]
+    if invalid == "failed_with_result":
+        completion = LifecycleCompletion(
+            state="failed",
+            result=None,
+            error=wire.LifecyclePublicError(code="source_unavailable"),
+            outcome=wire.OutcomeUnknown(
+                type="outcome_unknown", reason="terminal_invalid"
+            ),
+        )
+    entered, release = threading.Event(), threading.Event()
+
+    def worker(_token):
+        entered.set()
+        assert release.wait(5)
+        return LegacyLifecycleCompletion(completion, legacy)
+
+    try:
+        operation = registry.start(
+            "refresh",
+            worker,
+            actor="operator-a",
+            target="source:company",
+            subject=wire.SourceSubject(type="source", source_name="company"),
+        )
+        assert entered.wait(5)
+        if cancel:
+            registry.cancel(operation.id, actor="operator-a")
+        release.set()
+        # The V2 observation must also fail, even if V1 serialization is broken.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            terminal = registry.get_lifecycle(operation.id, actor="operator-a")
+            if terminal.state in {"failed", "succeeded"}:
+                break
+            time.sleep(0.01)
+        assert terminal.state == "failed"
+        assert terminal.outcome.type == "outcome_unknown"
+        legacy_terminal = registry.get(operation.id, actor="operator-a")
+        assert legacy_terminal.state == "failed" and legacy_terminal.result is None
+    finally:
+        release.set()
+        registry.close()
+
+
+@pytest.mark.parametrize(
+    "evidence,atomic,expected",
+    [
+        ("before_mutation", False, "cancelled"),
+        ("read_only", False, "cancelled"),
+        ("before_mutation", True, "failed"),
+        ("rollback_verified", False, "failed"),
+    ],
+)
+def test_late_cancel_requires_validated_pre_mutation_evidence(
+    tmp_path, evidence, atomic, expected
+):
+    from plugins.workflow.marketplace import lifecycle_models as wire
+    from plugins.workflow.marketplace.operations import LifecycleCompletion
+
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support"
+    )
+    subject = wire.PackageSubject(
+        type="package",
+        identity=wire.PackageIdentity(source_key="company", package_id="support"),
+    )
+    package_state = wire.PackageState(
+        profile="support",
+        identity=subject.identity,
+        observed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        state="absent",
+        installed=None,
+        trust=None,
+        recovery="clear",
+        busy=False,
+    )
+    outcome = wire.KnownUnchangedOutcome(
+        type="known_unchanged",
+        evidence=evidence,
+        package_state=package_state if evidence == "rollback_verified" else None,
+    )
+    entered, release = threading.Event(), threading.Event()
+
+    def worker(token):
+        if atomic:
+            token.begin_atomic()
+        entered.set()
+        assert release.wait(5)
+        return LifecycleCompletion(
+            state="failed",
+            result=None,
+            error=wire.LifecyclePublicError(code="marketplace_operation_failed"),
+            outcome=outcome,
+        )
+
+    try:
+        operation = registry.start(
+            "remove_confirm",
+            worker,
+            actor="operator-a",
+            subject=subject,
+            request_id=registry.admissions.new_request_id(),
+        )
+        assert entered.wait(5)
+        registry.cancel(operation.id, actor="operator-a")
+        release.set()
+        terminal = _wait_terminal(registry, operation.id)
+        assert terminal.state == expected
+        assert terminal.outcome.type == (
+            "cancelled_before_commit" if expected == "cancelled" else "known_unchanged"
+        )
+    finally:
+        release.set()
+        registry.close()
+
+
+def test_legacy_verifying_phase_has_a_strict_v2_projection(tmp_path):
+    from plugins.workflow.marketplace.lifecycle_models import SourceSubject
+
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support"
+    )
+    verifying, release = threading.Event(), threading.Event()
+
+    def worker(token):
+        token.set_progress("verifying", 90)
+        verifying.set()
+        assert release.wait(5)
+        token.checkpoint()
+
+    try:
+        operation = registry.start(
+            "refresh",
+            worker,
+            actor="operator-a",
+            target="source:company",
+            subject=SourceSubject(type="source", source_name="company"),
+        )
+        assert verifying.wait(5)
+        assert registry.get(operation.id, actor="operator-a").phase == "verifying"
+        lifecycle = registry.get_lifecycle(operation.id, actor="operator-a")
+        assert lifecycle.phase == "fetching" and lifecycle.progress == 90
+        assert registry.list_snapshot(actor="operator-a").items == (lifecycle,)
+        registry.cancel(operation.id, actor="operator-a")
+        release.set()
+        assert _wait_terminal(registry, operation.id).state == "cancelled"
+    finally:
+        release.set()
+        registry.close()
+
+
 @pytest.fixture
 def registry():
     value = WorkflowMarketplaceOperationRegistry(
@@ -747,10 +1067,8 @@ def test_legacy_read_receipt_prevents_retiring_its_profile(registry) -> None:
         )
     except TypeError as error:
         pytest.fail(f"read admission metadata is not supported: {error}")
-    assert _wait_terminal(registry, operation.id).state == "succeeded"
+    assert _wait_terminal(registry, operation.id).state == "failed"
     assert registry.retire_if_idle() is False
-    with pytest.raises(MarketplaceOperationRegistryError) as unavailable:
-        registry.get_lifecycle(operation.id, actor="operator-a")
-    assert unavailable.value.code == "marketplace_operation_unavailable"
-    with pytest.raises(MarketplaceOperationRegistryError):
-        registry.list_snapshot(actor="operator-a")
+    terminal = registry.get_lifecycle(operation.id, actor="operator-a")
+    assert terminal.outcome.type == "outcome_unknown"
+    assert registry.list_snapshot(actor="operator-a").items == (terminal,)
