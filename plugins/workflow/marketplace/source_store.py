@@ -890,8 +890,13 @@ class WorkflowSourceStore:
 
     @contextmanager
     def _locked(self):
+        from .lifecycle_state import _source_scope
+
+        # Protect every refresh read/status fallback, before touching a home.
+        _source_scope(store=self)
         root_identity = self._ensure_private_root()
         with workflow_lock(self.lock_path):
+            _source_scope(store=self)
             try:
                 metadata = self.root.lstat()
             except OSError:
@@ -954,6 +959,11 @@ class WorkflowSourceStore:
         rendered = _render_state(value, limit=limit, size_code=size_code)
         if cancelled is not None:
             _check_cancelled(cancelled)
+        from .lifecycle_state import _source_scope
+
+        # Encoding/cancellation callbacks can invalidate ownership after locking.
+        # Status writes require the same binding as verified-cache publication.
+        _source_scope(store=self)
         if verified_publication is not None:
             from .lifecycle_state import _source_write_started
 

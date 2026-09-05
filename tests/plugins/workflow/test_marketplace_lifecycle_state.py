@@ -280,6 +280,87 @@ def test_source_completion_catalog_replacement_cannot_transfer_authority(
     assert not other.catalog.source_store.catalog_path.exists()
 
 
+@pytest.mark.parametrize("path", ["fresh", "disabled", "fetch_failed"])
+@pytest.mark.parametrize("boundary", ["before_entry", "during_fetch"])
+def test_source_completion_backing_store_replacement_never_touches_foreign_home(
+    source_service, tmp_path, monkeypatch, path, boundary
+):
+    from plugins.workflow.marketplace.source_store import WorkflowSourceStore
+
+    original_store = source_service.catalog.source_store
+    foreign = WorkflowSourceStore(tmp_path / "foreign-home")
+    foreign.add(original_store.get("company"))
+    if path == "disabled":
+        if boundary == "before_entry":
+            foreign.set_enabled("company", False)
+        else:
+            # Change the backing store during the disabled cache-read path.
+            original_store.set_enabled("company", False)
+    before = foreign.path.read_bytes()
+
+    def replace_store():
+        source_service.catalog.source_store = foreign
+
+    real_fetch = source_service.catalog.git_fetcher.fetch
+
+    def fetch(*args, **kwargs):
+        if boundary == "during_fetch":
+            replace_store()
+        if path == "fetch_failed":
+            raise WorkflowMarketplaceError("source_unavailable", "fetch failed")
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(source_service.catalog.git_fetcher, "fetch", fetch)
+    if path == "disabled" and boundary == "during_fetch":
+        original_cached = original_store.cached
+
+        def cached(*args, **kwargs):
+            result = original_cached(*args, **kwargs)
+            replace_store()
+            return result
+
+        monkeypatch.setattr(original_store, "cached", cached)
+
+    def call():
+        if boundary == "before_entry":
+            replace_store()
+        return source_service.refresh_source("company")
+
+    completion = _source_completion(source_service, call=call)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert foreign.path.read_bytes() == before
+    assert not foreign.catalog_path.exists()
+    assert not original_store.catalog_path.exists()
+
+
+def test_source_completion_store_swap_during_fallback_never_writes_foreign_status(
+    source_service, tmp_path, monkeypatch
+):
+    from plugins.workflow.marketplace.source_store import WorkflowSourceStore
+
+    original_store = source_service.catalog.source_store
+    foreign = WorkflowSourceStore(tmp_path / "foreign-home")
+    foreign.add(original_store.get("company"))
+    before = foreign.path.read_bytes()
+
+    def fail_fetch(*args, **kwargs):
+        raise WorkflowMarketplaceError("source_unavailable", "fetch failed")
+
+    def transfer_fallback(*args, **kwargs):
+        source_service.catalog.source_store = foreign
+        return foreign.record_failed_refresh(*args, **kwargs)
+
+    monkeypatch.setattr(source_service.catalog.git_fetcher, "fetch", fail_fetch)
+    monkeypatch.setattr(original_store, "record_failed_refresh", transfer_fallback)
+    completion = _source_completion(source_service)
+    assert completion.state == "failed"
+    assert completion.outcome.type == "outcome_unknown"
+    assert foreign.path.read_bytes() == before
+    assert not foreign.catalog_path.exists()
+    assert not original_store.catalog_path.exists()
+
+
 def test_source_completion_reuse_retains_uncertainty_after_publication(source_service):
     def reused():
         result = source_service.refresh_source("company")

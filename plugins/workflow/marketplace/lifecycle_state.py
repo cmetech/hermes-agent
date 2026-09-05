@@ -204,7 +204,9 @@ def _source_scope(*, catalog=None, store=None):
         return None
     if (
         evidence.closed.is_set()
+        or evidence.invalid.is_set()
         or evidence.execution != _execution()
+        or evidence.catalog.source_store is not evidence.store
         or (catalog is not None and evidence.catalog is not catalog)
         or (store is not None and evidence.store is not store)
     ):
@@ -241,6 +243,7 @@ def source_refresh(method):
 
         try:
             evidence.result = method(catalog, name, cancelled=checkpoint)
+            _source_scope(catalog=catalog)
             return evidence.result
         finally:
             evidence.active = False
