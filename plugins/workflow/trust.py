@@ -1094,7 +1094,9 @@ class WorkflowTrustStore:
             return _normalize_trust_payload(
                 json.loads(
                     encoded.decode("utf-8"),
-                    object_pairs_hook=unique_pairs if reject_duplicate_keys else None,
+                    object_pairs_hook=(
+                        unique_pairs if mutation or reject_duplicate_keys else None
+                    ),
                 )
             )
         except (OSError, UnicodeError, ValueError, WorkflowTrustError) as exc:

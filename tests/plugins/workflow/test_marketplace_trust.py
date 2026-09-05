@@ -757,6 +757,58 @@ def test_trust_many_rejects_corrupt_store_without_rewrite(tmp_path: Path) -> Non
     assert store.path.read_bytes() == before
 
 
+def test_trust_many_rejects_duplicate_store_without_discarding_manual_grant(
+    tmp_path: Path,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    package_digest = "1" * 64
+    risk_digest = "a" * 64
+    store.trust(package_digest, actor="manual", risk_digest=risk_digest)
+    manual_records = json.loads(store.path.read_text(encoding="utf-8"))["records"]
+    store.path.write_text(
+        '{"version":2,"records":' + json.dumps(manual_records) + ',"records":{}}',
+        encoding="utf-8",
+    )
+    before = store.path.read_bytes()
+
+    with pytest.raises(WorkflowTrustError, match="corrupt"):
+        store.trust_origin_many(
+            ((package_digest, risk_digest),),
+            actor="alice",
+            origin="marketplace:company/package",
+        )
+
+    assert store.path.read_bytes() == before
+
+
+def test_trust_many_reconciliation_rejects_duplicate_post_write_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = WorkflowTrustStore(tmp_path / "home")
+    package_digest = "1" * 64
+    risk_digest = "a" * 64
+
+    def duplicate_then_raise(payload):
+        store.path.parent.mkdir(parents=True, exist_ok=True)
+        store.path.write_text(
+            '{"version":2,"records":{},"records":'
+            + json.dumps(payload["records"], sort_keys=True, separators=(",", ":"))
+            + "}",
+            encoding="utf-8",
+        )
+        raise OSError("ambiguous replacement")
+
+    monkeypatch.setattr(store, "_write", duplicate_then_raise)
+
+    with pytest.raises(WorkflowTrustError, match="indeterminate"):
+        store.trust_origin_many(
+            ((package_digest, risk_digest),),
+            actor="alice",
+            origin="marketplace:company/package",
+        )
+
+
 def test_revoke_one_origin_digest_missing_pair_does_not_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

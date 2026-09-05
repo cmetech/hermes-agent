@@ -185,6 +185,10 @@ class _Evidence:
     actor: str
     execution: tuple
     completion: LifecycleCompletion | None = None
+    used: bool = False
+    reused: bool = False
+    entered: bool = False
+    committed: bool = False
     cancelled: bool = False
 
 
@@ -274,6 +278,14 @@ def domain_mutation(kind):
         @wraps(method)
         def wrapped(service, *args, **kwargs):
             evidence = _current_evidence(service)
+            if evidence:
+                if evidence.used:
+                    evidence.reused = True
+                    raise WorkflowMarketplaceError(
+                        "marketplace_operation_failed",
+                        "lifecycle evidence collector is already used",
+                    )
+                evidence.used = True
             boundary = None
             handle = None
             try:
@@ -328,6 +340,8 @@ def domain_mutation(kind):
                     def enter():
                         accepted = enter_atomic()
                         boundary.entered = bool(accepted)
+                        if evidence and accepted:
+                            evidence.entered = True
                         return accepted
 
                     kwargs["enter_atomic"] = enter
@@ -388,6 +402,7 @@ def domain_mutation(kind):
                             evidence.completion = _failure(error, outcome)
                         raise error
                     if evidence:
+                        evidence.committed = True
                         state = (
                             boundary.trust_state
                             if kind.startswith("trust_")
@@ -476,7 +491,7 @@ def complete_mutation(
         try:
             call()
         except Exception as error:
-            if evidence.cancelled:
+            if evidence.cancelled and not evidence.entered and not evidence.committed:
                 raise MarketplaceOperationCancelled(
                     "marketplace operation was cancelled"
                 ) from None
@@ -485,7 +500,7 @@ def complete_mutation(
                 if evidence.completion and evidence.completion.state == "failed"
                 else _unknown(error)
             )
-        return evidence.completion or _unknown()
+        return _unknown() if evidence.reused else evidence.completion or _unknown()
     finally:
         _evidence.reset(handle)
 
@@ -517,6 +532,23 @@ def review_token_metadata(
                     and w.workflow_name == selection.workflow_name
                 ]
             )
+            installed, issued_workflows, issued_digest, package_resources = (
+                service._trust_review_parts(
+                    review.identity,
+                    workflow_paths=authority.workflow_paths,
+                )
+            )
+            expected_review = TrustReview(
+                confirmationToken=token,
+                reviewDigest=issued_digest,
+                identity=authority.identity,
+                sourceName=installed.source_name,
+                version=installed.package_version,
+                resolvedCommit=installed.resolved_commit,
+                distributionDigest=installed.distribution_digest,
+                packageResources=package_resources,
+                workflows=issued_workflows,
+            )
             if (
                 selection != actual_selection
                 or not expected
@@ -525,6 +557,7 @@ def review_token_metadata(
                 or [(w.workflow_name, w.definition_path) for w in review.workflows]
                 != [(w.workflow_name, w.definition_path) for w in expected]
                 or review.distribution_digest != authority.distribution_digest
+                or review != expected_review
             ):
                 raise WorkflowMarketplaceError(
                     "confirmation_token_invalid", "confirmation binding is invalid"
@@ -533,7 +566,11 @@ def review_token_metadata(
             authority = service.transactions.inspect_token(
                 token, actor=actor, profile=service.profile
             )
-            if selection is not None or authority.operation != operation:
+            if (
+                selection is not None
+                or authority.operation != operation
+                or not service._review_matches_transaction_authority(review, authority)
+            ):
                 raise WorkflowMarketplaceError(
                     "confirmation_token_invalid", "confirmation binding is invalid"
                 )

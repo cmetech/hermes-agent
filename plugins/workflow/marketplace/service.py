@@ -87,7 +87,11 @@ from .source_store import (
     _read_bounded,
     _strict_json,
 )
-from .transactions import MarketplaceTransactionStore, TransactionCandidate
+from .transactions import (
+    MarketplaceTransactionStore,
+    PreparedTransactionMetadata,
+    TransactionCandidate,
+)
 from .lifecycle_state import domain_mutation, _capture_trust
 
 
@@ -851,6 +855,172 @@ class WorkflowMarketplaceService:
             operation=prepared.operation,
             identity=prepared.identity,
         )
+
+    def _review_matches_transaction_authority(
+        self,
+        review: InstallReview | UpdateReview | RemoveReview,
+        authority: PreparedTransactionMetadata,
+    ) -> bool:
+        """Rebuild the exact public review from the persisted candidate authority."""
+
+        if authority.operation == "remove":
+            distribution = load_distribution(
+                authority.destination,
+                expected_digest=authority.distribution_digest,
+            )
+        else:
+            distribution = load_distribution(
+                authority.staging_path,
+                expected_digest=authority.distribution_digest,
+            )
+        workflows, blockers = self._assess_distribution(
+            distribution, authority.identity, authority.source_name
+        )
+        if blockers:
+            return False
+        if authority.operation == "install":
+            if not isinstance(review, InstallReview):
+                return False
+            changes = _file_changes(None, distribution)
+            review_digest = _canonical_digest(
+                _REVIEW_DOMAIN,
+                {
+                    "operation": "install",
+                    "identity": authority.identity.model_dump(
+                        mode="json", by_alias=True
+                    ),
+                    "source": authority.source_name,
+                    "repository": authority.repository_url,
+                    "ref": authority.configured_ref,
+                    "commit": authority.resolved_commit,
+                    "path": authority.package_path,
+                    "version": authority.package_version,
+                    "digest": authority.distribution_digest,
+                    "files": [
+                        item.model_dump(mode="json", by_alias=True) for item in changes
+                    ],
+                    "workflows": [
+                        self._trust_digest_projection(item) for item in workflows
+                    ],
+                },
+            )
+            expected = InstallReview(
+                operation="install",
+                confirmationToken=review.confirmation_token,
+                reviewDigest=review_digest,
+                identity=authority.identity,
+                sourceName=authority.source_name,
+                repositoryUrl=authority.repository_url,
+                configuredRef=authority.configured_ref,
+                resolvedCommit=authority.resolved_commit,
+                packagePath=authority.package_path,
+                candidateVersion=authority.package_version,
+                candidateDigest=authority.distribution_digest,
+                assessment=self._assessment(
+                    distribution, workflows, blockers, review_digest=review_digest
+                ),
+                fileChanges=changes,
+                workflowReviews=workflows,
+            )
+            return review == expected
+
+        installed = authority.installed_provenance
+        if installed is None:
+            return False
+        if authority.operation == "update":
+            if not isinstance(review, UpdateReview):
+                return False
+            old_distribution = load_distribution(
+                authority.destination,
+                expected_digest=installed.distribution_digest,
+            )
+            old_workflows, old_blockers = self._assess_distribution(
+                old_distribution, authority.identity, installed.source_name
+            )
+            if old_blockers:
+                return False
+            changes = _file_changes(old_distribution, distribution)
+            workflow_changes = _set_change(
+                (item.workflow_name for item in old_workflows),
+                (item.workflow_name for item in workflows),
+            )
+            requirement_changes = _requirement_changes(
+                old_distribution.manifest.external_requirements,
+                distribution.manifest.external_requirements,
+            )
+            risk_changes = _risk_changes(old_workflows, workflows)
+            compatibility_changes = _compatibility_changes(old_workflows, workflows)
+            review_digest = _canonical_digest(
+                _REVIEW_DOMAIN,
+                {
+                    "operation": "update",
+                    "identity": authority.identity.model_dump(
+                        mode="json", by_alias=True
+                    ),
+                    "old": installed.model_dump(mode="json", by_alias=True),
+                    "candidateCommit": authority.resolved_commit,
+                    "candidateVersion": authority.package_version,
+                    "candidateDigest": authority.distribution_digest,
+                    "files": [
+                        item.model_dump(mode="json", by_alias=True) for item in changes
+                    ],
+                    "workflowChanges": workflow_changes.model_dump(mode="json"),
+                    "requirementChanges": requirement_changes.model_dump(mode="json"),
+                    "riskChanges": risk_changes.model_dump(mode="json"),
+                    "compatibilityChanges": compatibility_changes.model_dump(
+                        mode="json"
+                    ),
+                },
+            )
+            expected = UpdateReview(
+                operation="update",
+                result="update_available",
+                confirmationToken=review.confirmation_token,
+                reviewDigest=review_digest,
+                identity=authority.identity,
+                sourceName=installed.source_name,
+                repositoryUrl=installed.repository_url,
+                configuredRef=installed.configured_ref,
+                oldVersion=installed.package_version,
+                candidateVersion=authority.package_version,
+                oldCommit=installed.resolved_commit,
+                candidateCommit=authority.resolved_commit,
+                oldDigest=installed.distribution_digest,
+                candidateDigest=authority.distribution_digest,
+                fileChanges=changes,
+                workflowChanges=workflow_changes,
+                requirementChanges=requirement_changes,
+                riskChanges=risk_changes,
+                compatibilityChanges=compatibility_changes,
+                assessment=self._assessment(
+                    distribution, workflows, blockers, review_digest=review_digest
+                ),
+                workflowReviews=workflows,
+            )
+            return review == expected
+
+        if not isinstance(review, RemoveReview):
+            return False
+        workflow_names = sorted(item.workflow_name for item in workflows)
+        review_digest = _canonical_digest(
+            _REVIEW_DOMAIN,
+            {
+                "operation": "remove",
+                "provenance": installed.model_dump(mode="json", by_alias=True),
+                "workflowNames": workflow_names,
+            },
+        )
+        expected = RemoveReview(
+            operation="remove",
+            confirmationToken=review.confirmation_token,
+            reviewDigest=review_digest,
+            identity=authority.identity,
+            currentVersion=installed.package_version,
+            currentCommit=installed.resolved_commit,
+            distributionDigest=installed.distribution_digest,
+            workflowNames=workflow_names,
+        )
+        return review == expected
 
     def refresh_source(
         self,

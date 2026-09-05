@@ -572,6 +572,83 @@ def test_token_availability_is_false_after_consumption(lifecycle_domain, domain)
     assert not metadata.validate_unused(metadata.confirmation_token)
 
 
+def test_review_authority_rejects_altered_digest_bound_facts(lifecycle_domain, domain):
+    d = lifecycle_domain
+    review = d.prepare()
+    altered = review.model_copy(update={"candidate_version": "9.9.9"})
+
+    with pytest.raises(WorkflowMarketplaceError, match="binding is invalid"):
+        domain.review_token_metadata(
+            d.service,
+            altered,
+            actor="alice",
+            subject=d.subject,
+            selection=None,
+        )
+
+    result = domain.complete_read(
+        d.service,
+        kind="install_prepare",
+        subject=d.subject,
+        selection=None,
+        actor="alice",
+        call=lambda: altered,
+    )
+    assert result.state == "failed"
+    assert result.review_token is None
+
+
+def test_review_authority_rejects_altered_facts_for_every_review_kind(
+    lifecycle_domain, domain
+):
+    d = lifecycle_domain
+    install = d.prepare()
+    altered_assessment = install.assessment.model_copy(update={"package_resources": []})
+    altered_install = install.model_copy(update={"assessment": altered_assessment})
+    with pytest.raises(WorkflowMarketplaceError, match="binding is invalid"):
+        domain.review_token_metadata(
+            d.service,
+            altered_install,
+            actor="alice",
+            subject=d.subject,
+            selection=None,
+        )
+
+    d.service.confirm_install(install.confirmation_token, actor="alice")
+    update = d.prepare_update()
+    altered_workflow = update.workflow_reviews[0].model_copy(
+        update={"risk_digest": "f" * 64}
+    )
+    altered_update = update.model_copy(
+        update={"workflow_reviews": [altered_workflow, *update.workflow_reviews[1:]]}
+    )
+
+    remove = d.service.prepare_remove(d.identity, actor="alice")
+    altered_remove = remove.model_copy(update={"workflow_names": []})
+
+    trust = d.service.review_trust(d.identity, actor="alice")
+    altered_trust_workflow = trust.workflows[0].model_copy(
+        update={"trust_state": "trusted"}
+    )
+    altered_trust = trust.model_copy(
+        update={"workflows": [altered_trust_workflow, *trust.workflows[1:]]}
+    )
+
+    for review, selection in (
+        (altered_update, None),
+        (altered_remove, None),
+        (altered_trust, AllTrustSelection(type="all")),
+    ):
+        with pytest.raises(WorkflowMarketplaceError, match="binding is invalid"):
+            domain.review_token_metadata(
+                d.service,
+                review,
+                actor="alice",
+                subject=d.subject,
+                selection=selection,
+            )
+
+
 @pytest.mark.parametrize("checkpoint", ["cancelled", "enter_atomic"])
 def test_verified_prewrite_cancellation_reaches_registry_cancel_path(
     lifecycle_domain, checkpoint
@@ -643,6 +720,42 @@ def test_second_domain_call_cannot_overwrite_first_committed_evidence(lifecycle_
     def two_calls():
         d.service.confirm_install(review.confirmation_token, actor="alice")
         d.service.confirm_install(review.confirmation_token, actor="alice")
+
+    result = d.mutation("install_confirm", two_calls)
+    assert result.outcome.type == "outcome_unknown"
+    assert d.state().state == "installed"
+
+
+def test_second_domain_call_cannot_cancel_after_first_commit(lifecycle_domain):
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+
+    d = lifecycle_domain
+    d.install_version()
+    review = d.service.review_trust(d.identity, actor="alice")
+    d.service.grant_trust(review, actor="alice")
+
+    def two_calls():
+        d.service.revoke_trust(d.identity)
+        d.service.revoke_trust(d.identity, enter_atomic=lambda: False)
+
+    try:
+        result = d.mutation("trust_revoke", two_calls, AllTrustSelection(type="all"))
+    except MarketplaceOperationCancelled:
+        pytest.fail("second call falsely cancelled an already committed mutation")
+    assert result.outcome.type == "outcome_unknown"
+    assert all(workflow.state == "untrusted" for workflow in d.state().trust.workflows)
+
+
+def test_caught_second_domain_call_still_fails_closed(lifecycle_domain):
+    d = lifecycle_domain
+    review = d.prepare()
+
+    def two_calls():
+        d.service.confirm_install(review.confirmation_token, actor="alice")
+        try:
+            d.service.confirm_install(review.confirmation_token, actor="alice")
+        except WorkflowMarketplaceError:
+            pass
 
     result = d.mutation("install_confirm", two_calls)
     assert result.outcome.type == "outcome_unknown"
