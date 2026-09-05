@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Literal, Mapping, TypedDict, cast
+from collections.abc import Callable
 
 import yaml
 
@@ -1052,15 +1053,19 @@ class WorkflowTrustStore:
         self.lock_path = self.path.with_suffix(".lock")
 
     def _read(
-        self, *, mutation: bool, max_bytes: int | None = None
+        self,
+        *,
+        mutation: bool,
+        max_bytes: int | None = None,
+        reject_duplicate_keys: bool = False,
     ) -> _TrustPayload:
-        if not self.path.exists():
-            return {"version": 2, "records": {}}
         if self.path.is_symlink():
             if mutation:
                 raise WorkflowTrustError(
                     "workflow trust store is corrupt: symlink not allowed"
                 )
+            return {"version": 2, "records": {}}
+        if not self.path.exists():
             return {"version": 2, "records": {}}
         try:
             if max_bytes is not None and (
@@ -1077,7 +1082,21 @@ class WorkflowTrustStore:
                 encoded = stream.read(read_limit + 1)
             if len(encoded) > read_limit:
                 raise ValueError("trust store exceeds the read limit")
-            return _normalize_trust_payload(json.loads(encoded.decode("utf-8")))
+
+            def unique_pairs(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate trust key")
+                    result[key] = value
+                return result
+
+            return _normalize_trust_payload(
+                json.loads(
+                    encoded.decode("utf-8"),
+                    object_pairs_hook=unique_pairs if reject_duplicate_keys else None,
+                )
+            )
         except (OSError, UnicodeError, ValueError, WorkflowTrustError) as exc:
             if mutation:
                 raise WorkflowTrustError("workflow trust store is corrupt") from exc
@@ -1177,6 +1196,7 @@ class WorkflowTrustStore:
         *,
         actor: str,
         origin: str,
+        observe: Callable[[Mapping[str, object]], None] | None = None,
     ) -> int:
         """Apply one bounded set of installation grants in one atomic write."""
 
@@ -1235,10 +1255,75 @@ class WorkflowTrustStore:
                 intended,
                 indeterminate="workflow trust grant state is indeterminate",
             )
+            if observe is not None:
+                current = self._read(mutation=True, reject_duplicate_keys=True)
+                if current != intended:
+                    raise WorkflowTrustError(
+                        "workflow trust grant state is indeterminate"
+                    )
+                observe(current)
         return len(pending)
 
+    def revoke_origin_many(
+        self,
+        package_digests: Iterable[str],
+        origin: str,
+        *,
+        observe: Callable[[Mapping[str, object]], None] | None = None,
+    ) -> int:
+        """Revoke one exact selection atomically, observing under the write lock."""
+        normalized_origin = _validated_trust_origin(origin)
+        digests = []
+        for digest in package_digests:
+            if (
+                len(digests) >= _WORKFLOW_TRUST_MAX_BATCH_GRANTS
+                or not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+            ):
+                raise WorkflowTrustError("workflow trust revocation batch is invalid")
+            digests.append(digest)
+        if not digests or len(set(digests)) != len(digests):
+            raise WorkflowTrustError("workflow trust revocation batch is invalid")
+        with _locked(self.lock_path):
+            original = self._read(mutation=True)
+            intended = deepcopy(original)
+            revoked = 0
+            for digest in digests:
+                record = intended["records"].get(digest)
+                if (
+                    record is not None
+                    and record["grants"].pop(normalized_origin, None) is not None
+                ):
+                    revoked += 1
+                    if not record["grants"]:
+                        del intended["records"][digest]
+            if revoked:
+                self._write_revocation(original, intended)
+            if observe is not None:
+                current = self._read(mutation=True, reject_duplicate_keys=True)
+                if current != intended:
+                    raise WorkflowTrustError(
+                        "workflow trust revocation state is indeterminate"
+                    )
+                observe(current)
+            return revoked
+
+    def observe_snapshot(self, observe: Callable[[Mapping[str, object]], object]):
+        """Strict bounded read and projection while holding the actual trust lock."""
+        with _locked(self.lock_path):
+            return observe(
+                self._read(
+                    mutation=True,
+                    max_bytes=WORKFLOW_TRUST_MAX_STORE_BYTES,
+                    reject_duplicate_keys=True,
+                )
+            )
+
     def revoke(self, package_digest: str) -> bool:
-        if not isinstance(package_digest, str) or _SHA256.fullmatch(package_digest) is None:
+        if (
+            not isinstance(package_digest, str)
+            or _SHA256.fullmatch(package_digest) is None
+        ):
             return False
         with _locked(self.lock_path):
             payload = self._read(mutation=True)

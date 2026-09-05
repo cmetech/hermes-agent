@@ -122,6 +122,8 @@ class PreparedTransactionMetadata:
 
     operation: Literal["install", "update", "remove"]
     identity: InstalledPackageIdentity
+    review_digest: str
+    expires_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1281,6 +1283,8 @@ class MarketplaceTransactionStore:
                         )
                     ),
                     identity=record.identity,
+                    review_digest=record.review_digest,
+                    expires_at=record.expires_at,
                 )
         except WorkflowMarketplaceError:
             raise
@@ -1814,6 +1818,9 @@ class MarketplaceTransactionStore:
                         "transaction_rollback_failed",
                         "package installation rollback requires recovery",
                     ) from rollback_error
+                from .lifecycle_state import _record_rollback
+
+                _record_rollback(self, prepared.identity, prepared.installed_provenance)
                 raise original
 
     def _rollback_remove(self, journal: _JournalRecord, provenance_snapshot) -> None:
@@ -1974,6 +1981,9 @@ class MarketplaceTransactionStore:
                         "transaction_rollback_failed",
                         "package removal rollback requires recovery",
                     ) from rollback_error
+                from .lifecycle_state import _record_rollback
+
+                _record_rollback(self, prepared.identity, prepared.installed_provenance)
                 raise original
 
     def _journal_markers_match(self, journal: _JournalRecord) -> bool:

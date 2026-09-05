@@ -88,6 +88,7 @@ from .source_store import (
     _strict_json,
 )
 from .transactions import MarketplaceTransactionStore, TransactionCandidate
+from .lifecycle_state import domain_mutation, _capture_trust
 
 
 _INDEX_PATH = ".well-known/hermes-workflows/index.json"
@@ -373,6 +374,7 @@ class _TrustAuthorization:
     distribution_digest: str
     review_digest: str
     workflow_paths: tuple[str, ...]
+    expires_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +393,7 @@ class _TrustConfirmationStore:
         self.source_store = source_store
         self.path = source_store.root / "trust-confirmations.json"
         self.clock = clock
+        self._selections = {}
 
     def _read(self) -> _TrustTokenState:
         if not _path_entry_exists(self.path):
@@ -462,6 +465,7 @@ class _TrustConfirmationStore:
         review_digest: str,
         workflow_paths: tuple[str, ...],
         ttl_seconds: int = 300,
+        workflow_name: str | None = None,
     ) -> str:
         token = secrets.token_urlsafe(32)
         record = _TrustTokenRecord(
@@ -489,9 +493,31 @@ class _TrustConfirmationStore:
                         "too many prepared trust confirmations",
                     )
                 self._write([*current, record], parent_identity=parent_identity)
+                live = {item.token_digest for item in current}
+                self._selections = {
+                    key: value for key, value in self._selections.items() if key in live
+                }
+                self._selections[record.token_digest] = workflow_name
         except WorkflowLockTimeout as error:
             _fail("trust_confirmation_lock_timeout", str(error))
         return token
+
+    def selection(self, token: str):
+        from .lifecycle_models import AllTrustSelection, OneTrustSelection
+
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        with self.source_store._locked():
+            if digest not in self._selections:
+                _fail(
+                    "confirmation_token_invalid",
+                    "confirmation selection is unavailable",
+                )
+            name = self._selections[digest]
+            return (
+                OneTrustSelection(type="one", workflow_name=name)
+                if name is not None
+                else AllTrustSelection(type="all")
+            )
 
     def consume(self, token: str, *, actor: str, profile: str) -> _TrustAuthorization:
         try:
@@ -535,6 +561,7 @@ class _TrustConfirmationStore:
                     distribution_digest=record.distribution_digest,
                     review_digest=record.review_digest,
                     workflow_paths=tuple(record.workflow_paths),
+                    expires_at=record.expires_at,
                 )
         except WorkflowLockTimeout as error:
             _fail("trust_confirmation_lock_timeout", str(error))
@@ -584,6 +611,7 @@ class _TrustConfirmationStore:
             distribution_digest=record.distribution_digest,
             review_digest=record.review_digest,
             workflow_paths=tuple(record.workflow_paths),
+            expires_at=record.expires_at,
         )
 
 
@@ -1590,6 +1618,7 @@ class WorkflowMarketplaceService:
                 workflowReviews=workflows,
             )
 
+    @domain_mutation("install_confirm")
     def confirm_install(
         self,
         token: str,
@@ -1765,6 +1794,7 @@ class WorkflowMarketplaceService:
                 workflowReviews=candidate_workflows,
             )
 
+    @domain_mutation("update_confirm")
     def confirm_update(
         self,
         token: str,
@@ -1952,6 +1982,7 @@ class WorkflowMarketplaceService:
             workflowNames=workflow_names,
         )
 
+    @domain_mutation("remove_confirm")
     def confirm_remove(
         self,
         token: str,
@@ -2061,6 +2092,7 @@ class WorkflowMarketplaceService:
             distribution_digest=installed.distribution_digest,
             review_digest=review_digest,
             workflow_paths=tuple(item.definition_path for item in workflows),
+            workflow_name=workflow_name,
         )
         return TrustReview(
             confirmationToken=token,
@@ -2074,6 +2106,7 @@ class WorkflowMarketplaceService:
             workflows=workflows,
         )
 
+    @domain_mutation("trust_confirm")
     def grant_trust(
         self,
         review_or_token: TrustReview | str,
@@ -2130,17 +2163,32 @@ class WorkflowMarketplaceService:
                         "marketplace_operation_cancelled",
                         "marketplace operation was cancelled",
                     )
+                states = {}
+
+                def capture(payload):
+                    state = _capture_trust(self, authorization.identity, payload)
+                    if state.trust is None:
+                        _fail(
+                            "trust_state_unverified",
+                            "package trust state is unconfirmed",
+                        )
+                    states.update({
+                        item.workflow_name: item.state for item in state.trust.workflows
+                    })
+
                 self.trust_store.trust_origin_many(
                     tuple(
                         (item.package_digest, item.risk_digest) for item in workflows
                     ),
                     actor=actor,
                     origin=origin,
+                    observe=capture,
                 )
         except WorkflowLockTimeout as error:
             _fail("trust_confirmation_lock_timeout", str(error))
-        return self.workflow_trust(authorization.identity)
+        return states
 
+    @domain_mutation("trust_revoke")
     def revoke_trust(
         self,
         identity: InstalledPackageIdentity,
@@ -2175,11 +2223,10 @@ class WorkflowMarketplaceService:
                         "marketplace_operation_cancelled",
                         "marketplace operation was cancelled",
                     )
-                return sum(
-                    self.trust_store.revoke_origin_for_digest(
-                        item.package_digest, origin
-                    )
-                    for item in workflows
+                return self.trust_store.revoke_origin_many(
+                    (item.package_digest for item in workflows),
+                    origin,
+                    observe=lambda payload: _capture_trust(self, identity, payload),
                 )
         except WorkflowLockTimeout as error:
             _fail("trust_confirmation_lock_timeout", str(error))

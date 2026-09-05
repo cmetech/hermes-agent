@@ -2198,8 +2198,9 @@ def test_update_trust_revocation_failure_rolls_back_bytes_and_provenance(
 
     monkeypatch.setattr(service.trust_store, "_write", fail_before_commit)
 
-    with pytest.raises(WorkflowTrustError):
+    with pytest.raises(WorkflowMarketplaceError) as error:
         service.confirm_update(review.confirmation_token, actor="alice")
+    assert error.value.code == "transaction_rollback_completed"
 
     assert _snapshot(destination) == before
     assert service.installed_store.get(installed.identity) == provenance
@@ -2226,8 +2227,9 @@ def test_remove_trust_revocation_failure_rolls_back_bytes_and_provenance(
 
     monkeypatch.setattr(service.trust_store, "_write", fail_before_commit)
 
-    with pytest.raises(WorkflowTrustError):
+    with pytest.raises(WorkflowMarketplaceError) as error:
         service.confirm_remove(review.confirmation_token, actor="alice")
+    assert error.value.code == "transaction_rollback_completed"
 
     assert _snapshot(destination) == before
     assert service.installed_store.get(installed.identity) == provenance
