@@ -42,6 +42,8 @@ MARKETPLACE_ACTIONS = frozenset({
     "check",
     "update",
     "uninstall",
+    "package-state",
+    "recover-packages",
 })
 _CONFIRMABLE_ACTIONS = frozenset({"install", "update", "uninstall", "trust"})
 _NOT_FOUND_CODES = frozenset({
@@ -185,6 +187,20 @@ def configure_marketplace_parsers(actions) -> None:
 
     installed = actions.add_parser("installed", help="List installed workflow packages")
     _json_flag(installed)
+
+    state = actions.add_parser(
+        "package-state", help="Read verified package state on this backend/profile"
+    )
+    state.add_argument("identifier", metavar="SOURCE_KEY/PACKAGE_ID")
+    _json_flag(state)
+    recovery = actions.add_parser(
+        "recover-packages",
+        help="Recover owned package transactions on this backend/profile",
+    )
+    recovery.add_argument(
+        "--yes", action="store_true", help="Confirm profile-wide recovery"
+    )
+    _json_flag(recovery)
 
     check = actions.add_parser("check", help="Check installed packages for updates")
     check.add_argument("identifier", nargs="?", metavar="source/package")
@@ -854,6 +870,22 @@ def _render_review(
 
 
 def _render_human(result: Mapping[str, object], args: argparse.Namespace) -> None:
+    if args.workflow_action == "package-state":
+        print(f"Package: {_review_identity(result.get('identity'))}")
+        print(f"Profile: {result.get('profile')}")
+        print(f"State: {result.get('state')}")
+        print(f"Recovery: {result.get('recovery')}; busy: {result.get('busy')}")
+        installed = result.get("installed")
+        if isinstance(installed, Mapping):
+            print(f"Currently installed: {installed.get('version')}")
+        return
+    if args.workflow_action == "recover-packages":
+        print(f"Profile: {result.get('profile')}; recovery: {result.get('status')}")
+        for entry in cast(list[dict], result.get("remaining", [])):
+            print(
+                f"- {_review_identity(entry.get('identity'))}: {entry.get('classification')}"
+            )
+        return
     status = _review_text(result.get("status", "ok"), args)
     print(status.replace("_", " ").title())
     package = result.get("package")
@@ -940,6 +972,8 @@ def _emit_error(
     else:
         if isinstance(error.result, Mapping):
             partial = cast(Mapping[str, object], error.result)
+            if args.workflow_action in {"package-state", "recover-packages"}:
+                _render_human(partial, args)
             if partial.get("status") == "partial_failure":
                 print("Partial failure")
                 for key, label in (("succeeded", "Succeeded"), ("failed", "Failed")):
@@ -1267,6 +1301,12 @@ def _validate_before_service(args: argparse.Namespace) -> bool:
         return marketplace
     if action not in MARKETPLACE_ACTIONS:
         return False
+    if action == "recover-packages" and not args.yes and not _stdin_is_tty():
+        _fail(
+            "confirmation_required",
+            "interactive confirmation or --yes is required for profile-wide package recovery",
+            exit_code=EXIT_AUTHORIZATION,
+        )
     if action == "source" and getattr(args, "source_action", None) is None:
         _fail("invalid_request", "source action is required", exit_code=EXIT_INVOCATION)
     if action == "update":
@@ -1281,8 +1321,117 @@ def _validate_before_service(args: argparse.Namespace) -> bool:
     return True
 
 
+def _invoke_package_state(args: argparse.Namespace, service) -> dict[str, object]:
+    from .lifecycle_state import read_package_state
+
+    state = read_package_state(service, _identity(args.identifier))
+    result = state.model_dump(mode="json", by_alias=False)
+    if state.state == "unconfirmed":
+        _fail(
+            "package_state_unconfirmed",
+            "package state cannot be confirmed on this backend/profile",
+            result=result,
+        )
+    return result
+
+
+def _recovery_result(service, inspection, *, status: str, recovered=(), affected=None):
+    return {
+        "status": status,
+        "profile": service.profile,
+        "affected_identities": [
+            _public(identity)
+            for identity in sorted(
+                {entry.identity for entry in (affected or inspection).entries},
+                key=lambda identity: (identity.source_key, identity.package_id),
+            )
+        ],
+        "recovered_transaction_ids": list(recovered),
+        "remaining": _public(inspection.entries),
+        "complete": inspection.complete,
+    }
+
+
+def _require_recovery_idle(service, inspection):
+    if not inspection.complete:
+        _fail(
+            "transaction_recovery_inspection_incomplete",
+            "recovery scope could not be inspected completely",
+        )
+    if inspection.active_writer:
+        _fail(
+            "transaction_recovery_busy",
+            "an active writer lease prevents package recovery on this backend/profile",
+            exit_code=EXIT_CONFLICT,
+            result=_recovery_result(service, inspection, status="busy"),
+        )
+
+
+def _invoke_recovery(args: argparse.Namespace, service) -> dict[str, object]:
+    store = service.transactions
+    before = store.inspect_recovery()
+    _require_recovery_idle(service, before)
+    if not args.yes:
+        print(
+            f"Package recovery on this backend, profile {service.profile}:",
+            file=sys.stderr,
+        )
+        for entry in before.entries:
+            print(
+                f"- {_identifier(entry.identity)}: {entry.kind} ({entry.classification})",
+                file=sys.stderr,
+            )
+        if not before.entries:
+            print("No affected package identities.", file=sys.stderr)
+        print(
+            "Confirm profile-wide package recovery? [y/N] ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not _read_confirmation(""):
+            result = _recovery_result(service, before, status="cancelled")
+            if any(entry.kind == "journal" for entry in before.entries):
+                _fail(
+                    "transaction_recovery_unfinished",
+                    "package recovery was cancelled; journals remain unresolved on this backend/profile",
+                    result=result,
+                )
+            return result
+    with store._locked():
+        current = store.inspect_recovery()
+        _require_recovery_idle(service, current)
+        if current != before:
+            _fail(
+                "transaction_recovery_scope_changed",
+                "package recovery scope changed; inspect and confirm again",
+                exit_code=EXIT_CONFLICT,
+                result=_recovery_result(service, current, status="recovery_required"),
+            )
+        recovered = store.recover_transactions()
+        remaining = store.inspect_recovery()
+        result = _recovery_result(
+            service,
+            remaining,
+            status="recovery_required" if remaining.entries else "clear",
+            recovered=recovered,
+            affected=before,
+        )
+        if remaining.entries or not remaining.complete:
+            _fail(
+                "transaction_recovery_ambiguous",
+                "package recovery remains unresolved on this backend/profile",
+                result=result,
+            )
+        return result
+
+
 def _invoke(args: argparse.Namespace, service) -> dict[str, object]:
     action = args.workflow_action
+    if action == "package-state":
+        return _invoke_package_state(args, service)
+    if action == "recover-packages":
+        return _invoke_recovery(args, service)
     if action == "source":
         return _invoke_source(args, service)
     if action == "search":

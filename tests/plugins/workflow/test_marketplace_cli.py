@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import json
+import threading
 
 import pytest
 
@@ -35,6 +37,7 @@ from plugins.workflow.marketplace.models import (
     WorkflowTrustReviewItem,
 )
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
+from test_marketplace_service import published_repo  # noqa: F401
 
 
 _DIGEST = "1" * 64
@@ -619,6 +622,387 @@ def _run(parser, capsys, *arguments: str):
     captured = capsys.readouterr()
     machine_output = captured.out.lstrip().startswith("{")
     return code, captured, json.loads(captured.out) if machine_output else None
+
+
+@pytest.fixture
+def recovery_home(tmp_path, published_repo):
+    """Real profile, Git source, journals and CLI; no substituted service result."""
+    from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+
+    class Home:
+        identity_text = "company/laptop-support"
+        identity = _identity()
+
+        def __init__(self, path):
+            self.path = path
+            self.now = datetime.now(timezone.utc)
+            self.service = WorkflowMarketplaceService(
+                path, clock=lambda: self.now, profile="default"
+            )
+            self.service.add_source(
+                WorkflowMarketplaceSource(
+                    name="company", repositoryUrl=published_repo.remote.as_uri()
+                )
+            )
+            assert self.service.refresh_source("company").state == "fresh"
+
+        def prepare(self, identifier=None):
+            return self.service.prepare_install(
+                InstallRequest(identifier=identifier or self.identity_text), actor="cli"
+            )
+
+        def journal(self, *, active=False, ambiguous=False, identifier=None):
+            if not active:
+                self.now -= timedelta(hours=1)
+            review = self.prepare(identifier)
+            consumed = self.service.transactions.consume(
+                review.confirmation_token, actor="cli", profile="default"
+            )
+            if ambiguous:
+                marker = consumed.staging_path.parent / "owner.json"
+                value = json.loads(marker.read_text())
+                value["packageDigest"] = "0" * 64
+                marker.write_text(json.dumps(value))
+            return consumed
+
+        def snapshot(self):
+            return {
+                p.relative_to(self.path).as_posix(): p.read_bytes()
+                for p in self.path.rglob("*")
+                if p.is_file()
+            }
+
+        def run(self, capsys, *arguments):
+            return _run(_parser(), capsys, "--hermes-home", str(self.path), *arguments)
+
+    return Home(tmp_path / "recovery-profile")
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_package_state_reports_verified_local_bytes(recovery_home, capsys, installed):
+    home = recovery_home
+    if installed:
+        review = home.prepare()
+        home.service.confirm_install(review.confirmation_token, actor="cli")
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "package-state", home.identity_text, "--json")
+    assert code == 0
+    state = output["result"]
+    assert state["identity"] == {
+        "source_key": "company",
+        "package_id": "laptop-support",
+    }
+    assert state["state"] == ("installed" if installed else "absent")
+    assert state["recovery"] == "clear"
+    if installed:
+        assert state["installed"]["version"] == "1.0.0"
+        assert {w["state"] for w in state["trust"]["workflows"]} == {"untrusted"}
+    else:
+        assert state["installed"] is state["trust"] is None
+    assert home.snapshot() == before
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_package_state_preserves_journals_and_uncertainty(
+    recovery_home, capsys, active, ambiguous
+):
+    home = recovery_home
+    home.journal(active=active, ambiguous=ambiguous)
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "package-state", home.identity_text, "--json")
+    assert code != 0
+    state = output["result"]
+    assert state["state"] == "unconfirmed"
+    assert state["installed"] is state["trust"] is None
+    assert state["busy"] is active
+    assert state["recovery"] == ("unconfirmed" if ambiguous else "required")
+    assert home.snapshot() == before
+
+
+def test_recovery_noninteractive_refusal_never_mutates(
+    recovery_home, monkeypatch, capsys
+):
+    home = recovery_home
+    home.journal()
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: False)
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert code == machine_contract.EXIT_AUTHORIZATION
+    assert output["error"]["code"] == "confirmation_required"
+    assert home.snapshot() == before
+
+
+def test_recovery_removes_only_owned_expired_journal(recovery_home, capsys):
+    home = recovery_home
+    consumed = home.journal()
+    unrelated = home.service.transactions.staging_root / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "keep.txt").write_text("unrelated bytes")
+    code, captured, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code == 0
+    assert output["result"]["status"] == "clear"
+    assert output["result"]["recovered_transaction_ids"] == [consumed.transaction_id]
+    assert not home.service.transactions.list_journals()
+    assert not consumed.staging_path.parent.exists()
+    assert (unrelated / "keep.txt").read_text() == "unrelated bytes"
+    assert str(home.path) not in captured.out
+    assert "staging_path" not in captured.out
+    code, _, state = home.run(capsys, "package-state", home.identity_text, "--json")
+    assert code == 0 and state["result"]["state"] == "absent"
+
+
+def test_recovery_active_writer_refuses_without_cleanup(recovery_home, capsys):
+    home = recovery_home
+    home.journal(active=True)
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code != 0
+    assert output["result"]["status"] == "busy"
+    assert home.snapshot() == before
+
+
+def test_recovery_empty_recovered_ids_do_not_clear_ambiguous_journal(
+    recovery_home, capsys
+):
+    home = recovery_home
+    consumed = home.journal(ambiguous=True)
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code != 0
+    assert output["result"]["status"] == "recovery_required"
+    assert output["result"]["recovered_transaction_ids"] == []
+    assert (
+        home.service.transactions.list_journals()[0].transaction_id
+        == consumed.transaction_id
+    )
+    assert home.snapshot() == before
+
+
+@pytest.mark.parametrize("damage", ["marker", "bytes"])
+def test_recovery_declining_ambiguous_journal_still_exits_nonzero(
+    recovery_home, monkeypatch, capsys, damage
+):
+    home = recovery_home
+    consumed = home.journal(ambiguous=damage == "marker")
+    if damage == "bytes":
+        (consumed.staging_path / "workflows" / "diagnostic.yaml").write_text(
+            "broken package bytes"
+        )
+    before = home.snapshot()
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert output["result"]["status"] == "cancelled"
+    assert home.snapshot() == before
+    assert code != 0
+    assert output["error"]["code"] == "transaction_recovery_unfinished"
+
+
+@pytest.mark.parametrize("answer", ["no", "yes"])
+def test_recovery_interactive_confirmation_shows_exact_profile_identities(
+    recovery_home, monkeypatch, capsys, answer
+):
+    home = recovery_home
+    consumed = home.journal()
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    before = home.snapshot()
+
+    def confirm(prompt):
+        display = capsys.readouterr()
+        assert home.identity_text in display.err
+        assert "default" in display.err
+        assert str(consumed.staging_path) not in display.err
+        assert home.snapshot() == before
+        return answer
+
+    monkeypatch.setattr("builtins.input", confirm)
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert (code == 0) is (answer == "yes")
+    assert output["result"]["status"] == ("clear" if answer == "yes" else "cancelled")
+    if answer == "no":
+        assert home.snapshot() == before
+    else:
+        assert not home.service.transactions.list_journals()
+
+
+def test_recovery_is_scoped_to_selected_real_profile(recovery_home, capsys):
+    home = recovery_home
+    foreign = type(home)(home.path.parent / "foreign-profile")
+    home.journal()
+    foreign.journal()
+    foreign_before = foreign.snapshot()
+    code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code == 0 and output["result"]["status"] == "clear"
+    assert foreign.snapshot() == foreign_before
+    assert foreign.service.transactions.list_journals()
+
+
+def test_recovery_live_unused_review_is_preserved_without_writer_refusal(
+    recovery_home, capsys
+):
+    home = recovery_home
+    review = home.prepare()
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code == 0 and output["result"]["status"] == "clear"
+    assert home.snapshot() == before
+    installed = home.service.confirm_install(review.confirmation_token, actor="cli")
+    assert installed.version == "1.0.0"
+
+
+def test_recovery_partial_result_preserves_ambiguous_neighbor(recovery_home, capsys):
+    home = recovery_home
+    source = home.service.list_sources()[0]
+    home.service.add_source(source.model_copy(update={"name": "neighbor"}))
+    home.service.refresh_source("neighbor")
+    owned = home.journal()
+    ambiguous = home.journal(identifier="neighbor/laptop-support", ambiguous=True)
+    code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code != 0 and output["result"]["status"] == "recovery_required"
+    assert output["result"]["recovered_transaction_ids"] == [owned.transaction_id]
+    assert [j.transaction_id for j in home.service.transactions.list_journals()] == [
+        ambiguous.transaction_id
+    ]
+    assert ambiguous.staging_path.exists()
+
+
+def test_recovery_confirmation_scope_change_refuses_new_work(
+    recovery_home, monkeypatch, capsys
+):
+    home = recovery_home
+    home.journal()
+    source = home.service.list_sources()[0]
+    home.service.add_source(source.model_copy(update={"name": "neighbor"}))
+    home.service.refresh_source("neighbor")
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    at_confirmation = []
+
+    def confirm(_prompt):
+        home.journal(identifier="neighbor/laptop-support")
+        at_confirmation.append(home.snapshot())
+        return "yes"
+
+    monkeypatch.setattr("builtins.input", confirm)
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert code != 0
+    assert output["error"]["code"] == "transaction_recovery_scope_changed"
+    assert home.snapshot() == at_confirmation[0]
+
+
+def test_recovery_incomplete_scan_refuses_even_explicit_confirmation(
+    recovery_home, capsys
+):
+    home = recovery_home
+    home.journal()
+    for index in range(321):
+        (home.service.transactions.staging_root / f"unrelated-{index}").mkdir()
+    before = home.snapshot()
+    code, _, output = home.run(capsys, "recover-packages", "--yes", "--json")
+    assert code != 0
+    assert output["error"]["code"] == "transaction_recovery_inspection_incomplete"
+    assert home.snapshot() == before
+
+
+@pytest.mark.parametrize("answer", ["no", "yes"])
+def test_recovery_confirmation_includes_owned_abandoned_staging(
+    recovery_home, monkeypatch, capsys, answer
+):
+    home = recovery_home
+    review = home.prepare()
+    store = home.service.transactions
+    prepared = store._read_prepared().transactions[0]
+    staging = store.staging_root / prepared.transaction_id
+    with store._locked() as parent_identity:
+        store._write_prepared([], parent_identity=parent_identity)
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+
+    def confirm(_prompt):
+        output = capsys.readouterr()
+        assert home.identity_text in output.err
+        assert "abandoned_staging" in output.err
+        assert review.confirmation_token not in output.err
+        assert staging.exists()
+        return answer
+
+    monkeypatch.setattr("builtins.input", confirm)
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert code == 0
+    assert output["result"]["status"] == ("clear" if answer == "yes" else "cancelled")
+    assert output["result"]["recovered_transaction_ids"] == []
+    assert staging.exists() is (answer == "no")
+
+
+def test_recovery_confirmation_unlocks_but_recheck_recovery_and_final_read_serialize(
+    recovery_home, monkeypatch, capsys
+):
+    from plugins.workflow.marketplace.transactions import MarketplaceTransactionStore
+
+    home = recovery_home
+    home.journal()
+    competitor = MarketplaceTransactionStore(home.path, lock_timeout_seconds=0.05)
+    inspecting = MarketplaceTransactionStore.inspect_recovery
+    recovering = MarketplaceTransactionStore.recover_transactions
+    observations = []
+    inspect_count = 0
+    competitor_started = threading.Event()
+
+    def acquire_competing_lock():
+        competitor_started.set()
+        try:
+            with competitor._locked():
+                return True
+        except WorkflowMarketplaceError as error:
+            assert error.code == "transaction_lock_timeout"
+            return False
+
+    def can_acquire():
+        competitor_started.clear()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(acquire_competing_lock)
+            assert competitor_started.wait(5)
+            return future.result(timeout=5)
+
+    def inspect(store):
+        nonlocal inspect_count
+        inspect_count += 1
+        if inspect_count > 1:
+            observations.append(can_acquire())
+        return inspecting(store)
+
+    def recover(store):
+        observations.append(can_acquire())
+        return recovering(store)
+
+    def confirm(_prompt):
+        assert can_acquire(), "confirmation must not retain the marketplace lock"
+        return "yes"
+
+    monkeypatch.setattr(MarketplaceTransactionStore, "inspect_recovery", inspect)
+    monkeypatch.setattr(MarketplaceTransactionStore, "recover_transactions", recover)
+    monkeypatch.setattr("plugins.workflow.marketplace.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr("builtins.input", confirm)
+    code, _, output = home.run(capsys, "recover-packages", "--json")
+    assert code == 0 and output["result"]["status"] == "clear"
+    assert observations == [False, False, False]
+
+
+@pytest.mark.parametrize("state", ["absent", "installed", "unconfirmed"])
+def test_package_state_human_output_preserves_current_truth(
+    recovery_home, capsys, state
+):
+    home = recovery_home
+    if state == "installed":
+        review = home.prepare()
+        home.service.confirm_install(review.confirmation_token, actor="cli")
+    elif state == "unconfirmed":
+        home.journal(ambiguous=True)
+    code, output, _ = home.run(capsys, "package-state", home.identity_text)
+    assert (code == 0) is (state != "unconfirmed")
+    assert home.identity_text in output.out
+    assert f"State: {state}" in output.out
+    assert ("Currently installed: 1.0.0" in output.out) is (state == "installed")
+    assert str(home.path) not in output.out + output.err
 
 
 @pytest.mark.parametrize(

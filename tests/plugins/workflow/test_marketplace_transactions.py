@@ -186,6 +186,137 @@ def _authorize_remove(
     return candidate, _consume(store, candidate)
 
 
+@pytest.mark.parametrize("consumed", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
+def test_recovery_inspection_distinguishes_review_from_writer_without_writes(
+    tmp_path, consumed, expired
+):
+    now = [datetime.now(timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    if consumed:
+        store.consume(prepared.token, actor="alice", profile="p1")
+    if expired:
+        now[0] += timedelta(hours=1)
+    before = _snapshot(tmp_path)
+    inspection = store.inspect_recovery()
+    assert inspection.complete
+    assert inspection.active_writer is (consumed and not expired)
+    assert _snapshot(tmp_path) == before
+    if consumed or expired:
+        assert {e.identity for e in inspection.entries} == {candidate.identity}
+        assert {e.transaction_id for e in inspection.entries} == {
+            prepared.transaction_id
+        }
+    else:
+        assert inspection.entries == ()
+    if consumed:
+        assert inspection.entries[0].classification == (
+            "owned" if expired else "active_writer"
+        )
+    # The inspection contains no review secret or private filesystem targets.
+    from dataclasses import asdict
+
+    output = json.dumps(asdict(inspection), default=lambda value: value.model_dump())
+    assert prepared.token not in output
+    assert str(tmp_path) not in output
+
+
+@pytest.mark.parametrize("damage", ["foreign", "malformed", "symlink"])
+def test_recovery_inspection_retains_ambiguous_journals_and_ownership_bytes(
+    tmp_path, damage
+):
+    now = [datetime.now(timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    consumed = _consume(store, candidate)
+    marker = consumed.staging_path.parent / "owner.json"
+    if damage == "foreign":
+        value = json.loads(marker.read_bytes())
+        value["packageDigest"] = "0" * 64
+        marker.write_text(json.dumps(value))
+    elif damage == "malformed":
+        marker.write_text("{")
+    else:
+        target = tmp_path / "unrelated-marker.json"
+        marker.replace(target)
+        marker.symlink_to(target)
+    now[0] += timedelta(hours=1)
+    before = _snapshot(tmp_path)
+    inspection = store.inspect_recovery()
+    assert not inspection.active_writer
+    assert inspection.entries[0].classification == "ownership_mismatch"
+    assert store.recover_transactions() == ()
+    assert store.inspect_recovery() == inspection
+    assert _snapshot(tmp_path) == before
+
+
+def test_recovery_inspection_and_cleanup_share_abandoned_ownership(tmp_path):
+    now = [datetime.now(timezone.utc)]
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now[0])
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    # Simulate lost preparation publication after owned staging was created.
+    with store._locked() as parent_identity:
+        store._write_prepared([], parent_identity=parent_identity)
+    unrelated = store.staging_root / ("f" * 32)
+    unrelated.mkdir()
+    (unrelated / "owner.json").write_text("{}")
+    before = _snapshot(tmp_path)
+    inspection = store.inspect_recovery()
+    assert [(e.transaction_id, e.identity, e.kind) for e in inspection.entries] == [
+        (prepared.transaction_id, candidate.identity, "abandoned_staging")
+    ]
+    assert _snapshot(tmp_path) == before
+    assert store.recover_transactions() == ()
+    assert not prepared.staging_path.parent.exists()
+    assert (unrelated / "owner.json").read_text() == "{}"
+    assert store.inspect_recovery().entries == ()
+
+
+def test_recovery_inspection_refuses_incomplete_staging_scan_without_writes(tmp_path):
+    store = MarketplaceTransactionStore(tmp_path)
+    store._ensure_workflow_roots()
+    with store._locked():
+        pass
+    for index in range(321):
+        (store.staging_root / f"unrelated-{index}").mkdir()
+    before = _snapshot(tmp_path)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.inspect_recovery()
+    assert error.value.code == "transaction_recovery_inspection_incomplete"
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("linked_root", ["staging", "workflows", "quarantine"])
+def test_recovery_inspection_does_not_follow_staging_root_symlink(
+    tmp_path, linked_root
+):
+    store = MarketplaceTransactionStore(tmp_path / "profile")
+    store.home.mkdir()
+    store._ensure_workflow_roots()
+    with store._locked():
+        pass
+    foreign = tmp_path / "foreign"
+    root = {
+        "staging": store.staging_root,
+        "workflows": store.home / "workflows",
+        "quarantine": store.quarantine_root,
+    }[linked_root]
+    root.rename(foreign)
+    root.symlink_to(foreign, target_is_directory=True)
+    before = _snapshot(tmp_path)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.inspect_recovery()
+    assert error.value.code == "transaction_recovery_inspection_incomplete"
+    assert _snapshot(tmp_path) == before
+
+
 def test_confirmation_token_is_random_hashed_single_use_and_fully_bound(
     tmp_path: Path,
 ) -> None:

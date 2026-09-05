@@ -141,6 +141,26 @@ class TransactionJournal:
     previous_provenance: InstalledPackageProvenance | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryEntry:
+    """Finite confirmation scope, without filesystem targets or review secrets."""
+
+    transaction_id: str
+    identity: InstalledPackageIdentity
+    kind: Literal["journal", "expired_preparation", "abandoned_staging"]
+    classification: Literal[
+        "owned", "ownership_mismatch", "active_writer", "active_preparation"
+    ]
+    phase: JournalPhase | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryInspection:
+    entries: tuple[_RecoveryEntry, ...]
+    active_writer: bool
+    complete: bool = True
+
+
 class _StateModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -2129,17 +2149,30 @@ class MarketplaceTransactionStore:
             package_digest=previous.distribution_digest,
         )
 
-    def _clean_abandoned_staging(
+    def _abandoned_staging_candidates(
         self,
         *,
         active_ids: set[str],
         journal_ids: set[str],
-    ) -> None:
+        require_complete: bool = False,
+    ) -> Iterator[tuple[Path, _OwnerMarker]]:
+        if require_complete and _entry(self.staging_root) is None:
+            return
         try:
             with os.scandir(self.staging_root) as iterator:
                 entries = list(islice(iterator, _MAX_PREPARED + _MAX_JOURNALS + 1))
         except OSError:
+            if require_complete:
+                _fail(
+                    "transaction_recovery_inspection_incomplete",
+                    "staging scope could not be inspected completely",
+                )
             return
+        if require_complete and len(entries) > _MAX_PREPARED + _MAX_JOURNALS:
+            _fail(
+                "transaction_recovery_inspection_incomplete",
+                "staging scope exceeds the inspection limit",
+            )
         for entry in entries:
             if (
                 entry.name in active_ids
@@ -2179,8 +2212,102 @@ class MarketplaceTransactionStore:
                 )
                 is not None
             ):
-                shutil.rmtree(envelope)
-                _fsync_directory(self.staging_root)
+                yield envelope, marker
+
+    def _clean_abandoned_staging(
+        self,
+        *,
+        active_ids: set[str],
+        journal_ids: set[str],
+    ) -> None:
+        for envelope, _marker in self._abandoned_staging_candidates(
+            active_ids=active_ids, journal_ids=journal_ids
+        ):
+            shutil.rmtree(envelope)
+            _fsync_directory(self.staging_root)
+
+    def inspect_recovery(self) -> _RecoveryInspection:
+        """Read bounded recovery scope; incomplete inspection raises, never clears.
+
+        Lock artifacts may be created by the existing lock primitive. No prepared
+        records, journals, owned envelopes, packages or trust are changed here.
+        Callers recheck this snapshot and recover under the same reentrant lock.
+        """
+        with self._locked():
+            # Validate parents before any journal or abandoned-staging marker read.
+            for root in (
+                self.home,
+                self.home / "workflows",
+                self.staging_root,
+                self.quarantine_root,
+            ):
+                if _entry(root) is not None:
+                    _require_existing_directory(
+                        root, code="transaction_recovery_inspection_incomplete"
+                    )
+            prepared = self._read_prepared()
+            journals = self._read_journals()
+            now = self.clock()
+            if not isinstance(now, datetime) or now.tzinfo is None:
+                _fail(
+                    "transaction_state_invalid",
+                    "transaction clock did not return an aware timestamp",
+                )
+            active_ids = {
+                item.transaction_id
+                for item in prepared.transactions
+                if _parse_timestamp(item.expires_at) > now
+            }
+            abandoned = tuple(
+                self._abandoned_staging_candidates(
+                    active_ids=active_ids,
+                    journal_ids={item.transaction_id for item in journals.journals},
+                    require_complete=True,
+                )
+            )
+            entries = [
+                _RecoveryEntry(
+                    item.transaction_id, item.identity, "expired_preparation", "owned"
+                )
+                for item in prepared.transactions
+                if item.transaction_id not in active_ids
+            ]
+            active_writer = False
+            for journal in journals.journals:
+                writer = (
+                    journal.phase in {"install_consumed", "remove_consumed"}
+                    and _parse_timestamp(journal.consumed_expires_at) > now
+                )
+                active_writer |= writer
+                if writer:
+                    classification = "active_writer"
+                elif journal.transaction_id in active_ids:
+                    classification = "active_preparation"
+                elif self._journal_markers_match(journal):
+                    classification = "owned"
+                else:
+                    classification = "ownership_mismatch"
+                entries.append(
+                    _RecoveryEntry(
+                        journal.transaction_id,
+                        journal.identity,
+                        "journal",
+                        classification,
+                        journal.phase,
+                    )
+                )
+            entries.extend(
+                _RecoveryEntry(
+                    marker.transaction_id, marker.identity, "abandoned_staging", "owned"
+                )
+                for _envelope, marker in abandoned
+            )
+            return _RecoveryInspection(
+                tuple(
+                    sorted(entries, key=lambda item: (item.transaction_id, item.kind))
+                ),
+                active_writer,
+            )
 
     def recover_transactions(self) -> tuple[str, ...]:
         """Complete or roll back only exact journals with matching owned markers."""
