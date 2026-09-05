@@ -15,7 +15,7 @@ import {
   sameLifecycleValue
 } from '@/lib/workflow-marketplace-lifecycle-codec'
 import type * as wire from '@/types/workflow-marketplace-lifecycle'
-import { lifecycleRules } from '@/types/workflow-marketplace-lifecycle'
+import { lifecycleHttpErrorCodes, lifecycleRules } from '@/types/workflow-marketplace-lifecycle'
 
 const ROOT = '/api/plugins/workflow/marketplace/lifecycle/v2'
 const REQUEST_ID = /^wmreq_([0-9a-f]{32})_[0-9]{13}_[0-9a-f]{32}$/
@@ -26,7 +26,36 @@ export interface LifecycleScope {
   connectionId: string | null
   profile: string
   registryEpoch?: string
+  connectionGeneration?: string
+  principal?: string
 }
+
+export interface LifecycleClockScope extends LifecycleScope {
+  registryEpoch: string
+  connectionGeneration: string
+  principal: string
+}
+export interface LifecycleClockSample {
+  wallNowMs: number
+  monotonicNowMs: number
+}
+export interface LifecycleClockObservation {
+  readonly registryEpoch: string
+  readonly serverTimeMs: number
+  readonly wallReceivedMs: number
+  readonly monotonicReceivedMs: number
+}
+const clockObservations = new WeakMap<LifecycleClockObservation, LifecycleClockScope>()
+
+const localCodes = [
+  'marketplace_lifecycle_unsupported',
+  'marketplace_network_error',
+  'marketplace_invalid_response',
+  'marketplace_request_failed',
+  'marketplace_clock_revalidation_required'
+] as const
+
+type LocalCode = (typeof localCodes)[number]
 
 export interface LifecycleCorrelation {
   requestId: string
@@ -40,18 +69,21 @@ export interface LifecycleStart extends LifecycleCorrelation {
 }
 
 export class LifecycleApiError extends Error {
-  readonly code: string
+  readonly code: wire.LifecycleHttpErrorCode | LocalCode
   readonly status: number
   constructor(code: string, status: number) {
     super('Workflow marketplace lifecycle request could not be completed.')
     this.name = 'LifecycleApiError'
-    this.code = code
-    this.status = status
+    this.code =
+      (lifecycleHttpErrorCodes as readonly string[]).includes(code) || (localCodes as readonly string[]).includes(code)
+        ? (code as typeof this.code)
+        : 'marketplace_request_failed'
+    this.status = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 0
   }
 }
 
 function invalid(): never {
-  throw new TypeError('Hermes returned invalid workflow lifecycle data.')
+  throw new LifecycleApiError('marketplace_invalid_response', 0)
 }
 
 function invalidRequest(): never {
@@ -96,7 +128,11 @@ function text(value: unknown): value is string {
 }
 
 function captureScope(value: unknown, epoch = true): LifecycleScope {
-  const fields = record(value, ['connectionId', 'profile', 'registryEpoch'], ['registryEpoch'])
+  const fields = record(
+    value,
+    ['connectionId', 'profile', 'registryEpoch', 'connectionGeneration', 'principal'],
+    ['registryEpoch', 'connectionGeneration', 'principal']
+  )
 
   if (
     (fields.connectionId !== null && !text(fields.connectionId)) ||
@@ -109,6 +145,10 @@ function captureScope(value: unknown, epoch = true): LifecycleScope {
   return {
     connectionId: fields.connectionId as string | null,
     profile: fields.profile,
+    ...(fields.connectionGeneration === undefined
+      ? {}
+      : { connectionGeneration: fields.connectionGeneration as string }),
+    ...(fields.principal === undefined ? {} : { principal: fields.principal as string }),
     ...(fields.registryEpoch === undefined ? {} : { registryEpoch: fields.registryEpoch as string })
   }
 }
@@ -155,8 +195,16 @@ async function request<T>(
       connectionId: scope.connectionId,
       profile: scope.profile
     })
-  } catch {
-    throw new LifecycleApiError('marketplace_network_error', 0)
+  } catch (error) {
+    const message =
+      error && typeof error === 'object' ? Object.getOwnPropertyDescriptor(error, 'message')?.value : undefined
+
+    throw new LifecycleApiError(
+      typeof message === 'string' && message.endsWith('Invalid workflow lifecycle response.')
+        ? 'marketplace_request_failed'
+        : 'marketplace_network_error',
+      0
+    )
   }
 
   if (!response.ok) {
@@ -175,20 +223,17 @@ async function request<T>(
       throw new LifecycleApiError('marketplace_lifecycle_unsupported', 404)
     }
 
-    // The backend's bounded code is the only reflected error material.
-    let code = String(response.status)
+    let code = 'marketplace_request_failed'
 
-    if (
-      body &&
-      typeof body === 'object' &&
-      'detail' in body &&
-      body.detail &&
-      typeof body.detail === 'object' &&
-      'code' in body.detail &&
-      typeof body.detail.code === 'string' &&
-      /^[a-z][a-z0-9_]{0,127}$/.test(body.detail.code)
-    ) {
-      code = body.detail.code
+    try {
+      const envelope = record(body, ['detail'])
+      const detail = record(envelope.detail, ['code'])
+
+      if (typeof detail.code === 'string' && (lifecycleHttpErrorCodes as readonly string[]).includes(detail.code)) {
+        code = detail.code
+      }
+    } catch {
+      /* Untrusted errors are replaced, never retained as causes. */
     }
 
     throw new LifecycleApiError(code, response.status)
@@ -234,23 +279,114 @@ export async function getLifecycleCapabilities(scopeInput: LifecycleScope): Prom
   return value
 }
 
-/** Server clock observation and elapsed local milliseconds; never a matching heuristic. */
-export function createLifecycleRequestId(rawCapabilities: unknown, receivedAtMs: number, nowMs = Date.now()): string {
-  const capabilities = decodeLifecycleCapabilities(rawCapabilities)
-
-  if (!capabilities || !Number.isSafeInteger(receivedAtMs) || !Number.isSafeInteger(nowMs) || nowMs < receivedAtMs) {
-    invalidRequest()
+function clockFailure(observation?: LifecycleClockObservation): never {
+  if (observation && typeof observation === 'object') {
+    clockObservations.delete(observation)
   }
 
-  const issued = Date.parse(capabilities.server_time) + nowMs - receivedAtMs
+  throw new LifecycleApiError('marketplace_clock_revalidation_required', 0)
+}
 
-  if (!Number.isSafeInteger(issued) || !/^\d{13}$/.test(String(issued))) {
-    invalidRequest()
+export function discardLifecycleClockObservation(observation: LifecycleClockObservation): void {
+  clockObservations.delete(observation)
+}
+
+function clockScope(input: LifecycleClockScope): LifecycleClockScope {
+  const scope = captureScope(input)
+
+  if (!text(scope.connectionGeneration) || !isLifecycleProfile(scope.principal)) {
+    clockFailure()
   }
 
-  const random = crypto.getRandomValues(new Uint8Array(16))
+  return scope as LifecycleClockScope
+}
 
-  return `wmreq_${capabilities.registry_epoch}_${issued}_${Array.from(random, byte => byte.toString(16).padStart(2, '0')).join('')}`
+export function observeLifecycleClock(
+  rawCapabilities: unknown,
+  scopeInput: LifecycleClockScope,
+  received: LifecycleClockSample
+): LifecycleClockObservation {
+  try {
+    const capabilities = decodeLifecycleCapabilities(rawCapabilities),
+      scope = clockScope(scopeInput)
+
+    if (
+      !capabilities ||
+      capabilities.profile !== scope.profile ||
+      capabilities.registry_epoch !== scope.registryEpoch ||
+      !Number.isFinite(received.wallNowMs) ||
+      !Number.isFinite(received.monotonicNowMs)
+    ) {
+      clockFailure()
+    }
+
+    const observation = Object.freeze({
+      registryEpoch: capabilities.registry_epoch,
+      serverTimeMs:
+        Date.parse(capabilities.server_time) +
+        Number(/\.\d{3}(\d{3})Z$/.exec(capabilities.server_time)?.[1] ?? 0) / 1000,
+      wallReceivedMs: received.wallNowMs,
+      monotonicReceivedMs: received.monotonicNowMs
+    })
+
+    clockObservations.set(observation, scope)
+
+    return observation
+  } catch {
+    return clockFailure()
+  }
+}
+
+function observedTime(
+  observation: LifecycleClockObservation,
+  now: LifecycleClockSample,
+  scopeInput: LifecycleClockScope
+): number {
+  try {
+    const bound = clockObservations.get(observation),
+      scope = clockScope(scopeInput)
+
+    if (!bound || !sameLifecycleValue(bound, scope)) {
+      clockFailure(observation)
+    }
+
+    const monotonicElapsed = now.monotonicNowMs - observation.monotonicReceivedMs
+    const wallElapsed = now.wallNowMs - observation.wallReceivedMs
+
+    if (
+      ![monotonicElapsed, wallElapsed].every(value => Number.isFinite(value) && value >= 0 && value <= 300000) ||
+      Math.abs(monotonicElapsed - wallElapsed) > 1000
+    ) {
+      clockFailure(observation)
+    }
+
+    const issued = Math.floor(observation.serverTimeMs + monotonicElapsed)
+
+    if (!Number.isSafeInteger(issued) || !/^\d{13}$/.test(String(issued))) {
+      clockFailure(observation)
+    }
+
+    return issued
+  } catch {
+    return clockFailure(observation)
+  }
+}
+
+/** Only monotonic elapsed contributes to issuance; wall time detects discontinuity. */
+export function createLifecycleRequestId(
+  observation: LifecycleClockObservation,
+  now: LifecycleClockSample,
+  currentScope: LifecycleClockScope
+): string {
+  const issued = observedTime(observation, now, currentScope)
+
+  try {
+    const random = crypto.getRandomValues(new Uint8Array(16))
+
+    return `wmreq_${observation.registryEpoch}_${issued}_${Array.from(random, byte => byte.toString(16).padStart(2, '0')).join('')}`
+  } catch {
+    return clockFailure(observation)
+  }
 }
 
 async function exactOperation(
@@ -391,8 +527,11 @@ export async function getLifecyclePackageState(
 
 export async function startLifecycleOperation(
   input: unknown,
-  scopeInput: LifecycleScope
+  scopeInput: LifecycleClockScope,
+  observation: LifecycleClockObservation,
+  now: LifecycleClockSample
 ): Promise<wire.LifecycleOperation | wire.AdmissionEvicted> {
+  observedTime(observation, now, scopeInput)
   const scope = captureScope(scopeInput)
   const fields = record(input, ['requestId', 'kind', 'subject', 'selection', 'body'])
 

@@ -6,7 +6,19 @@ export type AdmissionEvicted = {
   request_id: string
   registry_epoch: string
   profile: string
-  kind: string
+  kind:
+    | 'refresh'
+    | 'inspect'
+    | 'update_check'
+    | 'install_prepare'
+    | 'update_prepare'
+    | 'remove_prepare'
+    | 'trust_prepare'
+    | 'install_confirm'
+    | 'update_confirm'
+    | 'remove_confirm'
+    | 'trust_confirm'
+    | 'trust_revoke'
   subject: SourceSubject | PackageSubject | AllPackagesSubject | DirectInstallSubject
   selection: AllTrustSelection | OneTrustSelection | null
 }
@@ -555,22 +567,197 @@ export type _TrustBody = {
 
 export type LifecycleCapabilities = _Capabilities
 
+export const lifecycleDomains = {
+  casefold: { unicodeVersion: '14.0.0' },
+  clean_text: {
+    stripCodePoints: [
+      9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201,
+      8202, 8232, 8233, 8239, 8287, 12288
+    ]
+  },
+  lifecycle_relative_path: {
+    forbiddenCodePoints: [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+      31, 58, 92, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146,
+      147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 8232, 8233
+    ],
+    maxLength: 1024,
+    minLength: 1,
+    normalization: 'NFC'
+  },
+  repository_identity: {
+    authority: 'validate_credential_free_git_source',
+    credentialAuthority: '(?<![A-Za-z0-9._-])[A-Za-z0-9._-]+:[^@\\s/]+@[A-Za-z0-9.-]+',
+    credentialPrefixes: [
+      '(?<![A-Za-z0-9_-])(sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|gho_[A-Za-z0-9]{10,}|ghu_[A-Za-z0-9]{10,}|ghs_[A-Za-z0-9]{10,}|ghr_[A-Za-z0-9]{10,}|xapp-\\d+-[A-Za-z0-9-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{30,}|pplx-[A-Za-z0-9]{10,}|fal_[A-Za-z0-9_-]{10,}|fc-[A-Za-z0-9]{10,}|bb_live_[A-Za-z0-9_-]{10,}|gAAAA[A-Za-z0-9_=-]{20,}|AKIA[A-Z0-9]{16}|sk_live_[A-Za-z0-9]{10,}|sk_test_[A-Za-z0-9]{10,}|rk_live_[A-Za-z0-9]{10,}|SG\\.[A-Za-z0-9_-]{10,}|hf_[A-Za-z0-9]{10,}|r8_[A-Za-z0-9]{10,}|npm_[A-Za-z0-9]{10,}|pypi-[A-Za-z0-9_-]{10,}|dop_v1_[A-Za-z0-9]{10,}|doo_v1_[A-Za-z0-9]{10,}|am_[A-Za-z0-9_-]{10,}|sk_[A-Za-z0-9_]{10,}|tvly-[A-Za-z0-9]{10,}|exa_[A-Za-z0-9]{10,}|gsk_[A-Za-z0-9]{10,}|syt_[A-Za-z0-9]{10,}|retaindb_[A-Za-z0-9]{10,}|hsk-[A-Za-z0-9]{10,}|mem0_[A-Za-z0-9]{10,}|brv_[A-Za-z0-9]{10,}|xai-[A-Za-z0-9]{30,}|ntn_[A-Za-z0-9]{10,}|fw-[A-Za-z0-9]{30,}|fw_[A-Za-z0-9]{30,}|fpk_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_\\-]{10,}|gloas-[A-Za-z0-9_\\-]{10,}|gldt-[A-Za-z0-9_\\-]{10,}|glrt-[A-Za-z0-9_.\\-]{10,}|glrtr-[A-Za-z0-9_.\\-]{10,}|glcbt-[A-Za-z0-9_\\-]{10,}|glptt-[A-Za-z0-9_\\-]{10,}|glft-[A-Za-z0-9_\\-]{10,}|glimt-[A-Za-z0-9_\\-]{10,}|glagent-[A-Za-z0-9_\\-]{10,}|glsoat-[A-Za-z0-9_\\-]{10,}|glffct-[A-Za-z0-9_\\-]{10,}|glwt-[A-Za-z0-9_\\-]{10,}|GR1348941[A-Za-z0-9_\\-]{10,}|pk-lf-[A-Za-z0-9\\-]{8,})(?![A-Za-z0-9_-])'
+    ],
+    credentialQualifiers: [
+      'access',
+      'api',
+      'auth',
+      'authorization',
+      'aws',
+      'azure',
+      'client',
+      'deploy',
+      'github',
+      'gitlab',
+      'google',
+      'oauth',
+      'private',
+      'secret',
+      'security'
+    ],
+    credentialRedactionPatterns: [
+      { flags: 'i', pattern: '((?:https?|wss?|git|ssh|ftp|ftps|sftp)://)([^\\s:@/]{8,})(@[^\\s]+)' },
+      { flags: '', pattern: 'eyJ[A-Za-z0-9_-]{10,}(?:\\.[A-Za-z0-9_=-]{4,}){0,2}' },
+      { flags: '', pattern: '(bot)?(\\d{8,}):([-A-Za-z0-9_]{30,})' },
+      { flags: '', pattern: '-----BEGIN[A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END[A-Z ]*PRIVATE KEY-----' },
+      { flags: 'i', pattern: '((?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis|amqp)://[^:\\s]+:)([^@\\s]+)(@)' },
+      { flags: '', pattern: '(\\+[1-9]\\d{6,14})(?![A-Za-z0-9])' }
+    ],
+    credentialSplitControls: '[\\x00-\\x1f\\x7f\\u200b-\\u200f\\u2028-\\u202f\\u2060\\ufeff]',
+    credentialSuffixes: ['credential', 'credentials', 'key', 'password', 'secret', 'signature', 'token'],
+    credentialWords: [
+      'auth',
+      'authorization',
+      'credential',
+      'credentials',
+      'key',
+      'password',
+      'secret',
+      'signature',
+      'token'
+    ],
+    programLookupPattern: '^(?:os\\.(?:getenv|environ)|process\\.env|\\$ENV\\{)',
+    redactionFields: [
+      {
+        flags: '',
+        kind: 'assignment',
+        pattern:
+          '([A-Z0-9_]{0,50}(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)[A-Z0-9_]{0,50})\\s*=\\s*([\'\\"]?)(\\S+)\\2',
+        skipUrls: false
+      },
+      {
+        flags: 'i',
+        kind: 'assignment',
+        pattern:
+          '(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\\s*=\\s*([\'\\"]?)(\\S+)\\2',
+        skipUrls: true
+      },
+      {
+        flags: 'i',
+        kind: 'assignment',
+        pattern:
+          '(?<![A-Za-z0-9_.\\-])([A-Za-z0-9_\\-]+\\.[A-Za-z0-9_.\\-]*(?:api[ _.\\-]?key|token|secret|passwd|password|credential|auth)[A-Za-z0-9_.\\-]*|[A-Za-z0-9_.\\-]*(?:api[ _.\\-]?key|token|secret|passwd|password|credential|auth)[A-Za-z0-9_.\\-]*\\.[A-Za-z0-9_.\\-]+)=([\'\\"]?)([^\\s&]+?)\\2(?=[\\s&]|$)',
+        skipUrls: true
+      },
+      {
+        flags: 'im',
+        kind: 'assignment',
+        pattern:
+          '(^[ \\t]*(?:export[ \\t]+)?[A-Za-z0-9_\\-]*(?:api[ _.\\-]?key|token|secret|passwd|password|credential|auth)[A-Za-z0-9_\\-]*)=([\'\\"]?)([^\\s&]+?)\\2(?=[\\s&]|$)',
+        skipUrls: true
+      },
+      {
+        flags: 'im',
+        kind: 'yaml',
+        pattern:
+          '(^[ \\t]*[A-Za-z0-9_.\\-]*(?:api[ _.\\-]?key|token|secret|passwd|password|credential)[A-Za-z0-9_.\\-]*)(:[ \\t]*)(?![\'\\"])([^\\s&]+)',
+        skipUrls: true
+      },
+      {
+        flags: 'i',
+        kind: 'json',
+        pattern:
+          '("(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)")\\s*:\\s*"([^"]+)"',
+        skipUrls: false
+      },
+      {
+        flags: 'i',
+        kind: 'authorization',
+        pattern: '((?:Proxy-)?Authorization:\\s*)([A-Za-z][\\w.+-]*\\s+)?([^\\s\\"\']+)',
+        skipUrls: false
+      },
+      {
+        flags: 'i',
+        kind: 'header',
+        pattern: '((?:x-api-key|x-goog-api-key|api-key|apikey|x-api-token|x-auth-token|x-access-token)\\s*:\\s*)(\\S+)',
+        skipUrls: false
+      }
+    ],
+    secretKeywordPattern:
+      '(?:api|auth|access|refresh|session|secret)[ _.\\\\-]?(?:key|token)|token|secret|passwd|password|pass|pw|credential|auth|key'
+  }
+} as const
+
+export const lifecycleHttpErrorCodes = [
+  'marketplace_admission_capacity',
+  'marketplace_admission_not_found',
+  'marketplace_epoch_changed',
+  'marketplace_internal_error',
+  'marketplace_list_capacity',
+  'marketplace_list_expired',
+  'marketplace_operation_capacity',
+  'marketplace_operation_conflict',
+  'marketplace_operation_not_found',
+  'marketplace_operation_unavailable',
+  'marketplace_request_conflict',
+  'marketplace_request_expired',
+  'marketplace_request_invalid',
+  'marketplace_review_unavailable'
+] as const
+
+export type LifecycleHttpErrorCode = (typeof lifecycleHttpErrorCodes)[number]
+
+export const lifecycleCapabilityOrder = [
+  'operations',
+  'admission_replay',
+  'package_state',
+  'transactions',
+  'updates',
+  'trust',
+  'sources',
+  'inspect'
+] as const
+
 export const lifecycleSchemas = {
   AdmissionEvicted: {
     additionalProperties: false,
     properties: {
-      kind: { type: 'string' },
-      operation_id: { type: 'string' },
-      profile: { type: 'string' },
-      registry_epoch: { type: 'string' },
-      request_id: { type: 'string' },
+      kind: {
+        enum: [
+          'refresh',
+          'inspect',
+          'update_check',
+          'install_prepare',
+          'update_prepare',
+          'remove_prepare',
+          'trust_prepare',
+          'install_confirm',
+          'update_confirm',
+          'remove_confirm',
+          'trust_confirm',
+          'trust_revoke'
+        ],
+        type: 'string'
+      },
+      operation_id: { pattern: '^wmop_[0-9a-f]{12}_[0-9a-f]{32}$', type: 'string' },
+      profile: { maxLength: 256, minLength: 1, type: 'string' },
+      registry_epoch: { pattern: '^[0-9a-f]{32}$', type: 'string' },
+      request_id: {
+        maxLength: 85,
+        minLength: 85,
+        pattern: '^wmreq_([0-9a-f]{32})_[0-9]{13}_[0-9a-f]{32}$',
+        type: 'string'
+      },
       selection: {
         anyOf: [
           { oneOf: [{ $ref: '#/$defs/AllTrustSelection' }, { $ref: '#/$defs/OneTrustSelection' }] },
           { type: 'null' }
         ]
       },
-      state: { const: 'evicted', default: 'evicted', type: 'string' },
+      state: { const: 'evicted', type: 'string' },
       subject: {
         oneOf: [
           { $ref: '#/$defs/SourceSubject' },
@@ -580,7 +767,7 @@ export const lifecycleSchemas = {
         ]
       }
     },
-    required: ['operation_id', 'request_id', 'registry_epoch', 'profile', 'kind', 'subject', 'selection'],
+    required: ['state', 'operation_id', 'request_id', 'registry_epoch', 'profile', 'kind', 'subject', 'selection'],
     type: 'object'
   },
   AdmissionFound: {
@@ -650,8 +837,14 @@ export const lifecycleSchemas = {
       candidate_digest: { anyOf: [{ pattern: '^[0-9a-f]{64}$', type: 'string' }, { type: 'null' }], default: null },
       kind: { enum: ['added', 'modified', 'removed', 'renamed'], type: 'string' },
       old_digest: { anyOf: [{ pattern: '^[0-9a-f]{64}$', type: 'string' }, { type: 'null' }], default: null },
-      old_path: { anyOf: [{ maxLength: 1024, type: 'string' }, { type: 'null' }], default: null },
-      path: { maxLength: 1024, minLength: 1, type: 'string' }
+      old_path: {
+        anyOf: [
+          { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+          { type: 'null' }
+        ],
+        default: null
+      },
+      path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' }
     },
     required: ['path', 'kind'],
     type: 'object'
@@ -672,7 +865,7 @@ export const lifecycleSchemas = {
       file_changes: { items: { $ref: '#/$defs/FileDigestChange' }, maxItems: 1024, type: 'array' },
       identity: { $ref: '#/$defs/PackageIdentity' },
       operation: { const: 'install', type: 'string' },
-      package_path: { maxLength: 1024, minLength: 1, type: 'string' },
+      package_path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       repository_url: { maxLength: 4096, minLength: 1, type: 'string' },
       resolved_commit: { pattern: '^[0-9a-f]{40}$', type: 'string' },
       result: { const: 'review_required', default: 'review_required', type: 'string' },
@@ -716,7 +909,7 @@ export const lifecycleSchemas = {
       identity: { $ref: '#/$defs/InstalledPackageIdentity' },
       installed_at: { maxLength: 64, minLength: 20, type: 'string' },
       orphaned_source: { type: 'boolean' },
-      package_path: { maxLength: 1024, minLength: 1, type: 'string' },
+      package_path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       repository_url: { maxLength: 4096, minLength: 1, type: 'string' },
       resolved_commit: { pattern: '^[0-9a-f]{40}$', type: 'string' },
       source_name: { maxLength: 64, minLength: 1, type: 'string' },
@@ -725,7 +918,11 @@ export const lifecycleSchemas = {
           '^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$',
         type: 'string'
       },
-      workflow_paths: { items: { type: 'string' }, maxItems: 512, type: 'array' }
+      workflow_paths: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      }
     },
     required: [
       'identity',
@@ -824,7 +1021,12 @@ export const lifecycleSchemas = {
       profile: { maxLength: 256, minLength: 1, type: 'string' },
       progress: { maximum: 100, minimum: 0, type: 'integer' },
       registry_epoch: { pattern: '^[0-9a-f]{32}$', type: 'string' },
-      request_id: { maxLength: 85, minLength: 85, type: 'string' },
+      request_id: {
+        maxLength: 85,
+        minLength: 85,
+        pattern: '^wmreq_([0-9a-f]{32})_[0-9]{13}_[0-9a-f]{32}$',
+        type: 'string'
+      },
       result: {
         anyOf: [
           {
@@ -889,8 +1091,8 @@ export const lifecycleSchemas = {
     additionalProperties: false,
     properties: {
       complete: { type: 'boolean' },
-      items: { items: { $ref: '#/$defs/LifecycleOperation' }, type: 'array' },
-      next_cursor: { anyOf: [{ type: 'string' }, { type: 'null' }] }
+      items: { items: { $ref: '#/$defs/LifecycleOperation' }, maxItems: 100, type: 'array' },
+      next_cursor: { anyOf: [{ pattern: '^[0-9a-f]{32}$', type: 'string' }, { type: 'null' }] }
     },
     required: ['items', 'next_cursor', 'complete'],
     type: 'object'
@@ -971,13 +1173,7 @@ export const lifecycleSchemas = {
       installed: { anyOf: [{ $ref: '#/$defs/InstalledPackage' }, { type: 'null' }], default: null },
       license: { maxLength: 256, minLength: 1, type: 'string' },
       package_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
-      package_path: {
-        maxLength: 1024,
-        minLength: 1,
-        pattern:
-          '^(?!/)(?![A-Za-z]:)(?!.*\\/[A-Za-z]:)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*(?:^|/)\\.[gG][iI][tT](?:/|$))(?!.*\\\\)(?!.*\\x00).+$',
-        type: 'string'
-      },
+      package_path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       publisher: { maxLength: 256, minLength: 1, type: 'string' },
       repository_url: { maxLength: 4096, minLength: 1, type: 'string' },
       resolved_commit: { pattern: '^[0-9a-f]{40}$', type: 'string' },
@@ -1034,13 +1230,7 @@ export const lifecycleSchemas = {
   PackageInspectionResource: {
     additionalProperties: false,
     properties: {
-      path: {
-        maxLength: 1024,
-        minLength: 1,
-        pattern:
-          '^(?!/)(?![A-Za-z]:)(?!.*\\/[A-Za-z]:)(?!.*(?:^|/)\\.\\.?(/|$))(?!.*(?:^|/)\\.[gG][iI][tT](?:/|$))(?!.*\\\\)(?!.*\\x00).+$',
-        type: 'string'
-      },
+      path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       types: {
         items: {
           enum: ['command', 'mcp', 'mcp_resource', 'other', 'script', 'workflow_companion', 'workflow_definition'],
@@ -1061,7 +1251,11 @@ export const lifecycleSchemas = {
       blockers: { items: { $ref: '#/$defs/PackageDiagnostic' }, maxItems: 512, type: 'array' },
       external_requirements: { $ref: '#/$defs/ExternalRequirements' },
       package_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
-      package_resources: { items: { type: 'string' }, maxItems: 512, type: 'array' },
+      package_resources: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      },
       review_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
       workflow_names: {
         items: { maxLength: 256, minLength: 1, type: 'string' },
@@ -1168,11 +1362,16 @@ export const lifecycleSchemas = {
   ReviewTokenResponse: {
     additionalProperties: false,
     properties: {
-      confirmation_token: { type: 'string' },
-      expires_at: { type: 'string' },
-      operation_id: { type: 'string' },
-      request_id: { type: 'string' },
-      review_digest: { type: 'string' },
+      confirmation_token: { maxLength: 256, minLength: 32, pattern: '^[A-Za-z0-9_-]+$', type: 'string' },
+      expires_at: { maxLength: 64, minLength: 20, type: 'string' },
+      operation_id: { pattern: '^wmop_[0-9a-f]{12}_[0-9a-f]{32}$', type: 'string' },
+      request_id: {
+        maxLength: 85,
+        minLength: 85,
+        pattern: '^wmreq_([0-9a-f]{32})_[0-9]{13}_[0-9a-f]{32}$',
+        type: 'string'
+      },
+      review_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
       selection: {
         anyOf: [
           { oneOf: [{ $ref: '#/$defs/AllTrustSelection' }, { $ref: '#/$defs/OneTrustSelection' }] },
@@ -1277,7 +1476,11 @@ export const lifecycleSchemas = {
       distribution_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
       expires_at: { anyOf: [{ maxLength: 64, minLength: 20, type: 'string' }, { type: 'null' }], default: null },
       identity: { $ref: '#/$defs/PackageIdentity' },
-      package_resources: { items: { type: 'string' }, maxItems: 512, type: 'array' },
+      package_resources: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      },
       package_workflows: {
         items: { $ref: '#/$defs/WorkflowInventoryItem' },
         maxItems: 512,
@@ -1345,7 +1548,7 @@ export const lifecycleSchemas = {
   TrustWorkflowState: {
     additionalProperties: false,
     properties: {
-      definition_path: { maxLength: 1024, minLength: 1, type: 'string' },
+      definition_path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       state: { enum: ['trusted', 'untrusted'], type: 'string' },
       workflow_name: { maxLength: 256, minLength: 1, type: 'string' }
     },
@@ -1483,7 +1686,7 @@ export const lifecycleSchemas = {
   WorkflowInventoryItem: {
     additionalProperties: false,
     properties: {
-      definition_path: { maxLength: 1024, minLength: 1, type: 'string' },
+      definition_path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       workflow_name: { maxLength: 256, minLength: 1, type: 'string' }
     },
     required: ['workflow_name', 'definition_path'],
@@ -1513,14 +1716,32 @@ export const lifecycleSchemas = {
     properties: {
       approval_nodes: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
       command_nodes: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
-      command_resources: { items: { type: 'string' }, maxItems: 512, type: 'array' },
-      companion_path: { anyOf: [{ maxLength: 1024, type: 'string' }, { type: 'null' }], default: null },
+      command_resources: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      },
+      companion_path: {
+        anyOf: [
+          { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+          { type: 'null' }
+        ],
+        default: null
+      },
       compatibility: { items: { $ref: '#/$defs/PackageDiagnostic' }, maxItems: 512, type: 'array' },
-      definition_path: { maxLength: 1024, type: 'string' },
+      definition_path: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
       external_requirements: { $ref: '#/$defs/ExternalRequirements' },
       local_mcp_servers: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
-      mcp_resource_files: { items: { type: 'string' }, maxItems: 512, type: 'array' },
-      mcp_resources: { items: { type: 'string' }, maxItems: 512, type: 'array' },
+      mcp_resource_files: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      },
+      mcp_resources: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      },
       outward_action_nodes: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
       package_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
       package_resource_set: { const: 'package', type: 'string' },
@@ -1530,7 +1751,11 @@ export const lifecycleSchemas = {
       requested_tools: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
       required_secrets: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
       risk_digest: { pattern: '^[0-9a-f]{64}$', type: 'string' },
-      script_resources: { items: { type: 'string' }, maxItems: 512, type: 'array' },
+      script_resources: {
+        items: { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+        maxItems: 512,
+        type: 'array'
+      },
       shell_or_script_nodes: { items: { maxLength: 256, minLength: 1, type: 'string' }, maxItems: 512, type: 'array' },
       trust_state: { enum: ['trusted', 'untrusted'], type: 'string' },
       workflow_name: { maxLength: 256, minLength: 1, type: 'string' }
@@ -1583,10 +1808,10 @@ export const lifecycleSchemas = {
       },
       profile: { maxLength: 256, minLength: 1, type: 'string' },
       registry_epoch: { pattern: '^[0-9a-f]{32}$', type: 'string' },
-      schema_version: { const: 2, default: 2, type: 'integer' },
-      server_time: { type: 'string' }
+      schema_version: { const: 2, type: 'integer' },
+      server_time: { maxLength: 64, minLength: 20, type: 'string' }
     },
-    required: ['profile', 'registry_epoch', 'server_time', 'capabilities'],
+    required: ['schema_version', 'profile', 'registry_epoch', 'server_time', 'capabilities'],
     type: 'object'
   },
   _CheckBody: {
@@ -1622,7 +1847,13 @@ export const lifecycleSchemas = {
     additionalProperties: false,
     properties: {
       identifier: { type: 'string' },
-      package_path: { anyOf: [{ type: 'string' }, { type: 'null' }], default: null },
+      package_path: {
+        anyOf: [
+          { maxLength: 1024, minLength: 1, type: 'string', 'x-hermes-domain': 'lifecycle_relative_path' },
+          { type: 'null' }
+        ],
+        default: null
+      },
       ref: { anyOf: [{ type: 'string' }, { type: 'null' }], default: null }
     },
     required: ['identifier'],

@@ -5,6 +5,40 @@ import corpus from '../../../../tests/fixtures/workflow-marketplace-lifecycle-v2
 const codec = await import('./workflow-marketplace-lifecycle-codec').catch(() => null)
 
 describe('Python lifecycle acceptance parity', () => {
+  it('preserves a Python-valid U+FEFF repository identity', () => {
+    const value = structuredClone(corpus.operationCases.find(item => item.name === 'service install confirm')!.value)
+
+    const visit = (input: unknown): void => {
+      if (!input || typeof input !== 'object') {
+        return
+      }
+
+      for (const [key, child] of Object.entries(input)) {
+        if (key === 'repository_url') {
+          ;(input as Record<string, unknown>)[key] = '\ufeffhttps://fixtures.example/workflows.git'
+        } else {
+          visit(child)
+        }
+      }
+    }
+
+    visit(value)
+    expect(codec!.decodeLifecycleOperation(value)).toEqual(value)
+  })
+
+  it('has generated strict outer-envelope acceptance cases', () => {
+    expect((corpus as unknown as Record<string, unknown>).outerEnvelopeCases).toBeInstanceOf(Array)
+  })
+  it.each(corpus.outerEnvelopeCases)('$name follows Python outer-envelope acceptance', testCase => {
+    const decoders: Record<string, (value: unknown) => unknown> = {
+      LifecycleCapabilities: codec!.decodeLifecycleCapabilities,
+      AdmissionFound: codec!.decodeLifecycleAdmission,
+      AdmissionEvicted: codec!.decodeLifecycleEvicted,
+      LifecycleOperationPage: codec!.decodeLifecycleOperationPage
+    }
+
+    expect(decoders[testCase.model](testCase.value) !== null).toBe(testCase.accepted)
+  })
   // Break caught: dropped Python union, field, bound or relationship validation.
   it.each(corpus.operationCases)('$name follows Python acceptance', testCase => {
     expect(codec?.decodeLifecycleOperation).toBeTypeOf('function')

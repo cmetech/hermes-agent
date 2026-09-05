@@ -8,13 +8,16 @@ import pytest
 from pydantic import ValidationError
 
 from plugins.workflow.marketplace.lifecycle_models import (
+    LifecycleCapabilities,
     LifecycleOperation,
     PackageState,
 )
+from plugins.workflow.marketplace import lifecycle_models as wire
 from plugins.workflow.marketplace.operations import (
     AdmissionEvicted,
     AdmissionFound,
     LifecycleOperationPage,
+    ReviewTokenResponse,
 )
 
 
@@ -31,6 +34,16 @@ def test_generator_reproduces_actual_domain_projections():
     spec.loader.exec_module(module)
     generated = module.generate_corpus()
     assert generated == json.loads(CORPUS.read_text(encoding="utf-8"))
+    assert generated["domains"]["lifecycle_relative_path"]["maxLength"] == 1024
+    assert 0xFEFF not in generated["domains"]["clean_text"]["stripCodePoints"]
+    assert generated["httpErrorCodes"] == sorted(wire.LIFECYCLE_HTTP_ERROR_CODES)
+    assert generated["capabilities"]["capabilities"] == list(
+        wire.LIFECYCLE_CAPABILITIES
+    )
+    assert any(
+        case["accepted"] and "FEFF" in case["name"]
+        for case in generated["operationCases"]
+    )
     by_name = {case["name"]: case for case in generated["operationCases"]}
     selected = by_name["service grant one A"]["value"]["result"]["value"]
     assert {item["workflow_name"]: item["state"] for item in selected["workflows"]} == {
@@ -77,3 +90,56 @@ def test_checked_in_cases_follow_python_validation():
             else:
                 with pytest.raises(ValidationError, match=".*"):
                     model.model_validate_json(json.dumps(case["value"]))
+    models = {
+        model.__name__: model
+        for model in (
+            LifecycleCapabilities,
+            AdmissionFound,
+            AdmissionEvicted,
+            LifecycleOperationPage,
+        )
+    }
+    for case in corpus["outerEnvelopeCases"]:
+        model = models[case["model"]]
+        if case["accepted"]:
+            model.model_validate_json(json.dumps(case["value"]))
+        else:
+            with pytest.raises(ValidationError):
+                model.model_validate_json(json.dumps(case["value"]))
+    for case in corpus["tokenEndpointCases"]:
+        value = {
+            **case["value"],
+            "confirmation_token": case["character"] * case["length"],
+        }
+        if case["accepted"]:
+            ReviewTokenResponse.model_validate_json(json.dumps(value))
+        else:
+            with pytest.raises(ValidationError):
+                ReviewTokenResponse.model_validate_json(json.dumps(value))
+
+
+def test_generator_observes_isolated_authority_rule_changes(monkeypatch):
+    # Break caught: hard-coded domains or transport-code lists ignoring authority.
+    spec = importlib.util.spec_from_file_location(
+        "lifecycle_fixtures_rules",
+        ROOT / "scripts/generate_workflow_marketplace_lifecycle_fixtures.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    before = module.generate_types()
+    monkeypatch.setattr(
+        wire,
+        "LIFECYCLE_HTTP_ERROR_CODES",
+        wire.LIFECYCLE_HTTP_ERROR_CODES - {"marketplace_list_expired"},
+    )
+    assert module.generate_types() != before
+    before = module.generate_types()
+    original = wire.lifecycle_relative_path
+
+    def changed(value):
+        if "\u2028" in value:
+            return value
+        return original(value)
+
+    monkeypatch.setattr(wire, "lifecycle_relative_path", changed)
+    assert module.generate_types() != before

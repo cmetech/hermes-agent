@@ -7,7 +7,16 @@ import corpus from '../../../../tests/fixtures/workflow-marketplace-lifecycle-v2
 import { collectStructuredJsonResponse } from '../../electron/structured-api-response'
 
 const api = await import('./workflow-marketplace-lifecycle').catch(() => null)
-const scope = { connectionId: 'remote-a', profile: 'support', registryEpoch: corpus.capabilities.registry_epoch }
+
+const scope = {
+  connectionId: 'remote-a',
+  connectionGeneration: 'generation-a',
+  principal: 'alice',
+  profile: 'support',
+  registryEpoch: corpus.capabilities.registry_epoch
+}
+
+const received = { wallNowMs: 1000, monotonicNowMs: 50 }
 
 const expected = {
   requestId: corpus.validOperationA.request_id,
@@ -27,6 +36,153 @@ describe('exact scoped V2 lifecycle helpers', () => {
     Reflect.deleteProperty(window, 'hermesDesktop')
     vi.restoreAllMocks()
   })
+
+  it('rejects wall-clock adjustment instead of minting a future admission', () => {
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+    expect(() =>
+      api!.createLifecycleRequestId(observation, { wallNowMs: 32000, monotonicNowMs: 1050 }, scope)
+    ).toThrowError(expect.objectContaining({ code: 'marketplace_clock_revalidation_required' }))
+  })
+
+  it.each([
+    [-1, 0],
+    [0, -1],
+    [NaN, 0],
+    [0, Infinity],
+    [300001, 300000],
+    [300000, 300001],
+    [2000, 999],
+    [999, 2000]
+  ])('invalidates observations for elapsed wall=%s monotonic=%s and refuses reuse', (wall, monotonic) => {
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+    expect(() =>
+      api!.createLifecycleRequestId(
+        observation,
+        { wallNowMs: received.wallNowMs + wall, monotonicNowMs: received.monotonicNowMs + monotonic },
+        scope
+      )
+    ).toThrowError(expect.objectContaining({ code: 'marketplace_clock_revalidation_required' }))
+    expect(() => api!.createLifecycleRequestId(observation, received, scope)).toThrowError(
+      expect.objectContaining({ code: 'marketplace_clock_revalidation_required' })
+    )
+  })
+
+  it.each(['connectionId', 'connectionGeneration', 'profile', 'principal', 'registryEpoch'] as const)(
+    'refuses exact clock scope change in %s',
+    field => {
+      const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+      expect(() => api!.createLifecycleRequestId(observation, received, { ...scope, [field]: 'other' })).toThrowError(
+        expect.objectContaining({ code: 'marketplace_clock_revalidation_required' })
+      )
+      expect(() => api!.createLifecycleRequestId(observation, received, scope)).toThrow()
+    }
+  )
+
+  it('rejects copied or deserialized observations across application restart', () => {
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+
+    for (const copy of [{ ...observation }, JSON.parse(JSON.stringify(observation))]) {
+      expect(() => api!.createLifecycleRequestId(copy, received, scope)).toThrowError(
+        expect.objectContaining({ code: 'marketplace_clock_revalidation_required' })
+      )
+    }
+  })
+
+  it('refuses admission before POST when its observation requires reprobe', async () => {
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+    const intent = { ...expected, body: {} }
+    await expect(
+      api!.startLifecycleOperation(intent, scope, observation, { wallNowMs: 32000, monotonicNowMs: 1050 })
+    ).rejects.toMatchObject({ code: 'marketplace_clock_revalidation_required' })
+    expect(transport.mock.calls).toEqual([])
+  })
+  it('discards the observation on disconnect and on cryptographic failure', () => {
+    const disconnected = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+    api!.discardLifecycleClockObservation(disconnected)
+    expect(() => api!.createLifecycleRequestId(disconnected, received, scope)).toThrowError(
+      expect.objectContaining({ code: 'marketplace_clock_revalidation_required' })
+    )
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(() => {
+      throw new Error('private-crypto-failure')
+    })
+    expect(() => api!.createLifecycleRequestId(observation, received, scope)).toThrowError(
+      expect.objectContaining({ code: 'marketplace_clock_revalidation_required' })
+    )
+    vi.restoreAllMocks()
+    expect(() => api!.createLifecycleRequestId(observation, received, scope)).toThrow()
+  })
+
+  it.each([
+    [300000, 300000],
+    [1000, 0],
+    [0, 1000]
+  ])('accepts exact clock boundaries wall=%s monotonic=%s', (wall, monotonic) => {
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+
+    const id = api!.createLifecycleRequestId(
+      observation,
+      { wallNowMs: received.wallNowMs + wall, monotonicNowMs: received.monotonicNowMs + monotonic },
+      scope
+    )
+
+    expect(id.split('_')[2]).toBe(String(1788609600000 + monotonic))
+  })
+
+  it.each(corpus.httpErrorCodes)('retains only approved backend code %s with a bounded HTTP status', async code => {
+    for (const status of [400, 401, 403, 404, 409, 410, 422, 429, 500, 503]) {
+      transport.mockResolvedValue({ ok: false, status, body: { detail: { code } } })
+      await expect(api!.getLifecycleOperation(corpus.operationAId, scope)).rejects.toMatchObject({ code, status })
+    }
+  })
+
+  it('normalizes malformed raw HTTP errors without retaining secret material', async () => {
+    const secret = 'ephemeral_secret_error_only'
+
+    for (const body of [
+      JSON.stringify({ detail: { code: secret } }),
+      JSON.stringify({ detail: { code: { nested: secret } } }),
+      JSON.stringify({ detail: { code: 'marketplace_operation_not_found', extra: secret } }),
+      JSON.stringify({ detail: { code: 'marketplace_network_error' } }),
+      '{"detail":{"code":"marketplace_operation_not_found","code":"' + secret + '"}}',
+      '<html>' + secret + '</html>',
+      secret + ' '.repeat(16 * 1024 * 1024 + 64 * 1024)
+    ]) {
+      transport.mockImplementation(
+        () =>
+          new Promise((resolve, reject) => {
+            const stream = Object.assign(new EventEmitter(), {
+              statusCode: 409,
+              headers: { 'content-type': 'application/json' }
+            })
+
+            collectStructuredJsonResponse(
+              stream,
+              { url: 'https://backend.example/api/plugins/workflow/marketplace/lifecycle/v2/operations' },
+              resolve,
+              reject
+            )
+            stream.emit('data', Buffer.from(body))
+            stream.emit('end')
+          })
+      )
+      const error = await api!.getLifecycleOperation(corpus.operationAId, scope).catch(value => value)
+      expect(error).toMatchObject({ code: 'marketplace_request_failed' })
+      expect(JSON.stringify(error)).not.toContain(secret)
+      expect(String(error)).not.toContain(secret)
+      expect(Object.hasOwn(error, 'cause')).toBe(false)
+    }
+  })
+
+  it.each(['marketplace_unknown_backend_value', 'ephemeral_token_shaped_backend_value'])(
+    'never retains unapproved backend code %s',
+    async secret => {
+      transport.mockResolvedValue({ ok: false, status: 409, body: { detail: { code: secret } } })
+      const error = await api!.getLifecycleOperation(corpus.operationAId, scope).catch(value => value)
+      expect(JSON.stringify(error)).not.toContain(secret)
+      expect(error).toMatchObject({ code: 'marketplace_request_failed', status: 409 })
+    }
+  )
 
   // Break caught: a valid neighbor response being adopted as the requested watch.
   it.each(['getLifecycleOperation', 'cancelLifecycleOperation'] as const)(
@@ -76,11 +232,37 @@ describe('exact scoped V2 lifecycle helpers', () => {
 
   it('generates server-adjusted request identities using cryptographic randomness', () => {
     expect(api?.createLifecycleRequestId).toBeTypeOf('function')
-    const first = api!.createLifecycleRequestId(corpus.capabilities, 1000, 1500)
-    const second = api!.createLifecycleRequestId(corpus.capabilities, 1000, 1500)
+    const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
+    const now = { wallNowMs: 1500, monotonicNowMs: 550.75 }
+    const first = api!.createLifecycleRequestId(observation, now, scope)
+    const second = api!.createLifecycleRequestId(observation, now, scope)
     expect(first).toMatch(/^wmreq_e{32}_1788609600500_[0-9a-f]{32}$/)
     expect(first).not.toBe(second)
+    expect(first).toHaveLength(85)
   })
+
+  it('floors only after adding monotonic elapsed to sub-millisecond server time', () => {
+    const observation = api!.observeLifecycleClock(
+      { ...corpus.capabilities, server_time: '2026-09-05T12:00:00.000999Z' },
+      scope,
+      received
+    )
+
+    const id = api!.createLifecycleRequestId(observation, { wallNowMs: 1000.5, monotonicNowMs: 50.5 }, scope)
+    expect(id.split('_')[2]).toBe('1788609600001')
+  })
+
+  it.each(['getLifecycleOperation', 'cancelLifecycleOperation'] as const)(
+    '%s preserves an authoritative U+FEFF repository projection',
+    async method => {
+      const value = corpus.operationCases.find(
+        item => item.name === 'repository FEFF https://fixtures.example/public.git'
+      )!.value
+
+      transport.mockResolvedValue({ ok: true, value })
+      expect(await api![method](value.id, scope)).toEqual(value)
+    }
+  )
 
   it.each(
     corpus.operationCases.filter(
@@ -140,7 +322,14 @@ describe('exact scoped V2 lifecycle helpers', () => {
       body: bodies[value.kind]
     }
 
-    expect(await api!.startLifecycleOperation(intent, scope)).toEqual(value)
+    expect(
+      await api!.startLifecycleOperation(
+        intent,
+        scope,
+        api!.observeLifecycleClock(corpus.capabilities, scope, received),
+        received
+      )
+    ).toEqual(value)
     expect(transport.mock.calls[0][0]).toEqual({
       connectionId: 'remote-a',
       profile: 'support',
@@ -240,6 +429,25 @@ describe('exact scoped V2 lifecycle helpers', () => {
     }
   })
 
+  it.each(corpus.tokenEndpointCases)('$name follows Python only inside the explicit token endpoint', async testCase => {
+    const prepared = corpus.operationCases.find(item => item.name === 'service review one A')!.value
+    transport.mockResolvedValue({
+      ok: true,
+      value: { ...testCase.value, confirmation_token: testCase.character.repeat(testCase.length) }
+    })
+
+    if (testCase.accepted) {
+      expect(await api!.getLifecycleReviewToken(prepared, scope)).toEqual({
+        ...testCase.value,
+        confirmation_token: testCase.character.repeat(testCase.length)
+      })
+    } else {
+      await expect(api!.getLifecycleReviewToken(prepared, scope)).rejects.toMatchObject({
+        code: 'marketplace_invalid_response'
+      })
+    }
+  })
+
   it.each(['service install confirm', 'service update confirm', 'service remove confirm', 'service grant one A'])(
     'confirms %s with exact preparation metadata beside the ephemeral token',
     async name => {
@@ -266,7 +474,9 @@ describe('exact scoped V2 lifecycle helpers', () => {
       expect(
         await api!.startLifecycleOperation(
           { requestId: value.request_id, kind: value.kind, subject: value.subject, selection: value.selection, body },
-          scope
+          scope,
+          api!.observeLifecycleClock(corpus.capabilities, scope, received),
+          received
         )
       ).toEqual(value)
       expect(transport.mock.calls[0][0].body).toEqual({ request_id: value.request_id, body })

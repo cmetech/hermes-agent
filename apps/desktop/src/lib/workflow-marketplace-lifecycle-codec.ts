@@ -1,13 +1,10 @@
 import * as wire from '@/types/workflow-marketplace-lifecycle'
 
-import {
-  isWorkflowMarketplaceInstallIdentifier,
-  isWorkflowMarketplaceRepositoryUrl,
-  isWorkflowMarketplaceSourceRequestUrl
-} from './workflow-marketplace-codec'
+import { isWorkflowMarketplaceInstallIdentifier } from './workflow-marketplace-codec'
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 interface Schema {
+  'x-hermes-domain'?: string
   $ref?: string
   additionalProperties?: boolean
   anyOf?: readonly Schema[]
@@ -37,10 +34,7 @@ const EPOCH = /^[0-9a-f]{32}$/
 const SOURCE_KEY = /^[a-z0-9](?:[a-z0-9_-]{0,126}[a-z0-9])?$/
 const PACKAGE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
 
-const PYTHON_SPACE =
-  // Python str.strip includes these controls and excludes U+FEFF.
-  // eslint-disable-next-line no-control-regex
-  /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]$/u
+const pythonWhitespace = new Set<number>(wire.lifecycleDomains.clean_text.stripCodePoints)
 
 function requireValid(condition: unknown): asserts condition {
   if (!condition) {
@@ -49,7 +43,17 @@ function requireValid(condition: unknown): asserts condition {
 }
 
 function clean(value: string): boolean {
-  return !PYTHON_SPACE.test(value) && !value.includes('\0')
+  return (
+    !pythonWhitespace.has(value.codePointAt(0)!) &&
+    !pythonWhitespace.has([...value].at(-1)?.codePointAt(0)!) &&
+    !value.includes('\0')
+  )
+}
+
+function casefold(value: string): string {
+  return [...value]
+    .map(character => wire.lifecycleCaseFold[character as keyof typeof wire.lifecycleCaseFold] ?? character)
+    .join('')
 }
 
 export function isLifecycleProfile(value: unknown): value is string {
@@ -58,15 +62,21 @@ export function isLifecycleProfile(value: unknown): value is string {
 
 function canonicalPath(value: string): boolean {
   return (
-    value.length > 0 &&
+    [...value].length >= wire.lifecycleDomains.lifecycle_relative_path.minLength &&
+    [...value].length <= wire.lifecycleDomains.lifecycle_relative_path.maxLength &&
+    [...value].every(
+      char =>
+        !(wire.lifecycleDomains.lifecycle_relative_path.forbiddenCodePoints as readonly number[]).includes(
+          char.codePointAt(0)!
+        )
+    ) &&
     value.normalize('NFC') === value &&
     !value.includes('\\') &&
     !value.includes('\0') &&
     value
       .split('/')
       .every(
-        part =>
-          part !== '' && part !== '.' && part !== '..' && part.toLowerCase() !== '.git' && !/^[A-Za-z]:/.test(part)
+        part => part !== '' && part !== '.' && part !== '..' && casefold(part) !== '.git' && !/^[A-Za-z]:/.test(part)
       )
   )
 }
@@ -76,12 +86,175 @@ function repositoryIdentity(value: unknown): boolean {
     return false
   }
 
-  // V2 reuses the backend Git identity domain, which includes local file URLs,
-  // shorthand and HTTP. Reuse the credential checks in the request validator;
-  // HTTP uses the same authority/path rules as HTTPS. Preserve the exact value.
-  const validationValue = value.startsWith('http://') ? 'https://' + value.slice(7) : value
+  const facts = wire.lifecycleDomains.repository_identity
 
-  return isWorkflowMarketplaceRepositoryUrl(value) || isWorkflowMarketplaceSourceRequestUrl(validationValue)
+  const letter = (character: string | undefined) => !!character && /^[A-Za-z]$/.test(character)
+  const upper = (character: string | undefined) => !!character && /^[A-Z]$/.test(character)
+
+  const wordEnd = (key: string, end: number, plural = true): boolean =>
+    end >= key.length ||
+    !letter(key[end]) ||
+    (upper(key[end]) && !upper(key[end - 1])) ||
+    (plural && /[sS]/.test(key[end]) && wordEnd(key, end + 1, false))
+
+  const secretKeyword = (key: string): boolean =>
+    [...key.matchAll(new RegExp(facts.secretKeywordPattern, 'gi'))].some(match => {
+      const start = match.index!,
+        before = key[start - 1],
+        current = key[start]
+
+      return (
+        (start === 0 ||
+          !letter(before) ||
+          (upper(current) &&
+            (!upper(before) || (upper(before) && letter(key[start + 1]) && !upper(key[start + 1]))))) &&
+        wordEnd(key, start + match[0].length)
+      )
+    })
+
+  for (const rule of facts.redactionFields) {
+    if (rule.skipUrls && value.includes('://')) {
+      continue
+    }
+
+    for (const match of value.matchAll(new RegExp(rule.pattern, rule.flags + 'g'))) {
+      const token = rule.kind === 'json' || rule.kind === 'header' ? match[2] : match[3]
+
+      if (['assignment', 'yaml', 'json'].includes(rule.kind) && new RegExp(facts.programLookupPattern).test(token)) {
+        continue
+      }
+
+      if (['assignment', 'yaml'].includes(rule.kind) && !secretKeyword(match[1])) {
+        continue
+      }
+
+      const masked =
+        [...token].length < 18 ? '***' : [...token].slice(0, 6).join('') + '...' + [...token].slice(-4).join('')
+
+      const replacement =
+        rule.kind === 'assignment'
+          ? match[1] + '=' + match[2] + masked + match[2]
+          : rule.kind === 'json'
+            ? match[1] + ': "' + masked + '"'
+            : rule.kind === 'header'
+              ? match[1] + masked
+              : match[1] + (match[2] ?? '') + masked
+
+      if (replacement !== match[0]) {
+        return false
+      }
+    }
+  }
+
+  if (
+    facts.credentialPrefixes.some(
+      pattern =>
+        new RegExp(pattern).test(value) ||
+        new RegExp(pattern).test(value.replace(new RegExp(facts.credentialSplitControls, 'g'), ''))
+    ) ||
+    facts.credentialRedactionPatterns.some(({ pattern, flags }) => new RegExp(pattern, flags).test(value)) ||
+    new RegExp(facts.credentialAuthority).test(value)
+  ) {
+    return false
+  }
+
+  for (const match of value.matchAll(/[?#&;]([A-Za-z0-9_.~+%-]+)=/g)) {
+    let name = match[1]
+
+    for (let pass = 0; pass < 3; pass++) {
+      try {
+        name = decodeURIComponent(name.replaceAll('+', ' '))
+      } catch {
+        break
+      }
+    }
+
+    const words =
+      casefold(name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')).match(
+        /[a-z0-9]+/g
+      ) ?? []
+
+    if (words.some(word => (facts.credentialWords as readonly string[]).includes(word))) {
+      return false
+    }
+
+    const compact = casefold(name).replace(/[^a-z0-9]+/g, '')
+
+    for (const suffix of facts.credentialSuffixes) {
+      if (!compact.endsWith(suffix)) {
+        continue
+      }
+
+      const prefix = compact.slice(0, -suffix.length),
+        reachable = new Set([0])
+
+      for (let index = 0; index < prefix.length; index++) {
+        if (reachable.has(index)) {
+          for (const qualifier of facts.credentialQualifiers) {
+            if (prefix.startsWith(qualifier, index)) {
+              reachable.add(index + qualifier.length)
+            }
+          }
+        }
+      }
+
+      if (prefix && reachable.has(prefix.length)) {
+        return false
+      }
+    }
+  }
+
+  // Python urlsplit does not treat U+FEFF as whitespace. Preserve the original
+  // string: an unrecognized prefix is evaluated by the actual shorthand rule.
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(value)?.[1].toLowerCase()
+  const supported = scheme !== undefined && ['http', 'https', 'ssh', 'file'].includes(scheme)
+
+  if (!supported && value.startsWith('git@')) {
+    if (!/^git@[^@\s/:]+:.+$/.test(value)) {
+      return false
+    }
+  } else if (!supported && (scheme || value.includes('@'))) {
+    return false
+  }
+
+  for (const match of value.matchAll(/(?:https?|ssh|file):\/\/[^<>"']+/gi)) {
+    const characters = [...match[0]]
+    const end = characters.findIndex(char => pythonWhitespace.has(char.codePointAt(0)!))
+    const url = (end < 0 ? characters : characters.slice(0, end)).join('')
+    const authority = url.split('://')[1].split(/[/?#]/)[0]
+
+    // Match urlsplit's netloc normalization guard without normalizing the value.
+    if (/[/?#@:]/.test(authority.replace(/[@:#?]/g, '').normalize('NFKC'))) {
+      return false
+    }
+
+    if (authority.includes('[') || authority.includes(']')) {
+      try {
+        new URL(url)
+      } catch {
+        return false
+      }
+    }
+
+    const userinfo = authority.includes('@') ? authority.slice(0, authority.lastIndexOf('@')) : null
+
+    if (userinfo !== null && (!url.toLowerCase().startsWith('ssh:') || userinfo.includes(':'))) {
+      return false
+    }
+  }
+
+  if ((scheme === 'ssh' || scheme === 'file') && value.split('#')[0].includes('?')) {
+    return false
+  }
+
+  if (value.startsWith('git@') && value.split('#')[0].includes('?')) {
+    return false
+  }
+
+  return (
+    ['http://', 'https://', 'ssh://', 'file://', 'git@'].some(prefix => value.startsWith(prefix)) ||
+    value.split('/').filter(Boolean).length >= 2
+  )
 }
 
 /** Python canonical UTC preserves exactly six fractional digits when nonzero. */
@@ -278,6 +451,10 @@ function validate(schema: Schema, value: Json): Json {
     requireValid(schema.maxLength === undefined || length <= schema.maxLength)
     // Python's ASCII patterns use a strict end; JS $ otherwise admits a final newline.
     requireValid(!schema.pattern || new RegExp(schema.pattern.replace(/\$$/, '$(?![\\s\\S])'), 'u').test(value))
+
+    if (schema['x-hermes-domain'] === 'lifecycle_relative_path') {
+      requireValid(canonicalPath(value))
+    }
   }
 
   if (schema.type === 'array') {
@@ -820,7 +997,13 @@ export function decodeLifecycleSelection(value: unknown): wire.AllTrustSelection
 export function decodeLifecycleCapabilities(value: unknown): wire.LifecycleCapabilities | null {
   const decoded = decode<wire.LifecycleCapabilities>('_Capabilities', value)
 
-  return decoded && clean(decoded.profile) && isLifecycleTimestamp(decoded.server_time) && unique(decoded.capabilities)
+  return decoded &&
+    clean(decoded.profile) &&
+    isLifecycleTimestamp(decoded.server_time) &&
+    sameLifecycleValue(
+      decoded.capabilities,
+      wire.lifecycleCapabilityOrder.filter(item => decoded.capabilities.includes(item))
+    )
     ? decoded
     : null
 }
@@ -832,6 +1015,8 @@ export function decodeLifecycleOperationPage(value: unknown): wire.LifecycleOper
     !decoded ||
     decoded.items.length > 100 ||
     !unique(decoded.items.map(item => item.id)) ||
+    !unique(decoded.items.map(item => item.request_id)) ||
+    (!decoded.complete && decoded.items.length === 0) ||
     decoded.complete !== (decoded.next_cursor === null)
   ) {
     return null

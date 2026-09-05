@@ -12,9 +12,11 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import time
+import unicodedata
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -22,7 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests/plugins/workflow"))
 
-from pydantic import ValidationError  # noqa: E402
+from pydantic import TypeAdapter, ValidationError  # noqa: E402
+from hermes_cli import git_source  # noqa: E402
+from agent import redact  # noqa: E402
 from plugins.workflow.marketplace import lifecycle_models as wire  # noqa: E402
 from plugins.workflow.marketplace.api import _sanitize_result, _legacy_completion  # noqa: E402
 from plugins.workflow.marketplace.lifecycle_api import (  # noqa: E402
@@ -727,33 +731,289 @@ def generate_corpus():
                 wire.LifecycleOperation,
             )
         )
+    capabilities = _Capabilities(
+        schema_version=2,
+        profile="support",
+        registry_epoch=EPOCH,
+        server_time=UTC,
+        capabilities=list(wire.LIFECYCLE_CAPABILITIES),
+    ).model_dump(mode="json")
+    for prefix in ("\ufeff", ""):
+        for repository in (
+            "https://fixtures.example/public.git",
+            "http://fixtures.example/public.git",
+            "file:///fixture-example/public.git",
+            "owner/public",
+            "https://fixtures.example/a/../public.git",
+            "https://fixtures.example/public.git#path",
+            "git@fixtures.example:public.git",
+            "ssh://git@fixtures.example/public.git",
+            "ssh://developer@fixtures.example/public.git",
+            "https://fixtures.example/OPENAI_API_KEY=fixture-example",
+            "https://fixtures.example/Authorization: Basic fixture-example",
+            "https://fixtures.example/SECRETARY=fixture-example",
+            "https://fixtures.example/KEY=***",
+            "https://fixtures.example]/public.git",
+            "https://fixtures.example\uff1aport/public.git",
+            "https://fixtures.example/public.git?token=",
+            "ftp://fixtures.example/public.git",
+        ):
+            value = deepcopy(installed_case)
+
+            def replace_repository(obj):
+                if isinstance(obj, dict):
+                    for key, item in obj.items():
+                        if key == "repository_url":
+                            obj[key] = prefix + repository
+                        else:
+                            replace_repository(item)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        replace_repository(item)
+
+            replace_repository(value)
+            operations.append(
+                _case(
+                    f"repository {'FEFF' if prefix else 'plain'} {repository}",
+                    value,
+                    wire.LifecycleOperation,
+                )
+            )
+    for code in list(range(32)) + list(range(127, 160)) + [0x2028, 0x2029, 0xFEFF]:
+        value = deepcopy(installed_case)
+        value["result"]["value"]["package_path"] = "packages/a" + chr(code) + "b"
+        value["outcome"]["package_state"]["installed"]["package_path"] = value[
+            "result"
+        ]["value"]["package_path"]
+        operations.append(
+            _case(f"path code point {code}", value, wire.LifecycleOperation)
+        )
+    preparation = next(
+        case["value"] for case in genuine if case["name"] == "service review one A"
+    )
+    token_metadata = {
+        "operation_id": preparation["id"],
+        "request_id": preparation["request_id"],
+        "subject": preparation["subject"],
+        "selection": preparation["selection"],
+        "review_digest": preparation["result"]["value"]["review_digest"],
+        "expires_at": preparation["result"]["value"]["expires_at"],
+    }
+    token_cases = []
+
+    def token_case(name, metadata, length=32, character="a"):
+        # Endpoint-only material is constructed transiently for the Python oracle;
+        # artifacts contain only a recipe and public preparation metadata.
+        case = _case(
+            name,
+            {**metadata, "confirmation_token": character * length},
+            ReviewTokenResponse,
+        )
+        token_cases.append({
+            "name": name,
+            "value": metadata,
+            "length": length,
+            "character": character,
+            "accepted": case["accepted"],
+        })
+
+    for length in (0, 31, 32, 256, 257):
+        token_case(f"token length {length}", token_metadata, length)
+    token_case("token alphabet", token_metadata, character="!")
+    for field in token_metadata:
+        metadata = deepcopy(token_metadata)
+        del metadata[field]
+        token_case("token missing " + field, metadata)
+        token_case("token malformed " + field, {**token_metadata, field: False})
     return {
         **envelopes,
+        "domains": generate_domains(),
+        "httpErrorCodes": sorted(wire.LIFECYCLE_HTTP_ERROR_CODES),
+        "outerEnvelopeCases": outer_cases(capabilities, envelopes),
+        "tokenEndpointCases": token_cases,
         "operationCases": operations,
         "packageStateCases": states,
         "validOperationB": genuine[1]["value"],
         "operationAId": genuine[0]["value"]["id"],
         "validOperationA": genuine[0]["value"],
-        "capabilities": _Capabilities(
-            profile="support",
-            registry_epoch=EPOCH,
-            server_time=UTC,
-            capabilities=[
-                "operations",
-                "admission_replay",
-                "package_state",
-                "transactions",
-                "updates",
-                "trust",
-                "sources",
-                "inspect",
-            ],
-        ).model_dump(mode="json"),
+        "capabilities": capabilities,
     }
 
 
 def render(value):
     return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+def generate_domains():
+    path_schema = TypeAdapter(wire.LifecycleRelativePath).json_schema()
+    forbidden = []
+    for code in list(range(160)) + [0x2028, 0x2029]:
+        try:
+            wire.lifecycle_relative_path("a" + chr(code) + "b")
+        except ValueError:
+            forbidden.append(code)
+    return {
+        "clean_text": {
+            "stripCodePoints": [
+                code for code in range(sys.maxunicode + 1) if chr(code).isspace()
+            ]
+        },
+        "casefold": {"unicodeVersion": unicodedata.unidata_version},
+        "lifecycle_relative_path": {
+            "minLength": path_schema["minLength"],
+            "maxLength": path_schema["maxLength"],
+            "forbiddenCodePoints": forbidden,
+            "normalization": "NFC",
+        },
+        "repository_identity": {
+            "authority": "validate_credential_free_git_source",
+            "credentialWords": sorted(git_source._CREDENTIAL_PARAMETER_WORDS),
+            "credentialQualifiers": list(git_source._CREDENTIAL_COMPOUND_QUALIFIERS),
+            "credentialSuffixes": list(git_source._CREDENTIAL_COMPOUND_SUFFIXES),
+            "credentialPrefixes": [redact._PREFIX_RE.pattern],
+            "credentialSplitControls": redact._CONTROL_CHARS_RE.pattern,
+            "credentialRedactionPatterns": [
+                {
+                    "pattern": pattern.pattern,
+                    "flags": "i" if pattern.flags & re.IGNORECASE else "",
+                }
+                for pattern in (
+                    redact._URL_BARE_TOKEN_RE,
+                    redact._JWT_RE,
+                    redact._TELEGRAM_RE,
+                    redact._PRIVATE_KEY_RE,
+                    redact._DB_CONNSTR_RE,
+                    redact._SIGNAL_PHONE_RE,
+                )
+            ],
+            "credentialAuthority": git_source._USER_PASSWORD_AUTHORITY_RE.pattern,
+            "secretKeywordPattern": redact._KEY_KEYWORD_RE.pattern,
+            "programLookupPattern": redact._ENV_LOOKUP_VALUE_RE.pattern,
+            "redactionFields": [
+                {
+                    "pattern": pattern.pattern.replace("++", "+").replace("*+", "*"),
+                    "flags": ("i" if pattern.flags & re.IGNORECASE else "")
+                    + ("m" if pattern.flags & re.MULTILINE else ""),
+                    "kind": kind,
+                    "skipUrls": skip_urls,
+                }
+                for pattern, kind, skip_urls in (
+                    (redact._ENV_ASSIGN_RE, "assignment", False),
+                    (redact._ENV_ASSIGN_LOWER_RE, "assignment", True),
+                    (redact._CFG_DOTTED_RE, "assignment", True),
+                    (redact._CFG_ANCHORED_RE, "assignment", True),
+                    (redact._YAML_ASSIGN_RE, "yaml", True),
+                    (redact._JSON_FIELD_RE, "json", False),
+                    (redact._AUTH_HEADER_RE, "authorization", False),
+                    (redact._SECRET_HEADER_RE, "header", False),
+                )
+            ],
+        },
+    }
+
+
+def outer_cases(capabilities, envelopes):
+    cases = []
+
+    def add(name, value, model):
+        cases.append({**_case(name, value, model), "model": model.__name__})
+
+    for model, original in (
+        (wire.LifecycleCapabilities, capabilities),
+        (AdmissionFound, envelopes["admissionFound"]),
+        (AdmissionEvicted, envelopes["admissionEvicted"]),
+        (LifecycleOperationPage, envelopes["operationPage"]),
+    ):
+        add(model.__name__ + " valid", original, model)
+        for field in original:
+            value = deepcopy(original)
+            del value[field]
+            add(model.__name__ + " missing " + field, value, model)
+            value = deepcopy(original)
+            value[field] = 1 if isinstance(original[field], bool) else False
+            add(model.__name__ + " wrong scalar " + field, value, model)
+        add(model.__name__ + " extra", {**original, "unexpected": True}, model)
+    for values in (
+        [],
+        ["operations", "trust"],
+        ["trust", "operations"],
+        ["trust", "trust"],
+        ["unknown"],
+    ):
+        add(
+            "capability sequence " + repr(values),
+            {**capabilities, "capabilities": values},
+            wire.LifecycleCapabilities,
+        )
+    for field, replacements in {
+        "profile": ["\ufeffsupport", " support", "x" * 257, ""],
+        "registry_epoch": ["e" * 31, "E" * 32],
+        "server_time": ["2026-09-05T12:00:00.000000Z", "2026-02-30T12:00:00Z"],
+    }.items():
+        for index, value in enumerate(replacements):
+            add(
+                f"capabilities {field} {index}",
+                {**capabilities, field: value},
+                wire.LifecycleCapabilities,
+            )
+    original = envelopes["admissionEvicted"]
+    for field, value in {
+        "registry_epoch": "d" * 32,
+        "kind": "trust_prepare",
+        "selection": {"type": "all"},
+        "subject": {"type": "all_packages"},
+        "profile": "\ufeffsupport",
+    }.items():
+        add(
+            "evicted correlation " + field, {**original, field: value}, AdmissionEvicted
+        )
+    item = envelopes["admissionFound"]["operation"]
+    for size in (0, 1, 100, 101):
+        items = [
+            {
+                **item,
+                "id": f"wmop_aaaaaaaaaaaa_{index:032x}",
+                "request_id": f"wmreq_{EPOCH}_1788609600000_{index:032x}",
+            }
+            for index in range(size)
+        ]
+        add(
+            f"page size {size}",
+            {"items": items, "complete": True, "next_cursor": None},
+            LifecycleOperationPage,
+        )
+    for name, items, complete, cursor in (
+        ("incomplete empty", [], False, "e" * 32),
+        ("duplicate operation", [item, item], True, None),
+        (
+            "duplicate request",
+            [item, {**item, "id": "wmop_aaaaaaaaaaaa_" + "a" * 32}],
+            True,
+            None,
+        ),
+        (
+            "mixed profile",
+            [
+                item,
+                {
+                    **item,
+                    "id": "wmop_aaaaaaaaaaaa_" + "a" * 32,
+                    "request_id": f"wmreq_{EPOCH}_1788609600000_" + "a" * 32,
+                    "profile": "other",
+                },
+            ],
+            True,
+            None,
+        ),
+        ("complete cursor", [item], True, "e" * 32),
+        ("invalid cursor", [item], False, "E" * 32),
+    ):
+        add(
+            "page " + name,
+            {"items": items, "complete": complete, "next_cursor": cursor},
+            LifecycleOperationPage,
+        )
+    return cases
 
 
 def generate_types():
@@ -831,6 +1091,24 @@ def generate_types():
         type_name = "LifecycleOperationWire" if name == "LifecycleOperation" else name
         lines.append(f"export type {type_name} = {ts(schema)}\n")
     lines.append("export type LifecycleCapabilities = _Capabilities\n")
+    lines.append(
+        "export const lifecycleDomains = "
+        + json.dumps(generate_domains(), ensure_ascii=True, sort_keys=True)
+        + " as const\n"
+    )
+    lines.append(
+        "export const lifecycleHttpErrorCodes = "
+        + json.dumps(sorted(wire.LIFECYCLE_HTTP_ERROR_CODES))
+        + " as const\n"
+    )
+    lines.append(
+        "export type LifecycleHttpErrorCode = typeof lifecycleHttpErrorCodes[number]\n"
+    )
+    lines.append(
+        "export const lifecycleCapabilityOrder = "
+        + json.dumps(list(wire.LIFECYCLE_CAPABILITIES))
+        + " as const\n"
+    )
     lines.append(
         "export const lifecycleSchemas = "
         + json.dumps(structural(schemas), ensure_ascii=False, sort_keys=True)
