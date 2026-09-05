@@ -447,6 +447,10 @@ def reference_scanner_contract(
                 "previous_outputs": True,
                 "reference_operands": "lhs-and-equality-reference-rhs",
             },
+            "body-when": {
+                "syntax": "condition-v6",
+                "scoped_scan": ["previous-text", "equal-length-mask", "current-text"],
+            },
             "bash": {
                 "classifier": "bounded-authored-source-shell-state-classifier",
                 "not_a_general_parser": True,
@@ -455,7 +459,7 @@ def reference_scanner_contract(
                     "lexical-admission",
                     "strict-reference-parsing",
                 ],
-                "no_candidate_validation": "shell-state-validation-still-runs",
+                "no_candidate_validation": "checks-run;final-state-needs-candidates",
                 "quote_contexts": ["unquoted", "single", "double"],
                 "nesting_limit": 64,
                 "state_families": [
@@ -491,10 +495,9 @@ def reference_scanner_contract(
                 "heredocs": {
                     "delimiter_references": "rejected",
                     "body_references": "rejected-even-when-delimiter-quoted",
-                    "quoted_body_is_not_generally_literal": True,
                     "multiple": "processed-in-authored-order",
                     "tab_stripped": "supported",
-                    "missing_terminator": "rejected",
+                    "missing_terminator": "newline-consumption:reject;EOF:needs-candidates",
                 },
                 "malformed_precedence": {
                     "literal_candidate": "ignored-before-strict-grammar",

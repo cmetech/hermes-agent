@@ -104,6 +104,49 @@ def test_observation_boundary_retains_lazy_prefix_and_eager_atomicity(tmp_path):
                                          'code': 'output_reference_path_unsupported'}}}
 
 
+def test_authenticated_observations_preserve_distinct_scoped_semantic_codes(tmp_path):
+    case = {
+        'api': 'validate_authenticated_resource_references', 'normalizer_version': 6,
+        'input': {
+            'definition_yaml': (
+                'name: scoped-auth\ndescription: Scoped authenticated references\nnodes:\n'
+                '  - id: g\n    loop_group:\n      until: done\n      max_iterations: 2\n'
+                '      nodes:\n        - id: a\n          prompt: Produce\n'
+                '        - id: b\n          command: consume\n'
+            ),
+            'companion_yaml': 'language_compatibility: archon-2026-07\n',
+            'command_bodies': {}, 'named_script_bodies': {},
+        },
+    }
+    observations = []
+    for body, semantic in (
+        ('$a.output', 'scoped-reference-missing-dependency'),
+        ('$LOOP_PREV.missing.output', 'scoped-reference-unknown-producer'),
+    ):
+        case['input']['command_bodies'] = {'g/b': body}
+        actual = observe_scanner_case(case, tmp_path)
+        assert actual == {'value': None, 'error': {
+            'class': 'WorkflowValidationError', 'issues': [{
+                'code': 'loop_group_scope_invalid',
+                'path': 'nodes[0].loop_group.nodes[1].command',
+                'semantic_code': semantic,
+            }],
+        }}
+        observations.append(actual)
+    assert observations[0] != observations[1]
+
+
+def test_literal_corpus_covers_scoped_auth_and_candidate_guarded_eof():
+    cases = {case['id']: case for case in json.loads(RESOURCE.read_text())['scanner_cases']}
+    assert {
+        'resource.body-command-current-missing',
+        'resource.body-command-previous-unknown',
+        'bash.heredoc-eof-no-candidate', 'bash.heredoc-eof-live',
+        'bash.quote-eof-no-candidate', 'bash.quote-eof-live',
+        'bash.heredoc-missing',
+    } <= set(cases)
+
+
 def test_observation_boundary_predicate_and_quote_context(tmp_path):
     assert observe_scanner_case({
         'api': 'contains_output_reference', 'normalizer_version': 6,
@@ -171,8 +214,8 @@ def test_supported_python_unicode_observation_matrix(tmp_path):
         created = subprocess.run([uv, 'venv', '--offline', '--python', found.stdout.strip(), str(venv)], capture_output=True, text=True)
         assert created.returncode == 0, f'Cannot provision Unicode matrix Python {version}: {created.stderr}'
         python = venv / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-        installed = subprocess.run([uv, 'pip', 'install', '--offline', '--python', str(python), 'pyyaml', 'jsonschema'], capture_output=True, text=True)
-        assert installed.returncode == 0, f'Unicode matrix prerequisite missing: cached pyyaml/jsonschema for {version}: {installed.stderr}'
+        installed = subprocess.run([uv, 'pip', 'install', '--offline', '--python', str(python), 'pyyaml', 'jsonschema', 'psutil'], capture_output=True, text=True)
+        assert installed.returncode == 0, f'Unicode matrix prerequisite missing: cached pyyaml/jsonschema/psutil for {version}: {installed.stderr}'
         observed = subprocess.run([str(python), str(helper)], cwd=root,
             env={**os.environ, 'PYTHONPATH': str(root)}, capture_output=True, text=True)
         assert observed.returncode == 0, f'Unicode matrix observation {version} failed:\n{observed.stdout}\n{observed.stderr}'

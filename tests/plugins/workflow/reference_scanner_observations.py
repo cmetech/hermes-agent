@@ -68,7 +68,12 @@ def _error(exc: Exception) -> dict[str, object]:
         if value is not None:
             result[name] = list(value) if isinstance(value, tuple) else value
     if isinstance(exc, WorkflowValidationError):
-        result['issues'] = [{'code': issue.code, 'path': issue.path} for issue in exc.issues]
+        result['issues'] = []
+        for issue in exc.issues:
+            observed = {'code': issue.code, 'path': issue.path}
+            if hasattr(issue, 'semantic_code'):
+                observed['semantic_code'] = issue.semantic_code
+            result['issues'].append(observed)
     if exc.__cause__ is not None:
         cause = {'class': type(exc.__cause__).__name__}
         if getattr(exc.__cause__, 'code', None) is not None:

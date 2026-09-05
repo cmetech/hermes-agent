@@ -3417,6 +3417,158 @@
           ]
         }
       }
+    },
+    {
+      "id": "bash.heredoc-eof-no-candidate",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<EOF",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.heredoc-eof-live",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output; cat <<EOF",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.quote-eof-no-candidate",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.quote-eof-live",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "resource.body-command-current-missing",
+      "requirements": [
+        "H3",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 6,
+      "input": {
+        "definition_yaml": "name: scoped-auth\ndescription: Scoped authenticated references\nnodes:\n  - id: g\n    loop_group:\n      until: done\n      max_iterations: 2\n      nodes:\n        - id: a\n          prompt: Produce\n        - id: b\n          command: consume\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "g/b": "$a.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "loop_group_scope_invalid",
+              "path": "nodes[0].loop_group.nodes[1].command",
+              "semantic_code": "scoped-reference-missing-dependency"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.body-command-previous-unknown",
+      "requirements": [
+        "H3",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 6,
+      "input": {
+        "definition_yaml": "name: scoped-auth\ndescription: Scoped authenticated references\nnodes:\n  - id: g\n    loop_group:\n      until: done\n      max_iterations: 2\n      nodes:\n        - id: a\n          prompt: Produce\n        - id: b\n          command: consume\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "g/b": "$LOOP_PREV.missing.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "loop_group_scope_invalid",
+              "path": "nodes[0].loop_group.nodes[1].command",
+              "semantic_code": "scoped-reference-unknown-producer"
+            }
+          ]
+        }
+      }
     }
   ],
   "substitution_cases": [

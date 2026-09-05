@@ -634,6 +634,111 @@ def _archon_reference_surface_cases(
                 "surface:group-until-bash",
             ),
         ),
+        _case(
+            profile,
+            "reference-root-when-quoted-current",
+            _definition(
+                "reference-root-when-quoted-current",
+                """  - id: a
+    prompt: Produce.
+  - id: b
+    depends_on: [a]
+    prompt: Consume.
+    when: $a.output == '$missing.output'""",
+            ),
+            features=("mode:condition", "reference:quoted-current", "scope:root"),
+        ),
+        _case(
+            profile,
+            "loop-group-when-quoted-current",
+            _group_definition(
+                "loop-group-when-quoted-current",
+                """        - id: a
+          prompt: Produce.
+        - id: b
+          depends_on: [a]
+          prompt: Consume.
+          when: $a.output == '$missing.output'""",
+            ),
+            diagnostics=(scoped(
+                "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+            ),),
+            features=("mode:condition", "reference:quoted-current", "scope:body"),
+        ),
+        _case(
+            profile,
+            "reference-root-when-quoted-previous",
+            _definition(
+                "reference-root-when-quoted-previous",
+                """  - id: a
+    prompt: Produce.
+  - id: b
+    depends_on: [a]
+    prompt: Consume.
+    when: $a.output == '$LOOP_PREV.missing.output'""",
+            ),
+            features=("mode:condition", "reference:quoted-previous", "scope:root"),
+        ),
+        _case(
+            profile,
+            "loop-group-when-quoted-previous",
+            _group_definition(
+                "loop-group-when-quoted-previous",
+                """        - id: a
+          prompt: Produce.
+        - id: b
+          depends_on: [a]
+          prompt: Consume.
+          when: $a.output == '$LOOP_PREV.missing.output'""",
+            ),
+            diagnostics=(scoped(
+                "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+            ),),
+            features=("mode:condition", "reference:quoted-previous", "scope:body"),
+        ),
+        _case(
+            profile,
+            "reference-root-when-quoted-current-previous",
+            _definition(
+                "reference-root-when-quoted-current-previous",
+                """  - id: a
+    prompt: Produce.
+  - id: b
+    depends_on: [a]
+    prompt: Consume.
+    when: $a.output == '$missing.output $LOOP_PREV.missing.output'""",
+            ),
+            features=("mode:condition", "reference:quoted-current-previous", "scope:root"),
+        ),
+        _case(
+            profile,
+            "loop-group-when-quoted-current-previous",
+            _group_definition(
+                "loop-group-when-quoted-current-previous",
+                """        - id: a
+          prompt: Produce.
+        - id: b
+          depends_on: [a]
+          prompt: Consume.
+          when: $a.output == '$missing.output $LOOP_PREV.missing.output'""",
+            ),
+            diagnostics=(
+                scoped(
+                    "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+                ),
+                scoped(
+                    "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                ),
+            ),
+            features=(
+                "mode:condition", "reference:quoted-current-previous", "scope:body",
+                "ordering:previous-before-current",
+            ),
+        ),
     ]
 
 

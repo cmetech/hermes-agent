@@ -228,12 +228,23 @@ def test_complete_surface_publishes_controls_phase4_leaves_and_field_policies():
     assert by_path["nodes[].script"]["authenticated_body_source"] == "named_script_bodies"
     assert by_path["nodes[].script"]["value_discriminator"] == "script-inline-v1"
     assert by_path["nodes[].when"]["scanner_mode"] == "condition-v3"
-    assert by_path["nodes[].loop_group.nodes[].when"]["scanner_mode"] == "condition-v6"
+    assert by_path["nodes[].loop_group.nodes[].when"]["scanner_mode"] == "body-when"
     assert by_path["nodes[].bash"]["caller_policy"] == "root-bash-references"
     assert (
         by_path["nodes[].loop_group.until_bash"]["caller_policy"]
         == "group-until-bash-references"
     )
+
+
+def test_body_when_publishes_syntax_then_scoped_text_validation():
+    scanner = _scanner()
+    field = next(field for field in scanner["interpolation_surface"]["fields"]
+                 if field["field_path"] == "nodes[].loop_group.nodes[].when")
+    assert field["scanner_mode"] == field["caller_policy"] == "body-when"
+    assert scanner["modes"][field["scanner_mode"]] == {
+        "syntax": "condition-v6",
+        "scoped_scan": ["previous-text", "equal-length-mask", "current-text"],
+    }
 
 
 def test_grouped_surface_describes_container_major_runtime_order():
@@ -377,7 +388,7 @@ def test_modes_publish_every_bash_state_family_and_precedence():
         "lexical-admission",
         "strict-reference-parsing",
     ]
-    assert bash["no_candidate_validation"] == "shell-state-validation-still-runs"
+    assert bash["no_candidate_validation"] == "checks-run;final-state-needs-candidates"
     assert bash["nesting_limit"] == 64
     expected_families = {
         "quotes",
@@ -427,6 +438,12 @@ def test_modes_publish_every_bash_state_family_and_precedence():
         "literal_candidate": "ignored-before-strict-grammar",
         "live_candidate": "lexical-context-before-strict-grammar",
     }
+
+
+def test_heredoc_metadata_separates_consumption_from_candidate_guarded_eof():
+    heredocs = _scanner()["modes"]["bash"]["heredocs"]
+    assert heredocs["missing_terminator"] == "newline-consumption:reject;EOF:needs-candidates"
+    assert heredocs["body_references"] == "rejected-even-when-delimiter-quoted"
 
 
 def test_every_published_bash_example_matches_the_runtime_classifier():

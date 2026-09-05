@@ -489,6 +489,34 @@ def test_archon_corpus_covers_root_phase4_scopes_modes_and_ordering():
         assert _text(workflow_rows[case_id]["evidence"])
 
 
+@pytest.mark.parametrize(('suffix', 'codes'), [
+    ('current', ['scoped-reference-missing-dependency']),
+    ('previous', ['scoped-reference-unknown-producer']),
+    ('current-previous', [
+        'scoped-reference-unknown-producer', 'scoped-reference-missing-dependency',
+    ]),
+])
+def test_quoted_when_literals_distinguish_root_and_body_text_scan(suffix, codes):
+    cases = _cases(WorkflowLanguageProfile.ARCHON_2026_07)
+    root_id = 'reference-root-when-quoted-' + suffix
+    body_id = 'loop-group-when-quoted-' + suffix
+    assert {root_id, body_id} <= set(cases)
+    assert cases[root_id]['valid'] is True
+    assert cases[root_id]['diagnostics'] == []
+    assert cases[body_id]['valid'] is False
+    assert cases[body_id]['diagnostics'] == [{
+        'blocking': True, 'code': code, 'document': 'definition',
+        'hermes_code': 'loop_group_scope_invalid',
+        'path': 'nodes[0].loop_group.nodes[1].when',
+        'scope': 'loop-group:group', 'severity': 'error',
+    } for code in codes]
+    manifest = json.loads(REFERENCE_SCANNER_MANIFEST.read_text())
+    rows = {row['id']: row for row in manifest['workflow_cases']}
+    for case_id in (root_id, body_id):
+        assert rows[case_id]['requirements'] == ['S1', 'S5', 'S7']
+        assert rows[case_id]['evidence']
+
+
 def test_first_iteration_previous_output_case_matches_runtime_resolution():
     case = _cases(WorkflowLanguageProfile.ARCHON_2026_07)[
         "loop-group-first-iteration-previous-output"

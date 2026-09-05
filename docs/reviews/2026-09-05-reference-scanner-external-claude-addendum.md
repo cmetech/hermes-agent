@@ -1,0 +1,117 @@
+Scope re-verified at close: HEAD `5c3efdbe75…` unchanged, zero modifications to any candidate path (`plugins/`, `tests/`, `pyproject.toml`, `scripts/`, `AGENTS.md`), working tree holds only the intentional doc entries. I now have the evidence to write the bounded completion addendum.
+
+---
+
+# External adversarial code review — Declarative reference-scanner contract — COMPLETION ADDENDUM
+
+## 1. Reviewer, model, date, scope verification
+
+- **Reviewer / model:** Claude Code, `claude-opus-4-8[1m]` (Opus 4.8, 1M context) — the external CLI model itself, not a launching subagent. This is a bounded completion/addendum to my own prior report; the original remains immutable and verbatim.
+- **Date:** 2026-09-05.
+- **Host:** Darwin 25.5.0; local `.venv` = CPython 3.11.16 / Unicode 14.0.0 → top-level profile `python-3.11-unicode-14.0.0`.
+
+**Immutable scope (re-verified at start and end of this addendum):**
+
+| Item | Expected | Observed |
+| --- | --- | --- |
+| HEAD | `5c3efdbe75…` | `5c3efdbe757a6fa83cf85cec8a95ea3ff96bf6ed` ✓ |
+| Parent/base | `74fed08f91…` | `74fed08f91014ca7fc80ee9ea4427568ec95b04f` ✓ |
+| Branch | `feat/workflow-reference-scanner-contract` | matches ✓ |
+| Candidate-path local mods | none | `git diff --name-only <HEAD> -- plugins/ tests/ pyproject.toml scripts/ AGENTS.md` → empty ✓ |
+| Non-doc working-tree changes | none | none (only intentional untracked/staged docs) ✓ |
+
+Scope is valid — **not** `SCOPE ERROR`. I changed no source.
+
+## 2. Read-completion table (prior receipts vs newly delivered this addendum; remaining omissions)
+
+“Newly read” = contiguous Read delivery in this addendum, each response verified to contain the requested range. I am reporting remaining omissions **honestly**; I did **not** achieve full delivery of every minimum range, and I do not claim I did.
+
+| File | Total | Prior-receipt (original report) | Newly delivered this addendum | Remaining omission |
+| --- | --- | --- | --- | --- |
+| `AGENTS.md` | 1838 | rubric + early sections | **1025–1838 (full remainder)** | none |
+| `plugins/workflow/README.md` | 68 | — | **1–68** | none |
+| `plugins/workflow/conformance/reference_scanner_v1.json` | 4878 | via executed suite only | **1–4878 (every line)** | none |
+| `tests/…/fixtures/reference_scanner/case_manifest.json` | 2155 | — | **1–2155 (every line)** | none |
+| `tests/…/fixtures/reference_scanner/baselines/manifest.json` | 78 | — | **1–78** | none |
+| `plugins/workflow/reference_scanner_contract.py` | 586 | full | **1–586 (re-read)** | none |
+| `plugins/workflow/language_conformance.py` | 1612 | diff regions | **1–1611 (full)** | none |
+| `plugins/workflow/schema_cli.py` | 166 | diff | **1–166 (full)** | none |
+| `tests/…/reference_scanner_observations.py` | 279 | full | **1–279 (re-read)** | none |
+| `tests/…/test_reference_scanner_conformance.py` | 188 | partial | **1–188 (full)** | none |
+| `tests/…/test_reference_scanner_baselines.py` | 142 | via execution | **1–142 (full)** | none |
+| `tests/…/test_reference_scanner_contract.py` | 794 | 1–501 (approx) | **125–136, 502–794** | none |
+| `plugins/workflow/language_schema.py` | 4815 | 336–589, 2559–2678, 4605–4815 (prior) | **2278–2559, 2559–2678 (re-read); grep-index of all defs** | 1–335, 590–2277, 2679–4604 **not fully read this addendum** |
+| `scripts/test_workflow_merge_gate.sh` | 562 | 412–414 region | **1–562 (full)** | none |
+| `pyproject.toml` | 747 | package-data region | **package-data/packages sections via Grep (591–671)** | remaining lines not line-by-line read |
+| `tests/…/test_installed_distribution_e2e.py` | 2383 | — | **1–799** | 800–2383 not read |
+| `tests/…/test_cli.py` | 2932 | via execution (135 passes) | — | **1–2932 not read this addendum** |
+| `tests/…/test_language_schema.py` | 2746 | via execution (705 passes) | — | **1–2746 not read this addendum** |
+| `tests/…/test_language_conformance.py` | 918 | via execution (23 passes) | — | **1–918 not read this addendum** |
+| unchanged `bash_rendering.py` | — | lines 25–64 (original) | **classifier grep-index 510–1082 (targeted); 538/547/838/903 traced** | full body not line-read |
+| unchanged `resources.py` / `conditions.py` / `schema.py` | — | resources 55–84 (original) | traced via manifest citations + observation helper call sites | full bodies not line-read |
+
+**Honest correction of the original's completeness posture:** the original report claimed it inspected the literal JSON/manifest “indirectly via the executed conformance suite … rather than byte-reading all 4878 lines.” That was an omission. Both literal authorities (`reference_scanner_v1.json` 4878 lines and `case_manifest.json` 2155 lines) and the previously-truncated `AGENTS.md 1025–1838` are now read in full. Three large **test** files (`test_cli`, `test_language_schema`, `test_language_conformance`) and the bulk of `language_schema.py`, plus `test_installed_distribution_e2e.py 800–2383`, remain read only through their executed pass counts / prior receipts / partial reads — I record them as **open omissions** rather than assert coverage I did not perform.
+
+## 3. Corrected receipt / matrix / probe claims
+
+**3.1 Receipts and denials (restated faithfully).** Raw CLI result: success, `claude-opus-4-8[1m]`, exit 0. **1085 receipt-backed passes**: 22 (`test_reference_scanner_contract.py`) + 1063 (baselines 10, scanner conformance 190, language conformance 23, language schema 705, CLI 135). I did **not** rerun these and do not rerun them now. A `timeout`-wrapped runner attempt failed because `timeout` is unavailable on this host; the runner then succeeded without the wrapper. An initial structural import probe was **denied once**; a changed probe later succeeded. A digest-verification probe was **denied** and never executed by me. The original report did note these denials; I reaffirm — no implication that “no denials occurred.”
+
+**3.2 CORRECTION — the 3.11/3.12/3.13 Unicode matrix is receipt-backed, not host-limited.** My original report stated “3.12/3.13 interpreter matrix (host has 3.11 only)” and “I executed the corpus only under 3.11/Unicode-14.0.0.” **This is corrected.** The 190 conformance passes **include** `test_supported_python_unicode_observation_matrix` (`test_reference_scanner_conformance.py:157–188), which is **unconditional** (no skip): it locates `uv`, then for each of `(3.11,14.0.0),(3.12,15.0.0),(3.13,15.1.0)` runs `uv python find --offline`, `uv venv --offline`, `uv pip install --offline pyyaml jsonschema`, and executes `reference_scanner_observations.py` as a **nested subprocess** under that interpreter (`cwd=repo`, `PYTHONPATH=repo`). It asserts `outcome['profile']` equals the exact `python-<v>-unicode-<db>` id, that `outcome['passed']` equals the corpus-derived applicable-case count, that all three profiles were observed, and that the resource bytes are unchanged. The helper’s `profile_id()` (`reference_scanner_observations.py:51–56`) additionally asserts `unicodedata.unidata_version` matches the declared database. Therefore the receipt-backed evidence **does** cover 3.12/3.13 scanner behavior — including the profile-distinguishing corpus cases `unicode.kawi-u15` and `unicode.kawi-digit-u15` (`reference_scanner_v1.json:2757–2834`), which are filtered out under the top-level 3.11 interpreter and only execute inside the nested 3.12/3.13 subprocesses.
+  - **Distinctions preserved (do not overclaim):** (a) the *top-level* pytest interpreter is 3.11, running the parametrized `test_scanner_literals/substitution/structured` cases directly; the *nested subprocess matrix* is what reaches 3.12/3.13. (b) This is **not** native Linux/Windows evidence — all three run on this Darwin host. (c) It is **not** installed-wheel proof: the helper imports `plugins.workflow` from source via `PYTHONPATH=repo`; only `pyyaml`/`jsonschema` are offline-installed, not the Hermes wheel. Real-wheel offline proof is `test_installed_distribution_e2e.py` (see 3.4), not this matrix.
+
+**3.3 CORRECTION — digest probe now controller-attributed.** The digest probe I marked “denied/unexecuted” was **separately executed by the controller** (controller evidence, **not** my CLI run): Hermes-legacy corpus = format 1, 11 cases, **7265 canonical bytes, SHA-256 `c193258148699fbcbc42c909dee10001632377272e57a0ff3b79f3493f158a3b`, no `corpus_digest`**; Archon corpus self-exclusion recomputation **True**; contract-digest binding **True**. I cite this as controller-attributed validation and do **not** rerun it. Independently, this addendum’s source reading corroborates the mechanism: `language_conformance.py:1609–1611` computes `corpus_digest = "sha256:" + sha256(canonical_contract_json(envelope))` **after** the three literal sections are attached but **before** the `corpus_digest` key is added (self-exclusion), while the legacy branch returns at `:1596` with no `corpus_digest` and no scanner sections. The executed `test_reference_scanner_baselines.py::test_legacy_corpus_bytes` (in the 10 baseline passes) already asserts the legacy bytes/SHA/format-1/`corpus_digest`-absence directly.
+
+**3.4 CORRECTION — H4 is discharged by an executed integration test, not merely “recorded evidence.”** My original graded H4 “config verified; install matrix = recorded evidence.” Having now read `test_installed_distribution_e2e.py:1–799`, the design is stronger and specific: `test_installed_wheels_run_offline_schema_and_corpus_resources` (`:661–799`, `@pytest.mark.integration`) builds a real wheel **and** sdist via `uv build`, builds a second wheel from the extracted **sdist source**, then for **both** the direct wheel and the sdist-built wheel: creates a fresh venv, installs offline (`uv pip install --offline` plus `pip install --no-index --no-deps`), installs a **network-denial socket guard** (`sitecustomize`), and runs an origin probe that loads `conformance/reference_scanner_v1.json` and `README.md` via `importlib.resources` from the **installed site-packages**. It asserts the resolved module/scanner/readme are `is_relative_to(site_packages)`, **not** relative to `REPO_ROOT`, **not** relative to the earlier target-install, `pythonpath_present is False`, byte/SHA equality with source, and that the Jira package resolves under the venv prefix. This exactly discharges the H4 clause “outside source imports, no PYTHONPATH or flattened target-install shortcut.” The console-command determinism/byte-bound/digest assertions live in `test_installed_distribution_exposes_deterministic_workflow_schema_corpus` (`:440–484`) and `_assert_publication_contracts` (`:525–591`). **Caveat retained:** this suite runs under `-m integration` and is **not** part of my 1085 receipt-backed passes (I deliberately did not run the expensive build/matrix). It IS wired into the base merge gate (`scripts/test_workflow_merge_gate.sh:483–484`). So H4 = strong **source + gate-wiring** proof; **execution attributed** to the merge gate / recorded delivery, not personally reproduced by me.
+
+**3.5 CORRECTION — verdict overstatement.** The original asserted “every locked requirement provable on this Darwin host is proven” and an **unconditional PASS** while admitting partial reading. That is corrected below to a **qualified PASS** with explicit per-row proof provenance (executed test / rigorous source proof / controller-attributed / recorded-gate evidence / deferred). Recorded prior install evidence is **not** a fresh install proof.
+
+## 4. Findings
+
+**No Critical, Important, or Minor findings.** Having now read both literal authorities line-by-line, the neutral metadata builder in full, the corpus publisher, the baseline/conformance/contract suites, and the S5 inventory derivation, I found **no wrong literal outcome, no metadata/runtime mismatch, and no compatibility regression**. I did not manufacture findings to meet a quota.
+
+**Disposition of the two prior non-blocking observations (updated with newly-read context):**
+
+- **CLAUDE-OBS-1 (delimiter metadata compared to hardcoded literals) — downgraded to “correct by design; not a weakness.”** Newly-read `AGENTS.md:1785–1806` bans reading source text in tests (“Never read source code in tests … a hard antipattern, banned outright”) and `:1737–1783` bans change-detector snapshots. The published metadata is **authored data by construction**: `reference_scanner_contract.py` builds it from literal constants (`boundaries.candidate_end.text.characters=" \t\r\n'\"(){}<>=!&|,;:"` at `:347`; `complete_reference_suffix.reject_ascii_characters=".[\\/-_"` at `:369`), and the contract test comparing to hardcoded literals is the repo-sanctioned pattern, **not** a defect. The behavioral binding to the real runtime is supplied by the conformance corpus executing the live `_reference_candidate_end`/`_complete_reference_at` APIs (190 passes, including nested 3.12/3.13). I withdraw the implication that this is a latent drift risk of note.
+- **CLAUDE-OBS-2 (section headroom) — retained as a non-finding note, figures now attributed.** `_v6_contract_bounds`/`_require_contract_bounds` enforce `reference_scanner_v1 ≤ 32_000` and total `≤ 324_000` usable pre-output, with one-byte-overflow tests (`test_reference_scanner_contract.py:688–738`, executed). The specific “121 bytes free / 31,879 of 32,000” figures came from my original structural probe and are **not** re-measured in this addendum; treat them as prior-probe-derived, not re-verified here.
+
+## 5. Corrected 15-row requirements matrix
+
+Provenance legend: **[exec]** = my 1085 receipt-backed passes; **[src]** = rigorous source proof delivered this addendum; **[ctl]** = controller-attributed execution; **[gate]** = wired into merge gate / recorded delivery, not personally run; **[def]** = Studio/native-OS deferred.
+
+| ID | Verdict | Corrected evidence & provenance |
+| --- | --- | --- |
+| **H1** | **PASS** | Legacy corpus format-1/11-cases/7265-bytes/SHA `c193…`/no-`corpus_digest` and byte-identity of seven historical pairs asserted by `test_reference_scanner_baselines.py` **[exec, 10]**; baseline `manifest.json` (read `:1–78`) marks archon-6 `characterization-only`, others `immutable`, with per-artifact bytes+SHA; `test_archon_v6_changes_stay_within_the_publication_amendment` confines the archon-6 delta to `{contract_reader_version, reference_scanner_v1, contract_digest, limits.max_contract_bytes, limits.section_max_bytes.reference_scanner_v1, semantic_rules[strict-output-reference].field_paths}` **[exec+src]**; digest recompute **[ctl]**. |
+| **S1** | **PASS** (reader-rejection [def]) | Neutral builder publishes `applicability.publication=[{archon-2026-07, normalizer_versions:[6], contract_reader_version:3}]` and `unsupported_consumer_action="reject-capability-activation"` (`reference_scanner_contract.py:326–335`) **[src]**; contract-generation subprocess proves no runtime scanner import (`test_reference_scanner_contract.py:756–794`) **[exec]**. Actual older-reader rejection is Studio’s **[def]**. |
+| **S2** | **PASS** | Corpus `text.*`/`api.*`/`previous.*` literals (read `:1–1368`) cover suffixes `.outputx/_/[0]/.01/\field/-field/é/ /path`, producer tokens `$1a/$a.b/$café`, spans, condition v3/v6, error-after-yield prefix retention; grammar bound to `ARCHON_V3_*`; executed against live APIs **[exec, 190 incl. nested 3.12/3.13]+[src]**. |
+| **S3** | **PASS** (TS differential [def]) | Corpus `bash.*` (read `:1369–2623,3246–3294`) covers quotes/escapes/comments/`$$`/substitutions/arithmetic/arrays/heredocs/here-strings/functions/coprocesses/case-arms/nesting-64-vs-65/adjacency; `_bash_rules`/`state_families` (`reference_scanner_contract.py:22–155,461–503`) map to the unchanged classifier `classify_bash_reference_spans`→`_classify_authored_bash_reference_spans` (`bash_rendering.py:538/547`, `_BASH_LEXER_MAX_NESTING`, `function_declaration_name_end`); `test_every_published_bash_example_matches_the_runtime_classifier` executes each rule **[exec]+[src]**. |
+| **S4** | **PASS** | `structured_path_cases` (read `:4051–4876`) cover `$ref` siblings/containing constraints, `allOf/anyOf/oneOf`, numeric object-key vs array-index, prefix/tuple/additional items, dotted-key, unresolved/cyclic/nonlocal `$ref`, resolve leading-zero key vs index, missing/schemaless/missing-output; call `_v3_output_path_impossible`/`resolve_output_reference` directly **[exec]+[src]**. |
+| **S5** | **PASS** | `reference_scanner_interpolation_surface()` and `phase6_interpolation_surface()` both derive from the single `_INTERPOLATION_SURFACE_INVENTORY` (`language_schema.py:2278–2408,2559–2652,2655–…`); 16 specs → **18 root + 18 body + 2 group-control**; runtime caller `iter_interpolation_surface_templates` iterates the same tuple; `strict["field_paths"]==root_paths` (18) asserted (`test_reference_scanner_contract.py:740–754`) **[exec]+[src]**. |
+| **S6** | **PASS** (Studio diagnostics [def]) | `phase4_only=True` on `systemPrompt`, `agents.*` (leaves description/prompt), `hooks.*.[].response` (4 leaves), and `gate_message` (`_INTERPOLATION_SURFACE_INVENTORY`); workflow cases `reference-root-phase4-surfaces-valid`/`-container-order` authored (`language_conformance.py:404–464`) and executed via `test_language_conformance` **[exec, in 23]+[src]**. |
+| **S7** | **PASS** (Studio parity [def]) | `diagnostics.native_by_scope` body/group-until/group-gate maps published (`reference_scanner_contract.py:558–577`) and **executed against real `WorkflowValidationError` first-issue codes** for 5 scope/schema cases (`test_reference_scanner_contract.py:553–645`); competing/ordered failures authored in `language_conformance.py` (`loop-group-competing-previous-current-errors`, `loop-group-scope-diagnostic-ordering`) **[exec]+[src]**. |
+| **S8** | **PASS** (index-once [def]) | Multi-group (`loop-group-multigroup-scope-isolation`) and multi-surface (`loop-group-scope-diagnostic-ordering`) witnesses authored (`language_conformance.py:530–636`) and executed; Studio “index-once” explicitly a deferred row, not claimed proved **[exec]+[src]+[def]**. |
+| **S9** | **PASS** (canvas/pointer [def]) | Runtime scanner files byte-identical to base (original receipt); publication bounds enforced pre-output (`schema_cli.py:75–166`, `_require_contract_bounds`) with one-over tests **[exec]+[src]**; 250-node/500-edge/pointer-frame [def]. |
+| **S10** | **PASS on Darwin across three nested profiles; native-OS [def]** | **Corrected:** three profiles published (`reference_scanner_contract.py:398–432`); offsets `unicode-code-point/half-open/authored-input/utf16=studio-editor-boundary-only` (`test_reference_scanner_contract.py:648–673`); the unconditional matrix nested-executes 3.11/3.12/3.13 offline venvs, exercising profile-distinguishing `kawi-u15`/`kawi-digit-u15` **[exec, in 190]**. Not native Linux/Windows; UTF-16 conversion [def]. |
+| **H2** | **PASS** | Runtime scanner core unchanged (original diff receipt); corpus `api.version-*` reject non-6 with `ValueError`, prefix-before-failure and eager-atomicity honored (`reference_scanner_v1.json` + `reference_scanner_observations.py::_consume`); contract-generation imports no runtime scanner module (`:756–794`) **[exec]+[src]**. |
+| **H3** | **PASS** | Publisher copies the three literal sections verbatim and **never runs the scanner** (`language_conformance.py:1598–1611`); `corpus_digest` self-excluded, `contract_digest` bound; `test_builder_returns_fresh_json_compatible_metadata` proves per-call fresh copies (`:676–685`); finite coverage acknowledged, not sold as universal equivalence **[exec]+[src]+[ctl]**. |
+| **H4** | **PASS (source + gate-wiring proof; execution attributed)** | **Corrected:** `test_installed_distribution_e2e.py:661–799` performs real direct-wheel **and** sdist-built-wheel **offline** installs into fresh venvs, loads resources via `importlib.resources` from installed site-packages under a network-denial guard, asserting `pythonpath_present is False` and non-relativity to repo/target-install; `pyproject.toml:657` ships `workflow/conformance/*.json` under `plugins` package-data. Wired into base gate (`test_workflow_merge_gate.sh:483–484`) **[src]+[gate]**. **Not** in my 1085 receipt-backed passes; native-OS not established. |
+| **H5** | **PASS** | `emit_schema_corpus` validates format/section-counts then canonical+emitted byte bounds **before** `print` (`schema_cli.py:151–166`); contract bounds enforced pre-return; three new suites + `test_language_conformance`/`test_language_schema` registered in the base gate (`test_workflow_merge_gate.sh:408–414`), install-e2e at `:483–484`; legacy limits preserved **[exec]+[src]**. |
+
+## 6. Overall corrected verdict
+
+**PASS — qualified, with explicit proof-provenance and open reading omissions (not an unconditional universal pass).**
+
+Every locked requirement is supported by the evidence I examined, and I found **no defect** in the literal corpus, the independent manifest, the neutral metadata builder, the corpus publisher, or the S5 inventory derivation now read at source. The runtime scanner is unmodified and the declarative metadata is faithfully bound to it — where the contract makes behavioral claims (Bash classification, candidate discovery, container-major traversal, scope diagnostics), those claims are executed against the live APIs.
+
+I explicitly qualify, correcting my original unconditional PASS:
+
+1. **Cross-interpreter (S10)** is receipt-backed via the **nested 3.11/3.12/3.13 offline-venv subprocess matrix** on Darwin — not host-limited as I first wrote, but also **not** native Linux/Windows evidence.
+2. **Real offline wheel/sdist install (H4)** is proven by an executed **integration** test and wired into the merge gate, but was **not** part of my 1085 personally-run passes; I attribute its execution to the gate/recorded delivery.
+3. The **legacy digest / corpus self-exclusion (H1/H3)** recompute is **controller-attributed**, corroborated by source and the executed baseline suite.
+4. I did **not** fully read `test_cli.py`, `test_language_schema.py`, `test_language_conformance.py`, the bulk of `language_schema.py`, or `test_installed_distribution_e2e.py:800–2383` (see §2); claims resting on those files stand on executed pass counts + partial source, and I do not represent them as full source proof.
+5. Studio obligations (older-reader rejection enforcement, TS differential runs, 250-node/500-edge canvas + pointer-frame acceptance, UTF-16 editor boundary, contract/document index-once instrumentation) are correctly **published-only and deferred**, not claimed proved by Hermes.
+
+No new stable `CLAUDE-` findings. Prior `CLAUDE-OBS-1` is reclassified as correct-by-design (per `AGENTS.md` test-authoring policy); `CLAUDE-OBS-2` remains a non-blocking headroom note with figures attributed to the prior probe.
+
+## 7. Final candidate-file status (reviewer changed no source)
+
+`git diff --name-only 5c3efdbe75 -- plugins/ tests/ pyproject.toml scripts/ AGENTS.md` → **empty**; `git status` filtered to non-doc paths → **none**. All my activity this addendum was Read/Grep/read-only Git. The only working-tree entries remain the pre-existing intentional docs/plan/spec/review records (plus any test-runner `test_durations.json` cache from the *original* session, not this addendum). **No candidate production, test, corpus, fixture, configuration, or document was modified by this review.**

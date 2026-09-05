@@ -2533,9 +2533,9 @@ def _reference_scanner_scope_policy(
 ) -> tuple[str, str, bool]:
     if scope == "body":
         return (
-            ("condition-v6" if surface.scanner_mode == "condition" else surface.scanner_mode),
+            ("body-when" if surface.scanner_mode == "condition" else surface.scanner_mode),
             {
-                "condition": "body-condition-v6",
+                "condition": "body-when",
                 "bash": "body-bash-references",
                 "text": "body-text-references",
             }[surface.scanner_mode],

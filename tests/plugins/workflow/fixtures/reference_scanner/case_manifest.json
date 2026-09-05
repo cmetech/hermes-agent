@@ -1959,6 +1959,78 @@
         "schema-paths"
       ],
       "evidence": "_v3_schema_path_interpretation_impossible retains referenced target restrictions even when containing schema is open."
+    },
+    {
+      "id": "bash.heredoc-eof-no-candidate",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries",
+        "bash-input-operators"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans final quote/frame/pending-heredoc rejection is guarded by ordered candidates; consume_heredocs runs on newline and rejects missing terminators independently (bash.heredoc-missing)."
+    },
+    {
+      "id": "bash.heredoc-eof-live",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries",
+        "bash-input-operators"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans final quote/frame/pending-heredoc rejection is guarded by ordered candidates; consume_heredocs runs on newline and rejects missing terminators independently (bash.heredoc-missing)."
+    },
+    {
+      "id": "bash.quote-eof-no-candidate",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries",
+        "bash-quotes"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans final quote/frame/pending-heredoc rejection is guarded by ordered candidates; consume_heredocs runs on newline and rejects missing terminators independently (bash.heredoc-missing)."
+    },
+    {
+      "id": "bash.quote-eof-live",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries",
+        "bash-quotes"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans final quote/frame/pending-heredoc rejection is guarded by ordered candidates; consume_heredocs runs on newline and rejects missing terminators independently (bash.heredoc-missing)."
+    },
+    {
+      "id": "resource.body-command-current-missing",
+      "requirements": [
+        "H3",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources",
+        "previous-outputs"
+      ],
+      "evidence": "schema.validate_authenticated_resource_references projects g/b into _validate_v6_loop_group_references: undeclared current producer emits scoped-reference-missing-dependency, absent previous body producer emits scoped-reference-unknown-producer; native code/path coincide."
+    },
+    {
+      "id": "resource.body-command-previous-unknown",
+      "requirements": [
+        "H3",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources",
+        "previous-outputs"
+      ],
+      "evidence": "schema.validate_authenticated_resource_references projects g/b into _validate_v6_loop_group_references: undeclared current producer emits scoped-reference-missing-dependency, absent previous body producer emits scoped-reference-unknown-producer; native code/path coincide."
     }
   ],
   "workflow_cases": [
@@ -2150,6 +2222,78 @@
         "workflow-integration"
       ],
       "evidence": "schema._validate_v6_loop_group_references preserves group, child, surface, and group-control authored order"
+    },
+    {
+      "id": "reference-root-when-quoted-current",
+      "requirements": [
+        "S1",
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._normalize_node validates quoted when RHS as a literal; _validate_v6_loop_group_references subsequently scans body when as previous text, masks, then current text, emitting previous diagnostics before current. Root uses condition operands only."
+    },
+    {
+      "id": "loop-group-when-quoted-current",
+      "requirements": [
+        "S1",
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._normalize_node validates quoted when RHS as a literal; _validate_v6_loop_group_references subsequently scans body when as previous text, masks, then current text, emitting previous diagnostics before current. Root uses condition operands only."
+    },
+    {
+      "id": "reference-root-when-quoted-previous",
+      "requirements": [
+        "S1",
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._normalize_node validates quoted when RHS as a literal; _validate_v6_loop_group_references subsequently scans body when as previous text, masks, then current text, emitting previous diagnostics before current. Root uses condition operands only."
+    },
+    {
+      "id": "loop-group-when-quoted-previous",
+      "requirements": [
+        "S1",
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._normalize_node validates quoted when RHS as a literal; _validate_v6_loop_group_references subsequently scans body when as previous text, masks, then current text, emitting previous diagnostics before current. Root uses condition operands only."
+    },
+    {
+      "id": "reference-root-when-quoted-current-previous",
+      "requirements": [
+        "S1",
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._normalize_node validates quoted when RHS as a literal; _validate_v6_loop_group_references subsequently scans body when as previous text, masks, then current text, emitting previous diagnostics before current. Root uses condition operands only."
+    },
+    {
+      "id": "loop-group-when-quoted-current-previous",
+      "requirements": [
+        "S1",
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._normalize_node validates quoted when RHS as a literal; _validate_v6_loop_group_references subsequently scans body when as previous text, masks, then current text, emitting previous diagnostics before current. Root uses condition operands only."
     }
   ]
 }
