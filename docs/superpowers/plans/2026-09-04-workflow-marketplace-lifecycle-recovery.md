@@ -44,11 +44,13 @@ Existing implementations remain the starting point. New names below are delibera
 | --- | --- |
 | `plugins/workflow/marketplace/lifecycle_models.py` | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1 |
 | `plugins/workflow/marketplace/admissions.py` | Epoch/ID parsing, canonical private fingerprints, receipt lifetime/replay, 14A2 |
-| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict internal kind/result/phase publication, admission integration, snapshot lists, 14A1–A2 |
-| `plugins/workflow/marketplace/lifecycle_state.py` | Locked package-state projection and domain outcome evidence, 14A3 |
-| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3 |
-| `plugins/workflow/marketplace/api.py` | Mount V2, preserve read compatibility, reject preview V1 package mutations, 14A3 |
-| `plugins/workflow/marketplace/service.py`, `transactions.py`, `marketplace/cli.py` | Exact commit/rollback/trust evidence, public state and recovery adapters, 14A3 |
+| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict publication/admission/listing, 14A1–A2; non-projecting active-package mutation query, 14A3b |
+| `plugins/workflow/marketplace/lifecycle_state.py` | Locked package-state projection and domain outcome evidence, 14A3a |
+| `plugins/workflow/marketplace/service.py`, `transactions.py`, `plugins/workflow/trust.py` | Exact commit/rollback evidence, authoritative token metadata, full trust snapshot at the actual write boundary, 14A3a |
+| `plugins/workflow/marketplace/catalog.py`, `source_store.py` | Source-cache publication evidence, 14A3b; preserve strict source diagnostics |
+| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3b |
+| `plugins/workflow/marketplace/api.py` | Mount V2, preserve read compatibility and complete legacy terminal bridge, reject preview V1 package mutations, 14A3b |
+| `plugins/workflow/marketplace/cli.py` | Read-only package-state and explicit recovery adapters, 14A3c |
 | `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` | Deterministic Python public-model/scenario corpus and check/write modes, 14B |
 | `tests/fixtures/workflow-marketplace-lifecycle-v2.json` | Token-free cross-language operation/state corpus, 14B |
 | `apps/desktop/src/types/workflow-marketplace-lifecycle.ts` | Strict V2 types, 14B |
@@ -142,41 +144,124 @@ admissions.require_new_request_window(request_id)
 - [ ] Implement private review-token vault and immutable actor-scoped list snapshots with the amendment's budgets. Never persist HMACs, raw bodies, or tokens; existing transaction token hashes remain authoritative for consumption.
 - [ ] Run GREEN plus operation/API regression tests, changed-file Ruff and diff check. Fresh reviewer independently races same-ID starts and eviction replay; inspect no token/private target in snapshots/errors. Commit `feat(workflow): correlate marketplace admissions` and record evidence.
 
-## Task 14A3 — Backend outcome evidence, V2 routes, and recovery tooling
+## Backend integration checkpoints (replacement for monolithic 14A3)
 
-**Files:** Create `lifecycle_state.py`, `lifecycle_api.py`, `tests/plugins/workflow/test_marketplace_lifecycle_api.py`, `test_marketplace_lifecycle_state.py`; modify `api.py`, `service.py`, `transactions.py`, `marketplace/cli.py`, and corresponding existing service/transaction/CLI/API tests.
+14A3 is complete only after 14A3a, 14A3b, and 14A3c pass separate fresh review gates. This sequencing refinement does not change the approved public protocol, persistence, or recovery authority. Preserve the historical `task-14a3-brief.md` and inspection report. No new journal schema unless separately amended.
 
-**Consumes:** 14A1/A2 strict models/receipts.
+Complete the 14A2 staged interfaces before exposing V2 in 14A3b: authoritative typed worker outcomes, review-token expiry/digest/selection/unused checks, and V1 refresh/inspect/update-check terminal projections. Mixed legacy/V2 list coverage must be complete or fail closed; no missing-evidence placeholder may escape as truthful success. Read-only package knowledge cannot prove source-cache publication.
 
-**Produces:** V2 routes from amendment §§3–5; locked `read_package_state`; exact commit/rollback evidence; `package-state` and `recover-packages` CLI adapters; V1 preview mutation rejection. No new journal schema unless separately amended.
+## Task 14A3a — Locked package state and domain evidence producers
 
-Complete the 14A2 staged interfaces before exposing V2: supply authoritative typed worker outcomes, review-token expiry/digest/selection/unused checks, and V1 refresh/inspect/update-check V2 terminal projections. Mixed legacy/V2 list coverage must be complete or fail closed; no missing-evidence placeholder may escape as a truthful terminal success. Read-only knowledge can prove no package mutation, but source-cache publication requires its own evidence and never a guessed generic failure mapping.
+**Files:** Create `plugins/workflow/marketplace/lifecycle_state.py` and `tests/plugins/workflow/test_marketplace_lifecycle_state.py`; modify `plugins/workflow/marketplace/service.py`, `plugins/workflow/marketplace/transactions.py`, `plugins/workflow/trust.py`, and existing `tests/plugins/workflow/test_marketplace_service.py`, `test_marketplace_transactions.py`, `test_marketplace_trust.py`, `test_trust_policy.py` as required by changed behavior. No route, registry, catalog/source-store, CLI, or Desktop edits in this checkpoint.
 
-- [ ] Reproduce real transaction candidate-retained failure before adding evidence. Extend `test_post_trust_commit_failure_never_rolls_back_package_or_provenance`, verified rollback, remove failure, trust write/read failure and concurrent trust/update tests. Add state-route probes for mismatched bytes/provenance, ambiguous journals, busy leases, absence, and complete trust state.
+**Consumes:** 14A1 public models; 14A2 `LifecycleCompletion(state, result, error, outcome, review_token=None)` and `ReviewTokenMetadata(confirmation_token, expires_at, review_digest, subject, selection, validate_unused)` from `operations.py`; existing service methods and transaction/trust authorities.
 
-```python
-def test_cleanup_failure_is_recovery_required_not_old_version(lifecycle_api):
-    lifecycle_api.install_version("1.0.0")
-    review = lifecycle_api.prepare_update("2.0.0")
-    operation = lifecycle_api.confirm_with_fault(review, "after_trust_revoke")
-    assert operation.outcome.type == "recovery_required"
-    assert lifecycle_api.read_installed_bytes().manifest.version == "2.0.0"
-    assert lifecycle_api.package_state().state == "unconfirmed"
-```
-
-Build `lifecycle_api` in `test_marketplace_lifecycle_api.py` from the existing temporary repository/service fixtures and authenticated router context; faults use existing transaction seams. It must issue real route requests and wait for exact operation IDs.
-- [ ] Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_api.py tests/plugins/workflow/test_marketplace_lifecycle_state.py tests/plugins/workflow/test_marketplace_transactions.py tests/plugins/workflow/test_marketplace_service.py tests/plugins/workflow/test_marketplace_cli.py`.
-- [ ] Instrument transaction/service mutation boundaries with domain evidence. A verified rollback emits `transaction_rollback_completed`; ambiguous/failed rollback emits recovery-required. Capture trust grant/revoke results under the mutation lock. Implement package-state read using existing lock order and bounded byte checks; do not treat provenance-only success as recovery clearance.
-- [ ] Wire V2 route-body unions, capability probe, subject construction, exact prepare/confirm metadata and selection checks, token retrieval, exact ID/cancel/admission/list routes. Validate replay before token consumption. Retire V1 package/trust mutation routes before admission; retain read/source compatibility.
+**Produces:** These internal signatures in `lifecycle_state.py`, with existing service signatures/returns preserved:
 
 ```python
-# A route may expose only a validated domain projection.
-state = read_package_state(service, identity)
-return PackageState.model_validate(state.model_dump(mode="json"))
+def read_package_state(service: WorkflowMarketplaceService,
+                       identity: InstalledPackageIdentity) -> PackageState: ...
+
+def complete_read(service: WorkflowMarketplaceService, *,
+                  kind: Literal["inspect", "update_check", "install_prepare",
+                                "update_prepare", "remove_prepare", "trust_prepare"],
+                  subject: LifecycleSubject, selection: TrustSelection | None,
+                  actor: str, call: Callable[[], object]) -> LifecycleCompletion: ...
+
+def complete_mutation(service: WorkflowMarketplaceService, *,
+                      kind: Literal["install_confirm", "update_confirm", "remove_confirm",
+                                    "trust_confirm", "trust_revoke"],
+                      subject: PackageSubject, selection: TrustSelection | None,
+                      actor: str, call: Callable[[], object]) -> LifecycleCompletion: ...
+
+def review_token_metadata(service: WorkflowMarketplaceService,
+                          review: InstallReview | UpdateReview | RemoveReview | TrustReview,
+                          *, actor: str, subject: LifecycleSubject,
+                          selection: TrustSelection | None) -> ReviewTokenMetadata: ...
 ```
 
-- [ ] Add CLI read-only package-state and explicit recover-packages confirmation/JSON/exit behavior around `recover_transactions()`. Tests use real owned journals, active leases, unrelated directories, and two profiles. Never execute a real user's recovery during development.
-- [ ] Run focused GREEN, the complete marketplace backend test slice, workflow API/auth/CLI regressions, and Ruff/diff checks. Fresh reviewer independently reproduces candidate-retained rollback failure, lost admitted response replay, and a complete selected-trust map. Commit `feat(workflow): expose truthful lifecycle recovery`.
+These are signature declarations, not implementation bodies. `read_package_state` owns strict bounded domain reads and lease evidence, without registry access; 14A3b composes intersecting active-registry work into public `busy`. A context-local evidence collector may preserve existing service returns, but must reset in `finally`, remain private, and accept evidence only at the actual domain boundary. No cross-worker evidence, registry callbacks inside domain locks, or generic-error-to-positive-outcome fallback.
+
+- [ ] Extend real temporary-home/Git service fixtures into `lifecycle_domain`, a local test adapter over the actual service and these producers. The existing `test_post_trust_commit_failure_never_rolls_back_package_or_provenance` has already been reproduced at the inspection checkpoint; do not repeat it as claimed RED. Add failing outcome/state tests using its real `after_trust_revoke` fault seam:
+
+```python
+def test_cleanup_failure_has_no_verified_old_version(lifecycle_domain):
+    lifecycle_domain.install_version("1.0.0")
+    review = lifecycle_domain.prepare_update("2.0.0")
+    completion = lifecycle_domain.confirm_with_fault(review, "after_trust_revoke")
+    assert completion.outcome.type == "recovery_required"
+    assert lifecycle_domain.read_installed_bytes().manifest.version == "2.0.0"
+    state = read_package_state(lifecycle_domain.service, lifecycle_domain.identity)
+    assert state.state == "unconfirmed"
+    assert state.installed is None
+```
+
+- [ ] Add tests for verified rollback/absence, corrupt bytes/provenance/trust/journals, lease contention, bounded reads, update/remove failure, selected-A/full-A+B trust snapshots, concurrent manual trust writes and update/trust lock ordering. Test exact token actor/subject/selection/digest/expiry/unused authority and evidence isolation after exceptions across workers. Observe RED using `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_state.py tests/plugins/workflow/test_marketplace_transactions.py tests/plugins/workflow/test_marketplace_service.py tests/plugins/workflow/test_marketplace_trust.py tests/plugins/workflow/test_trust_policy.py`.
+- [ ] Implement locked state and explicit evidence emissions at transaction/service boundaries. `transaction_rollback_completed` requires verified bytes/provenance/full actual trust and clear recovery. `transaction_rollback_failed` and `transaction_recovery_ambiguous` always mean recovery-required, including read/preparation paths. Null proof cannot certify a cached version.
+- [ ] Extend only the narrow trust read/write boundary needed to capture strict complete snapshots under the actual trust lock. Its file lock is not reentrant: never wrap existing locking methods in another acquisition. Service marketplace locking alone does not serialize manual trust writers. Corrupt trust must remain unconfirmed, not silently untrusted. Capture successful package mutation state before releasing transaction serialization; do not reconstruct it later from cached results.
+- [ ] Implement token-free read/completion projection and metadata from real token authorities. Read-only outcomes apply only to the explicitly enumerated nonmutating package methods. Mutation completions consume typed evidence; missing evidence fails closed. Metadata cannot reissue/extend a token and must bind the exact review, actor, profile, subject, and selection.
+- [ ] Run the RED command as GREEN, changed-file Ruff check/format, and `git diff --check`. Record exact producer/trust-boundary interface receipts. Commit `feat(workflow): capture authoritative lifecycle state`; fresh reviewer independently tests candidate-retained failure, full selected-trust map, and concurrent trust/state boundaries before 14A3b.
+
+## Task 14A3b — Source evidence and authenticated V2 integration
+
+**Files:** Create `plugins/workflow/marketplace/lifecycle_api.py` and `tests/plugins/workflow/test_marketplace_lifecycle_api.py`; modify marketplace `api.py`, `catalog.py`, `source_store.py`, `operations.py`, and `lifecycle_state.py` solely for source completion integration; corresponding `test_marketplace_api.py`, `test_marketplace_catalog.py`, `test_marketplace_sources.py`, `test_marketplace_operations.py`, and lifecycle-state tests. No CLI or Desktop edits.
+
+**Consumes:** Accepted 14A3a producer signatures and interface receipt; 14A1 schemas; 14A2 exact replay/vault/snapshot mechanics.
+
+**Produces:** `create_lifecycle_router(context, verified_operator)` and every amendment §§3–5 V2 route; registry `intersects_active_mutation(identity: InstalledPackageIdentity) -> bool` (profile-wide, actor-nonprojecting); explicit source-cache completion evidence; complete V1 read/source bridge and pre-admission preview-mutation retirement.
+
+- [ ] Build `lifecycle_api` from actual temporary Git/service fixtures and authenticated router context. Issue real route requests and wait for exact operation IDs. Add lost-response replay, wrong ID/subject/selection, expired/consumed token, cross-actor/profile, capability/authentication, complete snapshot listing with V1 and V2 records, and pre-admission V1 mutation rejection tests.
+
+```python
+def test_replay_after_lost_confirm_response_admits_only_once(lifecycle_api):
+    request = lifecycle_api.reviewed_install_request()
+    first_id = lifecycle_api.post_and_drop_response(request)
+    replay = lifecycle_api.post(request)
+    assert replay.operation.id == first_id
+    assert lifecycle_api.count_admissions(request.request_id) == 1
+    assert lifecycle_api.wait_for(first_id).outcome.type == "committed"
+
+def test_selected_grant_returns_complete_map(lifecycle_api):
+    operation = lifecycle_api.grant_selected("A", package_workflows=("A", "B"))
+    states = {item.workflow_name: item.state
+              for item in operation.outcome.package_state.trust.workflows}
+    assert states == {"A": "trusted", "B": "untrusted"}
+```
+
+- [ ] Add fault tests before/after source-cache atomic replacement and cadence cancellation, proving published versus known unchanged versus uncertain state without diagnostic guessing. Add other-actor intersecting pending/running mutations to package-state `busy` tests; unrelated identities stay isolated and no foreign operation details escape. Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_api.py tests/plugins/workflow/test_marketplace_api.py tests/plugins/workflow/test_marketplace_catalog.py tests/plugins/workflow/test_marketplace_sources.py tests/plugins/workflow/test_marketplace_operations.py`.
+- [ ] Instrument source-store/catalog publication at its real write boundary, retaining existing caller signatures and strict diagnostics. Return committed source completion only with publication evidence; uncertain publication cannot become known unchanged. Preserve the two recorded catalog-suite failures as explicit unresolved debt unless fixed with independent evidence; never weaken sanitization to satisfy an old test.
+- [ ] Wire exact route-body unions, capability probe, token retrieval, get/cancel/admission/list routes, safe subject construction and preparation/confirmation metadata. Replay lookup precedes token authorization/consumption. Complete V1 refresh/inspect/check V2 terminal projections; no record omission or fake success. Reject V1 package/trust mutations before admission; preserve read/source compatibility.
+- [ ] Compose state-reader lease evidence with `intersects_active_mutation` without holding a registry lock while entering domain locks. Return only a validated `PackageState`; active work from another actor affects `busy`, not visibility of that actor's operation. Test lock ordering with event-controlled real workers.
+- [ ] Run focused GREEN, source/API/operation regressions, changed-file Ruff/format and diff checks. Commit `feat(workflow): expose correlated lifecycle API`; fresh reviewer independently reproduces lost admitted response replay, source publication fault truth, candidate-retained API outcome, selected trust map and mixed legacy/V2 listing before 14A3c.
+
+## Task 14A3c — Recovery CLI and complete backend gates
+
+**Files:** Modify `plugins/workflow/marketplace/cli.py` and `tests/plugins/workflow/test_marketplace_cli.py`; narrow CLI registration in `plugins/workflow/cli.py` only if required. No unrelated production fixes inside this gate; route/domain findings return to their owner with a fresh fix review.
+
+**Consumes:** Accepted `read_package_state`, existing `recover_transactions()` ownership/lease checks, and accepted V2 domain/API behavior.
+
+**Produces:** `hermes workflow package-state SOURCE_KEY/PACKAGE_ID --json` and `hermes workflow recover-packages --yes --json`, plus confirmation/exit behavior from amendment §9.
+
+- [ ] Write real temporary-home/journal CLI tests for installed/absent/unconfirmed state, ambiguous recovery, active leases, unrelated directories, and two profiles. Use the existing CLI test runner rather than a mocked service result:
+
+```python
+def test_read_state_does_not_recover_owned_journal(cli_home):
+    cli_home.create_ambiguous_owned_journal()
+    before = cli_home.journal_bytes()
+    result = cli_home.run("package-state", cli_home.identity_text, "--json")
+    assert result.json["state"] == "unconfirmed"
+    assert cli_home.journal_bytes() == before
+
+def test_recovery_requires_confirmation(cli_home):
+    before = cli_home.journal_bytes()
+    cli_home.run_noninteractive("recover-packages", "--json")
+    assert cli_home.journal_bytes() == before
+```
+
+`cli_home` adapts the actual CLI runner and owned temporary transaction fixtures; it never targets the user's profile. Observe RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_cli.py tests/plugins/workflow/test_cli.py`.
+- [ ] Implement read-only state rendering and bounded affected-identity confirmation around existing ownership-checked recovery. Without `--yes`, require interactive confirmation; noninteractive refusal performs no mutation. Refuse active writer leases; unresolved ambiguous journals yield nonzero exit. Never expose raw staging paths through Desktop or present workflow `doctor` as transaction recovery.
+- [ ] Run focused GREEN, then `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_*.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_trust_policy.py`. Run changed-file Ruff/format and `git diff --check`. Report exact failures rather than claiming the whole slice green; known catalog debt remains a mandatory whole-branch gate.
+- [ ] Commit `feat(workflow): add explicit package recovery tooling`; fresh reviewer independently executes no-write state/confirmation and owned/ambiguous recovery probes. Record all 14A3a/b/c acceptance receipts before 14B; overall 14A3 is not accepted from CLI tests alone.
 
 ## Task 14B — Desktop contract parity and backend-generated fixtures
 
