@@ -293,7 +293,16 @@ def complete_source_refresh(
         return _unknown()
     handle = _source_evidence.set(evidence)
     try:
-        value = call()
+        try:
+            value = call()
+        finally:
+            # The supplied callback owns control beyond the catalog return.
+            # Revalidate even when it raises, before classifying any outcome.
+            try:
+                _source_scope(catalog=service.catalog)
+            except Exception:
+                evidence.invalid.set()
+                raise
         if (
             evidence.invalid.is_set()
             or not evidence.used

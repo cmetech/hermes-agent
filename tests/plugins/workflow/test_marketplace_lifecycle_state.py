@@ -361,6 +361,48 @@ def test_source_completion_store_swap_during_fallback_never_writes_foreign_statu
     assert not original_store.catalog_path.exists()
 
 
+@pytest.mark.parametrize("refresh", ["fresh", "disabled", "cancelled"])
+@pytest.mark.parametrize("exit_kind", ["return", "error", "cancel"])
+@pytest.mark.parametrize("replacement", ["store", "catalog"])
+def test_source_completion_outer_callback_cannot_transfer_terminal_authority(
+    source_service, tmp_path, refresh, exit_kind, replacement
+):
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+    from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+
+    owner = source_service.catalog.source_store
+    foreign = WorkflowMarketplaceService(tmp_path / "foreign-home", profile="support")
+    foreign.add_source(owner.get("company"))
+    foreign_store = foreign.catalog.source_store
+    before = foreign_store.path.read_bytes()
+    if refresh == "disabled":
+        owner.set_enabled("company", False)
+
+    def call():
+        result = source_service.refresh_source(
+            "company", cancelled=lambda: refresh == "cancelled"
+        )
+        if replacement == "store":
+            source_service.catalog.source_store = foreign_store
+        else:
+            source_service.catalog = foreign.catalog
+        if exit_kind == "error":
+            raise RuntimeError("outer callback failed")
+        if exit_kind == "cancel":
+            raise MarketplaceOperationCancelled("outer callback cancelled")
+        return result
+
+    completion = _source_completion(source_service, call=call)
+    # A real commit remains in its owner home; scope rejection is no rollback.
+    assert owner.catalog_path.exists() is (refresh == "fresh")
+    assert foreign_store.path.read_bytes() == before
+    assert not foreign_store.catalog_path.exists()
+    assert (completion.state, completion.outcome.type) == (
+        "failed",
+        "outcome_unknown",
+    )
+
+
 def test_source_completion_reuse_retains_uncertainty_after_publication(source_service):
     def reused():
         result = source_service.refresh_source("company")
