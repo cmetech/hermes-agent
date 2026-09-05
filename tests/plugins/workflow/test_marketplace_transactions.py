@@ -560,31 +560,6 @@ def test_token_metadata_is_read_only_actor_profile_expiry_bound_and_canonical(
     metadata = store.inspect_token(prepared.token, actor="alice", profile="support")
     assert metadata.operation == "install"
     assert metadata.identity == candidate.identity
-    assert (
-        metadata.source_name,
-        metadata.repository_url,
-        metadata.configured_ref,
-        metadata.resolved_commit,
-        metadata.package_path,
-        metadata.package_version,
-        metadata.distribution_digest,
-        metadata.workflow_paths,
-        metadata.destination,
-        metadata.staging_path,
-        metadata.installed_provenance,
-    ) == (
-        prepared.source_name,
-        prepared.repository_url,
-        prepared.configured_ref,
-        prepared.resolved_commit,
-        prepared.package_path,
-        prepared.package_version,
-        prepared.distribution_digest,
-        prepared.workflow_paths,
-        prepared.destination,
-        prepared.staging_path,
-        None,
-    )
     assert not hasattr(metadata, "token")
     assert (
         store.inspect_token(prepared.token, actor="alice", profile="support")

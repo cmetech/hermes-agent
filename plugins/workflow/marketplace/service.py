@@ -14,6 +14,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+import threading
 from typing import Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -87,17 +88,15 @@ from .source_store import (
     _read_bounded,
     _strict_json,
 )
-from .transactions import (
-    MarketplaceTransactionStore,
-    PreparedTransactionMetadata,
-    TransactionCandidate,
-)
+from .transactions import MarketplaceTransactionStore, TransactionCandidate
 from .lifecycle_state import domain_mutation, _capture_trust
 
 
 _INDEX_PATH = ".well-known/hermes-workflows/index.json"
 _REVIEW_DOMAIN = b"hermes.workflow-marketplace.lifecycle-review.v1\0"
 _TRUST_REVIEW_DOMAIN = b"hermes.workflow-marketplace.trust-review.v1\0"
+_ISSUED_REVIEW_DOMAIN = b"hermes.workflow-marketplace.issued-review.v1\0"
+_ISSUED_REVIEW_LIMIT = 512  # Existing 256 transaction + 256 trust token maxima.
 _TRUST_TOKEN_STATE_VERSION = 1
 _TRUST_TOKEN_STATE_BYTES = 1024 * 1024
 _TRUST_TOKEN_LIMIT = 256
@@ -165,6 +164,16 @@ def _canonical_digest(domain: bytes, value: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(domain + encoded).hexdigest()
+
+
+def _issued_review_fingerprint(
+    review: InstallReview | UpdateReview | RemoveReview | TrustReview,
+) -> str:
+    """Fingerprint the complete issued review without retaining its raw token."""
+
+    value = review.model_dump(mode="json", by_alias=True)
+    value.pop("confirmationToken", None)
+    return _canonical_digest(_ISSUED_REVIEW_DOMAIN, value)
 
 
 def _set_change(old: Iterable[str], candidate: Iterable[str]) -> StringSetChange:
@@ -708,6 +717,8 @@ class WorkflowMarketplaceService:
             self.catalog.source_store,
             clock=clock,
         )
+        self._issued_review_lock = threading.Lock()
+        self._issued_reviews: dict[str, str] = {}
 
     def add_source(
         self, source: WorkflowMarketplaceSource
@@ -856,171 +867,57 @@ class WorkflowMarketplaceService:
             identity=prepared.identity,
         )
 
-    def _review_matches_transaction_authority(
-        self,
-        review: InstallReview | UpdateReview | RemoveReview,
-        authority: PreparedTransactionMetadata,
+    def _remember_issued_review(
+        self, review: InstallReview | UpdateReview | RemoveReview | TrustReview
+    ) -> None:
+        token = review.confirmation_token
+        if not isinstance(token, str):
+            _fail(
+                "confirmation_token_invalid",
+                "review confirmation authority is unavailable",
+            )
+        token_digest = hashlib.sha256(token.encode()).hexdigest()
+        fingerprint = _issued_review_fingerprint(review)
+        with self.transactions._locked():
+            transaction_now = self.transactions.clock()
+            trust_now = self._trust_confirmations.clock()
+            live = {
+                record.token_digest
+                for record in self.transactions._read_prepared().transactions
+                if _parse_timestamp(record.expires_at) > transaction_now
+            }
+            live.update(
+                record.token_digest
+                for record in self._trust_confirmations._read().tokens
+                if _parse_timestamp(record.expires_at) > trust_now
+            )
+        if token_digest not in live:
+            _fail(
+                "confirmation_token_invalid",
+                "review confirmation authority is unavailable",
+            )
+        with self._issued_review_lock:
+            retained = {
+                key: value for key, value in self._issued_reviews.items() if key in live
+            }
+            if token_digest not in retained and len(retained) >= _ISSUED_REVIEW_LIMIT:
+                _fail(
+                    "transaction_state_size_limit",
+                    "review confirmation authority capacity is exhausted",
+                )
+            retained[token_digest] = fingerprint
+            self._issued_reviews = retained
+
+    def _matches_issued_review(
+        self, review: InstallReview | UpdateReview | RemoveReview | TrustReview
     ) -> bool:
-        """Rebuild the exact public review from the persisted candidate authority."""
-
-        if authority.operation == "remove":
-            distribution = load_distribution(
-                authority.destination,
-                expected_digest=authority.distribution_digest,
-            )
-        else:
-            distribution = load_distribution(
-                authority.staging_path,
-                expected_digest=authority.distribution_digest,
-            )
-        workflows, blockers = self._assess_distribution(
-            distribution, authority.identity, authority.source_name
-        )
-        if blockers:
+        token = review.confirmation_token
+        if not isinstance(token, str):
             return False
-        if authority.operation == "install":
-            if not isinstance(review, InstallReview):
-                return False
-            changes = _file_changes(None, distribution)
-            review_digest = _canonical_digest(
-                _REVIEW_DOMAIN,
-                {
-                    "operation": "install",
-                    "identity": authority.identity.model_dump(
-                        mode="json", by_alias=True
-                    ),
-                    "source": authority.source_name,
-                    "repository": authority.repository_url,
-                    "ref": authority.configured_ref,
-                    "commit": authority.resolved_commit,
-                    "path": authority.package_path,
-                    "version": authority.package_version,
-                    "digest": authority.distribution_digest,
-                    "files": [
-                        item.model_dump(mode="json", by_alias=True) for item in changes
-                    ],
-                    "workflows": [
-                        self._trust_digest_projection(item) for item in workflows
-                    ],
-                },
-            )
-            expected = InstallReview(
-                operation="install",
-                confirmationToken=review.confirmation_token,
-                reviewDigest=review_digest,
-                identity=authority.identity,
-                sourceName=authority.source_name,
-                repositoryUrl=authority.repository_url,
-                configuredRef=authority.configured_ref,
-                resolvedCommit=authority.resolved_commit,
-                packagePath=authority.package_path,
-                candidateVersion=authority.package_version,
-                candidateDigest=authority.distribution_digest,
-                assessment=self._assessment(
-                    distribution, workflows, blockers, review_digest=review_digest
-                ),
-                fileChanges=changes,
-                workflowReviews=workflows,
-            )
-            return review == expected
-
-        installed = authority.installed_provenance
-        if installed is None:
-            return False
-        if authority.operation == "update":
-            if not isinstance(review, UpdateReview):
-                return False
-            old_distribution = load_distribution(
-                authority.destination,
-                expected_digest=installed.distribution_digest,
-            )
-            old_workflows, old_blockers = self._assess_distribution(
-                old_distribution, authority.identity, installed.source_name
-            )
-            if old_blockers:
-                return False
-            changes = _file_changes(old_distribution, distribution)
-            workflow_changes = _set_change(
-                (item.workflow_name for item in old_workflows),
-                (item.workflow_name for item in workflows),
-            )
-            requirement_changes = _requirement_changes(
-                old_distribution.manifest.external_requirements,
-                distribution.manifest.external_requirements,
-            )
-            risk_changes = _risk_changes(old_workflows, workflows)
-            compatibility_changes = _compatibility_changes(old_workflows, workflows)
-            review_digest = _canonical_digest(
-                _REVIEW_DOMAIN,
-                {
-                    "operation": "update",
-                    "identity": authority.identity.model_dump(
-                        mode="json", by_alias=True
-                    ),
-                    "old": installed.model_dump(mode="json", by_alias=True),
-                    "candidateCommit": authority.resolved_commit,
-                    "candidateVersion": authority.package_version,
-                    "candidateDigest": authority.distribution_digest,
-                    "files": [
-                        item.model_dump(mode="json", by_alias=True) for item in changes
-                    ],
-                    "workflowChanges": workflow_changes.model_dump(mode="json"),
-                    "requirementChanges": requirement_changes.model_dump(mode="json"),
-                    "riskChanges": risk_changes.model_dump(mode="json"),
-                    "compatibilityChanges": compatibility_changes.model_dump(
-                        mode="json"
-                    ),
-                },
-            )
-            expected = UpdateReview(
-                operation="update",
-                result="update_available",
-                confirmationToken=review.confirmation_token,
-                reviewDigest=review_digest,
-                identity=authority.identity,
-                sourceName=installed.source_name,
-                repositoryUrl=installed.repository_url,
-                configuredRef=installed.configured_ref,
-                oldVersion=installed.package_version,
-                candidateVersion=authority.package_version,
-                oldCommit=installed.resolved_commit,
-                candidateCommit=authority.resolved_commit,
-                oldDigest=installed.distribution_digest,
-                candidateDigest=authority.distribution_digest,
-                fileChanges=changes,
-                workflowChanges=workflow_changes,
-                requirementChanges=requirement_changes,
-                riskChanges=risk_changes,
-                compatibilityChanges=compatibility_changes,
-                assessment=self._assessment(
-                    distribution, workflows, blockers, review_digest=review_digest
-                ),
-                workflowReviews=workflows,
-            )
-            return review == expected
-
-        if not isinstance(review, RemoveReview):
-            return False
-        workflow_names = sorted(item.workflow_name for item in workflows)
-        review_digest = _canonical_digest(
-            _REVIEW_DOMAIN,
-            {
-                "operation": "remove",
-                "provenance": installed.model_dump(mode="json", by_alias=True),
-                "workflowNames": workflow_names,
-            },
-        )
-        expected = RemoveReview(
-            operation="remove",
-            confirmationToken=review.confirmation_token,
-            reviewDigest=review_digest,
-            identity=authority.identity,
-            currentVersion=installed.package_version,
-            currentCommit=installed.resolved_commit,
-            distributionDigest=installed.distribution_digest,
-            workflowNames=workflow_names,
-        )
-        return review == expected
+        token_digest = hashlib.sha256(token.encode()).hexdigest()
+        fingerprint = _issued_review_fingerprint(review)
+        with self._issued_review_lock:
+            return self._issued_reviews.get(token_digest) == fingerprint
 
     def refresh_source(
         self,
@@ -1771,7 +1668,7 @@ class WorkflowMarketplaceService:
                 actor=actor,
                 profile=self.profile,
             )
-            return InstallReview(
+            review = InstallReview(
                 operation="install",
                 confirmationToken=prepared.token,
                 reviewDigest=review_digest,
@@ -1787,6 +1684,8 @@ class WorkflowMarketplaceService:
                 fileChanges=changes,
                 workflowReviews=workflows,
             )
+            self._remember_issued_review(review)
+            return review
 
     @domain_mutation("install_confirm")
     def confirm_install(
@@ -1940,7 +1839,7 @@ class WorkflowMarketplaceService:
                     actor=actor,
                     profile=self.profile,
                 ).token
-            return UpdateReview(
+            review = UpdateReview(
                 operation="update",
                 result="unchanged" if unchanged else "update_available",
                 confirmationToken=token,
@@ -1963,6 +1862,9 @@ class WorkflowMarketplaceService:
                 assessment=assessment,
                 workflowReviews=candidate_workflows,
             )
+            if token is not None:
+                self._remember_issued_review(review)
+            return review
 
     @domain_mutation("update_confirm")
     def confirm_update(
@@ -2141,7 +2043,7 @@ class WorkflowMarketplaceService:
             actor=actor,
             profile=self.profile,
         )
-        return RemoveReview(
+        review = RemoveReview(
             operation="remove",
             confirmationToken=prepared.token,
             reviewDigest=review_digest,
@@ -2151,6 +2053,8 @@ class WorkflowMarketplaceService:
             distributionDigest=installed.distribution_digest,
             workflowNames=workflow_names,
         )
+        self._remember_issued_review(review)
+        return review
 
     @domain_mutation("remove_confirm")
     def confirm_remove(
@@ -2264,7 +2168,7 @@ class WorkflowMarketplaceService:
             workflow_paths=tuple(item.definition_path for item in workflows),
             workflow_name=workflow_name,
         )
-        return TrustReview(
+        review = TrustReview(
             confirmationToken=token,
             reviewDigest=review_digest,
             identity=identity,
@@ -2275,6 +2179,8 @@ class WorkflowMarketplaceService:
             packageResources=package_resources,
             workflows=workflows,
         )
+        self._remember_issued_review(review)
+        return review
 
     @domain_mutation("trust_confirm")
     def grant_trust(

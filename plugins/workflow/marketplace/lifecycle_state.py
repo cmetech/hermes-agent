@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import threading
 from typing import TYPE_CHECKING, Literal
@@ -187,6 +187,8 @@ class _Evidence:
     completion: LifecycleCompletion | None = None
     used: bool = False
     reused: bool = False
+    invalid_scope: threading.Event = field(default_factory=threading.Event, repr=False)
+    closed: threading.Event = field(default_factory=threading.Event, repr=False)
     entered: bool = False
     committed: bool = False
     cancelled: bool = False
@@ -213,11 +215,15 @@ _boundary: ContextVar[_Boundary | None] = ContextVar(
 
 def _current_evidence(service):
     value = _evidence.get()
-    return (
-        value
-        if value and value.service is service and value.execution == _execution()
-        else None
-    )
+    if value is None:
+        return None
+    if value.closed.is_set() or value.execution != _execution():
+        value.invalid_scope.set()
+        raise WorkflowMarketplaceError(
+            "marketplace_operation_failed",
+            "lifecycle evidence scope is invalid",
+        )
+    return value if value.service is service else None
 
 
 def _failure(error, outcome):
@@ -491,6 +497,8 @@ def complete_mutation(
         try:
             call()
         except Exception as error:
+            if evidence.invalid_scope.is_set():
+                return _unknown(error)
             if evidence.cancelled and not evidence.entered and not evidence.committed:
                 raise MarketplaceOperationCancelled(
                     "marketplace operation was cancelled"
@@ -500,8 +508,13 @@ def complete_mutation(
                 if evidence.completion and evidence.completion.state == "failed"
                 else _unknown(error)
             )
-        return _unknown() if evidence.reused else evidence.completion or _unknown()
+        return (
+            _unknown()
+            if evidence.reused or evidence.invalid_scope.is_set()
+            else evidence.completion or _unknown()
+        )
     finally:
+        evidence.closed.set()
         _evidence.reset(handle)
 
 
@@ -532,23 +545,6 @@ def review_token_metadata(
                     and w.workflow_name == selection.workflow_name
                 ]
             )
-            installed, issued_workflows, issued_digest, package_resources = (
-                service._trust_review_parts(
-                    review.identity,
-                    workflow_paths=authority.workflow_paths,
-                )
-            )
-            expected_review = TrustReview(
-                confirmationToken=token,
-                reviewDigest=issued_digest,
-                identity=authority.identity,
-                sourceName=installed.source_name,
-                version=installed.package_version,
-                resolvedCommit=installed.resolved_commit,
-                distributionDigest=installed.distribution_digest,
-                packageResources=package_resources,
-                workflows=issued_workflows,
-            )
             if (
                 selection != actual_selection
                 or not expected
@@ -557,7 +553,7 @@ def review_token_metadata(
                 or [(w.workflow_name, w.definition_path) for w in review.workflows]
                 != [(w.workflow_name, w.definition_path) for w in expected]
                 or review.distribution_digest != authority.distribution_digest
-                or review != expected_review
+                or not service._matches_issued_review(review)
             ):
                 raise WorkflowMarketplaceError(
                     "confirmation_token_invalid", "confirmation binding is invalid"
@@ -569,7 +565,7 @@ def review_token_metadata(
             if (
                 selection is not None
                 or authority.operation != operation
-                or not service._review_matches_transaction_authority(review, authority)
+                or not service._matches_issued_review(review)
             ):
                 raise WorkflowMarketplaceError(
                     "confirmation_token_invalid", "confirmation binding is invalid"
@@ -654,6 +650,8 @@ def complete_read(
     handle = _evidence.set(evidence)
     try:
         value = call()
+        if evidence.invalid_scope.is_set():
+            return _unknown()
         metadata = None
         if kind == "update_check":
             projection = {
@@ -706,6 +704,8 @@ def complete_read(
             review_token=metadata,
         )
     except Exception as error:
+        if evidence.invalid_scope.is_set():
+            return _unknown(error)
         if isinstance(error, MarketplaceOperationCancelled) or getattr(
             error, "code", None
         ) in {"source_cancelled", "marketplace_operation_cancelled"}:
@@ -723,4 +723,5 @@ def complete_read(
         )
         return _failure(error, outcome)
     finally:
+        evidence.closed.set()
         _evidence.reset(handle)

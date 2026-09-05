@@ -122,17 +122,6 @@ class PreparedTransactionMetadata:
 
     operation: Literal["install", "update", "remove"]
     identity: InstalledPackageIdentity
-    source_name: str
-    repository_url: str
-    configured_ref: str | None
-    resolved_commit: str
-    package_path: str
-    package_version: str
-    distribution_digest: str
-    workflow_paths: tuple[str, ...]
-    destination: Path
-    staging_path: Path
-    installed_provenance: InstalledPackageProvenance | None
     review_digest: str
     expires_at: str
 
@@ -1294,17 +1283,6 @@ class MarketplaceTransactionStore:
                         )
                     ),
                     identity=record.identity,
-                    source_name=record.source_name,
-                    repository_url=record.repository_url,
-                    configured_ref=record.configured_ref,
-                    resolved_commit=record.resolved_commit,
-                    package_path=record.package_path,
-                    package_version=record.package_version,
-                    distribution_digest=record.distribution_digest,
-                    workflow_paths=tuple(record.workflow_paths),
-                    destination=Path(record.destination),
-                    staging_path=Path(record.staging_path),
-                    installed_provenance=record.installed_provenance,
                     review_digest=record.review_digest,
                     expires_at=record.expires_at,
                 )

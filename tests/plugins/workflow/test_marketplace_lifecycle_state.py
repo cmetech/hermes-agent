@@ -534,7 +534,92 @@ def test_copied_context_cannot_capture_another_threads_mutation(lifecycle_domain
 
     result = d.mutation("install_confirm", different_worker)
     assert result.outcome.type == "outcome_unknown"
-    assert d.state().state == "installed"
+    assert d.state().state == "absent"
+
+
+def test_caught_copied_context_call_remains_invalid_and_does_not_mutate(
+    lifecycle_domain,
+):
+    d = lifecycle_domain
+    review = d.prepare()
+
+    def different_worker():
+        context = copy_context()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(WorkflowMarketplaceError):
+                pool.submit(
+                    context.run,
+                    lambda: d.service.confirm_install(
+                        review.confirmation_token, actor="alice"
+                    ),
+                ).result()
+
+    result = d.mutation("install_confirm", different_worker)
+    assert result.outcome.type == "outcome_unknown"
+    assert d.state().state == "absent"
+
+
+def test_copied_context_call_then_owner_cancellation_cannot_report_cancelled(
+    lifecycle_domain,
+):
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+
+    d = lifecycle_domain
+    d.install_version()
+    review = d.service.review_trust(d.identity, actor="alice")
+    d.service.grant_trust(review, actor="alice")
+
+    def calls():
+        context = copy_context()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                pool.submit(
+                    context.run, lambda: d.service.revoke_trust(d.identity)
+                ).result()
+            except WorkflowMarketplaceError:
+                pass
+        d.service.revoke_trust(d.identity, enter_atomic=lambda: False)
+
+    try:
+        result = d.mutation("trust_revoke", calls, AllTrustSelection(type="all"))
+    except MarketplaceOperationCancelled:
+        pytest.fail("invalid copied-context call was rewritten as cancellation")
+    assert result.outcome.type == "outcome_unknown"
+    assert all(workflow.state == "trusted" for workflow in d.state().trust.workflows)
+
+
+def test_unrelated_legacy_worker_can_still_mutate_without_lifecycle_scope(
+    lifecycle_domain,
+):
+    d = lifecycle_domain
+    d.install_version()
+    review = d.service.review_trust(d.identity, actor="alice")
+    d.service.grant_trust(review, actor="alice")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        revoked = pool.submit(d.service.revoke_trust, d.identity).result()
+
+    assert revoked == 2
+    assert all(workflow.state == "untrusted" for workflow in d.state().trust.workflows)
+
+
+def test_copied_context_cannot_mutate_after_originating_scope_closes(
+    lifecycle_domain,
+):
+    d = lifecycle_domain
+    review = d.prepare()
+    copied = []
+
+    result = d.mutation("install_confirm", lambda: copied.append(copy_context()))
+    assert result.outcome.type == "outcome_unknown"
+
+    with pytest.raises(WorkflowMarketplaceError):
+        copied[0].run(
+            d.service.confirm_install,
+            review.confirmation_token,
+            actor="alice",
+        )
+    assert d.state().state == "absent"
 
 
 def test_wrong_subject_cannot_mutate_a_different_package(lifecycle_domain, domain):
@@ -647,6 +732,145 @@ def test_review_authority_rejects_altered_facts_for_every_review_kind(
                 subject=d.subject,
                 selection=selection,
             )
+
+
+def test_issued_install_review_remains_immutable_when_trust_changes(
+    lifecycle_domain, domain
+):
+    d = lifecycle_domain
+    issued = d.prepare()
+    workflow = issued.workflow_reviews[0]
+    assert workflow.trust_state == "untrusted"
+    d.service.trust_store.trust(
+        workflow.package_digest,
+        actor="manual",
+        risk_digest=workflow.risk_digest,
+    )
+    altered_workflow = workflow.model_copy(update={"trust_state": "trusted"})
+    altered = issued.model_copy(
+        update={"workflow_reviews": [altered_workflow, *issued.workflow_reviews[1:]]}
+    )
+
+    metadata = domain.review_token_metadata(
+        d.service,
+        issued,
+        actor="alice",
+        subject=d.subject,
+        selection=None,
+    )
+    assert metadata.validate_unused(issued.confirmation_token)
+    with pytest.raises(WorkflowMarketplaceError, match="binding is invalid"):
+        domain.review_token_metadata(
+            d.service,
+            altered,
+            actor="alice",
+            subject=d.subject,
+            selection=None,
+        )
+
+
+def test_issued_trust_review_remains_immutable_when_trust_changes(
+    lifecycle_domain, domain
+):
+    d = lifecycle_domain
+    d.install_version()
+    issued = d.service.review_trust(d.identity, actor="alice")
+    workflow = issued.workflows[0]
+    assert workflow.trust_state == "untrusted"
+    d.service.trust_store.trust(
+        workflow.package_digest,
+        actor="manual",
+        risk_digest=workflow.risk_digest,
+    )
+    altered_workflow = workflow.model_copy(update={"trust_state": "trusted"})
+    altered = issued.model_copy(
+        update={"workflows": [altered_workflow, *issued.workflows[1:]]}
+    )
+    selection = AllTrustSelection(type="all")
+
+    metadata = domain.review_token_metadata(
+        d.service,
+        issued,
+        actor="alice",
+        subject=d.subject,
+        selection=selection,
+    )
+    assert metadata.validate_unused(issued.confirmation_token)
+    with pytest.raises(WorkflowMarketplaceError, match="binding is invalid"):
+        domain.review_token_metadata(
+            d.service,
+            altered,
+            actor="alice",
+            subject=d.subject,
+            selection=selection,
+        )
+
+
+def test_recreated_service_lacks_v2_review_proof_but_legacy_confirmation_works(
+    lifecycle_domain, domain
+):
+    from plugins.workflow.marketplace.service import WorkflowMarketplaceService
+
+    d = lifecycle_domain
+    issued = d.prepare()
+    recreated = WorkflowMarketplaceService(d.service.home, profile="support")
+
+    with pytest.raises(WorkflowMarketplaceError, match="binding is invalid"):
+        domain.review_token_metadata(
+            recreated,
+            issued,
+            actor="alice",
+            subject=d.subject,
+            selection=None,
+        )
+
+    installed = recreated.confirm_install(issued.confirmation_token, actor="alice")
+    assert installed.version == "1.0.0"
+
+
+def test_review_authority_capacity_never_evicts_a_live_review(
+    lifecycle_domain, domain, monkeypatch
+):
+    import plugins.workflow.marketplace.service as service_module
+
+    d = lifecycle_domain
+    monkeypatch.setattr(service_module, "_ISSUED_REVIEW_LIMIT", 1)
+    issued = d.prepare()
+    assert issued.confirmation_token not in repr(d.service._issued_reviews)
+
+    with pytest.raises(WorkflowMarketplaceError) as exhausted:
+        d.prepare()
+    assert exhausted.value.code == "transaction_state_size_limit"
+
+    metadata = domain.review_token_metadata(
+        d.service,
+        issued,
+        actor="alice",
+        subject=d.subject,
+        selection=None,
+    )
+    assert metadata.validate_unused(issued.confirmation_token)
+
+
+def test_consumed_review_authority_is_pruned_before_new_capture(
+    lifecycle_domain, domain, monkeypatch
+):
+    import plugins.workflow.marketplace.service as service_module
+
+    d = lifecycle_domain
+    monkeypatch.setattr(service_module, "_ISSUED_REVIEW_LIMIT", 1)
+    install = d.prepare()
+    d.service.confirm_install(install.confirmation_token, actor="alice")
+    remove = d.service.prepare_remove(d.identity, actor="alice")
+
+    metadata = domain.review_token_metadata(
+        d.service,
+        remove,
+        actor="alice",
+        subject=d.subject,
+        selection=None,
+    )
+    assert metadata.validate_unused(remove.confirmation_token)
 
 
 @pytest.mark.parametrize("checkpoint", ["cancelled", "enter_atomic"])
