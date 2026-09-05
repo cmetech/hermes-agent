@@ -28,6 +28,36 @@ SUBJECT = PackageSubject(
 )
 
 
+def test_direct_selector_is_epoch_keyed_and_binds_each_canonical_component(tmp_path):
+    from plugins.workflow.marketplace.admissions import LifecycleAdmissionStore
+
+    store = LifecycleAdmissionStore(profile_key=str(tmp_path), epoch=EPOCH)
+    recreated = LifecycleAdmissionStore(profile_key=str(tmp_path), epoch=EPOCH)
+    selector = store.direct_selector_id(
+        "https://example.test/a.git", "main", "packages/a"
+    )
+    assert selector == recreated.direct_selector_id(
+        "https://example.test/a.git", "main", "packages/a"
+    )
+    assert len(selector) == 64 and all(
+        character in "0123456789abcdef" for character in selector
+    )
+    for repository, ref, path in [
+        ("https://example.test/b.git", "main", "packages/a"),
+        ("https://example.test/a.git", None, "packages/a"),
+        ("https://example.test/a.git", "main", "packages/b"),
+        ("https://example.test/a.git", "main", None),
+    ]:
+        assert store.direct_selector_id(repository, ref, path) != selector
+    different_epoch = LifecycleAdmissionStore(profile_key=str(tmp_path), epoch="b" * 32)
+    assert (
+        different_epoch.direct_selector_id(
+            "https://example.test/a.git", "main", "packages/a"
+        )
+        != selector
+    )
+
+
 def request_id(number=1, *, now=NOW, epoch=EPOCH):
     return f"wmreq_{epoch}_{int(now.timestamp() * 1000):013d}_{number:032x}"
 

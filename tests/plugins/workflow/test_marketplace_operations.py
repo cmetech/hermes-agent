@@ -60,6 +60,44 @@ def _refresh_result(source_name: str) -> MarketplaceSourceRefreshOperationResult
 
 
 @pytest.mark.parametrize(
+    "method", ["get_legacy", "list_legacy", "cancel_legacy", "cancel_lifecycle"]
+)
+def test_explicit_observation_version_uses_actor_and_birth_version(tmp_path, method):
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support"
+    )
+    entered, release = threading.Event(), threading.Event()
+    operation = registry.start(
+        "update_check",
+        lambda token: (entered.set(), release.wait(10))[-1],
+        actor="owner",
+        subject=AllPackagesSubject(type="all_packages"),
+        request_id=registry.admissions.new_request_id(),
+    )
+    assert entered.wait(5)
+    try:
+        adapter = getattr(registry, method, None)
+        assert callable(adapter), "explicit versioned observation is missing"
+        if method == "list_legacy":
+            assert adapter(actor="owner", offset=0, limit=1) == ()
+        else:
+            with pytest.raises(MarketplaceOperationNotFoundError):
+                adapter(operation.id, actor="foreign")
+            if method == "cancel_lifecycle":
+                assert adapter(operation.id, actor="owner").schema_version == 2
+            else:
+                with pytest.raises(MarketplaceOperationRegistryError) as caught:
+                    adapter(operation.id, actor="owner")
+                assert caught.value.code == "marketplace_lifecycle_upgrade_required"
+                assert not registry._records[operation.id].cancellation.is_cancelled()
+    finally:
+        release.set()
+        registry.close()
+
+
+@pytest.mark.parametrize(
     "kind",
     [
         "install_confirm",

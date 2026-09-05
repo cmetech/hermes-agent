@@ -124,6 +124,104 @@ def _install_legacy_test_package(service, actor):
     return service.confirm_install(review.confirmation_token, actor=actor)
 
 
+def test_http_version_scoped_observation_and_pre_cancel_rejection(legacy_case):
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+
+    client, service, registry, actor = legacy_case
+    root = "/api/plugins/workflow/marketplace"
+    headers = {"X-Test-Authority": "admin"}
+    subject = AllPackagesSubject(type="all_packages")
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(token):
+        entered.set()
+        assert release.wait(10)
+        assert not token.is_cancelled()
+        return complete_read(
+            service,
+            kind="update_check",
+            subject=subject,
+            selection=None,
+            actor=actor,
+            call=lambda: [],
+        )
+
+    operation = registry.start(
+        "update_check",
+        blocked,
+        actor=actor,
+        subject=subject,
+        request_id=registry.admissions.new_request_id(),
+    )
+    assert entered.wait(5)
+    try:
+        for method, suffix in [("get", ""), ("post", "/cancel")]:
+            own = getattr(client, method)(
+                root + "/operations/" + operation.id + suffix, headers=headers
+            )
+            assert own.status_code == 409, own.text
+            assert own.json() == {
+                "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+            }
+            foreign = getattr(client, method)(
+                root + "/operations/" + operation.id + suffix,
+                headers={**headers, "X-Test-Actor": "foreign"},
+            )
+            assert foreign.status_code == 404
+        assert not registry._records[operation.id].cancellation.is_cancelled()
+        page = client.get(root + "/operations", headers=headers)
+        assert page.status_code == 200, page.text
+        assert page.json()["operations"] == []
+    finally:
+        release.set()
+
+
+def test_http_v1_pagination_filters_version_before_slicing(legacy_case):
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+
+    client, service, registry, actor = legacy_case
+    root = "/api/plugins/workflow/marketplace"
+    headers = {"X-Test-Authority": "admin"}
+    legacy_ids, all_ids = [], []
+    subject = AllPackagesSubject(type="all_packages")
+    for _ in range(5):
+        response = client.post(root + "/updates/check", json={}, headers=headers)
+        assert response.status_code == 202
+        operation_id = response.json()["id"]
+        registry._records[operation_id].future.result(timeout=10)
+        legacy_ids.append(operation_id)
+        all_ids.append(operation_id)
+        operation = registry.start(
+            "update_check",
+            lambda token: complete_read(
+                service,
+                kind="update_check",
+                subject=subject,
+                selection=None,
+                actor=actor,
+                call=lambda: [],
+            ),
+            actor=actor,
+            subject=subject,
+            request_id=registry.admissions.new_request_id(),
+        )
+        registry._records[operation.id].future.result(timeout=10)
+        all_ids.append(operation.id)
+    collected = []
+    for offset in range(0, 6, 2):
+        page = client.get(
+            root + f"/operations?offset={offset}&limit=2", headers=headers
+        )
+        assert page.status_code == 200, page.text
+        collected.extend(item["id"] for item in page.json()["operations"])
+    assert collected == list(reversed(legacy_ids))
+    snapshot = client.get(root + "/lifecycle/v2/operations", headers=headers)
+    assert snapshot.status_code == 200, snapshot.text
+    assert {item["id"] for item in snapshot.json()["items"]} == set(all_ids)
+
+
 @pytest.mark.parametrize("method,path,body,service_method,kind", _LEGACY_READS)
 @pytest.mark.parametrize("cancel", [False, True])
 def test_legacy_bridge_queued_observation_and_cancellation(
@@ -260,7 +358,7 @@ def test_legacy_bridge_mixed_terminal_snapshot_is_complete(legacy_case):
             "/api/plugins/workflow/marketplace/lifecycle/v2/capabilities",
             headers=_headers(),
         ).status_code
-        == 404
+        == 200
     )
 
 

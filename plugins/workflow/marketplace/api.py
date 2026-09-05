@@ -1296,7 +1296,9 @@ def create_marketplace_router(
             profile=profile,
             offset=offset,
             limit=limit,
-            operations=list(registry.list(actor=actor, offset=offset, limit=limit)),
+            operations=list(
+                registry.list_legacy(actor=actor, offset=offset, limit=limit)
+            ),
         )
 
     @router.get(
@@ -1314,7 +1316,7 @@ def create_marketplace_router(
         key, _profile, _service, registry = api.current()
         actor = _actor(authority, key)
         try:
-            return registry.get(operation_id, actor=actor)
+            return registry.get_legacy(operation_id, actor=actor)
         except MarketplaceOperationRegistryError as error:
             raise _registry_error(error)
 
@@ -1333,10 +1335,13 @@ def create_marketplace_router(
         key, _profile, _service, registry = api.current()
         actor = _actor(authority, key)
         try:
-            return registry.cancel(operation_id, actor=actor)
+            return registry.cancel_legacy(operation_id, actor=actor)
         except MarketplaceOperationRegistryError as error:
             raise _registry_error(error)
 
+    from .lifecycle_api import create_lifecycle_router
+
+    router.include_router(create_lifecycle_router(api, verified_operator))
     return router
 
 

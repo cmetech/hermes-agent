@@ -165,6 +165,22 @@ class LifecycleAdmissionStore:
     def new_request_id(self):
         return f"wmreq_{self.epoch}_{int(self._now().timestamp() * 1000):013d}_{self._random()}"
 
+    def direct_selector_id(
+        self, repository_url: str, ref: str | None, package_path: str | None
+    ) -> str:
+        """Bind an already validated canonical selector without exposing its bytes."""
+        value = json.dumps(
+            [self.epoch, repository_url, ref, package_path],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hmac.new(
+            _PROCESS_SECRET,
+            b"hermes.marketplace.direct-selector.v2\0" + value,
+            hashlib.sha256,
+        ).hexdigest()
+
     def _issued(self, request_id):
         match = (
             _REQUEST_ID.fullmatch(request_id) if isinstance(request_id, str) else None

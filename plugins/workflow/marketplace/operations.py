@@ -1269,6 +1269,69 @@ class WorkflowMarketplaceOperationRegistry:
                 self._require_locked(operation_id, actor)
             )
 
+    def _require_legacy_locked(self, operation_id, actor):
+        record = self._require_locked(operation_id, actor)
+        if record.lifecycle:
+            raise MarketplaceOperationRegistryError(
+                "marketplace_lifecycle_upgrade_required",
+                "Marketplace lifecycle upgrade required.",
+            )
+        return record
+
+    def get_legacy(self, operation_id: str, *, actor: str) -> MarketplaceOperation:
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        with self._lock:
+            self._prune_locked(self._now())
+            return self._project_locked(
+                self._require_legacy_locked(operation_id, actor)
+            )
+
+    def list_legacy(
+        self, *, actor: str, offset: int, limit: int
+    ) -> tuple[MarketplaceOperation, ...]:
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        if (
+            type(offset) is not int
+            or offset < 0
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("operation pagination is invalid")
+        with self._lock:
+            self._prune_locked(self._now())
+            records = sorted(
+                (
+                    record
+                    for record in self._records.values()
+                    if record.actor == actor and not record.lifecycle
+                ),
+                key=lambda record: record.sequence,
+                reverse=True,
+            )
+            return tuple(
+                self._project_locked(record)
+                for record in records[offset : offset + limit]
+            )
+
+    def cancel_legacy(self, operation_id: str, *, actor: str) -> MarketplaceOperation:
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        with self._lock:
+            self._prune_locked(self._now())
+            record = self._require_legacy_locked(operation_id, actor)
+            self._cancel_locked(record)
+            return self._project_locked(record)
+
+    def cancel_lifecycle(self, operation_id: str, *, actor: str) -> LifecycleOperation:
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        with self._lock:
+            self._prune_locked(self._now())
+            record = self._require_locked(operation_id, actor)
+            # Establish that this record is eligible for a strict V2 observation
+            # before changing it, including legacy internal records without receipts.
+            self._project_lifecycle_locked(record)
+            self._cancel_locked(record)
+            return self._project_lifecycle_locked(record)
+
     def lookup_admission(self, request_id, *, actor="operator"):
         actor = _clean_identity(actor, label="operation actor", maximum=256)
         with self._lock:
@@ -1488,21 +1551,20 @@ class WorkflowMarketplaceOperationRegistry:
         with self._lock:
             self._prune_locked(self._now())
             record = self._require_locked(operation_id, actor)
-            if record.state in _TERMINAL_STATES:
-                return (
-                    self._project_lifecycle_locked(record)
-                    if record.lifecycle
-                    else self._project_locked(record)
-                )
-            record.cancellation.cancel()
-            future = record.future
-            if record.state == "pending" and future is not None and future.cancel():
-                self._terminal_locked(record, state="cancelled")
+            self._cancel_locked(record)
             return (
                 self._project_lifecycle_locked(record)
                 if record.lifecycle
                 else self._project_locked(record)
             )
+
+    def _cancel_locked(self, record):
+        if record.state in _TERMINAL_STATES:
+            return
+        record.cancellation.cancel()
+        future = record.future
+        if record.state == "pending" and future is not None and future.cancel():
+            self._terminal_locked(record, state="cancelled")
 
     def close(self, *, wait_timeout: float = 5.0) -> None:
         if isinstance(wait_timeout, bool) or not isinstance(wait_timeout, int | float):
