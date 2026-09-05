@@ -329,6 +329,68 @@ def test_unknown_producer_errors_publish_only_fixed_internal_failure(
     assert secret not in response.text
 
 
+@pytest.mark.parametrize("exception_name", ["ValueError", "GitSourceError"])
+def test_valid_request_unclassified_producer_failure_is_internal(
+    lifecycle_api, monkeypatch, exception_name
+):
+    from hermes_cli.git_source import GitSourceError
+
+    exception_type = ValueError if exception_name == "ValueError" else GitSourceError
+
+    def fail(**kwargs):
+        raise exception_type("private producer diagnostic")
+
+    monkeypatch.setattr(lifecycle_api.registry, "list_snapshot", fail)
+    response = lifecycle_api.client.get(V2 + "/operations")
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+
+
+def test_request_and_auth_rejections_precede_producer_failures(
+    lifecycle_api, monkeypatch
+):
+    api = lifecycle_api
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("producer must not run for rejected input")
+
+    monkeypatch.setattr(api.registry, "list_snapshot", fail)
+    monkeypatch.setattr(api.registry, "start", fail)
+    for query in ("limit=0", "limit=101", "limit=bad", "limit=1&limit=2", "unknown=1"):
+        response = api.client.get(V2 + "/operations?" + query)
+        assert response.status_code == 422, response.text
+        assert response.json() == {"detail": {"code": "marketplace_request_invalid"}}
+    for body in ({"unexpected": True}, {"identifier": "invalid-single-component"}):
+        response = api.post("/install/prepare", api.request(body))
+        assert response.status_code == 422, response.text
+        assert response.json() == {"detail": {"code": "marketplace_request_invalid"}}
+    assert (
+        api.client.get(
+            V2 + "/operations", headers={"X-Test-Authority": "none"}
+        ).status_code
+        == 403
+    )
+    assert (
+        api.client.post(
+            V2 + "/install/prepare",
+            json=api.request({"identifier": "company/laptop-support"}),
+            headers={"X-Test-Authority": "read"},
+        ).status_code
+        == 403
+    )
+
+
+def test_invalid_embedded_install_path_is_rejected_as_request_input(lifecycle_api):
+    response = lifecycle_api.post(
+        "/install/prepare",
+        lifecycle_api.request({
+            "identifier": "https://example.test/public.git/../escape"
+        }),
+    )
+    assert response.status_code == 422
+    assert response.json() == {"detail": {"code": "marketplace_request_invalid"}}
+
+
 @pytest.mark.parametrize("boundary", ["capabilities", "evicted"])
 def test_outer_route_rejects_missing_required_discriminator(
     lifecycle_api, monkeypatch, boundary

@@ -7,7 +7,7 @@ import json
 from typing import Generic, Literal, TypeVar
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from hermes_cli.git_source import (
@@ -202,14 +202,8 @@ def _call(call):
             raise _internal_error() from None
         status = _LIFECYCLE_ERROR_STATUS[error.code]
         raise HTTPException(status_code=status, detail={"code": error.code}) from None
-    except ValidationError:
-        raise _internal_error() from None
-    except (ValueError, GitSourceError):
-        raise _request_error() from None
     except Exception:
-        raise HTTPException(
-            status_code=500, detail={"code": "marketplace_internal_error"}
-        ) from None
+        raise _internal_error() from None
 
 
 def _public_completion(completion: LifecycleCompletion) -> LifecycleCompletion:
@@ -263,19 +257,24 @@ def _install_subject(service, registry, body):
                     package_id=package,
                 ),
             ), None
-    validate_credential_free_git_source(request.identifier)
-    resolved = resolve_git_source(request.identifier)
-    repository = canonical_git_source(resolved.clone_url, None)
-    validate_credential_free_git_source(repository)
-    if (
-        request.package_path is not None
-        and resolved.subdirectory is not None
-        and request.package_path != resolved.subdirectory
-    ):
-        raise _request_error()
-    path = request.package_path or resolved.subdirectory
-    # Reuse the package-path validator for embedded URL paths, too.
-    InstallRequest(identifier=repository, ref=request.ref, packagePath=path)
+    # Only parsing submitted coordinates is a request error. Registry and
+    # service calls stay outside this boundary so their failures remain 500s.
+    try:
+        validate_credential_free_git_source(request.identifier)
+        resolved = resolve_git_source(request.identifier)
+        repository = canonical_git_source(resolved.clone_url, None)
+        validate_credential_free_git_source(repository)
+        if (
+            request.package_path is not None
+            and resolved.subdirectory is not None
+            and request.package_path != resolved.subdirectory
+        ):
+            raise _request_error()
+        path = request.package_path or resolved.subdirectory
+        # Reuse the package-path validator for embedded URL paths, too.
+        InstallRequest(identifier=repository, ref=request.ref, packagePath=path)
+    except (ValueError, GitSourceError):
+        raise _request_error() from None
     selector = registry.admissions.direct_selector_id(repository, request.ref, path)
     return wire.DirectInstallSubject(
         type="direct_install",
@@ -370,14 +369,20 @@ def create_lifecycle_router(
     )
     def list_operations(request: Request):
         _, _, registry, actor = scope(request, "read")
+        try:
+            query = _query(request, {"cursor", "limit"})
+            limit = _uint(query.get("limit"), default=100, maximum=100)
+        except ValueError:
+            raise _request_error() from None
+        if limit < 1:
+            raise _request_error()
 
         def run():
-            query = _query(request, {"cursor", "limit"})
             return _strict_public(
                 LifecycleOperationPage,
                 registry.list_snapshot(
                     actor=actor,
-                    limit=_uint(query.get("limit"), default=100, maximum=100),
+                    limit=limit,
                     cursor=query.get("cursor"),
                 ),
             )
