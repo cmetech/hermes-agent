@@ -336,7 +336,7 @@ Refresh state invokes only the local-state read. Recovery guidance offers the ne
 
 ## 10. Migration and compatibility
 
-**2026-09-05 proposed clarification:** The [HTTP version compatibility addendum](2026-09-05-workflow-marketplace-http-version-compatibility.md) specifies reverse V1 observation of V2 operations and endpoint-version cancellation responses. It is pending user approval; Task 14A3b3 is paused before implementation. Accepted predecessor tasks and the rest of this approved amendment remain unchanged.
+**2026-09-05 approved clarification:** The user approved the [HTTP version compatibility addendum](2026-09-05-workflow-marketplace-http-version-compatibility.md), specifying reverse V1 observation of V2 operations and endpoint-version cancellation responses. Task 14A3b3 may resume. Accepted predecessor tasks and the rest of this approved amendment remain unchanged.
 
 V2 is an API lifecycle revision, not a package-language revision. No changes to the Studio-consumed package contract bytes, installed layout, source cache schema, or legacy manual trust grants are needed for admission receipts. Receipts and raw review tokens are memory-only. Existing journals remain the durable recovery authority; any implementation need for a new persisted journal field requires an explicit versioned read-compatible amendment before coding it.
 

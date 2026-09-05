@@ -1,6 +1,6 @@
 # Workflow Marketplace HTTP Version Compatibility Addendum
 
-**Status:** Proposed; user approval required before Task 14A3b3 production or test changes. The September 4 lifecycle design remains approved; this new migration decision is not yet approved.
+**Status:** Approved by the user on 2026-09-05 (“ok proceed”), following the plain-language explanation of the policy. Task 14A3b3 may resume in the existing Hermes worktree. This approval does not authorize Studio changes, merge, push, publication, release or worktree deletion.
 
 **Scope:** Clarifies section 10 of the [lifecycle recovery amendment](2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md). Execution stays in [Task 14A3b3](../plans/2026-09-04-workflow-marketplace-lifecycle-recovery.md#task-14a3b3--authenticated-v2-routes-and-actual-context-lifetime), not a restart of accepted tasks.
 
@@ -18,7 +18,7 @@ The approved amendment requires V1 read compatibility and V2 observation of V1 w
 | Convert every V2 record into V1 | Cannot preserve explicit outcomes and token-free review semantics faithfully; introduces downgrade policy and possible misleading legacy interpretation. Rejected. |
 | Retire V1 operation reads/cancel entirely | Simpler routing, but breaks the approved surviving refresh/inspect/update-check workflow. Rejected. |
 
-## Proposed public behavior
+## Approved public behavior
 
 The requested HTTP version chooses the response schema. Immutable admission version chooses eligibility for V1, not the receipt's existence: surviving V1 starts also have server-generated receipts.
 
@@ -46,7 +46,7 @@ Navigation, application restart and backend restart retain the September 4 guara
 
 ## Implementation and acceptance
 
-After approval, Task 14A3b3 may add narrow version-specific observation methods in `operations.py` and matching operation tests, alongside its existing API/context ownership. No accepted domain producer or source publication rule changes.
+Task 14A3b3 may add narrow version-specific observation methods in `operations.py` and matching operation tests, alongside its existing API/context ownership. No accepted domain producer or source publication rule changes.
 
 Required independent behavior tests:
 
