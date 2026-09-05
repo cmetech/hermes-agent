@@ -49,7 +49,7 @@ _MAX_SOURCE_STATE_BYTES = 1024 * 1024
 _MAX_CATALOG_STATE_BYTES = 64 * 1024 * 1024
 _MAX_ERROR_BYTES = 4096
 _SOURCE_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
-_CONTROL_OR_SPACE_RUN = re.compile(r"[\x00-\x20\x7f]+")
+_CONTROL_OR_SPACE_RUN = re.compile(r"[\x00-\x20\x7f\ufeff]+")
 _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _PATH_DECODE_MAX = 8
 _GENERIC_REFRESH_FAILURE = "workflow marketplace source refresh failed"
@@ -91,7 +91,9 @@ def _canonical_diagnostic_line(value: str) -> str:
 
 
 def _diagnostic_contains_control(value: str) -> bool:
-    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+    return any(
+        ord(character) < 32 or ord(character) in {127, 0xFEFF} for character in value
+    )
 
 
 def _diagnostic_matches_ascii_literal(value: str, index: int, literal: str) -> bool:

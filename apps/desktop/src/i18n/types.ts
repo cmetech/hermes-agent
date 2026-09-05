@@ -2184,6 +2184,90 @@ export interface Translations {
     workflowMarketplaceRemoveDescription: string
     workflowMarketplaceSourceRemoved: string
     workflowMarketplaceUnsupportedSources: string
+    workflowMarketplaceReviewInstallation: string
+    workflowMarketplaceReviewInstallationDescription: string
+    workflowMarketplaceReviewUpdate: string
+    workflowMarketplaceReviewUpdateDescription: string
+    workflowMarketplaceReviewRemoval: string
+    workflowMarketplaceReviewRemovalDescription: string
+    workflowMarketplaceReviewTrust: string
+    workflowMarketplaceReviewTrustDescription: string
+    workflowMarketplacePreparingInstallation: string
+    workflowMarketplacePreparingUpdate: string
+    workflowMarketplaceCheckingUpdates: string
+    workflowMarketplacePreparingRemoval: string
+    workflowMarketplacePreparingTrust: string
+    workflowMarketplaceOperationProgress: (phase: string, progress: number) => string
+    workflowMarketplaceCancelOperation: string
+    workflowMarketplaceConfirmInstall: string
+    workflowMarketplaceConfirmUpdate: string
+    workflowMarketplaceConfirmRemoval: string
+    workflowMarketplaceGrantTrust: string
+    workflowMarketplacePrepareAgain: string
+    workflowMarketplaceRetryStatus: string
+    workflowMarketplaceReviewDigest: string
+    workflowMarketplaceCandidateVersion: string
+    workflowMarketplaceCandidateCommit: string
+    workflowMarketplaceCandidateDigest: string
+    workflowMarketplacePreviousVersion: string
+    workflowMarketplacePreviousCommit: string
+    workflowMarketplacePreviousDigest: string
+    workflowMarketplaceChangedFiles: string
+    workflowMarketplaceFileChange: (kind: string, path: string) => string
+    workflowMarketplaceRenamedFrom: (path: string) => string
+    workflowMarketplacePackageResources: string
+    workflowMarketplaceWorkflowRisks: string
+    workflowMarketplaceDefinitionPath: string
+    workflowMarketplaceCompanionPath: string
+    workflowMarketplaceRiskDigest: string
+    workflowMarketplaceShellScriptNodes: string
+    workflowMarketplaceScriptResources: string
+    workflowMarketplaceCommandNodes: string
+    workflowMarketplaceCommandResources: string
+    workflowMarketplaceLocalMcp: string
+    workflowMarketplaceRemoteMcp: string
+    workflowMarketplaceMcpDefinitions: string
+    workflowMarketplaceMcpResourceFiles: string
+    workflowMarketplaceRequestedSkills: string
+    workflowMarketplaceOutwardActions: string
+    workflowMarketplaceApprovalNodes: string
+    workflowMarketplaceRequiredSecrets: string
+    workflowMarketplaceWorkflowChanges: string
+    workflowMarketplaceRequirementChanges: string
+    workflowMarketplaceRiskChanges: string
+    workflowMarketplaceCompatibilityChanges: string
+    workflowMarketplaceAdded: string
+    workflowMarketplaceRemoved: string
+    workflowMarketplaceNoChanges: string
+    workflowMarketplaceInstalledTrustRequired: string
+    workflowMarketplaceUpdatedTrustRequired: (version: string) => string
+    workflowMarketplaceReviewTrustAction: string
+    workflowMarketplaceInstallFailed: string
+    workflowMarketplaceInstallCancelled: string
+    workflowMarketplaceUpdateFailed: string
+    workflowMarketplaceUpdateCancelled: string
+    workflowMarketplaceVersionRemainsInstalled: (version: string) => string
+    workflowMarketplaceNothingInstalled: string
+    workflowMarketplaceOperationStatusLost: string
+    workflowMarketplaceOperationStatusUnavailable: string
+    workflowMarketplaceReviewStale: string
+    workflowMarketplacePackageCurrent: (version: string) => string
+    workflowMarketplaceTrustAllWorkflows: string
+    workflowMarketplaceTrustOneWorkflow: string
+    workflowMarketplaceSelectWorkflow: string
+    workflowMarketplaceTrustNotGranted: string
+    workflowMarketplaceTrustGranted: string
+    workflowMarketplaceRemovalScope: string
+    workflowMarketplaceRemovalPreserves: string
+    workflowMarketplacePackageRemoved: string
+    workflowMarketplaceRemovalFailed: string
+    workflowMarketplaceRemovalCancelled: string
+    workflowMarketplaceInstallPackage: string
+    workflowMarketplaceUpdatePackage: string
+    workflowMarketplaceCheckUpdates: string
+    workflowMarketplaceRemovePackage: string
+    workflowMarketplaceInstalledPackageLabel: (identifier: string) => string
+    workflowMarketplaceLifecycleUnavailable: string
     workflowCatalog: string
     workflowCatalogLoading: string
     workflowCatalogErrorTitle: string

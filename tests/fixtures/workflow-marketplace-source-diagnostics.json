@@ -153,6 +153,27 @@
     "failed=https://example.test/docs?access%5Ftoken=secret",
     "failed=https://example.test/%0A/root/operator/secret.txt"
   ],
+  "byteOrderMark": {
+    "raw": [
+      { "message": "\ufefffatal retry", "canonical": "fatal retry" },
+      { "message": "fatal retry\ufeff", "canonical": "fatal retry" },
+      { "message": "fatal\ufeffretry", "canonical": "fatal retry" }
+    ],
+    "encoded": [
+      {
+        "message": "%EF%BB%BFfatal retry",
+        "canonical": "workflow marketplace source refresh failed"
+      },
+      {
+        "message": "fatal retry%EF%BB%BF",
+        "canonical": "workflow marketplace source refresh failed"
+      },
+      {
+        "message": "fatal%EF%BB%BFretry",
+        "canonical": "workflow marketplace source refresh failed"
+      }
+    ]
+  },
   "matrix": {
     "prefix": "failed=https://example.test/docs",
     "delimiters": [";", ":", ",", "=", "[", "]", "(", ")", "{", "}", "\"", "'", "|", "!"],

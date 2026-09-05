@@ -1,4 +1,5 @@
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import type {
@@ -9,7 +10,15 @@ import type {
 } from '@/types/hermes'
 
 export interface MarketplacePackageDetailProps {
+  actions?: {
+    checkForUpdates?: (origin: HTMLButtonElement) => void
+    install?: (origin: HTMLButtonElement) => void
+    remove?: (origin: HTMLButtonElement) => void
+    reviewTrust?: (origin: HTMLButtonElement) => void
+    update?: (origin: HTMLButtonElement) => void
+  }
   detail: WorkflowMarketplacePackageDetail
+  lifecycleUnavailable?: boolean
 }
 
 export function marketplaceWebRepositoryHref(value: string): null | string {
@@ -90,7 +99,11 @@ function RequirementList({ requirements }: { requirements: WorkflowMarketplaceEx
   )
 }
 
-export function MarketplacePackageDetail({ detail }: MarketplacePackageDetailProps) {
+export function MarketplacePackageDetail({
+  actions,
+  detail,
+  lifecycleUnavailable = false
+}: MarketplacePackageDetailProps) {
   const { t } = useI18n()
   const copy = t.operations
   const repositoryHref = marketplaceWebRepositoryHref(detail.repository_url)
@@ -140,6 +153,54 @@ export function MarketplacePackageDetail({ detail }: MarketplacePackageDetailPro
             </Badge>
           ))}
         </div>
+        {actions ? (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {detail.install_status === 'not_installed' && detail.blockers.length === 0 && actions.install ? (
+              <Button onClick={event => actions.install?.(event.currentTarget)} size="sm" type="button">
+                {copy.workflowMarketplaceInstallPackage}
+              </Button>
+            ) : null}
+            {detail.install_status === 'installed' && detail.update_status === 'update_available' && actions.update ? (
+              <Button onClick={event => actions.update?.(event.currentTarget)} size="sm" type="button">
+                {copy.workflowMarketplaceUpdatePackage}
+              </Button>
+            ) : null}
+            {detail.install_status === 'installed' && detail.update_status === 'current' && actions.checkForUpdates ? (
+              <Button
+                onClick={event => actions.checkForUpdates?.(event.currentTarget)}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                {copy.workflowMarketplaceCheckUpdates}
+              </Button>
+            ) : null}
+            {detail.install_status === 'installed' && actions.reviewTrust ? (
+              <Button
+                onClick={event => actions.reviewTrust?.(event.currentTarget)}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                {copy.workflowMarketplaceReviewTrustAction}
+              </Button>
+            ) : null}
+            {detail.install_status === 'installed' && actions.remove ? (
+              <Button
+                onClick={event => actions.remove?.(event.currentTarget)}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                {copy.workflowMarketplaceRemovePackage}
+              </Button>
+            ) : null}
+          </div>
+        ) : lifecycleUnavailable ? (
+          <p className="mt-3 text-xs text-(--ui-text-tertiary)" role="status">
+            {copy.workflowMarketplaceLifecycleUnavailable}
+          </p>
+        ) : null}
       </header>
 
       <section aria-label={copy.workflowMarketplaceCandidateIdentity} role="region">

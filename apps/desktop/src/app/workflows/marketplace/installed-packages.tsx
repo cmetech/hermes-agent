@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
+import { useRef } from 'react'
 import type { ReactNode } from 'react'
 
 import { profileScopeKey } from '@/api/client'
@@ -15,6 +16,7 @@ import { ExternalLink } from '@/lib/external-link'
 
 import { marketplaceWebRepositoryHref } from './package-detail'
 import { marketplaceKeys } from './query-keys'
+import { useWorkflowPackageLifecycle } from './use-package-lifecycle'
 
 export interface InstalledPackagesProps {
   children: ReactNode
@@ -106,6 +108,8 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   const { t } = useI18n()
   const copy = t.operations
   const scopeKey = profileScopeKey(scope)
+  const focusFallbackRef = useRef<HTMLDivElement>(null)
+  const lifecycle = useWorkflowPackageLifecycle(scope, focusFallbackRef)
 
   const capabilities = useQuery({
     queryFn: () => getWorkflowMarketplaceCapabilities(scope),
@@ -121,6 +125,11 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   })
 
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
+  const supportsOperations = capabilities.data?.capabilities.includes('operations') === true
+  const supportsTransactions = capabilities.data?.capabilities.includes('transactions') === true
+  const supportsUpdates = capabilities.data?.capabilities.includes('updates') === true
+  const supportsTrust = capabilities.data?.capabilities.includes('trust') === true
+  const supportsLifecycle = supportsOperations && supportsTransactions
   const packages = installed.data?.packages ?? []
 
   const notice = capabilities.isPending ? (
@@ -144,7 +153,7 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   ) : null
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" ref={focusFallbackRef} tabIndex={-1}>
       {notice}
       {packages.length ? (
         <section aria-label={copy.workflowMarketplaceInstalledPackages}>
@@ -155,7 +164,11 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
               const repositoryHref = marketplaceWebRepositoryHref(item.repository_url)
 
               return (
-                <article className="border-b border-(--ui-stroke-tertiary) pb-3 last:border-b-0" key={identifier}>
+                <article
+                  aria-label={copy.workflowMarketplaceInstalledPackageLabel(identifier)}
+                  className="border-b border-(--ui-stroke-tertiary) pb-3 last:border-b-0"
+                  key={identifier}
+                >
                   <div className="flex flex-wrap items-baseline justify-between gap-2">
                     <h3 className="break-all font-mono text-xs font-medium text-(--ui-text-primary)">{identifier}</h3>
                     <span className="flex flex-wrap gap-1">
@@ -184,12 +197,49 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                       </li>
                     ))}
                   </ul>
+                  {supportsLifecycle ? (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {supportsTrust ? (
+                        <Button
+                          onClick={event => lifecycle.reviewTrust(item, event.currentTarget)}
+                          size="sm"
+                          type="button"
+                          variant="secondary"
+                        >
+                          {copy.workflowMarketplaceReviewTrustAction}
+                        </Button>
+                      ) : null}
+                      {supportsUpdates ? (
+                        <Button
+                          onClick={event => lifecycle.checkForUpdates(item, event.currentTarget)}
+                          size="sm"
+                          type="button"
+                          variant="secondary"
+                        >
+                          {copy.workflowMarketplaceCheckUpdates}
+                        </Button>
+                      ) : null}
+                      <Button
+                        onClick={event => lifecycle.remove(item, event.currentTarget)}
+                        size="sm"
+                        type="button"
+                        variant="secondary"
+                      >
+                        {copy.workflowMarketplaceRemovePackage}
+                      </Button>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-xs text-(--ui-text-tertiary)" role="status">
+                      {copy.workflowMarketplaceLifecycleUnavailable}
+                    </p>
+                  )}
                 </article>
               )
             })}
           </div>
         </section>
       ) : null}
+      {lifecycle.dialogs}
       {children}
     </div>
   )

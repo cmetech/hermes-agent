@@ -9,8 +9,14 @@ import { I18nProvider } from '@/i18n'
 import type {
   WorkflowMarketplaceCatalogPackage,
   WorkflowMarketplaceInstalledPackage,
+  WorkflowMarketplaceInstallReview,
   WorkflowMarketplaceOperation,
-  WorkflowMarketplacePackageDetail
+  WorkflowMarketplaceOperationKind,
+  WorkflowMarketplaceOperationResult,
+  WorkflowMarketplacePackageDetail,
+  WorkflowMarketplaceRemoveReview,
+  WorkflowMarketplaceTrustReview,
+  WorkflowMarketplaceUpdateReview
 } from '@/types/hermes'
 
 import { InstalledPackages } from './installed-packages'
@@ -23,26 +29,44 @@ import { WorkflowMarketplaceView } from './index'
 const api = vi.hoisted(() => ({
   cancelOperation: vi.fn(),
   capabilities: vi.fn(),
+  checkUpdates: vi.fn(),
+  confirmInstall: vi.fn(),
+  confirmRemove: vi.fn(),
+  confirmUpdate: vi.fn(),
   getOperation: vi.fn(),
+  grantTrust: vi.fn(),
   inspect: vi.fn(),
   installed: vi.fn(),
   listOperations: vi.fn(),
+  prepareInstall: vi.fn(),
+  prepareRemove: vi.fn(),
+  prepareUpdate: vi.fn(),
   refreshSource: vi.fn(),
+  reviewTrust: vi.fn(),
   search: vi.fn(),
   sources: vi.fn()
 }))
 
 vi.mock('@/hermes', () => ({
   cancelWorkflowMarketplaceOperation: (...args: unknown[]) => api.cancelOperation(...args),
+  checkWorkflowPackageUpdates: (...args: unknown[]) => api.checkUpdates(...args),
+  confirmWorkflowPackageInstall: (...args: unknown[]) => api.confirmInstall(...args),
+  confirmWorkflowPackageRemoval: (...args: unknown[]) => api.confirmRemove(...args),
+  confirmWorkflowPackageUpdate: (...args: unknown[]) => api.confirmUpdate(...args),
   getWorkflowMarketplaceCapabilities: (...args: unknown[]) => api.capabilities(...args),
   getWorkflowMarketplaceOperation: (...args: unknown[]) => api.getOperation(...args),
+  grantWorkflowPackageTrust: (...args: unknown[]) => api.grantTrust(...args),
   inspectWorkflowPackage: (...args: unknown[]) => api.inspect(...args),
   isWorkflowMarketplaceUnsupportedError: (error: unknown) =>
     typeof error === 'object' && error !== null && 'code' in error && error.code === 'marketplace_unsupported',
   listInstalledWorkflowPackages: (...args: unknown[]) => api.installed(...args),
   listWorkflowMarketplaceOperations: (...args: unknown[]) => api.listOperations(...args),
   listWorkflowMarketplaceSources: (...args: unknown[]) => api.sources(...args),
+  prepareWorkflowPackageInstall: (...args: unknown[]) => api.prepareInstall(...args),
+  prepareWorkflowPackageRemoval: (...args: unknown[]) => api.prepareRemove(...args),
+  prepareWorkflowPackageUpdate: (...args: unknown[]) => api.prepareUpdate(...args),
   refreshWorkflowMarketplaceSource: (...args: unknown[]) => api.refreshSource(...args),
+  reviewWorkflowPackageTrust: (...args: unknown[]) => api.reviewTrust(...args),
   searchWorkflowPackages: (...args: unknown[]) => api.search(...args)
 }))
 
@@ -50,6 +74,10 @@ const NOW = '2026-09-04T00:00:00Z'
 const DIGEST = 'a'.repeat(64)
 const COMMIT = 'b'.repeat(40)
 const OPERATION_ID = `wmop_${'c'.repeat(12)}_${'d'.repeat(32)}`
+const INSTALL_TOKEN = 'install-confirmation-token-value-1234567890'
+const UPDATE_TOKEN = 'update-confirmation-token-value-1234567890'
+const REMOVE_TOKEN = 'remove-confirmation-token-value-1234567890'
+const TRUST_TOKEN = 'trust-confirmation-token-value-1234567890'
 const scopeA = { connectionId: 'remote-a', profile: 'support' }
 const originalHasPointerCapture = Element.prototype.hasPointerCapture
 const originalReleasePointerCapture = Element.prototype.releasePointerCapture
@@ -277,6 +305,170 @@ function pendingRefresh(sourceName: string): WorkflowMarketplaceOperation {
   }
 }
 
+function assessment(detail = packageDetail()) {
+  return {
+    advisories: detail.advisories,
+    blockers: detail.blockers,
+    external_requirements: detail.external_requirements,
+    package_digest: detail.package_digest,
+    package_resources: detail.resources.map(resource => resource.path),
+    review_digest: 'f'.repeat(64),
+    workflow_names: detail.workflows.map(workflow => workflow.workflow_name)
+  }
+}
+
+function installReview(
+  detail = packageDetail({ install_status: 'not_installed', installed: null, update_status: 'not_applicable' })
+): WorkflowMarketplaceInstallReview {
+  return {
+    assessment: assessment(detail),
+    candidate_digest: detail.package_digest,
+    candidate_version: detail.version,
+    confirmation_token: INSTALL_TOKEN,
+    configured_ref: detail.configured_ref,
+    file_changes: detail.resources.map(resource => ({
+      candidate_digest: DIGEST,
+      kind: 'added' as const,
+      old_digest: null,
+      old_path: null,
+      path: resource.path
+    })),
+    identity: detail.identity,
+    operation: 'install',
+    package_path: detail.package_path,
+    repository_url: detail.repository_url,
+    resolved_commit: detail.resolved_commit,
+    result: 'review_required',
+    review_digest: 'f'.repeat(64),
+    source_name: detail.source_name,
+    workflow_reviews: detail.workflows
+  }
+}
+
+function updateReview(detail = packageDetail()): WorkflowMarketplaceUpdateReview {
+  const empty = { added: [] as string[], removed: [] as string[] }
+
+  return {
+    assessment: assessment(detail),
+    candidate_commit: detail.resolved_commit,
+    candidate_digest: detail.package_digest,
+    candidate_version: detail.version,
+    compatibility_changes: { added: [], removed: [] },
+    confirmation_token: UPDATE_TOKEN,
+    configured_ref: detail.configured_ref,
+    file_changes: [],
+    identity: detail.identity,
+    old_commit: '1'.repeat(40),
+    old_digest: '2'.repeat(64),
+    old_version: detail.installed?.version ?? '1.0.0',
+    operation: 'update',
+    repository_url: detail.repository_url,
+    requirement_changes: {
+      providers: empty,
+      runtimes: empty,
+      secrets: empty,
+      services: empty,
+      tools: empty
+    },
+    result: 'update_available',
+    review_digest: 'f'.repeat(64),
+    risk_changes: { added: [], removed: [] },
+    source_name: detail.source_name,
+    workflow_changes: empty,
+    workflow_reviews: detail.workflows
+  }
+}
+
+function removeReview(item = installedPackage()): WorkflowMarketplaceRemoveReview {
+  return {
+    confirmation_token: REMOVE_TOKEN,
+    current_commit: item.resolved_commit,
+    current_version: item.version,
+    distribution_digest: item.distribution_digest,
+    identity: item.identity,
+    operation: 'remove',
+    result: 'review_required',
+    review_digest: 'f'.repeat(64),
+    workflow_names: ['Laptop diagnostic']
+  }
+}
+
+function trustReview(item = installedPackage(), workflowName?: string): WorkflowMarketplaceTrustReview {
+  const workflows = packageDetail().workflows.filter(
+    workflow => workflowName === undefined || workflow.workflow_name === workflowName
+  )
+
+  return {
+    confirmation_token: workflowName ? `${TRUST_TOKEN}-one` : TRUST_TOKEN,
+    distribution_digest: item.distribution_digest,
+    identity: item.identity,
+    package_resources: packageDetail().resources.map(resource => resource.path),
+    resolved_commit: item.resolved_commit,
+    review_digest: 'f'.repeat(64),
+    source_name: item.source_name,
+    version: item.version,
+    workflows
+  }
+}
+
+function lifecycleOperation(
+  kind: WorkflowMarketplaceOperationKind,
+  result: WorkflowMarketplaceOperationResult,
+  id = OPERATION_ID
+): WorkflowMarketplaceOperation {
+  return {
+    created_at: NOW,
+    error: null,
+    finished_at: NOW,
+    id,
+    kind,
+    phase: 'completed',
+    profile: 'support',
+    progress: 100,
+    result,
+    schema_version: 1,
+    source_name: null,
+    started_at: NOW,
+    state: 'succeeded',
+    updated_at: NOW
+  } as WorkflowMarketplaceOperation
+}
+
+function pendingLifecycle(kind: WorkflowMarketplaceOperationKind, id = OPERATION_ID): WorkflowMarketplaceOperation {
+  return {
+    created_at: NOW,
+    error: null,
+    finished_at: null,
+    id,
+    kind,
+    phase: 'queued',
+    profile: 'support',
+    progress: 0,
+    result: null,
+    schema_version: 1,
+    source_name: null,
+    started_at: null,
+    state: 'pending',
+    updated_at: NOW
+  } as WorkflowMarketplaceOperation
+}
+
+function failedLifecycle(
+  kind: WorkflowMarketplaceOperationKind,
+  code = 'marketplace_operation_failed',
+  id = OPERATION_ID
+): WorkflowMarketplaceOperation {
+  return {
+    ...pendingLifecycle(kind, id),
+    error: { code, message: 'Workflow marketplace operation failed.' },
+    finished_at: NOW,
+    phase: 'failed',
+    progress: 80,
+    started_at: NOW,
+    state: 'failed'
+  } as WorkflowMarketplaceOperation
+}
+
 function unsuccessfulRefresh(state: 'cancelled' | 'failed'): WorkflowMarketplaceOperation {
   return {
     ...succeededRefresh('company'),
@@ -403,6 +595,15 @@ beforeEach(() => {
   api.getOperation.mockReset().mockResolvedValue(succeededDetail())
   api.listOperations.mockReset().mockResolvedValue({ limit: 100, offset: 0, operations: [], profile: 'support' })
   api.cancelOperation.mockReset()
+  api.checkUpdates.mockReset()
+  api.confirmInstall.mockReset()
+  api.confirmRemove.mockReset()
+  api.confirmUpdate.mockReset()
+  api.grantTrust.mockReset()
+  api.prepareInstall.mockReset()
+  api.prepareRemove.mockReset()
+  api.prepareUpdate.mockReset()
+  api.reviewTrust.mockReset()
   api.refreshSource.mockReset().mockImplementation((name: string) => Promise.resolve(succeededRefresh(name)))
 })
 
@@ -1423,5 +1624,572 @@ describe('browse presentation components', () => {
     expect(screen.getAllByRole('option')).toHaveLength(100)
     expect(screen.queryByText(/package_digest/i)).toBeNull()
     expect(screen.queryByText(DIGEST)).toBeNull()
+  })
+})
+
+describe('workflow package lifecycle', () => {
+  async function selectPackage() {
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    await screen.findByRole('region', { name: 'Laptop Support package details' })
+  }
+
+  it('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    api.prepareInstall.mockResolvedValueOnce(
+      lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
+    )
+    api.confirmInstall.mockResolvedValueOnce(
+      lifecycleOperation('install_confirm', {
+        type: 'installed_package',
+        value: installedPackage({ version: candidate.version })
+      })
+    )
+    api.reviewTrust.mockResolvedValueOnce(
+      lifecycleOperation('trust_prepare', { type: 'trust_review', value: trustReview() })
+    )
+    const rendered = renderMarketplace()
+    const invalidate = vi.spyOn(rendered.client, 'invalidateQueries')
+
+    await selectPackage()
+    const action = screen.getByRole('button', { name: 'Install package' })
+    fireEvent.click(action)
+    fireEvent.click(action)
+
+    expect(api.prepareInstall).toHaveBeenCalledTimes(1)
+    expect(api.prepareInstall).toHaveBeenCalledWith({ identifier: 'company/laptop-support' }, scopeA)
+    expect(await screen.findByRole('dialog', { name: 'Review installation' })).toBeTruthy()
+    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
+
+    const confirm = screen.getByRole('button', { name: 'Confirm install' })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+
+    await screen.findByText('Installed — trust required to run')
+    expect(api.confirmInstall).toHaveBeenCalledTimes(1)
+    expect(api.confirmInstall).toHaveBeenCalledWith(INSTALL_TOKEN, scopeA)
+    expect(api.grantTrust).not.toHaveBeenCalled()
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: marketplaceKeys.installed('remote-a::support') })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: marketplaceKeys.searchRoot('remote-a::support') })
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: marketplaceKeys.detail('remote-a::support', 'company', 'laptop-support')
+    })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['workflow-catalog', 'remote-a::support'] })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review trust' }))
+    expect(await screen.findByRole('dialog', { name: 'Review trust' })).toBeTruthy()
+    expect(api.reviewTrust).toHaveBeenCalledWith(
+      { packageId: candidate.identity.package_id, sourceKey: candidate.identity.source_key },
+      undefined,
+      scopeA
+    )
+    expect(api.grantTrust).not.toHaveBeenCalled()
+  })
+
+  it('shows prepare progress, cooperatively cancels, and stops old-scope polling without cross-publishing', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    const pending = pendingLifecycle('install_prepare')
+    api.inspect.mockResolvedValue(succeededDetail(candidate))
+    api.prepareInstall.mockResolvedValueOnce(pending)
+    api.cancelOperation.mockResolvedValueOnce({
+      ...pending,
+      error: null,
+      finished_at: NOW,
+      phase: 'cancelled',
+      progress: 10,
+      started_at: NOW,
+      state: 'cancelled'
+    })
+    const rendered = renderMarketplace()
+
+    await selectPackage()
+    vi.useFakeTimers()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+      await Promise.resolve()
+    })
+    expect(screen.getByText('queued 0%')).toBeTruthy()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel operation' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel operation' }))
+      await Promise.resolve()
+    })
+    expect(api.cancelOperation).toHaveBeenCalledTimes(1)
+    expect(api.cancelOperation).toHaveBeenCalledWith(OPERATION_ID, scopeA)
+    expect(screen.getByText('Installation was cancelled. Nothing new was installed.')).toBeTruthy()
+
+    api.prepareInstall.mockResolvedValueOnce(pending)
+    fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
+    await act(async () => {
+      rendered.rerender(
+        <I18nProvider configClient={null} initialLocale="en">
+          <QueryClientProvider client={rendered.client}>
+            <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
+          </QueryClientProvider>
+        </I18nProvider>
+      )
+      await vi.advanceTimersByTimeAsync(500)
+    })
+    expect(screen.queryByRole('dialog', { name: 'Review installation' })).toBeNull()
+  })
+
+  it('uses backend update truth for unchanged and preserves the exact previous version on failure', async () => {
+    const current = packageDetail({ update_status: 'current' })
+    api.inspect.mockResolvedValueOnce(succeededDetail(current))
+    api.checkUpdates.mockResolvedValueOnce(
+      lifecycleOperation('update_check', {
+        type: 'update_checks',
+        value: {
+          checks: [
+            {
+              candidate_version: null,
+              diagnostic_code: null,
+              identity: current.identity,
+              installed_version: '1.1.0',
+              message: null,
+              status: 'current'
+            }
+          ]
+        }
+      })
+    )
+    const rendered = renderMarketplace()
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
+    expect(await screen.findByText('Version 1.1.0 is current. No update was installed.')).toBeTruthy()
+    expect(api.prepareUpdate).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Close' }).at(-1)!)
+    api.inspect.mockResolvedValueOnce(succeededDetail(packageDetail()))
+    rendered.client.removeQueries({
+      queryKey: marketplaceKeys.detail('remote-a::support', 'company', 'laptop-support')
+    })
+    rendered.rerender(
+      <I18nProvider configClient={null} initialLocale="en">
+        <QueryClientProvider client={rendered.client}>
+          <WorkflowMarketplaceView scope={scopeA} />
+        </QueryClientProvider>
+      </I18nProvider>
+    )
+    await selectPackage()
+    api.prepareUpdate.mockResolvedValueOnce(
+      lifecycleOperation('update_prepare', { type: 'update_review', value: updateReview() })
+    )
+    api.confirmUpdate.mockResolvedValueOnce(failedLifecycle('update_confirm'))
+    fireEvent.click(screen.getByRole('button', { name: 'Update package' }))
+    await screen.findByRole('dialog', { name: 'Review update' })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
+    expect(await screen.findByText('Version 1.1.0 remains installed.')).toBeTruthy()
+    expect(screen.queryByText(/rolled back/i)).toBeNull()
+  })
+
+  it('uses an exact update check before preparing and leaves changed installed bytes untrusted', async () => {
+    const current = packageDetail({ update_status: 'current' })
+    api.inspect.mockResolvedValueOnce(succeededDetail(current))
+    api.checkUpdates.mockResolvedValueOnce(
+      lifecycleOperation('update_check', {
+        type: 'update_checks',
+        value: {
+          checks: [
+            {
+              candidate_version: '1.1.0',
+              diagnostic_code: null,
+              identity: current.identity,
+              installed_version: current.installed!.version,
+              message: null,
+              status: 'update_available'
+            }
+          ]
+        }
+      })
+    )
+    api.prepareUpdate.mockResolvedValueOnce(
+      lifecycleOperation('update_prepare', { type: 'update_review', value: updateReview(current) })
+    )
+    api.confirmUpdate.mockResolvedValueOnce(
+      lifecycleOperation('update_confirm', {
+        type: 'updated_package',
+        value: installedPackage({ version: current.version })
+      })
+    )
+    renderMarketplace()
+
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
+    expect(await screen.findByRole('dialog', { name: 'Review update' })).toBeTruthy()
+    expect(api.checkUpdates).toHaveBeenCalledWith(
+      { packageId: current.identity.package_id, sourceKey: current.identity.source_key },
+      scopeA
+    )
+    expect(api.prepareUpdate).toHaveBeenCalledWith(
+      { packageId: current.identity.package_id, sourceKey: current.identity.source_key },
+      scopeA
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
+    expect(await screen.findByText('Updated to version 1.1.0 — trust required to run')).toBeTruthy()
+    expect(api.confirmUpdate).toHaveBeenCalledWith(UPDATE_TOKEN, scopeA)
+    expect(api.grantTrust).not.toHaveBeenCalled()
+  })
+
+  it('offers provenance-backed installed actions, removes only after review, and retains the package on failure', async () => {
+    api.prepareRemove.mockResolvedValueOnce(
+      lifecycleOperation('remove_prepare', { type: 'remove_review', value: removeReview() })
+    )
+    api.confirmRemove.mockResolvedValueOnce(failedLifecycle('remove_confirm'))
+    renderWithProviders(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose project workflow</div>
+      </InstalledPackages>
+    )
+
+    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    expect(within(packageGroup).getByRole('button', { name: 'Review trust' })).toBeTruthy()
+    expect(within(packageGroup).getByRole('button', { name: 'Check for updates' })).toBeTruthy()
+    expect(within(packageGroup).getByRole('button', { name: 'Remove package' })).toBeTruthy()
+    expect(screen.getByText('Loose project workflow')).toBeTruthy()
+
+    fireEvent.click(within(packageGroup).getByRole('button', { name: 'Remove package' }))
+    expect(await screen.findByRole('dialog', { name: 'Review removal' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove package' }))
+    expect(await screen.findByText('Version 1.1.0 remains installed.')).toBeTruthy()
+    expect(api.confirmRemove).toHaveBeenCalledWith(REMOVE_TOKEN, scopeA)
+  })
+
+  it('does not announce removal until the exact confirm operation reaches terminal success', async () => {
+    const completion = deferred<WorkflowMarketplaceOperation>()
+    api.prepareRemove.mockResolvedValueOnce(
+      lifecycleOperation('remove_prepare', { type: 'remove_review', value: removeReview() })
+    )
+    api.confirmRemove.mockReturnValueOnce(completion.promise)
+    renderWithProviders(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose project workflow</div>
+      </InstalledPackages>
+    )
+
+    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    fireEvent.click(within(packageGroup).getByRole('button', { name: 'Remove package' }))
+    await screen.findByRole('dialog', { name: 'Review removal' })
+    fireEvent.click(screen.getByRole('button', { name: 'Remove package' }))
+    expect(screen.queryByText('Package removed.')).toBeNull()
+    expect(screen.getByText('Loose project workflow')).toBeTruthy()
+
+    completion.resolve(lifecycleOperation('remove_confirm', { type: 'removed_package', value: installedPackage() }))
+    expect(await screen.findByText('Package removed.')).toBeTruthy()
+  })
+
+  it('re-prepares trust for exactly one selected workflow and grants only the fresh token', async () => {
+    const allTrustReview = trustReview()
+    allTrustReview.workflows.push({
+      ...allTrustReview.workflows[0],
+      definition_path: 'workflows/battery-diagnostic.yml',
+      workflow_name: 'Battery diagnostic'
+    })
+    api.reviewTrust
+      .mockResolvedValueOnce(lifecycleOperation('trust_prepare', { type: 'trust_review', value: allTrustReview }))
+      .mockResolvedValueOnce(
+        lifecycleOperation('trust_prepare', {
+          type: 'trust_review',
+          value: trustReview(installedPackage(), 'Laptop diagnostic')
+        })
+      )
+    api.grantTrust.mockResolvedValueOnce(
+      lifecycleOperation('trust_confirm', {
+        type: 'trust_grant',
+        value: { workflows: [{ state: 'trusted', workflow_name: 'Laptop diagnostic' }] }
+      })
+    )
+    renderWithProviders(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>
+    )
+    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    fireEvent.click(within(packageGroup).getByRole('button', { name: 'Review trust' }))
+    await screen.findByRole('dialog', { name: 'Review trust' })
+    fireEvent.click(screen.getByRole('radio', { name: 'One workflow' }))
+
+    await waitFor(() =>
+      expect(api.reviewTrust).toHaveBeenLastCalledWith(
+        {
+          packageId: installedPackage().identity.package_id,
+          sourceKey: installedPackage().identity.source_key
+        },
+        'Laptop diagnostic',
+        scopeA
+      )
+    )
+    expect(screen.getByRole('option', { name: 'Battery diagnostic' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Grant trust' }))
+    await screen.findByText('Trust granted for the reviewed installed bytes.')
+    expect(api.grantTrust).toHaveBeenCalledWith(`${TRUST_TOKEN}-one`, scopeA)
+    expect(globalThis.document.body.textContent).not.toContain(TRUST_TOKEN)
+  })
+
+  it('polls admitted preparation, stops on status failure, and retries only the exact operation', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    api.prepareInstall.mockResolvedValueOnce(pendingLifecycle('install_prepare'))
+    api.getOperation.mockRejectedValueOnce(
+      new WorkflowMarketplaceApiError(
+        'marketplace_network_error',
+        0,
+        'access_token=secret /private/tmp/operation-status'
+      )
+    )
+    await renderMarketplace()
+    await selectPackage()
+    vi.useFakeTimers()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(500)
+    })
+
+    expect(screen.getByText('Operation status is temporarily unavailable. Retry.')).toBeTruthy()
+    expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
+    expect(api.getOperation).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500)
+    })
+    expect(api.getOperation).toHaveBeenCalledTimes(1)
+
+    api.getOperation.mockResolvedValueOnce(
+      lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
+    )
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry status' }))
+      await Promise.resolve()
+    })
+
+    expect(api.getOperation).toHaveBeenLastCalledWith(OPERATION_ID, scopeA)
+    expect(screen.getByRole('dialog', { name: 'Review installation' })).toBeTruthy()
+    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
+  })
+
+  it('stops an evicted operation without looping and admits one fresh replacement review', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    api.prepareInstall
+      .mockResolvedValueOnce(pendingLifecycle('install_prepare'))
+      .mockResolvedValueOnce(
+        lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
+      )
+    api.getOperation.mockRejectedValueOnce(
+      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'private operation identity')
+    )
+    renderMarketplace()
+    await selectPackage()
+    vi.useFakeTimers()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(500)
+    })
+    expect(screen.getByText('Operation status expired. Refresh package truth or prepare again.')).toBeTruthy()
+    expect(api.getOperation).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500)
+      fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
+      await Promise.resolve()
+    })
+    expect(api.getOperation).toHaveBeenCalledTimes(1)
+    expect(api.prepareInstall).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('dialog', { name: 'Review installation' })).toBeTruthy()
+  })
+
+  it('classifies rejected stale confirmation without installing or exposing backend details', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    api.prepareInstall.mockResolvedValueOnce(
+      lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
+    )
+    api.confirmInstall.mockRejectedValueOnce(
+      new WorkflowMarketplaceApiError(
+        'confirmation_token_invalid',
+        409,
+        'access_token=secret /private/tmp/stale-review'
+      )
+    )
+    renderMarketplace()
+
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByRole('dialog', { name: 'Review installation' })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm install' }))
+
+    expect(
+      await screen.findByText('The review expired or changed. Prepare a fresh review before continuing.')
+    ).toBeTruthy()
+    expect(screen.getByText('Nothing new was installed.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Prepare again' })).toBeTruthy()
+    expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
+    expect(api.grantTrust).not.toHaveBeenCalled()
+  })
+
+  it('closes preparation without backend cancellation and returns focus to the originating action', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    api.prepareInstall.mockResolvedValueOnce(pendingLifecycle('install_prepare'))
+    renderMarketplace()
+
+    await selectPackage()
+    const action = screen.getByRole('button', { name: 'Install package' })
+    action.focus()
+    fireEvent.click(action)
+    await screen.findByText('queued 0%')
+    const dialog = screen.getByRole('dialog', { name: 'Preparing installation review' })
+    fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' }).at(-1)!)
+
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(action))
+    expect(api.cancelOperation).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('rejects a mismatched review identity and gates lifecycle controls on declared capabilities', async () => {
+    const candidate = packageDetail({
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    api.prepareInstall.mockResolvedValueOnce(
+      lifecycleOperation('install_prepare', {
+        type: 'install_review',
+        value: installReview({ ...candidate, identity: { package_id: 'other-package', source_key: 'company' } })
+      })
+    )
+    const rendered = renderMarketplace()
+
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    expect(await screen.findByText('Installation failed. Nothing new was installed.')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Confirm install' })).toBeNull()
+
+    cleanup()
+    api.capabilities.mockResolvedValueOnce({
+      capabilities: ['sources', 'search', 'installed', 'operations'],
+      profile: 'support',
+      schema_version: 1
+    })
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    rendered.client.clear()
+    renderMarketplace()
+    await selectPackage()
+    expect(screen.queryByRole('button', { name: 'Install package' })).toBeNull()
+    expect(screen.getByText('Upgrade Hermes to manage installed workflow packages.')).toBeTruthy()
+  })
+
+  it('does not offer installation for a freshly inspected candidate with structural blockers', async () => {
+    const candidate = packageDetail({
+      blockers: [{ code: 'package_invalid', message: 'Package structure is invalid.', severity: 'blocker' }],
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
+    renderMarketplace()
+
+    await selectPackage()
+    expect(screen.getByText('Package structure is invalid.')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Install package' })).toBeNull()
+    expect(api.prepareInstall).not.toHaveBeenCalled()
+  })
+
+  it('retains last-known package detail when a lifecycle invalidation refetch fails', async () => {
+    api.inspect
+      .mockResolvedValueOnce(succeededDetail())
+      .mockRejectedValueOnce(new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'private refetch error'))
+    const rendered = renderMarketplace()
+    await selectPackage()
+    expect(screen.getByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+
+    await rendered.client.invalidateQueries({
+      queryKey: marketplaceKeys.detail('remote-a::support', 'company', 'laptop-support')
+    })
+
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    expect(screen.queryByText('Could not inspect workflow package')).toBeNull()
+  })
+
+  it('discards a late lifecycle review when package selection changes', async () => {
+    const lateReview = deferred<WorkflowMarketplaceOperation>()
+    const first = packageDetail({ install_status: 'not_installed', installed: null, update_status: 'not_applicable' })
+
+    const second = packageDetail({
+      display_name: 'Printer Support',
+      id: 'printer-support',
+      identifier: 'company/printer-support',
+      identity: { package_id: 'printer-support', source_key: 'company' },
+      install_status: 'not_installed',
+      installed: null,
+      update_status: 'not_applicable'
+    })
+
+    api.search.mockResolvedValueOnce(
+      page([
+        packageItem(),
+        packageItem({ display_name: 'Printer Support', id: 'printer-support', identifier: 'company/printer-support' })
+      ])
+    )
+    api.inspect.mockImplementation((_source: string, packageId: string) =>
+      Promise.resolve(succeededDetail(packageId === 'printer-support' ? second : first))
+    )
+    api.prepareInstall.mockReturnValueOnce(lateReview.promise)
+    renderMarketplace()
+
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByText('queued 0%')
+
+    const replacement = globalThis.document.querySelector<HTMLButtonElement>(
+      '[data-marketplace-package="company/printer-support"]'
+    )!
+
+    fireEvent.click(replacement)
+    expect(await screen.findByRole('region', { name: 'Printer Support package details' })).toBeTruthy()
+
+    lateReview.resolve(lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(first) }))
+    await act(async () => Promise.resolve())
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
   })
 })

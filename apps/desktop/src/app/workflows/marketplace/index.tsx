@@ -30,6 +30,7 @@ import { MarketplacePackageList, type MarketplacePackageSelection } from './pack
 import { marketplaceKeys } from './query-keys'
 import { ManageWorkflowSourcesDialog } from './source-dialog'
 import { type MarketplaceOperationOrigin, useMarketplaceOperation } from './use-marketplace-operation'
+import { useWorkflowPackageLifecycle } from './use-package-lifecycle'
 
 const PAGE_LIMIT = 50
 const NARROW_MARKETPLACE_QUERY = '(max-width: 39.999rem)'
@@ -133,8 +134,13 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const supportsSources = capabilities.data?.capabilities.includes('sources') === true
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
   const supportsOperations = capabilities.data?.capabilities.includes('operations') === true
+  const supportsTransactions = capabilities.data?.capabilities.includes('transactions') === true
+  const supportsUpdates = capabilities.data?.capabilities.includes('updates') === true
+  const supportsTrust = capabilities.data?.capabilities.includes('trust') === true
   const supportsSourceOperations = supportsSources && supportsOperations
+  const supportsLifecycle = supportsOperations && supportsTransactions
   const sourceOperations = useMarketplaceOperation(scope, supportsSourceOperations)
+  const lifecycle = useWorkflowPackageLifecycle(scope, searchRef, selection?.identifier ?? null)
 
   if (refreshAllGuardRef.current?.scopeKey !== scopeKey) {
     refreshAllGuardRef.current = null
@@ -232,10 +238,11 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const detail = detailFrom(effectiveOperation)
 
   const detailFailed =
-    detailRequest.isError ||
-    (needsDetailPolling && detailOperation.isError) ||
-    effectiveOperation?.state === 'failed' ||
-    effectiveOperation?.state === 'cancelled'
+    !detail &&
+    (detailRequest.isError ||
+      (needsDetailPolling && detailOperation.isError) ||
+      effectiveOperation?.state === 'failed' ||
+      effectiveOperation?.state === 'cancelled')
 
   const detailLoading = selection !== null && !detail && !detailFailed
 
@@ -457,7 +464,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     )
   }
 
-  const searchError = packages.isError
+  const searchError = packages.isError && packages.data === undefined
   const searchErrorCode = errorCode(packages.error)
 
   const searchErrorTitle =
@@ -517,7 +524,39 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         </div>
       ) : detail ? (
         <div className={narrow ? 'mt-3' : undefined}>
-          <MarketplacePackageDetail detail={detail} />
+          <MarketplacePackageDetail
+            actions={
+              supportsLifecycle
+                ? {
+                    ...(detail.install_status === 'not_installed' && detail.blockers.length === 0
+                      ? { install: (origin: HTMLButtonElement) => lifecycle.install(detail, origin) }
+                      : {}),
+                    ...(detail.installed && supportsUpdates
+                      ? {
+                          checkForUpdates: (origin: HTMLButtonElement) =>
+                            lifecycle.checkForUpdates(detail.installed!, origin, detail.source_name),
+                          update: (origin: HTMLButtonElement) =>
+                            lifecycle.update(detail.installed!, origin, detail.source_name)
+                        }
+                      : {}),
+                    ...(detail.installed && supportsTrust
+                      ? {
+                          reviewTrust: (origin: HTMLButtonElement) =>
+                            lifecycle.reviewTrust(detail.installed!, origin, detail.source_name)
+                        }
+                      : {}),
+                    ...(detail.installed
+                      ? {
+                          remove: (origin: HTMLButtonElement) =>
+                            lifecycle.remove(detail.installed!, origin, detail.source_name)
+                        }
+                      : {})
+                  }
+                : undefined
+            }
+            detail={detail}
+            lifecycleUnavailable={!supportsLifecycle}
+          />
         </div>
       ) : null}
     </div>
@@ -624,6 +663,8 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         scope={scope}
         supported={supportsSourceOperations}
       />
+
+      {lifecycle.dialogs}
 
       {stale && !(narrow && selection) ? (
         <p

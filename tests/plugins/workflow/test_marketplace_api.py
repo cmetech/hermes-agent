@@ -829,6 +829,45 @@ def test_source_list_projection_canonicalizes_control_bearing_diagnostics(api) -
 
 
 @pytest.mark.parametrize(
+    "case",
+    [
+        *_DIAGNOSTIC_CORPUS["byteOrderMark"]["raw"],
+        *_DIAGNOSTIC_CORPUS["byteOrderMark"]["encoded"],
+    ],
+)
+def test_source_list_projection_contains_no_raw_or_encoded_byte_order_mark(
+    api,
+    case: dict[str, str],
+) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=case["message"],
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    projected = response.json()["sources"][0]["message"]
+    assert projected == case["canonical"]
+    assert "\ufeff" not in projected
+    assert "%EF%BB%BF" not in projected.upper()
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         b'{"enabled":true,"enabled":false}',

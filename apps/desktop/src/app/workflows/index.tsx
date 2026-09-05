@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { profileScopeKey } from '@/api/client'
 import { ActivityBoard } from '@/components/activity-board/activity-board'
 import type { ActivityBoardCard } from '@/components/activity-board/types'
 import { PageLoader } from '@/components/page-loader'
@@ -425,7 +426,12 @@ export function WorkflowsView() {
       {view === 'workflows' ? (
         <div className="mt-4 min-h-0 flex-1 overflow-y-auto">
           <InstalledPackages scope={marketplaceScope}>
-            <WorkflowCatalog onRunWorkflow={openReview} onViewWorkflow={openView} requestProfile={requestProfile} />
+            <WorkflowCatalog
+              cacheScopeKey={profileScopeKey(marketplaceScope)}
+              onRunWorkflow={openReview}
+              onViewWorkflow={openView}
+              requestProfile={requestProfile}
+            />
           </InstalledPackages>
         </div>
       ) : view === 'marketplace' ? (

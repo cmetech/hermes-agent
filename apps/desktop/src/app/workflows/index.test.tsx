@@ -455,6 +455,7 @@ describe('WorkflowsView', () => {
     close.focus()
 
     const frames: FrameRequestCallback[] = []
+
     const requestFrame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(callback => {
       frames.push(callback)
 
@@ -1354,7 +1355,9 @@ describe('WorkflowsView', () => {
     expect(await screen.findByText('Profile B workflow')).toBeTruthy()
     const profileAResult = { items: [definition({ name: 'Profile A workflow' })], truncated: false }
     profileA.resolve(profileAResult)
-    await waitFor(() => expect(client.getQueryData(['workflow-catalog', 'profile-a'])).toEqual(profileAResult))
+    await waitFor(() =>
+      expect(client.getQueryData(['workflow-catalog', 'remote-a::profile-a'])).toEqual(profileAResult)
+    )
     expect(screen.queryByText('Profile A workflow')).toBeNull()
 
     apiRequestState.profile = 'profile-a'

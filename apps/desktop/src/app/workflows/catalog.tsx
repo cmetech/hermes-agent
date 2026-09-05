@@ -42,6 +42,7 @@ const PAGE_SIZE_OPTIONS = [10, 25, 50] as const
 const EMPTY_CATALOG_ITEMS: Array<WorkflowDefinition | WorkflowDefinitionError> = []
 
 export interface WorkflowCatalogProps {
+  cacheScopeKey?: string
   onRunWorkflow?: (workflow: WorkflowDefinition) => void
   onViewWorkflow?: (workflow: WorkflowDefinition) => void
   requestProfile: string | null
@@ -212,7 +213,12 @@ function CatalogRow({
   )
 }
 
-export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile }: WorkflowCatalogProps) {
+export function WorkflowCatalog({
+  cacheScopeKey,
+  onRunWorkflow,
+  onViewWorkflow,
+  requestProfile
+}: WorkflowCatalogProps) {
   const { t } = useI18n()
   const pageSizeLabelId = useId()
   const [page, setPage] = useState(1)
@@ -222,7 +228,7 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile 
 
   const catalog = useQuery({
     queryFn: () => listWorkflowDefinitions(requestProfile),
-    queryKey: ['workflow-catalog', profile]
+    queryKey: ['workflow-catalog', cacheScopeKey ?? profile]
   })
 
   const items = catalog.data?.items ?? EMPTY_CATALOG_ITEMS
@@ -247,7 +253,7 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile 
     )
   }
 
-  if (catalog.isError) {
+  if (catalog.isError && !catalog.data) {
     return (
       <div className="grid min-h-48 place-items-center" role="alert">
         <ErrorState

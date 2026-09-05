@@ -1205,6 +1205,70 @@ def test_refresh_diagnostics_canonicalize_controls_before_persistence_and_reject
     assert "\\t" not in service.catalog.source_store.catalog_path.read_text()
 
 
+@pytest.mark.parametrize("case", _DIAGNOSTIC_CORPUS["byteOrderMark"]["raw"])
+def test_refresh_diagnostics_canonicalize_byte_order_mark_before_persistence_and_reject_raw_state(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    case: dict[str, str],
+) -> None:
+    configured = service.add_source(
+        WorkflowMarketplaceSource(
+            name="company",
+            repositoryUrl=published_repo.remote.as_uri(),
+        )
+    )
+    message = case["message"]
+
+    assert redact_source_refresh_message(message) == case["canonical"]
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=message,
+        )
+
+    service.catalog.source_store.record_failed_refresh(
+        configured,
+        WorkflowMarketplaceError("source_unavailable", message),
+        attempted_at="2026-09-04T01:00:00Z",
+        state="unavailable",
+    )
+
+    persisted = service.catalog.source_store.catalog_path.read_text()
+    assert "\ufeff" not in persisted
+    assert "\ufeff" not in (service.list_source_records()[0].message or "")
+
+    raw_state = json.loads(persisted)
+    raw_state["statuses"][0]["message"] = message
+    tampered = (json.dumps(raw_state, sort_keys=True) + "\n").encode()
+    service.catalog.source_store.catalog_path.write_bytes(tampered)
+
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        service.list_source_records()
+
+    assert error.value.code == "catalog_state_invalid"
+    assert service.catalog.source_store.catalog_path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize("case", _DIAGNOSTIC_CORPUS["byteOrderMark"]["encoded"])
+def test_refresh_diagnostics_reject_encoded_byte_order_mark(
+    case: dict[str, str],
+) -> None:
+    message = case["message"]
+
+    assert redact_source_refresh_message(message) == case["canonical"]
+    with pytest.raises(ValidationError):
+        SourceRefreshStatus(
+            sourceName="company",
+            state="unavailable",
+            attemptedAt="2026-09-04T01:00:00Z",
+            diagnosticCode="source_unavailable",
+            message=message,
+        )
+
+
 def test_source_list_records_report_auth_failure_without_inventing_cache(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,

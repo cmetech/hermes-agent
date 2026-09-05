@@ -118,6 +118,10 @@ function containsControl(value: string): boolean {
   })
 }
 
+function diagnosticContainsControl(value: string): boolean {
+  return containsControl(value) || value.includes('\uFEFF')
+}
+
 function exactRecord(value: unknown, keys: readonly string[]): Map<string, unknown> | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return null
@@ -730,6 +734,7 @@ function decodeSource(value: unknown): WorkflowMarketplaceSource | null {
 
 const DIAGNOSTIC_PERCENT_ESCAPE = /%[0-9A-Fa-f]{2}/
 const DIAGNOSTIC_PERCENT_ESCAPE_RUN = /(?:%[0-9A-Fa-f]{2})+/g
+
 const DIAGNOSTIC_CREDENTIAL_NAMES = new Set([
   'accesstoken',
   'apikey',
@@ -743,12 +748,15 @@ const DIAGNOSTIC_CREDENTIAL_NAMES = new Set([
   'refreshtoken',
   'token'
 ])
+
 const DIAGNOSTIC_TOKEN_BREAKS = new Set(['<', '>', '"', "'"])
 const DIAGNOSTIC_PATH_BREAKS = new Set([...`"'<>()[\\]{},;?#=&/`])
 const DIAGNOSTIC_TRAILING_URL_PUNCTUATION = new Set([...'.,;:!?)]}'])
+
 const DIAGNOSTIC_URI_ASCII = new Set([
   ...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!$&()*+,;=:@/?#%'
 ])
+
 const HEX_DIGITS = new Set([...'0123456789abcdefABCDEF'])
 
 function isAsciiAlphanumeric(value: string): boolean {
@@ -801,6 +809,7 @@ function diagnosticContainsCredentialAssignment(value: readonly string[]): boole
       .filter(character => character !== '_' && character !== '-')
       .join('')
       .toLowerCase()
+
     let cursor = index
 
     while (cursor < value.length && diagnosticCharacterIsWhitespace(value[cursor])) {
@@ -1178,7 +1187,7 @@ function diagnosticHttpUrlEnd(
         return null
       }
 
-      if ([...decoded].some(character => containsControl(character) || '/\\%'.includes(character))) {
+      if ([...decoded].some(character => diagnosticContainsControl(character) || '/\\%'.includes(character))) {
         return null
       }
 
@@ -1262,7 +1271,7 @@ function safeDiagnosticText(value: unknown): string | null {
   const codePointLength = [...value].length
   const decoded = codePointLength >= 1 && codePointLength <= 4096 && value.trim() === value ? value : null
 
-  if (decoded === null || containsControl(decoded) || diagnosticTextIsUnsafe(decoded)) {
+  if (decoded === null || diagnosticContainsControl(decoded) || diagnosticTextIsUnsafe(decoded)) {
     return null
   }
 
@@ -1289,7 +1298,7 @@ function safeDiagnosticText(value: unknown): string | null {
       return null
     }
 
-    if (containsControl(next) || diagnosticTextIsUnsafe(next)) {
+    if (diagnosticContainsControl(next) || diagnosticTextIsUnsafe(next)) {
       return null
     }
 

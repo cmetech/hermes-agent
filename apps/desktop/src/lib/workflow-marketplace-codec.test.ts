@@ -942,6 +942,7 @@ describe('workflow marketplace codec', () => {
 
     const nearMatch = '/.staginq'
     const message = `${'x'.repeat(4096 - encodedTail.length - nearMatch.length)}${nearMatch}${encodedTail}`
+
     const response = {
       profile: 'support',
       sources: Array.from({ length: 128 }, (_, index) => ({
@@ -987,6 +988,32 @@ describe('workflow marketplace codec', () => {
       }
 
       expect(decodeWorkflowMarketplaceSourceList(response)).toBeNull()
+    }
+  )
+
+  it.each([...diagnosticCorpus.byteOrderMark.raw, ...diagnosticCorpus.byteOrderMark.encoded])(
+    'rejects a source diagnostic containing a raw or encoded byte-order mark: $message',
+    ({ message }) => {
+      expect(
+        decodeWorkflowMarketplaceSourceList({
+          profile: 'support',
+          sources: [
+            {
+              attempted_at: NOW,
+              diagnostic_code: 'source_unavailable',
+              enabled: true,
+              message,
+              name: 'company',
+              ref: null,
+              refresh_state: 'unavailable',
+              repository_url: 'https://example.test/team/workflows.git',
+              resolved_commit: null,
+              verified_at: null,
+              verified_package_count: 0
+            }
+          ]
+        })
+      ).toBeNull()
     }
   )
 
