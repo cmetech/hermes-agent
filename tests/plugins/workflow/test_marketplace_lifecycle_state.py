@@ -873,6 +873,76 @@ def test_consumed_review_authority_is_pruned_before_new_capture(
     assert metadata.validate_unused(remove.confirmation_token)
 
 
+@pytest.mark.parametrize("second_kind", ["trust", "remove"])
+def test_concurrent_review_capture_never_prunes_newer_live_proof(
+    lifecycle_domain, domain, monkeypatch, second_kind
+):
+    d = lifecycle_domain
+    d.install_version()
+    paused = threading.Event()
+    finish = threading.Event()
+    newer_started = threading.Event()
+    original_lock = d.service._issued_review_lock
+
+    class Gate:
+        def __enter__(self):
+            if threading.current_thread().name.startswith("old-snapshot"):
+                paused.set()
+                assert finish.wait(5)
+            original_lock.acquire()
+
+        def __exit__(self, *_args):
+            original_lock.release()
+
+    monkeypatch.setattr(d.service, "_issued_review_lock", Gate())
+    all_selection = AllTrustSelection(type="all")
+
+    def prepare_newer():
+        newer_started.set()
+        if second_kind == "trust":
+            return d.service.review_trust(d.identity, actor="alice")
+        return d.service.prepare_remove(d.identity, actor="alice")
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="old-snapshot") as pool:
+        older_future = pool.submit(d.service.review_trust, d.identity, actor="alice")
+        assert paused.wait(5)
+        try:
+            newer_future = pool.submit(prepare_newer)
+            assert newer_started.wait(5)
+        finally:
+            finish.set()
+        older = older_future.result(timeout=5)
+        newer = newer_future.result(timeout=5)
+
+    selection = all_selection if second_kind == "trust" else None
+    original_metadata = domain.review_token_metadata(
+        d.service,
+        newer,
+        actor="alice",
+        subject=d.subject,
+        selection=selection,
+    )
+    original_expiry = original_metadata.expires_at
+    assert original_metadata.validate_unused(newer.confirmation_token)
+    assert domain.review_token_metadata(
+        d.service,
+        older,
+        actor="alice",
+        subject=d.subject,
+        selection=all_selection,
+    ).validate_unused(older.confirmation_token)
+    newer_metadata = domain.review_token_metadata(
+        d.service,
+        newer,
+        actor="alice",
+        subject=d.subject,
+        selection=selection,
+    )
+    assert newer_metadata.expires_at == original_expiry
+    assert newer_metadata.validate_unused(newer.confirmation_token)
+    assert original_metadata.validate_unused(newer.confirmation_token)
+
+
 @pytest.mark.parametrize("checkpoint", ["cancelled", "enter_atomic"])
 def test_verified_prewrite_cancellation_reaches_registry_cancel_path(
     lifecycle_domain, checkpoint

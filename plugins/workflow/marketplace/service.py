@@ -891,22 +891,27 @@ class WorkflowMarketplaceService:
                 for record in self._trust_confirmations._read().tokens
                 if _parse_timestamp(record.expires_at) > trust_now
             )
-        if token_digest not in live:
-            _fail(
-                "confirmation_token_invalid",
-                "review confirmation authority is unavailable",
-            )
-        with self._issued_review_lock:
-            retained = {
-                key: value for key, value in self._issued_reviews.items() if key in live
-            }
-            if token_digest not in retained and len(retained) >= _ISSUED_REVIEW_LIMIT:
+            if token_digest not in live:
                 _fail(
-                    "transaction_state_size_limit",
-                    "review confirmation authority capacity is exhausted",
+                    "confirmation_token_invalid",
+                    "review confirmation authority is unavailable",
                 )
-            retained[token_digest] = fingerprint
-            self._issued_reviews = retained
+            with self._issued_review_lock:
+                retained = {
+                    key: value
+                    for key, value in self._issued_reviews.items()
+                    if key in live
+                }
+                if (
+                    token_digest not in retained
+                    and len(retained) >= _ISSUED_REVIEW_LIMIT
+                ):
+                    _fail(
+                        "transaction_state_size_limit",
+                        "review confirmation authority capacity is exhausted",
+                    )
+                retained[token_digest] = fingerprint
+                self._issued_reviews = retained
 
     def _matches_issued_review(
         self, review: InstallReview | UpdateReview | RemoveReview | TrustReview
