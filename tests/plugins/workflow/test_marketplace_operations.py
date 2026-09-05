@@ -731,3 +731,26 @@ def test_idle_registry_can_be_retired_but_active_registry_is_preserved() -> None
     finally:
         release.set()
         registry.close_retired()
+
+
+def test_legacy_read_receipt_prevents_retiring_its_profile(registry) -> None:
+    from plugins.workflow.marketplace.lifecycle_models import SourceSubject
+
+    try:
+        operation = registry.start(
+            "refresh",
+            lambda _: _refresh_result("company"),
+            actor="operator-a",
+            target="source:company",
+            subject=SourceSubject(type="source", source_name="company"),
+            canonical_body={"source_name": "company"},
+        )
+    except TypeError as error:
+        pytest.fail(f"read admission metadata is not supported: {error}")
+    assert _wait_terminal(registry, operation.id).state == "succeeded"
+    assert registry.retire_if_idle() is False
+    with pytest.raises(MarketplaceOperationRegistryError) as unavailable:
+        registry.get_lifecycle(operation.id, actor="operator-a")
+    assert unavailable.value.code == "marketplace_operation_unavailable"
+    with pytest.raises(MarketplaceOperationRegistryError):
+        registry.list_snapshot(actor="operator-a")

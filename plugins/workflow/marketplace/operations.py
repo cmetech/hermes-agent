@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -27,9 +27,25 @@ from pydantic import (
 from hermes_cli.git_source import GitSourceError, validate_credential_free_git_source
 
 from .lifecycle_models import (
+    CancelledBeforeCommitOutcome,
+    KnownUnchangedOutcome,
+    LifecycleOperation,
+    LifecycleOutcome,
+    LifecyclePublicError,
+    LifecycleResult,
+    LifecycleSubject,
+    OutcomeUnknown,
+    StrictLifecycleModel,
+    TrustSelection,
     RESULT_TYPE_BY_KIND,
     RUNNING_PHASES_BY_KIND,
     require_result_kind,
+)
+from .admissions import (
+    AdmissionReceipt,
+    LifecycleAdmissionStore,
+    MarketplaceOperationRegistryError,
+    canonical_profile_key,
 )
 from .models import (
     InstallReview,
@@ -323,13 +339,6 @@ class MarketplaceOperation(_StrictOperationModel):
         return self
 
 
-class MarketplaceOperationRegistryError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
 class MarketplaceOperationCapacityError(MarketplaceOperationRegistryError):
     pass
 
@@ -344,6 +353,74 @@ class MarketplaceOperationNotFoundError(MarketplaceOperationRegistryError):
 
 class MarketplaceOperationCancelled(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewTokenMetadata:
+    """Private authority supplied by a preparation's service boundary."""
+
+    confirmation_token: str = field(repr=False)
+    expires_at: str
+    review_digest: str
+    subject: LifecycleSubject
+    selection: TrustSelection | None
+    validate_unused: Callable[[str], bool] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleCompletion:
+    """Explicit worker evidence; validated against the reserved operation."""
+
+    state: Literal["succeeded", "failed"]
+    result: LifecycleResult | None
+    error: LifecyclePublicError | None
+    outcome: LifecycleOutcome
+    review_token: ReviewTokenMetadata | None = field(default=None, repr=False)
+
+
+class AdmissionFound(StrictLifecycleModel):
+    state: Literal["found"] = "found"
+    operation: LifecycleOperation
+
+
+class AdmissionEvicted(StrictLifecycleModel):
+    state: Literal["evicted"] = "evicted"
+    operation_id: str
+    request_id: str
+    registry_epoch: str
+    profile: str
+    kind: str
+    subject: LifecycleSubject
+    selection: TrustSelection | None
+
+
+class LifecycleOperationPage(StrictLifecycleModel):
+    items: tuple[LifecycleOperation, ...]
+    next_cursor: str | None
+    complete: bool
+
+
+class ReviewTokenResponse(StrictLifecycleModel):
+    operation_id: str
+    request_id: str
+    subject: LifecycleSubject
+    selection: TrustSelection | None
+    review_digest: str
+    confirmation_token: str = Field(repr=False)
+    expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ListSnapshot:
+    actor: str
+    expires_at: datetime
+    entries: tuple[bytes, ...]
+    cursors: dict[str, int]
+
+
+_SNAPSHOT_RECORDS_MAX = 1088
+_SNAPSHOTS_MAX = 4
+_SNAPSHOT_BYTES_MAX = 16 * 1024 * 1024
 
 
 def _cancelled() -> NoReturn:
@@ -430,10 +507,13 @@ class _OperationRecord:
     updated_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
-    result: MarketplaceOperationResult | None
-    error: MarketplaceOperationPublicError | None
+    result: MarketplaceOperationResult | LifecycleResult | None
+    error: MarketplaceOperationPublicError | LifecyclePublicError | None
     cancellation: CancellationToken
     future: Future[None] | None = None
+    receipt: AdmissionReceipt | None = None
+    lifecycle: bool = False
+    outcome: LifecycleOutcome | None = None
 
 
 def _utc(value: datetime) -> datetime:
@@ -496,10 +576,9 @@ class WorkflowMarketplaceOperationRegistry:
         max_terminal: int = 128,
         terminal_ttl: timedelta = timedelta(hours=1),
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        admissions: LifecycleAdmissionStore | None = None,
     ):
-        self.profile_key = _clean_identity(
-            profile_key, label="operation profile key", maximum=4096
-        )
+        self.profile_key = canonical_profile_key(profile_key)
         self.profile = _clean_identity(profile, label="operation profile", maximum=256)
         if (
             isinstance(max_workers, bool)
@@ -522,8 +601,20 @@ class WorkflowMarketplaceOperationRegistry:
         self.max_terminal = max_terminal
         self.terminal_ttl = terminal_ttl
         self.clock = clock
-        self._profile_digest = hashlib.sha256(profile_key.encode()).hexdigest()[:12]
-        self._lock = threading.RLock()
+        self._profile_digest = hashlib.sha256(self.profile_key.encode()).hexdigest()[
+            :12
+        ]
+        self.admissions = admissions or LifecycleAdmissionStore(
+            profile_key=self.profile_key, clock=clock
+        )
+        if self.admissions.profile_key != self.profile_key:
+            raise ValueError("admission profile is inconsistent")
+        self._lock = self.admissions.lock
+        # Workers never acquire this gate. Authorization may acquire a domain
+        # lock whose progress callback needs _lock, so it must run outside _lock.
+        self._authorization_gate = threading.Lock()
+        self._snapshots: list[_ListSnapshot] = []
+        self._review_tokens: dict[str, ReviewTokenMetadata] = {}
         self._records: dict[str, _OperationRecord] = {}
         self._active_targets: dict[str, str] = {}
         self._sequence = 0
@@ -562,6 +653,76 @@ class WorkflowMarketplaceOperationRegistry:
         }
         for operation_id in expired | evicted:
             self._records.pop(operation_id, None)
+            self._review_tokens.pop(operation_id, None)
+        self.admissions.prune()
+        self._snapshots = [
+            snapshot for snapshot in self._snapshots if snapshot.expires_at > now
+        ]
+        for operation_id, token in tuple(self._review_tokens.items()):
+            if datetime.fromisoformat(token.expires_at.replace("Z", "+00:00")) <= now:
+                self._review_tokens.pop(operation_id, None)
+
+    def _project_lifecycle_locked(self, record: _OperationRecord) -> LifecycleOperation:
+        receipt = record.receipt
+        if receipt is None or (
+            not record.lifecycle and record.state in _TERMINAL_STATES
+        ):
+            raise MarketplaceOperationRegistryError(
+                "marketplace_operation_unavailable",
+                "Lifecycle projection is unavailable.",
+            )
+        try:
+            return LifecycleOperation.model_validate({
+                "schema_version": 2,
+                "id": record.id,
+                "registry_epoch": self.admissions.epoch,
+                "request_id": receipt.request_id,
+                "kind": receipt.kind,
+                "subject": receipt.subject.model_dump(mode="json"),
+                "selection": receipt.selection.model_dump(mode="json")
+                if receipt.selection
+                else None,
+                "profile": self.profile,
+                "state": record.state,
+                "phase": record.phase,
+                "progress": record.progress,
+                "created_at": _timestamp(record.created_at),
+                "started_at": _timestamp(record.started_at)
+                if record.started_at
+                else None,
+                "updated_at": _timestamp(record.updated_at),
+                "finished_at": _timestamp(record.finished_at)
+                if record.finished_at
+                else None,
+                "result": record.result.model_dump(mode="json")
+                if record.result
+                else None,
+                "error": record.error.model_dump(mode="json") if record.error else None,
+                "outcome": record.outcome.model_dump(mode="json")
+                if record.outcome
+                else None,
+            })
+        except Exception:
+            raise MarketplaceOperationRegistryError(
+                "marketplace_operation_unavailable",
+                "Lifecycle projection is unavailable.",
+            ) from None
+
+    def _project_receipt_locked(self, receipt):
+        record = self._records.get(receipt.operation_id)
+        if record is not None:
+            return self._project_lifecycle_locked(record)
+        return AdmissionEvicted(
+            operation_id=receipt.operation_id,
+            request_id=receipt.request_id,
+            registry_epoch=self.admissions.epoch,
+            profile=self.profile,
+            kind=receipt.kind,
+            subject=receipt.subject.model_copy(deep=True),
+            selection=receipt.selection.model_copy(deep=True)
+            if receipt.selection
+            else None,
+        )
 
     def _project_locked(self, record: _OperationRecord) -> MarketplaceOperation:
         return MarketplaceOperation.model_validate({
@@ -614,8 +775,9 @@ class WorkflowMarketplaceOperationRegistry:
         record: _OperationRecord,
         *,
         state: Literal["succeeded", "failed", "cancelled"],
-        result: MarketplaceOperationResult | None = None,
-        error: MarketplaceOperationPublicError | None = None,
+        result: MarketplaceOperationResult | LifecycleResult | None = None,
+        error: MarketplaceOperationPublicError | LifecyclePublicError | None = None,
+        outcome: LifecycleOutcome | None = None,
     ) -> None:
         if record.state in _TERMINAL_STATES:
             return
@@ -631,6 +793,42 @@ class WorkflowMarketplaceOperationRegistry:
         record.finished_at = now
         record.result = result
         record.error = error
+        record.outcome = outcome
+        if record.lifecycle:
+            if state == "cancelled":
+                if record.cancellation.atomic_started:
+                    record.state = "failed"
+                    record.phase = "failed"
+                    record.error = LifecyclePublicError(
+                        code="marketplace_operation_failed"
+                    )
+                    record.outcome = OutcomeUnknown(
+                        type="outcome_unknown", reason="terminal_invalid"
+                    )
+                else:
+                    record.outcome = CancelledBeforeCommitOutcome(
+                        type="cancelled_before_commit", package_state=None
+                    )
+            if record.outcome is None:
+                record.outcome = OutcomeUnknown(
+                    type="outcome_unknown", reason="terminal_invalid"
+                )
+            try:
+                validated = self._project_lifecycle_locked(record)
+                record.result = validated.result
+                record.error = validated.error
+                record.outcome = validated.outcome
+            except MarketplaceOperationRegistryError:
+                record.state = "failed"
+                record.phase = "failed"
+                record.progress = min(record.progress, 99)
+                record.result = None
+                record.error = LifecyclePublicError(code="marketplace_operation_failed")
+                record.outcome = OutcomeUnknown(
+                    type="outcome_unknown", reason="terminal_invalid"
+                )
+        if record.receipt is not None:
+            self.admissions.finish(record.receipt)
         self._release_target_locked(record)
         self._prune_locked(now)
 
@@ -644,7 +842,12 @@ class WorkflowMarketplaceOperationRegistry:
             record = self._records.get(operation_id)
             if record is None or record.state != "running":
                 return
-            if phase not in _registry_running_phases(record.kind):
+            allowed_phases = (
+                RUNNING_PHASES_BY_KIND[record.receipt.kind]
+                if record.lifecycle
+                else _registry_running_phases(record.kind)
+            )
+            if phase not in allowed_phases:
                 raise ValueError("operation phase is invalid for its kind")
             if progress < record.progress:
                 raise ValueError("operation progress cannot move backwards")
@@ -655,11 +858,59 @@ class WorkflowMarketplaceOperationRegistry:
     def start(
         self,
         kind: str,
+        call: Callable[
+            [CancellationToken], MarketplaceOperationResult | LifecycleCompletion
+        ],
+        *,
+        actor: str = "operator",
+        target: str | None = None,
+        request_id: str | None = None,
+        canonical_body: object = None,
+        subject: LifecycleSubject | None = None,
+        selection: TrustSelection | None = None,
+        authorize: Callable[[], None] | None = None,
+    ) -> MarketplaceOperation | LifecycleOperation | AdmissionEvicted:
+        with self._authorization_gate:
+            if authorize is not None:
+                with self._lock:
+                    self._prune_locked(self._now())
+                    if request_id is not None:
+                        receipt = self.admissions.lookup(
+                            actor, self.profile_key, request_id
+                        )
+                        if receipt is not None:
+                            receipt.require_same_request(
+                                _lifecycle_kind(kind),
+                                canonical_body,
+                                subject,
+                                selection,
+                            )
+                            return self._project_receipt_locked(receipt)
+                        self.admissions.require_new_request_window(request_id)
+                authorize()
+            return self._start(
+                kind,
+                call,
+                actor=actor,
+                target=target,
+                request_id=request_id,
+                canonical_body=canonical_body,
+                subject=subject,
+                selection=selection,
+            )
+
+    def _start(
+        self,
+        kind: str,
         call: Callable[[CancellationToken], MarketplaceOperationResult],
         *,
         actor: str = "operator",
         target: str | None = None,
-    ) -> MarketplaceOperation:
+        request_id: str | None = None,
+        canonical_body: object = None,
+        subject: LifecycleSubject | None = None,
+        selection: TrustSelection | None = None,
+    ) -> MarketplaceOperation | LifecycleOperation | AdmissionEvicted:
         kind = _clean_identifier(kind, label="operation kind")
         if _lifecycle_kind(kind) not in RESULT_TYPE_BY_KIND:
             raise ValueError("operation kind is invalid")
@@ -668,15 +919,28 @@ class WorkflowMarketplaceOperationRegistry:
             raise TypeError("operation call must be callable")
         if target is not None:
             target = _clean_identity(target, label="operation target", maximum=512)
-        _refresh_source_name(kind, target)
+        lifecycle = request_id is not None
+        if not lifecycle:
+            _refresh_source_name(kind, target)
         with self._lock:
+            now = self._now()
+            self._prune_locked(now)
+            receipt = None
+            if lifecycle or subject is not None:
+                if request_id is None:
+                    request_id = self.admissions.new_request_id()
+                receipt = self.admissions.lookup(actor, self.profile_key, request_id)
+                if receipt is not None:
+                    receipt.require_same_request(
+                        _lifecycle_kind(kind), canonical_body, subject, selection
+                    )
+                    return self._project_receipt_locked(receipt)
+                self.admissions.require_new_request_window(request_id)
             if self._closed:
                 raise MarketplaceOperationCapacityError(
                     "marketplace_operation_unavailable",
                     "marketplace operation registry is closed",
                 )
-            now = self._now()
-            self._prune_locked(now)
             in_flight = sum(
                 record.state not in _TERMINAL_STATES
                 for record in self._records.values()
@@ -691,8 +955,18 @@ class WorkflowMarketplaceOperationRegistry:
                     "marketplace_operation_conflict",
                     "a conflicting marketplace operation is already active",
                 )
+            if request_id is not None:
+                receipt = self.admissions.reserve(
+                    request_id,
+                    actor,
+                    self.profile_key,
+                    _lifecycle_kind(kind),
+                    canonical_body,
+                    subject,
+                    selection,
+                ).receipt
             self._sequence += 1
-            operation_id = self._operation_id()
+            operation_id = receipt.operation_id if receipt else self._operation_id()
             cancellation = CancellationToken(
                 lambda phase, progress: self._progress(operation_id, phase, progress)
             )
@@ -712,20 +986,38 @@ class WorkflowMarketplaceOperationRegistry:
                 result=None,
                 error=None,
                 cancellation=cancellation,
+                receipt=receipt,
+                lifecycle=lifecycle,
             )
             self._records[operation_id] = record
             if target is not None:
                 self._active_targets[target] = operation_id
-            projection = self._project_locked(record)
-        try:
-            future = self._executor.submit(self._run, operation_id, call)
-        except Exception:
-            with self._lock:
-                current = self._records.pop(operation_id, None)
-                if current is not None:
-                    self._release_target_locked(current)
-            raise
-        with self._lock:
+            projection = (
+                self._project_lifecycle_locked(record)
+                if lifecycle
+                else self._project_locked(record)
+            )
+            try:
+                future = self._executor.submit(self._run, operation_id, call)
+            except Exception:
+                record.started_at = now
+                self._terminal_locked(
+                    record,
+                    state="failed",
+                    error=MarketplaceOperationPublicError(
+                        code="marketplace_operation_unavailable"
+                    ),
+                    outcome=KnownUnchangedOutcome(
+                        type="known_unchanged",
+                        evidence="before_mutation",
+                        package_state=None,
+                    ),
+                )
+                return (
+                    self._project_lifecycle_locked(record)
+                    if lifecycle
+                    else self._project_locked(record)
+                )
             current = self._records.get(operation_id)
             if current is not None:
                 current.future = future
@@ -752,6 +1044,26 @@ class WorkflowMarketplaceOperationRegistry:
         try:
             cancellation.checkpoint()
             result = call(cancellation)
+            if record.lifecycle:
+                with self._lock:
+                    if not isinstance(
+                        result, LifecycleCompletion
+                    ) or result.state not in {"succeeded", "failed"}:
+                        raise ValueError("lifecycle completion evidence is required")
+                    cancellation.checkpoint()
+                    if result.review_token is not None:
+                        self._validate_review_metadata(record, result)
+                    self._terminal_locked(
+                        record,
+                        state=result.state,
+                        result=result.result,
+                        error=result.error,
+                        outcome=result.outcome,
+                    )
+                    if record.state == "succeeded" and result.review_token is not None:
+                        if record.id in self._records:
+                            self._review_tokens[record.id] = result.review_token
+                return
             result = validate_marketplace_operation_result(
                 result.model_dump(mode="json", by_alias=True)
                 if isinstance(result, _OperationResultBase)
@@ -815,7 +1127,197 @@ class WorkflowMarketplaceOperationRegistry:
         actor = _clean_identity(actor, label="operation actor", maximum=256)
         with self._lock:
             self._prune_locked(self._now())
-            return self._project_locked(self._require_locked(operation_id, actor))
+            record = self._require_locked(operation_id, actor)
+            return (
+                self._project_lifecycle_locked(record)
+                if record.lifecycle
+                else self._project_locked(record)
+            )
+
+    def get_lifecycle(self, operation_id, *, actor="operator"):
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        with self._lock:
+            self._prune_locked(self._now())
+            return self._project_lifecycle_locked(
+                self._require_locked(operation_id, actor)
+            )
+
+    def lookup_admission(self, request_id, *, actor="operator"):
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        with self._lock:
+            self._prune_locked(self._now())
+            receipt = self.admissions.lookup(actor, self.profile_key, request_id)
+            if receipt is None:
+                self.admissions.require_new_request_window(request_id)
+                raise MarketplaceOperationNotFoundError(
+                    "marketplace_admission_not_found",
+                    "Marketplace admission was not found.",
+                )
+            projection = self._project_receipt_locked(receipt)
+            return (
+                AdmissionFound(operation=projection)
+                if isinstance(projection, LifecycleOperation)
+                else projection
+            )
+
+    def list_snapshot(self, *, actor="operator", limit=100, cursor=None):
+        actor = _clean_identity(actor, label="operation actor", maximum=256)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("operation pagination is invalid")
+        with self._lock:
+            now = self._now()
+            self._prune_locked(now)
+            if cursor is None:
+                if len(self._snapshots) >= _SNAPSHOTS_MAX:
+                    raise MarketplaceOperationCapacityError(
+                        "marketplace_list_capacity", "Operation list capacity is full."
+                    )
+                records = sorted(
+                    (
+                        record
+                        for record in self._records.values()
+                        if record.actor == actor
+                    ),
+                    key=lambda record: record.sequence,
+                    reverse=True,
+                )
+                if len(records) > _SNAPSHOT_RECORDS_MAX:
+                    raise MarketplaceOperationCapacityError(
+                        "marketplace_list_capacity", "Operation list capacity is full."
+                    )
+                entries = []
+                size = sum(
+                    len(entry)
+                    for snapshot in self._snapshots
+                    for entry in snapshot.entries
+                )
+                for record in records:
+                    entry = (
+                        self
+                        ._project_lifecycle_locked(record)
+                        .model_dump_json()
+                        .encode()
+                    )
+                    size += len(entry)
+                    if size > _SNAPSHOT_BYTES_MAX:
+                        raise MarketplaceOperationCapacityError(
+                            "marketplace_list_capacity",
+                            "Operation list capacity is full.",
+                        )
+                    entries.append(entry)
+                snapshot = _ListSnapshot(
+                    actor, now + timedelta(seconds=30), tuple(entries), {}
+                )
+                self._snapshots.append(snapshot)
+                offset = 0
+            else:
+                if not isinstance(cursor, str) or len(cursor) != 32:
+                    raise MarketplaceOperationRegistryError(
+                        "marketplace_list_expired", "Operation list expired."
+                    )
+                snapshot = next(
+                    (
+                        item
+                        for item in self._snapshots
+                        if item.actor == actor and cursor in item.cursors
+                    ),
+                    None,
+                )
+                if snapshot is None:
+                    raise MarketplaceOperationRegistryError(
+                        "marketplace_list_expired", "Operation list expired."
+                    )
+                offset = snapshot.cursors[cursor]
+            end = min(offset + limit, len(snapshot.entries))
+            next_cursor = None
+            if end < len(snapshot.entries):
+                next_cursor = next(
+                    (
+                        key
+                        for key, position in snapshot.cursors.items()
+                        if position == end
+                    ),
+                    None,
+                )
+                if next_cursor is None:
+                    next_cursor = secrets.token_hex(16)
+                    snapshot.cursors[next_cursor] = end
+            return LifecycleOperationPage(
+                items=tuple(
+                    LifecycleOperation.model_validate_json(entry)
+                    for entry in snapshot.entries[offset:end]
+                ),
+                next_cursor=next_cursor,
+                complete=end == len(snapshot.entries),
+            )
+
+    def _validate_review_metadata(self, record, completion):
+        metadata = completion.review_token
+        receipt = record.receipt
+        value = getattr(completion.result, "value", None)
+        if (
+            completion.state != "succeeded"
+            or not record.kind.endswith("_prepare")
+            or receipt is None
+            or metadata.subject != receipt.subject
+            or metadata.selection != receipt.selection
+            or getattr(value, "review_digest", None) != metadata.review_digest
+            or getattr(value, "confirmation_available", False) is not True
+            or value.expires_at != metadata.expires_at
+            or not isinstance(metadata.confirmation_token, str)
+            or not 1 <= len(metadata.confirmation_token) <= 4096
+            or not callable(metadata.validate_unused)
+        ):
+            raise ValueError("review authority is inconsistent")
+
+    def review_token(
+        self, operation_id, *, actor, registry_epoch, review_digest, subject, selection
+    ):
+        def unavailable():
+            raise MarketplaceOperationRegistryError(
+                "marketplace_review_unavailable", "Marketplace review is unavailable."
+            )
+
+        with self._lock:
+            self._prune_locked(self._now())
+            record = self._records.get(operation_id)
+            metadata = self._review_tokens.get(operation_id)
+            if (
+                registry_epoch != self.admissions.epoch
+                or record is None
+                or record.actor != actor
+                or record.state != "succeeded"
+                or metadata is None
+                or metadata.subject != subject
+                or metadata.selection != selection
+                or metadata.review_digest != review_digest
+            ):
+                unavailable()
+        # Domain token inspection can acquire transaction/trust locks. Never
+        # hold the registry lock here: a committing worker may report progress.
+        try:
+            valid = metadata.validate_unused(metadata.confirmation_token) is True
+        except Exception:
+            valid = False
+        with self._lock:
+            self._prune_locked(self._now())
+            if not valid:
+                if self._review_tokens.get(operation_id) is metadata:
+                    self._review_tokens.pop(operation_id, None)
+                unavailable()
+            if self._review_tokens.get(operation_id) is not metadata:
+                unavailable()
+            return ReviewTokenResponse(
+                operation_id=record.id,
+                request_id=record.receipt.request_id,
+                subject=metadata.subject.model_copy(deep=True),
+                selection=metadata.selection.model_copy(deep=True)
+                if metadata.selection
+                else None,
+                review_digest=metadata.review_digest,
+                confirmation_token=metadata.confirmation_token,
+                expires_at=metadata.expires_at,
+            )
 
     def list(
         self,
@@ -842,7 +1344,11 @@ class WorkflowMarketplaceOperationRegistry:
                 reverse=True,
             )
             return tuple(
-                self._project_locked(record)
+                (
+                    self._project_lifecycle_locked(record)
+                    if record.lifecycle
+                    else self._project_locked(record)
+                )
                 for record in records[offset : offset + limit]
             )
 
@@ -854,12 +1360,20 @@ class WorkflowMarketplaceOperationRegistry:
             self._prune_locked(self._now())
             record = self._require_locked(operation_id, actor)
             if record.state in _TERMINAL_STATES:
-                return self._project_locked(record)
+                return (
+                    self._project_lifecycle_locked(record)
+                    if record.lifecycle
+                    else self._project_locked(record)
+                )
             record.cancellation.cancel()
             future = record.future
             if record.state == "pending" and future is not None and future.cancel():
                 self._terminal_locked(record, state="cancelled")
-            return self._project_locked(record)
+            return (
+                self._project_lifecycle_locked(record)
+                if record.lifecycle
+                else self._project_locked(record)
+            )
 
     def close(self, *, wait_timeout: float = 5.0) -> None:
         if isinstance(wait_timeout, bool) or not isinstance(wait_timeout, int | float):
@@ -886,6 +1400,13 @@ class WorkflowMarketplaceOperationRegistry:
         """Prevent new work if this registry has no pending/running operations."""
 
         with self._lock:
+            self._prune_locked(self._now())
+            if (
+                self.admissions.has_live_receipts()
+                or self._snapshots
+                or self._review_tokens
+            ):
+                return False
             if any(
                 record.state not in _TERMINAL_STATES
                 for record in self._records.values()
@@ -916,6 +1437,12 @@ class WorkflowMarketplaceOperationRegistry:
 
 
 __all__ = [
+    "AdmissionEvicted",
+    "AdmissionFound",
+    "LifecycleCompletion",
+    "LifecycleOperationPage",
+    "ReviewTokenMetadata",
+    "ReviewTokenResponse",
     "CancellationToken",
     "MarketplaceOperation",
     "MarketplaceOperationCancelled",

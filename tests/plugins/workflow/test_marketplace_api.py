@@ -991,6 +991,77 @@ def test_package_detail_installed_and_update_check_have_strict_success_models(
     assert any(call[0] == "inspect" for call in service.calls)
 
 
+@pytest.mark.parametrize(
+    "method,path,body,service_method,subject",
+    [
+        (
+            "post",
+            "/sources/company/refresh",
+            None,
+            "refresh_source",
+            {"type": "source", "source_name": "company"},
+        ),
+        (
+            "get",
+            "/packages/company/laptop-support",
+            None,
+            "inspect",
+            {
+                "type": "package",
+                "identity": {"source_key": "company", "package_id": "laptop-support"},
+            },
+        ),
+        ("post", "/updates/check", {}, "check_updates", {"type": "all_packages"}),
+        (
+            "post",
+            "/updates/check",
+            {"identity": {"sourceKey": "company", "packageId": "laptop-support"}},
+            "check_updates",
+            {
+                "type": "package",
+                "identity": {"source_key": "company", "package_id": "laptop-support"},
+            },
+        ),
+    ],
+)
+def test_legacy_read_starts_supply_safe_receipt_subjects(
+    api, method, path, body, service_method, subject
+):
+    from plugins.workflow.marketplace.api import _actor
+
+    client, service, context, _home, _profile = api
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(service, service_method)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    setattr(service, service_method, blocked)
+    try:
+        response = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        assert response.status_code == 202
+        assert entered.wait(5)
+        key, _, _, registry = context.current()
+        actor = _actor(_Authority(frozenset({"admin"})), key)
+        try:
+            operation = registry.get_lifecycle(response.json()["id"], actor=actor)
+        except MarketplaceOperationRegistryError as error:
+            pytest.fail(f"V1 read admission lacks lifecycle subject: {error.code}")
+        assert operation.subject.model_dump(mode="json") == subject
+        assert operation.request_id.startswith(f"wmreq_{operation.registry_epoch}_")
+        assert "request_id" not in response.json()
+        assert registry.retire_if_idle() is False
+    finally:
+        release.set()
+
+
 def test_update_check_rejects_a_service_projection_with_unknown_fields(api) -> None:
     client, service, _context, _home, _profile = api
 

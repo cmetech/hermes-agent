@@ -30,6 +30,13 @@ from hermes_cli.git_source import (
     validate_credential_free_git_source,
 )
 from hermes_constants import get_hermes_home, hermes_home_key
+from .lifecycle_models import (
+    AllPackagesSubject,
+    LifecycleSubject,
+    PackageIdentity,
+    PackageSubject,
+    SourceSubject,
+)
 
 from .models import (
     InstallRequest,
@@ -873,10 +880,21 @@ def _start(
     *,
     actor: str,
     target: str | None = None,
+    subject: LifecycleSubject | None = None,
+    canonical_body: object = None,
 ) -> MarketplaceOperation:
     try:
-        return registry.start(kind, call, actor=actor, target=target)
+        return registry.start(
+            kind,
+            call,
+            actor=actor,
+            target=target,
+            subject=subject,
+            canonical_body=canonical_body,
+        )
     except MarketplaceOperationRegistryError as error:
+        if error.code == "marketplace_admission_capacity":
+            raise HTTPException(status_code=503, detail={"code": error.code}) from None
         raise _registry_error(error)
 
 
@@ -1079,6 +1097,8 @@ def create_marketplace_router(
             run,
             actor=actor,
             target=f"source:{name}",
+            subject=SourceSubject(type="source", source_name=name),
+            canonical_body={"source_name": name},
         )
 
     @router.get(
@@ -1141,7 +1161,19 @@ def create_marketplace_router(
                 "package_detail", PackageInspection.model_validate(value)
             )
 
-        return _start(registry, "package_detail", run, actor=actor)
+        return _start(
+            registry,
+            "package_detail",
+            run,
+            actor=actor,
+            subject=PackageSubject(
+                type="package",
+                identity=PackageIdentity(
+                    source_key=identity.source_key, package_id=identity.package_id
+                ),
+            ),
+            canonical_body=identity.model_dump(mode="json"),
+        )
 
     @router.get(
         "/installed",
@@ -1191,7 +1223,25 @@ def create_marketplace_router(
             if body.identity is not None
             else "package:all"
         )
-        return _start(registry, "update_check", run, actor=actor, target=target)
+        return _start(
+            registry,
+            "update_check",
+            run,
+            actor=actor,
+            target=target,
+            subject=(
+                PackageSubject(
+                    type="package",
+                    identity=PackageIdentity(
+                        source_key=body.identity.source_key,
+                        package_id=body.identity.package_id,
+                    ),
+                )
+                if body.identity
+                else AllPackagesSubject(type="all_packages")
+            ),
+            canonical_body=body.model_dump(mode="json"),
+        )
 
     @router.post(
         "/install/prepare",
