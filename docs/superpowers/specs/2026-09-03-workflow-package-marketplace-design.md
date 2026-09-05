@@ -4,6 +4,8 @@
 
 **Status:** Approved
 
+**Lifecycle review pause (2026-09-04):** The baseline remains approved, but Task 14 is not review-clean. Review the [draft lifecycle recovery amendment](2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md) and [replacement remaining-work plan](../plans/2026-09-04-workflow-marketplace-lifecycle-recovery.md) before any further production work. Their proposed changes to admission, recovery claims, navigation, and cache authority require explicit user approval. Tasks 1–13 and commit `c89f36c6b8` are preserved.
+
 **Audience:** Engineers implementing, reviewing, testing, documenting, or maintaining Hermes workflow packaging and marketplace support
 
 ## 1. Summary

@@ -1,0 +1,458 @@
+# Workflow Marketplace Lifecycle Recovery Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` after user approval. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. This draft does not authorize production implementation.
+
+**Goal:** Finish the existing marketplace branch with truthful, recoverable lifecycle operations and independently reviewed release evidence.
+
+**Architecture:** Extend the backend operation registry with safe subjects, bounded admission receipts, strict outcomes, and locked local-state reconciliation. A feature-owned application supervisor outlives Marketplace/Installed views; thin dialog adapters retain only ephemeral review secrets. Shared cache barriers prevent retained stale projections from authorizing mutations.
+
+**Tech Stack:** Existing Python/Pydantic/FastAPI/transaction locks and Git fixtures; React/TypeScript/Nanostores/TanStack Query/Vitest/Testing Library/Playwright. No new runtime dependency is planned.
+
+**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
+
+## Global constraints
+
+- Status: draft pending explicit user approval of the amendment and this plan.
+- Continue only in `/Users/coreyellis/Developer/personal/github.com/cmetech/hermes-agent/.worktrees/workflow-package-marketplace`, branch `feat/workflow-package-marketplace`.
+- Baseline `c89f36c6b8b23c430432b947e3b4f8417eb974a5` is preserved. Do not revert or delete it. Tasks 1–13 are complete; their historical checkboxes are not a restart queue.
+- This plan replaces remaining Task 14 and Task 15 execution in the September 3 plan. The seven work groups are contract, Desktop parity, supervisor, package lifecycle, separate trust, accessibility, and Task 15. Contract and supervisor groups have smaller independent review gates below.
+- No production/test edits until design approval. No Studio modifications, merge to `base`, push, publication, release, or worktree deletion without separate explicit approval.
+- Backend owns admission, installed state, trust, and recovery evidence. Desktop never guesses operation identity or installed versions from timestamps, display names, or cached cards.
+- Request IDs: `wmreq_<epoch32>_<issued_ms13>_<random32>`; first admission within five minutes, at most 30 seconds future skew; receipts retained at least 24 hours and while active; 4,096 unexpired receipts per profile; no early receipt eviction.
+- Existing operation execution/result bounds remain; snapshot lists: at most 100 records/page, 1,088 records/snapshot, four snapshots/profile, 16 MiB aggregate, 30-second expiry.
+- Visible polling: 500 ms, at most three simultaneous operation requests; pause hidden/disconnected; admission timeout 15 seconds. Remove cadence listeners and timers after every settlement.
+- Tokens never enter shared state, query caches/keys, URLs, logs, DOM, or persistence. Token retrieval is explicit and actor/profile/review-bound.
+- Keep package contract v1 artifacts byte-identical; preserve source sanitizer/U+FEFF parity, source CRUD/Refresh-all, and existing loose workflow/trust/run behavior.
+- Keep package installation and trust separate. Destination requirements remain advisories; malformed/inconsistent package structures block.
+- Use `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh` for Python evidence, never direct pytest. Run Desktop commands from `apps/desktop`; dependencies belong to the existing root workspace install.
+- Every task requires observed RED, focused GREEN, fresh reviewer evidence, and ledger updates. No production fix is accepted only on implementer-authored tests. A new contract gap pauses dependent work for a recorded amendment.
+- Update locales `ar`, `en`, `ja`, `zh`, and `zh-hant` before completion.
+
+## Execution and review protocol
+
+After approval, record its exact scope/date in the existing `.superpowers/sdd/2026-09-03-workflow-package-marketplace/progress.md`. Before each task, capture clean status, task-base SHA, and applicable instructions. Write `task-14a1-brief.md` / `task-14a1-report.md` (and corresponding task IDs below) in that directory; do not overwrite historical Task 13/14 reports.
+
+Dispatch one implementation agent with the approved spec, task text, prior interface receipts, file ownership, and test commands. It writes failing behavior tests, observes the expected failure, implements the smallest change, observes passing checks, self-reviews, and commits. The controller then packages the exact base-to-head diff and sends it to a **fresh** reviewer. The reviewer checks spec compliance and code quality, independently reproduces at least one changed authority/race/failure boundary, and reports evidence. Reuse the implementer for verified fixes; use a fresh reviewer for acceptance. Do not begin a dependent task with open blocking findings. Record every finding, decision, RED/GREEN command, independent probe, changed SHA, and disposition in the ledger.
+
+Documentation-only phase verification consists of scope/diff/link/consistency checks; no production pass is inferred from it. Implementation task commits below are new history. No agent is authorized to merge or publish.
+
+## File and interface map
+
+Existing implementations remain the starting point. New names below are deliberate plan interfaces, not claims that files already exist.
+
+| File | Responsibility / task |
+| --- | --- |
+| `plugins/workflow/marketplace/lifecycle_models.py` | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1 |
+| `plugins/workflow/marketplace/admissions.py` | Epoch/ID parsing, canonical private fingerprints, receipt lifetime/replay, 14A2 |
+| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict internal kind/result/phase publication, admission integration, snapshot lists, 14A1–A2 |
+| `plugins/workflow/marketplace/lifecycle_state.py` | Locked package-state projection and domain outcome evidence, 14A3 |
+| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3 |
+| `plugins/workflow/marketplace/api.py` | Mount V2, preserve read compatibility, reject preview V1 package mutations, 14A3 |
+| `plugins/workflow/marketplace/service.py`, `transactions.py`, `marketplace/cli.py` | Exact commit/rollback/trust evidence, public state and recovery adapters, 14A3 |
+| `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` | Deterministic Python public-model/scenario corpus and check/write modes, 14B |
+| `tests/fixtures/workflow-marketplace-lifecycle-v2.json` | Token-free cross-language operation/state corpus, 14B |
+| `apps/desktop/src/types/workflow-marketplace-lifecycle.ts` | Strict V2 types, 14B |
+| `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.ts` | Strict V2 decoding and cross-field checks, 14B |
+| `apps/desktop/src/api/workflow-marketplace-lifecycle.ts` | Scoped V2 API helpers and requested-ID enforcement, 14B |
+| `apps/desktop/src/store/workflow-marketplace-supervisor.ts` | Application-lifetime Nanostore records and public methods, 14C1 |
+| `apps/desktop/src/lib/workflow-marketplace-supervision.ts` | Pure transitions, exact correlation, guard/poll scheduling, 14C1 |
+| `apps/desktop/src/lib/workflow-marketplace-reconciliation.ts` | Query invalidation and generation/barrier policy, 14C2 |
+| `apps/desktop/src/main.tsx` | Initialize/dispose main-window supervisor alongside QueryClient, 14C1 |
+| `apps/desktop/src/app/workflows/marketplace/use-package-lifecycle.tsx` | Thin view/dialog adapter, 14D–E |
+| Existing Marketplace dialogs, `index.tsx`, `installed-packages.tsx`, `package-detail.tsx`, `query-keys.ts`, Workflows `index.tsx` / `catalog.tsx` | Shared supervisor/barrier consumers and keyboard/focus behavior, 14C2–F |
+
+Python public names: `LifecycleSubject`, `LifecycleSelection`, `LifecycleOutcome`, `LifecycleOperation`, `PackageState`, `TrustSnapshot`, `LifecycleAdmissionStore`, `read_package_state(service, identity)`, `create_lifecycle_router(context, verified_operator)`. Reuse existing `InstalledPackageIdentity`, result values, service signatures, and sanitized projections; V2 reviews omit token fields without changing CLI review objects.
+
+Desktop names: `decodeLifecycleOperation(value)`, `decodePackageState(value)`, `startLifecycleOperation(intent, scope, requestId)`, `getLifecycleOperation(id, scope)`, `cancelLifecycleOperation(id, scope)`, `getLifecycleAdmission(requestId, scope)`, `listLifecycleOperations(cursor, scope)`, `getPackageState(identity, scope)`, `getLifecycleReviewToken(operation, scope)`. All inputs/outputs use types in the new lifecycle type module. Existing `@/hermes` barrel re-exports them.
+
+Supervisor factory: `createMarketplaceSupervisor({api, queryClient, clock, visibility, connections})`. Public methods: `start(intent, scope)`, `retry(requestKey)`, `cancel(requestKey)`, `reconcileScope(scope)`, `reconcilePackage(scope, identity)`, `getPackageGate(scope, identity)`, `dispose()`, and `$records` read-only store. `intent` is a discriminated route-body union; sensitive confirm body exists only inside the admission transport closure. `PackageGate` is `{state: 'ready'|'busy'|'reconciling'|'unknown'|'recovery_required', packageState: PackageState|null}`. No token/DOM field is permitted on records/gates.
+
+## Task 14A1 — Strict lifecycle schema and publication invariants
+
+**Files:** Create `lifecycle_models.py` and `tests/plugins/workflow/test_marketplace_lifecycle_models.py`; modify `operations.py` and `test_marketplace_operations.py`. Keep HTTP route changes for 14A3.
+
+**Consumes:** Existing result models/validators, the amendment §3 and §5 exact schema tables.
+
+**Produces:** Strict V2 public types and a shared kind/result/phase table consumed by the registry and later API; no new persistence.
+
+- [ ] Write parameterized acceptance/rejection tests for each kind, state, subject, selection, result, time/progress relation, and package-state invariant. Extend existing registry tests to reject mismatched results before publication.
+
+```python
+def test_confirm_cannot_publish_another_kind_result(operation_payloads):
+    payload = operation_payloads.valid("update_confirm", "succeeded")
+    payload["result"]["type"] = "installed_package"
+    with pytest.raises(ValidationError):
+        LifecycleOperation.model_validate(payload)
+
+def test_recovery_required_cannot_claim_verified_installed_state(state_payloads):
+    payload = state_payloads.installed()
+    payload["recovery"] = "required"
+    with pytest.raises(ValidationError):
+        PackageState.model_validate(payload)
+```
+
+Define test payload builders locally using existing valid review/package helpers; no loose casts. Include refresh source mismatch, one-workflow review mismatch, unknown/duplicate trust inventory, direct selector bounds, result/identity mismatch, and invalid outcome/state combinations.
+- [ ] Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_models.py tests/plugins/workflow/test_marketplace_operations.py`. Expected new relationship tests fail for missing models or accepted invalid combinations.
+- [ ] Implement frozen strict models, token-free V2 review projections, and exhaustive shared correlation table. Registry publication calls the validator; backend exceptions cannot publish an invalid terminal union. Preserve V1 public shape until 14A3 and existing refresh identity checks.
+
+```python
+def require_result_kind(kind, result):
+    if result.type != RESULT_TYPE_BY_KIND[kind]:
+        raise ValueError("operation kind/result mismatch")
+```
+
+- [ ] Run focused GREEN and existing operation/API tests; run Ruff check/format on touched Python files and `git diff --check`.
+- [ ] Commit `feat(workflow): define lifecycle recovery contract`; fresh reviewer independently tests invalid state/result/subject combinations. Record acceptance before 14A2.
+
+## Task 14A2 — Bounded idempotent admission and stable operation listing
+
+**Files:** Create `admissions.py`, `tests/plugins/workflow/test_marketplace_admissions.py`; modify `operations.py`, `test_marketplace_operations.py`.
+
+**Consumes:** 14A1 models and correlation table.
+
+**Produces:** `LifecycleAdmissionStore.reserve(request_id, actor, profile_key, kind, canonical_body, subject, selection)` with found/new/conflict/expired outcomes; registry `start` integration, actor-scoped exact admission lookup, token-free snapshot pagination, and private token vault.
+
+- [ ] Write tests with injected clock/epoch/random and events controlling enqueue/worker execution. Verify concurrent replay, changed body/subject/kind/selection, replay before token revalidation, enqueue failure receipt, capacity, expiry after pruning, epoch change, cross-actor/profile isolation, and profile cache retirement.
+
+```python
+def test_replay_after_terminal_eviction_never_enqueues_again(admitted_confirm):
+    first = admitted_confirm.start()
+    admitted_confirm.finish_and_evict_result()
+    replay = admitted_confirm.replay()
+    assert replay.state == "evicted"
+    assert replay.operation_id == first.id
+    assert admitted_confirm.worker_invocations == 1
+```
+
+`admitted_confirm` is a new local fixture wrapping the real registry/store with a counted event-controlled worker; it does not replace transaction tests. Add snapshot-page tests where new operations finish/evict between pages and expiry/capacity do not silently truncate.
+- [ ] Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_admissions.py tests/plugins/workflow/test_marketplace_operations.py`.
+- [ ] Implement admission under the existing registry lock: receipt lookup → fingerprint comparison → new-request age/epoch/capacity check → reservation → one submission. Preserve unresolved receipt on scheduling failure. Retire full result to a tombstone, never re-admit. Keep epoch/admission data above disposable profile service caches. V1 read-oriented starts receive server-generated IDs internally.
+
+```python
+# Required ordering inside the admission lock:
+receipt = admissions.lookup(actor, profile_key, request_id)
+if receipt is not None:
+    receipt.require_same_request(kind, canonical_body, subject, selection)
+    return project_receipt(receipt)
+admissions.require_new_request_window(request_id)
+```
+
+- [ ] Implement private review-token vault and immutable actor-scoped list snapshots with the amendment's budgets. Never persist HMACs, raw bodies, or tokens; existing transaction token hashes remain authoritative for consumption.
+- [ ] Run GREEN plus operation/API regression tests, changed-file Ruff and diff check. Fresh reviewer independently races same-ID starts and eviction replay; inspect no token/private target in snapshots/errors. Commit `feat(workflow): correlate marketplace admissions` and record evidence.
+
+## Task 14A3 — Backend outcome evidence, V2 routes, and recovery tooling
+
+**Files:** Create `lifecycle_state.py`, `lifecycle_api.py`, `tests/plugins/workflow/test_marketplace_lifecycle_api.py`, `test_marketplace_lifecycle_state.py`; modify `api.py`, `service.py`, `transactions.py`, `marketplace/cli.py`, and corresponding existing service/transaction/CLI/API tests.
+
+**Consumes:** 14A1/A2 strict models/receipts.
+
+**Produces:** V2 routes from amendment §§3–5; locked `read_package_state`; exact commit/rollback evidence; `package-state` and `recover-packages` CLI adapters; V1 preview mutation rejection. No new journal schema unless separately amended.
+
+- [ ] Reproduce real transaction candidate-retained failure before adding evidence. Extend `test_post_trust_commit_failure_never_rolls_back_package_or_provenance`, verified rollback, remove failure, trust write/read failure and concurrent trust/update tests. Add state-route probes for mismatched bytes/provenance, ambiguous journals, busy leases, absence, and complete trust state.
+
+```python
+def test_cleanup_failure_is_recovery_required_not_old_version(lifecycle_api):
+    lifecycle_api.install_version("1.0.0")
+    review = lifecycle_api.prepare_update("2.0.0")
+    operation = lifecycle_api.confirm_with_fault(review, "after_trust_revoke")
+    assert operation.outcome.type == "recovery_required"
+    assert lifecycle_api.read_installed_bytes().manifest.version == "2.0.0"
+    assert lifecycle_api.package_state().state == "unconfirmed"
+```
+
+Build `lifecycle_api` in `test_marketplace_lifecycle_api.py` from the existing temporary repository/service fixtures and authenticated router context; faults use existing transaction seams. It must issue real route requests and wait for exact operation IDs.
+- [ ] Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_api.py tests/plugins/workflow/test_marketplace_lifecycle_state.py tests/plugins/workflow/test_marketplace_transactions.py tests/plugins/workflow/test_marketplace_service.py tests/plugins/workflow/test_marketplace_cli.py`.
+- [ ] Instrument transaction/service mutation boundaries with domain evidence. A verified rollback emits `transaction_rollback_completed`; ambiguous/failed rollback emits recovery-required. Capture trust grant/revoke results under the mutation lock. Implement package-state read using existing lock order and bounded byte checks; do not treat provenance-only success as recovery clearance.
+- [ ] Wire V2 route-body unions, capability probe, subject construction, exact prepare/confirm metadata and selection checks, token retrieval, exact ID/cancel/admission/list routes. Validate replay before token consumption. Retire V1 package/trust mutation routes before admission; retain read/source compatibility.
+
+```python
+# A route may expose only a validated domain projection.
+state = read_package_state(service, identity)
+return PackageState.model_validate(state.model_dump(mode="json"))
+```
+
+- [ ] Add CLI read-only package-state and explicit recover-packages confirmation/JSON/exit behavior around `recover_transactions()`. Tests use real owned journals, active leases, unrelated directories, and two profiles. Never execute a real user's recovery during development.
+- [ ] Run focused GREEN, the complete marketplace backend test slice, workflow API/auth/CLI regressions, and Ruff/diff checks. Fresh reviewer independently reproduces candidate-retained rollback failure, lost admitted response replay, and a complete selected-trust map. Commit `feat(workflow): expose truthful lifecycle recovery`.
+
+## Task 14B — Desktop contract parity and backend-generated fixtures
+
+**Files:** Create the three V2 Desktop type/codec/API modules in the file map and corresponding `.test.ts` files; create fixture generator, `tests/fixtures/workflow-marketplace-lifecycle-v2.json`, and `tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py`. Modify `apps/desktop/src/hermes.ts` re-exports and existing API tests for exact requested-ID correlation where shared.
+
+**Consumes:** 14A public schemas and real service/API projections.
+
+**Produces:** Strict V2 decoding, scoped helpers, contract fixture `--write`/`--check`; no lifecycle view changes yet.
+
+- [ ] Generate the fixture corpus through actual model/projection functions and real temporary Git scenarios. Cover every table row in amendment §11, including invalid relationships derived from valid cases with Python expected acceptance. Fixed test tokens stay confined to token-endpoint tests and never enter the shared operation corpus. Include complete A/B grant and rollback-failed fixtures.
+- [ ] Write differential and helper RED tests:
+
+```typescript
+it.each(corpus.operationCases)('$name follows Python acceptance', testCase => {
+  expect(decodeLifecycleOperation(testCase.value) !== null).toBe(testCase.accepted)
+})
+
+it('rejects another operation returned by get', async () => {
+  transport.reply(corpus.validOperationB)
+  await expect(getLifecycleOperation(corpus.operationAId, scopeA)).rejects.toThrow()
+})
+```
+
+Define `transport` using the existing Desktop API test transport mock; it returns raw fixture JSON to the real helper/decoder. Add cancel-ID mismatch, all exact scope/epoch/subject/request checks, selected workflow mismatch, capability 404 versus auth/network failure, duplicate JSON and byte limits, and token retrieval envelope mismatch.
+- [ ] Run RED from Desktop: `npx vitest run --project ui src/lib/workflow-marketplace-lifecycle-codec.test.ts src/api/workflow-marketplace-lifecycle.test.ts`.
+- [ ] Implement bounded decoders into fresh objects and exact requested-ID checks before returning operations. Implement client request-ID generation from backend epoch/time with cryptographic randomness. Expose explicit token helper outside QueryClient; preserve existing V1 browse/source behavior.
+
+```typescript
+const value = decodeLifecycleOperation(raw)
+if (!value || value.id !== requestedId) throw invalidLifecycleResponse()
+return value
+```
+
+- [ ] Run generator `--check` using the repository interpreter, Python fixture tests via wrapper, Desktop focused GREEN plus existing marketplace codec/API suites, typecheck and changed-file lint/format. Reviewer independently generates fixtures and verifies Python/TS acceptance plus requested-ID rejection. Commit `feat(desktop): validate lifecycle recovery protocol`.
+
+## Task 14C1 — Application operation supervisor
+
+**Files:** Create `store/workflow-marketplace-supervisor.ts` / `.test.ts`, `lib/workflow-marketplace-supervision.ts` / `.test.ts`, and a small `app/workflows/marketplace/supervisor-provider.tsx` if React context is needed; modify `src/main.tsx` for main-window lifecycle only.
+
+**Consumes:** 14B helpers/types, existing connection/profile/visibility stores.
+
+**Produces:** The supervisor factory/public methods defined above, with memory-only records and injectable clock/transport. `getPackageGate` initially exposes busy/unknown states; 14C2 supplies reconciliation.
+
+- [ ] Write transition-table tests and deterministic event tests for close/tab/route survival, A→B→A, disconnect/reconnect, same connection ID reconfiguration, lost POST response, exact replay, evicted result, cancel racing commit, StrictMode, old generation settlement, update-check status-error guard release, hidden cadence cleanup and concurrent request bounds.
+
+```typescript
+it('retains admission correlation after view detachment', async () => {
+  const harness = createSupervisorHarness(corpus)
+  const pending = harness.supervisor.start(harness.confirmIntent, scopeA)
+  harness.loseAdmissionResponse()
+  harness.detachView()
+  await pending
+  await harness.supervisor.reconcileScope(scopeA)
+  expect(harness.record().operationId).toBe(corpus.admittedConfirm.id)
+  expect(harness.admittedWorkerCount()).toBe(1)
+})
+```
+
+Create the test harness in this suite using a real supervisor and fixture-decoding API fake, deterministic clock and deferred responses. It simulates the server receipt table, not optimistic UI outcomes; backend one-worker proof remains in 14A2/A3.
+- [ ] Run RED: `npx vitest run --project ui src/store/workflow-marketplace-supervisor.test.ts src/lib/workflow-marketplace-supervision.test.ts`.
+- [ ] Implement pure transitions, immutable request/operation correlation and synchronous call guards. Individual call guards release in `finally`; barriers remain separate. Attach one application instance above Workflows routes, not inside Marketplace or Installed. Keep DOM focus and dialog state outside it.
+
+```typescript
+try {
+  await recoverExactRequest(record)
+} finally {
+  releaseCallGuard(record.key, callGeneration)
+}
+```
+
+- [ ] Implement actor-owned snapshot-list reconciliation, direct lookup for every unresolved known request/ID, bounded poll queue and disposal. Unknown admission stays blocked until found or admission window closes plus state reconciliation; no “latest” recovery. Clear sensitive replay closures after bounded admission lifetime.
+- [ ] Run GREEN, V2 API/codec suites, typecheck/lint/format. Fresh reviewer independently races timeout, navigation and a late admission; verifies exact scope invalidation cannot target foreground B. Commit `feat(desktop): supervise marketplace operations across navigation`.
+
+## Task 14C2 — Shared cache reconciliation barriers
+
+**Files:** Create `lib/workflow-marketplace-reconciliation.ts` / `.test.ts`; modify supervisor, Marketplace `query-keys.ts`, `index.tsx`, `package-detail.tsx`, `installed-packages.tsx`, Workflows `catalog.tsx` / `index.tsx`, and their behavior tests.
+
+**Consumes:** 14C1 records/gates and 14A3 `PackageState`.
+
+**Produces:** Per-package query-generation barriers and action gating for all consumers, using the amendment §7 table.
+
+- [ ] Write all four success-plus-failed-refetch cases, ambiguous outcome, verified rollback, stale in-flight response, detail aliases, multiple terminal histories, source deletion/orphaning, profile switch, absent package and unbound workflow-catalog cases.
+
+```typescript
+it('keeps Install disabled after success when refetch fails', async () => {
+  const harness = renderLifecycleHarness(corpus.installScenario)
+  await harness.installAndConfirm()
+  harness.failOriginRefetches()
+  await harness.closeAndReopenMarketplace()
+  expect(screen.queryByRole('button', { name: 'Install package' })).toBeNull()
+  expect(screen.getByText(/Refreshing package state/)).toBeVisible()
+})
+```
+
+Define `renderLifecycleHarness` in `marketplace/lifecycle-test-harness.tsx` (test-only module) with real QueryClient/supervisor/providers and strict fixture decoding; reuse it in 14D–F. It controls network responses, not DOM claims.
+- [ ] Run RED: `npx vitest run --project ui src/lib/workflow-marketplace-reconciliation.test.ts src/app/workflows/marketplace/index.test.tsx src/app/workflows/index.test.tsx`.
+- [ ] Implement barrier generations before POST; cancel old query requests, invalidate exact origin roots, ignore pre-barrier completions for action readiness, and require fresh locked package state plus control-specific projections. Retained metadata is labeled last observed. Trust snapshots replace as a whole. Conservatively gate unbound catalog entry points while affected catalog truth is stale; never join by workflow name.
+
+```typescript
+if (responseGeneration !== gate.generation || gate.hasUnresolvedAdmission) return gate
+if (state.state === 'unconfirmed' || state.busy || state.recovery !== 'clear') return gate
+return markLocalStateVerified(gate, state)
+```
+
+- [ ] Run GREEN plus workflow UI, supervisor and API/codec suites, typecheck/lint/format. Reviewer independently delays an older query until after success and makes all refetches fail; verify stale install/remove/update/trust controls stay unusable. Commit `fix(desktop): fence stale marketplace mutation caches`.
+
+## Task 14D — Install, update and removal lifecycle adapters
+
+**Files:** Refactor `use-package-lifecycle.tsx`, install/remove dialogs, Marketplace/Installed integration and corresponding tests. Extract `package-lifecycle-presentation.ts` / `.test.ts` for outcome-to-copy decisions. Keep shared review sections.
+
+**Consumes:** Supervisor and package gates, exact V2 reviews/outcomes.
+
+**Produces:** Thin prepare/review/token/confirm flow, truthful terminal presentation, explicit current/error/orphaned update-check results.
+
+- [ ] Replace tests expecting unconditional “nothing installed/version remains” from generic failures with table-driven proof-based assertions. Cover update old_version differing from card version; removal current_version differing from card; lost admission; rollback failed/ambiguous; status/terminal ID mismatch; no-op update token absence; expired token; safe direct-subject handling without a new form.
+
+```typescript
+it.each(['rollbackFailed', 'recoveryAmbiguous', 'lostConfirmResponse'] as const)(
+  '%s cannot claim the prior version remains', async scenario => {
+    const harness = renderLifecycleHarness(corpus[scenario])
+    await harness.updateAndConfirm()
+    expect(await screen.findByText(/State could not be confirmed/)).toBeVisible()
+    expect(screen.queryByText(/remains installed|Nothing new was installed/)).toBeNull()
+  }
+)
+```
+
+- [ ] Run RED: `npx vitest run --project ui src/app/workflows/marketplace/install-review-dialog.test.tsx src/app/workflows/marketplace/remove-review-dialog.test.tsx src/app/workflows/marketplace/index.test.tsx src/app/workflows/marketplace/package-lifecycle-presentation.test.ts`.
+- [ ] Refactor the controller to subscribe to supervisor records; remove controller-owned polling/generic failure classifiers. Fetch token explicitly only for the reviewed operation; confirm sends exact subject/review/preparation binding under a new request ID. Clear secrets on all specified boundaries; supervision survives. Present commit history separately from current-state reconciliation.
+
+```typescript
+switch (outcome.type) {
+  case 'recovery_required':
+  case 'outcome_unknown':
+    return { kind: 'state_unconfirmed', canPrepareAgain: false }
+  case 'known_unchanged':
+    return unchangedPresentation(outcome.package_state, authoritativeReview)
+}
+```
+
+Implement exhaustive handling for committed/cancelled outcomes as defined in the spec, plus distinct check error/orphaned and exact safe Retry. Do not infer an installed version from `target.installed` captured on a card.
+- [ ] Run GREEN and all Marketplace/workflow UI, typecheck/lint/format. Reviewer independently exercises a real backend-derived rollback-failed fixture and stale-card version mismatch. Commit `fix(desktop): render authoritative package lifecycle outcomes`.
+
+## Task 14E — Separate trust lifecycle and complete package state
+
+**Files:** Refactor trust portion of `use-package-lifecycle.tsx` into `use-package-trust-review.ts` if needed for a single responsibility; modify trust dialog, `review-sections.tsx`, post-install action gating, and tests.
+
+**Consumes:** V2 trust selection/inventory/full-map contract and shared supervisor/barriers.
+
+**Produces:** Exact all/one reviews, capability-gated independent trust, complete actual trust display.
+
+- [ ] Write real A/B fixture tests: grant A → A trusted/B untrusted is success; all requires both; wrong selected review, unknown/duplicate/missing members, wrong digest, and post-write response failure produce unknown after possible admission. Verify full trust snapshot updates and failed-refetch behavior.
+
+```typescript
+it('accepts the complete package map after granting A', async () => {
+  const harness = renderLifecycleHarness(corpus.grantAOnly)
+  await harness.reviewAndGrantOne('A')
+  expect(await screen.findByText('Trust granted for A')).toBeVisible()
+  expect(harness.visibleTrustState('B')).toBe('untrusted')
+})
+```
+
+- [ ] Run RED: `npx vitest run --project ui src/app/workflows/marketplace/trust-review-dialog.test.tsx src/app/workflows/marketplace/index.test.tsx`.
+- [ ] Implement selection correlation against backend package inventory and exact preparation review; changing selection clears token and requests a new matching review. Render current per-workflow trust_state and all existing risks. Post-install Review trust checks trust capability and verified local state. Keep existing independent/manual grant semantics; do not force blanket untrusted flags or add a revoke UI.
+
+```typescript
+const selected = selection.type === 'all' ? packageMembers : [selection.workflow_name]
+if (!isCompleteKnownMap(result.workflows, packageMembers)) return unknownOutcome()
+if (!selected.every(name => stateByName.get(name) === 'trusted')) return unknownOutcome()
+```
+
+- [ ] Run GREEN plus V2 parity/supervisor/workflow UI, typecheck/lint/format. Fresh reviewer obtains an actual A/B backend grant fixture and verifies displayed truth under failed refetch. Commit `fix(desktop): reconcile full package trust results`.
+
+## Task 14F — Keyboard, focus, responsive and retained-state integration
+
+**Files:** Modify Marketplace `index.tsx`, lifecycle dialogs, shared dialog primitive only if necessary, and focused UI tests. Add `marketplace/lifecycle-navigation.test.tsx` and `lifecycle-accessibility.test.tsx`.
+
+**Consumes:** Completed package/trust adapters and shared supervisor.
+
+**Produces:** One-Escape behavior and deterministic foreground-only focus under every lifecycle transition.
+
+- [ ] Write portal/document Escape tests in narrow layout, pending confirm admission timeout, close/tab/profile transitions, terminal success/cancel/failure focus, removed origin, disabled origin, and late background completion. Assert behavior rather than CSS class snapshots.
+
+```typescript
+it('one Escape closes the dialog and preserves package detail', async () => {
+  const harness = renderLifecycleHarness(corpus.installScenario, { narrow: true })
+  await harness.openInstallReview()
+  await harness.user.keyboard('{Escape}')
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(screen.getByRole('region', { name: /package details/ })).toBeVisible()
+})
+```
+
+- [ ] Run RED: `npx vitest run --project ui src/app/workflows/marketplace/lifecycle-navigation.test.tsx src/app/workflows/marketplace/lifecycle-accessibility.test.tsx`.
+- [ ] Implement modal key ownership and parent `defaultPrevented` guards, finite admission locking, focus origin/fallback policy and safe live regions. Confirm one cadence releases its abort listener even on ordinary timeout resolution. Migrate V2 source/inspect operation callers through shared helpers without reopening source CRUD design; preserve Refresh-all behavior and exact source identity.
+
+```typescript
+if (event.defaultPrevented || modalOwnsKeyboard) return
+if (event.key === 'Escape' && narrow && selection) showPackageList()
+```
+
+- [ ] Run GREEN, full workflow UI, source/operation/ConfirmDialog regressions, typecheck and lint. Inspect 320px and 200% zoom, RTL, reduced motion, and keyboard-only navigation using the actual UI/browser test harness. Record screenshots only if useful to review; do not substitute screenshots for assertions.
+- [ ] Fresh reviewer independently tests Escape during a deferred confirm and focus after successful removal/navigation. Commit `fix(desktop): preserve lifecycle keyboard ownership`. Mark original Task 14 complete only when 14A1–F are accepted with no blocking findings.
+
+## Task 15 — Localization, documentation, end-to-end proof and release gates
+
+**Files:** Modify `apps/desktop/src/i18n/{types,en,ar,ja,zh,zh-hant}.ts`, `languages.test.ts`, `docs/workflow-orchestration.md`, `website/docs/user-guide/features/workflows.md`, `website/docs/reference/cli-commands.md`; create `website/docs/user-guide/features/workflow-packages.md`, `tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py`, `apps/desktop/e2e/workflow-marketplace-lifecycle.spec.ts`; modify `scripts/test_workflow_merge_gate.sh`, related gate tests, and existing E2E fixtures only as needed.
+
+**Consumes:** All accepted Task 14 slices.
+
+**Produces:** Complete locale copy, operator/publisher guidance, real Git/API/trust/admission/UI proof, reproducible branch review gates.
+
+- [ ] Write failing E2E tests in real temporary homes and Git repositories: source → inspect → prepare → explicit confirm → untrusted admission refusal → separate one/all trust → allowed admission → changed update and trust invalidation → remove. Include rollback success/failure/ambiguity, foreign/manual grants, two profiles, cancellation, lost POST response replay, and journal recovery. Test existing public/private credential seams without collecting credentials or using external repositories.
+
+```python
+def test_lost_confirm_response_installs_once_then_requires_trust(real_marketplace):
+    review = real_marketplace.prepare_install()
+    request_id = real_marketplace.new_request_id()
+    real_marketplace.confirm_and_drop_response(review, request_id)
+    operation = real_marketplace.recover_admission(request_id)
+    assert operation.outcome.type == "committed"
+    assert real_marketplace.install_commit_count == 1
+    assert real_marketplace.admission_code() == "workflow_trust_required"
+```
+
+`real_marketplace` starts the actual authenticated API/service with existing safe temp Git fixtures and bounded event synchronization; instrumentation counts commits while the actual filesystem/provenance/trust writes occur. The Playwright fixture launches an isolated backend and renderer; response dropping happens at the test transport boundary after actual server admission, not by substituting success payloads. Cover tab-close-return and failed-refetch action gating in that real path.
+- [ ] Run RED with the repository wrapper for the new E2E file; from Desktop run `npx vitest run --project ui src/i18n/languages.test.ts` and focused Playwright lifecycle tests after building the renderer. Capture specific missing behavior, not unrelated environment failure.
+- [ ] Translate all source/browse/lifecycle/recovery copy in all five locales. Locale tests assert usable keys and interpolation behavior; do not write source-text scans or fixed enumeration counts.
+- [ ] Document manifest/index/digest publishing, user-managed Git push, private authentication setup, selected remote/profile authority, all lifecycle steps, install/trust separation, retained cache barriers, request replay/expiry/capacity, renderer versus backend restart, package-state/recover-packages commands, and current-state versus historical-outcome limits. Do not claim Doctor performs transaction recovery or that failed rollback preserves a version.
+- [ ] Add fixture `--check`, lifecycle Python/UI/parity/supervisor/E2E tests to existing workflow gates. Keep all existing checks. Ensure gate tests use temporary repos and don't mutate the actual base/brand branches. Packaging/build commands must use publication-disabled paths; no release command is authorized.
+- [ ] Run focused GREEN and the final gates below. A fresh reviewer independently exercises the real temporary Git/API/Desktop lifecycle and verifies locale/docs match implemented recovery behavior. Commit `test(workflow): verify marketplace lifecycle end to end` (separate docs commit permitted).
+
+## Final verification and whole-branch review
+
+Use the repository interpreter selected by `scripts/run_tests.sh`; if a generator needs it explicitly, set a task-specific interpreter path found through the same existing environment. Do not change user/global configuration or install a second dependency tree. The following commands are execution requirements after approval, not claims that they passed during drafting.
+
+From the Hermes worktree:
+
+```bash
+uv run python scripts/generate_workflow_package_contract.py --check
+uv run python scripts/generate_workflow_marketplace_lifecycle_fixtures.py --check
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/ tests/hermes_cli/test_git_source.py tests/hermes_cli/test_plugin_install_ref.py tests/hermes_cli/test_plugins_cmd.py tests/hermes_cli/test_workflow_dashboard_auth.py tests/test_project_metadata.py
+npm run test:workflow-ui --workspace apps/desktop
+npm run typecheck --workspace apps/desktop
+npm run lint --workspace apps/desktop -- --quiet
+scripts/test_workflow_merge_gate.sh --phase base
+git diff --check
+git status --short
+```
+
+From `apps/desktop`:
+
+```bash
+npx vitest run --project ui src/api/workflow-marketplace.test.ts src/api/workflow-marketplace-lifecycle.test.ts src/lib/workflow-marketplace-codec.test.ts src/lib/workflow-marketplace-lifecycle-codec.test.ts src/lib/workflow-marketplace-supervision.test.ts src/lib/workflow-marketplace-reconciliation.test.ts src/store/workflow-marketplace-supervisor.test.ts src/i18n/languages.test.ts
+npm run test:ui
+npm run build
+npx playwright test e2e/workflow-marketplace-lifecycle.spec.ts
+```
+
+Read the current merge-gate script before invoking it; run only its local test/rehearsal paths. It must not integrate the feature branch into the real `base` checkout. If a gate needs an unavailable host/browser/runtime, record the exact missing evidence and leave the release gate open; do not silently skip or mark ready. Resolve existing Task 14 report's catalog-suite failures against the exact feature-start baseline before classifying them as pre-existing. A prior implementer report is not a waiver.
+
+- [ ] Fresh whole-branch reviewer receives `git diff c1dc7a23e1e987f7f64a1bee89b224af4d4adf5d..HEAD`, commit list, amendment, plan, ledger and verification receipts. Also inspect `base...HEAD` read-only for integration drift; do not merge to resolve it without approval.
+- [ ] Audit all prior deferred findings in the ledger, including package/digest test helper exclusion, changed-file formatting, portability/flakiness conventions, provenance timestamp, repeated package hashing, and backend union correlation. Close with evidence or explicitly report an accepted nonblocking limitation; do not silently omit earlier debt.
+- [ ] Reviewer tests user-visible truth independently across Python/API/TS/cache boundaries. Verified fixes follow RED/GREEN and a fresh reviewer gate; if they expose another protocol gap, amend the design before dependent implementation.
+- [ ] Run exact final required checks once more only if review fixes changed their inputs. Record clean status, exact tested HEAD, artifact SHA/byte hashes for later Studio pinning, review dispositions, test outcomes and remaining environmental limitations.
+- [ ] Present branch for approval. Stop with the feature worktree intact. No merge, push, publication, release, worktree deletion, or Studio work until explicitly authorized.
+
+## Spec coverage map
+
+| Amendment requirement | Task gate |
+| --- | --- |
+| A public subject / G backend correlation | 14A1, 14A3, 14B |
+| B admission/replay / epoch / eviction | 14A2, 14A3, 14B, 14C1 |
+| C stable supervisor and scope isolation | 14C1, 14F |
+| D explicit outcomes/current state/recovery tooling | 14A3, 14C2, 14D, 15 |
+| E mutation barriers | 14C2, 14D, 14E |
+| F full-package trust / exact selection | 14A1, 14A3, 14B, 14E |
+| G exact get/cancel/prepare/confirm identity | 14A1–B, 14C1, 14D–E |
+| H keyboard/focus/capabilities/timer disposal | 14C1, 14E, 14F |
+| I generated fixtures/differential/integration matrix | 14B, each task's independent review, 15 |
+| Compatibility/token privacy/list stability | 14A2–B, 14C1, 15 |
+
+Implementation mode is already selected by the user: subagent-driven, one implementation agent at a time and a fresh reviewer per task. No further mode-selection question is required; the pending decision is approval of this design amendment and remaining-work plan.

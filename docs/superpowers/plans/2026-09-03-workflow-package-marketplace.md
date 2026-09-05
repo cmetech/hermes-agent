@@ -1,5 +1,7 @@
 # Workflow Package Marketplace Implementation Plan
 
+**Execution pause (2026-09-04):** Tasks 1–13 are complete; historical unchecked boxes below are not a restart queue. Task 14's implementation at `c89f36c6b8` needs changes and must not be approved or merged. Task 15 has not started. The [draft lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md) and [replacement remaining-work plan](2026-09-04-workflow-marketplace-lifecycle-recovery.md) replace the remaining sequence once explicitly approved. Do not execute the monolithic Task 14 or resume production work before that approval. For future Python checks, repository `AGENTS.md` requires `scripts/run_tests.sh`; old direct-pytest examples below are historical.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` (recommended) or
 > `superpowers:executing-plans` to implement this plan task-by-task. Steps use
@@ -1334,6 +1336,8 @@ git commit -m "feat(desktop): manage workflow sources"
 
 ### Task 14: Add install, update, removal, and separate trust reviews
 
+**Historical task, paused:** Initial implementation exists at `c89f36c6b8`; review found protocol gaps. Unconditional unchanged-version copy and invalidation-only recovery below are not safe implementation instructions. Continue through the replacement plan only after design approval.
+
 **Files:**
 
 - Create: `apps/desktop/src/app/workflows/marketplace/install-review-dialog.tsx`
@@ -1418,6 +1422,8 @@ git commit -m "feat(desktop): review workflow package lifecycle"
 ```
 
 ### Task 15: Complete localization, documentation, end-to-end coverage, and merge gates
+
+**Not started:** Execute the amended Task 15 in the replacement plan after all revised Task 14 gates are accepted. Preserve this section as the original scope record.
 
 **Files:**
 
