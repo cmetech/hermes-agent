@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import os
+from pathlib import Path, PurePosixPath
 import shutil
 import sqlite3
 import subprocess
 import sys
-from pathlib import Path
+import tarfile
+import zipfile
 
 import pytest
 
@@ -19,6 +22,15 @@ from tests.ericsson_connector_source import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VERSION_SELECTION_MARKER = "<!-- workflow-language-version-selection -->"
+SCANNER_RESOURCE = Path("plugins/workflow/conformance/reference_scanner_v1.json")
+WORKFLOW_README = Path("plugins/workflow/README.md")
+
+
+@dataclass(frozen=True)
+class BuiltDistributions:
+    direct_wheel: Path
+    sdist: Path
+    sdist_wheel: Path
 
 
 def _installed_console_path(prefix: Path) -> Path:
@@ -77,6 +89,55 @@ def _temporary_source_vendor(build_source: Path) -> None:
     router = build_source / "skills" / "ericsson" / "gitlab"
     router.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source.router_skill, router / "SKILL.md")
+
+
+def _safe_extract_sdist(sdist: Path, destination: Path) -> Path:
+    destination.mkdir(parents=True)
+    destination_root = destination.resolve()
+    top_level_names: set[str] = set()
+    with tarfile.open(sdist, "r:gz") as archive:
+        for member in archive.getmembers():
+            relative = PurePosixPath(member.name)
+            assert not relative.is_absolute(), member.name
+            assert relative.parts and ".." not in relative.parts, member.name
+            top_level_names.add(relative.parts[0])
+            target = destination.joinpath(*relative.parts).resolve()
+            assert target.is_relative_to(destination_root), member.name
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            assert member.isfile(), f"unsafe sdist member type: {member.name}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            assert source is not None, member.name
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+    assert len(top_level_names) == 1
+    extracted_root = destination / next(iter(top_level_names))
+    assert extracted_root.is_dir()
+    return extracted_root
+
+
+def _wheel_member_bytes(wheel: Path, relative_path: Path) -> bytes:
+    member_name = relative_path.as_posix()
+    with zipfile.ZipFile(wheel) as archive:
+        assert member_name in archive.namelist(), member_name
+        return archive.read(member_name)
+
+
+def _sdist_member_bytes(sdist: Path, relative_path: Path) -> bytes:
+    relative_parts = tuple(PurePosixPath(relative_path.as_posix()).parts)
+    with tarfile.open(sdist, "r:gz") as archive:
+        matches = [
+            member
+            for member in archive.getmembers()
+            if tuple(PurePosixPath(member.name).parts[1:]) == relative_parts
+        ]
+        assert len(matches) == 1, relative_path
+        source = archive.extractfile(matches[0])
+        assert source is not None
+        with source:
+            return source.read()
 
 
 def test_temporary_source_vendor_uses_complete_copied_vendor(
@@ -147,6 +208,7 @@ def installed_distribution(tmp_path_factory):
         build_source,
         ignore=shutil.ignore_patterns(
             ".git",
+            ".superpowers",
             ".worktrees",
             ".venv",
             "venv",
@@ -168,6 +230,7 @@ def installed_distribution(tmp_path_factory):
             "uv",
             "build",
             "--wheel",
+            "--sdist",
             "--no-build-logs",
             "--out-dir",
             str(artifacts),
@@ -182,6 +245,39 @@ def installed_distribution(tmp_path_factory):
     assert build.returncode == 0, f"uv build failed:\n{build.stderr}"
     wheels = list(artifacts.glob("*.whl"))
     assert len(wheels) == 1
+    sdists = list(artifacts.glob("*.tar.gz"))
+    assert len(sdists) == 1
+    direct_wheel = wheels[0]
+    sdist = sdists[0]
+
+    extracted_source = _safe_extract_sdist(sdist, root / "sdist-source")
+    sdist_wheel_artifacts = root / "sdist-wheel-artifacts"
+    sdist_wheel_build = subprocess.run(
+        [
+            "uv",
+            "build",
+            "--wheel",
+            "--no-build-logs",
+            "--out-dir",
+            str(sdist_wheel_artifacts),
+            ".",
+        ],
+        cwd=extracted_source,
+        env=build_env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert sdist_wheel_build.returncode == 0, (
+        f"sdist wheel build failed:\n{sdist_wheel_build.stderr}"
+    )
+    sdist_wheels = list(sdist_wheel_artifacts.glob("*.whl"))
+    assert len(sdist_wheels) == 1
+    built_distributions = BuiltDistributions(
+        direct_wheel=direct_wheel,
+        sdist=sdist,
+        sdist_wheel=sdist_wheels[0],
+    )
 
     site = root / "site"
     install = subprocess.run(
@@ -194,7 +290,7 @@ def installed_distribution(tmp_path_factory):
             "--target",
             str(site),
             "--no-deps",
-            str(wheels[0]),
+            str(direct_wheel),
         ],
         cwd=root,
         capture_output=True,
@@ -214,7 +310,7 @@ def installed_distribution(tmp_path_factory):
             "--prefix",
             str(console_root),
             "--no-deps",
-            str(wheels[0]),
+            str(direct_wheel),
         ],
         cwd=root,
         capture_output=True,
@@ -229,7 +325,7 @@ def installed_distribution(tmp_path_factory):
     env["PYTHONPATH"] = str(site)
     env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
     env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
-    return site, env, wheels
+    return site, env, built_distributions
 
 
 def test_installed_distribution_contains_complete_gitlab_connector(
@@ -328,6 +424,20 @@ def test_installed_distribution_contains_complete_sharepoint_connector(
 
 
 @pytest.mark.integration
+def test_scanner_publication_resources_ship_in_wheel_and_sdist(
+    installed_distribution,
+) -> None:
+    _site, _env, artifacts = installed_distribution
+    for relative_path in (SCANNER_RESOURCE, WORKFLOW_README):
+        source_path = REPO_ROOT / relative_path
+        assert source_path.is_file(), f"missing published source: {relative_path}"
+        expected = source_path.read_bytes()
+        assert _wheel_member_bytes(artifacts.direct_wheel, relative_path) == expected
+        assert _sdist_member_bytes(artifacts.sdist, relative_path) == expected
+        assert _wheel_member_bytes(artifacts.sdist_wheel, relative_path) == expected
+
+
+@pytest.mark.integration
 def test_installed_distribution_exposes_deterministic_workflow_schema_corpus(
     tmp_path: Path,
     installed_distribution,
@@ -361,168 +471,342 @@ def test_installed_distribution_exposes_deterministic_workflow_schema_corpus(
     assert first.returncode == second.returncode == 0, first.stderr.decode("utf-8")
     assert first.stderr == second.stderr == b""
     assert first.stdout == second.stdout
-    assert len(first.stdout) <= 160_001
+    assert len(first.stdout) <= 384_001
     corpus = json.loads(first.stdout.decode("utf-8"))
-    assert corpus["format_version"] == 1
+    assert corpus["format_version"] == 2
     assert corpus["profile"] == "archon-2026-07"
     assert corpus["normalizer_version"] == 6
     assert corpus["contract"]["normalizer"] == (
         "plugins.workflow.language.normalize_workflow"
     )
     assert corpus["contract"]["contract_digest"].startswith("sha256:")
+    assert corpus["corpus_digest"].startswith("sha256:")
     assert (site / "plugins/workflow/language_conformance.py").is_file()
 
 
+def _canonical_publication_bytes(payload: dict[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _run_workflow_publications(
+    command_prefix: list[str], *, cwd: Path, env: dict[str, str]
+) -> dict[tuple[str, str, str], bytes]:
+    outputs: dict[tuple[str, str, str], bytes] = {}
+    for profile in ("hermes-legacy", "archon-2026-07"):
+        for publication in ("schema", "schema-corpus"):
+            for mode in ("compact", "pretty"):
+                command = [
+                    *command_prefix,
+                    "workflow",
+                    publication,
+                    "--profile",
+                    profile,
+                ]
+                if mode == "compact":
+                    command.append("--json")
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    capture_output=True,
+                    env=env,
+                    timeout=120,
+                )
+                assert completed.returncode == 0, completed.stderr.decode("utf-8")
+                assert completed.stderr == b""
+                outputs[(profile, publication, mode)] = completed.stdout
+    return outputs
+
+
+def _assert_publication_contracts(
+    outputs: dict[tuple[str, str, str], bytes],
+) -> None:
+    expected_normalizers = {"hermes-legacy": 2, "archon-2026-07": 6}
+    expected_readers = {"hermes-legacy": 2, "archon-2026-07": 3}
+    for profile in expected_normalizers:
+        for publication in ("schema", "schema-corpus"):
+            compact = outputs[(profile, publication, "compact")]
+            pretty = outputs[(profile, publication, "pretty")]
+            assert compact.endswith(b"\n")
+            assert pretty.endswith(b"\n")
+            payload = json.loads(compact)
+            assert json.loads(pretty) == payload
+            canonical = _canonical_publication_bytes(payload)
+            assert compact == canonical + b"\n"
+            assert payload["profile"] == profile
+            assert payload["normalizer_version"] == expected_normalizers[profile]
+
+            if publication == "schema":
+                assert payload["schema_version"] == 1
+                assert (
+                    payload["contract_reader_version"] == expected_readers[profile]
+                )
+                digest_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "contract_digest"
+                }
+                assert payload["contract_digest"] == "sha256:" + hashlib.sha256(
+                    _canonical_publication_bytes(digest_payload)
+                ).hexdigest()
+                limits = payload["limits"]
+                assert len(canonical) <= (
+                    limits["max_contract_bytes"]
+                    - limits["reserved_growth_bytes"]
+                )
+                continue
+
+            assert payload["contract"]["contract_reader_version"] == (
+                expected_readers[profile]
+            )
+            assert payload["contract"]["contract_digest"].startswith("sha256:")
+            if profile == "hermes-legacy":
+                assert payload["format_version"] == 1
+                assert "corpus_digest" not in payload
+                assert len(canonical) == 7_265
+                assert hashlib.sha256(canonical).hexdigest() == (
+                    "c193258148699fbcbc42c909dee10001632377272e57a0ff3b79f3493f158a3b"
+                )
+                assert len(canonical) <= 160_000
+                assert len(pretty.rstrip(b"\n")) <= 160_000
+            else:
+                assert payload["format_version"] == 2
+                digest_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "corpus_digest"
+                }
+                assert payload["corpus_digest"] == "sha256:" + hashlib.sha256(
+                    _canonical_publication_bytes(digest_payload)
+                ).hexdigest()
+                assert len(payload["cases"]) <= 64
+                assert len(payload["scanner_cases"]) <= 256
+                assert len(payload["substitution_cases"]) <= 64
+                assert len(payload["structured_path_cases"]) <= 64
+                assert len(canonical) <= 384_000
+                assert len(pretty.rstrip(b"\n")) <= 768_000
+
+
+def _install_socket_guard(
+    venv_python: Path, *, cwd: Path, env: dict[str, str]
+) -> Path:
+    locate_site = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert locate_site.returncode == 0, locate_site.stderr
+    site_packages = Path(locate_site.stdout.strip()).resolve()
+    sitecustomize = site_packages / "sitecustomize.py"
+    sitecustomize.write_text(
+        """
+import socket
+
+
+def _deny_network(*_args, **_kwargs):
+    raise RuntimeError("offline socket guard active")
+
+
+socket.socket.connect = _deny_network
+socket.create_connection = _deny_network
+""".lstrip(),
+        encoding="utf-8",
+    )
+    guard_probe = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            """
+import json
+import socket
+
+failures = []
+operations = (
+    lambda: socket.create_connection(("127.0.0.1", 9)),
+    lambda: socket.socket().connect(("127.0.0.1", 9)),
+)
+for operation in operations:
+    try:
+        operation()
+    except RuntimeError as exc:
+        failures.append(str(exc))
+print(json.dumps(failures))
+""".strip(),
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert guard_probe.returncode == 0, guard_probe.stderr
+    assert json.loads(guard_probe.stdout) == [
+        "offline socket guard active",
+        "offline socket guard active",
+    ]
+    return site_packages
+
+
 @pytest.mark.integration
-def test_wheel_installed_venv_console_resolves_archon_corpus_resources(
+def test_installed_wheels_run_offline_schema_and_corpus_resources(
     tmp_path: Path,
     installed_distribution,
 ) -> None:
-    site, _masked_env, wheels = installed_distribution
-    venv = tmp_path / "wheel-installed-venv"
-    create_venv = subprocess.run(
-        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert create_venv.returncode == 0, create_venv.stderr
-
-    venv_python = _venv_python_path(venv)
-    install_dependencies = subprocess.run(
-        [
-            "uv",
-            "pip",
-            "install",
-            "--offline",
-            "--python",
-            str(venv_python),
-            str(wheels[0]),
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert install_dependencies.returncode == 0, install_dependencies.stderr
-    install = subprocess.run(
-        [
-            str(venv_python),
-            "-m",
-            "pip",
-            "install",
-            "--no-index",
-            "--force-reinstall",
-            "--no-deps",
-            str(wheels[0]),
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert install.returncode == 0, install.stderr
-
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
-    env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
-    outside_source = tmp_path / "outside-source"
-    outside_source.mkdir()
-    probe = subprocess.run(
-        [
-            venv_python,
-            "-c",
-            (
-                "import json, sys, sysconfig; from pathlib import Path; "
-                "import plugins.workflow.language_conformance as conformance; "
-                "print(json.dumps({'module': str(Path(conformance.__file__).resolve()), "
-                "'resource': str(conformance._JIRA_DEFINITION.resolve()), "
-                "'site_packages': sysconfig.get_paths()['purelib'], "
-                "'prefix': sys.prefix}))"
-            ),
-        ],
-        cwd=outside_source,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=120,
-    )
-    assert probe.returncode == 0, probe.stderr
-    origins = json.loads(probe.stdout)
-    module = Path(origins["module"]).resolve()
-    resource = Path(origins["resource"]).resolve()
-    site_packages = Path(origins["site_packages"]).resolve()
-    prefix = Path(origins["prefix"]).resolve()
-    expected_resource = (
-        prefix
-        / "capabilities"
-        / "workflow-packages"
-        / "ericsson"
-        / "workflows"
-        / "jira-defect-loop.yaml"
-    )
-    assert module.is_relative_to(site_packages)
-    assert not module.is_relative_to(REPO_ROOT)
-    assert not module.is_relative_to(site.resolve())
-    assert prefix == venv.resolve()
-    assert expected_resource.is_file()
-
-    command = [
-        str(_installed_console_path(venv)),
-        "workflow",
-        "schema-corpus",
-        "--profile",
-        "archon-2026-07",
-        "--json",
-    ]
-    first = subprocess.run(
-        command,
-        cwd=outside_source,
-        capture_output=True,
-        env=env,
-        timeout=120,
-    )
-    second = subprocess.run(
-        command,
-        cwd=outside_source,
-        capture_output=True,
-        env=env,
-        timeout=120,
-    )
-    source = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "hermes_cli.main",
-            "workflow",
-            "schema-corpus",
-            "--profile",
-            "archon-2026-07",
-            "--json",
-        ],
+    extracted_site, _masked_env, artifacts = installed_distribution
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONPATH", None)
+    clean_env.pop("HERMES_BUNDLED_SKILLS_DIR", None)
+    clean_env.pop("HERMES_BUNDLED_PLUGINS_DIR", None)
+    source_outputs = _run_workflow_publications(
+        [sys.executable, "-m", "hermes_cli.main"],
         cwd=REPO_ROOT,
-        capture_output=True,
-        env=env,
-        timeout=120,
+        env=clean_env,
     )
+    _assert_publication_contracts(source_outputs)
+    source_resource = (REPO_ROOT / SCANNER_RESOURCE).read_bytes()
+    source_readme = (REPO_ROOT / WORKFLOW_README).read_bytes()
 
-    assert first.returncode == 0, first.stderr.decode("utf-8")
-    assert second.returncode == 0, second.stderr.decode("utf-8")
-    assert source.returncode == 0, source.stderr.decode("utf-8")
-    assert first.stderr == second.stderr == source.stderr == b""
-    assert first.stdout == second.stdout == source.stdout
-    assert resource == expected_resource
-    assert len(first.stdout) <= 160_001
-    corpus = json.loads(first.stdout.decode("utf-8"))
-    assert corpus["format_version"] == 1
-    assert corpus["profile"] == "archon-2026-07"
-    assert corpus["normalizer_version"] == 6
-    assert corpus["contract"]["normalizer"] == (
-        "plugins.workflow.language.normalize_workflow"
-    )
-    assert corpus["contract"]["contract_digest"].startswith("sha256:")
+    for artifact_name, wheel in (
+        ("direct-wheel", artifacts.direct_wheel),
+        ("sdist-wheel", artifacts.sdist_wheel),
+    ):
+        artifact_root = tmp_path / artifact_name
+        outside_source = artifact_root / "outside-source"
+        outside_source.mkdir(parents=True)
+        venv = artifact_root / "installed-venv"
+        create_venv = subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+            cwd=outside_source,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert create_venv.returncode == 0, create_venv.stderr
+
+        venv_python = _venv_python_path(venv)
+        offline_install = subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--offline",
+                "--python",
+                str(venv_python),
+                str(wheel),
+            ],
+            cwd=outside_source,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert offline_install.returncode == 0, offline_install.stderr
+        no_index_install = subprocess.run(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--force-reinstall",
+                "--no-deps",
+                str(wheel),
+            ],
+            cwd=outside_source,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert no_index_install.returncode == 0, no_index_install.stderr
+
+        site_packages = _install_socket_guard(
+            venv_python, cwd=outside_source, env=clean_env
+        )
+        origin_probe = subprocess.run(
+            [
+                str(venv_python),
+                "-c",
+                (
+                    "import hashlib, json, os, socket, sys; "
+                    "from importlib.resources import files; from pathlib import Path; "
+                    "import plugins.workflow.language_conformance as conformance; "
+                    "import sitecustomize; root=files('plugins.workflow'); "
+                    "scanner=root.joinpath('conformance/reference_scanner_v1.json'); "
+                    "readme=root.joinpath('README.md'); "
+                    "print(json.dumps({'module': str(Path(conformance.__file__).resolve()), "
+                    "'scanner': str(Path(str(scanner)).resolve()), "
+                    "'scanner_sha256': hashlib.sha256(scanner.read_bytes()).hexdigest(), "
+                    "'readme': str(Path(str(readme)).resolve()), "
+                    "'readme_sha256': hashlib.sha256(readme.read_bytes()).hexdigest(), "
+                    "'jira': str(conformance._JIRA_DEFINITION.resolve()), "
+                    "'guard': str(Path(sitecustomize.__file__).resolve()), "
+                    "'guard_connect': socket.socket.connect.__module__, "
+                    "'guard_create_connection': socket.create_connection.__module__, "
+                    "'pythonpath_present': 'PYTHONPATH' in os.environ, "
+                    "'prefix': sys.prefix}))"
+                ),
+            ],
+            cwd=outside_source,
+            capture_output=True,
+            text=True,
+            env=clean_env,
+            timeout=120,
+        )
+        assert origin_probe.returncode == 0, origin_probe.stderr
+        origins = json.loads(origin_probe.stdout)
+        module = Path(origins["module"]).resolve()
+        scanner = Path(origins["scanner"]).resolve()
+        readme = Path(origins["readme"]).resolve()
+        jira = Path(origins["jira"]).resolve()
+        prefix = Path(origins["prefix"]).resolve()
+        expected_jira = (
+            prefix
+            / "capabilities"
+            / "workflow-packages"
+            / "ericsson"
+            / "workflows"
+            / "jira-defect-loop.yaml"
+        )
+        assert prefix == venv.resolve()
+        assert module.is_relative_to(site_packages)
+        assert scanner.is_relative_to(site_packages)
+        assert readme.is_relative_to(site_packages)
+        assert not module.is_relative_to(REPO_ROOT)
+        assert not scanner.is_relative_to(REPO_ROOT)
+        assert not readme.is_relative_to(REPO_ROOT)
+        assert not module.is_relative_to(extracted_site.resolve())
+        assert scanner.read_bytes() == source_resource
+        assert readme.read_bytes() == source_readme
+        assert origins["scanner_sha256"] == hashlib.sha256(
+            source_resource
+        ).hexdigest()
+        assert origins["readme_sha256"] == hashlib.sha256(source_readme).hexdigest()
+        assert origins["guard_connect"] == "sitecustomize"
+        assert origins["guard_create_connection"] == "sitecustomize"
+        assert origins["pythonpath_present"] is False
+        assert Path(origins["guard"]).resolve() == (
+            site_packages / "sitecustomize.py"
+        )
+        assert jira == expected_jira
+        assert expected_jira.is_file()
+
+        installed_outputs = _run_workflow_publications(
+            [str(_installed_console_path(venv))],
+            cwd=outside_source,
+            env=clean_env,
+        )
+        _assert_publication_contracts(installed_outputs)
+        assert installed_outputs == source_outputs
 
 
 @pytest.mark.integration
@@ -839,7 +1123,7 @@ def test_extracted_wheel_registers_workflow_cli_from_a_clean_home(
     installed_distribution,
 ) -> None:
     """Exercise installed-filesystem layout through the authorized Nix build path."""
-    site, env, wheels = installed_distribution
+    site, env, artifacts = installed_distribution
 
     home = tmp_path / "home"
     env = env.copy()
@@ -1673,7 +1957,7 @@ print(json.dumps({
             "install",
             "--python",
             str(installed_python),
-            str(wheels[0]),
+            str(artifacts.direct_wheel),
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -1922,7 +2206,7 @@ print(json.dumps(payload))
             "install",
             "--python",
             str(installed_python),
-            f"{wheels[0]}[mcp]",
+            f"{artifacts.direct_wheel}[mcp]",
         ],
         cwd=tmp_path,
         capture_output=True,

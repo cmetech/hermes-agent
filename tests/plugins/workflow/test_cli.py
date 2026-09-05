@@ -27,7 +27,10 @@ from plugins.workflow.store import RunStore
 from plugins.workflow.trust import build_risk_summary, compute_package_digest
 from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
 from plugins.workflow.compat import assess_compatibility
-from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.language_schema import (
+    canonical_contract_json,
+    workflow_authoring_contract,
+)
 from plugins.workflow.language_conformance import workflow_language_conformance
 from plugins.workflow.models import WorkflowLanguageProfile
 
@@ -1226,7 +1229,7 @@ def test_schema_corpus_json_is_compact_utf8_bounded_and_byte_deterministic(capsy
 
     assert first_output == second_output
     assert first_output.encode("utf-8").decode("utf-8") == first_output
-    assert len(first_output.encode("utf-8")) <= 160_001
+    assert len(first_output.encode("utf-8")) <= 384_001
     assert first_output.count("\n") == 1
     assert first_output == (
         json.dumps(
@@ -1242,8 +1245,14 @@ def test_schema_corpus_json_is_compact_utf8_bounded_and_byte_deterministic(capsy
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ({"cases": [{} for _ in range(65)]}, "more than 64 cases"),
-        ({"cases": [], "padding": "x" * 160_000}, "more than 160000 bytes"),
+        (
+            {"format_version": 1, "cases": [{} for _ in range(65)]},
+            "more than 64 cases",
+        ),
+        (
+            {"format_version": 1, "cases": [], "padding": "x" * 160_000},
+            "more than 160000 bytes",
+        ),
     ],
     ids=["case-count", "encoded-bytes"],
 )
@@ -1257,12 +1266,268 @@ def test_schema_corpus_refuses_to_print_out_of_bounds_payloads(
         "workflow_language_conformance",
         lambda _profile: payload,
     )
-    args = argparse.Namespace(profile="archon-2026-07", json=True)
+    args = argparse.Namespace(profile="hermes-legacy", json=True)
 
     with pytest.raises(ValueError, match=message):
         schema_cli.emit_schema_corpus(args)
 
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("section", "limit"),
+    [
+        ("cases", 64),
+        ("scanner_cases", 256),
+        ("substitution_cases", 64),
+        ("structured_path_cases", 64),
+    ],
+)
+def test_archon_schema_corpus_checks_every_section_count_before_stdout(
+    section, limit, monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    payload = {
+        "format_version": 2,
+        "cases": [],
+        "scanner_cases": [],
+        "substitution_cases": [],
+        "structured_path_cases": [],
+    }
+    payload[section] = [{} for _ in range(limit)]
+    schema_cli._validate_schema_corpus_structure(
+        payload,
+        profile=WorkflowLanguageProfile.ARCHON_2026_07,
+    )
+    payload[section] = [{} for _ in range(limit + 1)]
+    monkeypatch.setattr(
+        schema_cli, "workflow_language_conformance", lambda _profile: payload
+    )
+
+    with pytest.raises(
+        ValueError, match=rf"{section} has more than {limit} cases"
+    ):
+        schema_cli.emit_schema_corpus(
+            argparse.Namespace(profile="archon-2026-07", json=True)
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_schema_corpus_rejects_unknown_format_before_stdout(monkeypatch, capsys):
+    import plugins.workflow.schema_cli as schema_cli
+
+    monkeypatch.setattr(
+        schema_cli,
+        "workflow_language_conformance",
+        lambda _profile: {"format_version": 3, "cases": []},
+    )
+
+    with pytest.raises(ValueError, match="unsupported format_version: 3"):
+        schema_cli.emit_schema_corpus(
+            argparse.Namespace(profile="archon-2026-07", json=True)
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("format_version", [1.0, 2.0])
+def test_schema_corpus_requires_exact_integer_format_version(
+    format_version, monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    payload = {
+        "format_version": format_version,
+        "cases": [],
+        "scanner_cases": [],
+        "substitution_cases": [],
+        "structured_path_cases": [],
+    }
+    monkeypatch.setattr(
+        schema_cli, "workflow_language_conformance", lambda _profile: payload
+    )
+
+    with pytest.raises(
+        ValueError, match=rf"unsupported format_version: {format_version}"
+    ):
+        schema_cli.emit_schema_corpus(
+            argparse.Namespace(profile="archon-2026-07", json=True)
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("profile", "payload", "message"),
+    [
+        (
+            "archon-2026-07",
+            {"format_version": 3, "cases": [object()]},
+            "unsupported format_version: 3",
+        ),
+        (
+            "archon-2026-07",
+            {"format_version": 1, "cases": [object()]},
+            "unsupported for profile archon-2026-07",
+        ),
+        (
+            "archon-2026-07",
+            {
+                "format_version": 2,
+                "cases": object(),
+                "scanner_cases": [],
+                "substitution_cases": [],
+                "structured_path_cases": [],
+            },
+            "cases must be a list",
+        ),
+    ],
+    ids=["format-before-encoding", "profile-before-encoding", "section-before-encoding"],
+)
+def test_schema_corpus_structural_errors_precede_serialization(
+    profile, payload, message, monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    monkeypatch.setattr(
+        schema_cli, "workflow_language_conformance", lambda _profile: payload
+    )
+
+    with pytest.raises(ValueError, match=message):
+        schema_cli.emit_schema_corpus(
+            argparse.Namespace(profile=profile, json=True)
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("profile", "format_version"),
+    [("hermes-legacy", 2), ("archon-2026-07", 1)],
+)
+def test_schema_corpus_rejects_format_for_the_wrong_profile_before_stdout(
+    profile, format_version, monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    payload = {"format_version": format_version, "cases": []}
+    if format_version == 2:
+        payload.update(
+            scanner_cases=[], substitution_cases=[], structured_path_cases=[]
+        )
+    monkeypatch.setattr(
+        schema_cli, "workflow_language_conformance", lambda _profile: payload
+    )
+
+    with pytest.raises(ValueError, match=rf"unsupported for profile {profile}"):
+        schema_cli.emit_schema_corpus(
+            argparse.Namespace(profile=profile, json=True)
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("format_version", "canonical_limit", "emitted_limit", "byte_error"),
+    [
+        (1, 160_000, 160_000, "more than 160000 bytes"),
+        (2, 384_000, 768_000, "canonical bytes"),
+    ],
+)
+def test_schema_corpus_byte_boundaries_are_inclusive_and_one_byte_over_rejects(
+    format_version, canonical_limit, emitted_limit, byte_error
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    schema_cli._validate_schema_corpus_bytes(
+        format_version,
+        canonical_bytes=canonical_limit,
+        emitted_bytes=emitted_limit,
+    )
+    with pytest.raises(ValueError, match=byte_error):
+        schema_cli._validate_schema_corpus_bytes(
+            format_version,
+            canonical_bytes=canonical_limit + 1,
+            emitted_bytes=emitted_limit + 1,
+        )
+    emitted_error = (
+        "more than 160000 bytes" if format_version == 1 else "emitted bytes"
+    )
+    with pytest.raises(ValueError, match=emitted_error):
+        schema_cli._validate_schema_corpus_bytes(
+            format_version,
+            canonical_bytes=canonical_limit,
+            emitted_bytes=emitted_limit + 1,
+        )
+
+
+def test_archon_schema_corpus_count_precedes_byte_errors(monkeypatch, capsys):
+    import plugins.workflow.schema_cli as schema_cli
+
+    payload = {
+        "format_version": 2,
+        "cases": [object(), *({} for _ in range(64))],
+        "scanner_cases": [],
+        "substitution_cases": [],
+        "structured_path_cases": [],
+        "padding": "x" * 384_000,
+    }
+    monkeypatch.setattr(
+        schema_cli, "workflow_language_conformance", lambda _profile: payload
+    )
+
+    with pytest.raises(ValueError, match="cases has more than 64 cases"):
+        schema_cli.emit_schema_corpus(
+            argparse.Namespace(profile="archon-2026-07", json=False)
+        )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_archon_schema_corpus_enforces_actual_canonical_boundary(
+    monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    payload = {
+        "format_version": 2,
+        "cases": [],
+        "scanner_cases": [],
+        "substitution_cases": [],
+        "structured_path_cases": [],
+        "padding": "",
+    }
+    baseline = len(canonical_contract_json(payload).encode("utf-8"))
+    payload["padding"] = "x" * (384_000 - baseline)
+    assert len(canonical_contract_json(payload).encode("utf-8")) == 384_000
+    monkeypatch.setattr(
+        schema_cli, "workflow_language_conformance", lambda _profile: payload
+    )
+    args = argparse.Namespace(profile="archon-2026-07", json=True)
+
+    assert schema_cli.emit_schema_corpus(args) == 0
+    assert capsys.readouterr().out
+    payload["padding"] += "x"
+    with pytest.raises(ValueError, match="more than 384000 canonical bytes"):
+        schema_cli.emit_schema_corpus(args)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_generic_authoring_emitter_preserves_original_two_limit_behavior(capsys):
+    import plugins.workflow.schema_cli as schema_cli
+
+    args = argparse.Namespace(profile="hermes-legacy", json=True)
+
+    assert schema_cli.emit_authoring_json(
+        args,
+        lambda _profile: {"cases": []},
+        max_cases=64,
+        max_bytes=160_000,
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {"cases": []}
 
 
 @pytest.mark.parametrize("action", ["schema", "schema-corpus"])

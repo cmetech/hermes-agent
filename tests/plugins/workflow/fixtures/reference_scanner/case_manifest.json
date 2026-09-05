@@ -1,0 +1,2155 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "text.whole-output",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.path",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.repeated",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.punctuation",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.absent",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.embedded-dollar",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-x",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-underscore",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-slash",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-bracket",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-leading-zero",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-backslash",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.suffix-hyphen",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.producer-digit",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.producer-dot",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.producer-unicode",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.path-empty",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.path-double-dot",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.non-ascii-suffix",
+      "requirements": [
+        "S2"
+      ],
+      "families": [
+        "text-grammar"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.valid-before-malformed.first",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "text-grammar",
+        "iterator-api"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "text.valid-before-malformed.drain",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "text-grammar",
+        "iterator-api"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_reference_iterator_rejects_noncanonical_reference_syntax; language_schema._output_reference_at exact ASCII grammar"
+    },
+    {
+      "id": "api.version-two",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.version-bool",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.version-unknown",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.candidates-nested",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.spans-truncated",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.spans-valid",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.spans-overlap",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.spans-negative",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.spans-outside",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.spans-error-after-yield",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.classifier-span-bool",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.classifier-span-overlap",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.presence-valid-before",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.presence-valid-after",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.presence-malformed-only",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema iterator bodies preserve yielded prefix; test_phase3_bash_reference_ordering.py:test_lexical_reference_parser_cannot_read_past_an_admitted_span"
+    },
+    {
+      "id": "api.condition-iterator-rhs-reference",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema.iter_when_output_references accepts a quoted literal or decimal RHS before yielding its LHS, so an unquoted reference RHS yields no token; contrasted with tests/plugins/workflow/test_phase3_conditions.py:test_v3_condition_validation_returns_both_operand_references_in_source_order."
+    },
+    {
+      "id": "api.condition-v3-rhs-reference",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "conditions.validate_v3_condition_syntax and _Expression.references preserve both reference operands in source order; independently asserted by tests/plugins/workflow/test_phase3_conditions.py:test_v3_condition_validation_returns_both_operand_references_in_source_order (line 292)."
+    },
+    {
+      "id": "api.condition-v6-previous",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "conditions.validate_v6_condition_syntax invokes _parse(..., allow_previous=True); _Parser._parse_reference constructs a previous record with authored prefix-inclusive offsets, and _Expression.references preserves both operands in source order. The ordinary both-operand ordering is independently asserted by tests/plugins/workflow/test_phase3_conditions.py:test_v3_condition_validation_returns_both_operand_references_in_source_order."
+    },
+    {
+      "id": "api.condition-v3-previous",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "conditions.validate_v3_condition_syntax uses _parse without allow_previous; _Parser._parse_reference passes the previous spelling to the ordinary iterator and translates WorkflowReferenceSyntaxError into condition_runtime_syntax_invalid with its cause."
+    },
+    {
+      "id": "api.condition-literal-rhs",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema.iter_when_output_references consumes quoted RHS text without scanning it and then yields the LHS; independently asserted by tests/plugins/workflow/test_strict_output_references.py:test_v3_when_quoted_rhs_reference_text_remains_literal."
+    },
+    {
+      "id": "api.condition-late-malformed",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "language_schema.iter_when_output_references yields each completed literal-RHS clause before parsing the next; tests/plugins/workflow/test_strict_output_references.py:test_v3_when_reference_iterator_yields_absolute_offsets_before_late_syntax_error establishes the retained prefix and absolute syntax-error offset."
+    },
+    {
+      "id": "api.condition-invalid",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "conditions.validate_v3_condition_syntax calls _Parser._parse_clause, which requires a comparison operator after the reference; its _syntax_error raises condition_runtime_syntax_invalid."
+    },
+    {
+      "id": "previous.whole",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.path",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.producer-malformed",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.path-malformed",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.ordinary-overlap",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.bash-whole",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.bash-spans",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.bash-masking",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.pre-v6",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.render-masking",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.first-whole",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.first-field",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.unknown-producer",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "previous.shadowing",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "language_schema.iter_loop_previous_output_references; resources.StrictSubstitutionRenderer._references equal-length mask; VariableContext.previous_output_reference explicit None"
+    },
+    {
+      "id": "bash.bare",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.single",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.double",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.escaped",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.comment",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.dollar-double",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.continued",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.literal-malformed",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.live-malformed",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.quote-contexts",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-quotes"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_ignores_escaped_and_comment_output_references_at_admission; test_phase3_bash_lexer_security.py:test_v3_lexer_preserves_authored_offset_for_quoted_shell_word_text"
+    },
+    {
+      "id": "bash.command-substitution",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.backtick",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.ansi-c",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.parameter",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.arithmetic",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.legacy-arithmetic",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.bare-arithmetic",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.conditional",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.extglob",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.braces",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.process-in",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.process-out",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.nested-mixed",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.unterminated-quote",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.unterminated-command",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.command-position",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans accepts top-level spans when frames/array contexts are absent; command position is bookkeeping, not blanket rejection. Top-level case pattern is admitted; nested command substitution case is covered separately."
+    },
+    {
+      "id": "bash.quoted-extglob",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission; test_phase3_bash_lexer_security.py:test_v3_admission_rejects_dialect_contexts_that_are_not_simple_tokens"
+    },
+    {
+      "id": "bash.assignment",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.array",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.subscript",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.declare-integer",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.let",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.function",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.coproc",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.case-action",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.case-pattern",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans accepts top-level spans when frames/array contexts are absent; command position is bookkeeping, not blanket rejection. Top-level case pattern is admitted; nested command substitution case is covered separately."
+    },
+    {
+      "id": "bash.redirection",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.redirection-target",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-words"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_ARRAY_SUBSCRIPT_CONTEXTS/_ARITHMETIC_BUILTIN_CONTEXTS; test_phase3_bash_lexer_security.py:test_v3_real_shell_keeps_exact_data_in_top_level_case_actions"
+    },
+    {
+      "id": "bash.heredoc-unquoted",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-quoted",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-tabs",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-multiple",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-delimiter",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-quoted-delimiter",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-missing",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.here-string",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.heredoc-safe-tail",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-input-operators"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:test_v3_bash_rejects_unsafe_output_reference_contexts_during_admission/test_v3_bash_maximal_munch_admits_here_string_operands; classifier consume_heredocs"
+    },
+    {
+      "id": "bash.no-candidate-invalid",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_rendering.function_declaration_name_end raises unconditionally for quoted/dynamic function names, even with no candidate spans. Final unterminated quote check, by contrast, is guarded by ordered."
+    },
+    {
+      "id": "bash.nesting-64",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans global validation and 64-frame bound; test_phase3_bash_reference_ordering.py lexical precedence"
+    },
+    {
+      "id": "bash.nesting-65",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans global validation and 64-frame bound; test_phase3_bash_reference_ordering.py lexical precedence"
+    },
+    {
+      "id": "bash.adjacent",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans global validation and 64-frame bound; test_phase3_bash_reference_ordering.py lexical precedence"
+    },
+    {
+      "id": "bash.context-before-grammar",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans global validation and 64-frame bound; test_phase3_bash_reference_ordering.py lexical precedence"
+    },
+    {
+      "id": "bash.eager-error",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans global validation and 64-frame bound; test_phase3_bash_reference_ordering.py lexical precedence"
+    },
+    {
+      "id": "scalar.names-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.names-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.unknown-maximal",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.positional",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.fallback-arguments",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.comment-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.comment-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.escape-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.escape-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.single",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.double",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.bare",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.overlap-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.overlap-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.nonrecursive",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.outputs-only",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "scalar.unsafe",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_output_tokens_own_scalar_named_producer_spans_in_prompt_and_bash; resources.StrictSubstitutionRenderer._scalar/_substitutions; bash_rendering._quote_inline_value"
+    },
+    {
+      "id": "path.whole",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.containing-type-ref",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.ref-sibling",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.allof",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.anyof-possible",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.anyof-impossible",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.oneof-possible",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.numeric-object",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.numeric-array",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.numeric-both-impossible",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.numeric-array-alternative",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.prefix-items",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.tuple-items",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.additional-items",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.additional-properties",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.dotted-key",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.unresolved-ref",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.cyclic-ref",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.nonlocal-ref",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-whole",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-mapping",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-array",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-leading-zero-key",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-leading-zero-index",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-missing",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-schemaless",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "path.resolve-missing-output",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "test_strict_output_references.py static schema feasibility and immutable _resolved_output fixture; schema._v3_output_path_impossible containing type/ref siblings/independent numeric interpretations"
+    },
+    {
+      "id": "unicode.astral-offset",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "Unicode 15.0 adds Kawi U+11F02 Lo; bash_rendering declaration flag isalpha; explicit code-point offsets and historical condition isspace"
+    },
+    {
+      "id": "unicode.nbsp-suffix",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "Unicode 15.0 adds Kawi U+11F02 Lo; bash_rendering declaration flag isalpha; explicit code-point offsets and historical condition isspace"
+    },
+    {
+      "id": "unicode.condition-whitespace",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "Unicode 15.0 adds Kawi U+11F02 Lo; bash_rendering declaration flag isalpha; explicit code-point offsets and historical condition isspace"
+    },
+    {
+      "id": "unicode.superscript-digit",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans ordinary redirection branch (bash_rendering.py:1214) uses str.isdigit for the preceding word. U+00B2 is a Digit in all supported Unicode databases; the later output token keeps authored code-point offsets."
+    },
+    {
+      "id": "unicode.kawi-u14",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "Unicode 15.0 adds Kawi U+11F02 Lo; bash_rendering declaration flag isalpha; explicit code-point offsets and historical condition isspace"
+    },
+    {
+      "id": "unicode.kawi-u15",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "Unicode 15.0 adds Kawi U+11F02 Lo; bash_rendering declaration flag isalpha; explicit code-point offsets and historical condition isspace"
+    },
+    {
+      "id": "unicode.kawi-digit-u14",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans ordinary redirection branch (bash_rendering.py:1214) uses str.isdigit for the preceding word. U+11F50 is unassigned in Unicode 14, but this fixture still admits the later output reference at authored [12,21); it does not claim an observable divergence from Unicode 15."
+    },
+    {
+      "id": "unicode.kawi-digit-u15",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "families": [
+        "unicode"
+      ],
+      "evidence": "bash_rendering._classify_authored_bash_reference_spans ordinary redirection branch (bash_rendering.py:1214) uses str.isdigit for the preceding word. U+11F50 is Decimal in Unicode 15/15.1; this fixture admits the later output reference at authored [12,21), the same observable result as the Unicode 14 case."
+    },
+    {
+      "id": "resource.command-v2",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.command-v3-missing",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.command-v3-valid",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.script-v3",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.script-v4",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.script-v6",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-invalid-before",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-invalid-after",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-valid-before-malformed",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-valid-after-malformed",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-reference-free",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-command-v2",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "resource.digest-command-v3",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "test_strict_output_references.py:test_named_script_scan_never_loses_a_valid_reference_around_other_bytes and pre-v3 digest assertions; schema.validate_authenticated_resource_references Phase3/4 branches"
+    },
+    {
+      "id": "bash.adjacent-previous-current-scalar",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "bash-boundaries"
+      ],
+      "evidence": "bash_output_references masks previous spans with equal length before parsing ordinary adjacent spans; dedicated previous wrappers bound at next dollar."
+    },
+    {
+      "id": "bash.joined-command-substitution",
+      "requirements": [
+        "S3"
+      ],
+      "families": [
+        "bash-frames"
+      ],
+      "evidence": "test_phase3_bash_substitution.py:_JOINED_UNSUPPORTED_CONTEXTS command-substitution physical continuation"
+    },
+    {
+      "id": "api.spans-malformed-pair",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "iter_output_references_in_spans unpacking requires a pair and propagates ValueError unchanged."
+    },
+    {
+      "id": "api.spans-bool",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "families": [
+        "iterator-api"
+      ],
+      "evidence": "iter_output_references_in_spans has numeric comparison guards but no exact-int guard (unlike classifier); False is accepted as zero."
+    },
+    {
+      "id": "previous.v3-dedicated-api",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "families": [
+        "previous-outputs"
+      ],
+      "evidence": "iter_loop_previous_output_references uses _require_strict_reference_semantics, allowing v3 even though authoring policy activates previous outputs only in v6."
+    },
+    {
+      "id": "scalar.malformed-cause",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "families": [
+        "scalars"
+      ],
+      "evidence": "test_strict_output_references.py:test_v3_malformed_later_reference_reports_its_exact_producer; StrictSubstitutionRenderer._references translates with cause."
+    },
+    {
+      "id": "resource.ordered-script-errors",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "families": [
+        "authenticated-resources"
+      ],
+      "evidence": "validate_authenticated_resource_references v3 iterates definition.nodes, accumulates named-script issues in authored order, independent of body-map insertion order."
+    },
+    {
+      "id": "path.numeric-object-alternative",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "_v3_schema_path_impossible requires both numeric interpretations impossible; maxItems=0 does not reject exact permitted mapping key."
+    },
+    {
+      "id": "path.ref-target-constraint",
+      "requirements": [
+        "S4"
+      ],
+      "families": [
+        "schema-paths"
+      ],
+      "evidence": "_v3_schema_path_interpretation_impossible retains referenced target restrictions even when containing schema is open."
+    }
+  ],
+  "workflow_cases": [
+    {
+      "id": "loop-group-current-ref-with-dependency",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py current body references require direct body dependencies"
+    },
+    {
+      "id": "loop-group-current-ref-needs-dependency",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_rejects_invalid_body_reference_scopes"
+    },
+    {
+      "id": "loop-group-mixed-ref-needs-dependency",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_mixed_references_keep_exact_missing_dependency_semantic_code"
+    },
+    {
+      "id": "loop-group-outer-ref-with-dependency",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py outer references resolve through loop-group dependencies"
+    },
+    {
+      "id": "loop-group-outer-ref-needs-dependency",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_rejects_invalid_body_reference_scopes"
+    },
+    {
+      "id": "loop-group-loop-prev-valid",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py previous-iteration body references use the dedicated scope"
+    },
+    {
+      "id": "loop-group-loop-prev-unknown-producer",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_rejects_invalid_previous_condition_scopes"
+    },
+    {
+      "id": "loop-group-gate-ref-needs-dependency",
+      "requirements": [
+        "S6",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_group_gate_missing_dependency_has_branch_local_semantic_code"
+    },
+    {
+      "id": "loop-group-structured-paths-valid",
+      "requirements": [
+        "S4",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_accepts_structured_paths_on_all_scoped_reference_surfaces"
+    },
+    {
+      "id": "loop-group-body-outer-collision-body-field-valid",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py sibling body producer shadows an outer producer with the same ID"
+    },
+    {
+      "id": "loop-group-first-iteration-previous-output",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_language_conformance.py:test_first_iteration_previous_output_case_matches_runtime_resolution"
+    },
+    {
+      "id": "jira-defect-loop-distributed",
+      "requirements": [
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_language_conformance.py:test_distributed_jira_case_is_exact_and_provenance_tagged"
+    },
+    {
+      "id": "reference-root-phase4-surfaces-valid",
+      "requirements": [
+        "S5",
+        "S6"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase4_references.py:test_included_nodes_rewrite_every_inline_reference_surface; root Phase-4 templates are validated through the shared inventory"
+    },
+    {
+      "id": "reference-root-phase4-container-order",
+      "requirements": [
+        "S5",
+        "S6",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "language_schema.iter_interpolation_surface_templates visits authored agent and hook containers before each container's ordered leaves"
+    },
+    {
+      "id": "loop-group-multimode-scopes-valid",
+      "requirements": [
+        "S5",
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_accepts_structured_paths_on_all_scoped_reference_surfaces and test_v6_admits_all_group_until_bash_reference_scopes"
+    },
+    {
+      "id": "loop-group-multigroup-scope-isolation",
+      "requirements": [
+        "S7",
+        "S8"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py scoped-reference validation; repeated body IDs remain local to each authored loop group"
+    },
+    {
+      "id": "loop-group-competing-previous-current-errors",
+      "requirements": [
+        "S7"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "test_phase6_language.py:test_v6_mixed_references_keep_exact_missing_dependency_semantic_code; previous references are validated before masked ordinary references"
+    },
+    {
+      "id": "loop-group-scope-diagnostic-ordering",
+      "requirements": [
+        "S7",
+        "S8"
+      ],
+      "families": [
+        "workflow-integration"
+      ],
+      "evidence": "schema._validate_v6_loop_group_references preserves group, child, surface, and group-control authored order"
+    }
+  ]
+}

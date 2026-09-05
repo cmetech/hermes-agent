@@ -652,6 +652,9 @@ plugins = [
   # packaging exception merely to retain its descriptor or linked skill files.
   "**/config.schema.json",
   "**/skills/**/*",
+  # Literal reference-scanner conformance data consumed through
+  # importlib.resources by installed workflow-language publishers.
+  "workflow/conformance/*.json",
   # Authenticated, read-only workflow showcase catalog and package resources.
   "workflow/showcases/**/*",
 ]

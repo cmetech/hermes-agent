@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -11,7 +12,10 @@ import yaml
 
 from plugins.workflow.language import CURRENT_NORMALIZER_BY_PROFILE
 from plugins.workflow.language_conformance import workflow_language_conformance
-from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.language_schema import (
+    canonical_contract_json,
+    workflow_authoring_contract,
+)
 from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowNode,
@@ -26,8 +30,12 @@ from plugins.workflow.schema import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+REFERENCE_SCANNER_MANIFEST = (
+    Path(__file__).parent / "fixtures/reference_scanner/case_manifest.json"
+)
 MAX_CORPUS_CASES = 64
-MAX_CORPUS_BYTES = 160_000
+LEGACY_MAX_CORPUS_BYTES = 160_000
+ARCHON_MAX_CORPUS_BYTES = 384_000
 
 
 def _mapping(value: object) -> Mapping[str, object]:
@@ -111,7 +119,9 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
     ).encode("utf-8")
 
     assert first == second
-    assert first["format_version"] == 1
+    assert first["format_version"] == (
+        2 if profile is WorkflowLanguageProfile.ARCHON_2026_07 else 1
+    )
     assert first["profile"] == profile.value
     assert first["normalizer_version"] == CURRENT_NORMALIZER_BY_PROFILE[profile]
     assert first["contract"] == {
@@ -130,7 +140,11 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
         f"hermes workflow schema-corpus --profile {profile.value} --json"
     )
     assert 1 <= len(cases) <= MAX_CORPUS_CASES
-    assert len(encoded) <= MAX_CORPUS_BYTES
+    assert len(encoded) <= (
+        ARCHON_MAX_CORPUS_BYTES
+        if profile is WorkflowLanguageProfile.ARCHON_2026_07
+        else LEGACY_MAX_CORPUS_BYTES
+    )
 
     ids = [_text(case["id"]) for case in cases]
     assert len(ids) == len(set(ids))
@@ -159,6 +173,83 @@ def test_conformance_envelope_is_versioned_bounded_and_deterministic(profile):
             assert scope == "root" or scope.startswith(
                 "loop-group:"
             )
+
+
+def test_archon_corpus_binds_reviewed_scanner_artifacts():
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    corpus = workflow_language_conformance(profile)
+
+    assert corpus["format_version"] == 2
+    assert corpus["scanner_cases"]
+    assert corpus["contract"]["contract_digest"] == workflow_authoring_contract(
+        profile
+    )["contract_digest"]
+    payload = {key: value for key, value in corpus.items() if key != "corpus_digest"}
+    assert corpus["corpus_digest"] == "sha256:" + sha256(
+        canonical_contract_json(payload).encode("utf-8")
+    ).hexdigest()
+
+
+def test_archon_corpus_returns_mutation_isolated_literal_sections():
+    profile = WorkflowLanguageProfile.ARCHON_2026_07
+    first = workflow_language_conformance(profile)
+    first["scanner_cases"][0]["expected"]["error"] = {"class": "Mutated"}
+    first["substitution_cases"].clear()
+    first["structured_path_cases"][0]["input"] = {"mutated": True}
+
+    second = workflow_language_conformance(profile)
+
+    assert second["scanner_cases"][0]["expected"]["error"] != {
+        "class": "Mutated"
+    }
+    assert second["substitution_cases"]
+    assert second["structured_path_cases"][0]["input"] != {"mutated": True}
+
+
+def test_archon_corpus_publication_never_calls_runtime_scanners(monkeypatch):
+    from plugins.workflow import bash_rendering, conditions, language_schema
+    from plugins.workflow import output_resolution, resources, schema, trust
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("corpus publication must not execute scanners")
+
+    runtime_entry_points = {
+        language_schema: (
+            "contains_output_reference",
+            "iter_loop_previous_output_references",
+            "iter_output_reference_candidate_spans",
+            "iter_output_references",
+            "iter_output_references_in_spans",
+            "iter_when_output_references",
+        ),
+        bash_rendering: (
+            "bash_loop_previous_output_references",
+            "bash_loop_previous_reference_spans",
+            "bash_output_references",
+            "classify_bash_reference_spans",
+        ),
+        conditions: (
+            "validate_v3_condition_syntax",
+            "validate_v6_condition_syntax",
+        ),
+        resources: ("substitution_renderer",),
+        output_resolution: ("resolve_output_reference",),
+        schema: (
+            "_v3_output_path_impossible",
+            "validate_authenticated_resource_references",
+        ),
+        trust: ("compute_package_digest",),
+    }
+    for module, names in runtime_entry_points.items():
+        for name in names:
+            monkeypatch.setattr(module, name, unexpected_call)
+
+    corpus = workflow_language_conformance(
+        WorkflowLanguageProfile.ARCHON_2026_07
+    )
+
+    assert corpus["scanner_cases"]
+    assert corpus["corpus_digest"].startswith("sha256:")
 
 
 @pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
@@ -335,6 +426,67 @@ def test_archon_corpus_has_stable_loop_group_cases_and_portable_codes():
         "loop-group-unknown-field-preserved",
         "jira-defect-loop-distributed",
     } <= set(cases)
+
+
+def test_archon_corpus_covers_root_phase4_scopes_modes_and_ordering():
+    cases = _cases(WorkflowLanguageProfile.ARCHON_2026_07)
+    expected_requirements = {
+        "reference-root-phase4-surfaces-valid": {"S5", "S6"},
+        "reference-root-phase4-container-order": {"S5", "S6", "S7"},
+        "loop-group-multimode-scopes-valid": {"S5", "S7"},
+        "loop-group-multigroup-scope-isolation": {"S7", "S8"},
+        "loop-group-competing-previous-current-errors": {"S7"},
+        "loop-group-scope-diagnostic-ordering": {"S7", "S8"},
+    }
+
+    assert set(expected_requirements) <= set(cases)
+    assert cases["reference-root-phase4-surfaces-valid"]["valid"] is True
+    assert cases["loop-group-multimode-scopes-valid"]["valid"] is True
+    assert cases["loop-group-multigroup-scope-isolation"]["valid"] is True
+    assert [
+        diagnostic["path"]
+        for diagnostic in cases["reference-root-phase4-container-order"][
+            "diagnostics"
+        ]
+    ] == [
+        "nodes[1].systemPrompt",
+        "nodes[1].agents.first.description",
+        "nodes[1].agents.first.prompt",
+        "nodes[1].agents.second.description",
+        "nodes[1].agents.second.prompt",
+        "nodes[1].hooks.PreToolUse[0].response.systemMessage",
+        "nodes[1].hooks.PreToolUse[0].response.stopReason",
+        (
+            "nodes[1].hooks.PreToolUse[0].response.hookSpecificOutput."
+            "permissionDecisionReason"
+        ),
+        (
+            "nodes[1].hooks.PreToolUse[0].response.hookSpecificOutput."
+            "additionalContext"
+        ),
+        "nodes[1].hooks.PreToolUse[1].response.systemMessage",
+    ]
+    assert cases["loop-group-competing-previous-current-errors"]["codes"] == [
+        "scoped-reference-unknown-producer",
+        "scoped-reference-missing-dependency",
+    ]
+    assert cases["loop-group-scope-diagnostic-ordering"]["codes"] == [
+        "scoped-reference-missing-dependency",
+        "scoped-reference-unknown-producer",
+        "scoped-reference-missing-dependency",
+    ]
+
+    manifest = json.loads(
+        REFERENCE_SCANNER_MANIFEST.read_text(encoding="utf-8")
+    )
+    workflow_rows = {
+        row["id"]: row for row in _mapping_list(manifest["workflow_cases"])
+    }
+    assert len(workflow_rows) == len(_mapping_list(manifest["workflow_cases"]))
+    assert set(expected_requirements) <= set(workflow_rows) <= set(cases)
+    for case_id, requirements in expected_requirements.items():
+        assert set(_string_list(workflow_rows[case_id]["requirements"])) == requirements
+        assert _text(workflow_rows[case_id]["evidence"])
 
 
 def test_first_iteration_previous_output_case_matches_runtime_resolution():
