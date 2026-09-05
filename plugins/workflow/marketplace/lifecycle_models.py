@@ -103,22 +103,15 @@ class StrictLifecycleModel(BaseModel):
     ) -> Self:
         """Reject duplicate object keys before Pydantic decodes the document."""
 
+        validation_message = None
         try:
             json.loads(json_data, object_pairs_hook=_unique_json_object)
-        except _DuplicateJsonKeyError as error:
-            raise ValidationError.from_exception_data(
-                cls.__name__,
-                [
-                    {
-                        "type": "value_error",
-                        "loc": (),
-                        "input": "JSON document",
-                        "ctx": {"error": ValueError("duplicate JSON object key")},
-                    }
-                ],
-                input_type="json",
-                hide_input=True,
-            ) from error
+        except _DuplicateJsonKeyError:
+            validation_message = "duplicate JSON object key"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            validation_message = "invalid JSON document"
+        if validation_message is not None:
+            raise _json_validation_error(cls.__name__, validation_message)
         return super().model_validate_json(
             json_data,
             strict=strict,
@@ -131,6 +124,22 @@ class StrictLifecycleModel(BaseModel):
 
 class _DuplicateJsonKeyError(ValueError):
     """Private sentinel used to preserve a stable public validation error."""
+
+
+def _json_validation_error(model_name: str, message: str) -> ValidationError:
+    return ValidationError.from_exception_data(
+        model_name,
+        [
+            {
+                "type": "value_error",
+                "loc": (),
+                "input": "JSON document",
+                "ctx": {"error": ValueError(message)},
+            }
+        ],
+        input_type="json",
+        hide_input=True,
+    )
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

@@ -1094,6 +1094,34 @@ def test_lifecycle_json_decoder_rejects_duplicate_keys_at_every_depth(nested) ->
         LifecycleOperation.model_validate_json(encoded)
 
 
+@pytest.mark.parametrize("wire_type", [str, bytes, bytearray])
+def test_lifecycle_json_decoder_accepts_supported_document_types(wire_type) -> None:
+    encoded = json.dumps(_operation("install_prepare", "pending"))
+    document = encoded if wire_type is str else wire_type(encoded, "utf-8")
+
+    operation = LifecycleOperation.model_validate_json(document)
+
+    assert operation.kind == "install_prepare"
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        '{"schema_version":2,"secret":"must-not-escape"',
+        b'{"schema_version":2,"secret":"must-not-escape-\xff"}',
+        bytearray(b'{"schema_version":2,"secret":"must-not-escape-\xff"}'),
+    ],
+)
+def test_lifecycle_json_decoder_safely_rejects_malformed_documents(document) -> None:
+    with pytest.raises(ValidationError) as caught:
+        LifecycleOperation.model_validate_json(document)
+
+    rendered = str(caught.value)
+    assert "must-not-escape" not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     ("kind", "field", "value"),
     [
