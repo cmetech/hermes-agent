@@ -363,7 +363,9 @@ def test_source_completion_store_swap_during_fallback_never_writes_foreign_statu
 
 @pytest.mark.parametrize("refresh", ["fresh", "disabled", "cancelled"])
 @pytest.mark.parametrize("exit_kind", ["return", "error", "cancel"])
-@pytest.mark.parametrize("replacement", ["store", "catalog"])
+@pytest.mark.parametrize(
+    "replacement", ["store", "catalog", "catalog_none", "catalog_missing"]
+)
 def test_source_completion_outer_callback_cannot_transfer_terminal_authority(
     source_service, tmp_path, refresh, exit_kind, replacement
 ):
@@ -384,8 +386,12 @@ def test_source_completion_outer_callback_cannot_transfer_terminal_authority(
         )
         if replacement == "store":
             source_service.catalog.source_store = foreign_store
-        else:
+        elif replacement == "catalog":
             source_service.catalog = foreign.catalog
+        elif replacement == "catalog_none":
+            source_service.catalog = None
+        else:
+            del source_service.catalog
         if exit_kind == "error":
             raise RuntimeError("outer callback failed")
         if exit_kind == "cancel":

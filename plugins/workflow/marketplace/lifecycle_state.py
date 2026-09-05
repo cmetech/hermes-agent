@@ -299,7 +299,9 @@ def complete_source_refresh(
             # The supplied callback owns control beyond the catalog return.
             # Revalidate even when it raises, before classifying any outcome.
             try:
-                _source_scope(catalog=service.catalog)
+                if service.catalog is not catalog:
+                    raise ValueError("source catalog binding is invalid")
+                _source_scope(catalog=catalog)
             except Exception:
                 evidence.invalid.set()
                 raise
