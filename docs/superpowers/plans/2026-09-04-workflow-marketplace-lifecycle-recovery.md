@@ -106,7 +106,7 @@ def require_result_kind(kind, result):
 
 ## Task 14A2 — Bounded idempotent admission and stable operation listing
 
-**Files:** Create `admissions.py`, `tests/plugins/workflow/test_marketplace_admissions.py`; modify `operations.py`, `test_marketplace_operations.py`.
+**Files:** Create `admissions.py`, `tests/plugins/workflow/test_marketplace_admissions.py`; modify `operations.py`, `test_marketplace_operations.py`. Also modify `api.py`'s `_start` adapter and existing refresh/inspect/update-check callers, plus their `test_marketplace_api.py` coverage, solely to pass already-validated safe subject/body metadata for V1 receipt integration. New V2 routes and V1 mutation retirement remain in 14A3.
 
 **Consumes:** 14A1 models and correlation table.
 
