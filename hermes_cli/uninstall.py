@@ -193,7 +193,7 @@ def remove_wrapper_script():
         try:
             if path.is_dir() or path.stat().st_size > 4096:
                 return ""
-            return path.read_text(errors="ignore")
+            return path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return ""
 

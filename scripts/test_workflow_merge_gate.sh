@@ -408,6 +408,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_language.py \
       tests/plugins/workflow/test_language_snapshot.py \
       tests/plugins/workflow/test_language_schema.py \
+      tests/plugins/workflow/test_language_conformance.py \
       tests/plugins/workflow/test_phase3_language.py \
       tests/plugins/workflow/test_phase3_execution_semantics.py \
       tests/plugins/workflow/test_phase3_code_catalog.py \

@@ -28,6 +28,7 @@ from plugins.workflow.trust import build_risk_summary, compute_package_digest
 from plugins.workflow.trust import WorkflowPackageDigest, WorkflowTrustStore
 from plugins.workflow.compat import assess_compatibility
 from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.language_conformance import workflow_language_conformance
 from plugins.workflow.models import WorkflowLanguageProfile
 
 
@@ -173,20 +174,39 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
     return tuple(entries)
 
 
-def _run_packaged_schema(tmp_path: Path, arguments: list[str]):
+def _run_packaged_schema(
+    tmp_path: Path,
+    arguments: list[str],
+    *,
+    forbid_plugin_runtime: bool = False,
+):
     home = tmp_path / "fresh-home"
     hermes_home = tmp_path / "fresh-hermes-home"
     guard_dir = tmp_path / "process-guards"
     guard_dir.mkdir()
-    (guard_dir / "sitecustomize.py").write_text(
+    plugin_runtime_guards = (
         """
+            "plugins.workflow.discovery",
+            "hermes_cli.plugins",
+            "providers",
+"""
+        if forbid_plugin_runtime
+        else ""
+    )
+    (guard_dir / "sitecustomize.py").write_text(
+        f"""
 import socket
 import sys
 
 class _ForbiddenRuntimeImports:
     def find_spec(self, fullname, path=None, target=None):
-        if fullname in {"run_agent", "model_tools", "tools.mcp_tool"}:
-            raise RuntimeError(f"forbidden runtime import: {fullname}")
+        if fullname in {{
+            "run_agent",
+            "model_tools",
+            "tools.mcp_tool",
+{plugin_runtime_guards}
+        }}:
+            raise RuntimeError(f"forbidden runtime import: {{fullname}}")
         return None
 
 def _forbid_network(*args, **kwargs):
@@ -659,6 +679,135 @@ def test_json_load_failures_preserve_typed_workflow_issue_codes(
     assert envelope["error"]["details"]["issues"][0]["code"] == expected_code
 
 
+@pytest.mark.parametrize("max_attempts", (True, -1, 1.5))
+def test_json_validate_preserves_raw_loop_child_retry_issue_envelope(
+    workflow_writer, tmp_path, capsys, max_attempts
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="invalid-loop-child-retry",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "done",
+                    "max_iterations": 1,
+                    "nodes": [
+                        {
+                            "id": "retrying",
+                            "prompt": "Retry.",
+                            "retry": {"max_attempts": max_attempts},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    envelope = _json_envelope(capsys)
+    assert envelope["error"]["code"] == "archon_retry_invalid"
+    assert envelope["error"]["details"]["issues"][0] == {
+        "blocking": True,
+        "code": "archon_retry_invalid",
+        "path": "nodes[0].retry.max_attempts",
+        "severity": "error",
+    }
+
+
+def test_json_load_failure_exposes_additive_semantic_issue_code(
+    workflow_writer, tmp_path, capsys
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="semantic-load-error",
+        nodes=[
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "done",
+                    "max_iterations": 1,
+                    "nodes": [
+                        {"id": "producer", "prompt": "produce"},
+                        {"id": "consumer", "prompt": "Use $producer.output"},
+                    ],
+                },
+            }
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    issue = _json_envelope(capsys)["error"]["details"]["issues"][0]
+    assert issue == {
+        "blocking": True,
+        "code": "loop_group_scope_invalid",
+        "path": "nodes[0].loop_group.nodes[1].prompt",
+        "semantic_code": "scoped-reference-missing-dependency",
+        "severity": "error",
+    }
+
+
+def test_json_gate_message_failure_exposes_branch_local_semantic_issue_code(
+    workflow_writer, tmp_path, capsys
+):
+    path = workflow_writer(
+        tmp_path / ".hermes" / "workflows",
+        name="semantic-gate-load-error",
+        nodes=[
+            {"id": "outer", "prompt": "produce"},
+            {
+                "id": "group",
+                "loop_group": {
+                    "until": "done",
+                    "max_iterations": 1,
+                    "gate_message": "Review $outer.output",
+                    "nodes": [{"id": "consumer", "prompt": "consume"}],
+                },
+            },
+        ],
+    )
+    path.with_name(f"{path.stem}.hermes.yaml").write_text(
+        "language_compatibility: archon-2026-07\n", encoding="utf-8"
+    )
+    args = _parser().parse_args([
+        "--workdir",
+        str(tmp_path),
+        "validate",
+        path.stem,
+        "--json",
+    ])
+
+    assert args.func(args) == machine_contract.EXIT_INVOCATION
+    issue = _json_envelope(capsys)["error"]["details"]["issues"][0]
+    assert issue == {
+        "blocking": True,
+        "code": "output_reference_not_declared_dependency",
+        "path": "nodes[1].loop_group.gate_message",
+        "semantic_code": "scoped-reference-missing-dependency",
+        "severity": "error",
+    }
+
+
 def test_doctor_text_renders_sanitized_finding_code_path_and_migration(
     workflow_writer, tmp_path, capsys
 ):
@@ -1034,14 +1183,97 @@ def test_schema_text_is_indented_json(capsys):
     assert '\n  "compatibility_codes"' in output.out
 
 
+@pytest.mark.parametrize("profile", tuple(WorkflowLanguageProfile))
+def test_schema_corpus_json_emits_complete_envelope_without_discovery(
+    profile, tmp_path, capsys, monkeypatch
+):
+    workdir = tmp_path / "missing-workflow-directory"
+    hermes_home = tmp_path / "missing-profile-directory"
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("schema-corpus must not discover workflows or start runtimes")
+
+    monkeypatch.setattr("plugins.workflow.cli._discover", unexpected_call)
+    args = _parser().parse_args([
+        "--workdir",
+        str(workdir),
+        "--hermes-home",
+        str(hermes_home),
+        "schema-corpus",
+        "--profile",
+        profile.value,
+        "--json",
+    ])
+
+    assert args.func(args, agent_runner=unexpected_call) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out) == workflow_language_conformance(profile)
+    assert not workdir.exists()
+    assert not hermes_home.exists()
+
+
+def test_schema_corpus_json_is_compact_utf8_bounded_and_byte_deterministic(capsys):
+    parser = _parser()
+    arguments = ["schema-corpus", "--profile", "archon-2026-07", "--json"]
+
+    first = parser.parse_args(arguments)
+    assert first.func(first) == 0
+    first_output = capsys.readouterr().out
+    second = parser.parse_args(arguments)
+    assert second.func(second) == 0
+    second_output = capsys.readouterr().out
+
+    assert first_output == second_output
+    assert first_output.encode("utf-8").decode("utf-8") == first_output
+    assert len(first_output.encode("utf-8")) <= 160_001
+    assert first_output.count("\n") == 1
+    assert first_output == (
+        json.dumps(
+            json.loads(first_output),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"cases": [{} for _ in range(65)]}, "more than 64 cases"),
+        ({"cases": [], "padding": "x" * 160_000}, "more than 160000 bytes"),
+    ],
+    ids=["case-count", "encoded-bytes"],
+)
+def test_schema_corpus_refuses_to_print_out_of_bounds_payloads(
+    payload, message, monkeypatch, capsys
+):
+    import plugins.workflow.schema_cli as schema_cli
+
+    monkeypatch.setattr(
+        schema_cli,
+        "workflow_language_conformance",
+        lambda _profile: payload,
+    )
+    args = argparse.Namespace(profile="archon-2026-07", json=True)
+
+    with pytest.raises(ValueError, match=message):
+        schema_cli.emit_schema_corpus(args)
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("action", ["schema", "schema-corpus"])
 @pytest.mark.parametrize("json_mode", [True, False], ids=["json", "text"])
 def test_packaged_schema_command_is_read_only_before_normal_startup(
-    tmp_path, json_mode
+    tmp_path, action, json_mode
 ):
     """The exact packaged introspection path must not initialize Hermes."""
     arguments = [
         "workflow",
-        "schema",
+        action,
         "--profile",
         "archon-2026-07",
     ]
@@ -1049,7 +1281,7 @@ def test_packaged_schema_command_is_read_only_before_normal_startup(
         arguments.append("--json")
 
     completed, before, after, home, hermes_home = _run_packaged_schema(
-        tmp_path, arguments
+        tmp_path, arguments, forbid_plugin_runtime=True
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -1057,9 +1289,17 @@ def test_packaged_schema_command_is_read_only_before_normal_startup(
     assert json.loads(completed.stdout)["profile"] == "archon-2026-07"
     if json_mode:
         assert completed.stdout.count("\n") == 1
-        assert ": " not in completed.stdout
+        assert completed.stdout == (
+            json.dumps(
+                json.loads(completed.stdout),
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
     else:
-        assert '\n  "compatibility_codes"' in completed.stdout
+        assert "\n  " in completed.stdout
     assert before == ((), ())
     assert after == before
     assert not home.exists()
@@ -1070,12 +1310,24 @@ def test_packaged_schema_command_is_read_only_before_normal_startup(
     ("arguments", "returncode", "early_recovery_called"),
     [
         (["workflow", "schema", "--json"], 0, False),
+        (["workflow", "schema-corpus", "--json"], 0, False),
         (["workflow", "schema", "--help"], 0, False),
+        (["workflow", "schema-corpus", "--help"], 0, False),
         (["workflow", "schema", "--definitely-child"], 2, False),
+        (["workflow", "schema-corpus", "--definitely-child"], 2, False),
         (["--version"], 0, True),
         (["update", "--help"], 0, True),
     ],
-    ids=["schema-success", "schema-help", "schema-error", "normal", "update"],
+    ids=[
+        "schema-success",
+        "corpus-success",
+        "schema-help",
+        "corpus-help",
+        "schema-error",
+        "corpus-error",
+        "normal",
+        "update",
+    ],
 )
 def test_packaged_schema_alone_skips_early_recovery_marker_probe(
     tmp_path, arguments, returncode, early_recovery_called
@@ -1097,11 +1349,13 @@ def test_packaged_schema_alone_skips_early_recovery_marker_probe(
     ],
     ids=["global", "workflow-root"],
 )
+@pytest.mark.parametrize("action", ["schema", "schema-corpus"])
 def test_packaged_schema_rejects_unknown_precommand_once_without_startup(
-    tmp_path, arguments
+    tmp_path, arguments, action
 ):
+    arguments = [action if argument == "schema" else argument for argument in arguments]
     completed, before, after, home, hermes_home = _run_packaged_schema(
-        tmp_path, arguments
+        tmp_path, arguments, forbid_plugin_runtime=True
     )
 
     assert completed.returncode == 2
@@ -1115,14 +1369,17 @@ def test_packaged_schema_rejects_unknown_precommand_once_without_startup(
     assert not hermes_home.exists()
 
 
-def test_packaged_schema_help_is_read_only_argparse_output(tmp_path):
+@pytest.mark.parametrize("action", ["schema", "schema-corpus"])
+def test_packaged_schema_help_is_read_only_argparse_output(tmp_path, action):
     completed, before, after, home, hermes_home = _run_packaged_schema(
-        tmp_path, ["workflow", "schema", "--help"]
+        tmp_path,
+        ["workflow", action, "--help"],
+        forbid_plugin_runtime=True,
     )
 
     assert completed.returncode == 0
     assert completed.stderr == ""
-    assert completed.stdout.count("usage: hermes workflow schema") == 1
+    assert completed.stdout.count(f"usage: hermes workflow {action}") == 1
     assert "--profile {hermes-legacy,archon-2026-07}" in completed.stdout
     assert "--json" in completed.stdout
     assert before == after == ((), ())
@@ -1131,28 +1388,55 @@ def test_packaged_schema_help_is_read_only_argparse_output(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("arguments", "message"),
+    ("action", "arguments", "message"),
     [
         (
-            ["workflow", "schema", "--profile", "future-profile"],
+            "schema",
+            ["--profile", "future-profile"],
             "invalid choice: 'future-profile'",
         ),
         (
-            ["workflow", "schema", "--profile"],
+            "schema-corpus",
+            ["--profile", "future-profile"],
+            "invalid choice: 'future-profile'",
+        ),
+        (
+            "schema",
+            ["--profile"],
             "argument --profile: expected one argument",
         ),
         (
-            ["workflow", "schema", "--definitely-child", "--json"],
+            "schema-corpus",
+            ["--profile"],
+            "argument --profile: expected one argument",
+        ),
+        (
+            "schema",
+            ["--definitely-child", "--json"],
+            "unrecognized arguments: --definitely-child",
+        ),
+        (
+            "schema-corpus",
+            ["--definitely-child", "--json"],
             "unrecognized arguments: --definitely-child",
         ),
     ],
-    ids=["invalid-profile", "missing-profile", "unknown-child"],
+    ids=[
+        "schema-invalid-profile",
+        "corpus-invalid-profile",
+        "schema-missing-profile",
+        "corpus-missing-profile",
+        "schema-unknown-child",
+        "corpus-unknown-child",
+    ],
 )
 def test_packaged_schema_parse_errors_are_single_and_read_only(
-    tmp_path, arguments, message
+    tmp_path, action, arguments, message
 ):
     completed, before, after, home, hermes_home = _run_packaged_schema(
-        tmp_path, arguments
+        tmp_path,
+        ["workflow", action, *arguments],
+        forbid_plugin_runtime=True,
     )
 
     assert completed.returncode == 2
@@ -1207,11 +1491,13 @@ def test_packaged_schema_parse_errors_are_single_and_read_only(
     ],
     ids=["global-before-command", "global-before-action", "global-after-child"],
 )
+@pytest.mark.parametrize("action", ["schema", "schema-corpus"])
 def test_packaged_schema_keeps_global_and_child_profiles_distinct(
-    tmp_path, arguments, expected_profile
+    tmp_path, arguments, expected_profile, action
 ):
+    arguments = [action if argument == "schema" else argument for argument in arguments]
     completed, before, after, home, hermes_home = _run_packaged_schema(
-        tmp_path, arguments
+        tmp_path, arguments, forbid_plugin_runtime=True
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -1223,9 +1509,12 @@ def test_packaged_schema_keeps_global_and_child_profiles_distinct(
 
 
 @pytest.mark.parametrize("version_flag", ["--version", "-V"])
-def test_packaged_schema_defers_to_normal_version_precedence(tmp_path, version_flag):
+@pytest.mark.parametrize("action", ["schema", "schema-corpus"])
+def test_packaged_schema_defers_to_normal_version_precedence(
+    tmp_path, version_flag, action
+):
     completed, before, after, home, hermes_home = _run_packaged_schema(
-        tmp_path, [version_flag, "workflow", "schema", "--json"]
+        tmp_path, [version_flag, "workflow", action, "--json"]
     )
 
     assert completed.returncode == 0, completed.stderr
@@ -1239,10 +1528,13 @@ def test_packaged_schema_defers_to_normal_version_precedence(tmp_path, version_f
 
 
 @pytest.mark.parametrize("oneshot_flag", ["--oneshot", "-z"])
-def test_packaged_schema_defers_to_normal_oneshot_precedence(tmp_path, oneshot_flag):
+@pytest.mark.parametrize("action", ["schema", "schema-corpus"])
+def test_packaged_schema_defers_to_normal_oneshot_precedence(
+    tmp_path, oneshot_flag, action
+):
     completed, before, after, home, hermes_home = _run_packaged_schema(
         tmp_path,
-        [oneshot_flag, "precedence probe", "workflow", "schema", "--json"],
+        [oneshot_flag, "precedence probe", "workflow", action, "--json"],
     )
 
     assert completed.returncode == 1

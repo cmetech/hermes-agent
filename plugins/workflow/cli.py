@@ -62,6 +62,7 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowPackage,
     WorkflowRuntimeConfig,
+    WorkflowSemanticValidationIssue,
     WorkflowStructuredOutput,
     WorkflowValidationError,
 )
@@ -100,7 +101,11 @@ from plugins.workflow.sanitize import (
     projection_key_is_secret,
     sanitize_projection,
 )
-from plugins.workflow.schema_cli import configure_schema_parser, emit_schema
+from plugins.workflow.schema_cli import (
+    configure_schema_parser,
+    emit_schema,
+    emit_schema_corpus,
+)
 from plugins.workflow.sessions import NodeSessionRegistry
 from plugins.workflow.store import (
     ForegroundExecutionConflict,
@@ -784,6 +789,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     configure_schema_parser(schema_parser)
 
+    corpus_parser = actions.add_parser(
+        "schema-corpus", help="Print workflow authoring conformance fixtures"
+    )
+    configure_schema_parser(corpus_parser)
+
     list_parser = actions.add_parser(
         "list", aliases=["ls"], help="List discovered workflows"
     )
@@ -1175,6 +1185,10 @@ def _cmd_schema(args: argparse.Namespace) -> int:
     return emit_schema(args)
 
 
+def _cmd_schema_corpus(args: argparse.Namespace) -> int:
+    return emit_schema_corpus(args)
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     capabilities = connector_capability_snapshot()
     entries = build_catalog(
@@ -1263,6 +1277,12 @@ def _language_payload(package: WorkflowPackage) -> dict[str, object]:
     return payload
 
 
+def _semantic_issue_payload(issue: ValidationIssue) -> dict[str, str]:
+    if isinstance(issue, WorkflowSemanticValidationIssue):
+        return {"semantic_code": issue.semantic_code}
+    return {}
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     package = _resolve(args, args.name)
     compilation = (
@@ -1302,6 +1322,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         issue_entries.append({
             "path": issue.path,
             "code": issue.code,
+            **_semantic_issue_payload(issue),
             "message": issue.message,
             "severity": issue.severity,
             "blocking": issue.blocking,
@@ -2914,7 +2935,7 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {schema|list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
+            "Usage: hermes workflow {schema|schema-corpus|list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
@@ -2925,6 +2946,8 @@ def workflow_command(
     try:
         if action == "schema":
             return _cmd_schema(args)
+        if action == "schema-corpus":
+            return _cmd_schema_corpus(args)
         if action in {"list", "ls"}:
             return _cmd_list(args)
         if action == "show":
@@ -3041,6 +3064,7 @@ def workflow_command(
             {
                 "code": issue.code,
                 "path": issue.path,
+                **_semantic_issue_payload(issue),
                 "severity": issue.severity,
                 "blocking": issue.blocking,
             }
