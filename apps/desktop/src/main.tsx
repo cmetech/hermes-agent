@@ -19,6 +19,10 @@ import { createRoot } from 'react-dom/client'
 import { HashRouter } from 'react-router'
 
 import App from './app'
+import {
+  MarketplaceSupervisorProvider,
+  startMainWindowMarketplaceSupervision
+} from './app/workflows/marketplace/supervisor-provider'
 import { RootErrorBoundary } from './components/error-boundary'
 import { HapticsProvider } from './components/haptics-provider'
 import { RootTooltipProvider } from './components/ui/tooltip'
@@ -60,6 +64,7 @@ if (winParam === 'overlay') {
   // main window's focus/visibility state to :root so decorative infinite
   // animations stop producing frames when nobody can see them.
   installRendererAnimationPauseState()
+  const marketplaceSupervisor = startMainWindowMarketplaceSupervision(queryClient)
 
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
@@ -84,7 +89,9 @@ if (winParam === 'overlay') {
                     both freeze for seconds despite the main thread being free.
                     Disabling transitions makes navigate() commit at default priority. */}
                   <HashRouter useTransitions={false}>
-                    <App />
+                    <MarketplaceSupervisorProvider supervisor={marketplaceSupervisor}>
+                      <App />
+                    </MarketplaceSupervisorProvider>
                   </HashRouter>
                 </RootTooltipProvider>
               </HapticsProvider>
