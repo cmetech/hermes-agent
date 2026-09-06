@@ -665,7 +665,7 @@ describe('application marketplace operation supervision', () => {
     }
   )
 
-  it.each(['watching', 'terminal', 'evicted'] as const)(
+  it.each(['watching', 'status_unknown', 'terminal', 'evicted'] as const)(
     'does not overwrite exact %s truth from a later list snapshot',
     async state => {
       const h = setup()
@@ -688,6 +688,8 @@ describe('application marketplace operation supervision', () => {
 
         if (state === 'evicted') {
           h.evict()
+        } else if (state === 'status_unknown') {
+          h.fail(new LifecycleApiError('marketplace_network_error', 0))
         }
       }
 
@@ -697,10 +699,77 @@ describe('application marketplace operation supervision', () => {
           ? { status: 'terminal', operation: terminal }
           : state === 'evicted'
             ? { status: 'evicted', operation: pending, operationId: pending.id }
-            : { status: 'watching', operation: pending }
+            : state === 'status_unknown'
+              ? { status: 'status_unknown', operation: pending }
+              : { status: 'watching', operation: pending }
       )
     }
   )
+
+  it.each(['recovered-first', 'conflict-first'] as const)(
+    'publishes no known recovery when a later snapshot owner conflicts (%s)',
+    async order => {
+      const h = setup()
+      const binding = await h.bind()
+      const inspect = { kind: 'inspect' as const, subject, selection: null, body: {} }
+      h.lose()
+      await h.supervisor.start(inspect, binding!)
+      await h.supervisor.start(inspect, binding!)
+      const [first, second] = [...h.receipts.values()]
+
+      const recovered = decodeLifecycleOperation({
+        ...fixture('service inspect'),
+        id: first.id,
+        request_id: first.request_id
+      })!
+
+      const conflicting = decodeLifecycleOperation({
+        ...fixture('service install confirm pending'),
+        id: second.id,
+        request_id: second.request_id
+      })!
+
+      h.receipts.clear()
+      h.list(order === 'recovered-first' ? [recovered, conflicting] : [conflicting, recovered])
+
+      expect(await h.bind()).toBeNull()
+      expect(
+        h.supervisor.$records
+          .get()
+          .filter(record => [first.request_id, second.request_id].includes(record.requestId))
+          .map(record => record.operation)
+      ).toEqual([null, null])
+    }
+  )
+
+  it('publishes every known recovery after the complete snapshot validates', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    const inspect = { kind: 'inspect' as const, subject, selection: null, body: {} }
+    h.lose()
+    await h.supervisor.start(inspect, binding!)
+    await h.supervisor.start(inspect, binding!)
+    const admitted = [...h.receipts.values()]
+
+    const recovered = admitted.map(operation =>
+      decodeLifecycleOperation({
+        ...fixture('service inspect'),
+        id: operation.id,
+        request_id: operation.request_id
+      })!
+    )
+
+    h.receipts.clear()
+    h.list(recovered)
+
+    expect(await h.bind()).toEqual(binding)
+    expect(
+      h.supervisor.$records
+        .get()
+        .filter(record => admitted.some(operation => operation.request_id === record.requestId))
+        .map(record => record.operation)
+    ).toEqual(recovered)
+  })
 
   // Break caught: not-found plus a present-time state read prematurely fences a POST still admissible on the server.
   it('keeps a missing admission blocked until the server admission window closes and current state is read', async () => {

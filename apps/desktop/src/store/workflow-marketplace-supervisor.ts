@@ -760,10 +760,6 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     if (owner) {
       acceptSupervisedOperation(operation, binding, owner.record)
-
-      if (!owner.record.operation && owner.record.status === 'admission_unknown') {
-        accept(owner, operation, binding)
-      }
     }
 
     return owner
@@ -917,12 +913,31 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         }
 
         const items = await scan(binding, controller.signal)
-        // Validate both directions for the whole snapshot before publishing any new observation.
-        const snapshot = items.map(operation => ({ operation, known: snapshotOwner(operation, binding) }))
 
-        for (const { operation, known } of snapshot) {
-          if (!known) {
-            // Known requests use exact lookup facts; a retained snapshot may be older.
+        // Validate both directions for the whole snapshot before publishing any new observation.
+        const snapshot = items.map(operation => {
+          const known = snapshotOwner(operation, binding)
+
+          return { operation, known, expected: known?.record }
+        })
+
+        if (!usable(binding)) {
+          return null
+        }
+
+        for (const { operation, known, expected } of snapshot) {
+          if (known) {
+            if (
+              known.record === expected &&
+              !known.record.operation &&
+              known.record.status === 'admission_unknown' &&
+              sameAuthority(known.record.binding, binding) &&
+              (known.record.requestId === operation.request_id || known.record.operationId === operation.id)
+            ) {
+              accept(known, operation, binding)
+            }
+          } else {
+            // New observations publish only after every snapshot owner correlation validates.
             const entry = add(binding, {
               requestId: operation.request_id,
               operationId: operation.id,
