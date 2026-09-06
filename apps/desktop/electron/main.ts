@@ -788,10 +788,10 @@ if (INSTALL_STAMP) {
 // they are the neutral 'hermes' / '.hermes'; the emitter restamps per brand).
 function perBrandDefaultHome() {
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, 'otto')
+    return path.join(process.env.LOCALAPPDATA, 'hermes')
   }
 
-  return path.join(app.getPath('home'), '.otto')
+  return path.join(app.getPath('home'), '.hermes')
 }
 
 function resolveHermesHome() {
@@ -946,7 +946,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'OTTO'
+const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
@@ -1359,7 +1359,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('io.cmetech.otto')
+  app.setAppUserModelId('com.nousresearch.hermes')
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -17647,7 +17647,7 @@ ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMark
 // them — cron/blueprint_catalog.py, Honcho OAuth) keep resolving. Keep both in
 // DEEP_LINK_PROTOCOLS until the backend is migrated to otto://.
 // ---------------------------------------------------------------------------
-const OTTO_PROTOCOL = 'otto'
+const OTTO_PROTOCOL = 'hermes'
 const HERMES_PROTOCOL = 'hermes'
 const DEEP_LINK_PROTOCOLS = [OTTO_PROTOCOL, HERMES_PROTOCOL]
 const REGISTERED_DEEP_LINK_PROTOCOLS = [...new Set(DEV_SERVER ? [OTTO_PROTOCOL, 'hermes-dev'] : DEEP_LINK_PROTOCOLS)]

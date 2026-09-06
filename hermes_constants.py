@@ -57,8 +57,8 @@ def _get_platform_default_hermes_home() -> Path:
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
         base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-        return base / "otto"
-    return Path.home() / ".otto"
+        return base / "hermes"
+    return Path.home() / ".hermes"
 
 
 def home_dir_basename() -> str:

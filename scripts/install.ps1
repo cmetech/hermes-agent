@@ -40,8 +40,8 @@ param(
     # bootstrap-runner passes this, and only when isReleaseInstall is true;
     # source installs / user `-Commit` pins keep the safe stash+restore path.
     [switch]$DiscardLocal,
-    [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\otto" }),
-    [string]$InstallDir = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\otto\hermes-agent" }),
+    [string]$HermesHome = $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }),
+    [string]$InstallDir = $(if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }),
 
     # --- Stage protocol (additive; default invocation behaves as before) ----
     # See the "Stage protocol" section near the bottom of the file for the
@@ -355,14 +355,14 @@ if ($PSBoundParameters.ContainsKey('HermesHome')) {
     $HermesHome = ConvertTo-LongPath $HermesHome
 } else {
     $HermesHome = ConvertTo-LongPath $(
-        if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\otto" }
+        if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }
     )
 }
 if ($PSBoundParameters.ContainsKey('InstallDir')) {
     $InstallDir = ConvertTo-LongPath $InstallDir
 } else {
     $InstallDir = ConvertTo-LongPath $(
-        if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\otto\hermes-agent" }
+        if ($env:HERMES_HOME) { "$env:HERMES_HOME\hermes-agent" } else { "$env:LOCALAPPDATA\hermes\hermes-agent" }
     )
 }
 if ($script:NormalizedProfilePaths) {
@@ -3573,7 +3573,7 @@ function Set-PathVariable {
     # baked the per-brand default home into every resolver, so for the DEFAULT home a
     # global User-scope HERMES_HOME is redundant AND it collides when two brands
     # coexist on one machine (the second brand would load the first brand's home).
-    $defaultHermesHome = "$env:LOCALAPPDATA\otto"   # per-brand default (home emitter rewrites the segment)
+    $defaultHermesHome = "$env:LOCALAPPDATA\hermes"   # per-brand default (home emitter rewrites the segment)
     $currentHermesHome = [Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
     if ($HermesHome -ieq $defaultHermesHome) {
         # Default home: never persist a global var. Remove a stale auto-set one (any

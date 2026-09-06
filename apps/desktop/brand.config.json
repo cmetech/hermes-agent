@@ -1,13 +1,13 @@
 {
   "$comment": "OTTO branding — SINGLE source of truth for the desktop's user-facing product name. Applied at BUILD TIME only (see scripts/brand-transform.mjs); source .ts/.tsx files are never modified, so upstream Hermes merges never conflict on branding. To rebrand: change name + rules and rebuild. To get stock Hermes behavior: set name to \"Hermes\" (transform becomes a no-op).",
-  "name": "OTTO",
+  "name": "Hermes",
   "protect": [
     "X-Hermes-[A-Za-z0-9-]+",
     "Hermes-Desktop"
   ],
   "rules": [
-    ["\\bHermes\\b", "OTTO"],
-    ["\\bHERMES\\b", "OTTO"]
+    ["\\bHermes\\b", "Hermes"],
+    ["\\bHERMES\\b", "HERMES"]
   ],
   "neutralize": [
     ["Hermes Desktop starts its own local gateway by default. Use a remote gateway when you want this app to control an already-running Hermes backend", "This app starts its own local gateway by default. Use a remote gateway when you want it to control an already-running backend"],

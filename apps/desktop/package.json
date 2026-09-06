@@ -1,13 +1,13 @@
 {
-  "name": "otto",
-  "productName": "OTTO",
+  "name": "hermes",
+  "productName": "Hermes",
   "private": true,
   "version": "4.2.2",
-  "description": "Native desktop shell for OTTO.",
+  "description": "Native desktop shell for Hermes Agent.",
   "author": "cmetech",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cmetech/otto.git"
+    "url": "git+https://github.com/NousResearch/hermes-agent.git"
   },
   "type": "module",
   "main": "dist/electron-main.mjs",
@@ -194,19 +194,18 @@
   },
   "build": {
     "electronVersion": "41.10.4",
-    "appId": "io.cmetech.otto",
-    "productName": "OTTO",
-    "executableName": "OTTO",
+    "appId": "com.nousresearch.hermes",
+    "productName": "Hermes",
+    "executableName": "Hermes",
     "protocols": [
       {
-        "name": "OTTO Protocol",
+        "name": "Hermes Protocol",
         "schemes": [
-          "otto",
           "hermes"
         ]
       }
     ],
-    "artifactName": "OTTO-${version}-${os}-${arch}.${ext}",
+    "artifactName": "Hermes-${version}-${os}-${arch}.${ext}",
     "icon": "assets/icon",
     "directories": {
       "output": "release"
@@ -246,12 +245,12 @@
       "entitlements": "electron/entitlements.mac.plist",
       "entitlementsInherit": "electron/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "CFBundleDisplayName": "OTTO",
-        "CFBundleExecutable": "OTTO",
-        "CFBundleName": "OTTO",
-        "NSAudioCaptureUsageDescription": "OTTO uses audio capture for voice conversations.",
+        "CFBundleDisplayName": "Hermes",
+        "CFBundleExecutable": "Hermes",
+        "CFBundleName": "Hermes",
+        "NSAudioCaptureUsageDescription": "Hermes uses audio capture for voice conversations.",
         "NSCameraUsageDescription": "Hermes uses the camera when a plugin or feature you enable requests it.",
-        "NSMicrophoneUsageDescription": "OTTO uses the microphone for voice input and voice conversations.",
+        "NSMicrophoneUsageDescription": "Hermes uses the microphone for voice input and voice conversations.",
         "NSCalendarsUsageDescription": "Hermes needs access to Calendar to provide requested meeting and scheduling support.",
         "NSCalendarsFullAccessUsageDescription": "Hermes needs full access to Calendar to read and manage events when explicitly requested.",
         "NSRemindersUsageDescription": "Hermes needs access to Reminders to provide requested personal-assistant and scheduling support.",
@@ -268,7 +267,7 @@
       ]
     },
     "dmg": {
-      "title": "Install OTTO",
+      "title": "Install Hermes",
       "backgroundColor": "#f5f5f7",
       "iconSize": 96,
       "window": {
@@ -290,7 +289,7 @@
       ]
     },
     "win": {
-      "legalTrademarks": "OTTO",
+      "legalTrademarks": "Hermes",
       "target": [
         "nsis",
         "msi"
@@ -300,7 +299,7 @@
     "linux": {
       "category": "Development",
       "maintainer": "Nous Research <support@nousresearch.com>",
-      "synopsis": "Native desktop shell for OTTO.",
+      "synopsis": "Native desktop shell for Hermes Agent.",
       "target": [
         "AppImage",
         "deb",
@@ -311,8 +310,8 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
-      "shortcutName": "OTTO",
-      "uninstallDisplayName": "OTTO",
+      "shortcutName": "Hermes",
+      "uninstallDisplayName": "Hermes",
       "warningsAsErrors": false
     }
   }
