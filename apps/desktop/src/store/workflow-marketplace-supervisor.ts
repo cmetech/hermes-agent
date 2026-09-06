@@ -202,10 +202,11 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     entry.call = undefined
     forgetReplay(entry)
 
-    update(entry, {
-      status: entry.record.status === 'terminal' ? 'terminal' : 'suspended',
-      callPending: false
-    })
+    const nextStatus = entry.record.status === 'terminal' ? 'terminal' : 'suspended'
+
+    if (entry.record.status !== nextStatus || entry.record.callPending) {
+      update(entry, { status: nextStatus, callPending: false })
+    }
   }
 
   function clearScopeWork(scope: MarketplaceScope | null) {
@@ -246,6 +247,29 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       samples.delete(scopeKey(scope))
       scanned.delete(scopeKey(scope))
     }
+  }
+
+  function ownedScopes() {
+    // Every registered scan enters knownScopes before awaiting any descriptor/query work.
+    const scopes = new Map(knownScopes)
+
+    const include = (scope: MarketplaceScope) =>
+      scopes.set(scopeKey(scope), {
+        connectionId: scope.connectionId,
+        profile: scope.profile
+      })
+
+    for (const binding of packageCalls.values()) {
+      include(binding)
+    }
+
+    for (const entry of entries) {
+      if (entry.call || entry.cadence || entry.replay) {
+        include(entry.record.binding)
+      }
+    }
+
+    return [...scopes.values()]
   }
 
   function assertScopeOwner(
@@ -343,6 +367,10 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     if (scope === null) {
       bindings.notify({ kind: 'exhausted' })
     } else {
+      if (reason === 'disconnect') {
+        knownScopes.delete(scopeKey(scope))
+      }
+
       clearScopeWork(scope)
       bindings.suspend(scope, reason)
     }
@@ -940,30 +968,9 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
   const offVisibility = visibility.listen(() => {
     if (!visibility.get()) {
-      for (const controller of packageCalls.keys()) {
-        controller.abort()
-      }
-
-      packageCalls.clear()
-
-      for (const controller of scanControllers.values()) {
-        controller.abort()
-      }
-
-      scanControllers.clear()
-      scans.clear()
-      samples.clear()
-
-      for (const entry of entries) {
-        entry.cadence?.abort()
-        entry.cadence = undefined
-        entry.call?.abort()
-        entry.call = undefined
-        forgetReplay(entry)
-
-        if (entry.record.callPending) {
-          update(entry, { status: 'suspended', callPending: false })
-        }
+      // Rotate the coordinator's private attempts too: it can still be awaiting final query cancellation.
+      for (const scope of ownedScopes()) {
+        suspend(scope, 'hidden')
       }
     } else {
       for (const scope of knownScopes.values()) {
@@ -979,6 +986,11 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     disposed = true
     status.set('disposed')
+
+    for (const scope of ownedScopes()) {
+      bindings.suspend(scope, 'disposed')
+    }
+
     clearScopeWork(null)
     offConnections()
     offVisibility()

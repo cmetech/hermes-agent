@@ -887,6 +887,197 @@ describe('application marketplace operation supervision', () => {
     expect(h.supervisor.bindings.presentation(scope, 'old')).toBeUndefined()
   })
 
+  // Scope cancellation and its coordinator callback must not publish the same guard cleanup twice.
+  it('publishes one guard cleanup when hiding also invalidates the coordinator attempt', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    await h.supervisor.start(h.intent, binding!)
+    const states: string[] = []
+    const detach = h.supervisor.$records.listen(records => states.push(records[0].status))
+    h.visibility.set(false)
+    expect(states).toEqual(['suspended'])
+    expect(h.record()).toMatchObject({ barrier: true, callPending: false })
+    detach()
+  })
+
+  // A disconnected scope must not be repeatedly cancelled or silently resumed by another scope's visibility return.
+  it('disconnects only the exact origin and resumes it once only when explicitly reconnected', async () => {
+    const h = setup()
+    await h.bind()
+    const other = await h.supervisor.reconcileScope({ ...scope, connectionId: 'remote-b' })
+    const cancellations = vi.spyOn(h.queryClient, 'cancelQueries')
+    h.disconnect()
+    expect(h.supervisor.bindings.isCurrent(other!)).toBe(true)
+    expect(h.supervisor.bindings.presentation(other!, 'other-current')).toBe('other-current')
+    h.visibility.set(false)
+    expect(cancellations.mock.calls.map(call => call[0]?.queryKey)).toEqual([
+      ['workflow-marketplace', 'remote-a::support'],
+      ['workflow-marketplace', 'remote-b::support']
+    ])
+    const dispatched: Array<string | null> = []
+    const capabilities = h.api.capabilities
+
+    h.api.capabilities = input => {
+      dispatched.push(input.connectionId)
+
+      return capabilities(input)
+    }
+
+    h.reconnect()
+    h.visibility.set(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(dispatched).toEqual(['remote-b'])
+
+    const first = h.bind(),
+      second = h.bind()
+
+    expect(first).toBe(second)
+    expect(await first).not.toBeNull()
+    expect(dispatched).toEqual(['remote-b', 'remote-a'])
+    cancellations.mockRestore()
+  })
+
+  // Late completion of an invalidated final await must not purge a newer valid binding's data.
+  it('preserves the resumed binding and new-scope data when an old final cancellation settles late', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    const capabilities = h.api.capabilities
+    h.api.capabilities = async input => ({
+      ...((await capabilities(input)) as object),
+      principal_binding: 'c'.repeat(64)
+    })
+
+    h.api.packageState = async () => {
+      throw new LifecycleApiError('marketplace_network_error', 401)
+    }
+
+    const finalCancellation = deferred<void>()
+    const cancelQueries = h.queryClient.cancelQueries.bind(h.queryClient)
+    let cancellations = 0
+
+    const cancellation = vi.spyOn(h.queryClient, 'cancelQueries').mockImplementation(async (...args) => {
+      await cancelQueries(...args)
+
+      if (++cancellations === 3) {
+        await finalCancellation.promise
+      }
+    })
+
+    const pending = h.supervisor.reconcilePackage(binding!, identity)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(cancellations).toBe(3)
+    h.visibility.set(false)
+    h.visibility.set(true)
+    const resumed = await h.bind()
+    expect(resumed?.principalBinding).toBe('c'.repeat(64))
+    const key = ['workflow-marketplace', 'remote-a::support', 'installed']
+    h.queryClient.setQueryData(key, 'fresh-current-data')
+    finalCancellation.resolve()
+    expect(await pending).toBeNull()
+    expect(h.supervisor.bindings.isCurrent(resumed!)).toBe(true)
+    expect(h.queryClient.getQueryData(key)).toBe('fresh-current-data')
+    expect(h.probes()).toBe(3)
+    cancellation.mockRestore()
+  })
+
+  // Review R2 final-await race: aborting transport ownership alone cannot cancel a coordinator publication attempt.
+  it.each([
+    ['hidden', true],
+    ['hidden', false],
+    ['disconnect', true],
+    ['disconnect', false],
+    ['dispose', true],
+    ['dispose', false]
+  ] as const)(
+    'invalidates changed-principal publication waiting on final query cancellation on %s (operation record: %s)',
+    async (boundary, withOperation) => {
+      const h = setup()
+      const binding = await h.bind()
+
+      if (withOperation) {
+        await h.supervisor.start(h.intent, binding!)
+      }
+
+      const capabilities = h.api.capabilities
+      h.api.capabilities = async input => ({
+        ...((await capabilities(input)) as object),
+        principal_binding: 'c'.repeat(64)
+      })
+
+      h.api.packageState = async () => {
+        throw new LifecycleApiError('marketplace_network_error', 401)
+      }
+
+      const finalCancellation = deferred<void>()
+      const cancelQueries = h.queryClient.cancelQueries.bind(h.queryClient)
+      let cancellations = 0
+
+      const cancellation = vi.spyOn(h.queryClient, 'cancelQueries').mockImplementation(async (...args) => {
+        await cancelQueries(...args)
+        cancellations++
+
+        if (cancellations === 3) {
+          await finalCancellation.promise
+        }
+      })
+
+      const pending = h.supervisor.reconcilePackage(binding!, identity)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(cancellations).toBe(3)
+      expect(h.supervisor.bindings.state(scope).kind).toBe('probing')
+      const before = h.probes()
+
+      if (boundary === 'hidden') {
+        h.visibility.set(false)
+      } else if (boundary === 'disconnect') {
+        h.disconnect()
+      } else {
+        h.supervisor.dispose()
+      }
+
+      finalCancellation.resolve()
+      expect(await pending).toBeNull()
+      expect(h.supervisor.bindings.state(scope).kind).toBe('unavailable')
+      expect(h.supervisor.bindings.presentation(scope, 'private')).toBeUndefined()
+
+      if (withOperation) {
+        expect(h.record()).toMatchObject({ barrier: true, callPending: false, binding })
+      } else {
+        expect(h.supervisor.$records.get()).toEqual([])
+      }
+
+      expect(h.probes()).toBe(before)
+      expect(await h.bind()).toBeNull()
+
+      if (boundary !== 'dispose') {
+        if (boundary === 'hidden') {
+          h.visibility.set(true)
+        } else {
+          h.reconnect()
+        }
+
+        const first = h.bind(),
+          second = h.bind()
+
+        expect(first).toBe(second)
+        const current = await first
+        expect(current?.principalBinding).toBe('c'.repeat(64))
+        expect(h.supervisor.bindings.isCurrent(current!)).toBe(true)
+        expect(h.probes()).toBe(before + 1)
+
+        if (withOperation) {
+          expect(h.record().barrier).toBe(true)
+        }
+      }
+
+      h.supervisor.dispose()
+      h.supervisor.dispose()
+      cancellation.mockRestore()
+      expect(h.listeners.size).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+    }
+  )
+
   // Recovery policy checks: a replacement scan has one policy attempt, and a nested package read cannot await itself.
   it('bounds repeated snapshot authentication recovery to one owned replacement scan', async () => {
     const h = setup()
