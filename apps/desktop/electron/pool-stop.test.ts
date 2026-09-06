@@ -136,3 +136,22 @@ test('a respawn can await the in-flight stop before reusing the key', async () =
 
   assert.deepEqual(order, ['exit-signal', 'spawn'])
 })
+// Break caught: direct pool teardown allows a late response through before retiring its native descriptor.
+test('invalidates route authority before eviction and child teardown', async () => {
+  const events: string[] = []
+  const pool = new Map([['support', { process: {} }]])
+
+  const stopper = createPoolStopper({
+    pool,
+    invalidate: key => {
+      events.push(`invalid:${key}:${pool.has(key)}`)
+    },
+    stopChild: () => {
+      events.push('stop')
+    },
+    waitForExit: async () => {}
+  })
+
+  await stopper.stop('support')
+  assert.deepEqual(events, ['invalid:support:true', 'stop'])
+})

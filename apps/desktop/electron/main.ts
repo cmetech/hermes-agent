@@ -130,6 +130,13 @@ import {
   withTransientRetries
 } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
+import { createConnectionGenerationRegistry, GENERATION_EXHAUSTED } from './connection-generation'
+import { broadcastConnectionGeneration } from './connection-generation-event'
+import {
+  invalidateLegacyConfiguration as invalidateLegacyGenerations,
+  invalidateRegistryConfiguration as invalidateRegistryGenerations,
+  invalidateSshGeneration
+} from './connection-generation-routing'
 import {
   backendScopeKey,
   backendScopePrefix,
@@ -234,6 +241,11 @@ import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
+import {
+  dispatchLifecycleRequest,
+  mergeNativeRequestHeaders,
+  validateLifecycleRequest
+} from './lifecycle-api-transport'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -1438,6 +1450,88 @@ function registerMediaProtocol() {
 
 let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
+
+const connectionGenerations = createConnectionGenerationRegistry((reason, routes) => {
+  if (reason === GENERATION_EXHAUSTED) {
+    backendConnectionState.clearConnectionPromise()
+
+    for (const entry of backendPool.values()) {
+      entry.connectionPromise = null
+    }
+
+    broadcastConnectionGeneration(BrowserWindow.getAllWindows(), { kind: 'exhausted' })
+
+    return
+  }
+
+  for (const route of routes) {
+    const [connectionId, profile] = JSON.parse(route)
+    broadcastConnectionGeneration(BrowserWindow.getAllWindows(), { kind: 'scope_invalidated', connectionId, profile })
+  }
+})
+
+function lifecycleRouteKey(connectionId, profile) {
+  return JSON.stringify([connectionId || null, String(profile || '').trim() || primaryProfileKey()])
+}
+
+function invalidateRegistryGeneration(id, registry = connectionRegistryCache) {
+  connectionGenerations.invalidateRoutes(route => JSON.parse(route)[0] === id)
+
+  if (registry?.primary === id) {
+    connectionGenerations.invalidate('primary')
+  }
+
+  for (const key of backendPool.keys()) {
+    if (String(key).startsWith(backendScopePrefix(id))) {
+      connectionGenerations.invalidate(`pool:${key}`)
+    }
+  }
+}
+
+function invalidateRegistryConfiguration(previous, next) {
+  invalidateRegistryGenerations(previous, next, {
+    primary: () => connectionGenerations.invalidate('primary'),
+    registry: id => invalidateRegistryGeneration(id, previous)
+  })
+}
+
+function invalidateLegacyConfiguration(previous, next) {
+  invalidateLegacyGenerations(previous, next, {
+    primary: () => connectionGenerations.invalidate('primary'),
+    legacy: profile => connectionGenerations.invalidate(`pool:${profile}`),
+    primaryProfile: primaryProfileKey(),
+    poolKeys: backendPool.keys()
+  })
+}
+
+function invalidateOauthGeneration(baseUrl, cookiePartition = false) {
+  const registry = readDesktopConnectionsRegistry()
+  const config = readDesktopConnectionConfig()
+  const partition = cookiePartition ? resolveOauthPartitionForUrl(baseUrl) : null
+
+  const matches = url =>
+    url &&
+    (cookiePartition
+      ? resolveOauthPartitionForUrl(url) === partition
+      : normalizeRemoteBaseUrl(url) === normalizeRemoteBaseUrl(baseUrl))
+
+  for (const source of registry.connections) {
+    if ((source.kind === 'cloud' || source.authMode === 'oauth') && matches(source.url)) {
+      invalidateRegistryGeneration(source.id, registry)
+    }
+  }
+
+  if (config.remote?.authMode === 'oauth' && matches(config.remote.url)) {
+    connectionGenerations.invalidate('primary')
+  }
+
+  for (const [profile, remote] of Object.entries(config.profiles || {}) as [string, any][]) {
+    if (remote.authMode === 'oauth' && matches(remote.url)) {
+      connectionGenerations.invalidate(profile === primaryProfileKey() ? 'primary' : `pool:${profile}`)
+    }
+  }
+}
+
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
 const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
@@ -5388,8 +5482,7 @@ function fetchJson(url, token, options: any = {}) {
             agent,
             method: options.method || 'GET',
             headers: {
-              ...headersForRemoteRequest(url),
-              ...(options.headers || {}),
+              ...mergeNativeRequestHeaders(options.nativeLifecycle ? {} : headersForRemoteRequest(url), options),
               'Content-Type': contentType,
               'X-Hermes-Session-Token': token,
               // RFC 8252 native flow authenticates the gated gateway with a bearer
@@ -7532,6 +7625,7 @@ async function hasLiveOauthSession(baseUrl) {
 }
 
 async function clearOauthSession(baseUrl) {
+  invalidateOauthGeneration(baseUrl, true)
   const sess = getOauthSessionForUrl(baseUrl)
 
   if (!sess) {
@@ -7572,6 +7666,8 @@ async function clearOauthSession(baseUrl) {
 //     → ``/auth/callback``, which sets the gateway cookie with NO interactive
 //     prompt. This is the per-agent cloud cascade (decisions.md Q5).
 function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
+  invalidateOauthGeneration(baseUrl, true)
+
   return new Promise((resolve, reject) => {
     if (!app.isReady()) {
       reject(new Error('Desktop is not ready to start an OAuth login.'))
@@ -7618,6 +7714,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
       if (err) {
         reject(err)
       } else {
+        invalidateOauthGeneration(baseUrl, true)
         resolve({ baseUrl, ok: true })
       }
     }
@@ -7749,7 +7846,9 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
 
     setJsonRequestHeaders(request)
 
-    for (const [name, value] of Object.entries({ ...headersForRemoteRequest(url), ...(options.headers || {}) })) {
+    for (const [name, value] of Object.entries(
+      mergeNativeRequestHeaders(options.nativeLifecycle ? {} : headersForRemoteRequest(url), options)
+    )) {
       request.setHeader(name, String(value))
     }
 
@@ -7919,12 +8018,17 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
   return tokens
 }
 
-function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet) {
+function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet, replacement = true) {
+  if (replacement) {
+    invalidateOauthGeneration(baseUrl)
+  }
+
   _nativeTokens.set(baseUrl, tokens)
   _persistNativeTokens(baseUrl, tokens)
 }
 
 function _clearNativeTokens(baseUrl: string) {
+  invalidateOauthGeneration(baseUrl)
   _nativeTokens.delete(baseUrl)
   _persistNativeTokens(baseUrl, null)
 }
@@ -7976,7 +8080,7 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
     )
 
     const rotated = parseTokenResponse(body)
-    _storeNativeTokens(baseUrl, rotated)
+    _storeNativeTokens(baseUrl, rotated, false)
 
     return rotated.accessToken
   } catch (error: any) {
@@ -8592,6 +8696,7 @@ function renewPortalAccessSilently() {
 // cascade. Resolves once the portal session cookie appears.
 function openPortalLoginWindow() {
   const portalBaseUrl = resolvePortalBaseUrl()
+  invalidateOauthGeneration(portalBaseUrl, true)
 
   return new Promise((resolve, reject) => {
     if (!app.isReady()) {
@@ -8634,6 +8739,7 @@ function openPortalLoginWindow() {
       if (err) {
         reject(err)
       } else {
+        invalidateOauthGeneration(portalBaseUrl, true)
         resolve({ portalBaseUrl, ok: true })
       }
     }
@@ -9408,13 +9514,14 @@ function readDesktopConnectionConfig() {
     // Missing or malformed connection settings should fall back to local.
   }
 
+  invalidateLegacyConfiguration(connectionConfigCache, config)
   connectionConfigCache = config
   connectionConfigCacheMtime = mtime
 
   return config
 }
 
-function writeDesktopConnectionConfig(config) {
+function writeDesktopConnectionConfig(config, internal = false) {
   fs.mkdirSync(path.dirname(DESKTOP_CONNECTION_CONFIG_PATH), { recursive: true })
   // Owner-only, not writeFileAtomic: this is the single choke point for every
   // connection.json write (the IPC save/apply handlers and
@@ -9424,6 +9531,11 @@ function writeDesktopConnectionConfig(config) {
   // fields that are NOT encrypted — off other local accounts, matching
   // native-oauth-tokens.json and desktop-installation.json.
   writeSecretFileAtomic(DESKTOP_CONNECTION_CONFIG_PATH, JSON.stringify(config, null, 2))
+
+  if (!internal) {
+    invalidateLegacyConfiguration(connectionConfigCache, config)
+  }
+
   connectionConfigCache = config
   connectionConfigCacheMtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
 }
@@ -9520,6 +9632,7 @@ function readDesktopConnectionsRegistry() {
     }
   }
 
+  invalidateRegistryConfiguration(connectionRegistryCache, registry)
   connectionRegistryCache = registry
   connectionRegistryCacheMtime = mtime
 
@@ -9551,11 +9664,16 @@ function preserveCorruptRegistrySidecar() {
   }
 }
 
-function writeDesktopConnectionsRegistry(registry) {
+function writeDesktopConnectionsRegistry(registry, internal = false) {
   fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
   // Owner-only for the same reason as connection.json: entries carry
   // safeStorage-encrypted tokens plus URLs and SSH host/user/keyPath.
   writeSecretFileAtomic(DESKTOP_CONNECTIONS_REGISTRY_PATH, JSON.stringify(registry, null, 2))
+
+  if (!internal) {
+    invalidateRegistryConfiguration(connectionRegistryCache, registry)
+  }
+
   connectionRegistryCache = registry
   connectionRegistryCacheMtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
 }
@@ -10276,7 +10394,7 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
-async function teardownSshConnection(profile) {
+async function teardownSshConnection(profile, replacingRetiredTunnel = false) {
   const scope = sshScopeKey(profile)
   const state = sshConnections.get(scope)
 
@@ -10284,6 +10402,7 @@ async function teardownSshConnection(profile) {
     return
   }
 
+  invalidateSshGeneration(state, scope, replacingRetiredTunnel, connectionGenerations.invalidate)
   sshConnections.delete(scope)
 
   terminalIpc.disposeTerminalSessionsForSshScope(scope)
@@ -10561,7 +10680,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   const existing = sshConnections.get(scope)
 
   if (existing && existing.fingerprint !== fingerprint) {
-    await teardownSshConnection(profile)
+    await teardownSshConnection(profile, true)
   }
 
   let ssh = sshConnections.get(scope)?.ssh
@@ -10669,6 +10788,8 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       removeForceCleanup()
       sshConnections.set(scope, {
         ssh,
+        managedScope: metadata.managedScope,
+        poolKey: metadata.poolKey || '',
         fingerprint,
         ownershipId: result.ownershipId || sshOwnershipKey(profile),
         localPort: result.localPort,
@@ -10743,7 +10864,7 @@ function persistSshConnectionToken(profile, source, token, registryConnectionId 
       const entry = registry.connections.find(c => c.id === id)
 
       if (entry && entry.kind === 'ssh') {
-        writeDesktopConnectionsRegistry(upsertConnection(registry, { ...entry, token: encrypted }))
+        writeDesktopConnectionsRegistry(upsertConnection(registry, { ...entry, token: encrypted }), true)
       }
     }
 
@@ -10758,11 +10879,11 @@ function persistSshConnectionToken(profile, source, token, registryConnectionId 
 
       if (key && config.profiles?.[key]?.mode === 'ssh') {
         config.profiles[key].token = encrypted
-        writeDesktopConnectionConfig(config)
+        writeDesktopConnectionConfig(config, true)
       }
     } else if (config.mode === 'ssh' && config.remote) {
       config.remote.token = encrypted
-      writeDesktopConnectionConfig(config)
+      writeDesktopConnectionConfig(config, true)
     }
   } catch (error: any) {
     sshRememberLog(`[ssh] could not persist served token: ${error.message}`)
@@ -11235,6 +11356,7 @@ function stopBackendChild(child) {
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
+  connectionGenerations.invalidate('primary')
   backendStartFailure = null
   remoteReauthFailure = null
   remoteLiveness.clear()
@@ -11383,6 +11505,15 @@ function profileRouteOptions(profile, request?) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
+  connectionGenerations.assertAvailable()
+  const connection = await resolveBackend(profile)
+  connectionGenerations.assertCurrent(connection.connectionGeneration)
+  connectionGenerations.associate(lifecycleRouteKey(null, profile), connection.connectionGeneration)
+
+  return connection
+}
+
+async function resolveBackend(profile) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
 
   profileDeletionGate.assertCanStart(key)
@@ -11416,6 +11547,13 @@ async function ensureBackend(profile) {
   if (existing) {
     existing.lastActiveAt = Date.now()
     const connection = await existing.connectionPromise
+
+    if (!connectionGenerations.isCurrent(connection.connectionGeneration)) {
+      await stopPoolBackend(key)
+
+      return ensureBackend(profile)
+    }
+
     setWslBridgeProfileState(key, connection.mode !== 'remote')
 
     return connection
@@ -11465,6 +11603,16 @@ async function ensureBackend(profile) {
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
 async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
+  connectionGenerations.assertAvailable()
+  const id = String(connectionId || '').trim() || readDesktopConnectionsRegistry().primary
+  const connection = await resolveRegistryBackend(id, profile, managedUpdateCorrelation)
+  connectionGenerations.assertCurrent(connection.connectionGeneration)
+  connectionGenerations.associate(lifecycleRouteKey(id, profile || 'default'), connection.connectionGeneration)
+
+  return { ...connection, connectionId: id }
+}
+
+async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
   const source = registry.connections.find(c => c.id === id)
@@ -11585,8 +11733,15 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
 
     if (existingLocal) {
       existingLocal.lastActiveAt = Date.now()
+      const connection = await existingLocal.connectionPromise
 
-      return existingLocal.connectionPromise
+      if (!connectionGenerations.isCurrent(connection.connectionGeneration)) {
+        await stopPoolBackend(localRoute.poolKey)
+
+        return ensureRegistryBackend(id, profile, managedUpdateCorrelation)
+      }
+
+      return connection
     }
 
     evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
@@ -11630,6 +11785,13 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   if (existing) {
     existing.lastActiveAt = Date.now()
     const connectionPromise = existing.connectionPromise
+    const descriptor = await connectionPromise
+
+    if (!connectionGenerations.isCurrent(descriptor.connectionGeneration)) {
+      await stopPoolBackend(key)
+
+      return ensureRegistryBackend(id, profile, managedUpdateCorrelation)
+    }
 
     // A remote process can die while its local SSH forward stays LISTENing.
     // Validate the exact cached descriptor at dispatch time; background
@@ -11707,6 +11869,7 @@ async function connectRegistryBackend(
   managedUpdateCorrelation = '',
   tokenPersistenceSource = ''
 ) {
+  const generationClaim = connectionGenerations.begin(`pool:${key}`)
   const profileKey = String(profile ?? '').trim() || 'default'
 
   if (source.kind === 'ssh') {
@@ -11736,7 +11899,7 @@ async function connectRegistryBackend(
 
     poolEntry.remoteBaseUrl = connection.baseUrl
 
-    return {
+    return connectionGenerations.publish(generationClaim, {
       ...connection,
       profile: profileKey,
       connectionId: source.id,
@@ -11746,7 +11909,7 @@ async function connectRegistryBackend(
       remoteProfile: sshConfig.remoteProfile || '',
       logs: hermesLog.slice(-80),
       ...getWindowState()
-    }
+    })
   }
 
   // remote / cloud: one gateway host serves every profile of that source,
@@ -11768,7 +11931,7 @@ async function connectRegistryBackend(
   await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode, connection.headers)
   poolEntry.remoteBaseUrl = connection.baseUrl
 
-  return {
+  return connectionGenerations.publish(generationClaim, {
     ...connection,
     profile: profileKey,
     connectionId: source.id,
@@ -11777,7 +11940,7 @@ async function connectRegistryBackend(
     sharedRemote: true,
     logs: hermesLog.slice(-80),
     ...getWindowState()
-  }
+  })
 }
 
 // Restore one scope while its connection-wide managed-update gate is still
@@ -12117,8 +12280,10 @@ async function drainManagedSshScope(scope) {
       scope.drained = true
 
       if (scope.primary) {
+        connectionGenerations.invalidate('primary')
         backendConnectionState.invalidate()
       } else if (backendPool.get(scope.key) === scope.entry) {
+        connectionGenerations.invalidate(`pool:${scope.key}`)
         backendPool.delete(scope.key)
       }
 
@@ -12357,6 +12522,7 @@ function startPoolIdleReaper() {
 // registry scopes) so the exit/error cleanup evicts the right entry.
 async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; poolKey?: string } = {}) {
   const poolKey = opts.poolKey || profile
+  const generationClaim = connectionGenerations.begin(`pool:${poolKey}`)
 
   await reapOrphanedBackendsOnce()
   profileDeletionGate.assertCanStart(profile)
@@ -12377,12 +12543,12 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     // awaiting connectionPromise, which may still be pending for a sibling.
     entry.remoteBaseUrl = remote.baseUrl
 
-    return {
+    return connectionGenerations.publish(generationClaim, {
       ...remote,
       profile,
       logs: hermesLog.slice(-80),
       ...getWindowState()
-    }
+    })
   }
 
   const token = crypto.randomBytes(32).toString('base64url')
@@ -12487,13 +12653,22 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     releaseBackendChild(child)
-    backendPool.delete(poolKey)
+
+    if (backendPool.get(poolKey) === entry) {
+      connectionGenerations.invalidate(`pool:${poolKey}`)
+      backendPool.delete(poolKey)
+    }
+
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     releaseBackendChild(child)
-    backendPool.delete(poolKey)
+
+    if (backendPool.get(poolKey) === entry) {
+      connectionGenerations.invalidate(`pool:${poolKey}`)
+      backendPool.delete(poolKey)
+    }
 
     if (!ready) {
       rejectStart?.(
@@ -12539,7 +12714,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     )
   }
 
-  return {
+  return connectionGenerations.publish(generationClaim, {
     baseUrl,
     mode: 'local',
     source: 'local',
@@ -12549,7 +12724,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     wsUrl,
     logs: hermesLog.slice(-80),
     ...getWindowState()
-  }
+  })
 }
 
 // Bounded, deduplicated pool teardown (see pool-stop.ts): every stop path —
@@ -12560,11 +12735,14 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 // survived detached under PID 1.
 const poolStopper = createPoolStopper({
   pool: backendPool,
+  invalidate: key => connectionGenerations.invalidate(`pool:${key}`),
   stopChild: child => stopBackendChild(child),
   waitForExit: child => waitForBackendExit(child)
 })
 
 function stopPoolBackend(profile) {
+  connectionGenerations.invalidate(`pool:${profile}`)
+
   return poolStopper.stop(profile)
 }
 
@@ -12648,6 +12826,8 @@ async function prepareProfileRenameRequest(request) {
 }
 
 async function startHermes() {
+  connectionGenerations.assertAvailable()
+
   // Only the single-instance lock holder may reap/spawn/claim the desktop
   // backend. A lock-losing instance must stay inert even if some path reaches
   // here (e.g. the deferred-quit window before `ready`): its reapOrphans()
@@ -12693,10 +12873,20 @@ async function startHermes() {
   const existingConnectionPromise = backendConnectionState.getPromise()
 
   if (existingConnectionPromise) {
-    return existingConnectionPromise
+    const descriptor = await existingConnectionPromise
+
+    if (connectionGenerations.isCurrent(descriptor.connectionGeneration)) {
+      return descriptor
+    }
+
+    connectionGenerations.assertAvailable()
+    await teardownPrimaryBackendAndWait({ soft: true })
+
+    return startHermes()
   }
 
   const connectionAttempt = backendConnectionState.startAttempt()
+  const generationClaim = connectionGenerations.begin('primary')
   const primaryProfile = primaryProfileKey()
 
   // Legacy path callers without an explicit profile belong to the primary
@@ -12734,7 +12924,10 @@ async function startHermes() {
         error: null
       })
 
-      return createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
+      return connectionGenerations.publish(
+        generationClaim,
+        createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
+      )
     }
 
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
@@ -12894,6 +13087,7 @@ async function startHermes() {
         return
       }
 
+      connectionGenerations.invalidate('primary')
       rememberLog(`Hermes backend failed to start: ${error.message}`)
       updateBootProgress(
         {
@@ -12920,6 +13114,7 @@ async function startHermes() {
         return
       }
 
+      connectionGenerations.invalidate('primary')
       rememberLog(`Hermes backend exited (${signal || code})`)
       sendBackendExit({ code, signal })
 
@@ -12993,7 +13188,7 @@ async function startHermes() {
     // accumulated count of the resolved episode.
     bootstrapRepairAttempt = 0
 
-    return {
+    return connectionGenerations.publish(generationClaim, {
       baseUrl,
       mode: 'local',
       source: 'local',
@@ -13002,7 +13197,7 @@ async function startHermes() {
       wsUrl,
       logs: hermesLog.slice(-80),
       ...getWindowState()
-    }
+    })
   })().catch(async error => {
     if (!backendConnectionState.clearPromiseForAttempt(connectionAttempt)) {
       throw error
@@ -13012,7 +13207,11 @@ async function startHermes() {
     stopBackendChild(failedProcess)
     await waitForBackendExit(failedProcess)
 
-    if (error instanceof FirstRunSetupResetError) {
+    if (
+      error instanceof FirstRunSetupResetError ||
+      error?.message === 'marketplace_connection_generation_changed' ||
+      error?.message === GENERATION_EXHAUSTED
+    ) {
       throw error
     }
 
@@ -14585,8 +14784,12 @@ ipcMain.handle('hermes:connection', async (_event, profile) => {
   const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
   const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
+  connectionGenerations.assertCurrent(connection.connectionGeneration)
+  connectionGenerations.associate(lifecycleRouteKey(connectionId, profileKey), connection.connectionGeneration)
+  // Proxy headers are native dispatch material, never renderer identity.
+  const { headers: _headers, ...rendererConnection } = connection
 
-  return connectionId ? { ...connection, connectionId } : connection
+  return { ...rendererConnection, connectionId: connectionId || null }
 })
 // Registry-scoped variant: resolve a backend for (connectionId, profile).
 // connectionId '' / 'local' / the registry primary all behave sensibly; the
@@ -14602,7 +14805,10 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   // scope share the first spawn instead of bootstrapping duplicate remotes.
   const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
 
-  return { ...connection, connectionId: id, registryScoped: true }
+  connectionGenerations.assertCurrent(connection.connectionGeneration)
+  const { headers: _headers, ...rendererConnection } = connection
+
+  return { ...rendererConnection, connectionId: id, registryScoped: true }
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
@@ -15847,6 +16053,8 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
     writeRegistry: writeDesktopConnectionsRegistry,
     apply: () =>
       applyConnectionChange({
+        invalidate: () =>
+          connectionGenerations.invalidate(!key || key === primaryProfileKey() ? 'primary' : `pool:${scope}`),
         cancelAndWait: value => sshBootstrapCoordinator.cancelAndWait(value),
         isPrimary: !key || key === primaryProfileKey(),
         rehomePrimary: () =>
@@ -16328,6 +16536,42 @@ async function teardownConnectionScopedProfileBackend(connectionId, profile) {
 }
 
 async function handleHermesApiRequest(request, structured = false) {
+  if (validateLifecycleRequest(request)) {
+    return dispatchLifecycleRequest(request, structured, {
+      authority: connectionGenerations,
+      resolve: async value => {
+        const id = apiRequestRegistryConnectionId(value)
+
+        if (id) {
+          const descriptor = await backendDialClaims.run(backendScopeKey(id, value.profile), () =>
+            ensureRegistryBackend(id, value.profile)
+          )
+
+          return {
+            descriptor,
+            path: pathForRegistryBackendRequest(value.path, value.profile, descriptor),
+            routeKey: lifecycleRouteKey(id, value.profile || 'default')
+          }
+        }
+
+        const route = resolveProfileApiRequest(value.profile, value.path, profileRouteOptions(value.profile, value))
+        const descriptor = await ensureBackend(route.backendProfile)
+        const routeKey = lifecycleRouteKey(null, value.profile)
+        connectionGenerations.associate(routeKey, descriptor.connectionGeneration)
+
+        return { descriptor, path: route.requestPath, routeKey }
+      },
+      accessToken: ensureNativeAccessToken,
+      fetchToken: (url, token, options) =>
+        fetchJson(url, token, { ...options, timeoutMs: resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS) }),
+      fetchCookie: (url, options) =>
+        fetchJsonViaOauthSession(url, {
+          ...options,
+          timeoutMs: resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+        })
+    })
+  }
+
   // Registry-pinned request (request.connectionId): the renderer is working
   // against a REGISTERED gateway connection, so the data — cron jobs and their
   // run sessions included — lives in THAT host's state.db, not any local
@@ -16454,6 +16698,7 @@ async function handleHermesApiRequest(request, structured = false) {
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
+  validateLifecycleRequest(request)
   // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
   // renderer reconnect entering ensureBackend() mid-mutation would otherwise
   // respawn the old-name backend and recreate its HERMES_HOME (#45474).

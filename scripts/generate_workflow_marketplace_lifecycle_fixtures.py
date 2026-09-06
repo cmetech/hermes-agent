@@ -794,6 +794,7 @@ def generate_corpus():
         schema_version=2,
         profile="support",
         registry_epoch=EPOCH,
+        principal_binding="b" * 64,
         server_time=UTC,
         capabilities=list(wire.LIFECYCLE_CAPABILITIES),
     ).model_dump(mode="json")
@@ -1027,6 +1028,13 @@ def outer_cases(capabilities, envelopes):
 
     def add(name, value, model):
         cases.append({**_case(name, value, model), "model": model.__name__})
+
+    for binding in ("", "b" * 63, "b" * 65, "B" * 64, "b" * 64 + "\n", "g" * 64):
+        add(
+            "principal binding domain " + repr(binding),
+            {**capabilities, "principal_binding": binding},
+            wire.LifecycleCapabilities,
+        )
 
     for model, original in (
         (wire.LifecycleCapabilities, capabilities),

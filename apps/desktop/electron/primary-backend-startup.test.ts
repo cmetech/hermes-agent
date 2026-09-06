@@ -173,3 +173,18 @@ test('reset rejects with a typed error and never enters either backend', async (
   assert.equal(options.connectRemote.mock.calls.length, 0)
   assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
 })
+// Break caught: primary projection loses required proxy headers before lifecycle dispatch bypasses ambient config merging.
+test('preserves validated remote descriptor headers at the primary boundary', () => {
+  const descriptor = createPrimaryRemoteConnection(
+    {
+      baseUrl: 'https://fixture.example',
+      token: 'fixture',
+      wsUrl: 'wss://fixture.example/ws',
+      headers: { 'X-Fixture': 'proxy' }
+    },
+    [],
+    {}
+  )
+
+  assert.deepEqual(descriptor.headers, { 'X-Fixture': 'proxy' })
+})

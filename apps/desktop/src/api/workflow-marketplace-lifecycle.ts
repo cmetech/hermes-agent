@@ -26,15 +26,18 @@ export interface LifecycleScope {
   connectionId: string | null
   profile: string
   registryEpoch?: string
-  connectionGeneration?: string
-  principal?: string
+  connectionGeneration: number
+  principalBinding?: string
 }
 
-export interface LifecycleClockScope extends LifecycleScope {
-  registryEpoch: string
-  connectionGeneration: string
-  principal: string
+export interface LifecycleConnectionBinding {
+  readonly connectionId: string | null
+  readonly connectionGeneration: number
+  readonly profile: string
+  readonly principalBinding: string
+  readonly registryEpoch: string
 }
+export type LifecycleClockScope = LifecycleConnectionBinding
 export interface LifecycleClockSample {
   wallNowMs: number
   monotonicNowMs: number
@@ -52,7 +55,9 @@ const localCodes = [
   'marketplace_network_error',
   'marketplace_invalid_response',
   'marketplace_request_failed',
-  'marketplace_clock_revalidation_required'
+  'marketplace_clock_revalidation_required',
+  'marketplace_connection_generation_changed',
+  'marketplace_connection_generation_exhausted'
 ] as const
 
 type LocalCode = (typeof localCodes)[number]
@@ -130,14 +135,25 @@ function text(value: unknown): value is string {
 function captureScope(value: unknown, epoch = true): LifecycleScope {
   const fields = record(
     value,
-    ['connectionId', 'profile', 'registryEpoch', 'connectionGeneration', 'principal'],
-    ['registryEpoch', 'connectionGeneration', 'principal']
+    ['connectionId', 'profile', 'registryEpoch', 'connectionGeneration', 'principalBinding'],
+    ['registryEpoch', 'connectionGeneration', 'principalBinding']
   )
+
+  if (fields.connectionGeneration === undefined) {
+    throw new LifecycleApiError('marketplace_lifecycle_unsupported', 0)
+  }
 
   if (
     (fields.connectionId !== null && !text(fields.connectionId)) ||
     !isLifecycleProfile(fields.profile) ||
-    (epoch && (typeof fields.registryEpoch !== 'string' || !EPOCH.test(fields.registryEpoch)))
+    typeof fields.connectionGeneration !== 'number' ||
+    !Number.isSafeInteger(fields.connectionGeneration) ||
+    fields.connectionGeneration <= 0 ||
+    (epoch &&
+      (typeof fields.registryEpoch !== 'string' ||
+        !EPOCH.test(fields.registryEpoch) ||
+        typeof fields.principalBinding !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(fields.principalBinding)))
   ) {
     invalidRequest()
   }
@@ -145,10 +161,8 @@ function captureScope(value: unknown, epoch = true): LifecycleScope {
   return {
     connectionId: fields.connectionId as string | null,
     profile: fields.profile,
-    ...(fields.connectionGeneration === undefined
-      ? {}
-      : { connectionGeneration: fields.connectionGeneration as string }),
-    ...(fields.principal === undefined ? {} : { principal: fields.principal as string }),
+    connectionGeneration: fields.connectionGeneration,
+    ...(fields.principalBinding === undefined ? {} : { principalBinding: fields.principalBinding as string }),
     ...(fields.registryEpoch === undefined ? {} : { registryEpoch: fields.registryEpoch as string })
   }
 }
@@ -193,11 +207,24 @@ async function request<T>(
     response = await window.hermesDesktop.apiStructured<unknown>({
       ...requestValue,
       connectionId: scope.connectionId,
-      profile: scope.profile
+      profile: scope.profile,
+      expectedConnectionGeneration: scope.connectionGeneration,
+      ...(!capabilities ? { expectedMarketplacePrincipalBinding: scope.principalBinding } : {})
     })
   } catch (error) {
     const message =
       error && typeof error === 'object' ? Object.getOwnPropertyDescriptor(error, 'message')?.value : undefined
+
+    const nativeCode =
+      typeof message === 'string'
+        ? /^(?:Error invoking remote method 'hermes:api:structured': Error: )?(marketplace_connection_generation_changed|marketplace_connection_generation_exhausted)$/.exec(
+            message
+          )?.[1]
+        : undefined
+
+    if (nativeCode) {
+      throw new LifecycleApiError(nativeCode, 0)
+    }
 
     throw new LifecycleApiError(
       typeof message === 'string' && message.endsWith('Invalid workflow lifecycle response.')
@@ -294,10 +321,6 @@ export function discardLifecycleClockObservation(observation: LifecycleClockObse
 function clockScope(input: LifecycleClockScope): LifecycleClockScope {
   const scope = captureScope(input)
 
-  if (!text(scope.connectionGeneration) || !isLifecycleProfile(scope.principal)) {
-    clockFailure()
-  }
-
   return scope as LifecycleClockScope
 }
 
@@ -314,6 +337,7 @@ export function observeLifecycleClock(
       !capabilities ||
       capabilities.profile !== scope.profile ||
       capabilities.registry_epoch !== scope.registryEpoch ||
+      capabilities.principal_binding !== scope.principalBinding ||
       !Number.isFinite(received.wallNowMs) ||
       !Number.isFinite(received.monotonicNowMs)
     ) {
@@ -420,7 +444,7 @@ async function exactOperation(
 
 export function getLifecycleOperation(
   id: string,
-  scope: LifecycleScope,
+  scope: LifecycleConnectionBinding,
   expected?: unknown
 ): Promise<wire.LifecycleOperation> {
   return exactOperation(id, scope, expected, false)
@@ -428,14 +452,14 @@ export function getLifecycleOperation(
 
 export function cancelLifecycleOperation(
   id: string,
-  scope: LifecycleScope,
+  scope: LifecycleConnectionBinding,
   expected?: unknown
 ): Promise<wire.LifecycleOperation> {
   return exactOperation(id, scope, expected, true)
 }
 
 export async function listLifecycleOperations(
-  scopeInput: LifecycleScope,
+  scopeInput: LifecycleConnectionBinding,
   options: { cursor?: string; limit?: number } = {}
 ): Promise<wire.LifecycleOperationPage> {
   const scope = captureScope(scopeInput)
@@ -477,7 +501,7 @@ export async function listLifecycleOperations(
 
 export async function lookupLifecycleAdmission(
   requestId: string,
-  scopeInput: LifecycleScope,
+  scopeInput: LifecycleConnectionBinding,
   expectedInput?: unknown
 ): Promise<wire.AdmissionFound | wire.AdmissionEvicted> {
   const scope = captureScope(scopeInput)
@@ -501,7 +525,7 @@ export async function lookupLifecycleAdmission(
 
 export async function getLifecyclePackageState(
   identityInput: wire.PackageIdentity,
-  scopeInput: LifecycleScope
+  scopeInput: LifecycleConnectionBinding
 ): Promise<wire.PackageState> {
   const scope = captureScope(scopeInput)
   const subject = decodeLifecycleSubject({ type: 'package', identity: identityInput })
@@ -621,7 +645,7 @@ export async function startLifecycleOperation(
 /** Explicit caller-owned secret. Never call from shared observation/query code. */
 export async function getLifecycleReviewToken(
   preparation: unknown,
-  scopeInput: LifecycleScope
+  scopeInput: LifecycleConnectionBinding
 ): Promise<wire.ReviewTokenResponse> {
   const scope = captureScope(scopeInput)
   const prepared = decodeLifecycleOperation(preparation)

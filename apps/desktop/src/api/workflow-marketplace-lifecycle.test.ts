@@ -10,8 +10,8 @@ const api = await import('./workflow-marketplace-lifecycle').catch(() => null)
 
 const scope = {
   connectionId: 'remote-a',
-  connectionGeneration: 'generation-a',
-  principal: 'alice',
+  connectionGeneration: 41,
+  principalBinding: 'b'.repeat(64),
   profile: 'support',
   registryEpoch: corpus.capabilities.registry_epoch
 }
@@ -35,6 +35,47 @@ describe('exact scoped V2 lifecycle helpers', () => {
   afterEach(() => {
     Reflect.deleteProperty(window, 'hermesDesktop')
     vi.restoreAllMocks()
+  })
+
+  // Break caught: native route sentinels become network failures, allowing unsafe same-process retry on exhaustion.
+  it.each(['marketplace_connection_generation_changed', 'marketplace_connection_generation_exhausted'])(
+    'preserves exact local native code %s without retaining error text',
+    async code => {
+      for (const message of [code, `Error invoking remote method 'hermes:api:structured': Error: ${code}`]) {
+        transport.mockRejectedValue(new Error(message))
+        await expect(api!.getLifecycleOperation(corpus.operationAId, scope)).rejects.toMatchObject({ code, status: 0 })
+      }
+
+      transport.mockRejectedValue(new Error(`secret ${code}`))
+      await expect(api!.getLifecycleOperation(corpus.operationAId, scope)).rejects.toMatchObject({
+        code: 'marketplace_network_error'
+      })
+    }
+  )
+
+  // Break caught: missing legacy generation is synthesized, or capabilities sends an actor precondition before observation.
+  it('requires native generation and sends only that dedicated precondition for capabilities', async () => {
+    await expect(
+      api!.getLifecycleCapabilities({ connectionId: null, profile: 'support' } as never)
+    ).rejects.toMatchObject({ code: 'marketplace_lifecycle_unsupported' })
+    expect(transport.mock.calls).toEqual([])
+    transport.mockResolvedValue({ ok: true, value: { ...corpus.capabilities, principal_binding: 'b'.repeat(64) } })
+    await api!.getLifecycleCapabilities(scope)
+    expect(transport.mock.calls[0][0]).toEqual({
+      path: '/api/plugins/workflow/marketplace/lifecycle/v2/capabilities',
+      connectionId: 'remote-a',
+      profile: 'support',
+      expectedConnectionGeneration: 41
+    })
+  })
+
+  // Break caught: the server actor precondition is dropped from the generated closed error set.
+  it('retains the safe backend principal transition error', async () => {
+    transport.mockResolvedValue({ ok: false, status: 409, body: { detail: { code: 'marketplace_principal_changed' } } })
+    await expect(api!.getLifecycleOperation(corpus.operationAId, scope)).rejects.toMatchObject({
+      code: 'marketplace_principal_changed',
+      status: 409
+    })
   })
 
   it('rejects wall-clock adjustment instead of minting a future admission', () => {
@@ -67,7 +108,7 @@ describe('exact scoped V2 lifecycle helpers', () => {
     )
   })
 
-  it.each(['connectionId', 'connectionGeneration', 'profile', 'principal', 'registryEpoch'] as const)(
+  it.each(['connectionId', 'connectionGeneration', 'profile', 'principalBinding', 'registryEpoch'] as const)(
     'refuses exact clock scope change in %s',
     field => {
       const observation = api!.observeLifecycleClock(corpus.capabilities, scope, received)
@@ -209,6 +250,8 @@ describe('exact scoped V2 lifecycle helpers', () => {
     expect(await api!.getLifecycleOperation(corpus.operationAId, scope, expected)).toEqual(corpus.validOperationA)
     expect(transport.mock.calls[0][0]).toEqual({
       connectionId: 'remote-a',
+      expectedConnectionGeneration: 41,
+      expectedMarketplacePrincipalBinding: 'b'.repeat(64),
       profile: 'support',
       path: `/api/plugins/workflow/marketplace/lifecycle/v2/operations/${corpus.operationAId}`
     })
@@ -335,6 +378,8 @@ describe('exact scoped V2 lifecycle helpers', () => {
       profile: 'support',
       method: 'POST',
       timeoutMs: 15000,
+      expectedConnectionGeneration: 41,
+      expectedMarketplacePrincipalBinding: 'b'.repeat(64),
       path: `/api/plugins/workflow/marketplace/lifecycle/v2${paths[value.kind]}`,
       body: { request_id: value.request_id, body: bodies[value.kind] }
     })

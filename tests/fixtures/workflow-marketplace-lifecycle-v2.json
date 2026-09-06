@@ -64,6 +64,7 @@
       "sources",
       "inspect"
     ],
+    "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "profile": "support",
     "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     "schema_version": 2,
@@ -315,6 +316,7 @@
     "marketplace_operation_conflict",
     "marketplace_operation_not_found",
     "marketplace_operation_unavailable",
+    "marketplace_principal_changed",
     "marketplace_request_conflict",
     "marketplace_request_expired",
     "marketplace_request_invalid",
@@ -67858,6 +67860,138 @@
   },
   "outerEnvelopeCases": [
     {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "principal binding domain ''",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": "",
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "principal binding domain 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "principal binding domain 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "principal binding domain 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "principal binding domain 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "principal binding domain 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
       "accepted": true,
       "model": "LifecycleCapabilities",
       "name": "LifecycleCapabilities valid",
@@ -67872,6 +68006,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -67893,6 +68028,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "server_time": "2026-09-05T12:00:00Z"
@@ -67913,6 +68049,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": false,
@@ -67934,6 +68071,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
         "server_time": "2026-09-05T12:00:00Z"
@@ -67954,6 +68092,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": false,
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -67975,6 +68114,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "schema_version": 2,
         "server_time": "2026-09-05T12:00:00Z"
@@ -67995,8 +68135,52 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": false,
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "LifecycleCapabilities missing principal_binding",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "schema_version": 2,
+        "server_time": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "model": "LifecycleCapabilities",
+      "name": "LifecycleCapabilities wrong scalar principal_binding",
+      "value": {
+        "capabilities": [
+          "operations",
+          "admission_replay",
+          "package_state",
+          "transactions",
+          "updates",
+          "trust",
+          "sources",
+          "inspect"
+        ],
+        "principal_binding": false,
+        "profile": "support",
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
         "server_time": "2026-09-05T12:00:00Z"
       }
@@ -68016,6 +68200,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2
@@ -68036,6 +68221,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68047,6 +68233,7 @@
       "model": "LifecycleCapabilities",
       "name": "LifecycleCapabilities missing capabilities",
       "value": {
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68059,6 +68246,7 @@
       "name": "LifecycleCapabilities wrong scalar capabilities",
       "value": {
         "capabilities": false,
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68080,6 +68268,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68917,6 +69106,7 @@
       "name": "capability sequence []",
       "value": {
         "capabilities": [],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68932,6 +69122,7 @@
           "operations",
           "trust"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68947,6 +69138,7 @@
           "trust",
           "operations"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68962,6 +69154,7 @@
           "trust",
           "trust"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68976,6 +69169,7 @@
         "capabilities": [
           "unknown"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -68997,6 +69191,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "﻿support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -69018,6 +69213,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": " support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -69039,6 +69235,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -69060,6 +69257,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -69081,6 +69279,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -69102,6 +69301,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
         "schema_version": 2,
@@ -69123,6 +69323,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,
@@ -69144,6 +69345,7 @@
           "sources",
           "inspect"
         ],
+        "principal_binding": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "profile": "support",
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "schema_version": 2,

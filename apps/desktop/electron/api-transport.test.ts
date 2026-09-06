@@ -25,6 +25,310 @@ import {
   shouldRetryRequest,
   withRetry
 } from './api-transport'
+import { createConnectionGenerationRegistry } from './connection-generation'
+
+const lifecycleTransport = await import('./lifecycle-api-transport').catch(() => null)
+const lifecycleRoot = '/api/plugins/workflow/marketplace/lifecycle/v2'
+const principalHeader = 'X-Hermes-Marketplace-Principal-Binding'
+const principal = 'a'.repeat(64)
+
+function pendingValue<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(done => {
+    resolve = done
+  })
+
+  return { promise, resolve }
+}
+
+describe('native lifecycle IPC authority boundary', () => {
+  // Break caught: low-level config merging reintroduces a differently-cased actor header after descriptor sanitation.
+  it('strips implicit/config collisions before reinjecting the native singleton at the final transport merge', () => {
+    expect(lifecycleTransport!.mergeNativeRequestHeaders).toBeTypeOf('function')
+
+    const headers = lifecycleTransport!.mergeNativeRequestHeaders(
+      { [principalHeader]: 'bad', 'x-hermes-marketplace-principal-binding': 'bad' },
+      {
+        headers: { 'x-HeRmEs-MaRkEtPlAcE-PrInCiPaL-BiNdInG': 'bad', [principalHeader]: principal, 'X-Fixture': 'kept' },
+        nativeLifecycle: true
+      }
+    )
+
+    expect(headers).toEqual({ 'X-Fixture': 'kept', [principalHeader]: principal })
+    expect(lifecycleTransport!.mergeNativeRequestHeaders({ [principalHeader]: 'bad' }, {})).toEqual({})
+  })
+
+  for (const structured of [false, true]) {
+    // Break caught: a rejected old route resolution leaks its error after native authority is retired.
+    it(`suppresses obsolete route-resolution errors (structured=${structured})`, async () => {
+      const authority = createConnectionGenerationRegistry()
+      authority.begin('primary')
+      const gate = pendingValue<void>()
+
+      const task = lifecycleTransport!.dispatchLifecycleRequest(
+        { path: `${lifecycleRoot}/capabilities`, expectedConnectionGeneration: 1 },
+        structured,
+        {
+          authority,
+          resolve: async () => {
+            await gate.promise
+            throw new Error('private old endpoint error')
+          },
+          accessToken: async () => null,
+          fetchToken: async () => {
+            throw new Error('must not fetch')
+          },
+          fetchCookie: async () => {
+            throw new Error('must not fetch')
+          }
+        }
+      )
+
+      authority.invalidate('primary')
+      gate.resolve()
+      await expect(task).rejects.toThrow('marketplace_connection_generation_changed')
+    })
+    // Break caught: either channel fetches under the wrong route or returns a stale secret-bearing response.
+    it.each(['resolve', 'auth', 'fetch'])(
+      `rejects generation race during %s (structured=${structured})`,
+      async stage => {
+        expect(lifecycleTransport).not.toBeNull()
+        const authority = createConnectionGenerationRegistry()
+        const claim = authority.begin('primary')
+
+        const descriptor = authority.publish(claim, {
+          baseUrl: 'https://fixture.example',
+          authMode: 'oauth',
+          token: null
+        })
+
+        authority.associate('route', 1)
+        const gate = pendingValue<void>()
+        const entered = pendingValue<void>()
+        const received: unknown[] = []
+        let dispatched = 0
+
+        const pause = async (at: string) => {
+          if (stage === at) {
+            entered.resolve()
+            await gate.promise
+          }
+        }
+
+        const task = lifecycleTransport!
+          .dispatchLifecycleRequest(
+            {
+              path: `${lifecycleRoot}/operations`,
+              expectedConnectionGeneration: 1,
+              expectedMarketplacePrincipalBinding: principal
+            },
+            structured,
+            {
+              authority,
+              resolve: async () => {
+                await pause('resolve')
+
+                return { descriptor, path: `${lifecycleRoot}/operations`, routeKey: 'route' }
+              },
+              accessToken: async () => {
+                await pause('auth')
+
+                return 'fixture-bearer'
+              },
+              fetchToken: async () => {
+                dispatched++
+                await pause('fetch')
+
+                return { secret: 'fixture-private-response' }
+              },
+              fetchCookie: async () => {
+                throw new Error('wrong transport')
+              }
+            }
+          )
+          .then(value => received.push(value))
+
+        await entered.promise
+        authority.begin('primary')
+        gate.resolve()
+        await expect(task).rejects.toThrow('marketplace_connection_generation_changed')
+        expect(dispatched).toBe(stage === 'fetch' ? 1 : 0)
+        expect(received).toEqual([])
+      }
+    )
+
+    // Break caught: numeric exhaustion can still resolve a route or dispatch a queued generation 1.
+    it(`refuses exhausted requests before resolving (structured=${structured})`, async () => {
+      expect(lifecycleTransport).not.toBeNull()
+      const authority = createConnectionGenerationRegistry(undefined, Number.MAX_SAFE_INTEGER)
+      expect(() => authority.begin('primary')).toThrow('marketplace_connection_generation_exhausted')
+      let resolutions = 0
+      await expect(
+        lifecycleTransport!.dispatchLifecycleRequest(
+          { path: `${lifecycleRoot}/capabilities`, expectedConnectionGeneration: 1 },
+          structured,
+          {
+            authority,
+            resolve: async () => {
+              resolutions++
+              throw new Error('must not resolve')
+            },
+            accessToken: async () => null,
+            fetchToken: async () => {
+              throw new Error('must not fetch')
+            },
+            fetchCookie: async () => {
+              throw new Error('must not fetch')
+            }
+          }
+        )
+      ).rejects.toThrow('marketplace_connection_generation_exhausted')
+      expect(resolutions).toBe(0)
+    })
+  }
+
+  // Break caught: renderer routing metadata leaks onto V1 or malformed principals become native headers.
+  it('validates the dedicated lifecycle-only fields without accepting arbitrary headers', () => {
+    expect(lifecycleTransport).not.toBeNull()
+    const validate = lifecycleTransport!.validateLifecycleRequest
+    expect(validate({ path: '/api/plugins/workflow/marketplace/sources' })).toBe(false)
+
+    for (const path of ['/api/status', `${lifecycleRoot}-other/capabilities`]) {
+      for (const field of ['expectedConnectionGeneration', 'expectedMarketplacePrincipalBinding']) {
+        expect(() => validate({ path, [field]: 1 })).toThrow()
+      }
+    }
+
+    for (const generation of [undefined, null, '1', 0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() =>
+        validate({ path: `${lifecycleRoot}/capabilities`, expectedConnectionGeneration: generation })
+      ).toThrow()
+    }
+
+    for (const binding of [
+      undefined,
+      null,
+      '',
+      'A'.repeat(64),
+      'a'.repeat(63),
+      'a'.repeat(65),
+      `${principal}\n`,
+      [principal]
+    ]) {
+      expect(() =>
+        validate({
+          path: `${lifecycleRoot}/operations`,
+          expectedConnectionGeneration: 1,
+          expectedMarketplacePrincipalBinding: binding
+        })
+      ).toThrow()
+    }
+
+    expect(() =>
+      validate({
+        path: `${lifecycleRoot}/operations`,
+        expectedConnectionGeneration: 1,
+        expectedMarketplacePrincipalBinding: principal,
+        headers: {}
+      })
+    ).toThrow()
+    expect(validate({ path: `${lifecycleRoot}/capabilities`, expectedConnectionGeneration: 1 })).toBe(true)
+  })
+
+  // Break caught: merge order preserves a descriptor collision or serializes expected generation into HTTP.
+  it.each(['token', 'bearer', 'cookie'])(
+    `sends one native-owned principal header through %s transport`,
+    async transport => {
+      expect(lifecycleTransport).not.toBeNull()
+      const wireRequests: Array<{ headers: string[]; url: string; body: string }> = []
+
+      const server = http.createServer((request, response) => {
+        let body = ''
+        request.on('data', chunk => {
+          body += chunk
+        })
+        request.on('end', () => {
+          wireRequests.push({ headers: request.rawHeaders, url: request.url!, body })
+          response.end('{"accepted":true}')
+        })
+      })
+
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+      const authority = createConnectionGenerationRegistry()
+
+      const descriptor = authority.publish(authority.begin('primary'), {
+        baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        authMode: transport === 'token' ? 'token' : 'oauth',
+        token: 'fixture-token',
+        headers: {
+          [principalHeader]: 'wrong',
+          'x-hermes-marketplace-principal-binding': 'wrong-lower',
+          'x-HeRmEs-MaRkEtPlAcE-PrInCiPaL-BiNdInG': 'wrong-mixed',
+          'X-Fixture': 'kept'
+        }
+      })
+
+      authority.associate('route', 1)
+
+      const send = (url: string, headers: Record<string, string>, body: unknown) =>
+        new Promise<unknown>((resolve, reject) => {
+          const req = http.request(url, { method: 'POST', headers }, response => {
+            let text = ''
+            response.on('data', chunk => {
+              text += chunk
+            })
+            response.on('end', () => resolve(JSON.parse(text)))
+          })
+
+          req.on('error', reject)
+          req.end(JSON.stringify(body))
+        })
+
+      try {
+        await lifecycleTransport!.dispatchLifecycleRequest(
+          {
+            path: `${lifecycleRoot}/install/prepare`,
+            method: 'POST',
+            body: { request_id: 'fixture' },
+            expectedConnectionGeneration: 1,
+            expectedMarketplacePrincipalBinding: principal
+          },
+          true,
+          {
+            authority,
+            resolve: async () => ({ descriptor, path: `${lifecycleRoot}/install/prepare`, routeKey: 'route' }),
+            accessToken: async () => (transport === 'bearer' ? 'fixture-bearer' : null),
+            fetchToken: (url, token, options) =>
+              send(
+                url,
+                {
+                  ...options.headers,
+                  ...(token ? { 'X-Hermes-Session-Token': token } : { Authorization: `Bearer ${options.bearer}` })
+                },
+                options.body
+              ),
+            fetchCookie: (url, options) => send(url, { ...options.headers, Cookie: 'fixture=session' }, options.body)
+          }
+        )
+        expect(wireRequests).toHaveLength(1)
+        const observed = wireRequests[0]!
+        expect(
+          observed.headers.filter(
+            (name, index) => index % 2 === 0 && name.toLowerCase() === principalHeader.toLowerCase()
+          )
+        ).toEqual([principalHeader])
+        expect(observed.headers[observed.headers.indexOf(principalHeader) + 1]).toBe(principal)
+        expect(observed.url).toBe(`${lifecycleRoot}/install/prepare`)
+        expect(observed.body).toBe('{"request_id":"fixture"}')
+        expect(JSON.stringify(observed)).not.toContain('expectedConnectionGeneration')
+        expect(JSON.stringify(observed)).not.toContain('wrong')
+      } finally {
+        await new Promise<void>(resolve => server.close(() => resolve()))
+      }
+    }
+  )
+})
 
 function errWithCode(code: string, message = code): NodeJS.ErrnoException {
   const e: NodeJS.ErrnoException = new Error(message)

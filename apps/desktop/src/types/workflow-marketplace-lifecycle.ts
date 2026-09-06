@@ -530,6 +530,7 @@ export type _Capabilities = {
   schema_version: 2
   profile: string
   registry_epoch: string
+  principal_binding: string
   server_time: string
   capabilities: Array<
     'operations' | 'admission_replay' | 'package_state' | 'transactions' | 'updates' | 'trust' | 'sources' | 'inspect'
@@ -702,6 +703,7 @@ export const lifecycleHttpErrorCodes = [
   'marketplace_operation_conflict',
   'marketplace_operation_not_found',
   'marketplace_operation_unavailable',
+  'marketplace_principal_changed',
   'marketplace_request_conflict',
   'marketplace_request_expired',
   'marketplace_request_invalid',
@@ -1806,12 +1808,13 @@ export const lifecycleSchemas = {
         maxItems: 8,
         type: 'array'
       },
+      principal_binding: { maxLength: 64, minLength: 64, pattern: '^[0-9a-f]{64}$', type: 'string' },
       profile: { maxLength: 256, minLength: 1, type: 'string' },
       registry_epoch: { pattern: '^[0-9a-f]{32}$', type: 'string' },
       schema_version: { const: 2, type: 'integer' },
       server_time: { maxLength: 64, minLength: 20, type: 'string' }
     },
-    required: ['schema_version', 'profile', 'registry_epoch', 'server_time', 'capabilities'],
+    required: ['schema_version', 'profile', 'registry_epoch', 'principal_binding', 'server_time', 'capabilities'],
     type: 'object'
   },
   _CheckBody: {
