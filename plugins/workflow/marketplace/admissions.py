@@ -29,6 +29,9 @@ from .lifecycle_models import (
 
 _PROCESS_EPOCH = secrets.token_hex(16)
 _PROCESS_SECRET = secrets.token_bytes(32)
+# Separate, memory-only process authority. Tests may replace this private value;
+# disposable profile stores never allocate or retain their own binding key.
+_PROCESS_PRINCIPAL_BINDING_KEY = secrets.token_bytes(32)
 _REQUEST_ID = re.compile(r"wmreq_([0-9a-f]{32})_([0-9]{13})_([0-9a-f]{32})", re.ASCII)
 _SUBJECT = TypeAdapter(LifecycleSubject)
 _SELECTION = TypeAdapter(TrustSelection | None)
@@ -164,6 +167,17 @@ class LifecycleAdmissionStore:
 
     def new_request_id(self):
         return f"wmreq_{self.epoch}_{int(self._now().timestamp() * 1000):013d}_{self._random()}"
+
+    def principal_binding(self, actor: str) -> str:
+        """Opaque equality proof for the exact already-authorized private actor."""
+        return hmac.new(
+            _PROCESS_PRINCIPAL_BINDING_KEY,
+            b"workflow-marketplace-lifecycle-principal-v2\0"
+            + self.epoch.encode("ascii")
+            + b"\0"
+            + actor.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
     def direct_selector_id(
         self, repository_url: str, ref: str | None, package_path: str | None

@@ -28,6 +28,44 @@ SUBJECT = PackageSubject(
 )
 
 
+# Break caught: deriving from a retireable store key, or omitting actor/epoch/key.
+def test_principal_binding_is_process_scoped_and_separates_exact_inputs(
+    tmp_path, monkeypatch, caplog
+):
+    from plugins.workflow.marketplace import admissions
+    from plugins.workflow.marketplace.api import _actor
+    from test_marketplace_api import _Authority
+
+    key = b"0123456789abcdef" * 2
+    monkeypatch.setattr(admissions, "_PROCESS_PRINCIPAL_BINDING_KEY", key)
+    authority = _Authority(frozenset({"read"}), "private-user-authority")
+    actor = _actor(authority, str(tmp_path))
+    first = admissions.LifecycleAdmissionStore(profile_key=str(tmp_path), epoch=EPOCH)
+    second = admissions.LifecycleAdmissionStore(profile_key=str(tmp_path), epoch=EPOCH)
+    binding = first.principal_binding(actor)
+    # Independently evaluated HMAC vector catches domain/separator drift.
+    assert first.principal_binding("marketplace:" + "a" * 64) == (
+        "cf3e5fc3fa2c3336869de15c5d4d88867939250f3685458326dd0c31158149f2"
+    )
+    assert binding == second.principal_binding(actor)
+    assert len(binding) == 64 and set(binding) <= set("0123456789abcdef")
+    assert first.principal_binding(actor + "a") != binding
+    assert (
+        first.principal_binding(_actor(authority, str(tmp_path / "other"))) != binding
+    )
+    assert (
+        admissions.LifecycleAdmissionStore(
+            profile_key=str(tmp_path), epoch="b" * 32
+        ).principal_binding(actor)
+        != binding
+    )
+    monkeypatch.setattr(admissions, "_PROCESS_PRINCIPAL_BINDING_KEY", b"x" * 32)
+    assert first.principal_binding(actor) != binding
+    exposed = binding + repr(first) + repr(second) + caplog.text
+    for private in (actor, authority.authority_binding, key.decode(), key.hex()):
+        assert private not in exposed
+
+
 def test_direct_selector_is_epoch_keyed_and_binds_each_canonical_component(tmp_path):
     from plugins.workflow.marketplace.admissions import LifecycleAdmissionStore
 
@@ -427,7 +465,11 @@ def test_vault_requires_exact_binding_and_never_restores_consumed_or_expired_aut
         completed = observed.wait(5)
         thread.join(timeout=5)
         inspections.append(completed)
-        return completed and token == "private-raw-token" and not fixture.consumed
+        return (
+            completed
+            and token == "private-raw-token-for-test-only-0001"
+            and not fixture.consumed
+        )
 
     result = RemoveReviewResult(
         type="remove_review",
@@ -453,7 +495,7 @@ def test_vault_requires_exact_binding_and_never_restores_consumed_or_expired_aut
                 type="known_unchanged", evidence="read_only", package_state=None
             ),
             review_token=operations.ReviewTokenMetadata(
-                confirmation_token="private-raw-token",
+                confirmation_token="private-raw-token-for-test-only-0001",
                 expires_at=expiry,
                 review_digest=digest,
                 subject=SUBJECT,
@@ -475,16 +517,16 @@ def test_vault_requires_exact_binding_and_never_restores_consumed_or_expired_aut
         selection=None,
     )
     token = fixture.registry.review_token(operation.id, **arguments)
-    assert token.confirmation_token == "private-raw-token"
+    assert token.confirmation_token == "private-raw-token-for-test-only-0001"
     assert fixture.registry.review_token(operation.id, **arguments) == token
     assert (
-        "private-raw-token"
+        "private-raw-token-for-test-only-0001"
         not in fixture.registry.get_lifecycle(
             operation.id, actor="alice"
         ).model_dump_json()
     )
     assert (
-        "private-raw-token"
+        "private-raw-token-for-test-only-0001"
         not in fixture.registry.list_snapshot(actor="alice").model_dump_json()
     )
     for changes in (
@@ -791,7 +833,10 @@ def test_invalid_typed_completion_is_terminal_unknown_and_releases_reservation(
 
 
 def _start_review_with_authority(
-    fixture, validate_unused, *, confirmation_token="private-raw-token"
+    fixture,
+    validate_unused,
+    *,
+    confirmation_token="private-raw-token-for-test-only-0001",
 ):
     expiry = "2026-09-04T00:05:00Z"
     digest = "d" * 64
@@ -843,7 +888,9 @@ def test_review_publication_validates_unused_authority_before_vaulting(
     def validator(token):
         validations.append(token)
         if authority == "raises":
-            error = RuntimeError("private-raw-token: private callback failure")
+            error = RuntimeError(
+                "private-raw-token-for-test-only-0001: private callback failure"
+            )
             error.code = "source_cancelled"
             raise error
         return authority == "valid"
@@ -851,7 +898,7 @@ def test_review_publication_validates_unused_authority_before_vaulting(
     operation = _start_review_with_authority(fixture, validator)
     fixture.finish(operation)
     terminal = fixture.registry.get_lifecycle(operation.id, actor="alice")
-    assert validations == ["private-raw-token"]
+    assert validations == ["private-raw-token-for-test-only-0001"]
     assert "private" not in terminal.model_dump_json()
     arguments = dict(
         actor="alice",
@@ -865,9 +912,12 @@ def test_review_publication_validates_unused_authority_before_vaulting(
         assert terminal.result.value.confirmation_available
         assert (
             fixture.registry.review_token(operation.id, **arguments).confirmation_token
-            == "private-raw-token"
+            == "private-raw-token-for-test-only-0001"
         )
-        assert validations == ["private-raw-token", "private-raw-token"]
+        assert validations == [
+            "private-raw-token-for-test-only-0001",
+            "private-raw-token-for-test-only-0001",
+        ]
     else:
         assert terminal.state == "failed" and terminal.result is None
         assert terminal.outcome.type == "outcome_unknown"
@@ -875,7 +925,7 @@ def test_review_publication_validates_unused_authority_before_vaulting(
         with pytest.raises(operations.MarketplaceOperationRegistryError) as unavailable:
             fixture.registry.review_token(operation.id, **arguments)
         assert unavailable.value.code == "marketplace_review_unavailable"
-        assert validations == ["private-raw-token"]
+        assert validations == ["private-raw-token-for-test-only-0001"]
 
 
 @pytest.mark.parametrize("boundary", ["expiry", "cancellation"])

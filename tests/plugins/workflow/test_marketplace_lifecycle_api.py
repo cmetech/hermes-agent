@@ -26,6 +26,266 @@ ROOT = "/api/plugins/workflow/marketplace"
 V2 = ROOT + "/lifecycle/v2"
 IDENTITY = {"source_key": "company", "package_id": "laptop-support"}
 SUBJECT = {"type": "package", "identity": IDENTITY}
+PRINCIPAL_HEADER = "X-Hermes-Marketplace-Principal-Binding"
+
+
+# Break caught: capabilities omit binding or publish a private principal, or rotate
+# binding when an idle profile registry is retired and reconstructed.
+def test_principal_binding_survives_real_profile_retirement(
+    lifecycle_api, tmp_path, caplog
+):
+    api = lifecycle_api
+    first = api.client.get(V2 + "/capabilities").json()
+    assert len(first["principal_binding"]) == 64
+    origin = api.home
+    api.home = tmp_path / "replacement"
+    other = api.client.get(V2 + "/capabilities").json()
+    assert other["principal_binding"] != first["principal_binding"]
+    api.home = origin
+    rebuilt = api.client.get(V2 + "/capabilities").json()
+    assert api.context.current()[3] is not api.registry
+    assert rebuilt["principal_binding"] == first["principal_binding"]
+    assert rebuilt["registry_epoch"] == first["registry_epoch"]
+    foreign = api.client.get(
+        V2 + "/capabilities", headers={"X-Test-Actor": "private-other-user"}
+    ).json()
+    assert foreign["principal_binding"] != first["principal_binding"]
+    exposed = json.dumps([first, other, rebuilt, foreign]) + caplog.text
+    for private in (
+        api.actor,
+        "private-other-user",
+        "session:provider:org:raw-user-identity",
+    ):
+        assert private not in exposed
+
+
+# Break caught: malformed capability producer values bypass response revalidation.
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "extra", "uppercase", "short", "long", "number", "null", "newline"],
+)
+def test_principal_capabilities_faults_are_fixed_internal_errors(
+    lifecycle_api, monkeypatch, mutation
+):
+    from plugins.workflow.marketplace import lifecycle_api as routes
+
+    def malformed(**kwargs):
+        kwargs["principal_binding"] = "a" * 64
+        if mutation == "missing":
+            del kwargs["principal_binding"]
+        elif mutation == "extra":
+            kwargs["private_actor"] = "private-must-not-publish"
+        else:
+            kwargs["principal_binding"] = {
+                "uppercase": "A" * 64,
+                "short": "a" * 63,
+                "long": "a" * 65,
+                "number": 123,
+                "null": None,
+                "newline": "a" * 64 + "\n",
+            }[mutation]
+        return kwargs
+
+    monkeypatch.setattr(routes, "_Capabilities", malformed)
+    response = lifecycle_api.client.get(V2 + "/capabilities")
+    assert response.status_code == 500
+    assert response.json() == {"detail": {"code": "marketplace_internal_error"}}
+
+
+_PRINCIPAL_ROUTES = [
+    ("GET", "/operations"),
+    ("GET", "/operations/{operation_id}"),
+    ("POST", "/operations/{operation_id}/cancel"),
+    ("GET", "/admissions/{request_id}"),
+    ("POST", "/operations/{operation_id}/review-token"),
+    ("GET", "/packages/company/laptop-support/state"),
+    *[
+        ("POST", path)
+        for path in (
+            "/updates/check",
+            "/install/prepare",
+            "/install/confirm",
+            "/update/prepare",
+            "/update/confirm",
+            "/remove/prepare",
+            "/remove/confirm",
+            "/trust/review",
+            "/trust/grant",
+            "/trust/revoke",
+            "/sources/company/refresh",
+            "/packages/company/laptop-support",
+        )
+    ],
+]
+
+
+# Break caught: any V2 route admits missing/ambiguous/stale bindings, compares
+# duplicates, or reaches a producer before enforcing the shared precondition.
+@pytest.mark.parametrize("method,path", _PRINCIPAL_ROUTES)
+def test_all_v2_routes_reject_principal_header_before_producer(
+    lifecycle_api, monkeypatch, method, path, caplog
+):
+    from plugins.workflow.marketplace import lifecycle_api as routes
+
+    api = lifecycle_api
+    operation = api.review()
+    confirm = api.confirm_request(operation)
+    token_body = {
+        "review_digest": operation["result"]["value"]["review_digest"],
+        "subject": operation["subject"],
+        "selection": operation["selection"],
+    }
+    if path.endswith("/review-token"):
+        payload = token_body
+    elif path.endswith("/confirm") or path == "/trust/grant":
+        payload = confirm
+    elif path == "/install/prepare":
+        payload = api.request({"identifier": "company/laptop-support"})
+    elif path in {
+        "/update/prepare",
+        "/remove/prepare",
+        "/trust/review",
+        "/trust/revoke",
+    }:
+        payload = api.request({"identity": IDENTITY})
+    else:
+        payload = api.request({})
+    binding = api.client.get(V2 + "/capabilities").json()["principal_binding"]
+    path = path.format(operation_id=operation["id"], request_id=operation["request_id"])
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append("producer")
+        raise RuntimeError("private-producer-must-not-run")
+
+    compare = routes.hmac.compare_digest
+    comparisons = []
+
+    def tracked_compare(left, right):
+        comparisons.append((left, right))
+        return compare(left, right)
+
+    with monkeypatch.context() as guard:
+        for name in (
+            "list_snapshot",
+            "get_lifecycle",
+            "cancel_lifecycle",
+            "lookup_admission",
+            "review_token",
+            "start",
+            "intersects_active_mutation",
+        ):
+            guard.setattr(api.registry, name, forbidden)
+        guard.setattr(routes, "read_package_state", forbidden)
+        guard.setattr(routes.hmac, "compare_digest", tracked_compare)
+        api.client.headers.pop(PRINCIPAL_HEADER, None)
+        wrong = ("b" if binding[0] != "b" else "c") + binding[1:]
+        variants = [
+            [],
+            [(PRINCIPAL_HEADER, "private-malformed")],
+            [(PRINCIPAL_HEADER, "a" * 63)],
+            [(PRINCIPAL_HEADER, "a" * 65)],
+            [(PRINCIPAL_HEADER, binding.upper())],
+            [(PRINCIPAL_HEADER, "a" * 4096)],
+            [(PRINCIPAL_HEADER, wrong)],
+            [(PRINCIPAL_HEADER, binding), (PRINCIPAL_HEADER.lower(), binding)],
+            [(PRINCIPAL_HEADER, binding), (PRINCIPAL_HEADER.swapcase(), wrong)],
+        ]
+        failures = []
+        for index, headers in enumerate(variants):
+            calls.clear()
+            comparisons.clear()
+            response = api.client.request(
+                method, V2 + path, headers=headers, json=payload
+            )
+            expected_comparisons = (
+                [(wrong, binding)] if headers == [(PRINCIPAL_HEADER, wrong)] else []
+            )
+            if (
+                response.status_code != 409
+                or response.json()
+                != {"detail": {"code": "marketplace_principal_changed"}}
+                or calls
+                or comparisons != expected_comparisons
+            ):
+                failures.append((
+                    index,
+                    response.status_code,
+                    response.json(),
+                    len(calls),
+                    len(comparisons),
+                ))
+        assert failures == []
+    assert binding not in caplog.text
+    assert "private-malformed" not in caplog.text
+    response = api.client.request(
+        method, V2 + path, headers={PRINCIPAL_HEADER.swapcase(): binding}, json=payload
+    )
+    expected = (
+        410
+        if path in {"/update/confirm", "/remove/confirm", "/trust/grant"}
+        else 202
+        if method == "POST" and not path.startswith("/operations/")
+        else 200
+    )
+    assert response.status_code == expected, response.text
+
+
+# Break caught: a copied binding authorizes another actor or changes owner scope.
+def test_principal_binding_does_not_replace_actor_authorization(lifecycle_api):
+    api = lifecycle_api
+    operation = api.review()
+    own = api.client.get(V2 + "/capabilities").json()["principal_binding"]
+    foreign_headers = {"X-Test-Actor": "private-other-user"}
+    foreign = api.client.get(V2 + "/capabilities", headers=foreign_headers).json()[
+        "principal_binding"
+    ]
+    assert foreign != own
+    for suffix in ("", "/cancel"):
+        method = api.client.get if not suffix else api.client.post
+        response = method(
+            V2 + "/operations/" + operation["id"] + suffix,
+            headers={**foreign_headers, PRINCIPAL_HEADER: own},
+        )
+        assert response.status_code == 409
+        assert response.json() == {"detail": {"code": "marketplace_principal_changed"}}
+        response = method(
+            V2 + "/operations/" + operation["id"] + suffix,
+            headers={**foreign_headers, PRINCIPAL_HEADER: foreign},
+        )
+        assert response.status_code == 404
+    response = api.client.get(
+        V2 + "/operations", headers={**foreign_headers, PRINCIPAL_HEADER: foreign}
+    )
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    response = api.client.get(
+        V2 + "/operations/" + operation["id"],
+        headers={"X-Test-Authority": "read", PRINCIPAL_HEADER: own},
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == operation["id"]
+
+
+# Break caught: capabilities derive/disclose a binding before authentication.
+@pytest.mark.parametrize("status", [401, 403])
+def test_principal_capabilities_auth_failure_discloses_no_binding(
+    lifecycle_api, status
+):
+    from fastapi import HTTPException
+
+    def denied(request, scope):
+        raise HTTPException(status_code=status, detail={"code": "denied"})
+
+    app = FastAPI()
+    app.include_router(
+        create_marketplace_router(denied, context=lifecycle_api.context),
+        prefix="/api/plugins/workflow",
+    )
+    with TestClient(app) as client:
+        response = client.get(V2 + "/capabilities")
+    assert response.status_code == status
+    assert response.json() == {"detail": {"code": "denied"}}
 
 
 class LifecycleApi:
@@ -59,6 +319,9 @@ class LifecycleApi:
         self.client.headers["X-Test-Authority"] = "admin"
         key, _, _, self.registry = self.context.current()
         self.actor = _actor(_Authority(frozenset({"admin"})), key)
+        self.client.headers[PRINCIPAL_HEADER] = self.client.get(
+            V2 + "/capabilities"
+        ).json()["principal_binding"]
 
     def request(self, body):
         return {"request_id": self.registry.admissions.new_request_id(), "body": body}
@@ -720,6 +983,9 @@ def test_foreign_actor_cannot_observe_token_admission_or_cancel(lifecycle_api):
     review = api.review()
     request = api.confirm_request(review)
     foreign = {"X-Test-Actor": "other-actor"}
+    foreign[PRINCIPAL_HEADER] = api.client.get(
+        V2 + "/capabilities", headers=foreign
+    ).json()["principal_binding"]
     for suffix in (
         "/operations/" + review["id"],
         "/admissions/" + review["request_id"],
@@ -913,6 +1179,9 @@ def test_state_reports_foreign_active_mutation_without_foreign_visibility(
     assert entered.wait(5)
     try:
         other = {"X-Test-Actor": "other-actor"}
+        other[PRINCIPAL_HEADER] = api.client.get(
+            V2 + "/capabilities", headers=other
+        ).json()["principal_binding"]
         state = api.client.get(
             V2 + "/packages/company/laptop-support/state", headers=other
         )
@@ -1026,6 +1295,9 @@ def test_actual_context_recreation_fails_closed_but_legacy_token_remains_valid(
     )
     try:
         with TestClient(app, headers={"X-Test-Authority": "admin"}) as client:
+            client.headers[PRINCIPAL_HEADER] = client.get(V2 + "/capabilities").json()[
+                "principal_binding"
+            ]
             assert (
                 client.get(V2 + "/capabilities").json()["registry_epoch"]
                 == api.registry.admissions.epoch
@@ -1060,8 +1332,12 @@ def test_complete_http_snapshot_is_stable_private_and_capacity_bounded(lifecycle
         else:
             operation_id = api.start("/updates/check", {})["id"]
         own.add(operation_id)
+    foreign_headers = {"X-Test-Actor": "foreign"}
+    foreign_headers[PRINCIPAL_HEADER] = api.client.get(
+        V2 + "/capabilities", headers=foreign_headers
+    ).json()["principal_binding"]
     foreign = api.client.post(
-        V2 + "/updates/check", json=api.request({}), headers={"X-Test-Actor": "foreign"}
+        V2 + "/updates/check", json=api.request({}), headers=foreign_headers
     )
     assert foreign.status_code == 202
     api.registry._records[foreign.json()["id"]].future.result(timeout=10)
@@ -1074,7 +1350,7 @@ def test_complete_http_snapshot_is_stable_private_and_capacity_bounded(lifecycle
         api.client.get(
             V2 + "/operations",
             params={"cursor": cursor},
-            headers={"X-Test-Actor": "foreign"},
+            headers=foreign_headers,
         ).status_code
         == 410
     )
@@ -1113,10 +1389,14 @@ def test_same_display_profile_does_not_share_receipts_or_tokens(
     assert capabilities.json()["profile"] == "support"
     assert capabilities.json()["registry_epoch"] == api.registry.admissions.epoch
     assert api.context.current()[2] is not api.service
+    api.client.headers[PRINCIPAL_HEADER] = capabilities.json()["principal_binding"]
     assert api.client.get(V2 + "/admissions/" + review["request_id"]).status_code == 404
     assert api.post("/install/confirm", request).status_code == 410
     assert api.client.get(V2 + "/operations").json()["items"] == []
     api.home = original_home
+    api.client.headers[PRINCIPAL_HEADER] = api.client.get(V2 + "/capabilities").json()[
+        "principal_binding"
+    ]
     assert (
         api.token(review)["confirmation_token"] == request["body"]["confirmation_token"]
     )
@@ -1296,7 +1576,7 @@ def test_invalid_eligible_record_fails_both_lists_instead_of_disappearing(
     with TestClient(
         api.client.app,
         raise_server_exceptions=False,
-        headers={"X-Test-Authority": "admin"},
+        headers=dict(api.client.headers),
     ) as client:
         for path in (ROOT + "/operations", V2 + "/operations"):
             result = client.get(path)

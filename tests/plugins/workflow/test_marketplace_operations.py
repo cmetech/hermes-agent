@@ -44,6 +44,7 @@ def _wire_envelope(name):
             "schema_version": 2,
             "profile": "support",
             "registry_epoch": operation["registry_epoch"],
+            "principal_binding": "a" * 64,
             "server_time": operation["created_at"],
             "capabilities": [
                 "operations",

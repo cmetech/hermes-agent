@@ -217,7 +217,17 @@ def test_http_v1_pagination_filters_version_before_slicing(legacy_case):
         assert page.status_code == 200, page.text
         collected.extend(item["id"] for item in page.json()["operations"])
     assert collected == list(reversed(legacy_ids))
-    snapshot = client.get(root + "/lifecycle/v2/operations", headers=headers)
+    capabilities = client.get(root + "/lifecycle/v2/capabilities", headers=headers)
+    assert capabilities.status_code == 200, capabilities.text
+    snapshot = client.get(
+        root + "/lifecycle/v2/operations",
+        headers={
+            **headers,
+            "X-Hermes-Marketplace-Principal-Binding": capabilities.json()[
+                "principal_binding"
+            ],
+        },
+    )
     assert snapshot.status_code == 200, snapshot.text
     assert {item["id"] for item in snapshot.json()["items"]} == set(all_ids)
 

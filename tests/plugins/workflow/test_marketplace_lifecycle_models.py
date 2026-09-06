@@ -44,6 +44,57 @@ _EPOCH = "e" * 32
 _REQUEST_ID = f"wmreq_{_EPOCH}_1788523200000_{'f' * 32}"
 
 
+# Break caught: accepting absent, coerced, or noncanonical principal bindings.
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "valid",
+        "missing",
+        "extra",
+        "uppercase",
+        "short",
+        "long",
+        "number",
+        "null",
+        "newline",
+    ],
+)
+def test_capabilities_require_an_exact_opaque_principal_binding(mutation):
+    from plugins.workflow.marketplace.lifecycle_models import LifecycleCapabilities
+
+    payload = dict(
+        schema_version=2,
+        profile="support",
+        registry_epoch=_EPOCH,
+        principal_binding="a" * 64,
+        server_time=_NOW,
+        capabilities=["operations"],
+    )
+    if mutation == "missing":
+        del payload["principal_binding"]
+    elif mutation == "extra":
+        payload["private_actor"] = "must-not-publish"
+    elif mutation != "valid":
+        payload["principal_binding"] = {
+            "uppercase": "A" * 64,
+            "short": "a" * 63,
+            "long": "a" * 65,
+            "number": 123,
+            "null": None,
+            "newline": "a" * 64 + "\n",
+        }[mutation]
+    if mutation == "valid":
+        assert (
+            LifecycleCapabilities.model_validate_json(
+                json.dumps(payload)
+            ).principal_binding
+            == "a" * 64
+        )
+    else:
+        with pytest.raises(ValidationError):
+            LifecycleCapabilities.model_validate_json(json.dumps(payload))
+
+
 @pytest.mark.parametrize("path", ["a", "é" * 1024, "workflows/\ufeff日.yaml"])
 def test_v2_relative_paths_preserve_valid_code_points(path):
     from plugins.workflow.marketplace.lifecycle_models import WorkflowInventoryItem

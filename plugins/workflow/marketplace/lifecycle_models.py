@@ -265,6 +265,7 @@ LifecycleHttpErrorCode = Literal[
     "marketplace_operation_conflict",
     "marketplace_operation_not_found",
     "marketplace_operation_unavailable",
+    "marketplace_principal_changed",
     "marketplace_request_conflict",
     "marketplace_request_expired",
     "marketplace_request_invalid",
@@ -277,6 +278,7 @@ class LifecycleCapabilities(StrictLifecycleModel):
     schema_version: Literal[2]
     profile: str = Field(min_length=1, max_length=256)
     registry_epoch: str = Field(pattern=_EPOCH_PATTERN)
+    principal_binding: str = Field(pattern=SHA256_PATTERN, min_length=64, max_length=64)
     server_time: str = Field(min_length=20, max_length=64)
     capabilities: list[LifecycleCapability] = Field(max_length=8)
 

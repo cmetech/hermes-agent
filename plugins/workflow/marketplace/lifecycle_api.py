@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hmac
 import json
+import re
 from typing import Generic, Literal, TypeVar
 
 from fastapi import APIRouter, HTTPException, Request
@@ -140,10 +141,31 @@ _LIFECYCLE_ERROR_STATUS = {
     "marketplace_operation_conflict": 409,
     "marketplace_internal_error": 500,
     "marketplace_epoch_changed": 409,
+    "marketplace_principal_changed": 409,
     "marketplace_request_conflict": 409,
     "marketplace_request_expired": 409,
     "marketplace_request_invalid": 409,
 }
+
+
+def _require_principal_binding(request, admissions, actor):
+    # Inspect wire occurrences before validating or comparing any value:
+    # convenience lookups can hide duplicate same-value fields.
+    values = [
+        value
+        for name, value in request.scope["headers"]
+        if name.lower() == b"x-hermes-marketplace-principal-binding"
+    ]
+    if (
+        len(values) != 1
+        or re.fullmatch(rb"[0-9a-f]{64}", values[0]) is None
+        or not hmac.compare_digest(
+            values[0].decode("ascii"), admissions.principal_binding(actor)
+        )
+    ):
+        raise HTTPException(
+            status_code=409, detail={"code": "marketplace_principal_changed"}
+        )
 
 
 def _strict_public(model, value):
@@ -325,16 +347,21 @@ def create_lifecycle_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/lifecycle/v2")
 
-    def scope(request, capability):
+    def scope(request, capability, *, require_binding=True):
         authority = _authorize(verified_operator, request, capability)
         key, profile, service, registry = context.current()
-        return profile, service, registry, _actor(authority, key)
+        actor = _actor(authority, key)
+        if require_binding:
+            _call(
+                lambda: _require_principal_binding(request, registry.admissions, actor)
+            )
+        return profile, service, registry, actor
 
     @router.get(
         "/capabilities", response_model=_Capabilities, response_model_by_alias=False
     )
     def capabilities(request: Request):
-        profile, _, registry, _ = scope(request, "read")
+        profile, _, registry, actor = scope(request, "read", require_binding=False)
 
         def run():
             return _strict_public(
@@ -343,6 +370,7 @@ def create_lifecycle_router(
                     schema_version=2,
                     profile=profile,
                     registry_epoch=registry.admissions.epoch,
+                    principal_binding=registry.admissions.principal_binding(actor),
                     server_time=datetime
                     .now(timezone.utc)
                     .isoformat()
