@@ -95,7 +95,7 @@ function harness() {
       return operation
     }
 
-    const name = operation.kind === 'update_check' ? 'service failed update check' : 'service install confirm'
+    const name = operation.kind === 'update_check' ? 'service update check' : 'service install confirm'
     const result = decodeLifecycleOperation({ ...fixture(name), id: operation.id, request_id: operation.request_id })
 
     if (!result) {
@@ -804,6 +804,43 @@ describe('application marketplace operation supervision', () => {
     cap.resolve(corpus.capabilities)
     expect(await old).toBeNull()
     expect(h.supervisor.bindings.isCurrent(fresh!)).toBe(true)
+  })
+
+  it('projects only declared capabilities for the exact current unsuspended binding', async () => {
+    const h = setup()
+    const capabilities = h.api.capabilities
+    h.api.capabilities = async input => ({
+      ...((await capabilities(input)) as object),
+      capabilities: ['operations', 'package_state']
+    })
+    const binding = (await h.bind())!
+    expect(h.supervisor.supports(binding, ['operations', 'package_state'])).toBe(true)
+    expect(h.supervisor.supports(binding, ['operations', 'transactions'])).toBe(false)
+    expect(h.supervisor.supports({ ...binding, connectionGeneration: 2 }, ['operations'])).toBe(false)
+    h.visibility.set(false)
+    expect(h.supervisor.supports(binding, ['operations'])).toBe(false)
+  })
+
+  it('does not publish capabilities from a late old-binding sample and expires stale authority', async () => {
+    const h = setup()
+    const oldBinding = (await h.bind())!
+    const oldSample = h.deferCapabilities()
+    const old = h.bind()
+    await vi.advanceTimersByTimeAsync(0)
+    h.changeGeneration()
+    h.resumeCapabilities()
+    const capabilities = h.api.capabilities
+    h.api.capabilities = async input => ({ ...((await capabilities(input)) as object), capabilities: ['operations'] })
+    const current = (await h.bind())!
+    oldSample.resolve(corpus.capabilities)
+    await old
+    expect(h.supervisor.supports(oldBinding, ['transactions'])).toBe(false)
+    expect(h.supervisor.supports(current, ['transactions'])).toBe(false)
+    expect(h.supervisor.supports(current, ['operations'])).toBe(true)
+    await vi.advanceTimersByTimeAsync(300001)
+    expect(h.supervisor.supports(current, ['operations'])).toBe(false)
+    h.notify('marketplace_connection_generation_exhausted')
+    expect(h.supervisor.supports(current, [])).toBe(false)
   })
 
   // Break caught: the application supervisor bypasses the physical limiter for polling or queued polls survive hiding.

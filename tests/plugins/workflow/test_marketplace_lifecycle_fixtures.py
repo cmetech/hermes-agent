@@ -140,6 +140,35 @@ def test_v1_inspection_preserves_distribution_and_effective_workflow_digests():
     )
 
 
+def test_generated_checks_distinguish_available_direct_failure_and_orphaning():
+    # Break caught: a missing catalog hides the intended fetch-error branch, or
+    # an available update is inferred without a fresh published catalog check.
+    spec = importlib.util.spec_from_file_location(
+        "lifecycle_check_scenarios",
+        ROOT / "scripts/generate_workflow_marketplace_lifecycle_fixtures.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    generated, _ = module.generate_corpora()
+    cases = {case["name"]: case["value"] for case in generated["operationCases"]}
+    failed = cases["service failed update check"]
+    assert failed["result"]["value"]["checks"][0]["status"] == "error"
+    assert failed["subject"]["identity"]["source_key"].startswith("direct-")
+    assert failed["result"]["value"]["checks"][0]["installed_version"] == "1.0.0"
+    states = {case["name"]: case["value"] for case in generated["packageStateCases"]}
+    direct = states["service direct installed"]
+    assert direct["identity"] == failed["subject"]["identity"]
+    assert direct["state"] == "installed" and direct["installed"]["version"] == "1.0.0"
+    available = cases["service available update check"]
+    check = available["result"]["value"]["checks"][0]
+    assert check["status"] == "update_available"
+    assert check["installed_version"] == "1.0.0"
+    assert check["candidate_version"] == "2.0.0"
+    assert check["identity"] == available["subject"]["identity"]
+    orphaned = cases["service orphaned update check"]
+    assert orphaned["result"]["value"]["checks"][0]["status"] == "orphaned"
+
+
 @pytest.mark.parametrize("missing", [True, False], ids=["missing", "changed"])
 def test_generator_check_detects_v1_inspection_drift(
     tmp_path, monkeypatch, capsys, missing

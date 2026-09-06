@@ -1328,14 +1328,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -1347,7 +1347,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -2933,12 +2933,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -2978,6 +2978,57 @@
         "selection": null,
         "started_at": "2026-09-05T12:00:00Z",
         "state": "failed",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
         "subject": {
           "identity": {
             "package_id": "laptop-support",
@@ -13062,7 +13113,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13092,7 +13143,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13125,7 +13176,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13157,14 +13208,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13176,7 +13227,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13208,14 +13259,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13255,14 +13306,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13277,7 +13328,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13309,14 +13360,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13328,7 +13379,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13360,14 +13411,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13379,7 +13430,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13411,14 +13462,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13430,7 +13481,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13463,14 +13514,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13482,7 +13533,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13514,14 +13565,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13533,7 +13584,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13565,14 +13616,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13584,7 +13635,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -13616,14 +13667,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ]
           }
@@ -13635,7 +13686,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -30620,12 +30671,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30663,12 +30714,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30705,12 +30756,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30751,12 +30802,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30794,12 +30845,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30837,12 +30888,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30881,12 +30932,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30924,12 +30975,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -30967,12 +31018,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -31010,12 +31061,12 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -31468,6 +31519,609 @@
         "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000018",
         "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "failed",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check pending",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "queued",
+        "profile": "support",
+        "progress": 0,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": null,
+        "state": "pending",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check running",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "running",
+        "profile": "support",
+        "progress": 50,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check cancelled",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "package_state": null,
+          "type": "cancelled_before_commit"
+        },
+        "phase": "cancelled",
+        "profile": "support",
+        "progress": 0,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "cancelled",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check wrong kind",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "refresh",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check wrong subject",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "type": "all_packages"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check wrong selection",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": {
+          "type": "one",
+          "workflow_name": "B"
+        },
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check wrong epoch",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "dddddddddddddddddddddddddddddddd",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check boolean progress",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": true,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check unknown key",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "unexpected": "extra",
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check wrong phase",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "queued",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check noncanonical UTC",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00+00:00"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check reversed time",
+      "value": {
+        "created_at": "2026-09-06T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check failed committed",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ]
+          }
+        },
         "schema_version": 2,
         "selection": null,
         "started_at": "2026-09-05T12:00:00Z",
@@ -34238,7 +34892,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -34268,7 +34922,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -34298,7 +34952,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -34328,7 +34982,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -34358,7 +35012,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -34388,7 +35042,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -34420,14 +35074,14 @@
             "checks": [
               {
                 "candidate_version": null,
-                "diagnostic_code": null,
+                "diagnostic_code": "source_unavailable",
                 "identity": {
                   "package_id": "laptop-support",
-                  "source_key": "company"
+                  "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
                 },
                 "installed_version": "1.0.0",
-                "message": null,
-                "status": "orphaned"
+                "message": "source_unavailable: Fixture repository unavailable.",
+                "status": "error"
               }
             ],
             "unexpected_nested": true
@@ -34440,7 +35094,7 @@
         "subject": {
           "identity": {
             "package_id": "laptop-support",
-            "source_key": "company"
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
           },
           "type": "package"
         },
@@ -38613,13 +39267,13 @@
           "value": {
             "diagnostic_code": null,
             "message": null,
-            "package_count": 0,
+            "package_count": 1,
             "repository_url": "https://fixtures.example/workflows.git",
-            "resolved_commit": null,
+            "resolved_commit": "4d49504c6fe9565928980327ef2ddc10e93f4ae8",
             "source_name": "company",
             "state": "disabled",
             "unexpected_nested": true,
-            "verified_at": null
+            "verified_at": "2026-09-05T12:00:00Z"
           }
         },
         "schema_version": 2,
@@ -38803,6 +39457,238 @@
         "selection": null,
         "started_at": "2026-09-05T12:00:00Z",
         "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check phase running",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "running",
+        "profile": "support",
+        "progress": 1,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check phase fetching",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "fetching",
+        "profile": "support",
+        "progress": 1,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service available update check phase reviewing",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "reviewing",
+        "profile": "support",
+        "progress": 1,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check phase validating",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "validating",
+        "profile": "support",
+        "progress": 1,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check phase committing",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "committing",
+        "profile": "support",
+        "progress": 1,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check phase recovering",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": null,
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": null,
+        "phase": "recovering",
+        "profile": "support",
+        "progress": 1,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": null,
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "running",
+        "subject": {
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "company"
+          },
+          "type": "package"
+        },
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service available update check extra result key",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_aaaaaaaaaaaa_00000000000000000000000000000019",
+        "kind": "update_check",
+        "outcome": {
+          "evidence": "read_only",
+          "package_state": null,
+          "type": "known_unchanged"
+        },
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "registry_epoch": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "request_id": "wmreq_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_1788609600000_00000000000000000000000000000019",
+        "result": {
+          "type": "update_checks",
+          "value": {
+            "checks": [
+              {
+                "candidate_version": "2.0.0",
+                "diagnostic_code": null,
+                "identity": {
+                  "package_id": "laptop-support",
+                  "source_key": "company"
+                },
+                "installed_version": "1.0.0",
+                "message": null,
+                "status": "update_available"
+              }
+            ],
+            "unexpected_nested": true
+          }
+        },
+        "schema_version": 2,
+        "selection": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
         "subject": {
           "identity": {
             "package_id": "laptop-support",
@@ -77695,6 +78581,61 @@
       }
     },
     {
+      "accepted": true,
+      "name": "service direct installed",
+      "value": {
+        "busy": false,
+        "identity": {
+          "package_id": "laptop-support",
+          "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+        },
+        "installed": {
+          "actor": "alice",
+          "configured_ref": null,
+          "contract_version": 1,
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "installed_at": "2026-09-05T12:00:00Z",
+          "orphaned_source": false,
+          "package_path": "packages/laptop-support",
+          "repository_url": "https://fixtures.example/workflows.git",
+          "resolved_commit": "8952affa7d73aa41ecc01917715ee1ffd727b72b",
+          "source_name": "direct-3d7d4329be2e6875930f83df498d3471",
+          "version": "1.0.0",
+          "workflow_paths": [
+            "workflows/A.yaml",
+            "workflows/B.yaml"
+          ]
+        },
+        "observed_at": "2026-09-05T12:00:00Z",
+        "profile": "support",
+        "recovery": "clear",
+        "state": "installed",
+        "trust": {
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "workflows": [
+            {
+              "definition_path": "workflows/A.yaml",
+              "state": "untrusted",
+              "workflow_name": "A"
+            },
+            {
+              "definition_path": "workflows/B.yaml",
+              "state": "untrusted",
+              "workflow_name": "B"
+            }
+          ]
+        }
+      }
+    },
+    {
       "accepted": false,
       "name": "service absent boolean busy",
       "value": {
@@ -78175,6 +79116,171 @@
         "recovery": "required",
         "state": "unconfirmed",
         "trust": null
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service direct installed boolean busy",
+      "value": {
+        "busy": 1,
+        "identity": {
+          "package_id": "laptop-support",
+          "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+        },
+        "installed": {
+          "actor": "alice",
+          "configured_ref": null,
+          "contract_version": 1,
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "installed_at": "2026-09-05T12:00:00Z",
+          "orphaned_source": false,
+          "package_path": "packages/laptop-support",
+          "repository_url": "https://fixtures.example/workflows.git",
+          "resolved_commit": "8952affa7d73aa41ecc01917715ee1ffd727b72b",
+          "source_name": "direct-3d7d4329be2e6875930f83df498d3471",
+          "version": "1.0.0",
+          "workflow_paths": [
+            "workflows/A.yaml",
+            "workflows/B.yaml"
+          ]
+        },
+        "observed_at": "2026-09-05T12:00:00Z",
+        "profile": "support",
+        "recovery": "clear",
+        "state": "installed",
+        "trust": {
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "workflows": [
+            {
+              "definition_path": "workflows/A.yaml",
+              "state": "untrusted",
+              "workflow_name": "A"
+            },
+            {
+              "definition_path": "workflows/B.yaml",
+              "state": "untrusted",
+              "workflow_name": "B"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "accepted": true,
+      "name": "service direct installed wrong state",
+      "value": {
+        "busy": false,
+        "identity": {
+          "package_id": "laptop-support",
+          "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+        },
+        "installed": {
+          "actor": "alice",
+          "configured_ref": null,
+          "contract_version": 1,
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "installed_at": "2026-09-05T12:00:00Z",
+          "orphaned_source": false,
+          "package_path": "packages/laptop-support",
+          "repository_url": "https://fixtures.example/workflows.git",
+          "resolved_commit": "8952affa7d73aa41ecc01917715ee1ffd727b72b",
+          "source_name": "direct-3d7d4329be2e6875930f83df498d3471",
+          "version": "1.0.0",
+          "workflow_paths": [
+            "workflows/A.yaml",
+            "workflows/B.yaml"
+          ]
+        },
+        "observed_at": "2026-09-05T12:00:00Z",
+        "profile": "support",
+        "recovery": "clear",
+        "state": "installed",
+        "trust": {
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "workflows": [
+            {
+              "definition_path": "workflows/A.yaml",
+              "state": "untrusted",
+              "workflow_name": "A"
+            },
+            {
+              "definition_path": "workflows/B.yaml",
+              "state": "untrusted",
+              "workflow_name": "B"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "accepted": false,
+      "name": "service direct installed wrong recovery",
+      "value": {
+        "busy": false,
+        "identity": {
+          "package_id": "laptop-support",
+          "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+        },
+        "installed": {
+          "actor": "alice",
+          "configured_ref": null,
+          "contract_version": 1,
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "installed_at": "2026-09-05T12:00:00Z",
+          "orphaned_source": false,
+          "package_path": "packages/laptop-support",
+          "repository_url": "https://fixtures.example/workflows.git",
+          "resolved_commit": "8952affa7d73aa41ecc01917715ee1ffd727b72b",
+          "source_name": "direct-3d7d4329be2e6875930f83df498d3471",
+          "version": "1.0.0",
+          "workflow_paths": [
+            "workflows/A.yaml",
+            "workflows/B.yaml"
+          ]
+        },
+        "observed_at": "2026-09-05T12:00:00Z",
+        "profile": "support",
+        "recovery": "required",
+        "state": "installed",
+        "trust": {
+          "distribution_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+          "identity": {
+            "package_id": "laptop-support",
+            "source_key": "direct-3d7d4329be2e6875930f83df498d3471"
+          },
+          "workflows": [
+            {
+              "definition_path": "workflows/A.yaml",
+              "state": "untrusted",
+              "workflow_name": "A"
+            },
+            {
+              "definition_path": "workflows/B.yaml",
+              "state": "untrusted",
+              "workflow_name": "B"
+            }
+          ]
+        }
       }
     }
   ],

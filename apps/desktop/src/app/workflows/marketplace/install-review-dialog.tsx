@@ -14,6 +14,7 @@ import { ExternalLink } from '@/lib/external-link'
 import type { WorkflowMarketplaceInstallReview, WorkflowMarketplaceUpdateReview } from '@/types/hermes'
 
 import { marketplaceWebRepositoryHref } from './package-detail'
+import { type PackageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
 import {
   ReviewDiagnostics,
   ReviewFacts,
@@ -27,6 +28,13 @@ type InstallReviewPresentation = Omit<WorkflowMarketplaceInstallReview, 'confirm
 type UpdateReviewPresentation = Omit<WorkflowMarketplaceUpdateReview, 'confirmation_token'>
 
 export type InstallReviewDialogView =
+  | {
+      kind: 'terminal'
+      mode: InstallMode
+      presentation: PackageLifecyclePresentation
+      canPrepareAgain: boolean
+      canRetry: boolean
+    }
   | { kind: 'progress'; mode: InstallMode; phase: string; progress: number; cancellable: boolean }
   | { kind: 'review'; mode: 'install'; review: InstallReviewPresentation }
   | { kind: 'review'; mode: 'update'; review: UpdateReviewPresentation }
@@ -40,8 +48,10 @@ export type InstallReviewDialogView =
     }
 
 export interface InstallReviewDialogProps {
+  confirmDisabled?: boolean
   onCancelOperation: () => void
   onClose: () => void
+  onRestoreFocus?: () => void
   onConfirm: () => Promise<void>
   onPrepareAgain: () => void
   onRetryStatus?: () => void
@@ -205,8 +215,10 @@ function ReviewContent({ view }: { view: Extract<InstallReviewDialogView, { kind
 }
 
 export function InstallReviewDialog({
+  confirmDisabled = false,
   onCancelOperation,
   onClose,
+  onRestoreFocus,
   onConfirm,
   onPrepareAgain,
   onRetryStatus,
@@ -234,7 +246,7 @@ export function InstallReviewDialog({
   const mode = view.mode
   const review = view.kind === 'review' ? view.review : null
   const blocked = review?.assessment.blockers.length ? true : false
-  const canConfirm = review !== null && !blocked
+  const canConfirm = review !== null && !blocked && !confirmDisabled
 
   const title =
     view.kind === 'review'
@@ -276,6 +288,12 @@ export function InstallReviewDialog({
     <Dialog onOpenChange={value => !value && close()} open={open}>
       <DialogContent
         className="w-[min(92vw,54rem)] max-w-4xl"
+        onCloseAutoFocus={event => {
+          if (onRestoreFocus) {
+            event.preventDefault()
+            onRestoreFocus()
+          }
+        }}
         onEscapeKeyDown={event => admissionBusy && event.preventDefault()}
         onOpenAutoFocus={event => {
           event.preventDefault()
@@ -306,28 +324,18 @@ export function InstallReviewDialog({
           </p>
         ) : view.kind === 'unchanged' ? (
           <p role="status">{copy.workflowMarketplacePackageCurrent(view.version)}</p>
+        ) : view.kind === 'terminal' ? (
+          <p
+            aria-live="polite"
+            role={
+              view.presentation.kind === 'unconfirmed' || view.presentation.kind === 'check_error' ? 'alert' : 'status'
+            }
+          >
+            {view.presentation.message}
+          </p>
         ) : (
           <div role="alert">
-            <p>
-              {view.kind === 'stale'
-                ? copy.workflowMarketplaceReviewStale
-                : view.kind === 'evicted'
-                  ? copy.workflowMarketplaceOperationStatusLost
-                  : view.kind === 'status'
-                    ? copy.workflowMarketplaceOperationStatusUnavailable
-                    : view.mode === 'install'
-                      ? view.kind === 'cancelled'
-                        ? copy.workflowMarketplaceInstallCancelled
-                        : copy.workflowMarketplaceInstallFailed
-                      : view.kind === 'cancelled'
-                        ? copy.workflowMarketplaceUpdateCancelled
-                        : copy.workflowMarketplaceUpdateFailed}
-            </p>
-            {view.mode === 'install' ? (
-              <p>{copy.workflowMarketplaceNothingInstalled}</p>
-            ) : view.previousVersion ? (
-              <p>{copy.workflowMarketplaceVersionRemainsInstalled(view.previousVersion)}</p>
-            ) : null}
+            <p>{unconfirmedPackagePresentation.message}</p>
           </div>
         )}
 
@@ -346,7 +354,7 @@ export function InstallReviewDialog({
             </Button>
           ) : null}
           {view.kind === 'succeeded' && view.trustRequired ? (
-            <Button onClick={onReviewTrust} type="button">
+            <Button disabled type="button">
               {copy.workflowMarketplaceReviewTrustAction}
             </Button>
           ) : null}
@@ -354,7 +362,11 @@ export function InstallReviewDialog({
             <Button onClick={onRetryStatus} type="button">
               {copy.workflowMarketplaceRetryStatus}
             </Button>
-          ) : 'recoverable' in view && view.recoverable ? (
+          ) : view.kind === 'terminal' && view.canRetry && onRetryStatus ? (
+            <Button onClick={onRetryStatus} type="button">
+              {copy.workflowMarketplaceRetryStatus}
+            </Button>
+          ) : view.kind === 'terminal' && view.canPrepareAgain ? (
             <Button onClick={onPrepareAgain} type="button">
               {copy.workflowMarketplacePrepareAgain}
             </Button>

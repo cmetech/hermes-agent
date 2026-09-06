@@ -26,6 +26,7 @@ import {
   createLifecycleHarness,
   legacyInspectionFixture,
   lifecycleIdentity,
+  lifecycleStateFixture,
   renderLifecycleHarness
 } from './lifecycle-test-harness'
 import { MarketplacePackageDetail } from './package-detail'
@@ -1640,6 +1641,57 @@ describe('browse presentation components', () => {
 // Task 14C2 transitional gate makes these V1 mutation paths unreachable. Preserve their scenarios for the
 // supervisor-backed adapter migration in 14D/E; the read-only structural-blocker assertion remains active.
 describe('workflow package lifecycle', () => {
+  const lifecycleCleanups: Array<() => void> = []
+  afterEach(() => {
+    lifecycleCleanups.splice(0).forEach(dispose => dispose())
+    vi.unstubAllGlobals()
+  })
+
+  async function setupLifecycle(installed = false) {
+    const h = createLifecycleHarness()
+    lifecycleCleanups.push(h.dispose)
+
+    if (installed) {
+      h.state('service installed untrusted')
+    }
+
+    h.route('install_prepare', 'service install prepare')
+    h.route('install_confirm', 'service install confirm')
+    h.route('update_check', 'service available update check')
+    h.route('update_prepare', 'service update prepare')
+    h.route('update_confirm', 'service update confirm')
+    h.route('remove_prepare', 'service remove prepare')
+    h.route('remove_confirm', 'service remove confirm')
+    api.inspect.mockResolvedValue(legacyInspectionFixture('service inspect'))
+
+    const tokens = vi.fn(async (input: { path: string }) => {
+      const prepared = [...h.receipts.values()].find(value => input.path.endsWith('/' + value.id + '/review-token'))
+      const review = prepared?.result?.value
+
+      if (!prepared || !review || !('review_digest' in review) || !('expires_at' in review)) {
+        throw new Error('Unexpected token request')
+      }
+
+      return {
+        ok: true,
+        value: {
+          operation_id: prepared.id,
+          request_id: prepared.request_id,
+          subject: prepared.subject,
+          selection: prepared.selection,
+          review_digest: review.review_digest,
+          expires_at: review.expires_at,
+          confirmation_token: INSTALL_TOKEN
+        }
+      }
+    })
+
+    vi.stubGlobal('hermesDesktop', { apiStructured: tokens })
+    await h.bind()
+
+    return Object.assign(h, { tokens })
+  }
+
   async function selectPackage() {
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
     await screen.findByRole('region', { name: 'Laptop Support package details' })
@@ -1703,202 +1755,142 @@ describe('workflow package lifecycle', () => {
     expect(api.grantTrust).not.toHaveBeenCalled()
   })
 
-  it.skip('shows prepare progress, cooperatively cancels, and stops old-scope polling without cross-publishing', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
-
-    const pending = pendingLifecycle('install_prepare')
-    api.inspect.mockResolvedValue(succeededDetail(candidate))
-    api.prepareInstall.mockResolvedValueOnce(pending)
-    api.cancelOperation.mockResolvedValueOnce({
-      ...pending,
-      error: null,
-      finished_at: NOW,
-      phase: 'cancelled',
-      progress: 10,
-      started_at: NOW,
-      state: 'cancelled'
-    })
-    const rendered = renderMarketplace()
-
+  it('shows prepare progress, cooperatively cancels, and stops old-scope polling without cross-publishing', async () => {
+    const h = await setupLifecycle()
+    h.route('install_prepare', 'service install prepare pending')
+    const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
-    vi.useFakeTimers()
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
-      await Promise.resolve()
-    })
-    expect(screen.getByText('queued 0%')).toBeTruthy()
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel operation' }))
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel operation' }))
-      await Promise.resolve()
-    })
-    expect(api.cancelOperation).toHaveBeenCalledTimes(1)
-    expect(api.cancelOperation).toHaveBeenCalledWith(OPERATION_ID, scopeA)
-    expect(screen.getByText('Installation was cancelled. Nothing new was installed.')).toBeTruthy()
-
-    api.prepareInstall.mockResolvedValueOnce(pending)
+    fireEvent.click(await screen.findByRole('button', { name: 'Install package' }))
+    await screen.findByText('queued 0%')
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel operation' }))
+    await screen.findByText('Cancelled before changes were committed.')
+    expect(h.calls.filter(call => call.type === 'cancel').map(call => call.id)).toEqual([
+      h.supervisor.$records.get()[0].operationId
+    ])
+    expect(screen.queryByText(/Nothing new was installed/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
-    await act(async () => {
-      rendered.rerender(
-        <I18nProvider configClient={null} initialLocale="en">
-          <QueryClientProvider client={rendered.client}>
-            <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
-          </QueryClientProvider>
-        </I18nProvider>
-      )
-      await vi.advanceTimersByTimeAsync(500)
-    })
-    expect(screen.queryByRole('dialog', { name: 'Review installation' })).toBeNull()
+    await screen.findByText('queued 0%')
+    view.rerender(
+      <h.Providers>
+        <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
+      </h.Providers>
+    )
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(api.prepareInstall).not.toHaveBeenCalled()
   })
 
-  it.skip('uses backend update truth for unchanged and preserves the exact previous version on failure', async () => {
-    const current = packageDetail({ update_status: 'current' })
-    api.inspect.mockResolvedValueOnce(succeededDetail(current))
-    api.checkUpdates.mockResolvedValueOnce(
-      lifecycleOperation('update_check', {
-        type: 'update_checks',
-        value: {
-          checks: [
-            {
-              candidate_version: null,
-              diagnostic_code: null,
-              identity: current.identity,
-              installed_version: '1.1.0',
-              message: null,
-              status: 'current'
-            }
-          ]
-        }
-      })
-    )
-    const rendered = renderMarketplace()
+  it('uses backend update truth for unchanged and preserves the exact previous version on failure', async () => {
+    const h = await setupLifecycle(true)
+    h.route('update_check', 'service update check')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
-    expect(await screen.findByText('Version 1.1.0 is current. No update was installed.')).toBeTruthy()
-    expect(api.prepareUpdate).not.toHaveBeenCalled()
-
-    fireEvent.click(screen.getAllByRole('button', { name: 'Close' }).at(-1)!)
-    api.inspect.mockResolvedValueOnce(succeededDetail(packageDetail()))
-    rendered.client.removeQueries({
-      queryKey: marketplaceKeys.detail('remote-a::support', 'company', 'laptop-support')
-    })
-    rendered.rerender(
-      <I18nProvider configClient={null} initialLocale="en">
-        <QueryClientProvider client={rendered.client}>
-          <WorkflowMarketplaceView scope={scopeA} />
-        </QueryClientProvider>
-      </I18nProvider>
-    )
-    await selectPackage()
-    api.prepareUpdate.mockResolvedValueOnce(
-      lifecycleOperation('update_prepare', { type: 'update_review', value: updateReview() })
-    )
-    api.confirmUpdate.mockResolvedValueOnce(failedLifecycle('update_confirm'))
+    await screen.findByText('Version 1.0.0 is current. No update was installed.')
+    expect(h.calls.filter(call => call.input?.kind === 'update_prepare')).toHaveLength(0)
+    fireEvent.click(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' }).at(-1)!)
+    h.route('update_check', 'service available update check')
+    h.route('update_confirm', 'service verified rollback')
     fireEvent.click(screen.getByRole('button', { name: 'Update package' }))
     await screen.findByRole('dialog', { name: 'Review update' })
+    expect(within(screen.getByRole('dialog')).getByText('1.0.0')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
-    expect(await screen.findByText('Version 1.1.0 remains installed.')).toBeTruthy()
-    expect(screen.queryByText(/rolled back/i)).toBeNull()
+    await screen.findByText('Changes were rolled back. Currently installed: 2.0.0.')
+    expect(screen.queryByText(/Version 1.1.0 remains installed/)).toBeNull()
   })
 
-  it.skip('uses an exact update check before preparing and leaves changed installed bytes untrusted', async () => {
-    const current = packageDetail({ update_status: 'current' })
-    api.inspect.mockResolvedValueOnce(succeededDetail(current))
-    api.checkUpdates.mockResolvedValueOnce(
-      lifecycleOperation('update_check', {
-        type: 'update_checks',
-        value: {
-          checks: [
-            {
-              candidate_version: '1.1.0',
-              diagnostic_code: null,
-              identity: current.identity,
-              installed_version: current.installed!.version,
-              message: null,
-              status: 'update_available'
-            }
-          ]
-        }
-      })
-    )
-    api.prepareUpdate.mockResolvedValueOnce(
-      lifecycleOperation('update_prepare', { type: 'update_review', value: updateReview(current) })
-    )
-    api.confirmUpdate.mockResolvedValueOnce(
-      lifecycleOperation('update_confirm', {
-        type: 'updated_package',
-        value: installedPackage({ version: current.version })
-      })
-    )
-    renderMarketplace()
-
+  it('uses an exact update check before preparing and leaves changed installed bytes untrusted', async () => {
+    const h = await setupLifecycle(true)
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
-    expect(await screen.findByRole('dialog', { name: 'Review update' })).toBeTruthy()
-    expect(api.checkUpdates).toHaveBeenCalledWith(
-      { packageId: current.identity.package_id, sourceKey: current.identity.source_key },
-      scopeA
-    )
-    expect(api.prepareUpdate).toHaveBeenCalledWith(
-      { packageId: current.identity.package_id, sourceKey: current.identity.source_key },
-      scopeA
-    )
-
+    await screen.findByRole('dialog', { name: 'Review update' })
+    expect(h.calls.filter(call => call.type === 'start').map(call => call.input?.kind)).toEqual([
+      'update_check',
+      'update_prepare'
+    ])
+    expect(h.calls.filter(call => call.input?.kind === 'update_check')[0].input?.body).toEqual({
+      identity: lifecycleIdentity
+    })
+    expect(h.tokens).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
-    expect(await screen.findByText('Updated to version 1.1.0 — trust required to run')).toBeTruthy()
-    expect(api.confirmUpdate).toHaveBeenCalledWith(UPDATE_TOKEN, scopeA)
+    await screen.findByText(/Updated to version 2.0.0. Installation does not grant trust./)
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+    const confirm = h.calls.find(call => call.input?.kind === 'update_confirm')!.input!
+    const prepared = [...h.receipts.values()].find(value => value.kind === 'update_prepare')!
+    expect(confirm.body).toMatchObject({
+      confirmation_token: INSTALL_TOKEN,
+      prepare_operation_id: prepared.id,
+      subject: prepared.subject,
+      selection: null
+    })
+    expect(JSON.stringify(h.supervisor.$records.get())).not.toContain(INSTALL_TOKEN)
+    expect(
+      JSON.stringify(
+        h.queryClient
+          .getQueryCache()
+          .getAll()
+          .map(query => [query.queryKey, query.state.data])
+      )
+    ).not.toContain(INSTALL_TOKEN)
+    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
+    expect(api.confirmUpdate).not.toHaveBeenCalled()
     expect(api.grantTrust).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Grant trust' })).toBeNull()
   })
 
-  it.skip('offers provenance-backed installed actions, removes only after review, and retains the package on failure', async () => {
-    api.prepareRemove.mockResolvedValueOnce(
-      lifecycleOperation('remove_prepare', { type: 'remove_review', value: removeReview() })
-    )
-    api.confirmRemove.mockResolvedValueOnce(failedLifecycle('remove_confirm'))
-    renderWithProviders(
+  it('offers provenance-backed installed actions, removes only after review, and retains the package on failure', async () => {
+    const h = await setupLifecycle(true)
+    h.route('remove_confirm', 'service remove confirm pending')
+    renderLifecycleHarness(
       <InstalledPackages scope={scopeA}>
         <div>Loose project workflow</div>
-      </InstalledPackages>
+      </InstalledPackages>,
+      h
     )
-
-    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
-    expect(within(packageGroup).getByRole('button', { name: 'Review trust' })).toBeTruthy()
-    expect(within(packageGroup).getByRole('button', { name: 'Check for updates' })).toBeTruthy()
-    expect(within(packageGroup).getByRole('button', { name: 'Remove package' })).toBeTruthy()
+    const article = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    await waitFor(() =>
+      expect(within(article).getByRole('button', { name: 'Remove package' }).hasAttribute('disabled')).toBe(false)
+    )
+    expect(within(article).getByRole('button', { name: 'Review trust' }).hasAttribute('disabled')).toBe(true)
+    fireEvent.click(within(article).getByRole('button', { name: 'Remove package' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Review removal' })
+    expect(within(dialog).getByText('2.0.0')).toBeTruthy()
+    expect(h.tokens).not.toHaveBeenCalled()
+    h.loseResponse()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove package' }))
+    await screen.findByText(/State could not be confirmed/)
     expect(screen.getByText('Loose project workflow')).toBeTruthy()
-
-    fireEvent.click(within(packageGroup).getByRole('button', { name: 'Remove package' }))
-    expect(await screen.findByRole('dialog', { name: 'Review removal' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Remove package' }))
-    expect(await screen.findByText('Version 1.1.0 remains installed.')).toBeTruthy()
-    expect(api.confirmRemove).toHaveBeenCalledWith(REMOVE_TOKEN, scopeA)
+    expect(article.isConnected).toBe(true)
+    expect(screen.queryByText(/remains installed|Package removal completed/)).toBeNull()
+    expect(api.confirmRemove).not.toHaveBeenCalled()
   })
 
-  it.skip('does not announce removal until the exact confirm operation reaches terminal success', async () => {
-    const completion = deferred<WorkflowMarketplaceOperation>()
-    api.prepareRemove.mockResolvedValueOnce(
-      lifecycleOperation('remove_prepare', { type: 'remove_review', value: removeReview() })
-    )
-    api.confirmRemove.mockReturnValueOnce(completion.promise)
-    renderWithProviders(
+  it('does not announce removal until the exact confirm operation reaches terminal success', async () => {
+    const h = await setupLifecycle(true)
+    h.route('remove_confirm', 'service remove confirm pending')
+    renderLifecycleHarness(
       <InstalledPackages scope={scopeA}>
         <div>Loose project workflow</div>
-      </InstalledPackages>
+      </InstalledPackages>,
+      h
     )
-
-    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
-    fireEvent.click(within(packageGroup).getByRole('button', { name: 'Remove package' }))
-    await screen.findByRole('dialog', { name: 'Review removal' })
-    fireEvent.click(screen.getByRole('button', { name: 'Remove package' }))
-    expect(screen.queryByText('Package removed.')).toBeNull()
+    const article = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    await waitFor(() =>
+      expect(within(article).getByRole('button', { name: 'Remove package' }).hasAttribute('disabled')).toBe(false)
+    )
+    fireEvent.click(within(article).getByRole('button', { name: 'Remove package' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Review removal' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove package' }))
+    await screen.findByText('queued 0%')
+    expect(screen.queryByText('Package removal completed.')).toBeNull()
+    const confirm = [...h.receipts.values()].find(value => value.kind === 'remove_confirm')!
+    await act(async () => {
+      h.complete('service remove confirm')
+      await new Promise(resolve => setTimeout(resolve, 550))
+    })
+    await screen.findByText('Package removal completed.')
+    expect(h.calls.some(call => call.type === 'get' && call.id === confirm.id)).toBe(true)
     expect(screen.getByText('Loose project workflow')).toBeTruthy()
-
-    completion.resolve(lifecycleOperation('remove_confirm', { type: 'removed_package', value: installedPackage() }))
-    expect(await screen.findByText('Package removed.')).toBeTruthy()
   })
 
   it.skip('re-prepares trust for exactly one selected workflow and grants only the fresh token', async () => {
@@ -1949,183 +1941,299 @@ describe('workflow package lifecycle', () => {
     expect(globalThis.document.body.textContent).not.toContain(TRUST_TOKEN)
   })
 
-  it.skip('polls admitted preparation, stops on status failure, and retries only the exact operation', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
-
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    api.prepareInstall.mockResolvedValueOnce(pendingLifecycle('install_prepare'))
-    api.getOperation.mockRejectedValueOnce(
-      new WorkflowMarketplaceApiError(
-        'marketplace_network_error',
-        0,
-        'access_token=secret /private/tmp/operation-status'
-      )
-    )
-    await renderMarketplace()
+  it('polls admitted preparation, stops on status failure, and retries only the exact operation', async () => {
+    const h = await setupLifecycle()
+    h.route('install_prepare', 'service install prepare pending')
+    h.failStatus()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
-    vi.useFakeTimers()
-
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByText(/State could not be confirmed/)
+    const gets = h.calls.filter(call => call.type === 'get')
+    expect(gets).toHaveLength(1)
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
-      await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(500)
+      await new Promise(resolve => setTimeout(resolve, 550))
     })
-
-    expect(screen.getByText('Operation status is temporarily unavailable. Retry.')).toBeTruthy()
-    expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
-    expect(api.getOperation).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_500)
-    })
-    expect(api.getOperation).toHaveBeenCalledTimes(1)
-
-    api.getOperation.mockResolvedValueOnce(
-      lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
-    )
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Retry status' }))
-      await Promise.resolve()
-    })
-
-    expect(api.getOperation).toHaveBeenLastCalledWith(OPERATION_ID, scopeA)
-    expect(screen.getByRole('dialog', { name: 'Review installation' })).toBeTruthy()
-    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
+    expect(h.calls.filter(call => call.type === 'get')).toHaveLength(1)
+    h.complete('service install prepare')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry status' }))
+    await screen.findByRole('dialog', { name: 'Review installation' })
+    expect(h.calls.filter(call => call.type === 'get').map(call => call.id)).toEqual([gets[0].id, gets[0].id])
+    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(1)
+    expect(h.tokens).not.toHaveBeenCalled()
   })
 
-  it.skip('stops an evicted operation without looping and admits one fresh replacement review', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
-
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    api.prepareInstall
-      .mockResolvedValueOnce(pendingLifecycle('install_prepare'))
-      .mockResolvedValueOnce(
-        lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
-      )
-    api.getOperation.mockRejectedValueOnce(
-      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'private operation identity')
-    )
-    renderMarketplace()
+  it('stops an evicted operation without looping and admits one fresh replacement review', async () => {
+    const h = await setupLifecycle()
+    h.route('install_prepare', 'service install prepare pending')
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
-    vi.useFakeTimers()
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
-      await Promise.resolve()
-      await vi.advanceTimersByTimeAsync(500)
-    })
-    expect(screen.getByText('Operation status expired. Refresh package truth or prepare again.')).toBeTruthy()
-    expect(api.getOperation).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_500)
-      fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
-      await Promise.resolve()
-    })
-    expect(api.getOperation).toHaveBeenCalledTimes(1)
-    expect(api.prepareInstall).toHaveBeenCalledTimes(2)
-    expect(screen.getByRole('dialog', { name: 'Review installation' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByText(/State could not be confirmed/)
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Prepare again' }).hasAttribute('disabled')).toBe(false)
+    )
+    const reads = h.calls.filter(call => call.type === 'get').length
+    h.route('install_prepare', 'service install prepare')
+    fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
+    await screen.findByRole('dialog', { name: 'Review installation' })
+    expect(h.calls.filter(call => call.type === 'get')).toHaveLength(reads)
+    const requests = h.calls.filter(call => call.type === 'start').map(call => call.input?.requestId)
+    expect(requests).toHaveLength(2)
+    expect(new Set(requests).size).toBe(2)
   })
 
-  it.skip('classifies rejected stale confirmation without installing or exposing backend details', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
+  it('classifies rejected stale confirmation without installing or exposing backend details', async () => {
+    const h = await setupLifecycle()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByRole('dialog', { name: 'Review installation' })
+    h.tokens.mockRejectedValueOnce(new Error('access_token=secret /private/tmp/stale-review'))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm install' }))
+    await screen.findByText('Review is unavailable. Prepare a fresh review.')
+    expect(screen.getByRole('button', { name: 'Prepare again' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.queryByText(/Nothing new was installed|access_token|private\/tmp/)).toBeNull()
+    expect(h.calls.some(call => call.input?.kind === 'install_confirm')).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
+    await screen.findByRole('dialog', { name: 'Review installation' })
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+  })
+
+  it('closes preparation without backend cancellation and returns focus to the originating action', async () => {
+    const h = await setupLifecycle()
+    h.route('install_prepare', 'service install prepare pending')
+    const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    const action = screen.getByRole('button', { name: 'Install package' })
+    fireEvent.click(action)
+    await screen.findByText('queued 0%')
+    fireEvent.click(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' }).at(-1)!)
+    await waitFor(() =>
+      expect(
+        globalThis.document.activeElement === action ||
+          globalThis.document.activeElement === screen.getByRole('searchbox')
+      ).toBe(true)
+    )
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+    view.unmount()
+    h.complete('service install prepare')
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 550))
     })
+    expect(h.supervisor.$records.get()[0].status).toBe('terminal')
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
 
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    api.prepareInstall.mockResolvedValueOnce(
-      lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
-    )
-    api.confirmInstall.mockRejectedValueOnce(
-      new WorkflowMarketplaceApiError(
-        'confirmation_token_invalid',
-        409,
-        'access_token=secret /private/tmp/stale-review'
-      )
-    )
-    renderMarketplace()
+  it('rejects a mismatched review identity and gates lifecycle controls on declared capabilities', async () => {
+    const h = await setupLifecycle()
+    h.mismatch()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByText(/State could not be confirmed/)
+    expect(screen.queryByRole('button', { name: 'Confirm install' })).toBeNull()
+    cleanup()
+    h.dispose()
+    const limited = await setupLifecycle()
+    limited.capabilities(['operations', 'admission_replay', 'package_state'])
+    await limited.bind()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, limited)
+    await selectPackage()
+    expect(screen.getByRole('button', { name: 'Install package' }).hasAttribute('disabled')).toBe(true)
+    expect(limited.calls.filter(call => call.type === 'start')).toHaveLength(0)
+  })
 
+  it('returns focus to the installed-view fallback when terminal removal removes its originating card', async () => {
+    const h = await setupLifecycle(true)
+    let removed = false
+    api.installed.mockImplementation(async () => ({
+      profile: 'support',
+      packages: removed ? [] : [installedPackage()]
+    }))
+    h.onPost(() => {
+      removed = [...h.receipts.values()].some(value => value.kind === 'remove_confirm')
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <p>Loose workflows</p>
+      </InstalledPackages>,
+      h
+    )
+    const article = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    const fallback = screen.getByText('Loose workflows').parentElement
+    const origin = await within(article).findByRole('button', { name: 'Remove package' })
+    origin.focus()
+    fireEvent.click(origin)
+    const dialog = await screen.findByRole('dialog', { name: 'Review removal' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove package' }))
+    await waitFor(() => expect(article.isConnected).toBe(false))
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(fallback))
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+  })
+
+  it('retains the exact returned admission key while its binding is temporarily suspended', async () => {
+    const h = await setupLifecycle()
+    h.route('install_prepare', 'service install prepare pending')
+    h.onPost(() => h.disconnect())
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByText(/State could not be confirmed/)
+    expect(screen.queryByRole('button', { name: 'Confirm install' })).toBeNull()
+    await act(async () => {
+      await h.bind()
+    })
+    await screen.findByText('queued 0%')
+    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(1)
+    expect(h.calls.filter(call => call.type === 'lookup').map(call => call.id)).toContain(
+      h.calls.find(call => call.type === 'start')?.input?.requestId
+    )
+  })
+
+  it('fences confirmation when the package disappears during the explicit token fetch', async () => {
+    const h = await setupLifecycle(true)
+    const binding = await h.bind()
+    const tokenReply = deferred<void>()
+    const respond = h.tokens.getMockImplementation()!
+    h.tokens.mockImplementationOnce(async input => {
+      const response = await respond(input)
+      await tokenReply.promise
+
+      return response
+    })
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Update package' }))
+    await screen.findByRole('dialog', { name: 'Review update' })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
+    await waitFor(() => expect(h.tokens).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      h.state('service absent')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      tokenReply.resolve()
+    })
+    expect(h.calls.some(call => call.input?.kind === 'update_confirm')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Confirm update' }).hasAttribute('disabled')).toBe(true)
+    expect(JSON.stringify(h.supervisor.$records.get())).not.toContain(INSTALL_TOKEN)
+  })
+
+  it.each(['service rollback failed', 'service recovery ambiguous', 'lost response', 'invalid terminal identity'])(
+    '%s cannot claim rollback or a previous installed version',
+    async scenario => {
+      const h = await setupLifecycle(true)
+      h.route('update_confirm', scenario.startsWith('service ') ? scenario : 'service update confirm pending')
+      const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      fireEvent.click(screen.getByRole('button', { name: 'Update package' }))
+      await screen.findByRole('dialog', { name: 'Review update' })
+
+      if (scenario === 'service rollback failed') {
+        h.state('service recovery required')
+      }
+
+      if (scenario === 'service recovery ambiguous') {
+        h.state('service ambiguous state')
+      }
+
+      if (scenario === 'lost response') {
+        h.loseResponse()
+      }
+
+      if (scenario === 'invalid terminal identity') {
+        h.mismatch()
+      }
+
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
+      await screen.findByText(/State could not be confirmed/)
+      expect(screen.queryByText(/remains installed|Nothing new was installed|Changes were rolled back/)).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Prepare again' })).toBeNull()
+      view.unmount()
+      renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      expect(screen.queryByRole('button', { name: 'Update package' })).toBeNull()
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(JSON.stringify(h.supervisor.$records.get())).not.toContain(INSTALL_TOKEN)
+    }
+  )
+
+  it('does not fetch a token or confirm an authoritative no-op update', async () => {
+    const h = await setupLifecycle(true)
+    h.route('update_prepare', 'service unchanged update')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Update package' }))
+    await screen.findByText('Version 1.0.0 is current. No update was installed.')
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Confirm update' })).toBeNull()
+    expect(h.calls.some(call => call.input?.kind === 'update_confirm')).toBe(false)
+  })
+
+  it('discards a token returned after navigation without admitting confirmation', async () => {
+    const h = await setupLifecycle()
+    const tokenReply = deferred<void>()
+    const respond = h.tokens.getMockImplementation()!
+    h.tokens.mockImplementationOnce(async input => {
+      const response = await respond(input)
+      await tokenReply.promise
+
+      return response
+    })
+    const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
     await screen.findByRole('dialog', { name: 'Review installation' })
     fireEvent.click(screen.getByRole('button', { name: 'Confirm install' }))
-
-    expect(
-      await screen.findByText('The review expired or changed. Prepare a fresh review before continuing.')
-    ).toBeTruthy()
-    expect(screen.getByText('Nothing new was installed.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Prepare again' })).toBeTruthy()
-    expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
-    expect(api.grantTrust).not.toHaveBeenCalled()
+    await waitFor(() => expect(h.tokens).toHaveBeenCalledTimes(1))
+    view.unmount()
+    await act(async () => tokenReply.resolve())
+    expect(h.calls.some(call => call.input?.kind === 'install_confirm')).toBe(false)
+    expect(JSON.stringify(h.supervisor.$records.get())).not.toContain(INSTALL_TOKEN)
+    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
   })
 
-  it.skip('closes preparation without backend cancellation and returns focus to the originating action', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
+  it('rejects an expired or mismatched token endpoint response and requires a fresh review', async () => {
+    const h = await setupLifecycle()
+    const respond = h.tokens.getMockImplementation()!
+    h.tokens.mockImplementationOnce(async input => {
+      const response = await respond(input)
+
+      return { ...response, value: { ...response.value, expires_at: '2026-09-05T12:00:00Z' } }
     })
-
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    api.prepareInstall.mockResolvedValueOnce(pendingLifecycle('install_prepare'))
-    renderMarketplace()
-
-    await selectPackage()
-    const action = screen.getByRole('button', { name: 'Install package' })
-    action.focus()
-    fireEvent.click(action)
-    await screen.findByText('queued 0%')
-    const dialog = screen.getByRole('dialog', { name: 'Preparing installation review' })
-    fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' }).at(-1)!)
-
-    await waitFor(() => expect(globalThis.document.activeElement).toBe(action))
-    expect(api.cancelOperation).not.toHaveBeenCalled()
-    expect(screen.queryByRole('dialog')).toBeNull()
-  })
-
-  it.skip('rejects a mismatched review identity and gates lifecycle controls on declared capabilities', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
-
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    api.prepareInstall.mockResolvedValueOnce(
-      lifecycleOperation('install_prepare', {
-        type: 'install_review',
-        value: installReview({ ...candidate, identity: { package_id: 'other-package', source_key: 'company' } })
-      })
-    )
-    const rendered = renderMarketplace()
-
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
-    expect(await screen.findByText('Installation failed. Nothing new was installed.')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Confirm install' })).toBeNull()
+    await screen.findByRole('dialog', { name: 'Review installation' })
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm install' }))
+    await screen.findByText('Review is unavailable. Prepare a fresh review.')
+    expect(h.calls.some(call => call.input?.kind === 'install_confirm')).toBe(false)
+    expect(screen.queryByText(/Nothing new was installed/)).toBeNull()
+  })
 
-    cleanup()
-    api.capabilities.mockResolvedValueOnce({
-      capabilities: ['sources', 'search', 'installed', 'operations'],
-      profile: 'support',
-      schema_version: 1
-    })
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    rendered.client.clear()
-    renderMarketplace()
-    await selectPackage()
-    expect(screen.queryByRole('button', { name: 'Install package' })).toBeNull()
-    expect(screen.getByText('Upgrade Hermes to manage installed workflow packages.')).toBeTruthy()
+  it('renders a real direct-package check error without preparing or claiming the package is current', async () => {
+    const h = await setupLifecycle()
+    h.state('service direct installed')
+    const state = lifecycleStateFixture('service direct installed')
+    api.installed.mockResolvedValue({ profile: 'support', packages: [state.installed] })
+    h.route('update_check', 'service failed update check')
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose workflows</div>
+      </InstalledPackages>,
+      h
+    )
+    const check = await screen.findByRole('button', { name: 'Check for updates' })
+    fireEvent.click(check)
+    await screen.findByText('Could not check for updates.')
+    expect(h.calls.find(call => call.input?.kind === 'update_check')?.input?.body).toEqual({ identity: state.identity })
+    expect(screen.queryByText(/is current|No update was installed|remains installed/)).toBeNull()
+    expect(h.calls.some(call => call.input?.kind === 'update_prepare')).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'update_check')).toHaveLength(2))
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('does not offer installation for a freshly inspected candidate with structural blockers', async () => {
@@ -2162,47 +2270,42 @@ describe('workflow package lifecycle', () => {
     expect(screen.queryByText('Could not inspect workflow package')).toBeNull()
   })
 
-  it.skip('discards a late lifecycle review when package selection changes', async () => {
-    const lateReview = deferred<WorkflowMarketplaceOperation>()
-    const first = packageDetail({ install_status: 'not_installed', installed: null, update_status: 'not_applicable' })
-
-    const second = packageDetail({
-      display_name: 'Printer Support',
-      id: 'printer-support',
-      identifier: 'company/printer-support',
-      identity: { package_id: 'printer-support', source_key: 'company' },
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
-
-    api.search.mockResolvedValueOnce(
+  it('discards a late lifecycle review when package selection changes', async () => {
+    const h = await setupLifecycle()
+    const admission = h.holdAdmission()
+    api.search.mockResolvedValue(
       page([
         packageItem(),
         packageItem({ display_name: 'Printer Support', id: 'printer-support', identifier: 'company/printer-support' })
       ])
     )
+    const first = legacyInspectionFixture('service inspect')
     api.inspect.mockImplementation((_source: string, packageId: string) =>
-      Promise.resolve(succeededDetail(packageId === 'printer-support' ? second : first))
+      Promise.resolve(
+        packageId === 'printer-support'
+          ? succeededDetail(
+              packageDetail({
+                display_name: 'Printer Support',
+                id: 'printer-support',
+                identifier: 'company/printer-support',
+                identity: { package_id: 'printer-support', source_key: 'company' }
+              })
+            )
+          : first
+      )
     )
-    api.prepareInstall.mockReturnValueOnce(lateReview.promise)
-    renderMarketplace()
-
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
     await screen.findByText('queued 0%')
-
-    const replacement = globalThis.document.querySelector<HTMLButtonElement>(
-      '[data-marketplace-package="company/printer-support"]'
-    )!
-
-    fireEvent.click(replacement)
-    expect(await screen.findByRole('region', { name: 'Printer Support package details' })).toBeTruthy()
-
-    lateReview.resolve(lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(first) }))
-    await act(async () => Promise.resolve())
+    expect(screen.queryByRole('button', { name: 'Cancel operation' })).toBeNull()
+    fireEvent.click(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' }).at(-1)!)
+    fireEvent.click(screen.getByRole('option', { name: /Printer Support/ }))
+    await screen.findByRole('region', { name: 'Printer Support package details' })
+    await act(async () => admission.resolve())
     expect(screen.queryByRole('dialog')).toBeNull()
-    expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(h.supervisor.$records.get()[0].status).toBe('terminal')
   })
 })
 
@@ -2443,7 +2546,9 @@ describe('supervised marketplace readiness and transitional adapters', () => {
       )
       fireEvent.click(await screen.findByRole('button', { name: 'Refresh state' }))
       expect(await screen.findByText('Source unavailable')).toBeTruthy()
-      expect(screen.queryByRole('button', { name: 'Remove package' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'Remove package' }).hasAttribute('disabled')).toBe(false)
+      expect(screen.getByRole('button', { name: 'Update package' }).hasAttribute('disabled')).toBe(true)
+      expect(screen.getByRole('button', { name: 'Review trust' }).hasAttribute('disabled')).toBe(true)
       expect(api.inspect).not.toHaveBeenCalled()
     } finally {
       cleanup()

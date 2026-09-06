@@ -96,6 +96,13 @@ export function createLifecycleHarness() {
   let connectionGeneration = 1
   let afterPost: (() => void) | undefined
   let count = 0
+  const routes = new Map<LifecycleOperation['kind'], string>()
+  const calls: Array<{ type: string; input?: LifecycleStart; id?: string }> = []
+  let getFailure: LifecycleApiError | null = null
+  let admission: ReturnType<typeof deferredLifecycle<void>> | null = null
+  let loseResponse = false
+  let declared = corpus.capabilities.capabilities
+  let mismatch = false
   const now = Date.parse(corpus.capabilities.server_time)
 
   const supervisor = createMarketplaceSupervisor({
@@ -116,10 +123,12 @@ export function createLifecycleHarness() {
         ...corpus.capabilities,
         profile: scope.profile,
         principal_binding: principal,
-        registry_epoch: epoch
+        registry_epoch: epoch,
+        capabilities: declared
       }),
       list: async () => ({ ...corpus.operationPageFinal, items: [] }),
       start: async (input: LifecycleStart) => {
+        calls.push({ type: 'start', input })
         const retained = receipts.get(input.requestId)
 
         if (retained) {
@@ -127,7 +136,7 @@ export function createLifecycleHarness() {
         }
 
         const operation = decodeLifecycleOperation({
-          ...lifecycleFixture(terminalName),
+          ...lifecycleFixture(routes.get(input.kind) ?? terminalName),
           ...(invalidTerminalEvidence
             ? {
                 outcome: { type: 'outcome_unknown', reason: 'terminal_invalid' },
@@ -143,12 +152,43 @@ export function createLifecycleHarness() {
         }
 
         receipts.set(input.requestId, operation)
+
+        if (
+          routes.size &&
+          operation.outcome &&
+          'package_state' in operation.outcome &&
+          operation.outcome.package_state
+        ) {
+          packageState = operation.outcome.package_state
+        }
+
         afterPost?.()
 
-        return operation
+        if (admission) {
+          await admission.promise
+        }
+
+        if (loseResponse) {
+          throw new LifecycleApiError('marketplace_network_error', 0)
+        }
+
+        return mismatch
+          ? { ...operation, subject: { type: 'package', identity: { source_key: 'company', package_id: 'other' } } }
+          : operation
       },
-      get: async id => [...receipts.values()].find(item => item.id === id),
+      get: async id => {
+        calls.push({ type: 'get', id })
+
+        if (getFailure) {
+          const failure = getFailure
+          getFailure = null
+          throw failure
+        }
+
+        return [...receipts.values()].find(item => item.id === id)
+      },
       lookup: async id => {
+        calls.push({ type: 'lookup', id })
         const operation = receipts.get(id)
 
         return evicted && operation
@@ -164,7 +204,31 @@ export function createLifecycleHarness() {
             }
           : { state: 'found', operation }
       },
-      cancel: async id => [...receipts.values()].find(item => item.id === id),
+      cancel: async id => {
+        calls.push({ type: 'cancel', id })
+        const earlier = [...receipts.values()].find(item => item.id === id)
+
+        if (!earlier) {
+          return null
+        }
+
+        const originalName = routes.get(earlier.kind)
+        const name = originalName?.replace(/ pending$/, '')
+
+        const operation = decodeLifecycleOperation({
+          ...lifecycleFixture(`${name} cancelled`),
+          id,
+          request_id: earlier.request_id
+        })
+
+        if (!operation) {
+          throw new Error('Invalid cancellation fixture')
+        }
+
+        receipts.set(earlier.request_id, operation)
+
+        return operation
+      },
       packageState: async (_identity, binding) => {
         if (stateFailure) {
           throw new LifecycleApiError('marketplace_network_error', 0)
@@ -252,6 +316,22 @@ export function createLifecycleHarness() {
     bind,
     mutate,
     Providers,
+    calls,
+    receipts,
+    route: (kind: LifecycleOperation['kind'], name: string) => routes.set(kind, name),
+    capabilities: (values: string[]) => {
+      declared = values
+    },
+    mismatch: () => {
+      mismatch = true
+    },
+    failStatus: (code: LifecycleApiError['code'] = 'marketplace_network_error', status = 0) => {
+      getFailure = new LifecycleApiError(code, status)
+    },
+    holdAdmission: () => (admission = deferredLifecycle<void>()),
+    loseResponse: () => {
+      loseResponse = true
+    },
     failOriginRefetches: () => {
       stateFailure = true
     },
@@ -277,6 +357,10 @@ export function createLifecycleHarness() {
     },
     complete: (name: string) => {
       for (const [id, earlier] of receipts) {
+        if (earlier.kind !== lifecycleFixture(name).kind) {
+          continue
+        }
+
         const value = decodeLifecycleOperation({ ...lifecycleFixture(name), id: earlier.id, request_id: id })
 
         if (!value) {
@@ -284,6 +368,10 @@ export function createLifecycleHarness() {
         }
 
         receipts.set(id, value)
+
+        if (routes.size && value.outcome && 'package_state' in value.outcome && value.outcome.package_state) {
+          packageState = value.outcome.package_state
+        }
       }
     },
     evict: () => {

@@ -14,6 +14,7 @@ import {
 import { createMarketplaceBindingCoordinator } from '@/lib/workflow-marketplace-connection-binding'
 import {
   decodeLifecycleAdmission,
+  decodeLifecycleCapabilities,
   decodeLifecycleEvicted,
   decodeLifecycleOperationPage,
   decodeLifecyclePackageState,
@@ -36,6 +37,7 @@ import {
   type _IdentityBody,
   type _InstallBody,
   type _TrustBody,
+  type LifecycleCapabilities,
   type LifecycleOperation,
   lifecycleRules,
   type PackageIdentity,
@@ -165,6 +167,16 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
   const entries = new Set<Entry>()
   const scheduler = createSupervisionScheduler()
   const observations = new Map<string, LifecycleClockObservation>()
+
+  const supported = new Map<
+    string,
+    {
+      binding: LifecycleConnectionBinding
+      capabilities: LifecycleCapabilities['capabilities']
+      received: LifecycleClockSample
+    }
+  >()
+
   const samples = new Map<string, { capabilities: unknown; received: LifecycleClockSample }>()
   const scans = new Map<string, Promise<LifecycleConnectionBinding | null>>()
   const scanControllers = new Map<string, AbortController>()
@@ -237,17 +249,20 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       if (scope === null || key === scopeKey(scope)) {
         discardLifecycleClockObservation(observation)
         observations.delete(key)
+        supported.delete(key)
       }
     }
 
     if (scope === null) {
       scans.clear()
       samples.clear()
+      supported.clear()
       scanned.clear()
       knownScopes.clear()
     } else {
       scans.delete(scopeKey(scope))
       samples.delete(scopeKey(scope))
+      supported.delete(scopeKey(scope))
       scanned.delete(scopeKey(scope))
     }
   }
@@ -319,6 +334,12 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     },
     changed: scope => {
       reconciliation.changed()
+
+      for (const [key, sample] of supported) {
+        if (!bindings.isCurrent(sample.binding)) {
+          supported.delete(key)
+        }
+      }
 
       if (scope === null) {
         if (status.get() === 'restart_required' || disposed) {
@@ -735,6 +756,13 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       }
 
       observations.set(key, observeLifecycleClock(sample.capabilities, binding, sample.received))
+      const capabilities = decodeLifecycleCapabilities(sample.capabilities)
+
+      if (!capabilities) {
+        throw invalid()
+      }
+
+      supported.set(key, { binding, capabilities: capabilities.capabilities, received: sample.received })
       reconciliation.bind(binding)
       samples.delete(key)
 
@@ -1095,6 +1123,34 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     reconcileScope,
     reconcilePackage,
     getPackageGate,
+    supports(
+      binding: LifecycleConnectionBinding,
+      requiredCapabilities: readonly LifecycleCapabilities['capabilities'][number][]
+    ) {
+      const sample = supported.get(scopeKey(binding))
+
+      if (
+        !sample ||
+        !usable(binding) ||
+        !scanned.has(scopeKey(binding)) ||
+        !sameLifecycleValue(sample.binding, binding)
+      ) {
+        return false
+      }
+
+      const now = clock()
+      const wallElapsed = now.wallNowMs - sample.received.wallNowMs
+      const elapsed = now.monotonicNowMs - sample.received.monotonicNowMs
+
+      if (
+        ![elapsed, wallElapsed].every(value => Number.isFinite(value) && value >= 0 && value <= 300000) ||
+        Math.abs(elapsed - wallElapsed) > 1000
+      ) {
+        return false
+      }
+
+      return requiredCapabilities.every(capability => sample.capabilities.includes(capability))
+    },
     canUseCatalog(binding: LifecycleConnectionBinding, projection: QueryKey) {
       return (
         usable(binding) &&

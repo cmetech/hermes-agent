@@ -17,6 +17,7 @@ import { ExternalLink } from '@/lib/external-link'
 import { marketplaceWebRepositoryHref } from './package-detail'
 import { marketplaceKeys } from './query-keys'
 import { useMarketplaceReadOnlyScope } from './supervisor-provider'
+import { SupervisedPackageActions } from './use-package-lifecycle'
 
 export interface InstalledPackagesProps {
   children: ReactNode
@@ -205,9 +206,19 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                       </li>
                     ))}
                   </ul>
-                  <p className="mt-2 text-xs text-(--ui-text-tertiary)" role="status">
-                    {copy.workflowMarketplaceLifecycleUnavailable}
-                  </p>
+                  {truth.binding ? (
+                    <SupervisedPackageActions
+                      binding={truth.binding}
+                      focusFallbackRef={focusFallbackRef}
+                      identity={cached.identity}
+                      key={JSON.stringify([truth.binding, cached.identity])}
+                      sourceName={item.source_name}
+                    />
+                  ) : (
+                    <p className="mt-2 text-xs text-(--ui-text-tertiary)" role="status">
+                      {copy.workflowMarketplaceLifecycleUnavailable}
+                    </p>
+                  )}
                   {truth.binding ? (
                     <Button
                       onClick={() => {

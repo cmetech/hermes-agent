@@ -83,9 +83,10 @@ describe('RemoveReviewDialog', () => {
     expect((screen.getByRole('button', { name: 'Close' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it.each(['failed', 'cancelled', 'stale'] as const)('keeps the package after a %s removal', kind => {
+  it.each(['failed', 'cancelled', 'stale'] as const)('does not infer installed state from a %s removal label', kind => {
     renderDialog({ kind, currentVersion: '1.0.0' })
-    expect(screen.getByText('Version 1.0.0 remains installed.')).toBeTruthy()
+    expect(screen.getByText(/State could not be confirmed/)).toBeTruthy()
+    expect(screen.queryByText(/remains installed/)).toBeNull()
     expect(screen.queryByText(/removed successfully/i)).toBeNull()
   })
 })

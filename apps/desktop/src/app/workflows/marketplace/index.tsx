@@ -31,6 +31,7 @@ import { marketplaceKeys } from './query-keys'
 import { ManageWorkflowSourcesDialog } from './source-dialog'
 import { useMarketplaceReadOnlyScope } from './supervisor-provider'
 import { type MarketplaceOperationOrigin, useMarketplaceOperation } from './use-marketplace-operation'
+import { SupervisedPackageActions } from './use-package-lifecycle'
 
 const PAGE_LIMIT = 50
 const NARROW_MARKETPLACE_QUERY = '(max-width: 39.999rem)'
@@ -118,6 +119,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const [selectionState, setSelectionState] = useState<null | ScopedSelection>(null)
   const [detailRetryState, setDetailRetryState] = useState<DetailRetryAttempt | null>(null)
   const [sourcesDialogOpen, setSourcesDialogOpen] = useState(false)
+  const [actionContainer, setActionContainer] = useState<HTMLDivElement | null>(null)
   const [refreshingSourcesScope, setRefreshingSourcesScope] = useState<null | string>(null)
   const [refreshAttempt, setRefreshAttempt] = useState<null | ScopedRefreshAttempt>(null)
 
@@ -545,9 +547,10 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
                   : marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
               )?.state !== 'ready'
             )}
-            lifecycleUnavailable
+            lifecycleUnavailable={!truth.binding}
             packageState={truth.packageGate(detail.identity)?.packageState}
           />
+          <div ref={setActionContainer} />
           {truth.binding ? (
             <div className="mt-2 flex gap-2">
               <Button
@@ -580,11 +583,34 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     </div>
   )
 
+  const lifecycle =
+    truth.supervisor && detail && selection ? (
+      <SupervisedPackageActions
+        actionContainer={actionContainer}
+        binding={truth.binding}
+        detail={detail}
+        focusFallbackRef={searchRef}
+        identity={detail.identity}
+        key={JSON.stringify([scopeKey, detail.identity])}
+        projection={
+          needsDetailPolling
+            ? marketplaceKeys.operation(scopeKey, operationId ?? 'none')
+            : marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
+        }
+        sourceName={detail.source_name}
+      />
+    ) : null
+
   if (truth.quarantined) {
-    return <p role="status">Refreshing package state</p>
+    return (
+      <>
+        <p role="status">Refreshing package state</p>
+        {lifecycle}
+      </>
+    )
   }
 
-  return (
+  const content = (
     <section
       className="flex h-full min-h-0 flex-col"
       onKeyDown={event => {
@@ -608,7 +634,12 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
           />
           <Select
             onValueChange={value =>
-              setFilterState({ offset: 0, query: filters.query, scopeKey, source: value === '__all__' ? null : value })
+              setFilterState({
+                offset: 0,
+                query: filters.query,
+                scopeKey,
+                source: value === '__all__' ? null : value
+              })
             }
             value={filters.source ?? '__all__'}
           >
@@ -771,6 +802,13 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         </div>
       )}
     </section>
+  )
+
+  return (
+    <>
+      {content}
+      {lifecycle}
+    </>
   )
 }
 

@@ -228,7 +228,7 @@ describe('InstallReviewDialog', () => {
     await act(async () => admission.resolve())
   })
 
-  it('renders the full update comparison and states that the exact previous version remains after failure', () => {
+  it('renders the full update comparison without treating a generic failure as rollback evidence', () => {
     const rendered = renderDialog({ kind: 'review', mode: 'update', review: updateReview() })
     const dialog = screen.getByRole('dialog', { name: 'Review update' })
 
@@ -250,18 +250,20 @@ describe('InstallReviewDialog', () => {
       </I18nProvider>
     )
 
-    expect(screen.getByText('Version 1.0.0 remains installed.')).toBeTruthy()
+    expect(screen.getByText(/State could not be confirmed/)).toBeTruthy()
+    expect(screen.queryByText(/remains installed|Nothing new was installed/)).toBeNull()
     expect(screen.queryByText(/rolled back/i)).toBeNull()
-    expect(screen.getByRole('button', { name: 'Prepare again' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Prepare again' })).toBeNull()
   })
 
-  it('finishes install and changed update as untrusted with a separate trust action', () => {
+  it('finishes install and changed update as untrusted with trust non-actionable until 14E', () => {
     const onReviewTrust = vi.fn()
     renderDialog({ kind: 'succeeded', mode: 'install', version: '2.0.0', trustRequired: true }, { onReviewTrust })
 
     expect(screen.getByText('Installed — trust required to run')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Review trust' }))
-    expect(onReviewTrust).toHaveBeenCalledOnce()
+    expect(onReviewTrust).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Review trust' }).hasAttribute('disabled')).toBe(true)
   })
 
   it('provides responsive safe focus and Escape except during confirm admission', async () => {

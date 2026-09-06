@@ -326,7 +326,7 @@ describe('exact scoped V2 lifecycle helpers', () => {
       refresh: {},
       inspect: {},
       update_check: {
-        identity: value.subject.type === 'all_packages' ? null : { source_key: 'company', package_id: 'laptop-support' }
+        identity: value.subject.type === 'package' ? value.subject.identity : null
       },
       install_prepare:
         value.subject.type === 'direct_install'
@@ -341,6 +341,16 @@ describe('exact scoped V2 lifecycle helpers', () => {
       trust_revoke: {
         identity: { source_key: 'company', package_id: 'laptop-support' },
         workflow_name: value.selection?.type === 'one' ? value.selection.workflow_name : null
+      }
+    }
+
+    if (value.kind === 'update_check' && value.subject.type === 'package') {
+      expect(value.result?.type).toBe('update_checks')
+      expect(value.result?.value.checks?.[0]?.identity).toEqual(value.subject.identity)
+
+      if (testCase.name === 'service failed update check') {
+        expect(value.subject.identity?.source_key).toMatch(/^direct-[a-f0-9]{32}$/)
+        expect(value.result?.value.checks?.[0]?.status).toBe('error')
       }
     }
 

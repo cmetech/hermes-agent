@@ -12,17 +12,21 @@ import {
 import { useI18n } from '@/i18n'
 import type { WorkflowMarketplaceRemoveReview } from '@/types/hermes'
 
+import { type PackageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
 import { ReviewFacts, ReviewValueList } from './review-sections'
 
 export type RemoveReviewDialogView =
+  | { kind: 'terminal'; presentation: PackageLifecyclePresentation; canPrepareAgain: boolean; canRetry: boolean }
   | { kind: 'progress'; phase: string; progress: number; cancellable: boolean }
   | { kind: 'review'; review: Omit<WorkflowMarketplaceRemoveReview, 'confirmation_token'> }
   | { kind: 'succeeded' }
   | { kind: 'cancelled' | 'evicted' | 'failed' | 'stale' | 'status'; currentVersion: string; recoverable?: boolean }
 
 export interface RemoveReviewDialogProps {
+  confirmDisabled?: boolean
   onCancelOperation: () => void
   onClose: () => void
+  onRestoreFocus?: () => void
   onConfirm: () => Promise<void>
   onPrepareAgain: () => void
   onRetryStatus?: () => void
@@ -32,8 +36,10 @@ export interface RemoveReviewDialogProps {
 }
 
 export function RemoveReviewDialog({
+  confirmDisabled = false,
   onCancelOperation,
   onClose,
+  onRestoreFocus,
   onConfirm,
   onPrepareAgain,
   onRetryStatus,
@@ -59,7 +65,7 @@ export function RemoveReviewDialog({
   }, [])
 
   const confirm = async () => {
-    if (view.kind !== 'review' || confirmGuardRef.current) {
+    if (view.kind !== 'review' || confirmDisabled || confirmGuardRef.current) {
       return
     }
 
@@ -87,6 +93,12 @@ export function RemoveReviewDialog({
     <Dialog onOpenChange={value => !value && close()} open={open}>
       <DialogContent
         className="w-[min(92vw,42rem)] max-w-2xl"
+        onCloseAutoFocus={event => {
+          if (onRestoreFocus) {
+            event.preventDefault()
+            onRestoreFocus()
+          }
+        }}
         onEscapeKeyDown={event => admissionBusy && event.preventDefault()}
         onOpenAutoFocus={event => {
           event.preventDefault()
@@ -137,20 +149,13 @@ export function RemoveReviewDialog({
           <p aria-live="polite" role="status">
             {copy.workflowMarketplacePackageRemoved}
           </p>
+        ) : view.kind === 'terminal' ? (
+          <p aria-live="polite" role={view.presentation.kind === 'unconfirmed' ? 'alert' : 'status'}>
+            {view.presentation.message}
+          </p>
         ) : (
           <div role="alert">
-            <p>
-              {view.kind === 'stale'
-                ? copy.workflowMarketplaceReviewStale
-                : view.kind === 'evicted'
-                  ? copy.workflowMarketplaceOperationStatusLost
-                  : view.kind === 'status'
-                    ? copy.workflowMarketplaceOperationStatusUnavailable
-                    : view.kind === 'cancelled'
-                      ? copy.workflowMarketplaceRemovalCancelled
-                      : copy.workflowMarketplaceRemovalFailed}
-            </p>
-            <p>{copy.workflowMarketplaceVersionRemainsInstalled(view.currentVersion)}</p>
+            <p>{unconfirmedPackagePresentation.message}</p>
           </div>
         )}
 
@@ -164,7 +169,12 @@ export function RemoveReviewDialog({
             </Button>
           ) : null}
           {view.kind === 'review' ? (
-            <Button disabled={admissionBusy} onClick={() => void confirm()} type="button" variant="destructive">
+            <Button
+              disabled={admissionBusy || confirmDisabled}
+              onClick={() => void confirm()}
+              type="button"
+              variant="destructive"
+            >
               {copy.workflowMarketplaceConfirmRemoval}
             </Button>
           ) : null}
@@ -172,11 +182,11 @@ export function RemoveReviewDialog({
             <Button onClick={onRetryStatus} type="button">
               {copy.workflowMarketplaceRetryStatus}
             </Button>
-          ) : (view.kind === 'stale' ||
-              view.kind === 'evicted' ||
-              view.kind === 'failed' ||
-              view.kind === 'cancelled') &&
-            view.recoverable !== false ? (
+          ) : view.kind === 'terminal' && view.canRetry && onRetryStatus ? (
+            <Button onClick={onRetryStatus} type="button">
+              {copy.workflowMarketplaceRetryStatus}
+            </Button>
+          ) : view.kind === 'terminal' && view.canPrepareAgain ? (
             <Button onClick={onPrepareAgain} type="button">
               {copy.workflowMarketplacePrepareAgain}
             </Button>

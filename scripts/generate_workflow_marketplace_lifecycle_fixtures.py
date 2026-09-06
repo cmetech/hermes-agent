@@ -339,17 +339,47 @@ def generate_corpora():
             service.add_source(
                 WorkflowMarketplaceSource(name="company", repositoryUrl=repository_url)
             )
+            # A registered-source check reads its catalog. Exercise the fetch
+            # failure with an actually installed direct identity instead, in an
+            # isolated profile so its membership cannot affect later cases.
+            direct_service = WorkflowMarketplaceService(
+                root / "direct-profile", profile="support", clock=lambda: NOW
+            )
+            direct_review = direct_service.prepare_install(
+                InstallRequest(
+                    identifier=repository_url, packagePath="packages/laptop-support"
+                ),
+                actor="alice",
+            )
+            direct_installed = direct_service.confirm_install(
+                direct_review.confirmation_token, actor="alice"
+            )
+            direct_identity = direct_installed.identity
+            direct_subject = wire.PackageSubject(
+                type="package",
+                identity=wire.PackageIdentity.model_validate(
+                    direct_identity.model_dump(mode="json", by_alias=False)
+                ),
+            )
             with patch.object(
-                service.catalog.git_fetcher,
+                direct_service.catalog.git_fetcher,
                 "fetch",
                 side_effect=WorkflowMarketplaceError(
                     "source_unavailable", "Fixture repository unavailable."
                 ),
             ):
-                read(
+                record(
                     "service failed update check",
                     "update_check",
-                    lambda: service.check_updates(identity),
+                    complete_read(
+                        direct_service,
+                        kind="update_check",
+                        subject=direct_subject,
+                        selection=None,
+                        actor="alice",
+                        call=lambda: direct_service.check_updates(direct_identity),
+                    ),
+                    direct_subject,
                 )
             read(
                 "service all update checks",
@@ -407,6 +437,15 @@ def generate_corpora():
                 marker="v2",
             )
             repo.publish("publish v2")
+            service.refresh_source("company")
+            available_check = complete_read(
+                service,
+                kind="update_check",
+                subject=subject,
+                selection=None,
+                actor="alice",
+                call=lambda: service.check_updates(identity),
+            )
             review = read(
                 "service update prepare",
                 "update_prepare",
@@ -637,6 +676,21 @@ def generate_corpora():
                     "service ambiguous state",
                     _sanitize_result(
                         ambiguous_state.model_dump(mode="json"),
+                        allow_confirmation_token=False,
+                    ),
+                    wire.PackageState,
+                )
+            )
+            # Append the captured immutable result without renumbering the
+            # existing operation identities used by cross-language consumers.
+            record("service available update check", "update_check", available_check)
+            states.append(
+                _case(
+                    "service direct installed",
+                    _sanitize_result(
+                        read_package_state(direct_service, direct_identity).model_dump(
+                            mode="json"
+                        ),
                         allow_confirmation_token=False,
                     ),
                     wire.PackageState,
