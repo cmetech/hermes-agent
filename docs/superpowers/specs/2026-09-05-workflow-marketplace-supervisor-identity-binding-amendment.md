@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-05
 
-**Status:** Approved by the user on 2026-09-05 for implementation in the existing Hermes worktree. This approval does not authorize Workflow Studio changes, merge, push, publication, release, history rewrite, or worktree deletion.
+**Status:** Approved by the user on 2026-09-05 for implementation in the existing Hermes worktree, including the later fail-closed numeric-exhaustion clarification. This approval does not authorize Workflow Studio changes, merge, push, publication, release, history rewrite, or worktree deletion.
 
 **Baseline:** `eeba68e5c3521fa02a3cf6b5fb1cb56747c07b1f`, branch `feat/workflow-package-marketplace`.
 
@@ -119,7 +119,7 @@ Generation advances for every material route or authority change, including:
 
 The invalidation/change event must be published synchronously before asynchronous connection re-resolution can expose a changed descriptor. A late promise created under generation A cannot install or return itself as the current descriptor after generation B exists.
 
-The renderer cannot enforce this boundary by notification timing alone. Each lifecycle V2 IPC request carries `expectedConnectionGeneration`; main validates it against its authoritative route generation after resolving the route and before network dispatch, then validates it again before returning the response. A mismatch rejects with the exact secret-free native sentinel `marketplace_connection_generation_changed` and returns no backend body. The Desktop helper maps only that sentinel to the closed local error code of the same name. It has no HTTP status and is a recoverable scope-transition signal: suspend the old binding, quarantine its presentation, and reprobe rather than classifying an operation terminal or its outcome unknown. This field is native routing metadata and is never forwarded to the backend. It is required for capabilities as well as every later lifecycle request.
+The renderer cannot enforce this boundary by notification timing alone. Each lifecycle V2 IPC request carries `expectedConnectionGeneration`; main validates it against its authoritative route generation after resolving the route and before network dispatch, then validates it again before returning the response. A mismatch rejects with the exact secret-free native sentinel `marketplace_connection_generation_changed` and returns no backend body. The Desktop helper maps only that sentinel to the closed local error code of the same name. It has no HTTP status and is a recoverable scope-transition signal: suspend the old binding, quarantine its presentation, and reprobe rather than classifying an operation terminal or its outcome unknown. Exhaustion instead uses exact local `marketplace_connection_generation_exhausted`, also without an HTTP status or backend body; it is not recoverable inside that main-process lifetime and requires restart. These fields are native routing metadata and are never forwarded to the backend. Expected generation is required for capabilities as well as every later lifecycle request.
 
 Generation does not advance merely for:
 
@@ -129,7 +129,9 @@ Generation does not advance merely for:
 
 A reconnect still requires a fresh authenticated capabilities probe. Descriptor equality alone never proves the backend actor or registry epoch stayed the same.
 
-If the allocator reaches `Number.MAX_SAFE_INTEGER`, Electron synchronously invalidates all current descriptors and renderer lifecycle bindings, clears its descriptor cache, and restarts allocation at 1. No pre-rotation descriptor may remain current across that barrier. This is testable defensive behavior, not persistent wraparound.
+The allocator may issue `Number.MAX_SAFE_INTEGER` once, but it never reuses a numeric generation during one Electron main-process lifetime. On the next allocation attempt, Electron atomically enters a permanent exhausted state for that process, synchronously invalidates every current native generation and renderer lifecycle binding, clears its descriptor cache, and rejects the triggering and all later descriptor publication/lifecycle dispatch with exact local `marketplace_connection_generation_exhausted`. No counter reset or automatic wrap occurs. Marketplace presentation is quarantined, lifecycle controls are disabled, and the UI gives restart guidance without making any operation-outcome claim. Backend work may continue.
+
+Only a full application/Electron main-process restart starts allocation again at 1. That process boundary destroys the old IPC queue, renderer supervisor, branded clock observations, and route-generation table before reuse is possible. On restart, Desktop follows the existing fresh-start capabilities, actor-scoped operation-list, and authoritative package-state reconciliation rules. A renderer reload or window recreation inside the same main process does not clear exhaustion.
 
 ## 5. Observation and supervisor binding
 
@@ -170,7 +172,7 @@ Electron advances generation and Desktop immediately suspends the old binding be
 - If `principalBinding` or `registryEpoch` differs, Desktop never adopts old records into the new authority. Before accepting or publishing new-scope query data, it atomically cancels and removes/resets every marketplace query under the colliding `(connectionId, profile)` cache root, clears secrets, and keeps the old historical outcome unresolved. Any user-visible current package fact comes from a fresh new-scope package-state read. This privacy purge is binding-transition handling; a late old operation or response has no authority to invalidate or purge the new actor's cache.
 - If capabilities cannot be authenticated or validated, lifecycle mutation controls remain disabled. A transport failure is not evidence that the old operation failed or never started.
 
-An unexpected `401`, `403`, `marketplace_principal_changed`, or operation/admission not-found while supervising active or possibly admitted work triggers a capabilities reprobe before Desktop classifies eviction or terminal loss. The route may have changed actor or epoch. A generation change while capabilities or a request is in flight discards that response and retries only from a fresh binding when replay rules make retry safe.
+An unexpected `401`, `403`, `marketplace_principal_changed`, or operation/admission not-found while supervising active or possibly admitted work triggers a capabilities reprobe before Desktop classifies eviction or terminal loss. The route may have changed actor or epoch. A generation change while capabilities or a request is in flight discards that response and retries only from a fresh binding when replay rules make retry safe. `marketplace_connection_generation_exhausted` performs no reprobe in the same main process: it quarantines all marketplace presentation, releases network call guards while preserving unresolved outcome barriers, disables lifecycle controls, and requests an application restart.
 
 ```mermaid
 sequenceDiagram
@@ -224,6 +226,7 @@ sequenceDiagram
 | Same ID, material configuration/auth change | Generation advances; old binding suspends, presentation quarantines, and colliding queries cancel immediately | Late old-route results cannot affect the new scope or reveal prior-actor data |
 | Same actor/epoch after descriptor reconstruction | Exact records may rebind after exact lookup | No duplicate admission and no “latest” guess |
 | Different actor or epoch | No old-record adoption; colliding cache is privacy-purged before new publication | State is shown as unconfirmed until the new scope is read |
+| Native generation exhausted | All native generations/bindings invalidate; no value is reused in-process | Marketplace data is quarantined and lifecycle controls require full app restart; backend outcome is not inferred |
 | Renderer/application restart | Desktop binding, records, observations, barriers, and tokens are lost | Remote backend work may continue; fresh actor-scoped list/state rebuilds only what backend still retains |
 | Backend registry/process restart | Epoch, binding key, process operations, receipts, and vault change/disappear | Historical operation outcome can be unknown; durable package/journal state is re-read |
 
@@ -261,7 +264,8 @@ Tests use behavior assertions, backend-generated fixtures where applicable, dete
 | Generation stability | Cached unchanged descriptor is stable; navigation, visibility, polling, and transient unchanged-route reconnect do not advance it |
 | Generation invalidation | Every listed endpoint/auth/OAuth/SSH/backend/edit/delete/recreate change advances before renderer publication; late promises cannot become current |
 | Native dispatch race | Capabilities and later V2 calls reject generation mismatch with exact local `marketplace_connection_generation_changed` both before fetch and before IPC return; expected generation never reaches HTTP; supervisor reprobes without terminal/outcome claims |
-| Defensive rollover | Global invalidation barrier clears all current descriptors before allocator restarts; no retained supervisor binding collides |
+| Defensive exhaustion | With injected near-limit state, issue MAX_SAFE_INTEGER once; the first overflowing allocation invalidates/clears authoritative generations exactly once, and it plus every later allocation/dispatch returns exact `marketplace_connection_generation_exhausted`, never emits 1, and never reaches HTTP; a fresh main-process allocator starts at 1 with no retained IPC/supervisor state |
+| Exhaustion UX/state | Exhaustion quarantines all marketplace presentation, disables lifecycle actions, releases call guards but preserves unresolved barriers, gives restart guidance, performs no same-process reprobe, and makes no terminal/version/rollback claim |
 | Capabilities race | Generation change before response acceptance rejects the response and branded clock observation; no POST occurs from stale observation |
 | Per-request actor precondition | Missing, malformed, uppercase, oversized, duplicated, or unequal binding returns fixed `409 marketplace_principal_changed` before read/admission/cancel/token access; OAuth bearer/cookie change to same actor succeeds and different actor cannot act under the old observation |
 | Reserved header ownership | Exact/lower/mixed-case descriptor collisions are rejected and stripped; token and OAuth/cookie dispatch each send exactly one native-owned expected-binding header after sanitization |
@@ -283,7 +287,7 @@ Python evidence runs through `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh`. 
 After this written amendment is approved, the plan will split the stopped Task 14C1 before resuming it:
 
 1. **Backend principal binding:** process-epoch binding authority, strict model/capabilities derivation, per-request expected-binding precondition, and Python route/security tests. Generated Desktop parity is an explicit downstream handoff, not silently accepted drift.
-2. **Electron and Desktop binding parity:** connection-generation allocator and invalidation events, native pre-dispatch/pre-return checks, dedicated expected-binding IPC/header mapping, renderer descriptor/type changes, regenerated capability artifacts, strict decoder/clock binding, cache privacy transition, compatibility behavior, and native/TypeScript tests.
+2. **Electron and Desktop binding parity:** connection-generation allocator, permanent fail-closed exhaustion and invalidation events, native pre-dispatch/pre-return checks, dedicated expected-binding IPC/header mapping, renderer descriptor/type changes, regenerated capability artifacts, strict decoder/clock binding, cache privacy transition, compatibility behavior, and native/TypeScript tests.
 3. **Application operation supervisor:** restart Task 14C1 using only the two reviewed authorities, then proceed to cache barriers and the remaining lifecycle tasks in the approved sequence.
 
 Each unit starts from a clean accepted base, follows test-driven development, records its evidence in the existing SDD ledger, and receives a fresh reviewer before the next dependent unit. Finding another missing authority or correlation fact stops dependent implementation and returns to design amendment rather than adding a local heuristic.
@@ -296,5 +300,8 @@ Each unit starts from a clean accepted base, follows test-driven development, re
 | Public hash of username, authority binding, token, headers, URL, or credential bundle | Leaks stable correlation or enables guessing, mishandles rotation/equivalence, and makes Desktop reproduce backend authorization identity |
 | SSH `remoteIdentity`, install ID, registry schema version, or gateway activation epoch | Incomplete across modes or represents ownership/schema/navigation rather than authenticated route generation |
 | Renderer-computed connection fingerprint | Lets a less-authoritative layer decide which fields are material and risks secrets, normalization differences, and missed native session changes |
+| Reset numeric generation to 1 behind an invalidation broadcast | A queued pre-rotation IPC carrying the reused number can begin after reset and pass both numeric checks because broadcasts do not prove renderer acknowledgement |
+| Add a public rotation epoch/composite generation | Permits automatic continuation but expands every descriptor, IPC call, binding key, and test for a condition that requires roughly nine quadrillion allocations |
+| Freeze and drain every renderer/window before reuse | Requires an acknowledged multi-window protocol that proves no queued IPC can arrive; a timeout or send-only event is insufficient and disproportionate to the exhaustion condition |
 | Always discard work on any reconnect | Safe but loses deterministic same-actor navigation/recovery and does not solve lost-response admission correlation |
 | Adopt the latest operation with matching kind/package | Can attach another tab, client, request, profile, or actor's work and is forbidden by the lifecycle recovery contract |
