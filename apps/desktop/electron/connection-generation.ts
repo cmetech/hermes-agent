@@ -15,6 +15,7 @@ export function createConnectionGenerationRegistry(
   let exhausted = false
   const claims = new Map<string, GenerationClaim>()
   const routes = new Map<string, number>()
+  const routeLeases = new Map<string, object>()
 
   function assertAvailable() {
     if (exhausted) {
@@ -50,6 +51,7 @@ export function createConnectionGenerationRegistry(
     for (const [key, generation] of routes) {
       if (generations.has(generation)) {
         routes.delete(key)
+        routeLeases.set(key, {})
       }
     }
 
@@ -63,6 +65,35 @@ export function createConnectionGenerationRegistry(
     assertCurrent,
     isCurrent,
     invalidate,
+    captureRoute(route: string) {
+      assertAvailable()
+      let lease = routeLeases.get(route)
+
+      if (!lease) {
+        lease = {}
+        routeLeases.set(route, lease)
+      }
+
+      return lease
+    },
+    retireRoute(route: string) {
+      const existed = routes.delete(route)
+
+      if (existed || routeLeases.has(route)) {
+        routeLeases.set(route, {})
+      }
+
+      if (existed) {
+        onInvalidate(GENERATION_CHANGED, [route])
+      }
+    },
+    assertRouteCurrent(route: string, generation: number, lease: object) {
+      assertCurrent(generation)
+
+      if (routes.get(route) !== generation || routeLeases.get(route) !== lease) {
+        throw new Error(GENERATION_CHANGED)
+      }
+    },
     invalidateRoutes(predicate: (route: string) => boolean) {
       const generations = new Set([...routes].filter(([route]) => predicate(route)).map(([, generation]) => generation))
 
@@ -73,8 +104,13 @@ export function createConnectionGenerationRegistry(
       }
     },
     current: (route: string) => routes.get(route),
-    associate(route: string, generation: number) {
+    associate(route: string, generation: number, lease?: object) {
       assertCurrent(generation)
+
+      if (lease && routeLeases.get(route) !== lease) {
+        throw new Error(GENERATION_CHANGED)
+      }
+
       routes.set(route, generation)
     },
     begin(scope: string): GenerationClaim {
@@ -84,6 +120,7 @@ export function createConnectionGenerationRegistry(
         exhausted = true
         claims.clear()
         routes.clear()
+        routeLeases.clear()
         onInvalidate(GENERATION_EXHAUSTED, [])
         throw new Error(GENERATION_EXHAUSTED)
       }

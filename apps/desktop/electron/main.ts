@@ -132,11 +132,7 @@ import {
 import { applyConnectionConfigAtomically } from './connection-config-apply'
 import { createConnectionGenerationRegistry, GENERATION_EXHAUSTED } from './connection-generation'
 import { broadcastConnectionGeneration } from './connection-generation-event'
-import {
-  invalidateLegacyConfiguration as invalidateLegacyGenerations,
-  invalidateRegistryConfiguration as invalidateRegistryGenerations,
-  invalidateSshGeneration
-} from './connection-generation-routing'
+import { createConnectionGenerationRouting, invalidateSshGeneration } from './connection-generation-routing'
 import {
   backendScopeKey,
   backendScopePrefix,
@@ -164,6 +160,7 @@ import {
   upsertConnection
 } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
+import { publishConnectionRegistry } from './connection-registry-publication'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -242,6 +239,7 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import {
+  assertNativeLifecycleUrl,
   dispatchLifecycleRequest,
   mergeNativeRequestHeaders,
   validateLifecycleRequest
@@ -285,8 +283,9 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
+import { createNativeSessionGeneration } from './native-session-generation'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
-import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { createOauthJsonRequest, serializeJsonBody } from './oauth-net-request'
 import { LEGACY_OAUTH_PARTITION, resolveOauthPartition } from './oauth-partition'
 import { createParentStartMarkerResolver, parentWatchdogEnv } from './parent-process-identity'
 import { registerPetOverlayIpc } from './pet-overlay-ipc'
@@ -1470,66 +1469,29 @@ const connectionGenerations = createConnectionGenerationRegistry((reason, routes
   }
 })
 
-function lifecycleRouteKey(connectionId, profile) {
-  return JSON.stringify([connectionId || null, String(profile || '').trim() || primaryProfileKey()])
-}
+const connectionGenerationRouting = createConnectionGenerationRouting(connectionGenerations, {
+  primaryProfile: primaryProfileKey,
+  poolKeys: () => backendPool.keys()
+})
 
-function invalidateRegistryGeneration(id, registry = connectionRegistryCache) {
-  connectionGenerations.invalidateRoutes(route => JSON.parse(route)[0] === id)
-
-  if (registry?.primary === id) {
-    connectionGenerations.invalidate('primary')
-  }
-
-  for (const key of backendPool.keys()) {
-    if (String(key).startsWith(backendScopePrefix(id))) {
-      connectionGenerations.invalidate(`pool:${key}`)
-    }
-  }
-}
+const lifecycleRouteKey = connectionGenerationRouting.routeKey
 
 function invalidateRegistryConfiguration(previous, next) {
-  invalidateRegistryGenerations(previous, next, {
-    primary: () => connectionGenerations.invalidate('primary'),
-    registry: id => invalidateRegistryGeneration(id, previous)
-  })
+  connectionGenerationRouting.invalidateRegistryConfiguration(previous, next)
 }
 
 function invalidateLegacyConfiguration(previous, next) {
-  invalidateLegacyGenerations(previous, next, {
-    primary: () => connectionGenerations.invalidate('primary'),
-    legacy: profile => connectionGenerations.invalidate(`pool:${profile}`),
-    primaryProfile: primaryProfileKey(),
-    poolKeys: backendPool.keys()
-  })
+  connectionGenerationRouting.invalidateLegacyConfiguration(previous, next)
 }
 
 function invalidateOauthGeneration(baseUrl, cookiePartition = false) {
-  const registry = readDesktopConnectionsRegistry()
-  const config = readDesktopConnectionConfig()
-  const partition = cookiePartition ? resolveOauthPartitionForUrl(baseUrl) : null
-
-  const matches = url =>
-    url &&
-    (cookiePartition
-      ? resolveOauthPartitionForUrl(url) === partition
-      : normalizeRemoteBaseUrl(url) === normalizeRemoteBaseUrl(baseUrl))
-
-  for (const source of registry.connections) {
-    if ((source.kind === 'cloud' || source.authMode === 'oauth') && matches(source.url)) {
-      invalidateRegistryGeneration(source.id, registry)
-    }
-  }
-
-  if (config.remote?.authMode === 'oauth' && matches(config.remote.url)) {
-    connectionGenerations.invalidate('primary')
-  }
-
-  for (const [profile, remote] of Object.entries(config.profiles || {}) as [string, any][]) {
-    if (remote.authMode === 'oauth' && matches(remote.url)) {
-      connectionGenerations.invalidate(profile === primaryProfileKey() ? 'primary' : `pool:${profile}`)
-    }
-  }
+  connectionGenerationRouting.invalidateOauth(
+    baseUrl,
+    readDesktopConnectionsRegistry(),
+    readDesktopConnectionConfig(),
+    resolveOauthPartitionForUrl,
+    cookiePartition
+  )
 }
 
 const remoteLiveness = new RemoteLivenessTracker()
@@ -5452,6 +5414,10 @@ function multipartBody(upload) {
 }
 
 function fetchJson(url, token, options: any = {}) {
+  if (options.nativeLifecycle) {
+    assertNativeLifecycleUrl(url)
+  }
+
   // Retry policy lives in api-transport.ts: idempotent verbs retry on any
   // transient transport error; POST/PUT/DELETE only when the request provably
   // never reached the server (see shouldRetryRequest) — never double-submit.
@@ -7809,48 +7775,14 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // authed REST against a gated gateway, including minting WS tickets.
 function fetchJsonViaOauthSession(url, options: any = {}) {
   return new Promise((resolve, reject) => {
-    const sess = getOauthSessionForUrl(url)
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    let parsed
-
-    try {
-      parsed = new URL(url)
-    } catch (error) {
-      reject(new Error(`Invalid URL: ${error.message}`))
-
-      return
-    }
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
-
-      return
-    }
-
     const body = serializeJsonBody(options.body)
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-    const request = electronNet.request({
-      method: options.method || 'GET',
-      url,
-      session: sess,
-      useSessionCookies: true,
-      redirect: 'follow'
-    } as any)
-
-    setJsonRequestHeaders(request)
-
-    for (const [name, value] of Object.entries(
-      mergeNativeRequestHeaders(options.nativeLifecycle ? {} : headersForRemoteRequest(url), options)
-    )) {
-      request.setHeader(name, String(value))
-    }
+    const request = createOauthJsonRequest(url, options, {
+      sessionForUrl: getOauthSessionForUrl,
+      request: requestOptions => electronNet.request(requestOptions),
+      headersForUrl: headersForRemoteRequest
+    })
 
     let timedOut = false
 
@@ -7976,6 +7908,12 @@ function fetchWorkflowArtifactResource(
 // Backed by the encrypted on-disk store so it survives restarts.
 const _nativeTokens = new Map<string, NativeTokenSet>()
 
+const nativeSessionGeneration = createNativeSessionGeneration({
+  tokens: _nativeTokens,
+  invalidate: invalidateOauthGeneration,
+  persist: _persistNativeTokens
+})
+
 function _nativeTokenStorePath() {
   // Co-located with the connection config under userData; one JSON file mapping
   // baseUrl → { encoding, value } safeStorage payloads.
@@ -8019,18 +7957,11 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
 }
 
 function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet, replacement = true) {
-  if (replacement) {
-    invalidateOauthGeneration(baseUrl)
-  }
-
-  _nativeTokens.set(baseUrl, tokens)
-  _persistNativeTokens(baseUrl, tokens)
+  nativeSessionGeneration.store(baseUrl, tokens, replacement)
 }
 
 function _clearNativeTokens(baseUrl: string) {
-  invalidateOauthGeneration(baseUrl)
-  _nativeTokens.delete(baseUrl)
-  _persistNativeTokens(baseUrl, null)
+  nativeSessionGeneration.clear(baseUrl)
 }
 
 // True when we hold native bearer tokens for this gateway (the native-flow
@@ -9576,15 +9507,8 @@ function readDesktopConnectionsRegistry() {
     // same registry and the later atomic write is a no-op content-wise.
     registry = migrateV1ToRegistry(readDesktopConnectionConfig())
 
-    try {
-      writeDesktopConnectionsRegistry(registry)
-    } catch {
-      // Write failed (full disk, read-only userData). Keep the migrated
-      // registry in memory so list/save keep working this session instead of
-      // hard-failing every hermes:connections:* call.
-      connectionRegistryCache = registry
-      connectionRegistryCacheMtime = null
-    }
+    // Migration remains usable in memory if the registry cannot be persisted.
+    writeDesktopConnectionsRegistry(registry, false, true)
 
     return connectionRegistryCache
   }
@@ -9620,23 +9544,12 @@ function readDesktopConnectionsRegistry() {
   if (reconciled.changed) {
     registry = reconciled.registry
 
-    try {
-      writeDesktopConnectionsRegistry(registry)
+    writeDesktopConnectionsRegistry(registry, false, true)
 
-      return connectionRegistryCache
-    } catch {
-      connectionRegistryCache = registry
-      connectionRegistryCacheMtime = null
-
-      return registry
-    }
+    return connectionRegistryCache
   }
 
-  invalidateRegistryConfiguration(connectionRegistryCache, registry)
-  connectionRegistryCache = registry
-  connectionRegistryCacheMtime = mtime
-
-  return registry
+  return publishDesktopConnectionsRegistry(registry, { mtime })
 }
 
 // Copy an unparseable connections.json aside (once per corruption event) so a
@@ -9664,18 +9577,30 @@ function preserveCorruptRegistrySidecar() {
   }
 }
 
-function writeDesktopConnectionsRegistry(registry, internal = false) {
-  fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
-  // Owner-only for the same reason as connection.json: entries carry
-  // safeStorage-encrypted tokens plus URLs and SSH host/user/keyPath.
-  writeSecretFileAtomic(DESKTOP_CONNECTIONS_REGISTRY_PATH, JSON.stringify(registry, null, 2))
+function publishDesktopConnectionsRegistry(registry, options = {}) {
+  return publishConnectionRegistry(
+    registry,
+    {
+      current: () => connectionRegistryCache,
+      persist: next => {
+        fs.mkdirSync(path.dirname(DESKTOP_CONNECTIONS_REGISTRY_PATH), { recursive: true })
+        // Keep existing owner-only secret-file persistence.
+        writeSecretFileAtomic(DESKTOP_CONNECTIONS_REGISTRY_PATH, JSON.stringify(next, null, 2))
 
-  if (!internal) {
-    invalidateRegistryConfiguration(connectionRegistryCache, registry)
-  }
+        return fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
+      },
+      invalidate: invalidateRegistryConfiguration,
+      assign: (next, mtime) => {
+        connectionRegistryCache = next
+        connectionRegistryCacheMtime = mtime
+      }
+    },
+    options
+  )
+}
 
-  connectionRegistryCache = registry
-  connectionRegistryCacheMtime = fs.statSync(DESKTOP_CONNECTIONS_REGISTRY_PATH).mtimeMs
+function writeDesktopConnectionsRegistry(registry, internal = false, fallback = false) {
+  return publishDesktopConnectionsRegistry(registry, { persist: true, internal, fallback })
 }
 
 /**
@@ -11506,9 +11431,11 @@ function profileRouteOptions(profile, request?) {
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
   connectionGenerations.assertAvailable()
+  const routeKey = lifecycleRouteKey(null, profile)
+  const routeLease = connectionGenerations.captureRoute(routeKey)
   const connection = await resolveBackend(profile)
   connectionGenerations.assertCurrent(connection.connectionGeneration)
-  connectionGenerations.associate(lifecycleRouteKey(null, profile), connection.connectionGeneration)
+  connectionGenerations.associate(routeKey, connection.connectionGeneration, routeLease)
 
   return connection
 }
@@ -16554,10 +16481,11 @@ async function handleHermesApiRequest(request, structured = false) {
           }
         }
 
+        const routeKey = lifecycleRouteKey(null, value.profile)
+        const routeLease = connectionGenerations.captureRoute(routeKey)
         const route = resolveProfileApiRequest(value.profile, value.path, profileRouteOptions(value.profile, value))
         const descriptor = await ensureBackend(route.backendProfile)
-        const routeKey = lifecycleRouteKey(null, value.profile)
-        connectionGenerations.associate(routeKey, descriptor.connectionGeneration)
+        connectionGenerations.associate(routeKey, descriptor.connectionGeneration, routeLease)
 
         return { descriptor, path: route.requestPath, routeKey }
       },

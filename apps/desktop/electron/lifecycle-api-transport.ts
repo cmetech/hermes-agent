@@ -40,13 +40,86 @@ interface LifecycleTransportDeps {
   fetchCookie: (url: string, options: TransportOptions) => Promise<unknown>
 }
 
+function canonicalRequestPath(target: unknown): string {
+  if (
+    typeof target !== 'string' ||
+    !target.startsWith('/') ||
+    target.startsWith('//') ||
+    [...target].some(
+      character =>
+        character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127 || character === '\\' || character === '#'
+    )
+  ) {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+
+  const pathname = target.split('?')[0]
+  const normalized = new URL(target, 'https://native-request.invalid')
+
+  if (normalized.pathname !== pathname) {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+
+  // ASGI decodes path escapes after the native WHATWG boundary. No encoded spelling may enter V2 through V1.
+  let decoded: string
+
+  try {
+    decoded = decodeURIComponent(pathname)
+  } catch {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+
+  if (decoded !== pathname && (decoded === ROOT || decoded.startsWith(`${ROOT}/`))) {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+
+  return pathname
+}
+
+function lifecycleDestination(baseUrl: string, path: string): string {
+  const pathname = canonicalRequestPath(path)
+  const target = new URL(`${baseUrl}${path}`)
+
+  if (
+    !pathname.startsWith(`${ROOT}/`) ||
+    target.pathname !== pathname ||
+    target.hash ||
+    !['http:', 'https:'].includes(target.protocol)
+  ) {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+
+  return target.href
+}
+
+/** Final transport boundary: the header must not survive URL normalization or leave the exact V2 namespace. */
+export function assertNativeLifecycleUrl(url: string): void {
+  let target: URL
+
+  try {
+    target = new URL(url)
+  } catch {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+
+  if (
+    target.href !== url ||
+    target.hash ||
+    !['http:', 'https:'].includes(target.protocol) ||
+    !canonicalRequestPath(`${target.pathname}${target.search}`).startsWith(`${ROOT}/`)
+  ) {
+    throw new Error('Invalid workflow lifecycle request.')
+  }
+}
+
 export function validateLifecycleRequest(request: unknown): boolean {
   if (!request || typeof request !== 'object') {
     return false
   }
 
   const value = request as Record<string, unknown>
-  const lifecycle = typeof value.path === 'string' && value.path.startsWith(`${ROOT}/`)
+  const pathname = canonicalRequestPath(value.path)
+  const lifecycle = pathname.startsWith(`${ROOT}/`)
 
   if (!lifecycle) {
     if ('expectedConnectionGeneration' in value || 'expectedMarketplacePrincipalBinding' in value) {
@@ -76,8 +149,6 @@ export function validateLifecycleRequest(request: unknown): boolean {
   if (Object.keys(value).some(key => !allowed.includes(key))) {
     throw new Error('Invalid workflow lifecycle request.')
   }
-
-  const pathname = (value.path as string).split('?')[0]
 
   // No URL normalization may retarget the native-owned header outside V2.
   if (
@@ -166,8 +237,10 @@ export async function dispatchLifecycleRequest(
     throw error
   })
 
+  const routeLease = deps.authority.captureRoute(route.routeKey)
+
   const assertCurrent = () => {
-    deps.authority.assertCurrent(expected)
+    deps.authority.assertRouteCurrent(route.routeKey, expected, routeLease)
 
     if (route.descriptor.connectionGeneration !== expected || deps.authority.current(route.routeKey) !== expected) {
       throw new Error(GENERATION_CHANGED)
@@ -176,7 +249,7 @@ export async function dispatchLifecycleRequest(
 
   assertCurrent()
   const { descriptor } = route
-  const url = `${descriptor.baseUrl}${route.path}`
+  const url = lifecycleDestination(descriptor.baseUrl, route.path)
 
   try {
     const bearer = descriptor.authMode === 'oauth' ? await deps.accessToken(descriptor.baseUrl).catch(() => null) : null

@@ -60,6 +60,95 @@ describe('native lifecycle IPC authority boundary', () => {
   })
 
   for (const structured of [false, true]) {
+    // Break caught: WHATWG normalization routes a raw non-V2 alias into V2 without native generation.
+    it.each([
+      '/api/plugins/workflow/marketplace/lifecycle/v\t2/capabilities',
+      '/api/plugins/workflow/marketplace/lifecycle/v\n2/capabilities',
+      '/api/plugins/workflow/marketplace/lifecycle/v\r2/capabilities',
+      `\u0000${lifecycleRoot}/capabilities`,
+      `${lifecycleRoot}/capabilities\u007f`,
+      `${lifecycleRoot}/.\t./operations`,
+      `${lifecycleRoot}/../operations`,
+      `${lifecycleRoot}/%2e%2e/operations`,
+      `${lifecycleRoot}/%2E./operations`,
+      `${lifecycleRoot}\\..\\operations`,
+      `${lifecycleRoot}/operations#fragment`,
+      `//other.example${lifecycleRoot}/capabilities`,
+      `https://other.example${lifecycleRoot}/capabilities`
+    ])(`rejects a noncanonical IPC target before routing (structured=${structured}): %j`, async path => {
+      let resolved = 0
+      const authority = createConnectionGenerationRegistry()
+      authority.begin('primary')
+      const input = { path }
+      // Both main IPC handlers use this classifier before their legacy/V2 split.
+      expect(() => lifecycleTransport!.validateLifecycleRequest(input)).toThrow()
+      await expect(
+        lifecycleTransport!.dispatchLifecycleRequest(
+          { ...input, expectedConnectionGeneration: 1, expectedMarketplacePrincipalBinding: principal },
+          structured,
+          {
+            authority,
+            resolve: async () => {
+              resolved++
+              throw new Error('must not route')
+            },
+            accessToken: async () => {
+              throw new Error('must not authenticate')
+            },
+            fetchToken: async () => {
+              throw new Error('must not fetch')
+            },
+            fetchCookie: async () => {
+              throw new Error('must not fetch')
+            }
+          }
+        )
+      ).rejects.toThrow()
+      expect(resolved).toBe(0)
+    })
+
+    // Break caught: native route resolution changes the final path/base before the principal header is injected.
+    it.each([
+      { baseUrl: 'https://fixture.example', path: `${lifecycleRoot}/.\t./operations` },
+      { baseUrl: 'https://fixture.example', path: '/api/status' },
+      { baseUrl: 'https://fixture.example/prefix', path: `${lifecycleRoot}/operations` },
+      { baseUrl: 'https://fixture.example#fragment', path: `${lifecycleRoot}/operations` }
+    ])(`refuses a resolved destination outside exact V2 (structured=${structured}): %j`, async target => {
+      const authority = createConnectionGenerationRegistry()
+      const descriptor = authority.publish(authority.begin('primary'), { baseUrl: target.baseUrl, authMode: 'oauth' })
+      authority.associate('route', 1)
+      const effects: string[] = []
+      await expect(
+        lifecycleTransport!.dispatchLifecycleRequest(
+          {
+            path: `${lifecycleRoot}/operations`,
+            expectedConnectionGeneration: 1,
+            expectedMarketplacePrincipalBinding: principal
+          },
+          structured,
+          {
+            authority,
+            resolve: async () => ({ descriptor, path: target.path, routeKey: 'route' }),
+            accessToken: async () => {
+              effects.push('auth')
+
+              return null
+            },
+            fetchToken: async () => {
+              effects.push('token')
+
+              return { private: 'escaped' }
+            },
+            fetchCookie: async () => {
+              effects.push('cookie')
+
+              return { private: 'escaped' }
+            }
+          }
+        )
+      ).rejects.toThrow('Invalid workflow lifecycle request.')
+      expect(effects).toEqual([])
+    })
     // Break caught: a rejected old route resolution leaks its error after native authority is retired.
     it(`suppresses obsolete route-resolution errors (structured=${structured})`, async () => {
       const authority = createConnectionGenerationRegistry()
