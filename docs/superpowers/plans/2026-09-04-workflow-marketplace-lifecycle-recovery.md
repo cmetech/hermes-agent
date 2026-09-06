@@ -1,18 +1,18 @@
 # Workflow Marketplace Lifecycle Recovery Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved the lifecycle recovery design on 2026-09-04, strict-wire correction on 2026-09-05, and supervisor identity-binding design on 2026-09-05 for implementation in the existing Hermes worktree only.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved the lifecycle recovery design on 2026-09-04, strict-wire correction on 2026-09-05, supervisor identity-binding design on 2026-09-05, and inspection digest parity amendment on 2026-09-06 for implementation in the existing Hermes worktree only.
 
 **Goal:** Finish the existing marketplace branch with truthful, recoverable lifecycle operations and independently reviewed release evidence.
 
-**Architecture:** Extend the backend operation registry with safe subjects, bounded admission receipts, strict outcomes, locked local-state reconciliation, and an epoch-scoped opaque actor binding. Electron owns a separate live native-route generation and enforces it before dispatch and response return. A feature-owned application supervisor binds both authorities, outlives Marketplace/Installed views, and retains no review secret. Shared cache barriers and identity-transition quarantine prevent stale or prior-actor projections from authorizing mutations or being disclosed.
+**Architecture:** Extend the backend operation registry with safe subjects, bounded admission receipts, strict outcomes, locked local-state reconciliation, and an epoch-scoped opaque actor binding. Electron owns a separate live native-route generation and enforces it before dispatch and response return. A feature-owned application supervisor binds both authorities, outlives Marketplace/Installed views, and retains no review secret. Shared cache barriers and identity-transition quarantine prevent stale or prior-actor projections from authorizing mutations or being disclosed. Inspection decoding preserves the backend's separate distribution and per-workflow trust digest domains; neither digest substitutes for supervisor-owned admission freshness.
 
 **Tech Stack:** Existing Python/Pydantic/FastAPI/transaction locks and Git fixtures; React/TypeScript/Nanostores/TanStack Query/Vitest/Testing Library/Playwright. No new runtime dependency is planned.
 
-**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), [strict wire parity amendment](../specs/2026-09-05-workflow-marketplace-strict-wire-parity-amendment.md), [supervisor identity-binding amendment](../specs/2026-09-05-workflow-marketplace-supervisor-identity-binding-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
+**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), [strict wire parity amendment](../specs/2026-09-05-workflow-marketplace-strict-wire-parity-amendment.md), [supervisor identity-binding amendment](../specs/2026-09-05-workflow-marketplace-supervisor-identity-binding-amendment.md), [inspection digest parity amendment](../specs/2026-09-06-workflow-marketplace-inspection-digest-parity-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
 
 ## Global constraints
 
-- Status: lifecycle recovery design approved on 2026-09-04; strict wire parity and supervisor identity-binding amendments approved on 2026-09-05. The smaller Task 14C0a/14C0b/revised-14C1 sequence below replaces the stopped original 14C1 attempt.
+- Status: lifecycle recovery design approved on 2026-09-04; strict wire parity and supervisor identity-binding amendments approved on 2026-09-05; inspection digest parity approved on 2026-09-06. Task 14C2P is now authorized and still gates resumption of Task 14C2 and all dependent tasks. The smaller Task 14C0a/14C0b/revised-14C1 sequence below replaces the stopped original 14C1 attempt.
 - Continue only in `/Users/coreyellis/Developer/personal/github.com/cmetech/hermes-agent/.worktrees/workflow-package-marketplace`, branch `feat/workflow-package-marketplace`.
 - Baseline `c89f36c6b8b23c430432b947e3b4f8417eb974a5` is preserved. Do not revert or delete it. Tasks 1–13 are complete; their historical checkboxes are not a restart queue.
 - This plan replaces remaining Task 14 and Task 15 execution in the September 3 plan. The work groups are contract, Desktop parity, supervisor identity authority, durable supervisor, package lifecycle, separate trust, accessibility, and Task 15. Contract and supervisor groups have smaller independent review gates below.
@@ -36,6 +36,7 @@
 - Keep package installation and trust separate. Destination requirements remain advisories; malformed/inconsistent package structures block.
 - Use `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh` for Python evidence, never direct pytest. Run Desktop commands from `apps/desktop`; dependencies belong to the existing root workspace install.
 - Every task requires observed RED, focused GREEN, fresh reviewer evidence, and ledger updates. No production fix is accepted only on implementer-authored tests. A new contract gap pauses dependent work for a recorded amendment.
+- Inspection `package_digest` is the verified distribution digest; each `workflows[i].package_digest` is that workflow's effective marketplace trust digest and may differ from the root and siblings. Desktop preserves both domains exactly and never uses digest equality as freshness evidence.
 - Update locales `ar`, `en`, `ja`, `zh`, and `zh-hant` before completion.
 
 ## Execution and review protocol
@@ -50,31 +51,33 @@ Documentation-only phase verification consists of scope/diff/link/consistency ch
 
 Existing implementations remain the starting point. New names below are deliberate plan interfaces, not claims that files already exist.
 
-| File | Responsibility / task |
-| --- | --- |
-| `plugins/workflow/marketplace/lifecycle_models.py` | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1; V2-only lifecycle relative-path domain, 14B1 |
-| `plugins/workflow/marketplace/admissions.py` | Epoch/ID parsing, canonical private fingerprints, receipt lifetime/replay, 14A2; process-epoch principal-binding authority, 14C0a |
-| `plugins/workflow/marketplace/operations.py` | Existing worker registry; strict publication/admission/listing, 14A1–A2; legacy terminal bridge and non-projecting active-package mutation query, 14A3b2; strict evicted/page/token envelopes, 14B1 |
-| `plugins/workflow/marketplace/lifecycle_state.py` | Locked package-state projection and domain outcome evidence, 14A3a |
-| `plugins/workflow/marketplace/service.py`, `transactions.py`, `plugins/workflow/trust.py` | Exact commit/rollback evidence, authoritative token metadata, full trust snapshot at the actual write boundary, 14A3a |
-| `plugins/workflow/marketplace/catalog.py`, `source_store.py`, source portion of `lifecycle_state.py` | Source-cache publication evidence, 14A3b1; preserve strict source diagnostics |
-| `plugins/workflow/marketplace/lifecycle_api.py` | V2 router, capability/token/admission/local-state endpoints, 14A3b3; strict capabilities and response-boundary revalidation, 14B1; expected-principal precondition on all post-capabilities V2 routes, 14C0a |
-| `plugins/workflow/marketplace/api.py` | Legacy read/source bridge and preview mutation retirement, 14A3b2; mount V2 and actual profile-context integration, 14A3b3 |
-| `plugins/workflow/marketplace/cli.py` | Read-only package-state and explicit recovery adapters, 14A3c |
-| `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` | Deterministic Python public-model/scenario corpus and check/write modes, 14B; generated domain/error descriptors, 14B1–B2 |
-| `tests/fixtures/workflow-marketplace-lifecycle-v2.json` | Token-free cross-language operation/state corpus, 14B; regenerated strict-wire corpus, 14B2 |
-| `apps/desktop/src/types/workflow-marketplace-lifecycle.ts` | Strict generated V2 types/rules, 14B; regenerated parity, 14B2 |
-| `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.ts` | Strict V2 decoding and cross-field checks, 14B; U+FEFF repository parity and closed error handling, 14B2 |
-| `apps/desktop/electron/main.ts`, `preload.ts`, native transport tests | Process-global connection-generation allocation, invalidation-before-publication, and lifecycle IPC pre-dispatch/pre-return enforcement, 14C0b |
-| `apps/desktop/src/global.d.ts` | Required descriptor generation plus dedicated lifecycle expected-generation/expected-binding IPC fields, 14C0b |
-| `apps/desktop/src/api/workflow-marketplace-lifecycle.ts` | Scoped V2 API helpers and requested-ID enforcement, 14B; monotonic admission clock observation, 14B2; exact five-field binding and dedicated expected-binding transport, 14C0b |
-| `apps/desktop/src/api/client.ts`, Marketplace query keys/cache adapter | Binding-transition presentation quarantine and colliding-scope cancellation/purge seam, 14C0b; package mutation barriers remain 14C2 |
-| `apps/desktop/src/store/workflow-marketplace-supervisor.ts` | Application-lifetime Nanostore records and public methods, 14C1 |
-| `apps/desktop/src/lib/workflow-marketplace-supervision.ts` | Pure transitions, exact correlation, guard/poll scheduling, 14C1 |
-| `apps/desktop/src/lib/workflow-marketplace-reconciliation.ts` | Query invalidation and generation/barrier policy, 14C2 |
-| `apps/desktop/src/main.tsx` | Initialize/dispose main-window supervisor alongside QueryClient, 14C1 |
-| `apps/desktop/src/app/workflows/marketplace/use-package-lifecycle.tsx` | Thin view/dialog adapter, 14D–E |
-| Existing Marketplace dialogs, `index.tsx`, `installed-packages.tsx`, `package-detail.tsx`, `query-keys.ts`, Workflows `index.tsx` / `catalog.tsx` | Shared supervisor/barrier consumers and keyboard/focus behavior, 14C2–F |
+| File                                                                                                                                              | Responsibility / task                                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `plugins/workflow/marketplace/lifecycle_models.py`                                                                                                | V2 Subject/Selection/Outcome/Operation/PackageState schemas and correlations, 14A1; V2-only lifecycle relative-path domain, 14B1                                                                             |
+| `plugins/workflow/marketplace/admissions.py`                                                                                                      | Epoch/ID parsing, canonical private fingerprints, receipt lifetime/replay, 14A2; process-epoch principal-binding authority, 14C0a                                                                            |
+| `plugins/workflow/marketplace/operations.py`                                                                                                      | Existing worker registry; strict publication/admission/listing, 14A1–A2; legacy terminal bridge and non-projecting active-package mutation query, 14A3b2; strict evicted/page/token envelopes, 14B1          |
+| `plugins/workflow/marketplace/lifecycle_state.py`                                                                                                 | Locked package-state projection and domain outcome evidence, 14A3a                                                                                                                                           |
+| `plugins/workflow/marketplace/service.py`, `transactions.py`, `plugins/workflow/trust.py`                                                         | Exact commit/rollback evidence, authoritative token metadata, full trust snapshot at the actual write boundary, 14A3a                                                                                        |
+| `plugins/workflow/marketplace/catalog.py`, `source_store.py`, source portion of `lifecycle_state.py`                                              | Source-cache publication evidence, 14A3b1; preserve strict source diagnostics                                                                                                                                |
+| `plugins/workflow/marketplace/lifecycle_api.py`                                                                                                   | V2 router, capability/token/admission/local-state endpoints, 14A3b3; strict capabilities and response-boundary revalidation, 14B1; expected-principal precondition on all post-capabilities V2 routes, 14C0a |
+| `plugins/workflow/marketplace/api.py`                                                                                                             | Legacy read/source bridge and preview mutation retirement, 14A3b2; mount V2 and actual profile-context integration, 14A3b3                                                                                   |
+| `plugins/workflow/marketplace/cli.py`                                                                                                             | Read-only package-state and explicit recovery adapters, 14A3c                                                                                                                                                |
+| `scripts/generate_workflow_marketplace_lifecycle_fixtures.py`                                                                                     | Deterministic Python public-model/scenario corpus and check/write modes, 14B; generated domain/error descriptors, 14B1–B2                                                                                    |
+| `tests/fixtures/workflow-marketplace-lifecycle-v2.json`                                                                                           | Token-free cross-language operation/state corpus, 14B; regenerated strict-wire corpus, 14B2                                                                                                                  |
+| `tests/fixtures/workflow-marketplace-inspection-v1.json`                                                                                          | Generated real V1 admission/service/`get_legacy()` snake-case package-detail payload with distinct distribution/workflow digests, 14C2P                                                                      |
+| `apps/desktop/src/types/workflow-marketplace-lifecycle.ts`                                                                                        | Strict generated V2 types/rules, 14B; regenerated parity, 14B2                                                                                                                                               |
+| `apps/desktop/src/lib/workflow-marketplace-lifecycle-codec.ts`                                                                                    | Strict V2 decoding and cross-field checks, 14B; U+FEFF repository parity and closed error handling, 14B2                                                                                                     |
+| `apps/desktop/src/lib/workflow-marketplace-codec.ts` / `.test.ts`                                                                                 | Existing V1 package-detail decoder; remove only the unsupported workflow-to-distribution digest equality and prove generated parity, 14C2P                                                                   |
+| `apps/desktop/electron/main.ts`, `preload.ts`, native transport tests                                                                             | Process-global connection-generation allocation, invalidation-before-publication, and lifecycle IPC pre-dispatch/pre-return enforcement, 14C0b                                                               |
+| `apps/desktop/src/global.d.ts`                                                                                                                    | Required descriptor generation plus dedicated lifecycle expected-generation/expected-binding IPC fields, 14C0b                                                                                               |
+| `apps/desktop/src/api/workflow-marketplace-lifecycle.ts`                                                                                          | Scoped V2 API helpers and requested-ID enforcement, 14B; monotonic admission clock observation, 14B2; exact five-field binding and dedicated expected-binding transport, 14C0b                               |
+| `apps/desktop/src/api/client.ts`, Marketplace query keys/cache adapter                                                                            | Binding-transition presentation quarantine and colliding-scope cancellation/purge seam, 14C0b; package mutation barriers remain 14C2                                                                         |
+| `apps/desktop/src/store/workflow-marketplace-supervisor.ts`                                                                                       | Application-lifetime Nanostore records and public methods, 14C1                                                                                                                                              |
+| `apps/desktop/src/lib/workflow-marketplace-supervision.ts`                                                                                        | Pure transitions, exact correlation, guard/poll scheduling, 14C1                                                                                                                                             |
+| `apps/desktop/src/lib/workflow-marketplace-reconciliation.ts`                                                                                     | Query invalidation and generation/barrier policy, 14C2                                                                                                                                                       |
+| `apps/desktop/src/main.tsx`                                                                                                                       | Initialize/dispose main-window supervisor alongside QueryClient, 14C1                                                                                                                                        |
+| `apps/desktop/src/app/workflows/marketplace/use-package-lifecycle.tsx`                                                                            | Thin view/dialog adapter, 14D–E                                                                                                                                                                              |
+| Existing Marketplace dialogs, `index.tsx`, `installed-packages.tsx`, `package-detail.tsx`, `query-keys.ts`, Workflows `index.tsx` / `catalog.tsx` | Shared supervisor/barrier consumers and keyboard/focus behavior, 14C2–F                                                                                                                                      |
 
 Python public names: `LifecycleSubject`, `LifecycleSelection`, `LifecycleOutcome`, `LifecycleOperation`, `PackageState`, `TrustSnapshot`, `LifecycleAdmissionStore`, `read_package_state(service, identity)`, `create_lifecycle_router(context, verified_operator)`. Reuse existing `InstalledPackageIdentity`, result values, service signatures, and sanitized projections; V2 reviews omit token fields without changing CLI review objects.
 
@@ -107,6 +110,7 @@ def test_recovery_required_cannot_claim_verified_installed_state(state_payloads)
 ```
 
 Define test payload builders locally using existing valid review/package helpers; no loose casts. Include refresh source mismatch, one-workflow review mismatch, unknown/duplicate trust inventory, direct selector bounds, result/identity mismatch, and invalid outcome/state combinations.
+
 - [ ] Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_models.py tests/plugins/workflow/test_marketplace_operations.py`. Expected new relationship tests fail for missing models or accepted invalid combinations.
 - [ ] Implement frozen strict models, token-free V2 review projections, and exhaustive shared correlation table. Registry publication calls the validator; backend exceptions cannot publish an invalid terminal union. Preserve V1 public shape until 14A3 and existing refresh identity checks.
 
@@ -142,6 +146,7 @@ def test_replay_after_terminal_eviction_never_enqueues_again(admitted_confirm):
 ```
 
 `admitted_confirm` is a new local fixture wrapping the real registry/store with a counted event-controlled worker; it does not replace transaction tests. Add snapshot-page tests where new operations finish/evict between pages and expiry/capacity do not silently truncate.
+
 - [ ] Run RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_admissions.py tests/plugins/workflow/test_marketplace_operations.py`.
 - [ ] Implement admission under the existing registry lock: receipt lookup → fingerprint comparison → new-request age/epoch/capacity check → reservation → one submission. Preserve unresolved receipt on scheduling failure. Retire full result to a tombstone, never re-admit. Keep epoch/admission data above disposable profile service caches. V1 read-oriented starts receive server-generated IDs internally.
 
@@ -346,6 +351,7 @@ def test_recovery_requires_confirmation(cli_home):
 ```
 
 `cli_home` adapts the actual CLI runner and owned temporary transaction fixtures; it never targets the user's profile. Observe RED: `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_cli.py tests/plugins/workflow/test_cli.py`.
+
 - [ ] Implement read-only state rendering and bounded affected-identity confirmation around existing ownership-checked recovery. Without `--yes`, require interactive confirmation; noninteractive refusal performs no mutation. Refuse active writer leases; unresolved ambiguous journals yield nonzero exit. Never expose raw staging paths through Desktop or present workflow `doctor` as transaction recovery.
 - [ ] Run focused GREEN, then `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_*.py tests/plugins/workflow/test_api_runtime.py tests/plugins/workflow/test_desktop_api.py tests/plugins/workflow/test_cli.py tests/plugins/workflow/test_trust_policy.py`. Run changed-file Ruff/format and `git diff --check`. Report exact failures rather than claiming the whole slice green; known catalog debt remains a mandatory whole-branch gate.
 - [ ] Commit `feat(workflow): add explicit package recovery tooling`; fresh reviewer independently executes no-write state/confirmation and owned/ambiguous recovery probes. Record all 14A3a/b/c acceptance receipts before 14B; overall 14A3 is not accepted from CLI tests alone.
@@ -375,6 +381,7 @@ it('rejects another operation returned by get', async () => {
 ```
 
 Define `transport` using the existing Desktop API test transport mock; it returns raw fixture JSON to the real helper/decoder. Add cancel-ID mismatch, all exact scope/epoch/subject/request checks, selected workflow mismatch, capability 404 versus auth/network failure, duplicate JSON and byte limits, and token retrieval envelope mismatch.
+
 - [ ] Run RED from Desktop: `npx vitest run --project ui src/lib/workflow-marketplace-lifecycle-codec.test.ts src/api/workflow-marketplace-lifecycle.test.ts`.
 - [ ] Implement bounded decoders into fresh objects and exact requested-ID checks before returning operations. Implement client request-ID generation from backend epoch/time with cryptographic randomness. Expose explicit token helper outside QueryClient; preserve existing V1 browse/source behavior.
 
@@ -463,10 +470,12 @@ it.each(corpus.outerEnvelopeCases)('$name follows Python acceptance', testCase =
 - [ ] **Step 2: Write failing request-clock tests.** Replace scalar receipt-time inputs in tests with `{registryEpoch, serverTimeMs, wallReceivedMs, monotonicReceivedMs}`. Prove stable elapsed time mints the exact 85-character request ID, while negative/nonfinite elapsed time, either elapsed value over 300,000 ms, absolute wall/monotonic divergence over 1,000 ms, +31-second wall adjustment, scope/epoch change, and application restart refuse before POST with `marketplace_clock_revalidation_required`. Stub only `crypto.getRandomValues`; never persist the observation.
 
 ```typescript
-expect(() => createLifecycleRequestId(observation, {
-  wallNowMs: observation.wallReceivedMs + 31_000,
-  monotonicNowMs: observation.monotonicReceivedMs + 1_000
-})).toThrowError(expect.objectContaining({ code: 'marketplace_clock_revalidation_required' }))
+expect(() =>
+  createLifecycleRequestId(observation, {
+    wallNowMs: observation.wallReceivedMs + 31_000,
+    monotonicNowMs: observation.monotonicReceivedMs + 1_000
+  })
+).toThrowError(expect.objectContaining({ code: 'marketplace_clock_revalidation_required' }))
 ```
 
 - [ ] **Step 3: Write failing error-secrecy tests.** Cover every approved backend code and HTTP status. Feed unknown identifier-shaped, token-shaped, nested, duplicate-key, oversized, and non-JSON bodies through the actual transport helper; assert the result is the fixed generic local code and `JSON.stringify(error)` contains none of the supplied secret. Also preserve the local codes `marketplace_lifecycle_unsupported`, `marketplace_network_error`, `marketplace_invalid_response`, `marketplace_request_failed`, and `marketplace_clock_revalidation_required` only at their defined boundaries.
@@ -577,6 +586,7 @@ it('retains admission correlation after view detachment', async () => {
 ```
 
 Create the harness using a real supervisor and fixture-decoding API fake, deterministic clock, connection-binding coordinator, and deferred responses. It simulates the server receipt table, not optimistic UI outcomes; backend one-worker proof remains in 14A2/A3.
+
 - [ ] **Step 2: Observe RED.** Run `npx vitest run --project ui src/store/workflow-marketplace-supervisor.test.ts src/lib/workflow-marketplace-supervision.test.ts src/lib/workflow-marketplace-connection-binding.test.ts`.
 - [ ] **Step 3: Implement pure transitions and application lifetime.** Use immutable records keyed by the complete binding plus request ID and exact operation ID once known. Individual call guards release in `finally`; barriers remain separate. Attach one application instance above Workflows routes, never inside Marketplace or Installed. Keep DOM focus/dialog state and tokens outside it. On disconnect, release transport closures and retain only token-free records/barriers.
 
@@ -593,6 +603,23 @@ try {
 - [ ] **Step 6: Verify GREEN.** Re-run Step 2 plus V2 API/codec/binding suites, focused Workflows provider/navigation tests, TypeScript compile/typecheck, zero-warning changed-file lint, Prettier, and `git diff --check`. Confirm no secret/confirmation body enters records, query keys, URLs, logs, persistence, DOM, or errors.
 - [ ] **Step 7: Commit and review.** Commit `feat(desktop): supervise marketplace operations across navigation`. A fresh reviewer independently races lost admission, view detachment, generation change, principal change, 401/403/not-found, and late completion; verifies exact origin-only reconciliation, quarantine, bounded calls, guard release, and listener disposal. No 14C2 work begins with an open Critical/Important finding.
 
+## Task 14C2P — Inspection digest parity precursor
+
+**Status:** Approved on 2026-09-06. This is a separate implementation/review gate before resuming Task 14C2 fix round 1.
+
+**Files:** Modify `scripts/generate_workflow_marketplace_lifecycle_fixtures.py` and `tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py`; add generated `tests/fixtures/workflow-marketplace-inspection-v1.json`; modify `apps/desktop/src/lib/workflow-marketplace-codec.ts` / `.test.ts`. Modify the C2 lifecycle harness only after this precursor is review-clean and resumed C2 begins. Do not change backend models/service/routes, V2 operation eligibility, package digest algorithms, trust semantics, native code, or Workflow Studio.
+
+**Consumes:** Existing authoritative `PackageInspection`, real `WorkflowMarketplaceService.inspect()`, V1 registry/public serialization, V2 generated inspection, and the approved HTTP version-compatibility policy.
+
+**Produces:** One strict backend-generated V1 package-detail fixture proving the separate distribution and per-workflow effective trust digest domains, plus a V1 Desktop decoder whose validation exactly matches that backend invariant. It does not establish lifecycle freshness; the resumed C2 fix owns admission-generation lineage.
+
+- [ ] **Step 1: Preserve the stopped C2 RED.** Keep the three bounded uncommitted C2 test/harness files and record their diff before precursor implementation. Do not make the rendered historical-inspection test pass with a hand-shaped V2 downgrade, digest rewrite, or decoder bypass.
+- [ ] **Step 2: Generate an authoritative V1 fixture.** Reuse the generator's real temporary A/B Git repository and marketplace service. Start `registry.start("package_detail", worker, actor=..., subject=..., canonical_body=...)` with no caller-supplied request ID. The worker follows `_legacy_completion(complete_read(..., kind="inspect", call=lambda: service.inspect(...)))`; poll the exact ID through `get_legacy()` and serialize the strict `MarketplaceOperation` with `model_dump(mode="json", by_alias=False)` so the artifact matches V1 HTTP snake-case output. Emit at least two workflows whose effective workflow digests differ from the root distribution digest. Add `tests/fixtures/workflow-marketplace-inspection-v1.json` to generator `--write`/`--check` ownership and its Python reproduction test. Do not use `_public`, wrap a V2 operation, or hand-rewrite digest values.
+- [ ] **Step 3: Observe Desktop parity RED.** Feed that exact generated V1 payload to `decodeMarketplaceOperation` and assert preserved root/A/B digest values. It must fail only because the current decoder adds the unsupported equality. Add one-property negative mutations for malformed root/workflow digests, unexpected fields, identity/status, ordering/uniqueness, paths, and resource roles; those validations must already remain fail-closed.
+- [ ] **Step 4: Implement the smallest correction.** Remove only `workflows.some(item => item.package_digest !== packageDigest)` from `decodeMarketplacePackageDetail`. Retain strict digest syntax and every closed-shape/correlation/bounds check. Do not rename public fields, recompute values, equate siblings, weaken the generated V2 decoder, or treat digest validity as candidate freshness.
+- [ ] **Step 5: Verify the boundary.** From the worktree run `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py tests/plugins/workflow/test_marketplace_service.py tests/plugins/workflow/test_marketplace_api.py tests/plugins/workflow/test_marketplace_lifecycle_models.py`, then the generator's `--check` through the interpreter selected by that wrapper. From `apps/desktop` run `npx vitest run --project ui src/lib/workflow-marketplace-codec.test.ts src/lib/workflow-marketplace-lifecycle-codec.test.ts`, typecheck, zero-warning changed-file ESLint, and Prettier. Run repository Ruff check/format-check for the changed Python generator/test and root `git diff --check`. Never invoke direct pytest.
+- [ ] **Step 6: Commit and review.** Commit `fix(desktop): preserve inspection digest domains`. A fresh reviewer independently generates/observes one real V1 distinct-digest inspection, verifies exact Desktop preservation plus negative strictness, and confirms no V2-to-V1 downgrade, backend/schema/trust change, lifecycle-freshness heuristic, or unrelated scope. Reproduction of the still-open historical-inspection race is expected and does not block this precursor; passing R1/R2 belongs to resumed C2. Task 14C2 fix round 1 remains paused until this precursor is review-clean.
+
 ## Task 14C2 — Shared cache reconciliation barriers
 
 **Files:** Create `lib/workflow-marketplace-reconciliation.ts` / `.test.ts`; modify supervisor, Marketplace `query-keys.ts`, `index.tsx`, `package-detail.tsx`, `installed-packages.tsx`, Workflows `catalog.tsx` / `index.tsx`, and their behavior tests.
@@ -602,6 +629,8 @@ try {
 **Produces:** Per-package query-generation barriers and action gating for all consumers, using the amendment §7 table.
 
 **Transitional adapter gate:** The retained view-local `use-package-lifecycle.tsx` mutation callbacks do not participate in the application supervisor and therefore cannot prove that a barrier began before their POST. Task 14C2 must not label those callbacks fenced or allow a supervisor-derived `ready` gate to invoke them. Until Task 14D replaces install/update/remove preparation and confirmation with the supervisor, and Task 14E does the same for trust, the corresponding lifecycle controls are conservatively non-actionable; browsing and explicitly read-only metadata remain available and stale metadata is labeled last observed. Tests may drive the real V2 supervisor directly through `lifecycle-test-harness.tsx` to prove barrier semantics, but may not use that harness as evidence that the old callback path is safe. Direct/auxiliary renderers without an application supervisor use optional context only for read-only rendering and expose no lifecycle action fallback. Task 14D/E re-enable each control only through the supervisor-backed path after the exact post-barrier readiness requirements below pass. Existing behavior-test bodies whose sole purpose is exercising the temporarily unreachable callbacks must be preserved verbatim and may be skipped only individually with explicit 14D/14E ownership; record their exact names and skipped counts, add active no-fallback tests in C2, and re-enable every one before Task 15/final review.
+
+**Stopped fix-round state:** Fresh review of `d5676aaa56` found two Important blockers: historical inspection retrieval can acquire a new query-fetch generation, and later authoritative busy/recovery-required/unconfirmed state can leave catalog actions ready. The R1 direct-state RED is preserved in three uncommitted test/harness files. During its rendered setup, the separate V1 inspection digest parity gap was confirmed. Do not resume either R1 production work or R2 until Task 14C2P is approved, implemented, and review-clean. After that gate, resumed C2 replaces the stopped harness's invalid V2-envelope wrapper with the exact generated V1 fixture and uses it in the rendered historical-inspection regression; continue to forbid operation downgrade and hand-shaped digest substitution.
 
 - [ ] Write all four success-plus-failed-refetch cases, ambiguous outcome, verified rollback, stale in-flight response, detail aliases, multiple terminal histories, source deletion/orphaning, profile switch, absent package and unbound workflow-catalog cases.
 
@@ -617,6 +646,7 @@ it('keeps Install disabled after success when refetch fails', async () => {
 ```
 
 Define `renderLifecycleHarness` in `marketplace/lifecycle-test-harness.tsx` (test-only module) with real QueryClient/supervisor/providers and strict fixture decoding; reuse it in 14D–F. It controls network responses, not DOM claims.
+
 - [ ] Run RED: `npx vitest run --project ui src/lib/workflow-marketplace-reconciliation.test.ts src/app/workflows/marketplace/index.test.tsx src/app/workflows/index.test.tsx`.
 - [ ] Implement barrier generations before POST; cancel old query requests, invalidate exact origin roots, ignore pre-barrier completions for action readiness, and require fresh locked package state plus control-specific projections. Retained metadata is labeled last observed. Trust snapshots replace as a whole. Conservatively gate unbound catalog entry points while affected catalog truth is stale; never join by workflow name.
 
@@ -627,6 +657,8 @@ return markLocalStateVerified(gate, state)
 ```
 
 - [ ] Run GREEN plus workflow UI, supervisor and API/codec suites, typecheck/lint/format. Reviewer independently delays an older query until after success and makes all refetches fail; verify stale install/remove/update/trust controls stay unusable. Commit `fix(desktop): fence stale marketplace mutation caches`.
+
+For the stopped review fix, candidate freshness is admission-lineage evidence: a poll/get for an immutable operation carries the exact generation of its known inspection admission and can never acquire the generation at re-fetch time. Retrieval without a known exact admission establishes no candidate freshness. Catalog readiness must also inspect current authoritative package observations, including observations with no retained mutation record. A later busy, recovery-required, or unconfirmed observation fences the entire exact origin because the catalog has no package/workflow identity join; reopening requires a clear locked state and a catalog projection fetched after the contradictory observation. Add direct and rendered regressions for all three states, view remount, query removal/refetch, exact scope isolation, and failed replacement inspection admission before the fix commit and scoped re-review.
 
 ## Task 14D — Install, update and removal lifecycle adapters
 
@@ -640,7 +672,8 @@ return markLocalStateVerified(gate, state)
 
 ```typescript
 it.each(['rollbackFailed', 'recoveryAmbiguous', 'lostConfirmResponse'] as const)(
-  '%s cannot claim the prior version remains', async scenario => {
+  '%s cannot claim the prior version remains',
+  async scenario => {
     const harness = renderLifecycleHarness(corpus[scenario])
     await harness.updateAndConfirm()
     expect(await screen.findByText(/State could not be confirmed/)).toBeVisible()
@@ -663,6 +696,7 @@ switch (outcome.type) {
 ```
 
 Implement exhaustive handling for committed/cancelled outcomes as defined in the spec, plus distinct check error/orphaned and exact safe Retry. Do not infer an installed version from `target.installed` captured on a card.
+
 - [ ] Run GREEN and all Marketplace/workflow UI, typecheck/lint/format. Reviewer independently exercises a real backend-derived rollback-failed fixture and stale-card version mismatch. Commit `fix(desktop): render authoritative package lifecycle outcomes`.
 
 ## Task 14E — Separate trust lifecycle and complete package state
@@ -748,6 +782,7 @@ def test_lost_confirm_response_installs_once_then_requires_trust(real_marketplac
 ```
 
 `real_marketplace` starts the actual authenticated API/service with existing safe temp Git fixtures and bounded event synchronization; instrumentation counts commits while the actual filesystem/provenance/trust writes occur. The Playwright fixture launches an isolated backend and renderer; response dropping happens at the test transport boundary after actual server admission, not by substituting success payloads. Cover tab-close-return and failed-refetch action gating in that real path.
+
 - [ ] Run RED with the repository wrapper for the new E2E file; from Desktop run `npx vitest run --project ui src/i18n/languages.test.ts` and focused Playwright lifecycle tests after building the renderer. Capture specific missing behavior, not unrelated environment failure.
 - [ ] Translate all source/browse/lifecycle/recovery copy in all five locales. Locale tests assert usable keys and interpolation behavior; do not write source-text scans or fixed enumeration counts.
 - [ ] Document manifest/index/digest publishing, user-managed Git push, private authentication setup, selected remote/profile authority, all lifecycle steps, install/trust separation, retained cache barriers, request replay/expiry/capacity, renderer versus backend restart, package-state/recover-packages commands, and current-state versus historical-outcome limits. Do not claim Doctor performs transaction recovery or that failed rollback preserves a version.
@@ -793,19 +828,20 @@ Read the current merge-gate script before invoking it; run only its local test/r
 
 ## Spec coverage map
 
-| Amendment requirement | Task gate |
-| --- | --- |
-| Supervisor identity: backend actor binding and per-request precondition | 14C0a, 14C0b, 14C1 |
-| Supervisor identity: native generation, route races, quarantine/purge | 14C0b, 14C1, 14C2, 14F |
-| A public subject / G backend correlation | 14A1, 14A3, 14B |
-| B admission/replay / epoch / eviction | 14A2, 14A3, 14B, 14C0a, 14C0b, 14C1 |
-| C stable supervisor and scope isolation | 14C0a, 14C0b, 14C1, 14F |
-| D explicit outcomes/current state/recovery tooling | 14A3, 14C2, 14D, 15 |
-| E mutation barriers | 14C2, 14D, 14E |
-| F full-package trust / exact selection | 14A1, 14A3, 14B, 14E |
-| G exact get/cancel/prepare/confirm identity | 14A1–B, 14C0a, 14C0b, 14C1, 14D–E |
-| H keyboard/focus/capabilities/timer disposal | 14C1, 14E, 14F |
-| I generated fixtures/differential/integration matrix | 14B, 14C0a, 14C0b, each task's independent review, 15 |
-| Compatibility/token privacy/list stability | 14A2–B, 14C0a, 14C0b, 14C1, 15 |
+| Amendment requirement                                                   | Task gate                                             |
+| ----------------------------------------------------------------------- | ----------------------------------------------------- |
+| Supervisor identity: backend actor binding and per-request precondition | 14C0a, 14C0b, 14C1                                    |
+| Supervisor identity: native generation, route races, quarantine/purge   | 14C0b, 14C1, 14C2, 14F                                |
+| A public subject / G backend correlation                                | 14A1, 14A3, 14B                                       |
+| B admission/replay / epoch / eviction                                   | 14A2, 14A3, 14B, 14C0a, 14C0b, 14C1                   |
+| C stable supervisor and scope isolation                                 | 14C0a, 14C0b, 14C1, 14F                               |
+| D explicit outcomes/current state/recovery tooling                      | 14A3, 14C2, 14D, 15                                   |
+| E mutation barriers                                                     | 14C2, 14D, 14E                                        |
+| F full-package trust / exact selection                                  | 14A1, 14A3, 14B, 14E                                  |
+| G exact get/cancel/prepare/confirm identity                             | 14A1–B, 14C0a, 14C0b, 14C1, 14D–E                     |
+| H keyboard/focus/capabilities/timer disposal                            | 14C1, 14E, 14F                                        |
+| I generated fixtures/differential/integration matrix                    | 14B, 14C0a, 14C0b, each task's independent review, 15 |
+| Inspection distribution/effective-workflow digest domain parity         | 14C2P, resumed 14C2                                   |
+| Compatibility/token privacy/list stability                              | 14A2–B, 14C0a, 14C0b, 14C1, 15                        |
 
 Implementation mode is selected and approved by the user: subagent-driven, one implementation agent at a time and a fresh reviewer per task. No further mode-selection question is required. Integration and publication remain separately approval-gated.
