@@ -163,7 +163,6 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
   const status = atom<'available' | 'restart_required' | 'disposed'>('available')
   const entries = new Set<Entry>()
   const scheduler = createSupervisionScheduler()
-  const life = new AbortController()
   const observations = new Map<string, LifecycleClockObservation>()
   const samples = new Map<string, { capabilities: unknown; received: LifecycleClockSample }>()
   const scans = new Map<string, Promise<LifecycleConnectionBinding | null>>()
@@ -209,22 +208,103 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     })
   }
 
+  function clearScopeWork(scope: MarketplaceScope | null) {
+    for (const [key, controller] of scanControllers) {
+      if (scope === null || key === scopeKey(scope)) {
+        controller.abort()
+        scanControllers.delete(key)
+      }
+    }
+
+    for (const [controller, binding] of packageCalls) {
+      if (scope === null || scopeKey(scope) === scopeKey(binding)) {
+        controller.abort()
+        packageCalls.delete(controller)
+      }
+    }
+
+    for (const entry of entries) {
+      if (scope === null || scopeKey(scope) === scopeKey(entry.record.binding)) {
+        stop(entry)
+      }
+    }
+
+    for (const [key, observation] of observations) {
+      if (scope === null || key === scopeKey(scope)) {
+        discardLifecycleClockObservation(observation)
+        observations.delete(key)
+      }
+    }
+
+    if (scope === null) {
+      scans.clear()
+      samples.clear()
+      scanned.clear()
+      knownScopes.clear()
+    } else {
+      scans.delete(scopeKey(scope))
+      samples.delete(scopeKey(scope))
+      scanned.delete(scopeKey(scope))
+    }
+  }
+
+  function assertScopeOwner(
+    scope: MarketplaceScope,
+    controller: AbortController | undefined
+  ): asserts controller is AbortController {
+    if (
+      !controller ||
+      controller.signal.aborted ||
+      scanControllers.get(scopeKey(scope)) !== controller ||
+      disposed ||
+      status.get() === 'restart_required' ||
+      !visibility.get() ||
+      !connections.isConnected(scope)
+    ) {
+      throw new DOMException('Observation stopped.', 'AbortError')
+    }
+  }
+
   const bindings = createMarketplaceBindingCoordinator({
     queries: options.queryClient,
-    resolveConnection: connections.resolveConnection,
+    resolveConnection: async scope => {
+      const controller = scanControllers.get(scopeKey(scope))
+      assertScopeOwner(scope, controller)
+      const descriptor = await connections.resolveConnection(scope)
+      assertScopeOwner(scope, controller)
+
+      return descriptor
+    },
     getCapabilities: async scope => {
       const controller = scanControllers.get(scopeKey(scope))
-      const capabilities = await scheduler.run(() => api.capabilities(scope), controller?.signal ?? life.signal)
+      assertScopeOwner(scope, controller)
 
-      if (controller && !controller.signal.aborted && scanControllers.get(scopeKey(scope)) === controller) {
-        samples.set(scopeKey(scope), { capabilities, received: clock() })
-      }
+      const capabilities = await scheduler.run(() => {
+        assertScopeOwner(scope, controller)
+
+        return api.capabilities(scope)
+      }, controller.signal)
+
+      assertScopeOwner(scope, controller)
+      samples.set(scopeKey(scope), { capabilities, received: clock() })
 
       return capabilities
     },
     changed: scope => {
       if (scope === null) {
+        if (status.get() === 'restart_required' || disposed) {
+          return
+        }
+
         status.set('restart_required')
+        clearScopeWork(null)
+
+        return
+      }
+
+      // The coordinator emits per-scope invalidations before its one global exhaustion notification.
+      if (bindings.state(scope).kind === 'restart_required') {
+        return
       }
 
       for (const [controller, binding] of packageCalls) {
@@ -241,16 +321,6 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         ) {
           stop(entry)
         }
-      }
-
-      if (scope === null) {
-        for (const observation of observations.values()) {
-          discardLifecycleClockObservation(observation)
-        }
-
-        observations.clear()
-        samples.clear()
-        scanned.clear()
       }
     }
   })
@@ -270,32 +340,10 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       return
     }
 
-    for (const [key, controller] of scanControllers) {
-      if (scope === null || key === scopeKey(scope)) {
-        controller.abort()
-        scanControllers.delete(key)
-        scans.delete(key)
-        samples.delete(key)
-      }
-    }
-
-    for (const entry of entries) {
-      if (scope === null || scopeKey(scope) === scopeKey(entry.record.binding)) {
-        stop(entry)
-      }
-    }
-
-    for (const [key, observation] of observations) {
-      if (scope === null || key === scopeKey(scope)) {
-        discardLifecycleClockObservation(observation)
-        observations.delete(key)
-        scanned.delete(key)
-      }
-    }
-
     if (scope === null) {
       bindings.notify({ kind: 'exhausted' })
     } else {
+      clearScopeWork(scope)
       bindings.suspend(scope, reason)
     }
   }
@@ -459,7 +507,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
         const state =
           closed && entry.record.subject.type === 'package'
-            ? await reconcilePackage(target, entry.record.subject.identity)
+            ? await reconcilePackage(target, entry.record.subject.identity, false)
             : null
 
         if (usable(target) && entry.call === controller) {
@@ -522,6 +570,26 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
   function find(key: string) {
     return [...entries].find(entry => entry.record.key === key)
+  }
+
+  function snapshotOwner(operation: LifecycleOperation, binding: LifecycleConnectionBinding) {
+    const owners = [...entries].filter(
+      entry =>
+        sameAuthority(entry.record.binding, binding) &&
+        (entry.record.requestId === operation.request_id || entry.record.operationId === operation.id)
+    )
+
+    if (owners.length > 1) {
+      throw invalid()
+    }
+
+    const owner = owners[0]
+
+    if (owner) {
+      acceptSupervisedOperation(operation, binding, owner.record)
+    }
+
+    return owner
   }
 
   async function scan(binding: LifecycleConnectionBinding, signal: AbortSignal) {
@@ -641,16 +709,10 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         }
 
         const items = await scan(binding, controller.signal)
+        // Validate both directions for the whole snapshot before publishing any new observation.
+        const snapshot = items.map(operation => ({ operation, known: snapshotOwner(operation, binding) }))
 
-        for (const operation of items) {
-          const known = [...entries].find(
-            entry => sameAuthority(entry.record.binding, binding) && entry.record.requestId === operation.request_id
-          )
-
-          if (known) {
-            acceptSupervisedOperation(operation, binding, known.record)
-          }
-
+        for (const { operation, known } of snapshot) {
           if (!known) {
             // Known requests use exact lookup facts; a retained snapshot may be older.
             const entry = add(binding, {
@@ -686,7 +748,8 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
           suspend(scope, failure.code)
 
           if (reprobe && requiresProbe(failure)) {
-            await bindings.probe(scope)
+            // suspend removed this scan's ownership: the replacement cannot await this promise.
+            return reconcileScope(scope, false)
           }
         }
 
@@ -810,7 +873,8 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
   async function reconcilePackage(
     binding: LifecycleConnectionBinding,
-    identity: PackageIdentity
+    identity: PackageIdentity,
+    reprobe = true
   ): Promise<PackageState | null> {
     if (!usable(binding)) {
       return null
@@ -846,7 +910,10 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         suspend(null, failure.code)
       } else if (!disposed && bindings.isCurrent(binding) && requiresProbe(failure)) {
         suspend(binding, failure.code)
-        await bindings.probe(binding)
+
+        if (reprobe) {
+          await reconcileScope(binding, false)
+        }
       }
 
       return null
@@ -912,34 +979,9 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     disposed = true
     status.set('disposed')
-    life.abort()
-
-    for (const controller of packageCalls.keys()) {
-      controller.abort()
-    }
-
-    packageCalls.clear()
+    clearScopeWork(null)
     offConnections()
     offVisibility()
-
-    for (const entry of entries) {
-      stop(entry)
-    }
-
-    for (const observation of observations.values()) {
-      discardLifecycleClockObservation(observation)
-    }
-
-    for (const controller of scanControllers.values()) {
-      controller.abort()
-    }
-
-    observations.clear()
-    samples.clear()
-    scans.clear()
-    scanned.clear()
-    scanControllers.clear()
-    knownScopes.clear()
   }
 
   return {

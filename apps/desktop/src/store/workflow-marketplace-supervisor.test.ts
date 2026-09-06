@@ -71,6 +71,7 @@ function harness() {
 
   let deferGet: ReturnType<typeof deferred<unknown>> | null = null
   let deferCapabilities: ReturnType<typeof deferred<unknown>> | null = null
+  let descriptorWait: ReturnType<typeof deferred<{ connectionId: string; connectionGeneration: number }>> | null = null
   const listeners = new Set<(scope: { connectionId: string | null; profile: string } | null, reason: string) => void>()
   const receipts = new Map<string, LifecycleOperation>()
 
@@ -241,10 +242,13 @@ function harness() {
     visibility,
     clock: () => ({ wallNowMs: Date.now(), monotonicNowMs: performance.now() }),
     connections: {
-      resolveConnection: async (input: typeof scope) => ({
-        connectionId: input.connectionId,
-        connectionGeneration: generation
-      }),
+      resolveConnection: async (input: typeof scope) =>
+        descriptorWait
+          ? descriptorWait.promise
+          : {
+              connectionId: input.connectionId,
+              connectionGeneration: generation
+            },
       isConnected: () => connected,
       subscribe: (
         listener: (scope: { connectionId: string | null; profile: string } | null, reason: string) => void
@@ -300,6 +304,9 @@ function harness() {
     deferCapabilities: () => (deferCapabilities = deferred<unknown>()),
     resumeCapabilities: () => {
       deferCapabilities = null
+    },
+    holdDescriptor: (pending: NonNullable<typeof descriptorWait>) => {
+      descriptorWait = pending
     },
     fail: (error: LifecycleApiError) => {
       fail = error
@@ -878,6 +885,239 @@ describe('application marketplace operation supervision', () => {
     await vi.advanceTimersByTimeAsync(2000)
     expect(lists).toBe(2)
     expect(h.supervisor.bindings.presentation(scope, 'old')).toBeUndefined()
+  })
+
+  // Recovery policy checks: a replacement scan has one policy attempt, and a nested package read cannot await itself.
+  it('bounds repeated snapshot authentication recovery to one owned replacement scan', async () => {
+    const h = setup()
+    await h.bind()
+    const before = h.probes()
+    let lists = 0
+
+    h.api.list = async () => {
+      lists++
+      throw new LifecycleApiError('marketplace_network_error', 401)
+    }
+
+    expect(await h.bind()).toBeNull()
+    expect(h.probes()).toBe(before + 2)
+    expect(lists).toBe(2)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(h.probes()).toBe(before + 2)
+    expect(h.supervisor.bindings.presentation(scope, 'private')).toBeUndefined()
+  })
+
+  it('does not recursively reprobe or retain a guard when a nested expired-admission state read loses authorization', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    h.lose()
+    await h.supervisor.start(h.intent, binding!)
+    h.receipts.clear()
+    await vi.advanceTimersByTimeAsync(300001)
+
+    h.api.packageState = async () => {
+      throw new LifecycleApiError('marketplace_network_error', 401)
+    }
+
+    const before = h.probes()
+    expect(await h.bind()).toBeNull()
+    expect(h.probes()).toBe(before + 1)
+    expect(h.record()).toMatchObject({
+      callPending: false,
+      barrier: true,
+      operation: null,
+      admissionWindowClosed: false
+    })
+    expect(h.supervisor.bindings.presentation(scope, 'private')).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  // Review R3: request and operation identifiers are a bijection, including retained terminal histories.
+  it.each([
+    ['pending', 'request'],
+    ['pending', 'kind'],
+    ['pending', 'subject'],
+    ['pending', 'selection'],
+    ['terminal', 'request'],
+    ['terminal', 'kind'],
+    ['terminal', 'subject'],
+    ['terminal', 'selection']
+  ] as const)(
+    'rejects an inverse operation-ID collision with a valid changed %s/%s snapshot',
+    async (state, change) => {
+      const h = setup()
+      const original = fixture(state === 'terminal' ? 'service grant one A' : 'service grant one A pending')
+      h.list([original])
+      await h.bind()
+      h.api.lookup = async () => ({ state: 'found', operation: original })
+
+      const value = {
+        ...fixture(change === 'kind' ? 'service review one A pending' : 'service grant one A pending'),
+        id: original.id,
+        request_id: corpus.validOperationB.request_id,
+        ...(change === 'subject'
+          ? { subject: { type: 'package', identity: { ...identity, package_id: 'other-package' } } }
+          : {}),
+        ...(change === 'selection' ? { selection: { type: 'all' } } : {})
+      }
+
+      const changed = decodeLifecycleOperation(value)
+      expect(changed).not.toBeNull()
+      expect(changed!.request_id).not.toBe(original.request_id)
+      h.list([changed!])
+      expect(await h.bind()).toBeNull()
+      expect(h.supervisor.$records.get()).toHaveLength(1)
+      expect(h.record()).toMatchObject({
+        operationId: original.id,
+        requestId: original.request_id,
+        operation: original,
+        barrier: true,
+        callPending: false
+      })
+      expect(h.supervisor.bindings.presentation(scope, 'private')).toBeUndefined()
+      expect(vi.getTimerCount()).toBe(0)
+    }
+  )
+
+  // Review R2: recovery must remain a cancellable scope-owned operation at both asynchronous boundaries.
+  it.each([
+    ['package', 'hidden'],
+    ['package', 'disconnect'],
+    ['snapshot', 'hidden'],
+    ['snapshot', 'disconnect']
+  ] as const)('cancels %s recovery hidden in descriptor resolution on %s', async (source, boundary) => {
+    const h = setup()
+    const binding = await h.bind()
+    const descriptor = deferred<{ connectionId: string; connectionGeneration: number }>()
+
+    const fail = async () => {
+      h.holdDescriptor(descriptor)
+      throw new LifecycleApiError('marketplace_network_error', 401)
+    }
+
+    if (source === 'package') {
+      h.api.packageState = fail
+    } else {
+      h.api.list = fail
+    }
+
+    const pending = source === 'package' ? h.supervisor.reconcilePackage(binding!, identity) : h.bind()
+    await vi.advanceTimersByTimeAsync(0)
+    const before = h.probes()
+
+    if (boundary === 'hidden') {
+      h.visibility.set(false)
+    } else {
+      h.disconnect()
+    }
+
+    descriptor.resolve({ connectionId: scope.connectionId, connectionGeneration: 1 })
+    expect(await pending).toBeNull()
+    expect(h.probes()).toBe(before)
+    expect(h.supervisor.bindings.presentation(scope, 'private')).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([
+    ['package', 'hidden'],
+    ['package', 'disconnect'],
+    ['snapshot', 'hidden'],
+    ['snapshot', 'disconnect']
+  ] as const)('drops %s recovery queued behind physical capacity on %s', async (source, boundary) => {
+    const h = setup()
+    const binding = await h.bind()
+    const failedRead = deferred<unknown>()
+
+    if (source === 'package') {
+      h.api.packageState = () => failedRead.promise
+    } else {
+      h.api.list = input =>
+        input.connectionId === scope.connectionId
+          ? failedRead.promise
+          : Promise.resolve({ items: [], complete: true, next_cursor: null })
+    }
+
+    const recovery = source === 'package' ? h.supervisor.reconcilePackage(binding!, identity) : h.bind()
+    await vi.advanceTimersByTimeAsync(0)
+    const before = h.probes()
+    const blockers = deferred<unknown>()
+    let blockingCalls = 0
+    const capabilities = h.api.capabilities
+
+    h.api.capabilities = input => {
+      if (input.connectionId === scope.connectionId) {
+        return capabilities(input)
+      }
+
+      blockingCalls++
+
+      return blockers.promise
+    }
+
+    const other = Array.from({ length: 3 }, (_, index) =>
+      h.supervisor.reconcileScope({ ...scope, connectionId: `block-${index}` })
+    )
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(blockingCalls).toBe(2)
+    failedRead.reject(new LifecycleApiError('marketplace_network_error', 401))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(blockingCalls).toBe(3)
+    expect(h.probes()).toBe(before)
+
+    if (boundary === 'hidden') {
+      h.visibility.set(false)
+    } else {
+      h.disconnect()
+    }
+
+    blockers.resolve(corpus.capabilities)
+    expect(await recovery).toBeNull()
+    await Promise.all(other)
+    expect(h.probes()).toBe(before)
+    expect(h.supervisor.bindings.presentation(scope, 'private')).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  // Review R1: capability exhaustion must cancel every queued scope, not just operation records.
+  it('drops the fifth queued capability observer after global exhaustion without releasing physical slots early', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    await h.supervisor.start(h.intent, binding!)
+    const replies = Array.from({ length: 5 }, () => deferred<unknown>())
+    const dispatched: string[] = []
+
+    h.api.capabilities = async input => {
+      dispatched.push(input.connectionId!)
+
+      return replies[Number(input.connectionId!.slice(-1))].promise
+    }
+
+    const pending = replies.map((_, index) => h.supervisor.reconcileScope({ ...scope, connectionId: `scope-${index}` }))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(dispatched).toHaveLength(3)
+    replies[0].reject(new LifecycleApiError('marketplace_connection_generation_exhausted', 0))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.supervisor.$status.get()).toBe('restart_required')
+    const atExhaustion = [...dispatched]
+    expect(atExhaustion).not.toContain('scope-4')
+    expect(h.record().barrier).toBe(true)
+    expect(h.record().callPending).toBe(false)
+    replies[1].resolve(corpus.capabilities)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(dispatched).toEqual(atExhaustion)
+
+    for (const reply of replies.slice(2)) {
+      reply.resolve(corpus.capabilities)
+    }
+
+    expect(await Promise.all(pending)).toEqual(replies.map(() => null))
+    expect(await h.bind()).toBeNull()
+    h.visibility.set(false)
+    h.visibility.set(true)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(dispatched).toEqual(atExhaustion)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   // Break caught: an unavailable actor snapshot prevents exact recovery of an already-known request.
