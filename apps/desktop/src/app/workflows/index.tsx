@@ -39,6 +39,8 @@ import { AttentionInbox } from './attention-inbox'
 import { WorkflowCatalog } from './catalog'
 import { cancelPendingWorkflowDetailQuery } from './detail-query'
 import { InstalledPackages, WorkflowMarketplaceView } from './marketplace'
+import { marketplaceKeys } from './marketplace/query-keys'
+import { useMarketplaceReadOnlyScope } from './marketplace/supervisor-provider'
 import { ReviewRunDialog } from './review-run-dialog'
 import { $workflowSelectedRunId, selectWorkflowRun } from './store'
 import { ViewWorkflowDialog } from './view-workflow-dialog'
@@ -97,6 +99,8 @@ export function WorkflowsView() {
   const requestProfile = getApiRequestProfile()
   const profile = requestProfile ?? 'default'
   const marketplaceScope = { connectionId: getApiRequestConnection(), profile: requestProfile }
+  const marketplaceTruth = useMarketplaceReadOnlyScope(marketplaceScope)
+  const catalogReady = marketplaceTruth.canUseCatalog(marketplaceKeys.catalog(profileScopeKey(marketplaceScope)))
   const queryClient = useQueryClient()
   const selectedRunId = useStore($workflowSelectedRunId)
   const paneVisible = usePaneVisible()
@@ -128,6 +132,15 @@ export function WorkflowsView() {
     workflow: WorkflowDefinition
   }>(null)
 
+  // eslint-disable-next-line no-restricted-syntax -- a mutation barrier permanently retires the old catalog presentation
+  useEffect(() => {
+    if (!catalogReady) {
+      reviewGeneration.current += 1
+      setReviewIntent(null)
+      setViewIntent(null)
+    }
+  }, [catalogReady])
+
   const closeReview = () => {
     reviewGeneration.current += 1
 
@@ -150,6 +163,10 @@ export function WorkflowsView() {
     intentProfile: string,
     returnFocusTo = activeElement()
   ) => {
+    if (!catalogReady) {
+      return
+    }
+
     reviewGeneration.current += 1
     setViewIntent(null)
     setReviewIntent({ generation: reviewGeneration.current, profile: intentProfile, returnFocusTo, workflow })
@@ -158,6 +175,10 @@ export function WorkflowsView() {
   const openReview = (workflow: WorkflowDefinition) => openReviewForProfile(workflow, profile)
 
   const openView = (workflow: WorkflowDefinition) => {
+    if (!catalogReady) {
+      return
+    }
+
     setReviewIntent(null)
     setViewIntent({ profile, returnFocusTo: activeElement(), workflow })
   }
@@ -431,6 +452,7 @@ export function WorkflowsView() {
               onRunWorkflow={openReview}
               onViewWorkflow={openView}
               requestProfile={requestProfile}
+              scope={{ ...marketplaceScope, profile }}
             />
           </InstalledPackages>
         </div>
@@ -509,7 +531,7 @@ export function WorkflowsView() {
           selectedRunId={selectedRunId}
         />
       ) : null}
-      {reviewIntent ? (
+      {reviewIntent && catalogReady ? (
         <ReviewRunDialog
           onClose={closeReview}
           onRunLocated={async (runId, disposition, scheduled) => {
@@ -540,7 +562,7 @@ export function WorkflowsView() {
           workflow={reviewIntent.workflow}
         />
       ) : null}
-      {viewIntent ? (
+      {viewIntent && catalogReady ? (
         <ViewWorkflowDialog
           onClose={closeView}
           onRun={() => openReviewForProfile(viewIntent.workflow, viewIntent.profile, viewIntent.returnFocusTo)}

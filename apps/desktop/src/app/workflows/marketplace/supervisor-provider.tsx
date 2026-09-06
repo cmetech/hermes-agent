@@ -1,14 +1,15 @@
-import type { QueryClient } from '@tanstack/react-query'
+import type { QueryClient, QueryKey } from '@tanstack/react-query'
 import { atom } from 'nanostores'
-import { createContext, type ReactNode, useContext } from 'react'
+import { createContext, type ReactNode, useContext, useSyncExternalStore } from 'react'
 
-import { getApiRequestConnection, getApiRequestProfile, type HermesGateway } from '@/api/client'
+import { getApiRequestConnection, getApiRequestProfile, type HermesGateway, type ProfileScope } from '@/api/client'
 import * as lifecycle from '@/api/workflow-marketplace-lifecycle'
 import { $gateway } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $connection } from '@/store/session'
 import { isAuxiliaryWindow } from '@/store/windows'
 import { createMarketplaceSupervisor, type MarketplaceScope } from '@/store/workflow-marketplace-supervisor'
+import type { PackageIdentity } from '@/types/workflow-marketplace-lifecycle'
 
 type Supervisor = ReturnType<typeof createMarketplaceSupervisor>
 const MarketplaceSupervisorContext = createContext<Supervisor | null>(null)
@@ -30,6 +31,45 @@ export function useMarketplaceSupervisor() {
   }
 
   return supervisor
+}
+
+const noSubscription = () => () => undefined
+const noRevision = () => 0
+
+/** Optional access is limited to read-only presentation; mutation adapters use the strict hook above. */
+export function useMarketplaceReadOnlyScope(input: ProfileScope) {
+  const scope =
+    typeof input === 'object' && input !== null
+      ? { connectionId: input.connectionId ?? null, profile: input.profile ?? 'default' }
+      : { connectionId: null, profile: input ?? 'default' }
+
+  const supervisor = useContext(MarketplaceSupervisorContext)
+
+  const revision = useSyncExternalStore(
+    supervisor?.reconciliation.$revision.subscribe ?? noSubscription,
+    supervisor?.reconciliation.$revision.get ?? noRevision
+  )
+
+  return readOnlySnapshot(supervisor, scope, revision)
+}
+
+// Bind imperative reads to this subscription snapshot; React Compiler must not reuse a prior gate.
+function readOnlySnapshot(supervisor: Supervisor | null, scope: MarketplaceScope, revision: number) {
+  const state = supervisor?.bindings.state(scope)
+  const binding = state && 'binding' in state ? state.binding : null
+
+  return {
+    supervisor,
+    binding,
+    revision,
+    quarantined: Boolean(supervisor && !binding),
+    packageGate: (identity: PackageIdentity, projection?: QueryKey) =>
+      supervisor && binding ? supervisor.getPackageGate(binding, identity, projection) : null,
+    packageGeneration: (identity: PackageIdentity) =>
+      supervisor && binding ? supervisor.reconciliation.read(binding, identity).generation : 0,
+    canUseCatalog: (projection: QueryKey) =>
+      !supervisor || Boolean(binding && supervisor.canUseCatalog(binding, projection))
+  }
 }
 
 const applications = new WeakMap<QueryClient, Supervisor>()

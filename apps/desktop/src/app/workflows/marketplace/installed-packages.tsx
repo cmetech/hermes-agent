@@ -16,7 +16,7 @@ import { ExternalLink } from '@/lib/external-link'
 
 import { marketplaceWebRepositoryHref } from './package-detail'
 import { marketplaceKeys } from './query-keys'
-import { useWorkflowPackageLifecycle } from './use-package-lifecycle'
+import { useMarketplaceReadOnlyScope } from './supervisor-provider'
 
 export interface InstalledPackagesProps {
   children: ReactNode
@@ -109,7 +109,7 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   const copy = t.operations
   const scopeKey = profileScopeKey(scope)
   const focusFallbackRef = useRef<HTMLDivElement>(null)
-  const lifecycle = useWorkflowPackageLifecycle(scope, focusFallbackRef)
+  const truth = useMarketplaceReadOnlyScope(scope)
 
   const capabilities = useQuery({
     queryFn: () => getWorkflowMarketplaceCapabilities(scope),
@@ -118,18 +118,13 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   })
 
   const installed = useQuery({
-    enabled: capabilities.data?.capabilities.includes('installed') === true,
+    enabled: capabilities.data?.capabilities.includes('installed') === true && !truth.quarantined,
     queryFn: () => listInstalledWorkflowPackages(scope),
     queryKey: marketplaceKeys.installed(scopeKey),
     retry: false
   })
 
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
-  const supportsOperations = capabilities.data?.capabilities.includes('operations') === true
-  const supportsTransactions = capabilities.data?.capabilities.includes('transactions') === true
-  const supportsUpdates = capabilities.data?.capabilities.includes('updates') === true
-  const supportsTrust = capabilities.data?.capabilities.includes('trust') === true
-  const supportsLifecycle = supportsOperations && supportsTransactions
   const packages = installed.data?.packages ?? []
 
   const notice = capabilities.isPending ? (
@@ -155,11 +150,16 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   return (
     <div className="space-y-5" ref={focusFallbackRef} tabIndex={-1}>
       {notice}
-      {packages.length ? (
+      {truth.quarantined ? (
+        <p role="status">Refreshing package state</p>
+      ) : packages.length ? (
         <section aria-label={copy.workflowMarketplaceInstalledPackages}>
           <h2 className="text-sm font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceInstalledPackages}</h2>
           <div className="mt-2 space-y-3">
-            {packages.map(item => {
+            {packages.map(cached => {
+              const gate = truth.packageGate(cached.identity)
+              const current = gate?.packageState
+              const item = current?.installed ?? cached
               const identifier = `${item.identity.source_key}/${item.identity.package_id}`
               const repositoryHref = marketplaceWebRepositoryHref(item.repository_url)
 
@@ -169,6 +169,14 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                   className="border-b border-(--ui-stroke-tertiary) pb-3 last:border-b-0"
                   key={identifier}
                 >
+                  {current?.state === 'absent' ? (
+                    <p role="status">Package is absent. Last observed metadata</p>
+                  ) : truth.binding && gate?.state !== 'ready' ? (
+                    <p role="status">Last observed — Refreshing package state</p>
+                  ) : null}
+                  {gate?.state === 'recovery_required' ? (
+                    <p role="status">Recovery required. Package state is unconfirmed.</p>
+                  ) : null}
                   <div className="flex flex-wrap items-baseline justify-between gap-2">
                     <h3 className="break-all font-mono text-xs font-medium text-(--ui-text-primary)">{identifier}</h3>
                     <span className="flex flex-wrap gap-1">
@@ -197,49 +205,29 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                       </li>
                     ))}
                   </ul>
-                  {supportsLifecycle ? (
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      {supportsTrust ? (
-                        <Button
-                          onClick={event => lifecycle.reviewTrust(item, event.currentTarget)}
-                          size="sm"
-                          type="button"
-                          variant="secondary"
-                        >
-                          {copy.workflowMarketplaceReviewTrustAction}
-                        </Button>
-                      ) : null}
-                      {supportsUpdates ? (
-                        <Button
-                          onClick={event => lifecycle.checkForUpdates(item, event.currentTarget)}
-                          size="sm"
-                          type="button"
-                          variant="secondary"
-                        >
-                          {copy.workflowMarketplaceCheckUpdates}
-                        </Button>
-                      ) : null}
-                      <Button
-                        onClick={event => lifecycle.remove(item, event.currentTarget)}
-                        size="sm"
-                        type="button"
-                        variant="secondary"
-                      >
-                        {copy.workflowMarketplaceRemovePackage}
-                      </Button>
-                    </div>
-                  ) : (
-                    <p className="mt-2 text-xs text-(--ui-text-tertiary)" role="status">
-                      {copy.workflowMarketplaceLifecycleUnavailable}
-                    </p>
-                  )}
+                  <p className="mt-2 text-xs text-(--ui-text-tertiary)" role="status">
+                    {copy.workflowMarketplaceLifecycleUnavailable}
+                  </p>
+                  {truth.binding ? (
+                    <Button
+                      onClick={() => {
+                        if (truth.binding) {
+                          void truth.supervisor?.reconcilePackage(truth.binding, cached.identity)
+                        }
+                      }}
+                      size="sm"
+                      type="button"
+                      variant="secondary"
+                    >
+                      Refresh state
+                    </Button>
+                  ) : null}
                 </article>
               )
             })}
           </div>
         </section>
       ) : null}
-      {lifecycle.dialogs}
       {children}
     </div>
   )

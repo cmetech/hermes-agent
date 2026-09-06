@@ -7,6 +7,7 @@ import { I18nProvider, TRANSLATIONS } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
+import { createLifecycleHarness, lifecycleIdentity, lifecycleScope } from './marketplace/lifecycle-test-harness'
 import { isWorkflowAttemptEvidence, isWorkflowPersistentSessionRecoveryEvidence, RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
@@ -14,6 +15,99 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   Element.prototype.hasPointerCapture = vi.fn(() => false)
   Element.prototype.releasePointerCapture = vi.fn()
+})
+
+it('gates unbound catalog Run and Review while package truth is stale, without joining workflow names', async () => {
+  const h = createLifecycleHarness()
+
+  try {
+    const binding = await h.bind()
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [definition({ name: 'A' }), definition({ name: 'unrelated loose workflow' })],
+      truncated: false
+    })
+    render(
+      <h.Providers>
+        <WorkflowCatalog
+          cacheScopeKey="remote-a::support"
+          onRunWorkflow={vi.fn()}
+          onViewWorkflow={vi.fn()}
+          requestProfile="support"
+          scope={lifecycleScope}
+        />
+      </h.Providers>
+    )
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByRole('button', { name: workflowCopy.workflowRun })
+          .every(button => !(button as HTMLButtonElement).disabled)
+      ).toBe(true)
+    )
+    listWorkflowDefinitions.mockRejectedValue(new Error('offline'))
+    h.failOriginRefetches()
+    await act(async () => {
+      await h.mutate(binding)
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    expect(
+      screen
+        .getAllByRole('button', { name: workflowCopy.workflowRun })
+        .every(button => (button as HTMLButtonElement).disabled)
+    ).toBe(true)
+    expect(
+      screen
+        .getAllByRole('button', { name: workflowCopy.workflowView })
+        .every(button => (button as HTMLButtonElement).disabled)
+    ).toBe(true)
+    expect(screen.getByText(/Last observed/)).toBeTruthy()
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    h.state('service installed A trusted')
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: workflowCopy.workflowRun }) as HTMLButtonElement).disabled).toBe(false)
+    )
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it('discards open catalog presentation when a mutation fences it, without reopening an old intent after refresh', async () => {
+  const h = createLifecycleHarness()
+
+  try {
+    apiRequestState.profile = 'support'
+    const binding = await h.bind()
+    const { WorkflowsView } = await import('./index')
+    render(
+      <h.Providers>
+        <WorkflowsView />
+      </h.Providers>
+    )
+    const view = await screen.findByRole('button', { name: 'View' })
+    await waitFor(() => expect((view as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(view)
+    await screen.findByRole('dialog')
+    await act(async () => {
+      await h.mutate(binding)
+    })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      await h.queryClient.refetchQueries()
+    })
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
+    )
+    expect(screen.queryByRole('dialog')).toBeNull()
+  } finally {
+    cleanup()
+    h.dispose()
+  }
 })
 
 const getWorkflowRun = vi.fn()
@@ -167,8 +261,8 @@ async function renderView(client: QueryClient, initialTab: 'board' | 'workflows'
 }
 
 function setVisibility(value: 'hidden' | 'visible') {
-  Object.defineProperty(document, 'visibilityState', { configurable: true, value })
-  document.dispatchEvent(new Event('visibilitychange'))
+  Object.defineProperty(globalThis.document, 'visibilityState', { configurable: true, value })
+  globalThis.document.dispatchEvent(new Event('visibilitychange'))
 }
 
 beforeEach(() => {
@@ -195,7 +289,7 @@ beforeEach(() => {
     mock.mockReset()
   }
 
-  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+  Object.defineProperty(globalThis.document, 'visibilityState', { configurable: true, value: 'hidden' })
   $workflowSelectedRunId.set('run-1')
   getWorkflowRun.mockResolvedValue(run())
   getWorkflowEvidence.mockResolvedValue({
@@ -426,8 +520,8 @@ describe('WorkflowsView', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Laptop diagnostic/ }))
     await screen.findByRole('complementary', { name: 'Laptop diagnostic run details' })
 
-    const outside = document.createElement('button')
-    document.body.append(outside)
+    const outside = globalThis.document.createElement('button')
+    globalThis.document.body.append(outside)
 
     try {
       outside.focus()
@@ -435,7 +529,7 @@ describe('WorkflowsView', () => {
 
       await waitFor(() => expect($workflowSelectedRunId.get()).toBeNull())
       await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
-      expect(document.activeElement).toBe(outside)
+      expect(globalThis.document.activeElement).toBe(outside)
     } finally {
       outside.remove()
     }
@@ -935,7 +1029,9 @@ describe('WorkflowsView', () => {
       expect(within(row).getByText(aiCopy)).toBeTruthy()
       const button = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(button.disabled).toBe(true)
-      expect(document.getElementById(button.getAttribute('aria-describedby')!)?.textContent).toBe(expectedReason)
+      expect(globalThis.document.getElementById(button.getAttribute('aria-describedby')!)?.textContent).toBe(
+        expectedReason
+      )
     }
   })
 
@@ -1006,7 +1102,7 @@ describe('WorkflowsView', () => {
     for (const row of rows.slice(3, 4)) {
       const runButton = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(runButton.disabled).toBe(true)
-      expect(document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
+      expect(globalThis.document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
         'Run this bundled showcase from the CLI.'
       )
     }
@@ -1038,7 +1134,7 @@ describe('WorkflowsView', () => {
     const reviewDialog = await screen.findByRole('dialog', { name: 'Review & Run Laptop diagnostic' })
     fireEvent.click(within(reviewDialog).getByRole('button', { name: 'Close' }))
 
-    await waitFor(() => expect(document.activeElement).toBe(viewTrigger))
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(viewTrigger))
   })
 
   it('derives semantic input badges and explains unsupported input shapes accessibly', async () => {
@@ -1074,7 +1170,7 @@ describe('WorkflowsView', () => {
     expect(within(rows[1]!).getByText('3 inputs')).toBeTruthy()
     expect(within(rows[2]!).getByText('1 input').getAttribute('data-slot')).toBe('badge')
     const disabledRun = within(rows[2]!).getByRole('button', { name: 'Run' })
-    expect(document.getElementById(disabledRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(disabledRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
     )
   })
@@ -1107,11 +1203,11 @@ describe('WorkflowsView', () => {
     const incompatibleRun = within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
 
     expect(unsupportedRun.disabled).toBe(true)
-    expect(document.getElementById(unsupportedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(unsupportedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
     )
     expect(incompatibleRun.disabled).toBe(true)
-    expect(document.getElementById(incompatibleRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(incompatibleRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       workflowCopy.workflowRunIncompatible
     )
   })
@@ -1130,7 +1226,7 @@ describe('WorkflowsView', () => {
     expect(within(row).getByRole('button', { name: 'View' })).toBeTruthy()
     const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(run.disabled).toBe(true)
-    expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
       workflowCopy.workflowRunSupportUnavailable
     )
   })
@@ -1150,7 +1246,7 @@ describe('WorkflowsView', () => {
       const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
       const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(run.disabled).toBe(true)
-      expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+      expect(globalThis.document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
         workflowCopy.workflowRunIncompatible
       )
     }
@@ -1270,7 +1366,7 @@ describe('WorkflowsView', () => {
     expect(runExplanation.getAttribute('aria-disabled')).toBe('true')
     const reasonId = runButton.getAttribute('aria-describedby')
     expect(reasonId).toBeTruthy()
-    expect(document.getElementById(reasonId!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(reasonId!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
     )
 
@@ -1295,7 +1391,7 @@ describe('WorkflowsView', () => {
     // is behaviourally a boolean predicate, so cast it back onto the slot.
     HTMLElement.prototype.matches = function (this: HTMLElement, selector: string): boolean {
       if (selector === ':focus-visible') {
-        return this === document.activeElement
+        return this === globalThis.document.activeElement
       }
 
       return originalMatches.call(this, selector)
@@ -1304,9 +1400,9 @@ describe('WorkflowsView', () => {
     try {
       fireEvent.keyDown(globalThis.document, { key: 'Tab' })
       act(() => keyboardStops[0]!.focus())
-      expect(document.activeElement).toBe(view)
+      expect(globalThis.document.activeElement).toBe(view)
       act(() => keyboardStops[1]!.focus())
-      expect(document.activeElement).toBe(runExplanation)
+      expect(globalThis.document.activeElement).toBe(runExplanation)
       expect((await screen.findByRole('tooltip')).textContent).toContain(
         'Run is unavailable because this workflow uses unsupported input fields.'
       )
@@ -1318,7 +1414,7 @@ describe('WorkflowsView', () => {
     const untrustedRun = within(rows[2]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(untrustedView.disabled).toBe(false)
     expect(untrustedRun.disabled).toBe(true)
-    expect(document.getElementById(untrustedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(untrustedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow failed trust verification.'
     )
   })
@@ -1342,21 +1438,21 @@ describe('WorkflowsView', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const rendered = await renderView(client, 'workflows')
 
-    expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-a')
+    expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-a', 'remote-a')
     apiRequestState.profile = 'profile-b'
     rendered.rerender(
       <QueryClientProvider client={client}>
         {await import('./index').then(({ WorkflowsView }) => <WorkflowsView />)}
       </QueryClientProvider>
     )
-    await waitFor(() => expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-b'))
+    await waitFor(() => expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-b', 'remote-a'))
 
     profileB.resolve({ items: [definition({ name: 'Profile B workflow' })], truncated: false })
     expect(await screen.findByText('Profile B workflow')).toBeTruthy()
     const profileAResult = { items: [definition({ name: 'Profile A workflow' })], truncated: false }
     profileA.resolve(profileAResult)
     await waitFor(() =>
-      expect(client.getQueryData(['workflow-catalog', 'remote-a::profile-a'])).toEqual(profileAResult)
+      expect(client.getQueryData(['workflow-marketplace', 'remote-a::profile-a', 'catalog'])).toEqual(profileAResult)
     )
     expect(screen.queryByText('Profile A workflow')).toBeNull()
 

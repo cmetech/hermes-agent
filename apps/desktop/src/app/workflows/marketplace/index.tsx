@@ -29,8 +29,8 @@ import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList, type MarketplacePackageSelection } from './package-list'
 import { marketplaceKeys } from './query-keys'
 import { ManageWorkflowSourcesDialog } from './source-dialog'
+import { useMarketplaceReadOnlyScope } from './supervisor-provider'
 import { type MarketplaceOperationOrigin, useMarketplaceOperation } from './use-marketplace-operation'
-import { useWorkflowPackageLifecycle } from './use-package-lifecycle'
 
 const PAGE_LIMIT = 50
 const NARROW_MARKETPLACE_QUERY = '(max-width: 39.999rem)'
@@ -104,6 +104,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const { t } = useI18n()
   const copy = t.operations
   const scopeKey = profileScopeKey(scope)
+  const truth = useMarketplaceReadOnlyScope(scope)
   const narrow = useMediaQuery(NARROW_MARKETPLACE_QUERY)
   const rootRef = useRef<HTMLElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
@@ -134,20 +135,15 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const supportsSources = capabilities.data?.capabilities.includes('sources') === true
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
   const supportsOperations = capabilities.data?.capabilities.includes('operations') === true
-  const supportsTransactions = capabilities.data?.capabilities.includes('transactions') === true
-  const supportsUpdates = capabilities.data?.capabilities.includes('updates') === true
-  const supportsTrust = capabilities.data?.capabilities.includes('trust') === true
   const supportsSourceOperations = supportsSources && supportsOperations
-  const supportsLifecycle = supportsOperations && supportsTransactions
   const sourceOperations = useMarketplaceOperation(scope, supportsSourceOperations)
-  const lifecycle = useWorkflowPackageLifecycle(scope, searchRef, selection?.identifier ?? null)
 
   if (refreshAllGuardRef.current?.scopeKey !== scopeKey) {
     refreshAllGuardRef.current = null
   }
 
   const sources = useQuery({
-    enabled: supportsSources,
+    enabled: supportsSources && !truth.quarantined,
     queryFn: () => listWorkflowMarketplaceSources(scope),
     queryKey: marketplaceKeys.sources(scopeKey),
     retry: false
@@ -180,14 +176,14 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
       : []
 
   const installed = useQuery({
-    enabled: supportsInstalled,
+    enabled: supportsInstalled && !truth.quarantined,
     queryFn: () => listInstalledWorkflowPackages(scope),
     queryKey: marketplaceKeys.installed(scopeKey),
     retry: false
   })
 
   const packages = useQuery({
-    enabled: supportsSearch,
+    enabled: supportsSearch && !truth.quarantined,
     queryFn: () =>
       searchWorkflowPackages(filters.query, scope, {
         limit: PAGE_LIMIT,
@@ -204,7 +200,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   })
 
   const detailRequest = useQuery({
-    enabled: selection !== null,
+    enabled: selection !== null && !truth.quarantined,
     queryFn: () => inspectWorkflowPackage(selection!.sourceName, selection!.packageId, scope),
     queryKey: selection
       ? marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
@@ -216,7 +212,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const needsDetailPolling = operationNeedsPolling(detailRequest.data)
 
   const detailOperation = useQuery({
-    enabled: Boolean(operationId && needsDetailPolling),
+    enabled: Boolean(operationId && needsDetailPolling) && !truth.quarantined,
     queryFn: () => getWorkflowMarketplaceOperation(operationId!, scope),
     queryKey: marketplaceKeys.operation(scopeKey, operationId ?? 'none'),
     refetchInterval: query => {
@@ -257,6 +253,17 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const installedPackages = installed.data?.packages ?? []
   const selectedStillVisible = selection ? items.some(item => item.identifier === selection.identifier) : false
   const stale = items.some(item => item.state === 'stale')
+  const packageGeneration = detail ? truth.packageGeneration(detail.identity) : 0
+  const detailSourceKey = detail?.identity.source_key
+  const detailPackageId = detail?.identity.package_id
+  useEffect(() => {
+    if (truth.binding && detailSourceKey && detailPackageId) {
+      void truth.supervisor!.reconcilePackage(truth.binding, {
+        source_key: detailSourceKey,
+        package_id: detailPackageId
+      })
+    }
+  }, [truth.supervisor, truth.binding, detailSourceKey, detailPackageId, packageGeneration])
 
   // eslint-disable-next-line no-restricted-syntax -- resets ephemeral filters and selection at a backend authority boundary
   useEffect(() => {
@@ -524,39 +531,42 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         </div>
       ) : detail ? (
         <div className={narrow ? 'mt-3' : undefined}>
+          {truth.packageGate(detail.identity)?.state === 'recovery_required' ? (
+            <p role="status">Recovery required. Package state is unconfirmed.</p>
+          ) : null}
           <MarketplacePackageDetail
-            actions={
-              supportsLifecycle
-                ? {
-                    ...(detail.install_status === 'not_installed' && detail.blockers.length === 0
-                      ? { install: (origin: HTMLButtonElement) => lifecycle.install(detail, origin) }
-                      : {}),
-                    ...(detail.installed && supportsUpdates
-                      ? {
-                          checkForUpdates: (origin: HTMLButtonElement) =>
-                            lifecycle.checkForUpdates(detail.installed!, origin, detail.source_name),
-                          update: (origin: HTMLButtonElement) =>
-                            lifecycle.update(detail.installed!, origin, detail.source_name)
-                        }
-                      : {}),
-                    ...(detail.installed && supportsTrust
-                      ? {
-                          reviewTrust: (origin: HTMLButtonElement) =>
-                            lifecycle.reviewTrust(detail.installed!, origin, detail.source_name)
-                        }
-                      : {}),
-                    ...(detail.installed
-                      ? {
-                          remove: (origin: HTMLButtonElement) =>
-                            lifecycle.remove(detail.installed!, origin, detail.source_name)
-                        }
-                      : {})
-                  }
-                : undefined
-            }
             detail={detail}
-            lifecycleUnavailable={!supportsLifecycle}
+            lastObserved={Boolean(
+              truth.binding &&
+              truth.packageGate(
+                detail.identity,
+                needsDetailPolling
+                  ? marketplaceKeys.operation(scopeKey, operationId ?? 'none')
+                  : marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
+              )?.state !== 'ready'
+            )}
+            lifecycleUnavailable
+            packageState={truth.packageGate(detail.identity)?.packageState}
           />
+          {truth.binding ? (
+            <div className="mt-2 flex gap-2">
+              <Button
+                onClick={() => {
+                  if (truth.binding) {
+                    void truth.supervisor?.reconcilePackage(truth.binding, detail.identity)
+                  }
+                }}
+                size="sm"
+                type="button"
+                variant="secondary"
+              >
+                Refresh state
+              </Button>
+              <Button onClick={retryDetail} size="sm" type="button" variant="secondary">
+                {copy.workflowCatalogRetry}
+              </Button>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -569,6 +579,10 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
       />
     </div>
   )
+
+  if (truth.quarantined) {
+    return <p role="status">Refreshing package state</p>
+  }
 
   return (
     <section
@@ -664,8 +678,6 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         supported={supportsSourceOperations}
       />
 
-      {lifecycle.dialogs}
-
       {stale && !(narrow && selection) ? (
         <p
           aria-label={copy.workflowMarketplaceStaleLabel}
@@ -708,12 +720,19 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
                 title={filters.query ? copy.workflowMarketplaceNoMatchTitle : copy.workflowMarketplaceEmptyTitle}
               />
             ) : (
-              <MarketplacePackageList
-                installedPackages={installedPackages}
-                items={items}
-                onSelect={selectPackage}
-                selectedIdentifier={selection?.identifier ?? null}
-              />
+              <>
+                {truth.supervisor ? (
+                  <p className="text-xs" role="status">
+                    Last observed search metadata
+                  </p>
+                ) : null}
+                <MarketplacePackageList
+                  installedPackages={installedPackages}
+                  items={items}
+                  onSelect={selectPackage}
+                  selectedIdentifier={selection?.identifier ?? null}
+                />
+              </>
             )}
             {!packages.isPending && !searchError && (filters.offset > 0 || packages.data?.next_offset !== null) ? (
               <nav

@@ -1,4 +1,4 @@
-import type { QueryClient } from '@tanstack/react-query'
+import type { QueryClient, QueryKey } from '@tanstack/react-query'
 import { atom } from 'nanostores'
 
 import {
@@ -23,6 +23,7 @@ import {
   sameLifecycleIdentity,
   sameLifecycleValue
 } from '@/lib/workflow-marketplace-lifecycle-codec'
+import { createMarketplaceReconciliation } from '@/lib/workflow-marketplace-reconciliation'
 import {
   acceptSupervisedOperation,
   createSupervisionScheduler,
@@ -170,6 +171,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
   const packageCalls = new Map<AbortController, LifecycleConnectionBinding>()
   const knownScopes = new Map<string, MarketplaceScope>()
   const scanned = new Set<string>()
+  const reconciliation = createMarketplaceReconciliation(options.queryClient, binding => bindings.isCurrent(binding))
   let disposed = false
 
   function publish() {
@@ -180,6 +182,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     }
 
     records.set(Object.freeze([...entries].map(entry => entry.record)))
+    reconciliation.changed()
   }
 
   function update(entry: Entry, changes: Partial<SupervisedRecord>) {
@@ -315,6 +318,8 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       return capabilities
     },
     changed: scope => {
+      reconciliation.changed()
+
       if (scope === null) {
         if (status.get() === 'restart_required' || disposed) {
           return
@@ -418,6 +423,11 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     forgetReplay(entry)
     const terminal = operation.state !== 'pending' && operation.state !== 'running'
+
+    if (terminal && isMutation(operation.kind) && operation.subject.type === 'package') {
+      reconciliation.advance(binding, operation.subject.identity)
+    }
+
     update(entry, {
       binding,
       operationId: operation.id,
@@ -591,6 +601,11 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     }
 
     entries.add(entry)
+
+    if (isMutation(expected.kind) && expected.subject.type === 'package') {
+      reconciliation.advance(binding, expected.subject.identity)
+    }
+
     publish()
 
     return entry
@@ -720,6 +735,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       }
 
       observations.set(key, observeLifecycleClock(sample.capabilities, binding, sample.received))
+      reconciliation.bind(binding)
       samples.delete(key)
 
       try {
@@ -757,6 +773,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         }
 
         scanned.add(key)
+        reconciliation.changed()
 
         for (const entry of entries) {
           schedule(entry)
@@ -909,6 +926,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     }
 
     const controller = new AbortController()
+    const generation = reconciliation.read(binding, identity).generation
     packageCalls.set(controller, binding)
 
     try {
@@ -925,7 +943,25 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         return null
       }
 
-      // 14C2 owns post-mutation query generations and release of package barriers.
+      if (!reconciliation.accept(binding, identity, generation, value)) {
+        return null
+      }
+
+      if (!value.busy && value.recovery === 'clear' && value.state !== 'unconfirmed') {
+        for (const entry of entries) {
+          const record = entry.record
+
+          if (
+            sameLifecycleValue(record.binding, binding) &&
+            record.subject.type === 'package' &&
+            sameLifecycleIdentity(record.subject.identity, identity) &&
+            (record.status === 'terminal' || record.status === 'evicted' || record.admissionWindowClosed)
+          ) {
+            update(entry, { barrier: false })
+          }
+        }
+      }
+
       return value
     } catch (error) {
       if (controller.signal.aborted) {
@@ -950,18 +986,61 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     }
   }
 
-  function getPackageGate(binding: LifecycleConnectionBinding, identity: PackageIdentity): PackageGate {
-    const busy =
-      usable(binding) &&
-      [...entries].some(
-        ({ record }) =>
+  function getPackageGate(
+    binding: LifecycleConnectionBinding,
+    identity: PackageIdentity,
+    projection?: QueryKey
+  ): PackageGate {
+    if (!usable(binding) || !scanned.has(scopeKey(binding))) {
+      return { state: 'unknown', packageState: null }
+    }
+
+    const matching = [...entries]
+      .map(entry => entry.record)
+      .filter(
+        record =>
           sameLifecycleValue(record.binding, binding) &&
           record.subject.type === 'package' &&
-          sameLifecycleIdentity(record.subject.identity, identity) &&
-          (record.status === 'admitting' || record.status === 'watching')
+          sameLifecycleIdentity(record.subject.identity, identity)
       )
 
-    return { state: busy ? 'busy' : 'unknown', packageState: null }
+    const observation = reconciliation.read(binding, identity)
+    const state = observation.packageState
+
+    if (matching.some(record => record.status === 'admitting' || record.status === 'watching') || state?.busy) {
+      return { state: 'busy', packageState: null }
+    }
+
+    if (matching.some(record => record.barrier && record.status !== 'terminal')) {
+      return { state: 'unknown', packageState: null }
+    }
+
+    if (
+      state?.recovery === 'required' ||
+      (!state && matching.some(record => record.barrier && record.operation?.outcome?.type === 'recovery_required'))
+    ) {
+      return { state: 'recovery_required', packageState: null }
+    }
+
+    if (
+      state?.state === 'unconfirmed' ||
+      state?.recovery === 'unconfirmed' ||
+      (!state && matching.some(record => record.barrier && record.operation?.outcome?.type === 'outcome_unknown'))
+    ) {
+      return { state: 'unknown', packageState: null }
+    }
+
+    if (state) {
+      return {
+        state:
+          projection && !reconciliation.projectionFresh(binding, projection, observation.generation, identity)
+            ? 'reconciling'
+            : 'ready',
+        packageState: state
+      }
+    }
+
+    return { state: observation.generation ? 'reconciling' : 'unknown', packageState: null }
   }
 
   const offConnections = connections.subscribe(suspend)
@@ -992,6 +1071,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     }
 
     clearScopeWork(null)
+    reconciliation.dispose()
     offConnections()
     offVisibility()
   }
@@ -1008,12 +1088,23 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       subscribe: status.subscribe.bind(status)
     },
     bindings,
+    reconciliation,
     start,
     retry,
     cancel,
     reconcileScope,
     reconcilePackage,
     getPackageGate,
+    canUseCatalog(binding: LifecycleConnectionBinding, projection: QueryKey) {
+      return (
+        usable(binding) &&
+        scanned.has(scopeKey(binding)) &&
+        reconciliation.projectionFresh(binding, projection, reconciliation.scopeGeneration(binding)) &&
+        ![...entries].some(
+          ({ record }) => sameAuthority(record.binding, binding) && isMutation(record.kind) && record.barrier
+        )
+      )
+    },
     dispose
   }
 }

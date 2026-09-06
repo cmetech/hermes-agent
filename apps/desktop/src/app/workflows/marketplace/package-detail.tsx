@@ -8,6 +8,7 @@ import type {
   WorkflowMarketplacePackageResource,
   WorkflowMarketplaceResourceType
 } from '@/types/hermes'
+import type { PackageState } from '@/types/workflow-marketplace-lifecycle'
 
 export interface MarketplacePackageDetailProps {
   actions?: {
@@ -19,6 +20,8 @@ export interface MarketplacePackageDetailProps {
   }
   detail: WorkflowMarketplacePackageDetail
   lifecycleUnavailable?: boolean
+  lastObserved?: boolean
+  packageState?: PackageState | null
 }
 
 export function marketplaceWebRepositoryHref(value: string): null | string {
@@ -102,15 +105,17 @@ function RequirementList({ requirements }: { requirements: WorkflowMarketplaceEx
 export function MarketplacePackageDetail({
   actions,
   detail,
-  lifecycleUnavailable = false
+  lifecycleUnavailable = false,
+  lastObserved = false,
+  packageState
 }: MarketplacePackageDetailProps) {
   const { t } = useI18n()
   const copy = t.operations
   const repositoryHref = marketplaceWebRepositoryHref(detail.repository_url)
 
-  const installedRepositoryHref = detail.installed
-    ? marketplaceWebRepositoryHref(detail.installed.repository_url)
-    : null
+  const installed = packageState ? packageState.installed : detail.installed
+
+  const installedRepositoryHref = installed ? marketplaceWebRepositoryHref(installed.repository_url) : null
 
   const commands = resourcesWithType(detail.resources, ['command'])
   const scripts = resourcesWithType(detail.resources, ['script'])
@@ -128,6 +133,7 @@ export function MarketplacePackageDetail({
       role="region"
     >
       <header>
+        {lastObserved ? <p role="status">Last observed — Refreshing package state</p> : null}
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div className="min-w-0">
             <h2 className="text-lg font-medium text-(--ui-text-primary)">{detail.display_name}</h2>
@@ -135,13 +141,17 @@ export function MarketplacePackageDetail({
           </div>
           <span className="flex flex-wrap gap-1">
             <Badge variant="default">v{detail.version}</Badge>
-            {detail.install_status === 'installed' ? (
-              <Badge variant="muted">{copy.workflowMarketplaceInstalled}</Badge>
-            ) : null}
-            {detail.update_status === 'current' ? (
-              <Badge variant="default">{copy.workflowMarketplaceCurrent}</Badge>
-            ) : detail.update_status === 'update_available' ? (
-              <Badge variant="warn">{copy.workflowMarketplaceUpdateAvailable}</Badge>
+            {installed ? <Badge variant="muted">{copy.workflowMarketplaceInstalled}</Badge> : null}
+            {installed && detail.update_status === 'current' ? (
+              <Badge variant="default">
+                {lastObserved ? 'Last observed: ' : ''}
+                {copy.workflowMarketplaceCurrent}
+              </Badge>
+            ) : installed && detail.update_status === 'update_available' ? (
+              <Badge variant="warn">
+                {lastObserved ? 'Last observed: ' : ''}
+                {copy.workflowMarketplaceUpdateAvailable}
+              </Badge>
             ) : null}
           </span>
         </div>
@@ -156,42 +166,27 @@ export function MarketplacePackageDetail({
         {actions ? (
           <div className="mt-3 flex flex-wrap gap-2">
             {detail.install_status === 'not_installed' && detail.blockers.length === 0 && actions.install ? (
-              <Button onClick={event => actions.install?.(event.currentTarget)} size="sm" type="button">
+              <Button disabled size="sm" type="button">
                 {copy.workflowMarketplaceInstallPackage}
               </Button>
             ) : null}
             {detail.install_status === 'installed' && detail.update_status === 'update_available' && actions.update ? (
-              <Button onClick={event => actions.update?.(event.currentTarget)} size="sm" type="button">
+              <Button disabled size="sm" type="button">
                 {copy.workflowMarketplaceUpdatePackage}
               </Button>
             ) : null}
             {detail.install_status === 'installed' && detail.update_status === 'current' && actions.checkForUpdates ? (
-              <Button
-                onClick={event => actions.checkForUpdates?.(event.currentTarget)}
-                size="sm"
-                type="button"
-                variant="secondary"
-              >
+              <Button disabled size="sm" type="button" variant="secondary">
                 {copy.workflowMarketplaceCheckUpdates}
               </Button>
             ) : null}
             {detail.install_status === 'installed' && actions.reviewTrust ? (
-              <Button
-                onClick={event => actions.reviewTrust?.(event.currentTarget)}
-                size="sm"
-                type="button"
-                variant="secondary"
-              >
+              <Button disabled size="sm" type="button" variant="secondary">
                 {copy.workflowMarketplaceReviewTrustAction}
               </Button>
             ) : null}
             {detail.install_status === 'installed' && actions.remove ? (
-              <Button
-                onClick={event => actions.remove?.(event.currentTarget)}
-                size="sm"
-                type="button"
-                variant="secondary"
-              >
+              <Button disabled size="sm" type="button" variant="secondary">
                 {copy.workflowMarketplaceRemovePackage}
               </Button>
             ) : null}
@@ -233,7 +228,7 @@ export function MarketplacePackageDetail({
         </dl>
       </section>
 
-      {detail.installed ? (
+      {installed ? (
         <section aria-label={copy.workflowMarketplaceInstalledProvenance} role="region">
           <h3 className="text-xs font-medium text-(--ui-text-primary)">
             {copy.workflowMarketplaceInstalledProvenance}
@@ -241,32 +236,30 @@ export function MarketplacePackageDetail({
           <dl className="mt-1 grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledIdentity}</dt>
             <dd className="break-all font-mono">
-              {detail.installed.identity.source_key}/{detail.installed.identity.package_id}
+              {installed.identity.source_key}/{installed.identity.package_id}
             </dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledVersionLabel}</dt>
-            <dd>{detail.installed.version}</dd>
+            <dd>{installed.version}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledSource}</dt>
-            <dd>{detail.installed.source_name}</dd>
+            <dd>{installed.source_name}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledRepository}</dt>
             <dd className="min-w-0 break-all">
               {installedRepositoryHref ? (
-                <ExternalLink href={installedRepositoryHref}>{detail.installed.repository_url}</ExternalLink>
+                <ExternalLink href={installedRepositoryHref}>{installed.repository_url}</ExternalLink>
               ) : (
-                detail.installed.repository_url
+                installed.repository_url
               )}
             </dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledRef}</dt>
-            <dd className="break-all font-mono">
-              {detail.installed.configured_ref ?? copy.workflowMarketplaceDefaultRef}
-            </dd>
+            <dd className="break-all font-mono">{installed.configured_ref ?? copy.workflowMarketplaceDefaultRef}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledCommit}</dt>
-            <dd className="break-all font-mono">{detail.installed.resolved_commit}</dd>
+            <dd className="break-all font-mono">{installed.resolved_commit}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceDistributionDigest}</dt>
-            <dd className="break-all font-mono">{detail.installed.distribution_digest}</dd>
+            <dd className="break-all font-mono">{installed.distribution_digest}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledAt}</dt>
-            <dd>{detail.installed.installed_at}</dd>
+            <dd>{installed.installed_at}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledPackagePath}</dt>
-            <dd className="break-all font-mono">{detail.installed.package_path}</dd>
+            <dd className="break-all font-mono">{installed.package_path}</dd>
           </dl>
         </section>
       ) : null}
@@ -317,9 +310,12 @@ export function MarketplacePackageDetail({
               <span className="ms-2 font-mono text-[0.6875rem] text-(--ui-text-tertiary)">
                 {workflow.definition_path}
               </span>
-              <Badge className="ms-2" size="xs" variant={workflow.trust_state === 'trusted' ? 'default' : 'warn'}>
-                {workflow.trust_state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}
-              </Badge>
+              {!packageState ? (
+                <Badge className="ms-2" size="xs" variant={workflow.trust_state === 'trusted' ? 'default' : 'warn'}>
+                  {lastObserved ? 'Last observed: ' : ''}
+                  {workflow.trust_state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}
+                </Badge>
+              ) : null}
               {workflow.companion_path ? (
                 <span className="mt-0.5 block break-all font-mono text-[0.6875rem] text-(--ui-text-tertiary)">
                   {workflow.companion_path}
@@ -329,6 +325,26 @@ export function MarketplacePackageDetail({
           ))}
         </ul>
       </section>
+
+      {packageState?.trust ? (
+        <section aria-label="Current package trust" role="region">
+          <h3 className="text-xs font-medium">Current package trust</h3>
+          <ul>
+            {packageState.trust.workflows.map(workflow => (
+              <li key={workflow.definition_path}>
+                <span>{workflow.workflow_name}</span>
+                {' · '}
+                <span>{workflow.definition_path}</span>{' '}
+                <Badge variant={workflow.state === 'trusted' ? 'default' : 'warn'}>
+                  {workflow.state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}
+                </Badge>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : packageState?.state === 'absent' ? (
+        <p role="status">Package is absent.</p>
+      ) : null}
 
       <div className="grid gap-4 sm:grid-cols-2">
         <ResourceSection resources={commands} title={copy.workflowMarketplaceCommands} />

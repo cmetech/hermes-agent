@@ -524,7 +524,7 @@ describe('application marketplace operation supervision', () => {
     h.terminal()
     await h.bind()
     expect(h.record()).toMatchObject({ status: 'terminal', callPending: false })
-    expect(h.supervisor.getPackageGate(binding!, identity).state).toBe('unknown')
+    expect(h.supervisor.getPackageGate(binding!, identity).state).toBe('reconciling')
     h.dispose()
     expect(vi.getTimerCount()).toBe(0)
     expect(h.listeners.size).toBe(0)
