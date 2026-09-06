@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { QueryClient, QueryClientProvider, type QueryKey } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, type QueryKey, useQuery } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { type ReactNode, useRef } from 'react'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { profileScopeKey } from '@/api/client'
@@ -33,6 +33,7 @@ import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList } from './package-list'
 import { marketplaceKeys } from './query-keys'
 import { useMarketplaceReadOnlyScope } from './supervisor-provider'
+import { SupervisedPackageActions } from './use-package-lifecycle'
 
 import { WorkflowMarketplaceView } from './index'
 
@@ -549,6 +550,43 @@ function renderWithProviders(
 
 function renderMarketplace(scope = scopeA) {
   return renderWithProviders(<WorkflowMarketplaceView scope={scope} />)
+}
+
+function ProjectionLifecycleProbe({
+  enabled = true,
+  staticQuery = false
+}: {
+  enabled?: boolean
+  staticQuery?: boolean
+}) {
+  const truth = useMarketplaceReadOnlyScope(scopeA)
+  const fallback = useRef<HTMLDivElement>(null)
+  const key = marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support')
+
+  const query = useQuery<WorkflowMarketplaceOperation>({
+    queryKey: key,
+    queryFn: () => api.inspect('company', 'laptop-support', scopeA),
+    enabled: enabled && !truth.quarantined,
+    staleTime: staticQuery ? 'static' : 0,
+    retry: false
+  })
+
+  const detail = query.data?.result?.type === 'package_detail' ? query.data.result.value : undefined
+
+  return (
+    <div ref={fallback}>
+      {detail ? (
+        <SupervisedPackageActions
+          binding={truth.binding}
+          detail={detail}
+          focusFallbackRef={fallback}
+          identity={lifecycleIdentity}
+          projection={key}
+          sourceName="company"
+        />
+      ) : null}
+    </div>
+  )
 }
 
 function deferred<T>() {
@@ -2097,6 +2135,202 @@ describe('workflow package lifecycle', () => {
     ).toMatchObject({ result: { value: { blockers: [{ code: 'package_invalid' }] } } })
     expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
     expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  describe.each(['detail', 'operation'] as const)('exact %s projection recovery', projectionKind => {
+    it.each([
+      ['Install package', false, 'install_prepare', null],
+      ['Check for updates', true, 'update_check', null],
+      ['Update package', true, 'update_check', null],
+      ['Remove package', true, 'remove_prepare', null],
+      ['Install package', false, 'install_confirm', 'Confirm install'],
+      ['Update package', true, 'update_confirm', 'Confirm update'],
+      ['Remove package', true, 'remove_confirm', 'Remove package']
+    ] as const)(
+      'waits for the exact held projection after PackageState before %s / %s / %s',
+      async (label, installed, kind, confirmLabel) => {
+        let elapsed = 0
+
+        const h = await setupLifecycle(installed, () => ({
+          wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+          monotonicNowMs: elapsed
+        }))
+
+        const binding = await h.bind()
+
+        if (!confirmLabel) {
+          h.route('update_check', 'service update check')
+        }
+
+        if (projectionKind === 'operation') {
+          api.inspect.mockResolvedValue(legacyInspectionFixture('service inspect pending'))
+          api.getOperation.mockResolvedValue(legacyInspectionFixture('service inspect'))
+        }
+
+        renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+        await selectPackage()
+        let action = await screen.findByRole('button', { name: label })
+
+        if (confirmLabel) {
+          fireEvent.click(action)
+          action = await screen.findByRole('button', { name: confirmLabel })
+        }
+
+        await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+        const stateCalls = vi.spyOn(h.supervisor, 'reconcilePackage')
+        const state = h.holdState()
+        const projection = deferred<WorkflowMarketplaceOperation>()
+
+        const key =
+          projectionKind === 'detail'
+            ? marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support')
+            : marketplaceKeys.operation(profileScopeKey(scopeA), legacyInspectionFixture('service inspect').id)
+
+        const read = projectionKind === 'detail' ? api.inspect : api.getOperation
+        const before = read.mock.calls.length
+        read.mockReturnValue(projection.promise)
+        elapsed = 300001
+        fireEvent.click(action)
+        fireEvent.click(action)
+        await waitFor(() => expect(read).toHaveBeenCalledTimes(before + 1))
+
+        const joined = h.queryClient.refetchQueries(
+          { queryKey: key, exact: true, type: 'all' },
+          { cancelRefetch: false, throwOnError: true }
+        )
+
+        await waitFor(() => expect(stateCalls).toHaveBeenCalled())
+        await act(async () => {
+          state.resolve(lifecycleStateFixture(installed ? 'service installed untrusted' : 'service absent'))
+          await Promise.all(stateCalls.mock.results.map(result => result.value))
+        })
+        expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe('ready')
+        expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, key).state).toBe('reconciling')
+        expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(0)
+        expect(h.tokens).not.toHaveBeenCalled()
+        expect(read).toHaveBeenCalledTimes(before + 1)
+        await act(async () => {
+          projection.resolve(legacyInspectionFixture('service inspect'))
+          await joined
+        })
+        await waitFor(() => expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(1))
+        expect(h.tokens).toHaveBeenCalledTimes(confirmLabel ? 1 : 0)
+      }
+    )
+  })
+
+  it.each([
+    'changed',
+    'failed',
+    'missing',
+    'binding',
+    'partial',
+    'installed',
+    'busy',
+    'recovery',
+    'state failure',
+    'unmount',
+    'navigation'
+  ] as const)('abandons a held exact projection recovery on %s before POST or token retrieval', async failure => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(false, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    const action = await screen.findByRole('button', { name: 'Install package' })
+    const stateCalls = vi.spyOn(h.supervisor, 'reconcilePackage')
+    const projection = deferred<WorkflowMarketplaceOperation>()
+    const key = marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support')
+    const before = api.inspect.mock.calls.length
+    api.inspect.mockReturnValue(projection.promise)
+    elapsed = 300001
+    fireEvent.click(action)
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(before + 1))
+    await waitFor(() => expect(stateCalls).toHaveBeenCalled())
+    await act(async () => {
+      await Promise.all(stateCalls.mock.results.map(result => result.value))
+    })
+
+    const joined = h.queryClient
+      .refetchQueries({ queryKey: key, exact: true, type: 'all' }, { cancelRefetch: false, throwOnError: true })
+      .catch(() => undefined)
+
+    if (failure === 'missing') {
+      h.queryClient.removeQueries({ queryKey: key, exact: true })
+    } else if (failure === 'binding') {
+      h.changeAuthority('generation')
+      await h.bind()
+    } else if (failure === 'partial') {
+      h.capabilities(['operations', 'package_state'])
+      await h.bind()
+    } else if (failure === 'installed') {
+      h.state('service installed untrusted')
+    } else if (failure === 'busy') {
+      h.state('service absent', false, true)
+    } else if (failure === 'recovery') {
+      h.state('service recovery required')
+    } else if (failure === 'state failure') {
+      h.failOriginRefetches()
+    } else if (failure === 'unmount') {
+      view.unmount()
+    } else if (failure === 'navigation') {
+      view.rerender(
+        <h.Providers>
+          <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
+        </h.Providers>
+      )
+    }
+
+    await act(async () => {
+      if (failure === 'failed') {
+        projection.reject(new Error('Inspection failed'))
+      } else {
+        projection.resolve(
+          failure === 'changed' ? succeededDetail(packageDetail()) : legacyInspectionFixture('service inspect')
+        )
+      }
+
+      await joined
+      await Promise.all(stateCalls.mock.results.map(result => result.value))
+      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(h.tokens).not.toHaveBeenCalled()
+    })
+    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(h.tokens).not.toHaveBeenCalled()
+  })
+
+  it.each(['disabled', 'static'] as const)('does not authorize from a skipped %s exact projection', async kind => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(false, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    const view = renderLifecycleHarness(<ProjectionLifecycleProbe />, h)
+    const action = await screen.findByRole('button', { name: 'Install package' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    const pending = h.holdCapabilities()
+    const before = h.capabilityCalls.length
+    elapsed = 300001
+    fireEvent.click(action)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+    const settled = h.supervisor.reconcileScope(scopeA)
+    view.rerender(
+      <h.Providers>
+        <ProjectionLifecycleProbe enabled={kind !== 'disabled'} staticQuery={kind === 'static'} />
+      </h.Providers>
+    )
+    await act(async () => {
+      pending.resolve()
+      await settled
+    })
+    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(h.tokens).not.toHaveBeenCalled()
   })
 
   it.skip('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {

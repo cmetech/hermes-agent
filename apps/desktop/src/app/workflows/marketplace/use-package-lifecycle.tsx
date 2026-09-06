@@ -1,4 +1,4 @@
-import type { QueryKey } from '@tanstack/react-query'
+import { type QueryKey, useQueryClient } from '@tanstack/react-query'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 
@@ -42,6 +42,7 @@ export function usePackageLifecycle({
   detail
 }: PackageLifecycleProps) {
   const supervisor = useMarketplaceSupervisor()
+  const queryClient = useQueryClient()
   const records = useSyncExternalStore(supervisor.$records.subscribe, supervisor.$records.get)
   useSyncExternalStore(supervisor.reconciliation.$revision.subscribe, supervisor.reconciliation.$revision.get)
   const [attachment, setAttachment] = useState<Attachment | null>(null)
@@ -217,6 +218,30 @@ export function usePackageLifecycle({
           return
         }
 
+        if (expected.projection) {
+          const filter = { queryKey: expected.projection, exact: true, type: 'all' as const }
+          const query = queryClient.getQueryCache().find(filter)
+
+          // A skipped refetch cannot renew the captured projection's authority.
+          if (!query || query.isDisabled() || query.isStatic()) {
+            return
+          }
+
+          try {
+            await queryClient.refetchQueries(filter, { cancelRefetch: false, throwOnError: true })
+          } catch {
+            return
+          }
+
+          if (queryClient.getQueryCache().find(filter) !== query || query.isDisabled() || query.isStatic()) {
+            return
+          }
+        }
+
+        if (!owns() || !supervisor.bindings.isCurrent(binding)) {
+          return
+        }
+
         const state = await supervisor.reconcilePackage(binding, identity)
 
         if (owns() && state && sameLifecycleValue(state.installed, previousInstalled) && actionAllowed(mode)) {
@@ -229,7 +254,7 @@ export function usePackageLifecycle({
         }
       }
     },
-    [actionAllowed, binding, gate.packageState, identity, ready, supervisor, updates]
+    [actionAllowed, binding, gate.packageState, identity, queryClient, ready, supervisor, updates]
   )
 
   function check(action?: HTMLButtonElement) {
