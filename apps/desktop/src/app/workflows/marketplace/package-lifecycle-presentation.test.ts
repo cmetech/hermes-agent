@@ -32,6 +32,12 @@ function record(name: string): SupervisedRecord {
 }
 
 describe('authoritative package lifecycle presentation', () => {
+  it('offers a new check, not preparation or status retry, after an authoritative check error', () => {
+    const actual = packageLifecyclePresentation(record('service failed update check'))
+    expect(actual.retryAction).toBe('check')
+    expect(actual.canPrepareAgain).toBe(false)
+  })
+
   it.each([
     ['service install confirm', 'Installed version 1.0.0'],
     ['service update confirm', 'Updated to version 2.0.0'],

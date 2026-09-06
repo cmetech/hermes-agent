@@ -6,6 +6,7 @@ import type { ReactNode } from 'react'
 
 import {
   LifecycleApiError,
+  type LifecycleClockSample,
   type LifecycleConnectionBinding,
   type LifecycleStart
 } from '@/api/workflow-marketplace-lifecycle'
@@ -80,7 +81,7 @@ export function deferredLifecycle<T>() {
   return { promise, resolve }
 }
 
-export function createLifecycleHarness() {
+export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } })
   const visibility = atom(true)
   const receipts = new Map<string, LifecycleOperation>()
@@ -108,7 +109,7 @@ export function createLifecycleHarness() {
   const supervisor = createMarketplaceSupervisor({
     queryClient,
     visibility,
-    clock: () => ({ wallNowMs: now, monotonicNowMs: 0 }),
+    clock: clock ?? (() => ({ wallNowMs: now, monotonicNowMs: 0 })),
     connections: {
       resolveConnection: async scope => ({ connectionId: scope.connectionId, connectionGeneration }),
       isConnected: () => true,
@@ -121,6 +122,7 @@ export function createLifecycleHarness() {
     api: {
       capabilities: async scope => ({
         ...corpus.capabilities,
+        ...(clock ? { server_time: new Date(clock().wallNowMs).toISOString().replace('.000Z', 'Z') } : {}),
         profile: scope.profile,
         principal_binding: principal,
         registry_epoch: epoch,

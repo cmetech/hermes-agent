@@ -821,6 +821,100 @@ describe('application marketplace operation supervision', () => {
     expect(h.supervisor.supports(binding, ['operations'])).toBe(false)
   })
 
+  it('renews idle authority before expiry through one exact-scope scan', async () => {
+    const h = setup()
+    const binding = (await h.bind())!
+    await vi.advanceTimersByTimeAsync(239999)
+    expect(h.probes()).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.probes()).toBe(2)
+    expect(h.calls.filter(call => call.type === 'list').map(call => call.binding)).toEqual([binding, binding])
+    await vi.advanceTimersByTimeAsync(60001)
+    expect(h.supervisor.supports(binding, ['operations', 'transactions'])).toBe(true)
+    expect(h.posts()).toBe(0)
+  })
+
+  it('replaces the renewal deadline after explicit reconciliation and accounts for slow scans', async () => {
+    const h = setup()
+    await h.bind()
+    await vi.advanceTimersByTimeAsync(239000)
+    const page = deferred<unknown>()
+    const list = h.api.list
+    h.api.list = () => page.promise
+    const pending = h.bind()
+    await vi.advanceTimersByTimeAsync(120000)
+    expect(h.probes()).toBe(2)
+    expect(vi.getTimerCount()).toBe(0)
+    h.api.list = list
+    page.resolve({ items: [], complete: true, next_cursor: null })
+    const binding = (await pending)!
+    await vi.advanceTimersByTimeAsync(119999)
+    expect(h.probes()).toBe(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.probes()).toBe(3)
+    expect(h.supervisor.supports(binding, ['operations'])).toBe(true)
+  })
+
+  it.each(['hidden', 'disconnected', 'suspended', 'reconfigured', 'exhausted', 'disposed'])(
+    'cancels idle renewal when %s',
+    async reason => {
+      const h = setup()
+      const binding = (await h.bind())!
+      expect(vi.getTimerCount()).toBe(1)
+
+      if (reason === 'hidden') {
+        h.visibility.set(false)
+      } else if (reason === 'disconnected') {
+        h.disconnect()
+      } else if (reason === 'reconfigured') {
+        h.changeGeneration()
+      } else if (reason === 'exhausted') {
+        h.notify('marketplace_connection_generation_exhausted')
+      } else if (reason === 'disposed') {
+        h.supervisor.dispose()
+      } else {
+        h.notify('suspended')
+      }
+
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(300001)
+      expect(h.probes()).toBe(1)
+      expect(h.supervisor.supports(binding, ['operations'])).toBe(false)
+    }
+  )
+
+  it('deduplicates renewal with explicit reconciliation and rejects late old-binding capabilities', async () => {
+    const h = setup()
+    const oldBinding = (await h.bind())!
+    const oldSample = h.deferCapabilities()
+    await vi.advanceTimersByTimeAsync(240000)
+    expect(h.probes()).toBe(2)
+    const first = h.bind()
+    expect(h.bind()).toBe(first)
+    expect(h.supervisor.supports(oldBinding, ['operations'])).toBe(false)
+    await expect(h.supervisor.start(h.intent, oldBinding)).rejects.toMatchObject({
+      code: 'marketplace_clock_revalidation_required'
+    })
+    expect(h.posts()).toBe(0)
+    await vi.advanceTimersByTimeAsync(300001)
+    expect(h.probes()).toBe(2)
+    h.changeGeneration()
+    h.resumeCapabilities()
+    const capabilities = h.api.capabilities
+    h.api.capabilities = async input => ({ ...((await capabilities(input)) as object), capabilities: ['operations'] })
+    const current = (await h.bind())!
+    oldSample.resolve(corpus.capabilities)
+    expect(await first).toBeNull()
+    expect(h.supervisor.supports(oldBinding, ['transactions'])).toBe(false)
+    expect(h.supervisor.supports(current, ['operations'])).toBe(true)
+    expect(h.supervisor.supports(current, ['transactions'])).toBe(false)
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(240000)
+    expect(h.probes()).toBe(4)
+    expect(h.supervisor.supports(current, ['operations'])).toBe(true)
+    expect(h.supervisor.supports(current, ['transactions'])).toBe(false)
+  })
+
   it('does not publish capabilities from a late old-binding sample and expires stale authority', async () => {
     const h = setup()
     const oldBinding = (await h.bind())!
@@ -837,8 +931,24 @@ describe('application marketplace operation supervision', () => {
     expect(h.supervisor.supports(oldBinding, ['transactions'])).toBe(false)
     expect(h.supervisor.supports(current, ['transactions'])).toBe(false)
     expect(h.supervisor.supports(current, ['operations'])).toBe(true)
-    await vi.advanceTimersByTimeAsync(300001)
-    expect(h.supervisor.supports(current, ['operations'])).toBe(false)
+
+    // A throttled event loop may not run the renewal timer before both clocks age out.
+    const wall = Date.now(),
+      mono = performance.now()
+
+    const monotonic = vi.spyOn(performance, 'now')
+
+    try {
+      vi.setSystemTime(wall + 300000)
+      monotonic.mockReturnValue(mono + 300000)
+      expect(h.supervisor.supports(current, ['operations'])).toBe(true)
+      vi.setSystemTime(wall + 300001)
+      monotonic.mockReturnValue(mono + 300001)
+      expect(h.supervisor.supports(current, ['operations'])).toBe(false)
+    } finally {
+      monotonic.mockRestore()
+    }
+
     h.notify('marketplace_connection_generation_exhausted')
     expect(h.supervisor.supports(current, [])).toBe(false)
   })

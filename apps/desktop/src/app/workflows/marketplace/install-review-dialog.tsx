@@ -33,6 +33,7 @@ export type InstallReviewDialogView =
       mode: InstallMode
       presentation: PackageLifecyclePresentation
       canPrepareAgain: boolean
+      canRetryCheck: boolean
       canRetry: boolean
     }
   | { kind: 'progress'; mode: InstallMode; phase: string; progress: number; cancellable: boolean }
@@ -54,6 +55,7 @@ export interface InstallReviewDialogProps {
   onRestoreFocus?: () => void
   onConfirm: () => Promise<void>
   onPrepareAgain: () => void
+  onRetryCheck?: () => void
   onRetryStatus?: () => void
   onReviewTrust: () => void
   open: boolean
@@ -221,6 +223,7 @@ export function InstallReviewDialog({
   onRestoreFocus,
   onConfirm,
   onPrepareAgain,
+  onRetryCheck,
   onRetryStatus,
   onReviewTrust,
   open,
@@ -365,6 +368,10 @@ export function InstallReviewDialog({
           ) : view.kind === 'terminal' && view.canRetry && onRetryStatus ? (
             <Button onClick={onRetryStatus} type="button">
               {copy.workflowMarketplaceRetryStatus}
+            </Button>
+          ) : view.kind === 'terminal' && view.canRetryCheck && onRetryCheck ? (
+            <Button onClick={onRetryCheck} type="button">
+              Retry check
             </Button>
           ) : view.kind === 'terminal' && view.canPrepareAgain ? (
             <Button onClick={onPrepareAgain} type="button">

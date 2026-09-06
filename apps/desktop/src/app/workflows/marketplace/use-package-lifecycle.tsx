@@ -357,6 +357,7 @@ export function usePackageLifecycle({
   )
 
   const canPrepareAgain = Boolean(ready && (presentation.canPrepareAgain || record?.status === 'evicted'))
+  const canRetryCheck = Boolean(ready && presentation.retryAction === 'check')
   let installView: InstallReviewDialogView | null = null
   let removeView: RemoveReviewDialogView | null = null
 
@@ -391,7 +392,7 @@ export function usePackageLifecycle({
             result.value.result !== 'unchanged' &&
             mode === 'update'
           ? { kind: 'review', mode, review: result.value }
-          : { kind: 'terminal', mode, presentation, canRetry, canPrepareAgain }
+          : { kind: 'terminal', mode, presentation, canRetry, canPrepareAgain, canRetryCheck }
   }
 
   return {
@@ -514,6 +515,7 @@ function BoundPackageActions(props: PackageLifecycleProps) {
           onConfirm={lifecycle.confirm}
           onPrepareAgain={lifecycle.again}
           onRestoreFocus={lifecycle.restoreFocus}
+          onRetryCheck={() => lifecycle.check()}
           onRetryStatus={lifecycle.retry}
           onReviewTrust={() => undefined}
           open

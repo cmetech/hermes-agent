@@ -16,6 +16,7 @@ export interface PackageLifecyclePresentation {
     | 'review'
   message: string
   canPrepareAgain: boolean
+  retryAction?: 'check'
 }
 
 export const unconfirmedPackagePresentation: PackageLifecyclePresentation = {
@@ -99,7 +100,12 @@ export function packageLifecyclePresentation(
             return { kind: 'update_available', message: 'An update is available.', canPrepareAgain: true }
 
           case 'error':
-            return { kind: 'check_error', message: 'Could not check for updates.', canPrepareAgain: true }
+            return {
+              kind: 'check_error',
+              message: 'Could not check for updates.',
+              canPrepareAgain: false,
+              retryAction: 'check'
+            }
 
           case 'orphaned':
             return {

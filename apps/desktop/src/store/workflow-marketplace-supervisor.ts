@@ -180,6 +180,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
   const samples = new Map<string, { capabilities: unknown; received: LifecycleClockSample }>()
   const scans = new Map<string, Promise<LifecycleConnectionBinding | null>>()
   const scanControllers = new Map<string, AbortController>()
+  const renewals = new Map<string, { binding: LifecycleConnectionBinding; controller: AbortController }>()
   const packageCalls = new Map<AbortController, LifecycleConnectionBinding>()
   const knownScopes = new Map<string, MarketplaceScope>()
   const scanned = new Set<string>()
@@ -225,6 +226,13 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
   }
 
   function clearScopeWork(scope: MarketplaceScope | null) {
+    for (const [key, renewal] of renewals) {
+      if (scope === null || key === scopeKey(scope)) {
+        renewal.controller.abort()
+        renewals.delete(key)
+      }
+    }
+
     for (const [key, controller] of scanControllers) {
       if (scope === null || key === scopeKey(scope)) {
         controller.abort()
@@ -334,6 +342,13 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     },
     changed: scope => {
       reconciliation.changed()
+
+      for (const [key, renewal] of renewals) {
+        if (!bindings.isCurrent(renewal.binding)) {
+          renewal.controller.abort()
+          renewals.delete(key)
+        }
+      }
 
       for (const [key, sample] of supported) {
         if (!bindings.isCurrent(sample.binding)) {
@@ -714,6 +729,29 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     throw invalid()
   }
 
+  function scheduleRenewal(binding: LifecycleConnectionBinding, received: LifecycleClockSample) {
+    const key = scopeKey(binding)
+    renewals.get(key)?.controller.abort()
+    const controller = new AbortController()
+    const renewal = { binding, controller }
+    renewals.set(key, renewal)
+    const now = clock()
+    const elapsed = Math.max(now.wallNowMs - received.wallNowMs, now.monotonicNowMs - received.monotonicNowMs, 0)
+    // Renew before the 300s freshness limit, measured from receipt rather than scan completion.
+    const delay = Number.isFinite(elapsed) ? Math.max(0, 240000 - elapsed) : 0
+    void waitForSupervision(delay, controller.signal)
+      .then(() => {
+        if (renewals.get(key) !== renewal || !usable(binding)) {
+          return
+        }
+
+        renewals.delete(key)
+
+        return reconcileScope(binding)
+      })
+      .catch(() => undefined)
+  }
+
   function reconcileScope(scope: MarketplaceScope, reprobe = true): Promise<LifecycleConnectionBinding | null> {
     if (disposed || status.get() === 'restart_required') {
       return Promise.resolve(null)
@@ -801,6 +839,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         }
 
         scanned.add(key)
+        scheduleRenewal(binding, sample.received)
         reconciliation.changed()
 
         for (const entry of entries) {

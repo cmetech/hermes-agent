@@ -1647,8 +1647,8 @@ describe('workflow package lifecycle', () => {
     vi.unstubAllGlobals()
   })
 
-  async function setupLifecycle(installed = false) {
-    const h = createLifecycleHarness()
+  async function setupLifecycle(installed = false, clock?: Parameters<typeof createLifecycleHarness>[0]) {
+    const h = createLifecycleHarness(clock)
     lifecycleCleanups.push(h.dispose)
 
     if (installed) {
@@ -1696,6 +1696,45 @@ describe('workflow package lifecycle', () => {
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
     await screen.findByRole('region', { name: 'Laptop Support package details' })
   }
+
+  it('renews long-open ready authority and starts exactly one reviewed install with advancing clocks', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(false, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    expect((await screen.findByRole('button', { name: 'Install package' })).hasAttribute('disabled')).toBe(false)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    try {
+      await act(async () => {
+        await h.bind()
+      })
+      await act(async () => {
+        elapsed = 240000
+        await vi.advanceTimersByTimeAsync(240000)
+        elapsed = 300001
+        await vi.advanceTimersByTimeAsync(60001)
+      })
+      const install = screen.getByRole('button', { name: 'Install package' })
+      expect(install.hasAttribute('disabled')).toBe(false)
+      await act(async () => {
+        fireEvent.click(install)
+        fireEvent.click(install)
+      })
+      expect(h.calls.filter(call => call.input?.kind === 'install_prepare')).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(await screen.findByRole('dialog', { name: 'Review installation' })).not.toBeNull()
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(api.prepareInstall).not.toHaveBeenCalled()
+  })
 
   it.skip('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
     const candidate = packageDetail({
@@ -2230,8 +2269,13 @@ describe('workflow package lifecycle', () => {
     expect(h.calls.find(call => call.input?.kind === 'update_check')?.input?.body).toEqual({ identity: state.identity })
     expect(screen.queryByText(/is current|No update was installed|remains installed/)).toBeNull()
     expect(h.calls.some(call => call.input?.kind === 'update_prepare')).toBe(false)
-    fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
+    expect(screen.queryByRole('button', { name: 'Prepare again' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Retry status' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry check' }))
     await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'update_check')).toHaveLength(2))
+    const checks = h.calls.filter(call => call.input?.kind === 'update_check').map(call => call.input!)
+    expect(checks[1].requestId).not.toBe(checks[0].requestId)
+    expect(checks[1].body).toEqual({ identity: state.identity })
     expect(h.tokens).not.toHaveBeenCalled()
     expect(api.inspect).not.toHaveBeenCalled()
   })
