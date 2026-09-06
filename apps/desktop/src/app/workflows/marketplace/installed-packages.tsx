@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { useRef } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import { profileScopeKey } from '@/api/client'
@@ -105,11 +105,29 @@ export function InstalledProvenanceNotice({ context, kind, onRetry }: InstalledP
   )
 }
 
+function InstalledActionSlot({
+  identifier,
+  publish
+}: {
+  identifier: string
+  publish: (identifier: string, node: HTMLDivElement | null) => void
+}) {
+  const ref = useCallback((node: HTMLDivElement | null) => publish(identifier, node), [identifier, publish])
+
+  return <div ref={ref} />
+}
+
 export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
   const { t } = useI18n()
   const copy = t.operations
   const scopeKey = profileScopeKey(scope)
   const focusFallbackRef = useRef<HTMLDivElement>(null)
+  const [actionContainers, setActionContainers] = useState<Record<string, HTMLDivElement | null>>({})
+
+  const publishSlot = useCallback((identifier: string, node: HTMLDivElement | null) => {
+    setActionContainers(current => (current[identifier] === node ? current : { ...current, [identifier]: node }))
+  }, [])
+
   const truth = useMarketplaceReadOnlyScope(scope)
 
   const capabilities = useQuery({
@@ -206,19 +224,12 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                       </li>
                     ))}
                   </ul>
-                  {truth.binding ? (
-                    <SupervisedPackageActions
-                      binding={truth.binding}
-                      focusFallbackRef={focusFallbackRef}
-                      identity={cached.identity}
-                      key={JSON.stringify([truth.binding, cached.identity])}
-                      sourceName={item.source_name}
-                    />
-                  ) : (
+                  <InstalledActionSlot identifier={identifier} publish={publishSlot} />
+                  {!truth.binding ? (
                     <p className="mt-2 text-xs text-(--ui-text-tertiary)" role="status">
                       {copy.workflowMarketplaceLifecycleUnavailable}
                     </p>
-                  )}
+                  ) : null}
                   {truth.binding ? (
                     <Button
                       onClick={() => {
@@ -239,6 +250,18 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
           </div>
         </section>
       ) : null}
+      {truth.supervisor
+        ? packages.map(cached => (
+            <SupervisedPackageActions
+              actionContainer={actionContainers[`${cached.identity.source_key}/${cached.identity.package_id}`] ?? null}
+              binding={truth.binding}
+              focusFallbackRef={focusFallbackRef}
+              identity={cached.identity}
+              key={JSON.stringify([scopeKey, cached.identity])}
+              sourceName={cached.source_name}
+            />
+          ))
+        : null}
       {children}
     </div>
   )

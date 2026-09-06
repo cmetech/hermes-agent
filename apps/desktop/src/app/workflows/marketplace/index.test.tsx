@@ -1736,6 +1736,369 @@ describe('workflow package lifecycle', () => {
     expect(api.prepareInstall).not.toHaveBeenCalled()
   })
 
+  it.each([
+    ['Install package', false, 'install_prepare'],
+    ['Check for updates', true, 'update_check'],
+    ['Update package', true, 'update_check'],
+    ['Remove package', true, 'remove_prepare']
+  ] as const)(
+    'recovers overdue authority for %s before starting the exact intent once',
+    async (label, installed, kind) => {
+      let elapsed = 0
+
+      const h = await setupLifecycle(installed, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
+
+      h.route('update_check', 'service update check')
+      renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      const button = await screen.findByRole('button', { name: label })
+      expect(button.hasAttribute('disabled')).toBe(false)
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      fireEvent.click(button)
+      fireEvent.click(button)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(screen.getByText('Refreshing package state')).not.toBeNull()
+      const concurrent = h.supervisor.reconcileScope(scopeA)
+      pending.resolve()
+      await concurrent
+      await waitFor(() => expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(1))
+      expect(h.capabilityCalls).toHaveLength(before + 1)
+      expect(h.capabilityCalls.at(-1)).toEqual({
+        connectionId: 'remote-a',
+        profile: 'support',
+        connectionGeneration: 1
+      })
+      expect(h.tokens).not.toHaveBeenCalled()
+    }
+  )
+
+  it('refreshes overdue confirm authority before requesting a token or committing', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(false, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    fireEvent.click(await screen.findByRole('button', { name: 'Install package' }))
+    const confirm = await screen.findByRole('button', { name: 'Confirm install' })
+    await waitFor(() => expect(confirm.hasAttribute('disabled')).toBe(false))
+    const before = h.capabilityCalls.length
+    const pending = h.holdCapabilities()
+    elapsed = 300001
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(h.calls.some(call => call.input?.kind === 'install_confirm')).toBe(false)
+    pending.resolve()
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'install_confirm')).toHaveLength(1))
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['Check for updates', 'update_check'],
+    ['Update package', 'update_check'],
+    ['Remove package', 'remove_prepare']
+  ] as const)('retains an Installed-view overdue %s intent through temporary quarantine', async (label, kind) => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(true, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    h.route('update_check', 'service update check')
+    api.installed.mockResolvedValue({
+      profile: 'support',
+      packages: [lifecycleStateFixture('service installed untrusted').installed]
+    })
+
+    const view = renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose workflows</div>
+      </InstalledPackages>,
+      h
+    )
+
+    const button = await screen.findByRole('button', { name: label })
+    await waitFor(() => expect(button.hasAttribute('disabled')).toBe(false))
+    const before = h.capabilityCalls.length
+    const pending = h.holdCapabilities()
+    elapsed = 300001
+    fireEvent.click(button)
+    fireEvent.click(button)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+    expect(screen.queryByRole('article')).toBeNull()
+    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    pending.resolve()
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(1))
+    expect(h.capabilityCalls).toHaveLength(before + 1)
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Close' }))[0])
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(view.container.firstElementChild))
+  })
+
+  describe.each(['Marketplace', 'Installed'] as const)('%s overdue recovery fencing', surface => {
+    it.each([
+      'partial',
+      'updates unsupported',
+      'generation',
+      'principal',
+      'epoch',
+      'absent',
+      'changed',
+      'busy',
+      'recovery',
+      'probe failure',
+      'state failure',
+      'unmount',
+      'navigation'
+    ] as const)('abandons the exact pending check on %s', async change => {
+      let elapsed = 0
+
+      const h = await setupLifecycle(true, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
+
+      h.route('update_check', 'service update check')
+      api.installed.mockResolvedValue({
+        profile: 'support',
+        packages: [lifecycleStateFixture('service installed untrusted').installed]
+      })
+
+      const content = (scope: typeof scopeA) =>
+        surface === 'Marketplace' ? (
+          <WorkflowMarketplaceView scope={scope} />
+        ) : (
+          <InstalledPackages scope={scope}>
+            <div>Loose workflows</div>
+          </InstalledPackages>
+        )
+
+      const view = renderLifecycleHarness(content(scopeA), h)
+
+      if (surface === 'Marketplace') {
+        await selectPackage()
+      }
+
+      const action = await screen.findByRole('button', { name: 'Check for updates' })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      fireEvent.click(action)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      const settled = h.supervisor.reconcileScope(scopeA)
+
+      if (change === 'partial') {
+        h.capabilities(['operations', 'package_state'])
+      } else if (change === 'updates unsupported') {
+        h.capabilities(['operations', 'admission_replay', 'package_state', 'transactions'])
+      } else if (change === 'generation' || change === 'principal' || change === 'epoch') {
+        h.changeAuthority(change)
+      } else if (change === 'absent') {
+        h.state('service absent')
+      } else if (change === 'changed') {
+        h.stateFromOutcome('service update confirm')
+      } else if (change === 'busy') {
+        h.state('service installed untrusted', false, true)
+      } else if (change === 'recovery') {
+        h.state('service recovery required')
+      } else if (change === 'probe failure') {
+        h.failCapabilities()
+      } else if (change === 'state failure') {
+        h.failOriginRefetches()
+      } else if (change === 'unmount') {
+        view.unmount()
+      } else {
+        view.rerender(<h.Providers>{content({ connectionId: 'remote-b', profile: 'support' })}</h.Providers>)
+      }
+
+      await act(async () => {
+        pending.resolve()
+        await settled
+      })
+      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(h.tokens).not.toHaveBeenCalled()
+      expect(screen.queryByRole('dialog')).toBeNull()
+    })
+  })
+
+  it('deduplicates an overdue proactive deadline with rapid action-time recovery', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(false, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    await screen.findByRole('button', { name: 'Install package' })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    try {
+      await act(async () => {
+        await h.bind()
+      })
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      const button = screen.getByRole('button', { name: 'Install package' })
+      await act(async () => {
+        fireEvent.click(button)
+        fireEvent.click(button)
+        await vi.advanceTimersByTimeAsync(240000)
+      })
+      expect(h.capabilityCalls).toHaveLength(before + 1)
+      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      await act(async () => {
+        pending.resolve()
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(h.calls.filter(call => call.input?.kind === 'install_prepare')).toHaveLength(1)
+      expect(h.capabilityCalls).toHaveLength(before + 1)
+    } finally {
+      h.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['update', 'remove'] as const)(
+    'recovers overdue Installed-view %s confirmation with the same reviewed package',
+    async mode => {
+      let elapsed = 0
+
+      const h = await setupLifecycle(true, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
+
+      api.installed.mockResolvedValue({
+        profile: 'support',
+        packages: [lifecycleStateFixture('service installed untrusted').installed]
+      })
+      renderLifecycleHarness(
+        <InstalledPackages scope={scopeA}>
+          <div>Loose workflows</div>
+        </InstalledPackages>,
+        h
+      )
+      fireEvent.click(
+        await screen.findByRole('button', { name: mode === 'update' ? 'Update package' : 'Remove package' })
+      )
+
+      const confirm = await screen.findByRole('button', {
+        name: mode === 'update' ? 'Confirm update' : 'Remove package'
+      })
+
+      await waitFor(() => expect(confirm.hasAttribute('disabled')).toBe(false))
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      fireEvent.click(confirm)
+      fireEvent.click(confirm)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      expect(h.tokens).not.toHaveBeenCalled()
+      pending.resolve()
+      await waitFor(() => expect(h.calls.filter(call => call.input?.kind === mode + '_confirm')).toHaveLength(1))
+      expect(h.tokens).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it.each(['partial', 'changed', 'navigation', 'unmount'] as const)(
+    'abandons overdue confirmation before token fetch on %s',
+    async change => {
+      let elapsed = 0
+
+      const h = await setupLifecycle(false, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
+
+      const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      fireEvent.click(await screen.findByRole('button', { name: 'Install package' }))
+      const confirm = await screen.findByRole('button', { name: 'Confirm install' })
+      await waitFor(() => expect(confirm.hasAttribute('disabled')).toBe(false))
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      fireEvent.click(confirm)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      const settled = h.supervisor.reconcileScope(scopeA)
+
+      if (change === 'partial') {
+        h.capabilities(['operations'])
+      } else if (change === 'changed') {
+        h.state('service installed untrusted')
+      } else if (change === 'navigation') {
+        view.rerender(
+          <h.Providers>
+            <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
+          </h.Providers>
+        )
+      } else {
+        view.unmount()
+      }
+
+      await act(async () => {
+        pending.resolve()
+        await settled
+      })
+      expect(h.tokens).not.toHaveBeenCalled()
+      expect(h.calls.some(call => call.input?.kind === 'install_confirm')).toBe(false)
+    }
+  )
+
+  it('does not resume an overdue install when its selected inspection changes during recovery', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(false, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    const button = await screen.findByRole('button', { name: 'Install package' })
+    const before = h.capabilityCalls.length
+    const pending = h.holdCapabilities()
+    elapsed = 300001
+    fireEvent.click(button)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+    const settled = h.supervisor.reconcileScope(scopeA)
+
+    const changed = succeededDetail(
+      packageDetail({
+        blockers: [{ code: 'package_invalid', message: 'Changed inspection is blocked.', severity: 'blocker' }]
+      })
+    )
+
+    api.inspect.mockResolvedValue(changed)
+    await act(async () => {
+      h.queryClient.setQueryData(marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support'), changed)
+    })
+    await act(async () => {
+      pending.resolve()
+      await settled
+    })
+    expect(
+      h.queryClient.getQueryData(marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support'))
+    ).toMatchObject({ result: { value: { blockers: [{ code: 'package_invalid' }] } } })
+    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
   it.skip('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
     const candidate = packageDetail({
       install_status: 'not_installed',

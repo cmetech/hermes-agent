@@ -104,6 +104,9 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   let loseResponse = false
   let declared = corpus.capabilities.capabilities
   let mismatch = false
+  let capabilityWait: ReturnType<typeof deferredLifecycle<void>> | null = null
+  let capabilityFailure = false
+  const capabilityCalls: Array<{ connectionId: string | null; profile: string; connectionGeneration: number }> = []
   const now = Date.parse(corpus.capabilities.server_time)
 
   const supervisor = createMarketplaceSupervisor({
@@ -120,14 +123,30 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
       }
     },
     api: {
-      capabilities: async scope => ({
-        ...corpus.capabilities,
-        ...(clock ? { server_time: new Date(clock().wallNowMs).toISOString().replace('.000Z', 'Z') } : {}),
-        profile: scope.profile,
-        principal_binding: principal,
-        registry_epoch: epoch,
-        capabilities: declared
-      }),
+      capabilities: async scope => {
+        capabilityCalls.push(scope)
+        await capabilityWait?.promise
+
+        if (capabilityFailure) {
+          throw new LifecycleApiError('marketplace_network_error', 0)
+        }
+
+        return {
+          ...corpus.capabilities,
+          ...(clock
+            ? {
+                server_time: new Date(clock().wallNowMs)
+                  .toISOString()
+                  .replace('.000Z', 'Z')
+                  .replace(/(\.\d{3})Z$/, '$1000Z')
+              }
+            : {}),
+          profile: scope.profile,
+          principal_binding: principal,
+          registry_epoch: epoch,
+          capabilities: declared
+        }
+      },
       list: async () => ({ ...corpus.operationPageFinal, items: [] }),
       start: async (input: LifecycleStart) => {
         calls.push({ type: 'start', input })
@@ -319,6 +338,11 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     mutate,
     Providers,
     calls,
+    capabilityCalls,
+    holdCapabilities: () => (capabilityWait = deferredLifecycle<void>()),
+    failCapabilities: () => {
+      capabilityFailure = true
+    },
     receipts,
     route: (kind: LifecycleOperation['kind'], name: string) => routes.set(kind, name),
     capabilities: (values: string[]) => {
@@ -348,6 +372,15 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
       if (orphaned && packageState.installed) {
         packageState = { ...packageState, installed: { ...packageState.installed, orphaned_source: true } }
       }
+    },
+    stateFromOutcome: (name: string) => {
+      const outcome = lifecycleFixture(name).outcome
+
+      if (!outcome || !('package_state' in outcome) || !outcome.package_state) {
+        throw new Error('Expected authoritative PackageState outcome')
+      }
+
+      packageState = outcome.package_state
     },
     holdState: () => {
       stateRead = deferredLifecycle<unknown>()

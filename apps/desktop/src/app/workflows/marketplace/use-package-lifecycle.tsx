@@ -1,5 +1,5 @@
 import type { QueryKey } from '@tanstack/react-query'
-import { type RefObject, useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 
 import { getLifecycleReviewToken, type LifecycleConnectionBinding } from '@/api/workflow-marketplace-lifecycle'
@@ -49,6 +49,12 @@ export function usePackageLifecycle({
   const origin = useRef<HTMLButtonElement | null>(null)
   const secret = useRef<string | null>(null)
   const confirming = useRef(false)
+  const refreshing = useRef<object | null>(null)
+  const [refreshPending, setRefreshPending] = useState(false)
+  const latest = useRef({ binding, identity, detail, projection })
+  useLayoutEffect(() => {
+    latest.current = { binding, identity, detail, projection }
+  }, [binding, identity, detail, projection])
   const advancedChecks = useRef(new Set<string>())
   const reconciled = useRef(new Set<string>())
   const gate = supervisor.getPackageGate(binding, identity, projection)
@@ -66,6 +72,7 @@ export function usePackageLifecycle({
       owner.current = null
       secret.current = null
       confirming.current = false
+      refreshing.current = null
     },
     []
   )
@@ -135,7 +142,7 @@ export function usePackageLifecycle({
   )
 
   const supported = supervisor.supports(binding, ['operations', 'admission_replay', 'package_state', 'transactions'])
-  const ready = supported && gate.state === 'ready'
+  const ready = supported && gate.state === 'ready' && !refreshPending
   const updates = supervisor.supports(binding, ['updates'])
 
   const actionAllowed = useCallback(
@@ -166,8 +173,67 @@ export function usePackageLifecycle({
     [binding, detail, identity, projection, supervisor]
   )
 
+  const withAuthority = useCallback(
+    async (mode: Mode, execute: () => void | Promise<void>) => {
+      if (refreshing.current) {
+        return
+      }
+
+      if (actionAllowed(mode)) {
+        await execute()
+
+        return
+      }
+
+      // Only recover an intent initiated from the previously ready presentation.
+      if (!ready || (mode === 'update' && !updates)) {
+        return
+      }
+
+      const ticket = {}
+      const expectedOwner = owner.current
+      const expected = latest.current
+      const previousInstalled = gate.packageState?.installed
+      refreshing.current = ticket
+      setRefreshPending(true)
+
+      const owns = () =>
+        refreshing.current === ticket &&
+        owner.current === expectedOwner &&
+        sameLifecycleValue(latest.current.binding, expected.binding) &&
+        sameLifecycleIdentity(latest.current.identity, expected.identity) &&
+        sameLifecycleValue(latest.current.detail, expected.detail) &&
+        sameLifecycleValue(latest.current.projection, expected.projection)
+
+      try {
+        const fresh = await supervisor.reconcileScope({ connectionId: binding.connectionId, profile: binding.profile })
+
+        if (
+          !owns() ||
+          !sameLifecycleValue(fresh, binding) ||
+          !supervisor.supports(binding, ['operations', 'admission_replay', 'package_state', 'transactions']) ||
+          (mode === 'update' && !supervisor.supports(binding, ['updates']))
+        ) {
+          return
+        }
+
+        const state = await supervisor.reconcilePackage(binding, identity)
+
+        if (owns() && state && sameLifecycleValue(state.installed, previousInstalled) && actionAllowed(mode)) {
+          await execute()
+        }
+      } finally {
+        if (refreshing.current === ticket) {
+          refreshing.current = null
+          setRefreshPending(false)
+        }
+      }
+    },
+    [actionAllowed, binding, gate.packageState, identity, ready, supervisor, updates]
+  )
+
   function check(action?: HTMLButtonElement) {
-    if (!actionAllowed('update') || (owner.current && action)) {
+    if (owner.current && action) {
       return
     }
 
@@ -176,15 +242,17 @@ export function usePackageLifecycle({
     }
 
     secret.current = null
-    void dispatch(
-      { kind: 'update_check', subject: { type: 'package', identity }, selection: null, body: { identity } },
-      { mode: 'update', requestId: null, failed: false }
+    void withAuthority('update', () =>
+      dispatch(
+        { kind: 'update_check', subject: { type: 'package', identity }, selection: null, body: { identity } },
+        { mode: 'update', requestId: null, failed: false }
+      )
     )
   }
 
   const prepare = useCallback(
     (mode: Mode, action?: HTMLButtonElement) => {
-      if (!actionAllowed(mode) || (owner.current && action)) {
+      if (owner.current && action) {
         return
       }
 
@@ -197,31 +265,37 @@ export function usePackageLifecycle({
       const current = { mode, requestId: null, failed: false }
 
       if (mode === 'install') {
-        void dispatch(
-          {
-            kind: 'install_prepare',
-            subject,
-            selection: null,
-            body: { identifier: identity.source_key + '/' + identity.package_id, ref: null, package_path: null }
-          },
-          current
+        void withAuthority(mode, () =>
+          dispatch(
+            {
+              kind: 'install_prepare',
+              subject,
+              selection: null,
+              body: { identifier: identity.source_key + '/' + identity.package_id, ref: null, package_path: null }
+            },
+            current
+          )
         )
       } else {
-        void dispatch(
-          {
-            kind: mode === 'remove' ? 'remove_prepare' : 'update_prepare',
-            subject,
-            selection: null,
-            body: { identity }
-          },
-          current
+        void withAuthority(mode, () =>
+          dispatch(
+            {
+              kind: mode === 'remove' ? 'remove_prepare' : 'update_prepare',
+              subject,
+              selection: null,
+              body: { identity }
+            },
+            current
+          )
         )
       }
     },
-    [actionAllowed, dispatch, identity]
+    [dispatch, identity, withAuthority]
   )
 
   function close() {
+    refreshing.current = null
+    setRefreshPending(false)
     owner.current = null
     secret.current = null
     setAttachment(null)
@@ -281,7 +355,6 @@ export function usePackageLifecycle({
       !current ||
       current !== attachment ||
       confirming.current ||
-      !actionAllowed(current.mode) ||
       !prepared ||
       record?.status !== 'terminal' ||
       prepared.kind !== current.mode + '_prepare' ||
@@ -303,50 +376,54 @@ export function usePackageLifecycle({
     }
 
     confirming.current = true
+    const subject = prepared.subject
+    const reviewDigest = result.value.review_digest
 
-    try {
-      let token: ReviewTokenResponse | null = await getLifecycleReviewToken(prepared, binding)
+    await withAuthority(current.mode, async () => {
+      try {
+        let token: ReviewTokenResponse | null = await getLifecycleReviewToken(prepared, binding)
 
-      if (owner.current !== current || !supervisor.bindings.isCurrent(binding) || !actionAllowed(current.mode)) {
-        return
-      }
+        if (owner.current !== current || !supervisor.bindings.isCurrent(binding) || !actionAllowed(current.mode)) {
+          return
+        }
 
-      secret.current = token.confirmation_token
+        secret.current = token.confirmation_token
 
-      const body = {
-        confirmation_token: secret.current,
-        prepare_operation_id: prepared.id,
-        subject: prepared.subject,
-        selection: null,
-        review_digest: result.value.review_digest
-      }
-
-      token = null
-      secret.current = null
-      await dispatch(
-        {
-          kind:
-            current.mode === 'install'
-              ? 'install_confirm'
-              : current.mode === 'update'
-                ? 'update_confirm'
-                : 'remove_confirm',
-          subject: prepared.subject,
+        const body = {
+          confirmation_token: secret.current,
+          prepare_operation_id: prepared.id,
+          subject,
           selection: null,
-          body
-        },
-        { mode: current.mode, requestId: null, failed: false, preparation: prepared }
-      )
-    } catch {
-      if (owner.current === current && supervisor.bindings.isCurrent(binding)) {
-        const next = { ...current, tokenUnavailable: true }
-        owner.current = next
-        setAttachment(next)
+          review_digest: reviewDigest
+        }
+
+        token = null
+        secret.current = null
+        await dispatch(
+          {
+            kind:
+              current.mode === 'install'
+                ? 'install_confirm'
+                : current.mode === 'update'
+                  ? 'update_confirm'
+                  : 'remove_confirm',
+            subject,
+            selection: null,
+            body
+          },
+          { mode: current.mode, requestId: null, failed: false, preparation: prepared }
+        )
+      } catch {
+        if (owner.current === current && supervisor.bindings.isCurrent(binding)) {
+          const next = { ...current, tokenUnavailable: true }
+          owner.current = next
+          setAttachment(next)
+        }
+      } finally {
+        secret.current = null
       }
-    } finally {
-      secret.current = null
-      confirming.current = false
-    }
+    })
+    confirming.current = false
   }
 
   const progress =
@@ -397,7 +474,7 @@ export function usePackageLifecycle({
 
   return {
     ready,
-    canConfirm: Boolean(attachment && actionAllowed(attachment.mode)),
+    canConfirm: Boolean(!refreshPending && attachment && actionAllowed(attachment.mode)),
     updates,
     gate,
     prepare,
