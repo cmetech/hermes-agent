@@ -10,21 +10,20 @@ import { SearchField } from '@/components/ui/search-field'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   getWorkflowMarketplaceCapabilities,
-  getWorkflowMarketplaceOperation,
-  inspectWorkflowPackage,
   isWorkflowMarketplaceUnsupportedError,
   listInstalledWorkflowPackages,
   listWorkflowMarketplaceSources,
-  refreshWorkflowMarketplaceSource,
   searchWorkflowPackages
 } from '@/hermes'
 import type { WorkflowMarketplaceScope } from '@/hermes'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useI18n } from '@/i18n'
 import { ChevronLeft, RefreshCw } from '@/lib/icons'
-import type { WorkflowMarketplaceOperation, WorkflowMarketplacePackageDetail } from '@/types/hermes'
+import type { WorkflowMarketplacePackageDetail } from '@/types/hermes'
+import type { LifecycleOperation } from '@/types/workflow-marketplace-lifecycle'
 
 import { installedProvenanceErrorKind, InstalledProvenanceNotice } from './installed-packages'
+import { marketplaceEscapeIsOwned } from './lifecycle-dialog-behavior'
 import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList, type MarketplacePackageSelection } from './package-list'
 import { marketplaceKeys } from './query-keys'
@@ -73,10 +72,8 @@ function errorCode(error: unknown): null | string {
   return typeof error.code === 'string' ? error.code : null
 }
 
-function detailFrom(operation: WorkflowMarketplaceOperation | undefined): null | WorkflowMarketplacePackageDetail {
-  return operation?.kind === 'package_detail' &&
-    operation.state === 'succeeded' &&
-    operation.result.type === 'package_detail'
+function detailFrom(operation: LifecycleOperation | undefined): null | WorkflowMarketplacePackageDetail {
+  return operation?.kind === 'inspect' && operation.state === 'succeeded' && operation.result?.type === 'package_detail'
     ? operation.result.value
     : null
 }
@@ -87,14 +84,6 @@ function capabilityErrorKind(error: unknown): 'auth' | 'error' | 'unsupported' {
   }
 
   return errorStatus(error) === 401 || errorStatus(error) === 403 ? 'auth' : 'error'
-}
-
-function operationNeedsPolling(operation: WorkflowMarketplaceOperation | undefined): boolean {
-  return operation?.state === 'pending' || operation?.state === 'running'
-}
-
-function operationWasLost(error: unknown): boolean {
-  return errorCode(error) === 'marketplace_operation_not_found'
 }
 
 export interface WorkflowMarketplaceViewProps {
@@ -136,9 +125,18 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const supportsSearch = capabilities.data?.capabilities.includes('search') === true
   const supportsSources = capabilities.data?.capabilities.includes('sources') === true
   const supportsInstalled = capabilities.data?.capabilities.includes('installed') === true
-  const supportsOperations = capabilities.data?.capabilities.includes('operations') === true
-  const supportsSourceOperations = supportsSources && supportsOperations
-  const sourceOperations = useMarketplaceOperation(scope, supportsSourceOperations)
+
+  const supportsSourceOperations = Boolean(
+    supportsSources &&
+    truth.binding &&
+    truth.supervisor?.supports(truth.binding, ['operations', 'admission_replay', 'sources'])
+  )
+
+  const supportsInspection = Boolean(
+    truth.binding && truth.supervisor?.supports(truth.binding, ['operations', 'admission_replay', 'inspect'])
+  )
+
+  const sourceOperations = useMarketplaceOperation(scope, truth.binding, truth.supervisor, supportsSourceOperations)
 
   if (refreshAllGuardRef.current?.scopeKey !== scopeKey) {
     refreshAllGuardRef.current = null
@@ -202,47 +200,55 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   })
 
   const detailRequest = useQuery({
-    enabled: selection !== null && !truth.quarantined,
-    queryFn: () => inspectWorkflowPackage(selection!.sourceName, selection!.packageId, scope),
+    enabled: selection !== null && supportsInspection && !truth.quarantined,
+    queryFn: async ({ signal }) => {
+      const current = selection
+      const binding = truth.binding
+      const supervisor = truth.supervisor
+
+      if (!current || !binding || !supervisor) {
+        throw new Error('Workflow marketplace inspection is unavailable.')
+      }
+
+      const key = await supervisor.start(
+        {
+          kind: 'inspect',
+          subject: {
+            type: 'package',
+            identity: { source_key: current.sourceName, package_id: current.packageId }
+          },
+          selection: null,
+          body: {}
+        },
+        binding
+      )
+
+      const record = await supervisor.waitForRecord(key, signal)
+      const operation = record.operation
+
+      if (
+        record.status !== 'terminal' ||
+        !operation ||
+        operation.kind !== 'inspect' ||
+        operation.state !== 'succeeded' ||
+        operation.result?.type !== 'package_detail'
+      ) {
+        throw new Error('Workflow marketplace inspection did not complete.')
+      }
+
+      return operation
+    },
     queryKey: selection
       ? marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
       : marketplaceKeys.detail(scopeKey, '', ''),
     retry: false
   })
 
-  const operationId = detailRequest.data?.id ?? null
-  const needsDetailPolling = operationNeedsPolling(detailRequest.data)
+  const detail = detailFrom(detailRequest.data)
 
-  const detailOperation = useQuery({
-    enabled: Boolean(operationId && needsDetailPolling) && !truth.quarantined,
-    queryFn: () => getWorkflowMarketplaceOperation(operationId!, scope),
-    queryKey: marketplaceKeys.operation(scopeKey, operationId ?? 'none'),
-    refetchInterval: query => {
-      if (query.state.status === 'error') {
-        return false
-      }
+  const detailFailed = !detail && (detailRequest.isError || (selection !== null && !supportsInspection))
 
-      const operation = query.state.data
-
-      return operation &&
-        (operation.state === 'succeeded' || operation.state === 'failed' || operation.state === 'cancelled')
-        ? false
-        : 500
-    },
-    retry: false
-  })
-
-  const effectiveOperation = needsDetailPolling ? (detailOperation.data ?? detailRequest.data) : detailRequest.data
-  const detail = detailFrom(effectiveOperation)
-
-  const detailFailed =
-    !detail &&
-    (detailRequest.isError ||
-      (needsDetailPolling && detailOperation.isError) ||
-      effectiveOperation?.state === 'failed' ||
-      effectiveOperation?.state === 'cancelled')
-
-  const detailLoading = selection !== null && !detail && !detailFailed
+  const detailLoading = selection !== null && supportsInspection && !detail && !detailFailed
 
   const selectedRetryInFlight =
     selection !== null &&
@@ -250,7 +256,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     detailRetryState.sourceName === selection.sourceName &&
     detailRetryState.packageId === selection.packageId
 
-  const detailRetrying = detailRequest.isFetching || detailOperation.isFetching || selectedRetryInFlight
+  const detailRetrying = detailRequest.isFetching || selectedRetryInFlight
   const items = packages.data?.items ?? []
   const installedPackages = installed.data?.packages ?? []
   const selectedStillVisible = selection ? items.some(item => item.identifier === selection.identifier) : false
@@ -381,11 +387,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     detailRetryRef.current = retry
     setDetailRetryState(retry)
 
-    if (needsDetailPolling && detailOperation.isError && !operationWasLost(detailOperation.error)) {
-      void detailOperation.refetch().finally(release)
-    } else {
-      void detailRequest.refetch().finally(release)
-    }
+    void detailRequest.refetch().finally(release)
   }
 
   const refreshAllSources = async () => {
@@ -406,7 +408,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
           break
         }
 
-        await sourceOperations.start(source.name, () => refreshWorkflowMarketplaceSource(source.name, scope), origin)
+        await sourceOperations.start(source.name, origin)
 
         if (!sourceOperations.originIsCurrent(origin)) {
           break
@@ -542,9 +544,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
               truth.binding &&
               truth.packageGate(
                 detail.identity,
-                needsDetailPolling
-                  ? marketplaceKeys.operation(scopeKey, operationId ?? 'none')
-                  : marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
+                marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
               )?.state !== 'ready'
             )}
             lifecycleUnavailable={!truth.binding}
@@ -592,11 +592,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         focusFallbackRef={searchRef}
         identity={detail.identity}
         key={JSON.stringify([scopeKey, detail.identity])}
-        projection={
-          needsDetailPolling
-            ? marketplaceKeys.operation(scopeKey, operationId ?? 'none')
-            : marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)
-        }
+        projection={marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)}
         sourceName={detail.source_name}
       />
     ) : null
@@ -614,7 +610,7 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
     <section
       className="flex h-full min-h-0 flex-col"
       onKeyDown={event => {
-        if (event.key === 'Escape' && narrow && selection) {
+        if (event.key === 'Escape' && !marketplaceEscapeIsOwned(event) && narrow && selection) {
           event.stopPropagation()
           backToPackages()
         }
@@ -655,19 +651,25 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
               ))}
             </SelectContent>
           </Select>
-          {supportsSourceOperations ? (
+          {supportsSources ? (
             <>
-              <Button
-                aria-busy={refreshingSources}
-                disabled={refreshingSources || !sources.data?.sources.some(source => source.enabled)}
-                onClick={() => void refreshAllSources()}
-                size="sm"
-                type="button"
-                variant="secondary"
-              >
-                <RefreshCw className="size-4" />
-                {copy.workflowMarketplaceRefresh}
-              </Button>
+              {supportsSourceOperations ? (
+                <Button
+                  aria-busy={refreshingSources}
+                  disabled={refreshingSources || !sources.data?.sources.some(source => source.enabled)}
+                  onClick={() => void refreshAllSources()}
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  <RefreshCw className="size-4" />
+                  {copy.workflowMarketplaceRefresh}
+                </Button>
+              ) : (
+                <span className="text-xs text-(--ui-text-tertiary)" role="status">
+                  {copy.workflowMarketplaceUnsupportedSources}
+                </span>
+              )}
               <Button
                 onClick={() => setSourcesDialogOpen(true)}
                 ref={manageSourcesRef}
@@ -705,8 +707,9 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         onClose={closeSources}
         open={sourcesDialogOpen}
         operations={sourceOperations}
+        refreshSupported={supportsSourceOperations}
         scope={scope}
-        supported={supportsSourceOperations}
+        supported={supportsSources}
       />
 
       {stale && !(narrow && selection) ? (

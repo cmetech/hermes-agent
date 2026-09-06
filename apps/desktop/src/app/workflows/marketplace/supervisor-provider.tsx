@@ -57,12 +57,14 @@ export function useMarketplaceReadOnlyScope(input: ProfileScope) {
 function readOnlySnapshot(supervisor: Supervisor | null, scope: MarketplaceScope, revision: number) {
   const state = supervisor?.bindings.state(scope)
   const binding = state && 'binding' in state ? state.binding : null
+  const lifecycleUnsupported = state?.kind === 'unsupported'
 
   return {
     supervisor,
     binding,
     revision,
-    quarantined: Boolean(supervisor && !binding),
+    quarantined: Boolean(supervisor && !binding && !lifecycleUnsupported),
+    lifecycleUnsupported,
     catalogState: supervisor && binding ? supervisor.reconciliation.scopeState(binding) : 'unknown',
     packageGate: (identity: PackageIdentity, projection?: QueryKey) =>
       supervisor && binding ? supervisor.getPackageGate(binding, identity, projection) : null,

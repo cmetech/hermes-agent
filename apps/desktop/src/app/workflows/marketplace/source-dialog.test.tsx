@@ -328,6 +328,7 @@ describe('ManageWorkflowSourcesDialog', () => {
         ;(secondName === 'company' ? company : team).resolve({ profile: 'support', source: source() })
         await Promise.resolve()
       }
+
       ;(firstName === 'company' ? company : team).resolve({ profile: 'support', source: source() })
       await waitFor(() =>
         expect(
@@ -363,6 +364,7 @@ describe('ManageWorkflowSourcesDialog', () => {
   it('keeps source mutations functional and single-admission under StrictMode replay', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const controller = operations()
+
     const view = render(
       <StrictMode>
         <QueryClientProvider client={client}>
@@ -496,10 +498,11 @@ describe('ManageWorkflowSourcesDialog', () => {
     const first = deferred<null>()
     let activeScopeKey = 'remote-a::support'
     const starts: Array<{ name: string; scopeKey: string }> = []
+
     const controller = operations({
       captureOrigin: vi.fn(() => ({ generation: 1, scopeKey: activeScopeKey })),
       originIsCurrent: vi.fn(origin => origin.scopeKey === activeScopeKey),
-      start: vi.fn(async (name, _request, origin) => {
+      start: vi.fn(async (name, origin) => {
         starts.push({ name, scopeKey: origin?.scopeKey ?? '' })
 
         if (origin?.scopeKey === 'remote-a::support' && name === 'company') {
@@ -509,6 +512,7 @@ describe('ManageWorkflowSourcesDialog', () => {
         return null
       })
     })
+
     const view = renderDialog(controller)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Refresh all' }))
@@ -571,11 +575,13 @@ describe('ManageWorkflowSourcesDialog', () => {
 
   it('retries a transient operation status read without admitting a new refresh', async () => {
     const active = runningOperation()
+
     const controller = operations({
       errors: { company: 'status' },
       operationForSource: vi.fn(() => active),
       retry: vi.fn().mockResolvedValue(active)
     })
+
     renderDialog(controller)
 
     const row = await screen.findByRole('article', { name: 'company source' })
@@ -593,7 +599,7 @@ describe('ManageWorkflowSourcesDialog', () => {
     fireEvent.click(within(row).getByRole('button', { name: 'Retry' }))
 
     await waitFor(() => expect(controller.start).toHaveBeenCalledTimes(1))
-    expect(controller.start).toHaveBeenCalledWith('company', expect.any(Function))
+    expect(controller.start).toHaveBeenCalledWith('company')
     expect(controller.retry).not.toHaveBeenCalled()
   })
 
@@ -672,6 +678,7 @@ describe('ManageWorkflowSourcesDialog', () => {
           )
         )
       }
+
       const resolveB = async () => {
         const before = invalidate.mock.calls.length
         await act(async () => pendingB.resolve({ profile: 'support', source: source({ enabled: false }) }))

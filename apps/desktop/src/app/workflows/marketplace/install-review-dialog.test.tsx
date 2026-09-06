@@ -284,11 +284,11 @@ describe('InstallReviewDialog', () => {
     expect(dialog.className).toContain('w-[min(92vw,54rem)]')
 
     fireEvent.click(screen.getByRole('button', { name: 'Confirm install' }))
-    fireEvent.keyDown(globalThis.document, { key: 'Escape' })
+    fireEvent.keyDown(dialog, { key: 'Escape' })
     expect(onClose).not.toHaveBeenCalled()
 
     await act(async () => admission.resolve())
-    fireEvent.keyDown(globalThis.document, { key: 'Escape' })
+    fireEvent.keyDown(dialog, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledOnce()
   })
 })

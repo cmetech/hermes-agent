@@ -97,19 +97,26 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   let principal = corpus.capabilities.principal_binding
   let epoch = corpus.capabilities.registry_epoch
   let connectionGeneration = 1
-  let afterPost: (() => void) | undefined
+  let afterPost: { callback: () => void; kind: LifecycleOperation['kind'] | null } | undefined
   let count = 0
   const routes = new Map<LifecycleOperation['kind'], string>()
   const rawRoutes = new Map<LifecycleOperation['kind'], string>()
+  const oneShotRawRoutes = new Set<LifecycleOperation['kind']>()
   const rawRouteValues = new Map<LifecycleOperation['kind'], unknown>()
   const calls: Array<{ type: string; input?: LifecycleStart; id?: string }> = []
   let getFailure: LifecycleApiError | null = null
-  let admission: ReturnType<typeof deferredLifecycle<void>> | null = null
-  let loseResponse = false
+
+  let admission: {
+    deferred: ReturnType<typeof deferredLifecycle<void>>
+    kind: LifecycleOperation['kind'] | null
+  } | null = null
+
+  const kindAdmissions = new Map<LifecycleOperation['kind'], Array<ReturnType<typeof deferredLifecycle<void>>>>()
+  let loseResponse: LifecycleOperation['kind'] | null | false = false
   let declared = corpus.capabilities.capabilities
-  let mismatch = false
+  let mismatch: LifecycleOperation['kind'] | null | false = false
   let capabilityWait: ReturnType<typeof deferredLifecycle<void>> | null = null
-  let capabilityFailure = false
+  let capabilityFailure: LifecycleApiError['code'] | false = false
   const capabilityCalls: Array<{ connectionId: string | null; profile: string; connectionGeneration: number }> = []
   const now = Date.parse(corpus.capabilities.server_time)
 
@@ -132,7 +139,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
         await capabilityWait?.promise
 
         if (capabilityFailure) {
-          throw new LifecycleApiError('marketplace_network_error', 0)
+          throw new LifecycleApiError(capabilityFailure, 0)
         }
 
         return {
@@ -164,6 +171,11 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
         const rawValue = rawRouteValues.get(input.kind)
 
         if (rawName || rawValue) {
+          if (oneShotRawRoutes.delete(input.kind)) {
+            rawRoutes.delete(input.kind)
+            rawRouteValues.delete(input.kind)
+          }
+
           const raw = rawValue ?? corpus.operationCases.find(item => item.name === rawName)?.value
 
           if (!raw) {
@@ -189,8 +201,11 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
           return correlated
         }
 
+        const defaultFixture =
+          input.kind === 'inspect' ? 'service inspect' : input.kind === 'refresh' ? 'service refresh' : terminalName
+
         const operation = decodeLifecycleOperation({
-          ...lifecycleFixture(routes.get(input.kind) ?? terminalName),
+          ...lifecycleFixture(routes.get(input.kind) ?? defaultFixture),
           ...(invalidTerminalEvidence
             ? {
                 outcome: { type: 'outcome_unknown', reason: 'terminal_invalid' },
@@ -216,17 +231,23 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
           packageState = operation.outcome.package_state
         }
 
-        afterPost?.()
-
-        if (admission) {
-          await admission.promise
+        if (afterPost && (afterPost.kind === null || afterPost.kind === input.kind)) {
+          afterPost.callback()
         }
 
-        if (loseResponse) {
+        const kindAdmission = kindAdmissions.get(input.kind)?.shift()
+
+        if (kindAdmission) {
+          await kindAdmission.promise
+        } else if (admission && (admission.kind === null || admission.kind === input.kind)) {
+          await admission.deferred.promise
+        }
+
+        if (loseResponse === null || loseResponse === input.kind) {
           throw new LifecycleApiError('marketplace_network_error', 0)
         }
 
-        return mismatch
+        return mismatch === null || mismatch === input.kind
           ? { ...operation, subject: { type: 'package', identity: { source_key: 'company', package_id: 'other' } } }
           : operation
       },
@@ -375,25 +396,40 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     calls,
     capabilityCalls,
     holdCapabilities: () => (capabilityWait = deferredLifecycle<void>()),
-    failCapabilities: () => {
-      capabilityFailure = true
+    failCapabilities: (code: LifecycleApiError['code'] = 'marketplace_network_error') => {
+      capabilityFailure = code
     },
     receipts,
     route: (kind: LifecycleOperation['kind'], name: string) => routes.set(kind, name),
     routeRaw: (kind: LifecycleOperation['kind'], name: string) => rawRoutes.set(kind, name),
+    routeRawOnce: (kind: LifecycleOperation['kind'], name: string) => {
+      rawRoutes.set(kind, name)
+      oneShotRawRoutes.add(kind)
+    },
     routeValue: (kind: LifecycleOperation['kind'], value: unknown) => rawRouteValues.set(kind, value),
     capabilities: (values: string[]) => {
       declared = values
     },
-    mismatch: () => {
-      mismatch = true
+    mismatch: (kind?: LifecycleOperation['kind']) => {
+      mismatch = kind ?? null
     },
     failStatus: (code: LifecycleApiError['code'] = 'marketplace_network_error', status = 0) => {
       getFailure = new LifecycleApiError(code, status)
     },
-    holdAdmission: () => (admission = deferredLifecycle<void>()),
-    loseResponse: () => {
-      loseResponse = true
+    holdAdmission: (kind?: LifecycleOperation['kind']) => {
+      const deferred = deferredLifecycle<void>()
+      admission = { deferred, kind: kind ?? null }
+
+      return deferred
+    },
+    holdNextAdmission: (kind: LifecycleOperation['kind']) => {
+      const next = deferredLifecycle<void>()
+      kindAdmissions.set(kind, [...(kindAdmissions.get(kind) ?? []), next])
+
+      return next
+    },
+    loseResponse: (kind?: LifecycleOperation['kind']) => {
+      loseResponse = kind ?? null
     },
     failOriginRefetches: () => {
       stateFailure = true
@@ -431,8 +467,8 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
       return reads
     },
     packageStateCalls: () => packageStateCalls,
-    onPost: (callback: () => void) => {
-      afterPost = callback
+    onPost: (callback: () => void, kind?: LifecycleOperation['kind']) => {
+      afterPost = { callback, kind: kind ?? null }
     },
     complete: (name: string) => {
       for (const [id, earlier] of receipts) {

@@ -1,92 +1,36 @@
-import { useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 
 import { profileScopeKey } from '@/api/client'
-import {
-  cancelWorkflowMarketplaceOperation,
-  getWorkflowMarketplaceOperation,
-  listWorkflowMarketplaceOperations
-} from '@/hermes'
+import type { LifecycleConnectionBinding } from '@/api/workflow-marketplace-lifecycle'
 import type { WorkflowMarketplaceScope } from '@/hermes'
-import type { WorkflowMarketplaceOperation } from '@/types/hermes'
+import { sameLifecycleValue } from '@/lib/workflow-marketplace-lifecycle-codec'
+import type { createMarketplaceSupervisor, SupervisedRecord } from '@/store/workflow-marketplace-supervisor'
 
-import { marketplaceKeys } from './query-keys'
-
-const POLL_MS = 500
-const RECONCILE_LIMIT = 100
-const RECONCILE_MAX = 200
-
+type MarketplaceSupervisor = ReturnType<typeof createMarketplaceSupervisor>
 type OperationRecovery = 'evicted' | 'status'
 
-function terminal(operation: WorkflowMarketplaceOperation): boolean {
-  return operation.state === 'succeeded' || operation.state === 'failed' || operation.state === 'cancelled'
-}
+const EMPTY_RECORDS: readonly SupervisedRecord[] = Object.freeze([])
+const subscribeEmpty = () => () => undefined
+const readEmpty = () => EMPTY_RECORDS
 
-function errorCode(error: unknown): null | string {
-  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
-    ? error.code
-    : null
-}
-
-function nextCadence(signal: AbortSignal): Promise<boolean> {
-  return new Promise(resolve => {
-    let timer: null | number = null
-
-    const finish = (ready: boolean) => {
-      document.removeEventListener('visibilitychange', visible)
-      signal.removeEventListener('abort', abort)
-
-      if (timer !== null) {
-        window.clearTimeout(timer)
-      }
-
-      resolve(ready)
-    }
-
-    const schedule = () => {
-      document.removeEventListener('visibilitychange', visible)
-      timer = window.setTimeout(() => finish(true), POLL_MS)
-    }
-
-    const visible = () => {
-      if (document.visibilityState === 'visible') {
-        schedule()
-      }
-    }
-
-    const abort = () => finish(false)
-
-    if (signal.aborted) {
-      finish(false)
-
-      return
-    }
-
-    signal.addEventListener('abort', abort, { once: true })
-
-    if (document.visibilityState === 'hidden') {
-      document.addEventListener('visibilitychange', visible)
-    } else {
-      schedule()
-    }
-  })
+export interface MarketplaceDisplayedOperation {
+  id: string
+  phase: string
+  progress: number
+  state: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 }
 
 export interface MarketplaceOperationController {
   captureOrigin: () => MarketplaceOperationOrigin
-  cancel: (operationId: string) => Promise<null | WorkflowMarketplaceOperation>
+  cancel: (operationId: string) => Promise<null | MarketplaceDisplayedOperation>
   errors: Readonly<Record<string, OperationRecovery>>
   isReconciling: boolean
-  operationForSource: (sourceName: string) => WorkflowMarketplaceOperation | undefined
-  operations: readonly WorkflowMarketplaceOperation[]
+  operationForSource: (sourceName: string) => MarketplaceDisplayedOperation | undefined
+  operations: readonly MarketplaceDisplayedOperation[]
   originIsCurrent: (origin: MarketplaceOperationOrigin) => boolean
   reconcile: () => void
-  retry: (operationId: string) => Promise<null | WorkflowMarketplaceOperation>
-  start: (
-    sourceName: string,
-    request: () => Promise<WorkflowMarketplaceOperation>,
-    origin?: MarketplaceOperationOrigin
-  ) => Promise<null | WorkflowMarketplaceOperation>
+  retry: (operationId: string) => Promise<null | MarketplaceDisplayedOperation>
+  start: (sourceName: string, origin?: MarketplaceOperationOrigin) => Promise<null | MarketplaceDisplayedOperation>
 }
 
 export interface MarketplaceOperationOrigin {
@@ -94,39 +38,84 @@ export interface MarketplaceOperationOrigin {
   readonly scopeKey: string
 }
 
+/** Foreground adapter only. Exact admission, polling, replay and invalidation remain supervisor-owned. */
 export function useMarketplaceOperation(
   scope: WorkflowMarketplaceScope,
+  binding: LifecycleConnectionBinding | null,
+  supervisor: MarketplaceSupervisor | null,
   enabled = true
 ): MarketplaceOperationController {
-  const queryClient = useQueryClient()
   const scopeKey = profileScopeKey(scope)
-  const explicitScope = typeof scope === 'object' && scope !== null
-  const connectionId = explicitScope ? scope.connectionId : null
-  const profile = explicitScope ? scope.profile : scope
 
-  const requestScope = useMemo<WorkflowMarketplaceScope>(
-    () => (explicitScope ? { connectionId, profile: profile ?? null } : profile),
-    [connectionId, explicitScope, profile]
-  )
+  const authorityKey = binding
+    ? JSON.stringify([
+        binding.connectionId,
+        binding.connectionGeneration,
+        binding.profile,
+        binding.principalBinding,
+        binding.registryEpoch
+      ])
+    : 'unbound'
 
   const generationRef = useRef(0)
-  const renderedScopeKeyRef = useRef(scopeKey)
-  const mountedRef = useRef(true)
+  const renderedScopeRef = useRef(scopeKey)
+  const renderedAuthorityRef = useRef(authorityKey)
   const intentGuardsRef = useRef(new Set<string>())
-  const pollGuardsRef = useRef(new Set<string>())
-  const cadenceControllersRef = useRef(new Map<string, AbortController>())
-  const invalidatedRef = useRef(new Set<string>())
-  const reconcileGuardRef = useRef<null | string>(null)
-  const operationsRef = useRef(new Map<string, WorkflowMarketplaceOperation>())
-  const [operations, setOperations] = useState<WorkflowMarketplaceOperation[]>([])
-  const [errors, setErrors] = useState<Record<string, OperationRecovery>>({})
-  const [isReconciling, setIsReconciling] = useState(enabled)
-  const [reconcileNonce, setReconcileNonce] = useState(0)
+  const ownedKeysRef = useRef(new Map<string, string>())
+  const mountedRef = useRef(true)
+  const waitersRef = useRef(new Set<AbortController>())
 
-  if (renderedScopeKeyRef.current !== scopeKey) {
-    renderedScopeKeyRef.current = scopeKey
+  if (renderedScopeRef.current !== scopeKey || renderedAuthorityRef.current !== authorityKey) {
+    renderedScopeRef.current = scopeKey
+    renderedAuthorityRef.current = authorityKey
     generationRef.current += 1
+    intentGuardsRef.current.clear()
+    ownedKeysRef.current.clear()
   }
+
+  const records = useSyncExternalStore(
+    supervisor?.$records.subscribe ?? subscribeEmpty,
+    supervisor?.$records.get ?? readEmpty,
+    supervisor?.$records.get ?? readEmpty
+  )
+
+  // eslint-disable-next-line no-restricted-syntax -- tracks component lifetime for foreground waiter detachment
+  useEffect(() => {
+    mountedRef.current = true
+    const intentGuards = intentGuardsRef.current
+    const ownedKeys = ownedKeysRef.current
+    const waiters = waitersRef.current
+
+    return () => {
+      mountedRef.current = false
+      generationRef.current += 1
+      intentGuards.clear()
+      ownedKeys.clear()
+
+      for (const waiter of waiters) {
+        waiter.abort()
+      }
+
+      waiters.clear()
+    }
+  }, [authorityKey, scopeKey])
+
+  const available = Boolean(
+    enabled && binding && supervisor?.supports(binding, ['operations', 'admission_replay', 'sources'])
+  )
+
+  const matching = useMemo(
+    () =>
+      binding
+        ? records.filter(
+            record =>
+              record.kind === 'refresh' &&
+              record.subject.type === 'source' &&
+              sameLifecycleValue(record.binding, binding)
+          )
+        : [],
+    [binding, records]
+  )
 
   const captureOrigin = useCallback(
     (): MarketplaceOperationOrigin => ({ generation: generationRef.current, scopeKey }),
@@ -135,419 +124,183 @@ export function useMarketplaceOperation(
 
   const originIsCurrent = useCallback(
     (origin: MarketplaceOperationOrigin) =>
-      mountedRef.current &&
-      renderedScopeKeyRef.current === origin.scopeKey &&
-      generationRef.current === origin.generation,
+      mountedRef.current && renderedScopeRef.current === origin.scopeKey && generationRef.current === origin.generation,
     []
   )
 
-  const abortCadences = useCallback(() => {
-    for (const controller of cadenceControllersRef.current.values()) {
-      controller.abort()
-    }
-    cadenceControllersRef.current.clear()
-  }, [])
+  const recordForSource = useCallback(
+    (sourceName: string) => {
+      const owned = ownedKeysRef.current.get(sourceName)
+      const exact = owned ? matching.find(record => record.key === owned) : undefined
 
-  const publish = useCallback((operation: WorkflowMarketplaceOperation, generation: number) => {
-    if (
-      !mountedRef.current ||
-      generationRef.current !== generation ||
-      operation.kind !== 'refresh' ||
-      operation.source_name === null
-    ) {
-      return false
-    }
-
-    operationsRef.current.set(operation.id, operation)
-    setOperations([...operationsRef.current.values()])
-    setErrors(current => {
-      if (!(operation.source_name in current)) {
-        return current
+      if (exact) {
+        return exact
       }
 
-      const next = { ...current }
-      delete next[operation.source_name]
+      const active = matching.filter(
+        record =>
+          record.subject.type === 'source' && record.subject.source_name === sourceName && record.status !== 'terminal'
+      )
 
-      return next
-    })
-
-    return true
-  }, [])
-
-  const tombstone = useCallback((operation: WorkflowMarketplaceOperation, generation: number) => {
-    if (!mountedRef.current || generationRef.current !== generation || operation.source_name === null) {
-      return
-    }
-
-    operationsRef.current.delete(operation.id)
-    setOperations([...operationsRef.current.values()])
-    setErrors(existing => ({ ...existing, [operation.source_name]: 'evicted' }))
-  }, [])
-
-  const invalidateRefresh = useCallback(
-    async (originScopeKey: string, operationId: string, generation: number) => {
-      if (!mountedRef.current || generationRef.current !== generation || scopeKey !== originScopeKey) {
-        return
-      }
-
-      const identity = `${originScopeKey}:${operationId}`
-
-      if (invalidatedRef.current.has(identity)) {
-        return
-      }
-
-      invalidatedRef.current.add(identity)
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: marketplaceKeys.sources(originScopeKey) }),
-        queryClient.invalidateQueries({ queryKey: marketplaceKeys.searchRoot(originScopeKey) })
-      ])
+      // Public source subject is sufficient only for a single active record. Ambiguity fails closed.
+      return active.length === 1 ? active[0] : undefined
     },
-    [queryClient, scopeKey]
+    [matching]
   )
 
-  const poll = useCallback(
-    async (
-      initial: WorkflowMarketplaceOperation,
-      generation: number,
-      originScope: WorkflowMarketplaceScope,
-      originScopeKey: string
-    ): Promise<null | WorkflowMarketplaceOperation> => {
-      const pollIdentity = `${originScopeKey}:${initial.id}`
+  const operations = useMemo(() => matching.flatMap(record => (record.operation ? [record.operation] : [])), [matching])
 
-      if (pollGuardsRef.current.has(pollIdentity)) {
+  const errors = useMemo(() => {
+    const next: Record<string, OperationRecovery> = {}
+
+    const sources = new Set(
+      matching.flatMap(record => (record.subject.type === 'source' ? [record.subject.source_name] : []))
+    )
+
+    for (const sourceName of sources) {
+      const record = recordForSource(sourceName)
+
+      if (!record) {
+        continue
+      }
+
+      if (record.status === 'evicted') {
+        next[sourceName] = 'evicted'
+      } else if (
+        record.status === 'status_unknown' ||
+        record.status === 'admission_unknown' ||
+        record.status === 'suspended'
+      ) {
+        next[sourceName] = 'status'
+      }
+    }
+
+    return next
+  }, [matching, recordForSource])
+
+  const wait = useCallback(
+    async (key: string) => {
+      if (!supervisor) {
         return null
       }
 
-      pollGuardsRef.current.add(pollIdentity)
-      const cadence = new AbortController()
-      cadenceControllersRef.current.set(pollIdentity, cadence)
-
-      let current = initial
+      const waiter = new AbortController()
+      waitersRef.current.add(waiter)
 
       try {
-        if (!publish(current, generation)) {
-          return null
-        }
+        const record = await supervisor.waitForRecord(key, waiter.signal)
 
-        if (terminal(current)) {
-          await invalidateRefresh(originScopeKey, current.id, generation)
-
-          return current
-        }
-
-        while (mountedRef.current && generationRef.current === generation) {
-          if (!(await nextCadence(cadence.signal))) {
-            return null
-          }
-
-          if (!mountedRef.current || generationRef.current !== generation) {
-            return null
-          }
-
-          try {
-            current = await getWorkflowMarketplaceOperation(current.id, originScope)
-          } catch (error) {
-            if (!mountedRef.current || generationRef.current !== generation) {
-              return null
-            }
-
-            const sourceName = current.kind === 'refresh' ? current.source_name : null
-
-            if (errorCode(error) === 'marketplace_operation_not_found') {
-              tombstone(current, generation)
-              await invalidateRefresh(originScopeKey, current.id, generation)
-            } else if (sourceName !== null) {
-              setErrors(existing => ({
-                ...existing,
-                [sourceName]: 'status'
-              }))
-            }
-
-            return null
-          }
-
-          if (!publish(current, generation)) {
-            return null
-          }
-
-          if (terminal(current)) {
-            await invalidateRefresh(originScopeKey, current.id, generation)
-
-            return current
-          }
-        }
-
-        return null
+        return record.operation
       } finally {
-        cadence.abort()
-        cadenceControllersRef.current.delete(pollIdentity)
-        pollGuardsRef.current.delete(pollIdentity)
+        waitersRef.current.delete(waiter)
       }
     },
-    [invalidateRefresh, publish, tombstone]
-  )
-
-  // Lifecycle/generation guards are imperative cancellation tokens, not mirrors of reactive state.
-  // eslint-disable-next-line no-restricted-syntax
-  useEffect(() => {
-    mountedRef.current = true
-    const generation = ++generationRef.current
-    abortCadences()
-    operationsRef.current = new Map()
-    intentGuardsRef.current.clear()
-    pollGuardsRef.current.clear()
-    invalidatedRef.current.clear()
-    setOperations([])
-    setErrors({})
-
-    if (!enabled) {
-      setIsReconciling(false)
-
-      return () => {
-        abortCadences()
-        generationRef.current += 1
-      }
-    }
-
-    setIsReconciling(true)
-    void (async () => {
-      const refreshOperations: WorkflowMarketplaceOperation[] = []
-
-      for (let offset = 0; offset < RECONCILE_MAX; offset += RECONCILE_LIMIT) {
-        const page = await listWorkflowMarketplaceOperations(requestScope, {
-          limit: RECONCILE_LIMIT,
-          offset
-        })
-
-        if (!mountedRef.current || generationRef.current !== generation) {
-          return
-        }
-
-        refreshOperations.push(
-          ...page.operations.filter(operation => operation.kind === 'refresh' && operation.source_name !== null)
-        )
-
-        if (page.operations.length < RECONCILE_LIMIT) {
-          break
-        }
-      }
-
-      if (!mountedRef.current || generationRef.current !== generation) {
-        return
-      }
-
-      operationsRef.current = new Map(refreshOperations.map(operation => [operation.id, operation]))
-      setOperations(refreshOperations)
-
-      for (const operation of refreshOperations) {
-        if (!terminal(operation)) {
-          void poll(operation, generation, requestScope, scopeKey)
-        }
-      }
-
-      if (refreshOperations.some(terminal)) {
-        await invalidateRefresh(scopeKey, `reconcile-${generation}`, generation)
-      }
-    })()
-      .catch(() => {
-        if (mountedRef.current && generationRef.current === generation) {
-          setErrors({ __reconcile__: 'status' })
-        }
-      })
-      .finally(() => {
-        if (mountedRef.current && generationRef.current === generation) {
-          setIsReconciling(false)
-
-          if (reconcileGuardRef.current === scopeKey) {
-            reconcileGuardRef.current = null
-          }
-        }
-      })
-
-    return () => {
-      abortCadences()
-      generationRef.current += 1
-    }
-  }, [abortCadences, enabled, invalidateRefresh, poll, reconcileNonce, requestScope, scopeKey])
-
-  useEffect(
-    () => () => {
-      mountedRef.current = false
-      abortCadences()
-      generationRef.current += 1
-    },
-    [abortCadences]
+    [supervisor]
   )
 
   const start = useCallback(
-    async (
-      sourceName: string,
-      request: () => Promise<WorkflowMarketplaceOperation>,
-      origin: MarketplaceOperationOrigin = { generation: generationRef.current, scopeKey }
-    ) => {
-      const identity = `${origin.scopeKey}:source:${sourceName}`
-      let admitted: null | WorkflowMarketplaceOperation = null
+    async (sourceName: string, origin = captureOrigin()) => {
+      const guard = `${origin.scopeKey}\0${sourceName}`
 
-      if (!enabled || !originIsCurrent(origin) || intentGuardsRef.current.has(identity)) {
+      if (!available || !binding || !supervisor || !originIsCurrent(origin) || intentGuardsRef.current.has(guard)) {
         return null
       }
 
-      intentGuardsRef.current.add(identity)
+      intentGuardsRef.current.add(guard)
 
       try {
-        try {
-          admitted = await request()
-        } catch {
-          if (originIsCurrent(origin)) {
-            setErrors(current => ({ ...current, [sourceName]: 'status' }))
-          }
-
-          return null
-        }
+        const key = await supervisor.start(
+          { kind: 'refresh', subject: { type: 'source', source_name: sourceName }, selection: null, body: {} },
+          binding
+        )
 
         if (!originIsCurrent(origin)) {
           return null
         }
 
-        if (admitted.kind !== 'refresh' || admitted.source_name !== sourceName) {
-          setErrors(current => ({ ...current, [sourceName]: 'status' }))
+        ownedKeysRef.current.set(sourceName, key)
 
-          return null
-        }
+        return await wait(key)
+      } catch {
+        return null
       } finally {
-        intentGuardsRef.current.delete(identity)
+        intentGuardsRef.current.delete(guard)
       }
-
-      return admitted === null ? null : poll(admitted, origin.generation, requestScope, origin.scopeKey)
     },
-    [enabled, originIsCurrent, poll, requestScope, scopeKey]
+    [available, binding, captureOrigin, originIsCurrent, supervisor, wait]
+  )
+
+  const exactRecord = useCallback(
+    (operationId: string) => {
+      const candidates = matching.filter(record => record.operationId === operationId)
+
+      return candidates.length === 1 ? candidates[0] : undefined
+    },
+    [matching]
   )
 
   const cancel = useCallback(
     async (operationId: string) => {
-      const generation = generationRef.current
-      const existing = operationsRef.current.get(operationId)
-      const identity = existing?.source_name === null ? null : `${scopeKey}:source:${existing?.source_name}`
+      const record = exactRecord(operationId)
 
-      if (
-        !enabled ||
-        renderedScopeKeyRef.current !== scopeKey ||
-        existing === undefined ||
-        terminal(existing) ||
-        identity === null ||
-        intentGuardsRef.current.has(identity)
-      ) {
+      if (!available || !record || !supervisor || record.status === 'terminal') {
         return null
       }
 
-      intentGuardsRef.current.add(identity)
+      await supervisor.cancel(record.key)
 
       try {
-        const response = await cancelWorkflowMarketplaceOperation(operationId, requestScope)
-        publish(response, generation)
-
-        if (terminal(response)) {
-          await invalidateRefresh(scopeKey, response.id, generation)
-        }
-
-        return response
+        return await wait(record.key)
       } catch {
-        const currentOperation = operationsRef.current.get(operationId)
-
-        if (
-          mountedRef.current &&
-          generationRef.current === generation &&
-          currentOperation?.kind === 'refresh' &&
-          currentOperation.source_name !== null
-        ) {
-          setErrors(current => ({ ...current, [currentOperation.source_name]: 'status' }))
-        }
-
         return null
-      } finally {
-        intentGuardsRef.current.delete(identity)
       }
     },
-    [enabled, invalidateRefresh, publish, requestScope, scopeKey]
+    [available, exactRecord, supervisor, wait]
   )
 
   const retry = useCallback(
     async (operationId: string) => {
-      const generation = generationRef.current
-      const existing = operationsRef.current.get(operationId)
-      const identity = existing?.source_name === null ? null : `${scopeKey}:source:${existing?.source_name}`
+      const record = exactRecord(operationId)
 
-      if (
-        !enabled ||
-        renderedScopeKeyRef.current !== scopeKey ||
-        existing === undefined ||
-        terminal(existing) ||
-        identity === null ||
-        intentGuardsRef.current.has(identity)
-      ) {
+      if (!available || !record || !supervisor || record.status === 'terminal') {
         return null
       }
 
-      intentGuardsRef.current.add(identity)
-      let next: null | WorkflowMarketplaceOperation = null
+      await supervisor.retry(record.key)
 
       try {
-        next = await getWorkflowMarketplaceOperation(operationId, requestScope)
-      } catch (error) {
-        if (errorCode(error) === 'marketplace_operation_not_found') {
-          tombstone(existing, generation)
-          await invalidateRefresh(scopeKey, existing.id, generation)
-        } else if (mountedRef.current && generationRef.current === generation && existing.source_name !== null) {
-          setErrors(current => ({
-            ...current,
-            [existing.source_name]: 'status'
-          }))
-        }
-
+        return await wait(record.key)
+      } catch {
         return null
-      } finally {
-        intentGuardsRef.current.delete(identity)
       }
-
-      return next === null ? null : poll(next, generation, requestScope, scopeKey)
     },
-    [enabled, invalidateRefresh, poll, requestScope, scopeKey, tombstone]
+    [available, exactRecord, supervisor, wait]
   )
 
   const operationForSource = useCallback(
-    (sourceName: string) => {
-      const candidates = operations.filter(operation => operation.source_name === sourceName)
-
-      return candidates.sort((left, right) => {
-        const leftActive = terminal(left) ? 0 : 1
-        const rightActive = terminal(right) ? 0 : 1
-
-        return (
-          rightActive - leftActive ||
-          right.updated_at.localeCompare(left.updated_at) ||
-          right.created_at.localeCompare(left.created_at) ||
-          right.id.localeCompare(left.id)
-        )
-      })[0]
-    },
-    [operations]
+    (sourceName: string) => recordForSource(sourceName)?.operation ?? undefined,
+    [recordForSource]
   )
 
   const reconcile = useCallback(() => {
-    if (!enabled || reconcileGuardRef.current === scopeKey) {
+    if (!enabled || !supervisor) {
       return
     }
 
-    reconcileGuardRef.current = scopeKey
-    setReconcileNonce(current => current + 1)
-  }, [enabled, scopeKey])
+    const normalized =
+      typeof scope === 'object' && scope !== null
+        ? { connectionId: scope.connectionId, profile: scope.profile ?? 'default' }
+        : { connectionId: null, profile: scope ?? 'default' }
+
+    void supervisor.reconcileScope(normalized)
+  }, [enabled, scope, supervisor])
 
   return useMemo(
     () => ({
       cancel,
       captureOrigin,
       errors,
-      isReconciling,
+      isReconciling: enabled && !available,
       operationForSource,
       operations,
       originIsCurrent,
@@ -556,10 +309,11 @@ export function useMarketplaceOperation(
       start
     }),
     [
+      available,
       cancel,
       captureOrigin,
+      enabled,
       errors,
-      isReconciling,
       operationForSource,
       operations,
       originIsCurrent,

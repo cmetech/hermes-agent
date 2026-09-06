@@ -95,7 +95,13 @@ function harness() {
       return operation
     }
 
-    const name = operation.kind === 'update_check' ? 'service update check' : 'service install confirm'
+    const name =
+      operation.kind === 'update_check'
+        ? 'service update check'
+        : operation.kind === 'inspect'
+          ? 'service inspect'
+          : 'service install confirm'
+
     const result = decodeLifecycleOperation({ ...fixture(name), id: operation.id, request_id: operation.request_id })
 
     if (!result) {
@@ -130,7 +136,11 @@ function harness() {
         workers++
 
         const template = fixture(
-          intent.kind === 'update_check' ? 'service update check pending' : 'service install confirm pending'
+          intent.kind === 'update_check'
+            ? 'service update check pending'
+            : intent.kind === 'inspect'
+              ? 'service inspect pending'
+              : 'service install confirm pending'
         )
 
         const result = decodeLifecycleOperation({
@@ -530,6 +540,57 @@ describe('application marketplace operation supervision', () => {
     expect(h.listeners.size).toBe(0)
   })
 
+  it('detaches an aborted exact record waiter without cancelling or disposing supervised work', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    await h.supervisor.start(h.intent, binding!)
+    const controller = new AbortController()
+    const add = vi.spyOn(controller.signal, 'addEventListener')
+    const remove = vi.spyOn(controller.signal, 'removeEventListener')
+    const waiting = h.supervisor.waitForRecord(h.record().key, controller.signal)
+
+    controller.abort()
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' })
+    expect(remove).toHaveBeenCalledWith(add.mock.calls[0][0], add.mock.calls[0][1])
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+
+    h.terminal()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(h.record()).toMatchObject({ status: 'terminal', callPending: false })
+    controller.abort()
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+  })
+
+  it.each(['terminal', 'suspended', 'disposed'] as const)(
+    'settles an exact record waiter and removes its abort listener on %s',
+    async finish => {
+      const h = setup()
+      const binding = await h.bind()
+      await h.supervisor.start(h.intent, binding!)
+      const controller = new AbortController()
+      const add = vi.spyOn(controller.signal, 'addEventListener')
+      const remove = vi.spyOn(controller.signal, 'removeEventListener')
+      const waiting = h.supervisor.waitForRecord(h.record().key, controller.signal)
+
+      if (finish === 'terminal') {
+        h.terminal()
+        await vi.advanceTimersByTimeAsync(500)
+      } else if (finish === 'suspended') {
+        h.disconnect()
+      } else {
+        h.dispose()
+      }
+
+      await expect(waiting).resolves.toMatchObject({ status: finish === 'disposed' ? 'suspended' : finish })
+      expect(remove).toHaveBeenCalledWith(add.mock.calls[0][0], add.mock.calls[0][1])
+
+      if (finish === 'disposed') {
+        expect(vi.getTimerCount()).toBe(0)
+        expect(h.listeners.size).toBe(0)
+      }
+    }
+  )
+
   // Break caught: status error strands update-check guard or automatic polling continues after a recoverable failure.
   it('releases an update-check guard on status loss and allows explicit status retry', async () => {
     const h = setup()
@@ -634,6 +695,78 @@ describe('application marketplace operation supervision', () => {
     ])
     expect(h.supervisor.getPackageGate(binding!, identity).state).toBe('busy')
     expect(h.workers()).toBe(0)
+  })
+
+  it.each(['service install prepare pending', 'service update check pending', 'service review all pending'])(
+    'keeps an active package review/check barrier for %s',
+    async name => {
+      const h = setup()
+      h.list([fixture(name)])
+      const binding = await h.bind()
+
+      expect(h.supervisor.getPackageGate(binding!, identity).state).toBe('busy')
+    }
+  )
+
+  it('keeps a supervised read-only inspection out of the base package lifecycle barrier', async () => {
+    const h = setup()
+    h.list([fixture('service inspect pending')])
+    const binding = await h.bind()
+    await h.supervisor.reconcilePackage(binding!, identity)
+
+    expect(h.supervisor.getPackageGate(binding!, identity).state).toBe('ready')
+  })
+
+  it('blocks inspection behind active package work', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    await h.supervisor.start(h.intent, binding!)
+
+    await expect(
+      h.supervisor.start({ kind: 'inspect', subject, selection: null, body: {} }, binding!)
+    ).rejects.toMatchObject({ code: 'marketplace_request_conflict' })
+  })
+
+  it('admits a fresh exact inspection while an earlier detached inspection remains active', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    const inspect = { kind: 'inspect' as const, subject, selection: null, body: {} }
+    const first = await h.supervisor.start(inspect, binding!)
+    const second = await h.supervisor.start(inspect, binding!)
+    const requests = h.calls.filter(call => call.type === 'post').map(call => call.requestId)
+
+    expect(second).not.toBe(first)
+    expect(requests).toHaveLength(2)
+    expect(requests[1]).not.toBe(requests[0])
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+  })
+
+  it('allows only inspection through a terminal mutation barrier awaiting PackageState', async () => {
+    const h = setup()
+    const binding = await h.bind()
+    await h.supervisor.start(h.intent, binding!)
+    h.terminal()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(h.record()).toMatchObject({ status: 'terminal', barrier: true })
+
+    await expect(h.supervisor.start(h.intent, binding!)).rejects.toMatchObject({
+      code: 'marketplace_request_conflict'
+    })
+    await expect(
+      h.supervisor.start(
+        {
+          kind: 'install_prepare',
+          subject,
+          selection: null,
+          body: { identifier: 'company/laptop-support', package_path: null, ref: null }
+        },
+        binding!
+      )
+    ).rejects.toMatchObject({ code: 'marketplace_request_conflict' })
+
+    await expect(
+      h.supervisor.start({ kind: 'inspect', subject, selection: null, body: {} }, binding!)
+    ).resolves.toEqual(expect.any(String))
   })
 
   // Break caught: duplicate operation identities across snapshot pages are silently joined into a complete scan.

@@ -38,6 +38,7 @@ import { SupervisedPackageActions } from './use-package-lifecycle'
 import { WorkflowMarketplaceView } from './index'
 
 const api = vi.hoisted(() => ({
+  add: vi.fn(),
   cancelOperation: vi.fn(),
   capabilities: vi.fn(),
   checkUpdates: vi.fn(),
@@ -60,6 +61,7 @@ const api = vi.hoisted(() => ({
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<typeof Hermes>()),
+  addWorkflowMarketplaceSource: (...args: unknown[]) => api.add(...args),
   cancelWorkflowMarketplaceOperation: (...args: unknown[]) => api.cancelOperation(...args),
   checkWorkflowPackageUpdates: (...args: unknown[]) => api.checkUpdates(...args),
   confirmWorkflowPackageInstall: (...args: unknown[]) => api.confirmInstall(...args),
@@ -94,6 +96,7 @@ const scopeA = { connectionId: 'remote-a', profile: 'support' }
 const originalHasPointerCapture = Element.prototype.hasPointerCapture
 const originalReleasePointerCapture = Element.prototype.releasePointerCapture
 const originalScrollIntoView = Element.prototype.scrollIntoView
+const standaloneLifecycleCleanups: Array<() => void> = []
 
 beforeAll(() => {
   Element.prototype.hasPointerCapture = vi.fn(() => false)
@@ -584,6 +587,7 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
+  api.add.mockReset().mockResolvedValue({ profile: 'support' })
   api.capabilities.mockReset().mockResolvedValue({
     capabilities: ['sources', 'search', 'installed', 'updates', 'transactions', 'trust', 'operations'],
     profile: 'support',
@@ -640,9 +644,17 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  standaloneLifecycleCleanups.splice(0).forEach(dispose => dispose())
   vi.useRealTimers()
   vi.unstubAllGlobals()
 })
+
+function standaloneLifecycleHarness() {
+  const harness = createLifecycleHarness()
+  standaloneLifecycleCleanups.push(harness.dispose)
+
+  return harness
+}
 
 describe('marketplace query keys', () => {
   it('keys every backend-owned projection by connection, profile, filter, page, and detail identity', () => {
@@ -674,7 +686,9 @@ describe('marketplace query keys', () => {
 
 describe('WorkflowMarketplaceView', () => {
   it('shows feature-detected Refresh and Manage Sources actions and returns focus after closing', async () => {
-    renderMarketplace()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     const manage = await screen.findByRole('button', { name: 'Manage Sources' })
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeTruthy()
@@ -684,7 +698,9 @@ describe('WorkflowMarketplaceView', () => {
     const dialog = screen.getByRole('dialog', { name: 'Workflow sources' })
     fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' })[0])
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Workflow sources' })).toBeNull())
-    await waitFor(() => expect(globalThis.document.activeElement).toBe(manage))
+    await waitFor(() =>
+      expect(globalThis.document.activeElement).toBe(screen.getByRole('button', { name: 'Manage Sources' }))
+    )
   })
 
   it('does not imply source operations when only catalog search is supported', async () => {
@@ -698,26 +714,28 @@ describe('WorkflowMarketplaceView', () => {
   })
 
   it('refreshes enabled sources sequentially from the toolbar and skips disabled sources', async () => {
-    const order: string[] = []
-    api.refreshSource.mockImplementation(async (name: string) => {
-      order.push(name)
-
-      return succeededRefresh(name)
-    })
-    renderMarketplace()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('refresh', 'service refresh')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(order).toEqual(['company']))
-    expect(api.refreshSource).toHaveBeenCalledWith('company', scopeA)
-    expect(api.refreshSource).not.toHaveBeenCalledWith('disabled-source', expect.anything())
+    await waitFor(() =>
+      expect(
+        h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh').map(call => call.input?.subject)
+      ).toEqual([{ type: 'source', source_name: 'company' }])
+    )
+    expect(api.refreshSource).not.toHaveBeenCalled()
   })
 
   it.each([
-    ['failed', 'Failed'],
+    ['failed', 'Refresh status unavailable'],
     ['cancelled', 'Cancelled']
   ] as const)('keeps a %s toolbar refresh visible with a path to exact recovery', async (state, label) => {
-    api.refreshSource.mockResolvedValue(unsuccessfulRefresh(state))
-    renderMarketplace()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('refresh', state === 'cancelled' ? 'service refresh cancelled' : 'service refresh failed committed')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
 
@@ -727,11 +745,12 @@ describe('WorkflowMarketplaceView', () => {
   })
 
   it('keeps an evicted toolbar refresh visible with a path to exact recovery', async () => {
-    api.refreshSource.mockResolvedValue(pendingRefresh('company'))
-    api.getOperation.mockRejectedValue(
-      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'Operation not found.')
-    )
-    renderMarketplace()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('refresh', 'service refresh pending')
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     const refresh = await screen.findByRole('button', { name: 'Refresh' })
     vi.useFakeTimers()
@@ -746,7 +765,10 @@ describe('WorkflowMarketplaceView', () => {
   })
 
   it('aborts an old-scope Refresh sequence before admitting its next source', async () => {
-    const first = deferred<WorkflowMarketplaceOperation>()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    const first = h.holdNextAdmission('refresh')
+    h.route('refresh', 'service refresh')
     api.sources.mockResolvedValue({
       profile: 'support',
       sources: [
@@ -778,35 +800,36 @@ describe('WorkflowMarketplaceView', () => {
         }
       ]
     })
-    api.refreshSource.mockImplementation((name: string) =>
-      name === 'company' ? first.promise : Promise.resolve(succeededRefresh(name))
-    )
-    const view = renderMarketplace(scopeA)
+    const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(api.refreshSource).toHaveBeenCalledWith('company', scopeA))
+    await waitFor(() =>
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(1)
+    )
 
+    await h.bind({ connectionId: 'remote-b', profile: 'support' })
     view.rerender(
-      <I18nProvider configClient={null} initialLocale="en">
-        <QueryClientProvider client={view.client}>
-          <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
-        </QueryClientProvider>
-      </I18nProvider>
+      <h.Providers>
+        <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'support' }} />
+      </h.Providers>
     )
 
     const newScopeRefresh = await screen.findByRole('button', { name: 'Refresh' })
     expect(newScopeRefresh.getAttribute('aria-busy')).toBe('false')
     fireEvent.click(newScopeRefresh)
     await waitFor(() =>
-      expect(api.refreshSource).toHaveBeenCalledWith('company', {
-        connectionId: 'remote-b',
-        profile: 'support'
-      })
+      expect(
+        h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh').map(call => call.input?.subject)
+      ).toEqual([
+        { type: 'source', source_name: 'company' },
+        { type: 'source', source_name: 'company' },
+        { type: 'source', source_name: 'team' }
+      ])
     )
-    await act(async () => first.resolve(succeededRefresh('company')))
+    await act(async () => first.resolve())
 
-    expect(api.refreshSource).not.toHaveBeenCalledWith('team', scopeA)
-    expect(api.refreshSource).toHaveBeenCalledWith('team', { connectionId: 'remote-b', profile: 'support' })
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(3)
+    expect(api.refreshSource).not.toHaveBeenCalled()
   })
   it('feature-detects before search and shows upgrade guidance for an older backend', async () => {
     const probe = deferred<never>()
@@ -1029,7 +1052,20 @@ describe('WorkflowMarketplaceView', () => {
   })
 
   it('shows authoritative package detail, resource categories, requirements, advisories, and badges', async () => {
-    renderMarketplace()
+    const h = standaloneLifecycleHarness()
+    h.state('service installed A trusted')
+    await h.bind()
+    const inspection = lifecycleFixture('service inspect')
+
+    if (inspection.result?.type !== 'package_detail') {
+      throw new Error('Expected strict V2 package detail fixture')
+    }
+
+    h.routeValue('inspect', {
+      ...inspection,
+      result: { ...inspection.result, value: packageDetail() }
+    })
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
@@ -1052,23 +1088,34 @@ describe('WorkflowMarketplaceView', () => {
     expect(within(detail).getByText('resources/guide.md')).toBeTruthy()
     expect(within(detail).getByText('Provider setup is required.')).toBeTruthy()
     expect(within(detail).getByText('SUPPORT_TOKEN')).toBeTruthy()
-    expect(api.inspect).toHaveBeenCalledWith('company', 'laptop-support', scopeA)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect')).toHaveLength(1)
+    expect(h.calls.find(call => call.input?.kind === 'inspect')?.input?.subject).toEqual({
+      type: 'package',
+      identity: lifecycleIdentity
+    })
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('polls a bounded detail operation and never turns file, redacted, SSH, or SCP identities into links', async () => {
-    api.inspect.mockResolvedValue(pendingDetail())
-    api.getOperation.mockResolvedValue(
-      succeededDetail(packageDetail({ repository_url: 'file:///REDACTED', update_status: 'current' }))
-    )
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('inspect', 'service inspect pending')
 
-    renderMarketplace()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
-    expect(await screen.findByText('file:///REDACTED')).toBeTruthy()
-    expect(screen.queryByRole('link', { name: 'file:///REDACTED' })).toBeNull()
-    expect(api.getOperation).toHaveBeenCalledWith(OPERATION_ID, scopeA)
+    await waitFor(() => expect(h.calls.some(call => call.type === 'get')).toBe(true))
+    h.complete('service inspect')
+    expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect')).toHaveLength(1)
+    expect(api.inspect).not.toHaveBeenCalled()
+    expect(api.getOperation).not.toHaveBeenCalled()
 
-    for (const repository_url of ['ssh://git@example.test/team/repo.git', 'git@example.test:team/repo.git']) {
+    for (const repository_url of [
+      'file:///REDACTED',
+      'ssh://git@example.test/team/repo.git',
+      'git@example.test:team/repo.git'
+    ]) {
       cleanup()
       renderWithProviders(
         <MarketplacePackageDetail
@@ -1083,190 +1130,159 @@ describe('WorkflowMarketplaceView', () => {
   it.each(['failed', 'cancelled'] as const)(
     'treats an initially %s detail operation as terminal without polling',
     async state => {
-      api.inspect.mockResolvedValueOnce(terminalDetail(state)).mockResolvedValueOnce(succeededDetail())
+      const h = standaloneLifecycleHarness()
+      await h.bind()
+      h.route('inspect', state === 'cancelled' ? 'service inspect cancelled' : 'service read-only failure')
 
-      renderMarketplace()
+      renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
       fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
       expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
       expect(screen.queryByRole('status', { name: 'Loading workflow package details' })).toBeNull()
-      expect(api.getOperation).not.toHaveBeenCalled()
+      expect(h.calls.some(call => call.type === 'get')).toBe(false)
 
+      h.route('inspect', 'service inspect')
       fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
       expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
-      expect(api.getOperation).not.toHaveBeenCalled()
+      expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(2)
+      expect(api.inspect).not.toHaveBeenCalled()
     }
   )
 
-  it('stops a rejected detail poll and retries that operation without leaking its error', async () => {
-    const statusRetry = deferred<WorkflowMarketplaceOperation>()
+  it('stops a rejected detail poll and starts one fresh exact retry without leaking its error', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('inspect', 'service inspect pending')
+    h.failStatus('marketplace_network_error')
 
-    api.inspect.mockResolvedValue(pendingDetail())
-    api.getOperation.mockRejectedValue(
-      new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'access_token=secret /private/tmp/operation')
-    )
-
-    renderMarketplace()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
     expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
     expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
     expect(screen.queryByRole('status', { name: 'Loading workflow package details' })).toBeNull()
-    const callsAfterFailure = api.getOperation.mock.calls.length
+    const callsAfterFailure = h.calls.filter(call => call.type === 'get').length
 
     await new Promise(resolve => setTimeout(resolve, 600))
-    expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure)
+    expect(h.calls.filter(call => call.type === 'get')).toHaveLength(callsAfterFailure)
 
-    api.getOperation.mockReturnValue(statusRetry.promise)
+    h.route('inspect', 'service inspect')
     const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement
     fireEvent.click(retry)
     fireEvent.click(retry)
 
-    expect(api.getOperation).toHaveBeenCalledTimes(callsAfterFailure + 1)
-    expect(await screen.findByRole('status', { name: 'Loading workflow package details' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
-    statusRetry.resolve(succeededDetail())
-
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
-    expect(api.inspect).toHaveBeenCalledTimes(1)
+    expect(h.calls.filter(call => call.type === 'get')).toHaveLength(callsAfterFailure)
+    const inspections = h.calls.filter(call => call.input?.kind === 'inspect')
+    expect(inspections).toHaveLength(2)
+    expect(inspections[1].input?.requestId).not.toBe(inspections[0].input?.requestId)
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
-  it('serializes a replacement inspection when the pending detail operation was evicted', async () => {
-    const replacementOperationId = `wmop_${'e'.repeat(12)}_${'f'.repeat(32)}`
-    const replacement = deferred<WorkflowMarketplaceOperation>()
+  it('serializes the automatic exact replacement when a pending inspection is evicted', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('inspect', 'service inspect pending')
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
 
-    api.inspect.mockResolvedValueOnce(pendingDetail()).mockReturnValue(replacement.promise)
-    api.getOperation.mockImplementation((id: string) =>
-      id === OPERATION_ID
-        ? Promise.reject(
-            new WorkflowMarketplaceApiError(
-              'marketplace_operation_not_found',
-              404,
-              'Workflow marketplace request failed.'
-            )
-          )
-        : Promise.resolve(succeededDetail(packageDetail(), replacementOperationId))
-    )
-
-    renderMarketplace()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(1))
+    const replacement = h.holdNextAdmission('inspect')
+    h.route('inspect', 'service inspect')
 
-    expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
-    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement
-    fireEvent.click(retry)
-    fireEvent.click(retry)
-
-    expect(api.inspect).toHaveBeenCalledTimes(2)
-    await waitFor(() => expect(retry.disabled).toBe(true))
-    expect(retry.getAttribute('aria-busy')).toBe('true')
-
-    replacement.resolve(pendingDetail(replacementOperationId))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(2))
+    expect(screen.getByRole('status', { name: 'Loading workflow package details' })).toBeTruthy()
+    await act(async () => replacement.resolve())
 
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
-    expect(api.getOperation.mock.calls.map(([id]) => id)).toEqual([OPERATION_ID, replacementOperationId])
+    const inspections = h.calls.filter(call => call.input?.kind === 'inspect')
+    expect(inspections).toHaveLength(2)
+    expect(inspections[1].input?.requestId).not.toBe(inspections[0].input?.requestId)
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('re-enables an evicted-operation Retry after its replacement inspection fails', async () => {
-    const replacement = deferred<WorkflowMarketplaceOperation>()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('inspect', 'service inspect pending')
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
 
-    api.inspect
-      .mockResolvedValueOnce(pendingDetail())
-      .mockReturnValueOnce(replacement.promise)
-      .mockResolvedValueOnce(succeededDetail())
-    api.getOperation.mockRejectedValue(
-      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'Workflow marketplace request failed.')
-    )
-
-    renderMarketplace()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(1))
+    h.routeRawOnce('inspect', 'service inspect wrong subject')
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(2))
     const retry = (await screen.findByRole('button', { name: 'Retry' })) as HTMLButtonElement
+    await waitFor(() => expect(retry.disabled).toBe(false))
+    h.route('inspect', 'service inspect')
     fireEvent.click(retry)
-    await waitFor(() => expect(retry.disabled).toBe(true))
-
-    replacement.reject(
-      new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'Workflow marketplace request failed.')
-    )
-
-    const retryAgain = (await screen.findByRole('button', { name: 'Retry' })) as HTMLButtonElement
-    await waitFor(() => expect(retryAgain.disabled).toBe(false))
-    fireEvent.click(retryAgain)
 
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
-    expect(api.inspect).toHaveBeenCalledTimes(3)
+    expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(3)
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('does not let an in-flight replacement block recovery after the scope changes', async () => {
-    const oldReplacement = deferred<WorkflowMarketplaceOperation>()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.route('inspect', 'service inspect pending')
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
 
-    const newDetail = packageDetail({
-      display_name: 'New backend package',
-      id: 'new',
-      identifier: 'other/new',
-      identity: { package_id: 'new', source_key: 'other' },
-      source_name: 'other'
-    })
-
-    api.search.mockImplementation((_query: string, scope: typeof scopeA) =>
-      scope.connectionId === 'remote-a'
-        ? Promise.resolve(page([packageItem()]))
-        : Promise.resolve(
-            page([
-              packageItem({
-                display_name: 'New backend package',
-                id: 'new',
-                identifier: 'other/new',
-                source_name: 'other'
-              })
-            ])
-          )
-    )
-    api.inspect
-      .mockResolvedValueOnce(pendingDetail())
-      .mockReturnValueOnce(oldReplacement.promise)
-      .mockResolvedValueOnce(terminalDetail('failed'))
-      .mockResolvedValueOnce(succeededDetail(newDetail))
-    api.getOperation.mockRejectedValue(
-      new WorkflowMarketplaceApiError('marketplace_operation_not_found', 404, 'Workflow marketplace request failed.')
-    )
-
-    const rendered = renderMarketplace()
+    const rendered = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    const oldReplacement = h.holdNextAdmission('inspect')
+    h.route('inspect', 'service inspect')
     fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(2))
 
+    const nextScope = { connectionId: 'remote-b', profile: 'support' }
+    await h.bind(nextScope)
     rendered.rerender(
-      <I18nProvider configClient={null} initialLocale="en">
-        <QueryClientProvider client={rendered.client}>
-          <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'other' }} />
-        </QueryClientProvider>
-      </I18nProvider>
+      <h.Providers>
+        <WorkflowMarketplaceView scope={nextScope} />
+      </h.Providers>
     )
 
-    fireEvent.click(await screen.findByRole('option', { name: /New backend package/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    await act(async () => oldReplacement.resolve())
 
-    expect(await screen.findByRole('region', { name: 'New backend package package details' })).toBeTruthy()
-    expect(api.inspect).toHaveBeenCalledTimes(4)
+    expect(screen.getByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(3)
+    expect(h.capabilityCalls.some(call => call.connectionId === 'remote-b' && call.profile === 'support')).toBe(true)
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('sanitizes detail failures and retries a fresh inspection', async () => {
-    api.inspect
-      .mockRejectedValueOnce(new Error('access_token=secret /private/tmp/checkout'))
-      .mockResolvedValueOnce(succeededDetail())
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    h.routeRawOnce('inspect', 'service inspect wrong subject')
 
-    renderMarketplace()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
     expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
     expect(screen.queryByText(/access_token|private\/tmp/)).toBeNull()
+    h.route('inspect', 'service inspect')
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
 
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
-    expect(api.inspect).toHaveBeenCalledTimes(2)
+    expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(2)
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('clears selection and ignores an old delayed detail when connection and profile change', async () => {
-    const oldDetail = deferred<WorkflowMarketplaceOperation>()
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    const oldDetail = h.holdNextAdmission('inspect')
+    h.route('inspect', 'service inspect')
     api.search.mockImplementation((_query: string, scope: typeof scopeA) =>
       scope.connectionId === 'remote-a'
         ? Promise.resolve(page([packageItem()]))
@@ -1274,32 +1290,29 @@ describe('WorkflowMarketplaceView', () => {
             page([packageItem({ display_name: 'New backend package', id: 'new', identifier: 'other/new' })])
           )
     )
-    api.inspect.mockImplementation((_source: string, _id: string, scope: typeof scopeA) =>
-      scope.connectionId === 'remote-a' ? oldDetail.promise : Promise.resolve(succeededDetail())
-    )
-
-    const rendered = renderMarketplace()
+    const rendered = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     const oldOption = await screen.findByRole('option', { name: /Laptop Support/ })
     oldOption.focus()
     fireEvent.click(oldOption)
     expect(await screen.findByRole('status', { name: 'Loading workflow package details' })).toBeTruthy()
 
+    const nextScope = { connectionId: 'remote-b', profile: 'other' }
+    await h.bind(nextScope)
     rendered.rerender(
-      <I18nProvider configClient={null} initialLocale="en">
-        <QueryClientProvider client={rendered.client}>
-          <WorkflowMarketplaceView scope={{ connectionId: 'remote-b', profile: 'other' }} />
-        </QueryClientProvider>
-      </I18nProvider>
+      <h.Providers>
+        <WorkflowMarketplaceView scope={nextScope} />
+      </h.Providers>
     )
 
     expect(await screen.findByText('New backend package')).toBeTruthy()
-    oldDetail.resolve(succeededDetail())
-    await act(async () => Promise.resolve())
+    await act(async () => oldDetail.resolve())
     expect(screen.queryByRole('region', { name: 'Laptop Support package details' })).toBeNull()
     expect(screen.queryByRole('option', { name: /Laptop Support/ })).toBeNull()
     await waitFor(() =>
       expect(window.document.activeElement).toBe(screen.getByRole('searchbox', { name: 'Search workflow packages' }))
     )
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+    expect(api.inspect).not.toHaveBeenCalled()
   })
 
   it('supports listbox keyboard selection and clears detail when filtering removes the selected package', async () => {
@@ -1716,6 +1729,26 @@ describe('workflow package lifecycle', () => {
     await screen.findByRole('region', { name: 'Laptop Support package details' })
   }
 
+  it('starts a fresh exact inspection after remount while the detached inspection remains supervised', async () => {
+    const h = await setupLifecycle()
+    h.route('inspect', 'service inspect pending')
+    const first = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(1))
+    first.unmount()
+
+    h.route('inspect', 'service inspect')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    await screen.findByRole('region', { name: 'Laptop Support package details' })
+
+    const inspections = h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect')
+    expect(inspections).toHaveLength(2)
+    expect(inspections[1].input?.requestId).not.toBe(inspections[0].input?.requestId)
+    expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+  })
+
   function LockedTrustProbe() {
     const gate = useMarketplaceReadOnlyScope(scopeA).packageGate(lifecycleIdentity)
     const trust = gate?.packageState?.trust?.workflows.find(workflow => workflow.workflow_name === 'A')?.state
@@ -1885,7 +1918,7 @@ describe('workflow package lifecycle', () => {
       fireEvent.click(button)
       fireEvent.click(button)
       await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
-      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
       expect(screen.getByText('Refreshing package state')).not.toBeNull()
       const concurrent = h.supervisor.reconcileScope(scopeA)
       pending.resolve()
@@ -1961,7 +1994,7 @@ describe('workflow package lifecycle', () => {
     fireEvent.click(button)
     await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
     expect(screen.queryByRole('article')).toBeNull()
-    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
     pending.resolve()
     await waitFor(() => expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(1))
     expect(h.capabilityCalls).toHaveLength(before + 1)
@@ -2050,7 +2083,7 @@ describe('workflow package lifecycle', () => {
         pending.resolve()
         await settled
       })
-      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
       expect(h.tokens).not.toHaveBeenCalled()
       expect(screen.queryByRole('dialog')).toBeNull()
     })
@@ -2083,7 +2116,7 @@ describe('workflow package lifecycle', () => {
         await vi.advanceTimersByTimeAsync(240000)
       })
       expect(h.capabilityCalls).toHaveLength(before + 1)
-      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
       await act(async () => {
         pending.resolve()
         await vi.advanceTimersByTimeAsync(0)
@@ -2201,13 +2234,25 @@ describe('workflow package lifecycle', () => {
     await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
     const settled = h.supervisor.reconcileScope(scopeA)
 
-    const changed = succeededDetail(
-      packageDetail({
-        blockers: [{ code: 'package_invalid', message: 'Changed inspection is blocked.', severity: 'blocker' }]
-      })
-    )
+    const inspected = lifecycleFixture('service inspect')
 
-    api.inspect.mockResolvedValue(changed)
+    const changed = {
+      ...inspected,
+      subject: { type: 'package', identity: { package_id: 'other', source_key: 'company' } },
+      result:
+        inspected.result?.type === 'package_detail'
+          ? {
+              ...inspected.result,
+              value: {
+                ...inspected.result.value,
+                id: 'other',
+                identifier: 'company/other',
+                identity: { package_id: 'other', source_key: 'company' }
+              }
+            }
+          : inspected.result
+    }
+
     await act(async () => {
       h.queryClient.setQueryData(marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support'), changed)
     })
@@ -2215,14 +2260,11 @@ describe('workflow package lifecycle', () => {
       pending.resolve()
       await settled
     })
-    expect(
-      h.queryClient.getQueryData(marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support'))
-    ).toMatchObject({ result: { value: { blockers: [{ code: 'package_invalid' }] } } })
-    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  describe.each(['detail', 'operation'] as const)('exact %s projection recovery', projectionKind => {
+  describe('exact V2 detail projection recovery', () => {
     it.each([
       ['Install package', false, 'install_prepare', null],
       ['Check for updates', true, 'update_check', null],
@@ -2247,11 +2289,6 @@ describe('workflow package lifecycle', () => {
           h.route('update_check', 'service update check')
         }
 
-        if (projectionKind === 'operation') {
-          api.inspect.mockResolvedValue(legacyInspectionFixture('service inspect pending'))
-          api.getOperation.mockResolvedValue(legacyInspectionFixture('service inspect'))
-        }
-
         renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
         await selectPackage()
         let action = await screen.findByRole('button', { name: label })
@@ -2264,39 +2301,24 @@ describe('workflow package lifecycle', () => {
         await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
         const stateCalls = vi.spyOn(h.supervisor, 'reconcilePackage')
         const state = h.holdState()
-        const projection = deferred<WorkflowMarketplaceOperation>()
-
-        const key =
-          projectionKind === 'detail'
-            ? marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support')
-            : marketplaceKeys.operation(profileScopeKey(scopeA), legacyInspectionFixture('service inspect').id)
-
-        const read = projectionKind === 'detail' ? api.inspect : api.getOperation
-        const before = read.mock.calls.length
-        read.mockReturnValue(projection.promise)
+        const projection = h.holdNextAdmission('inspect')
+        const key = marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support')
+        const before = h.calls.filter(call => call.input?.kind === 'inspect').length
         elapsed = 300001
         fireEvent.click(action)
         fireEvent.click(action)
-        await waitFor(() => expect(read).toHaveBeenCalledTimes(before + 1))
-
-        const joined = h.queryClient.refetchQueries(
-          { queryKey: key, exact: true, type: 'all' },
-          { cancelRefetch: false, throwOnError: true }
-        )
-
         await waitFor(() => expect(stateCalls).toHaveBeenCalled())
         await act(async () => {
           state.resolve(lifecycleStateFixture(installed ? 'service installed untrusted' : 'service absent'))
           await Promise.all(stateCalls.mock.results.map(result => result.value))
         })
+        await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(before + 1))
         expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe('ready')
         expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, key).state).toBe('reconciling')
         expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(0)
         expect(h.tokens).not.toHaveBeenCalled()
-        expect(read).toHaveBeenCalledTimes(before + 1)
         await act(async () => {
-          projection.resolve(legacyInspectionFixture('service inspect'))
-          await joined
+          projection.resolve()
         })
         await waitFor(() => expect(h.calls.filter(call => call.input?.kind === kind)).toHaveLength(1))
         expect(h.tokens).toHaveBeenCalledTimes(confirmLabel ? 1 : 0)
@@ -2328,21 +2350,21 @@ describe('workflow package lifecycle', () => {
     await selectPackage()
     const action = await screen.findByRole('button', { name: 'Install package' })
     const stateCalls = vi.spyOn(h.supervisor, 'reconcilePackage')
-    const projection = deferred<WorkflowMarketplaceOperation>()
+    const projection = h.holdNextAdmission('inspect')
     const key = marketplaceKeys.detail(profileScopeKey(scopeA), 'company', 'laptop-support')
-    const before = api.inspect.mock.calls.length
-    api.inspect.mockReturnValue(projection.promise)
+    const before = h.calls.filter(call => call.input?.kind === 'inspect').length
+
+    if (failure === 'failed' || failure === 'changed') {
+      h.routeRawOnce('inspect', 'service inspect wrong subject')
+    }
+
     elapsed = 300001
     fireEvent.click(action)
-    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(before + 1))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(before + 1))
     await waitFor(() => expect(stateCalls).toHaveBeenCalled())
     await act(async () => {
       await Promise.all(stateCalls.mock.results.map(result => result.value))
     })
-
-    const joined = h.queryClient
-      .refetchQueries({ queryKey: key, exact: true, type: 'all' }, { cancelRefetch: false, throwOnError: true })
-      .catch(() => undefined)
 
     if (failure === 'missing') {
       h.queryClient.removeQueries({ queryKey: key, exact: true })
@@ -2371,20 +2393,12 @@ describe('workflow package lifecycle', () => {
     }
 
     await act(async () => {
-      if (failure === 'failed') {
-        projection.reject(new Error('Inspection failed'))
-      } else {
-        projection.resolve(
-          failure === 'changed' ? succeededDetail(packageDetail()) : legacyInspectionFixture('service inspect')
-        )
-      }
-
-      await joined
+      projection.resolve()
       await Promise.all(stateCalls.mock.results.map(result => result.value))
-      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
       expect(h.tokens).not.toHaveBeenCalled()
     })
-    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
     expect(h.tokens).not.toHaveBeenCalled()
   })
 
@@ -2397,36 +2411,26 @@ describe('workflow package lifecycle', () => {
     }))
 
     const view = renderLifecycleHarness(<ProjectionLifecycleProbe />, h)
-    const action = await screen.findByRole('button', { name: 'Install package' })
+    let action = await screen.findByRole('button', { name: 'Install package' })
     await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
-    const pending = h.holdCapabilities()
-    const before = h.capabilityCalls.length
-    elapsed = 300001
-    fireEvent.click(action)
-    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
-    const settled = h.supervisor.reconcileScope(scopeA)
     view.rerender(
       <h.Providers>
         <ProjectionLifecycleProbe enabled={kind !== 'disabled'} staticQuery={kind === 'static'} />
       </h.Providers>
     )
-    await act(async () => {
-      pending.resolve()
-      await settled
-    })
-    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    action = await screen.findByRole('button', { name: 'Install package' })
+    const before = h.capabilityCalls.length
+    elapsed = 300001
+    fireEvent.click(action)
+    await act(async () => Promise.resolve())
+    expect(h.capabilityCalls).toHaveLength(before)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
     expect(h.tokens).not.toHaveBeenCalled()
   })
 
   it('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
     const h = await setupLifecycle()
     h.route('trust_prepare', 'service review all pending')
-    let inspection = 3001
-    api.inspect.mockImplementation(() =>
-      Promise.resolve(
-        legacyInspectionFixture('service inspect', `wmop_62e05a9a7e00_${(inspection++).toString(16).padStart(32, '0')}`)
-      )
-    )
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     await selectPackage()
@@ -2453,11 +2457,9 @@ describe('workflow package lifecycle', () => {
     await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(1))
     expect(await screen.findByRole('dialog', { name: 'Preparing trust review' })).toBeTruthy()
     expect(await screen.findByText('queued 0%')).toBeTruthy()
-    expect(h.calls.filter(call => call.type === 'start').map(call => call.input?.kind)).toEqual([
-      'install_prepare',
-      'install_confirm',
-      'trust_prepare'
-    ])
+    expect(
+      h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect').map(call => call.input?.kind)
+    ).toEqual(['install_prepare', 'install_confirm', 'trust_prepare'])
     expect(h.tokens).toHaveBeenCalledTimes(1)
     expect(api.reviewTrust).not.toHaveBeenCalled()
     expect(api.grantTrust).not.toHaveBeenCalled()
@@ -2553,20 +2555,19 @@ describe('workflow package lifecycle', () => {
     await selectPackage()
     const action = await screen.findByRole('button', { name: 'Review trust' })
     await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
-    const projection = deferred<WorkflowMarketplaceOperation>()
-    const before = api.inspect.mock.calls.length
+    const projection = h.holdNextAdmission('inspect')
+    const before = h.calls.filter(call => call.input?.kind === 'inspect').length
     const capabilityBefore = h.capabilityCalls.length
     const capabilities = h.holdCapabilities()
-    api.inspect.mockReturnValue(projection.promise)
     elapsed = 300001
     fireEvent.click(action)
     await waitFor(() => expect(h.capabilityCalls).toHaveLength(capabilityBefore + 1))
     expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
     capabilities.resolve()
-    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(before + 1))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(before + 1))
     expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
     expect(h.tokens).not.toHaveBeenCalled()
-    projection.resolve(legacyInspectionFixture('service inspect'))
+    projection.resolve()
 
     await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(1))
     expect(await screen.findByRole('dialog', { name: 'Review trust' })).toBeTruthy()
@@ -2629,7 +2630,7 @@ describe('workflow package lifecycle', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel operation' }))
     await screen.findByText('Cancelled before changes were committed.')
     expect(h.calls.filter(call => call.type === 'cancel').map(call => call.id)).toEqual([
-      h.supervisor.$records.get()[0].operationId
+      h.supervisor.$records.get().find(record => record.kind === 'install_prepare')?.operationId
     ])
     expect(screen.queryByText(/Nothing new was installed/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
@@ -2668,10 +2669,9 @@ describe('workflow package lifecycle', () => {
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
     await screen.findByRole('dialog', { name: 'Review update' })
-    expect(h.calls.filter(call => call.type === 'start').map(call => call.input?.kind)).toEqual([
-      'update_check',
-      'update_prepare'
-    ])
+    expect(
+      h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect').map(call => call.input?.kind)
+    ).toEqual(['update_check', 'update_prepare'])
     expect(h.calls.filter(call => call.input?.kind === 'update_check')[0].input?.body).toEqual({
       identity: lifecycleIdentity
     })
@@ -2720,7 +2720,7 @@ describe('workflow package lifecycle', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Review removal' })
     expect(within(dialog).getByText('2.0.0')).toBeTruthy()
     expect(h.tokens).not.toHaveBeenCalled()
-    h.loseResponse()
+    h.loseResponse('remove_confirm')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Remove package' }))
     await screen.findByText(/State could not be confirmed/)
     expect(screen.getByText('Loose project workflow')).toBeTruthy()
@@ -2972,7 +2972,7 @@ describe('workflow package lifecycle', () => {
   it('reports a lost trust preparation response as unconfirmed without claiming trust was not granted', async () => {
     const h = await setupLifecycle(true)
     h.route('trust_prepare', 'service review all')
-    h.loseResponse()
+    h.loseResponse('trust_prepare')
     api.installed.mockResolvedValue({
       packages: [lifecycleStateFixture('service installed A trusted').installed],
       profile: 'support'
@@ -3012,7 +3012,7 @@ describe('workflow package lifecycle', () => {
     await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
     fireEvent.click(action)
     const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
-    h.loseResponse()
+    h.loseResponse('trust_confirm')
     h.failOriginRefetches()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
 
@@ -3333,7 +3333,7 @@ describe('workflow package lifecycle', () => {
     await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
     fireEvent.click(action)
     const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
-    h.onPost(() => h.state('service installed A trusted'))
+    h.onPost(() => h.state('service installed A trusted'), 'trust_confirm')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
 
     expect(
@@ -3390,7 +3390,7 @@ describe('workflow package lifecycle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry status' }))
     await screen.findByRole('dialog', { name: 'Review installation' })
     expect(h.calls.filter(call => call.type === 'get').map(call => call.id)).toEqual([gets[0].id, gets[0].id])
-    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(1)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(1)
     expect(h.tokens).not.toHaveBeenCalled()
   })
 
@@ -3411,7 +3411,11 @@ describe('workflow package lifecycle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Prepare again' }))
     await screen.findByRole('dialog', { name: 'Review installation' })
     expect(h.calls.filter(call => call.type === 'get')).toHaveLength(reads)
-    const requests = h.calls.filter(call => call.type === 'start').map(call => call.input?.requestId)
+
+    const requests = h.calls
+      .filter(call => call.type === 'start' && call.input?.kind !== 'inspect')
+      .map(call => call.input?.requestId)
+
     expect(requests).toHaveLength(2)
     expect(new Set(requests).size).toBe(2)
   })
@@ -3460,7 +3464,7 @@ describe('workflow package lifecycle', () => {
 
   it('rejects a mismatched review identity and gates lifecycle controls on declared capabilities', async () => {
     const h = await setupLifecycle()
-    h.mismatch()
+    h.mismatch('install_prepare')
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
@@ -3469,12 +3473,12 @@ describe('workflow package lifecycle', () => {
     cleanup()
     h.dispose()
     const limited = await setupLifecycle()
-    limited.capabilities(['operations', 'admission_replay', 'package_state'])
+    limited.capabilities(['operations', 'admission_replay', 'package_state', 'inspect'])
     await limited.bind()
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, limited)
     await selectPackage()
     expect(screen.getByRole('button', { name: 'Install package' }).hasAttribute('disabled')).toBe(true)
-    expect(limited.calls.filter(call => call.type === 'start')).toHaveLength(0)
+    expect(limited.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
   })
 
   it('returns focus to the installed-view fallback when terminal removal removes its originating card', async () => {
@@ -3486,7 +3490,7 @@ describe('workflow package lifecycle', () => {
     }))
     h.onPost(() => {
       removed = [...h.receipts.values()].some(value => value.kind === 'remove_confirm')
-    })
+    }, 'remove_confirm')
     renderLifecycleHarness(
       <InstalledPackages scope={scopeA}>
         <p>Loose workflows</p>
@@ -3508,7 +3512,7 @@ describe('workflow package lifecycle', () => {
   it('retains the exact returned admission key while its binding is temporarily suspended', async () => {
     const h = await setupLifecycle()
     h.route('install_prepare', 'service install prepare pending')
-    h.onPost(() => h.disconnect())
+    h.onPost(() => h.disconnect(), 'install_prepare')
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
@@ -3518,9 +3522,9 @@ describe('workflow package lifecycle', () => {
       await h.bind()
     })
     await screen.findByText('queued 0%')
-    expect(h.calls.filter(call => call.type === 'start')).toHaveLength(1)
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(1)
     expect(h.calls.filter(call => call.type === 'lookup').map(call => call.id)).toContain(
-      h.calls.find(call => call.type === 'start')?.input?.requestId
+      h.calls.find(call => call.input?.kind === 'install_prepare')?.input?.requestId
     )
   })
 
@@ -3570,11 +3574,11 @@ describe('workflow package lifecycle', () => {
       }
 
       if (scenario === 'lost response') {
-        h.loseResponse()
+        h.loseResponse('update_confirm')
       }
 
       if (scenario === 'invalid terminal identity') {
-        h.mismatch()
+        h.mismatch('update_confirm')
       }
 
       fireEvent.click(screen.getByRole('button', { name: 'Confirm update' }))
@@ -3673,62 +3677,56 @@ describe('workflow package lifecycle', () => {
   })
 
   it('does not offer installation for a freshly inspected candidate with structural blockers', async () => {
-    const candidate = packageDetail({
-      blockers: [{ code: 'package_invalid', message: 'Package structure is invalid.', severity: 'blocker' }],
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
+    const h = await setupLifecycle()
+    const inspection = lifecycleFixture('service inspect')
 
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    renderMarketplace()
+    if (inspection.result?.type !== 'package_detail') {
+      throw new Error('Expected generated inspection detail')
+    }
+
+    h.routeValue('inspect', {
+      ...inspection,
+      result: {
+        ...inspection.result,
+        value: {
+          ...inspection.result.value,
+          blockers: [{ code: 'package_invalid', message: 'Package structure is invalid.', severity: 'blocker' }]
+        }
+      }
+    })
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     await selectPackage()
     expect(screen.getByText('Package structure is invalid.')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Install package' })).toBeNull()
-    expect(api.prepareInstall).not.toHaveBeenCalled()
+    expect(h.calls.some(call => call.input?.kind === 'install_prepare')).toBe(false)
   })
 
   it('retains last-known package detail when a lifecycle invalidation refetch fails', async () => {
-    api.inspect
-      .mockResolvedValueOnce(succeededDetail())
-      .mockRejectedValueOnce(new WorkflowMarketplaceApiError('marketplace_network_error', 0, 'private refetch error'))
-    const rendered = renderMarketplace()
+    const h = await setupLifecycle()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     expect(screen.getByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+    const before = h.calls.filter(call => call.input?.kind === 'inspect').length
+    h.routeRawOnce('inspect', 'service inspect wrong subject')
 
-    await rendered.client.invalidateQueries({
+    await h.queryClient.invalidateQueries({
       queryKey: marketplaceKeys.detail('remote-a::support', 'company', 'laptop-support')
     })
 
-    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'inspect')).toHaveLength(before + 1))
     expect(screen.getByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
     expect(screen.queryByText('Could not inspect workflow package')).toBeNull()
   })
 
   it('discards a late lifecycle review when package selection changes', async () => {
     const h = await setupLifecycle()
-    const admission = h.holdAdmission()
+    const admission = h.holdAdmission('install_prepare')
     api.search.mockResolvedValue(
       page([
         packageItem(),
         packageItem({ display_name: 'Printer Support', id: 'printer-support', identifier: 'company/printer-support' })
       ])
-    )
-    const first = legacyInspectionFixture('service inspect')
-    api.inspect.mockImplementation((_source: string, packageId: string) =>
-      Promise.resolve(
-        packageId === 'printer-support'
-          ? succeededDetail(
-              packageDetail({
-                display_name: 'Printer Support',
-                id: 'printer-support',
-                identifier: 'company/printer-support',
-                identity: { package_id: 'printer-support', source_key: 'company' }
-              })
-            )
-          : first
-      )
     )
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
@@ -3736,6 +3734,26 @@ describe('workflow package lifecycle', () => {
     await screen.findByText('queued 0%')
     expect(screen.queryByRole('button', { name: 'Cancel operation' })).toBeNull()
     fireEvent.click(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' }).at(-1)!)
+    const printer = lifecycleFixture('service inspect')
+
+    if (printer.result?.type !== 'package_detail') {
+      throw new Error('Expected generated inspection detail')
+    }
+
+    h.routeValue('inspect', {
+      ...printer,
+      subject: { type: 'package', identity: { package_id: 'printer-support', source_key: 'company' } },
+      result: {
+        ...printer.result,
+        value: {
+          ...printer.result.value,
+          display_name: 'Printer Support',
+          id: 'printer-support',
+          identifier: 'company/printer-support',
+          identity: { package_id: 'printer-support', source_key: 'company' }
+        }
+      }
+    })
     fireEvent.click(screen.getByRole('option', { name: /Printer Support/ }))
     await screen.findByRole('region', { name: 'Printer Support package details' })
     await act(async () => admission.resolve())
@@ -3792,35 +3810,39 @@ describe('supervised marketplace readiness and transitional adapters', () => {
     }
   })
 
-  it('keeps the old pending inspection last-observed after mutation, failed replacement admission and remount', async () => {
+  it('keeps the last accepted inspection last-observed after mutation, failed replacement and remount', async () => {
     const h = createLifecycleHarness()
 
     try {
       const binding = await h.bind()
-      const pending = legacyInspectionFixture('service inspect pending')
-      const completed = legacyInspectionFixture('service inspect')
-      api.inspect.mockResolvedValue(pending)
-      api.getOperation.mockResolvedValue(completed)
+      h.route('inspect', 'service inspect')
       const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
       await selectPackage()
       const region = screen.getByRole('region', { name: 'Laptop Support package details' })
       await waitFor(() => expect(within(region).queryByText(/Last observed —/)).toBeNull())
-      api.inspect.mockRejectedValue(new Error('replacement inspection unavailable'))
+      const inspections = h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect').length
+      h.routeRawOnce('inspect', 'service inspect wrong subject')
       h.state('service installed A trusted')
       await act(async () => {
         await h.mutate(binding, 'service update confirm')
         await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
       })
-      await waitFor(() => expect(api.inspect.mock.calls.length).toBeGreaterThan(1))
-      expect(api.getOperation).toHaveBeenLastCalledWith(pending.id, scopeA)
+      await waitFor(() =>
+        expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect').length).toBeGreaterThan(
+          inspections
+        )
+      )
       expect(within(region).getByText(/Last observed —/)).toBeTruthy()
       view.unmount()
+      h.routeRawOnce('inspect', 'service inspect wrong subject')
       renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
       await selectPackage()
       expect(
         within(screen.getByRole('region', { name: 'Laptop Support package details' })).getByText(/Last observed —/)
       ).toBeTruthy()
       expect(screen.queryByRole('button', { name: 'Update package' })).toBeNull()
+      expect(api.inspect).not.toHaveBeenCalled()
+      expect(api.getOperation).not.toHaveBeenCalled()
     } finally {
       cleanup()
       h.dispose()
@@ -3888,14 +3910,33 @@ describe('supervised marketplace readiness and transitional adapters', () => {
     }
   })
 
-  it('does not invoke legacy lifecycle callbacks without an application supervisor', async () => {
+  it('keeps V1-only catalog and source CRUD usable without unsupervised inspection or lifecycle starts', async () => {
     renderMarketplace()
-    await selectPackage()
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
+    expect(screen.getByRole('searchbox', { name: 'Search workflow packages' })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage Sources' }))
+    const sources = await screen.findByRole('dialog', { name: 'Workflow sources' })
+    expect(within(sources).getByText('Upgrade Hermes to manage and refresh workflow sources.')).toBeTruthy()
+    fireEvent.click(within(sources).getByRole('button', { name: 'Add source' }))
+    fireEvent.change(within(sources).getByLabelText('Source name'), { target: { value: 'team' } })
+    fireEvent.change(within(sources).getByLabelText('Repository URL'), {
+      target: { value: 'https://example.test/team/workflows.git' }
+    })
+    fireEvent.click(within(sources).getByRole('button', { name: 'Save source' }))
+    await waitFor(() =>
+      expect(api.add).toHaveBeenCalledWith(
+        { enabled: true, name: 'team', ref: null, repositoryUrl: 'https://example.test/team/workflows.git' },
+        scopeA
+      )
+    )
 
     for (const name of ['Install package', 'Update package', 'Remove package', 'Review trust']) {
       expect(screen.queryByRole('button', { name })).toBeNull()
     }
 
+    expect(api.inspect).not.toHaveBeenCalled()
     expect(api.prepareInstall).not.toHaveBeenCalled()
     expect(api.prepareUpdate).not.toHaveBeenCalled()
     expect(api.prepareRemove).not.toHaveBeenCalled()

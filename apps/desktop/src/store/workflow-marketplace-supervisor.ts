@@ -1,6 +1,7 @@
 import type { QueryClient, QueryKey } from '@tanstack/react-query'
 import { atom } from 'nanostores'
 
+import { profileScopeKey } from '@/api/client'
 import {
   createLifecycleRequestId,
   discardLifecycleClockObservation,
@@ -119,6 +120,7 @@ interface Entry {
   cadence?: AbortController
   replay?: () => Promise<unknown>
   replayExpiry?: AbortController
+  refreshInvalidation?: string
 }
 const scopeKey = (scope: MarketplaceScope) => JSON.stringify([scope.connectionId, scope.profile])
 
@@ -203,6 +205,27 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     next.key = supervisionKey(next.binding, next.requestId, next.operationId)
     entry.record = freeze(next)
     publish()
+  }
+
+  function invalidateRefresh(entry: Entry) {
+    if (entry.record.kind !== 'refresh' || entry.record.subject.type !== 'source') {
+      return
+    }
+
+    const stamp = `${entry.record.status}:${entry.record.operation?.state ?? 'none'}`
+
+    if (entry.refreshInvalidation === stamp) {
+      return
+    }
+
+    entry.refreshInvalidation = stamp
+    const origin = profileScopeKey(entry.record.binding)
+    void options.queryClient.invalidateQueries({
+      predicate: query =>
+        query.queryKey[0] === 'workflow-marketplace' &&
+        query.queryKey[1] === origin &&
+        (query.queryKey[2] === 'sources' || query.queryKey[2] === 'search')
+    })
   }
 
   function forgetReplay(entry: Entry) {
@@ -441,6 +464,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
       forgetReplay(entry)
       update(entry, { binding, operationId: evicted.operation_id, status: 'evicted', errorCode: null })
+      invalidateRefresh(entry)
 
       return
     }
@@ -460,10 +484,6 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     forgetReplay(entry)
     const terminal = operation.state !== 'pending' && operation.state !== 'running'
 
-    if (terminal && isMutation(operation.kind) && operation.subject.type === 'package') {
-      reconciliation.advance(binding, operation.subject.identity)
-    }
-
     update(entry, {
       binding,
       operationId: operation.id,
@@ -472,6 +492,14 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       errorCode: null,
       barrier: isMutation(operation.kind) || !terminal
     })
+
+    if (terminal && isMutation(operation.kind) && operation.subject.type === 'package') {
+      reconciliation.advance(binding, operation.subject.identity)
+    }
+
+    if (terminal) {
+      invalidateRefresh(entry)
+    }
   }
 
   function schedule(entry: Entry) {
@@ -592,6 +620,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
             ),
             errorCode: failure.code
           })
+          invalidateRefresh(entry)
         }
       } else if (requiresProbe(failure)) {
         suspend(target, failure.code)
@@ -601,6 +630,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
           status: entry.record.operationId ? 'status_unknown' : 'admission_unknown',
           errorCode: failure.code
         })
+        invalidateRefresh(entry)
       }
     } finally {
       if (entry.call === controller) {
@@ -649,6 +679,70 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
   function find(key: string) {
     return [...entries].find(entry => entry.record.key === key)
+  }
+
+  function waitForRecord(key: string, signal?: AbortSignal): Promise<SupervisedRecord> {
+    return new Promise((resolve, reject) => {
+      let off: () => void = () => undefined
+      let finished = false
+
+      const cleanup = () => {
+        off()
+        signal?.removeEventListener('abort', abort)
+      }
+
+      const finish = (record: SupervisedRecord) => {
+        if (finished) {
+          return
+        }
+
+        finished = true
+        cleanup()
+        resolve(record)
+      }
+
+      const abort = () => {
+        if (finished) {
+          return
+        }
+
+        finished = true
+        cleanup()
+        reject(signal?.reason ?? new DOMException('Observation stopped.', 'AbortError'))
+      }
+
+      const inspect = () => {
+        const record = find(key)?.record
+
+        if (!record) {
+          if (disposed) {
+            abort()
+          }
+
+          return
+        }
+
+        if (
+          record.status === 'terminal' ||
+          record.status === 'evicted' ||
+          record.status === 'admission_unknown' ||
+          record.status === 'status_unknown' ||
+          record.status === 'suspended'
+        ) {
+          finish(record)
+        }
+      }
+
+      if (signal?.aborted) {
+        abort()
+
+        return
+      }
+
+      signal?.addEventListener('abort', abort, { once: true })
+      off = records.listen(inspect)
+      inspect()
+    })
   }
 
   function snapshotOwner(operation: LifecycleOperation, binding: LifecycleConnectionBinding) {
@@ -913,6 +1007,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         entry =>
           sameAuthority(entry.record.binding, binding) &&
           entry.record.barrier &&
+          !(input.kind === 'inspect' && (entry.record.kind === 'inspect' || entry.record.status === 'terminal')) &&
           sameLifecycleValue(entry.record.subject, subject)
       )
     ) {
@@ -950,6 +1045,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
           entry.call.abort()
           entry.call = undefined
           update(entry, { status: 'admission_unknown', callPending: false, errorCode: 'marketplace_network_error' })
+          invalidateRefresh(entry)
         }
       })
       .catch(() => undefined)
@@ -1074,18 +1170,23 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     const observation = reconciliation.read(binding, identity)
     const state = observation.packageState
+    const lifecycleBarriers = matching.filter(record => record.kind !== 'inspect')
 
-    if (matching.some(record => record.status === 'admitting' || record.status === 'watching') || state?.busy) {
+    if (
+      lifecycleBarriers.some(record => record.status === 'admitting' || record.status === 'watching') ||
+      state?.busy
+    ) {
       return { state: 'busy', packageState: null }
     }
 
-    if (matching.some(record => record.barrier && record.status !== 'terminal')) {
+    if (lifecycleBarriers.some(record => record.barrier && record.status !== 'terminal')) {
       return { state: 'unknown', packageState: null }
     }
 
     if (
       state?.recovery === 'required' ||
-      (!state && matching.some(record => record.barrier && record.operation?.outcome?.type === 'recovery_required'))
+      (!state &&
+        lifecycleBarriers.some(record => record.barrier && record.operation?.outcome?.type === 'recovery_required'))
     ) {
       return { state: 'recovery_required', packageState: null }
     }
@@ -1093,7 +1194,8 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     if (
       state?.state === 'unconfirmed' ||
       state?.recovery === 'unconfirmed' ||
-      (!state && matching.some(record => record.barrier && record.operation?.outcome?.type === 'outcome_unknown'))
+      (!state &&
+        lifecycleBarriers.some(record => record.barrier && record.operation?.outcome?.type === 'outcome_unknown'))
     ) {
       return { state: 'unknown', packageState: null }
     }
@@ -1158,6 +1260,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     bindings,
     reconciliation,
     start,
+    waitForRecord,
     retry,
     cancel,
     reconcileScope,

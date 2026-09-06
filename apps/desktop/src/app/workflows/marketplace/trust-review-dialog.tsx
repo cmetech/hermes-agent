@@ -17,6 +17,7 @@ import type {
   TrustWorkflowState
 } from '@/types/workflow-marketplace-lifecycle'
 
+import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { ReviewFacts, ReviewValueList, WorkflowRiskReview } from './review-sections'
 
 export type TrustSelection = AllTrustSelection | OneTrustSelection
@@ -59,7 +60,9 @@ export function TrustReviewDialog({
   const grantGuardRef = useRef(false)
   const mountedRef = useRef(true)
   const primaryRef = useRef<HTMLButtonElement>(null)
+  const headingRef = useRef<HTMLHeadingElement>(null)
   const [admissionBusy, setAdmissionBusy] = useState(false)
+  const rememberDialogFocus = useLifecycleDialogFocus(open, [view.kind, admissionBusy], primaryRef, headingRef)
   const review = view.kind === 'review' ? view.review : null
   const workflowNames = availableWorkflowNames ?? review?.workflows.map(workflow => workflow.workflow_name) ?? []
   const selectedWorkflow = selection.type === 'one' ? selection.workflow_name : (workflowNames[0] ?? '')
@@ -102,14 +105,22 @@ export function TrustReviewDialog({
   return (
     <Dialog onOpenChange={value => !value && close()} open={open}>
       <DialogContent
-        className="w-[min(92vw,54rem)] max-w-4xl"
+        className="w-[min(92vw,54rem)] max-w-4xl motion-reduce:animate-none motion-reduce:transition-none"
+        data-marketplace-lifecycle-dialog
         onCloseAutoFocus={event => {
           if (onRestoreFocus) {
             event.preventDefault()
             onRestoreFocus()
           }
         }}
-        onEscapeKeyDown={event => admissionBusy && event.preventDefault()}
+        onEscapeKeyDown={event => event.preventDefault()}
+        onFocusCapture={rememberDialogFocus}
+        onInteractOutside={event => admissionBusy && event.preventDefault()}
+        onKeyDown={event => {
+          if (event.key === 'Escape') {
+            claimLifecycleEscape(event, !admissionBusy, close)
+          }
+        }}
         onOpenAutoFocus={event => {
           event.preventDefault()
           primaryRef.current?.focus()
@@ -117,16 +128,14 @@ export function TrustReviewDialog({
         showCloseButton={!admissionBusy}
       >
         <DialogHeader>
-          <DialogTitle>
+          <DialogTitle ref={headingRef} tabIndex={-1}>
             {view.kind === 'progress' ? copy.workflowMarketplacePreparingTrust : copy.workflowMarketplaceReviewTrust}
           </DialogTitle>
           <DialogDescription>{copy.workflowMarketplaceReviewTrustDescription}</DialogDescription>
         </DialogHeader>
 
         {view.kind === 'progress' ? (
-          <p aria-live="polite" role="status">
-            {copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}
-          </p>
+          <p role="status">{copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}</p>
         ) : view.kind === 'review' ? (
           <>
             <ReviewFacts
@@ -199,7 +208,7 @@ export function TrustReviewDialog({
           </>
         ) : view.kind === 'succeeded' ? (
           <>
-            <p aria-live="polite" role="status">
+            <p role="status">
               {view.selection.type === 'one'
                 ? `Trust granted for ${view.selection.workflow_name}.`
                 : 'Trust granted for all reviewed workflows.'}

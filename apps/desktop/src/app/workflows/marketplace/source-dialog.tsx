@@ -16,7 +16,6 @@ import { Input } from '@/components/ui/input'
 import {
   addWorkflowMarketplaceSource,
   listWorkflowMarketplaceSources,
-  refreshWorkflowMarketplaceSource,
   removeWorkflowMarketplaceSource,
   setWorkflowMarketplaceSourceEnabled,
   updateWorkflowMarketplaceSource
@@ -95,6 +94,7 @@ export interface ManageWorkflowSourcesDialogProps {
   onClose: () => void
   open: boolean
   operations: MarketplaceOperationController
+  refreshSupported?: boolean
   scope: WorkflowMarketplaceScope
   supported: boolean
 }
@@ -104,7 +104,8 @@ export function ManageWorkflowSourcesDialog({
   open,
   operations,
   scope,
-  supported
+  supported,
+  refreshSupported = supported
 }: ManageWorkflowSourcesDialogProps) {
   const { t } = useI18n()
   const copy = t.operations
@@ -142,7 +143,6 @@ export function ManageWorkflowSourcesDialog({
     renderedScopeKeyRef.current === origin.scopeKey &&
     actionGenerationRef.current === origin.generation
 
-  // eslint-disable-next-line no-restricted-syntax -- resets ephemeral dialog state at an exact backend scope boundary
   useEffect(() => {
     setDraft(EMPTY_DRAFT)
     setEditing(null)
@@ -166,11 +166,12 @@ export function ManageWorkflowSourcesDialog({
 
   // eslint-disable-next-line no-restricted-syntax -- detects a closed-to-open transition so persisted operations reconcile on reopen
   useEffect(() => {
-    if (open && !wasOpenRef.current && supported) {
+    if (open && !wasOpenRef.current && refreshSupported) {
       operations.reconcile()
     }
+
     wasOpenRef.current = open
-  }, [open, operations, supported])
+  }, [open, operations, refreshSupported])
 
   const sources = useQuery({
     enabled: open && supported,
@@ -295,7 +296,7 @@ export function ManageWorkflowSourcesDialog({
   }
 
   const refreshOne = async (name: string) => {
-    await operations.start(name, () => refreshWorkflowMarketplaceSource(name, scope))
+    await operations.start(name)
   }
 
   const refreshAll = async () => {
@@ -315,7 +316,7 @@ export function ManageWorkflowSourcesDialog({
           break
         }
 
-        await operations.start(source.name, () => refreshWorkflowMarketplaceSource(source.name, scope), origin)
+        await operations.start(source.name, origin)
 
         if (!operations.originIsCurrent(origin) || renderedScopeKeyRef.current !== scopeKey) {
           break
@@ -334,10 +335,12 @@ export function ManageWorkflowSourcesDialog({
 
   const refreshAllBusy = refreshAllBusyScope === scopeKey
   const mutationBusy = mutationLedgerRef.current.has(scopeKey)
+
   const visibleActionFailure =
     actionFailure?.scopeKey === scopeKey && actionFailure.generation === actionGenerationRef.current
       ? actionFailure
       : null
+
   const visibleFormOpen = formOpen && formScopeKey === scopeKey
   const visibleRemoval = removeSource?.scopeKey === scopeKey ? removeSource : null
 
@@ -397,7 +400,9 @@ export function ManageWorkflowSourcesDialog({
                 </Button>
                 <Button
                   aria-busy={refreshAllBusy}
-                  disabled={refreshAllBusy || !sources.data?.sources.some(source => source.enabled)}
+                  disabled={
+                    !refreshSupported || refreshAllBusy || !sources.data?.sources.some(source => source.enabled)
+                  }
                   onClick={() => void refreshAll()}
                   size="sm"
                   type="button"
@@ -406,6 +411,11 @@ export function ManageWorkflowSourcesDialog({
                   <RefreshCw className="size-4" />
                   {copy.workflowMarketplaceRefreshAll}
                 </Button>
+                {!refreshSupported ? (
+                  <span className="text-xs text-(--ui-text-tertiary)" role="status">
+                    {copy.workflowMarketplaceUnsupportedSources}
+                  </span>
+                ) : null}
               </div>
 
               {visibleFormOpen ? (
@@ -601,7 +611,12 @@ export function ManageWorkflowSourcesDialog({
                         <div className="flex flex-wrap gap-2">
                           <Button
                             aria-label={copy.workflowMarketplaceRefreshSource(source.name)}
-                            disabled={!source.enabled || active?.state === 'pending' || active?.state === 'running'}
+                            disabled={
+                              !refreshSupported ||
+                              !source.enabled ||
+                              active?.state === 'pending' ||
+                              active?.state === 'running'
+                            }
                             onClick={() => void refreshOne(source.name)}
                             size="sm"
                             type="button"

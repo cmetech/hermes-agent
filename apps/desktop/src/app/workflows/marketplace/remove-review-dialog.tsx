@@ -12,6 +12,7 @@ import {
 import { useI18n } from '@/i18n'
 import type { WorkflowMarketplaceRemoveReview } from '@/types/hermes'
 
+import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { type PackageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
 import { ReviewFacts, ReviewValueList } from './review-sections'
 
@@ -52,7 +53,9 @@ export function RemoveReviewDialog({
   const confirmGuardRef = useRef(false)
   const mountedRef = useRef(true)
   const primaryRef = useRef<HTMLButtonElement>(null)
+  const headingRef = useRef<HTMLHeadingElement>(null)
   const [admissionBusy, setAdmissionBusy] = useState(false)
+  const rememberDialogFocus = useLifecycleDialogFocus(open, [view.kind, admissionBusy], primaryRef, headingRef)
 
   // eslint-disable-next-line no-restricted-syntax -- tracks component lifetime for guarded async admission cleanup
   useEffect(() => {
@@ -92,14 +95,22 @@ export function RemoveReviewDialog({
   return (
     <Dialog onOpenChange={value => !value && close()} open={open}>
       <DialogContent
-        className="w-[min(92vw,42rem)] max-w-2xl"
+        className="w-[min(92vw,42rem)] max-w-2xl motion-reduce:animate-none motion-reduce:transition-none"
+        data-marketplace-lifecycle-dialog
         onCloseAutoFocus={event => {
           if (onRestoreFocus) {
             event.preventDefault()
             onRestoreFocus()
           }
         }}
-        onEscapeKeyDown={event => admissionBusy && event.preventDefault()}
+        onEscapeKeyDown={event => event.preventDefault()}
+        onFocusCapture={rememberDialogFocus}
+        onInteractOutside={event => admissionBusy && event.preventDefault()}
+        onKeyDown={event => {
+          if (event.key === 'Escape') {
+            claimLifecycleEscape(event, !admissionBusy, close)
+          }
+        }}
         onOpenAutoFocus={event => {
           event.preventDefault()
           primaryRef.current?.focus()
@@ -107,7 +118,7 @@ export function RemoveReviewDialog({
         showCloseButton={!admissionBusy}
       >
         <DialogHeader>
-          <DialogTitle>
+          <DialogTitle ref={headingRef} tabIndex={-1}>
             {view.kind === 'progress'
               ? copy.workflowMarketplacePreparingRemoval
               : copy.workflowMarketplaceReviewRemoval}
@@ -116,9 +127,7 @@ export function RemoveReviewDialog({
         </DialogHeader>
 
         {view.kind === 'progress' ? (
-          <p aria-live="polite" role="status">
-            {copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}
-          </p>
+          <p role="status">{copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}</p>
         ) : view.kind === 'review' ? (
           <>
             <ReviewFacts
@@ -146,13 +155,9 @@ export function RemoveReviewDialog({
             </div>
           </>
         ) : view.kind === 'succeeded' ? (
-          <p aria-live="polite" role="status">
-            {copy.workflowMarketplacePackageRemoved}
-          </p>
+          <p role="status">{copy.workflowMarketplacePackageRemoved}</p>
         ) : view.kind === 'terminal' ? (
-          <p aria-live="polite" role={view.presentation.kind === 'unconfirmed' ? 'alert' : 'status'}>
-            {view.presentation.message}
-          </p>
+          <p role={view.presentation.kind === 'unconfirmed' ? 'alert' : 'status'}>{view.presentation.message}</p>
         ) : (
           <div role="alert">
             <p>{unconfirmedPackagePresentation.message}</p>

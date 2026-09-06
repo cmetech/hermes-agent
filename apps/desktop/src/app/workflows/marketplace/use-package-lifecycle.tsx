@@ -196,6 +196,20 @@ export function usePackageLifecycle({
       const expectedOwner = owner.current
       const expected = latest.current
       const previousInstalled = gate.packageState?.installed
+
+      const projectionFilter = expected.projection
+        ? { queryKey: expected.projection, exact: true, type: 'all' as const }
+        : null
+
+      const projectionQuery = projectionFilter ? queryClient.getQueryCache().find(projectionFilter) : null
+
+      // Capture the exact active projection before the authority probe temporarily
+      // disables its observer. Missing, disabled, or static projections never authorize.
+      if (projectionFilter && (!projectionQuery || projectionQuery.isDisabled() || projectionQuery.isStatic())) {
+        return
+      }
+
+      const projectionOptions = projectionQuery?.options
       refreshing.current = ticket
       setRefreshPending(true)
 
@@ -219,22 +233,18 @@ export function usePackageLifecycle({
           return
         }
 
-        if (expected.projection) {
-          const filter = { queryKey: expected.projection, exact: true, type: 'all' as const }
-          const query = queryClient.getQueryCache().find(filter)
-
-          // A skipped refetch cannot renew the captured projection's authority.
-          if (!query || query.isDisabled() || query.isStatic()) {
+        if (projectionFilter && projectionQuery && projectionOptions) {
+          if (queryClient.getQueryCache().find(projectionFilter) !== projectionQuery) {
             return
           }
 
           try {
-            await queryClient.refetchQueries(filter, { cancelRefetch: false, throwOnError: true })
+            await projectionQuery.fetch(projectionOptions, { cancelRefetch: false })
           } catch {
             return
           }
 
-          if (queryClient.getQueryCache().find(filter) !== query || query.isDisabled() || query.isStatic()) {
+          if (queryClient.getQueryCache().find(projectionFilter) !== projectionQuery) {
             return
           }
         }

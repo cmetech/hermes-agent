@@ -13,6 +13,7 @@ import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import type { WorkflowMarketplaceInstallReview, WorkflowMarketplaceUpdateReview } from '@/types/hermes'
 
+import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { marketplaceWebRepositoryHref } from './package-detail'
 import { type PackageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
 import {
@@ -236,7 +237,9 @@ export function InstallReviewDialog({
   const confirmGuardRef = useRef(false)
   const mountedRef = useRef(true)
   const primaryRef = useRef<HTMLButtonElement>(null)
+  const headingRef = useRef<HTMLHeadingElement>(null)
   const [admissionBusy, setAdmissionBusy] = useState(false)
+  const rememberDialogFocus = useLifecycleDialogFocus(open, [view.kind, admissionBusy], primaryRef, headingRef)
 
   // eslint-disable-next-line no-restricted-syntax -- tracks component lifetime for guarded async admission cleanup
   useEffect(() => {
@@ -292,14 +295,22 @@ export function InstallReviewDialog({
   return (
     <Dialog onOpenChange={value => !value && close()} open={open}>
       <DialogContent
-        className="w-[min(92vw,54rem)] max-w-4xl"
+        className="w-[min(92vw,54rem)] max-w-4xl motion-reduce:animate-none motion-reduce:transition-none"
+        data-marketplace-lifecycle-dialog
         onCloseAutoFocus={event => {
           if (onRestoreFocus) {
             event.preventDefault()
             onRestoreFocus()
           }
         }}
-        onEscapeKeyDown={event => admissionBusy && event.preventDefault()}
+        onEscapeKeyDown={event => event.preventDefault()}
+        onFocusCapture={rememberDialogFocus}
+        onInteractOutside={event => admissionBusy && event.preventDefault()}
+        onKeyDown={event => {
+          if (event.key === 'Escape') {
+            claimLifecycleEscape(event, !admissionBusy, close)
+          }
+        }}
         onOpenAutoFocus={event => {
           event.preventDefault()
           primaryRef.current?.focus()
@@ -307,7 +318,9 @@ export function InstallReviewDialog({
         showCloseButton={!admissionBusy}
       >
         <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
+          <DialogTitle ref={headingRef} tabIndex={-1}>
+            {title}
+          </DialogTitle>
           <DialogDescription>
             {mode === 'install'
               ? copy.workflowMarketplaceReviewInstallationDescription
@@ -316,13 +329,11 @@ export function InstallReviewDialog({
         </DialogHeader>
 
         {view.kind === 'progress' ? (
-          <p aria-live="polite" role="status">
-            {copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}
-          </p>
+          <p role="status">{copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}</p>
         ) : view.kind === 'review' ? (
           <ReviewContent view={view} />
         ) : view.kind === 'succeeded' ? (
-          <p aria-live="polite" role="status">
+          <p role="status">
             {view.mode === 'install'
               ? copy.workflowMarketplaceInstalledTrustRequired
               : copy.workflowMarketplaceUpdatedTrustRequired(view.version)}
@@ -331,7 +342,6 @@ export function InstallReviewDialog({
           <p role="status">{copy.workflowMarketplacePackageCurrent(view.version)}</p>
         ) : view.kind === 'terminal' ? (
           <p
-            aria-live="polite"
             role={
               view.presentation.kind === 'unconfirmed' || view.presentation.kind === 'check_error' ? 'alert' : 'status'
             }
