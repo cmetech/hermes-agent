@@ -25,6 +25,24 @@ afterEach(() => {
 })
 
 describe('package mutation reconciliation', () => {
+  it('does not fill from an older same-generation read after the latest authoritative attempt fails', async () => {
+    const h = harness()
+    const binding = await h.bind()
+    const [earlier, latest] = h.holdNextStateReads(2)
+    const oldRead = h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    const latestRead = h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    latest.resolve(null)
+    expect(await latestRead).toBeNull()
+    earlier.resolve(lifecycleStateFixture('service installed untrusted'))
+    expect(await oldRead).toBeNull()
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe('unknown')
+    h.state('service installed A trusted')
+    expect(await h.supervisor.reconcilePackage(binding, lifecycleIdentity)).toEqual(
+      lifecycleStateFixture('service installed A trusted')
+    )
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe('ready')
+  })
+
   it.each(['other-source', 'renamed-source', 'Company'])(
     'rejects wrong source admission lineage from %s for both candidate consumers',
     async source => {

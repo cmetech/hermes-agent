@@ -16,6 +16,10 @@ interface PackageObservation {
   generation: number
   packageState: PackageState | null
 }
+interface PackageReadTicket {
+  generation: number
+  order: number
+}
 
 function inspectionOperation(value: unknown, binding: LifecycleConnectionBinding) {
   const operation = decodeLifecycleOperation(value) ?? decodeMarketplaceOperation(value)
@@ -62,6 +66,8 @@ export function createMarketplaceReconciliation(
   isCurrent: (binding: LifecycleConnectionBinding) => boolean
 ) {
   const packages = new Map<string, { binding: LifecycleConnectionBinding; observation: PackageObservation }>()
+  const packageReads = new Map<string, number>()
+  let packageReadOrder = 0
   const scopes = new Map<string, { binding: LifecycleConnectionBinding; generation: number }>()
   const projections = new WeakMap<Query, { binding: LifecycleConnectionBinding; generation: number; fresh: boolean }>()
 
@@ -242,15 +248,29 @@ export function createMarketplaceReconciliation(
       return scopes.get(profileScopeKey(binding))?.generation ?? 0
     },
     advance,
+    beginPackageRead(binding: LifecycleConnectionBinding, identity: PackageIdentity): PackageReadTicket {
+      const ticket = { generation: read(binding, identity).generation, order: ++packageReadOrder }
+      // The latest-started exact read owns publication even if it fails; older responses cannot fill behind it.
+      packageReads.set(key(binding, identity), ticket.order)
+
+      return ticket
+    },
+    finishPackageRead(binding: LifecycleConnectionBinding, identity: PackageIdentity, ticket: PackageReadTicket) {
+      const packageKey = key(binding, identity)
+
+      if (packageReads.get(packageKey) === ticket.order) {
+        packageReads.delete(packageKey)
+      }
+    },
     accept(
       binding: LifecycleConnectionBinding,
       identity: PackageIdentity,
-      generation: number,
+      ticket: PackageReadTicket,
       packageState: PackageState
     ) {
       const previous = read(binding, identity)
 
-      if (previous.generation !== generation) {
+      if (previous.generation !== ticket.generation || packageReads.get(key(binding, identity)) !== ticket.order) {
         return false
       }
 

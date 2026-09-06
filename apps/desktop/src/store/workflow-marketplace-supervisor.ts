@@ -993,7 +993,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     }
 
     const controller = new AbortController()
-    const generation = reconciliation.read(binding, identity).generation
+    const ticket = reconciliation.beginPackageRead(binding, identity)
     packageCalls.set(controller, binding)
 
     try {
@@ -1010,7 +1010,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         return null
       }
 
-      if (!reconciliation.accept(binding, identity, generation, value)) {
+      if (!reconciliation.accept(binding, identity, ticket, value)) {
         return null
       }
 
@@ -1050,6 +1050,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       return null
     } finally {
       packageCalls.delete(controller)
+      reconciliation.finishPackageRead(binding, identity, ticket)
     }
   }
 

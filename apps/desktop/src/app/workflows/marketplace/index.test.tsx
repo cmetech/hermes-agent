@@ -1716,6 +1716,110 @@ describe('workflow package lifecycle', () => {
     await screen.findByRole('region', { name: 'Laptop Support package details' })
   }
 
+  function LockedTrustProbe() {
+    const gate = useMarketplaceReadOnlyScope(scopeA).packageGate(lifecycleIdentity)
+    const trust = gate?.packageState?.trust?.workflows.find(workflow => workflow.workflow_name === 'A')?.state
+
+    return (
+      <output aria-label="Locked workflow A trust">{gate ? `${gate.state}:${trust ?? 'none'}` : 'unavailable'}</output>
+    )
+  }
+
+  it('keeps later-started mount reconciliation truth when the earlier package read settles last', async () => {
+    const h = await setupLifecycle(true)
+    const [earlier, later] = h.holdNextStateReads(2)
+    const reconciliations = vi.spyOn(h.supervisor, 'reconcilePackage')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed untrusted').installed],
+      profile: 'support'
+    })
+
+    renderLifecycleHarness(
+      <>
+        <InstalledPackages scope={scopeA}>
+          <div />
+        </InstalledPackages>
+        <LockedTrustProbe />
+      </>,
+      h
+    )
+
+    await waitFor(() => expect(h.packageStateCalls()).toBe(2))
+    await act(async () => {
+      later.resolve(lifecycleStateFixture('service installed A trusted'))
+      await reconciliations.mock.results[1].value
+    })
+    expect((await screen.findByLabelText('Locked workflow A trust')).textContent).toBe('ready:trusted')
+    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    const reviewTrust = within(packageGroup).getByRole('button', { name: 'Review trust' })
+    expect(reviewTrust.hasAttribute('disabled')).toBe(false)
+
+    await act(async () => {
+      earlier.resolve(lifecycleStateFixture('service installed untrusted'))
+      await reconciliations.mock.results[0].value
+    })
+    expect(screen.getByLabelText('Locked workflow A trust').textContent).toBe('ready:trusted')
+    expect(reviewTrust.hasAttribute('disabled')).toBe(false)
+  })
+
+  it('keeps later-started trust-terminal truth when the lifecycle read settles last', async () => {
+    const h = await setupLifecycle(true)
+    h.state('service installed A trusted')
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+
+    renderLifecycleHarness(
+      <>
+        <InstalledPackages scope={scopeA}>
+          <div />
+        </InstalledPackages>
+        <LockedTrustProbe />
+      </>,
+      h
+    )
+
+    const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    const reviewTrust = within(packageGroup).getByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(reviewTrust.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(reviewTrust)
+    const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
+    const before = h.packageStateCalls()
+    const [earlier, later] = h.holdNextStateReads(2)
+    const reconciliations = vi.spyOn(h.supervisor, 'reconcilePackage')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
+    await waitFor(() => expect(h.packageStateCalls()).toBe(before + 2))
+    const terminal = lifecycleFixture('service grant all')
+
+    if (!terminal.outcome || !('package_state' in terminal.outcome) || !terminal.outcome.package_state) {
+      throw new Error('Expected generated grant-all PackageState')
+    }
+
+    const terminalState = terminal.outcome.package_state
+
+    await act(async () => {
+      later.resolve(terminalState)
+      await reconciliations.mock.results[1].value
+    })
+    expect(await screen.findByText('Trust granted for all reviewed workflows.')).toBeTruthy()
+    expect(within(screen.getByRole('region', { name: 'Current package trust' })).getAllByText('trusted')).toHaveLength(
+      2
+    )
+
+    await act(async () => {
+      earlier.resolve(lifecycleStateFixture('service installed A trusted'))
+      await reconciliations.mock.results[0].value
+    })
+    expect(screen.getByText('Trust granted for all reviewed workflows.')).toBeTruthy()
+    expect(screen.queryByText(/State could not be confirmed/)).toBeNull()
+    expect(within(screen.getByRole('region', { name: 'Current package trust' })).getAllByText('trusted')).toHaveLength(
+      2
+    )
+  })
+
   it('renews long-open ready authority and starts exactly one reviewed install with advancing clocks', async () => {
     let elapsed = 0
 

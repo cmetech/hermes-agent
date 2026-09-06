@@ -89,6 +89,8 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   let terminalName = 'service install confirm'
   let packageState = lifecycleStateFixture('service absent')
   let stateRead: null | ReturnType<typeof deferredLifecycle<unknown>> = null
+  const queuedStateReads: Array<ReturnType<typeof deferredLifecycle<unknown>>> = []
+  let packageStateCalls = 0
   let stateFailure = false
   let evicted = false
   let invalidTerminalEvidence = false
@@ -282,11 +284,13 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
         return operation
       },
       packageState: async (_identity, binding) => {
+        packageStateCalls++
+
         if (stateFailure) {
           throw new LifecycleApiError('marketplace_network_error', 0)
         }
 
-        return stateRead ? stateRead.promise : { ...packageState, profile: binding.profile }
+        return queuedStateReads.shift()?.promise ?? stateRead?.promise ?? { ...packageState, profile: binding.profile }
       }
     }
   })
@@ -420,6 +424,13 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
 
       return stateRead
     },
+    holdNextStateReads: (count: number) => {
+      const reads = Array.from({ length: count }, () => deferredLifecycle<unknown>())
+      queuedStateReads.push(...reads)
+
+      return reads
+    },
+    packageStateCalls: () => packageStateCalls,
     onPost: (callback: () => void) => {
       afterPost = callback
     },

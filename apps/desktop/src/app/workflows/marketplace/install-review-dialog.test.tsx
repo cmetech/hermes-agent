@@ -256,7 +256,7 @@ describe('InstallReviewDialog', () => {
     expect(screen.queryByRole('button', { name: 'Prepare again' })).toBeNull()
   })
 
-  it('finishes install and changed update as untrusted with trust non-actionable until 14E', () => {
+  it('keeps the component-level Review trust handoff disabled without integration authority', () => {
     const onReviewTrust = vi.fn()
     renderDialog({ kind: 'succeeded', mode: 'install', version: '2.0.0', trustRequired: true }, { onReviewTrust })
 
