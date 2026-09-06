@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider, type QueryKey, useQuery } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { type ReactNode, useRef } from 'react'
+import { type ReactNode, StrictMode, useLayoutEffect, useRef, useState } from 'react'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { profileScopeKey } from '@/api/client'
@@ -320,6 +320,22 @@ function pendingRefresh(sourceName: string): WorkflowMarketplaceOperation {
   }
 }
 
+function sourceRecord(name: string, enabled = true) {
+  return {
+    attempted_at: name === 'company' ? NOW : null,
+    diagnostic_code: null,
+    enabled,
+    message: null,
+    name,
+    ref: name === 'company' ? 'main' : null,
+    refresh_state: name === 'company' ? ('fresh' as const) : null,
+    repository_url: `https://example.test/${name}/workflows.git`,
+    resolved_commit: name === 'company' ? COMMIT : null,
+    verified_at: name === 'company' ? NOW : null,
+    verified_package_count: name === 'company' ? 1 : 0
+  }
+}
+
 function assessment(detail = packageDetail()) {
   return {
     advisories: detail.advisories,
@@ -567,6 +583,7 @@ function ProjectionLifecycleProbe({
           focusFallbackRef={fallback}
           identity={lifecycleIdentity}
           projection={key}
+          projectionEligible={enabled && !staticQuery}
           sourceName="company"
         />
       ) : null}
@@ -728,6 +745,118 @@ describe('WorkflowMarketplaceView', () => {
     expect(api.refreshSource).not.toHaveBeenCalled()
   })
 
+  it('keeps two-source Refresh-all supervised after dialog close with exact cancellation truth', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    api.sources.mockResolvedValue({ profile: 'support', sources: [sourceRecord('company'), sourceRecord('team')] })
+    h.routeSequence('refresh', ['service refresh cancelled', 'service refresh cancelled'])
+    const first = h.holdNextAdmission('refresh')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage Sources' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Workflow sources' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Refresh all' }))
+    await waitFor(() =>
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(1)
+    )
+    fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' })[0])
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Workflow sources' })).toBeNull())
+    await act(async () => first.resolve())
+    await waitFor(() =>
+      expect(
+        h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh').map(call => call.input?.subject)
+      ).toEqual([
+        { type: 'source', source_name: 'company' },
+        { type: 'source', source_name: 'team' }
+      ])
+    )
+
+    expect(
+      h.supervisor.$records
+        .get()
+        .map(record => ({ state: record.operation?.state, status: record.status, subject: record.subject }))
+    ).toEqual([
+      { state: 'cancelled', status: 'terminal', subject: { type: 'source', source_name: 'company' } },
+      { state: 'cancelled', status: 'terminal', subject: { type: 'source', source_name: 'team' } }
+    ])
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+    expect(api.refreshSource).not.toHaveBeenCalled()
+  })
+
+  it('keeps exact two-source eviction truth after closing and reopening the source dialog', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    api.sources.mockResolvedValue({ profile: 'support', sources: [sourceRecord('company'), sourceRecord('team')] })
+    h.routeSequence('refresh', ['service refresh', 'service refresh pending'])
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage Sources' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Workflow sources' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Refresh all' }))
+    await waitFor(() =>
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(2)
+    )
+    fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' })[0])
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Workflow sources' })).toBeNull())
+    vi.useFakeTimers()
+    await act(async () => vi.advanceTimersByTimeAsync(500))
+    vi.useRealTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage Sources' }))
+    const reopened = await screen.findByRole('dialog', { name: 'Workflow sources' })
+    const company = within(reopened).getByRole('article', { name: 'company source' })
+    const team = within(reopened).getByRole('article', { name: 'team source' })
+    expect(within(company).queryByText(/status expired/i)).toBeNull()
+    await waitFor(() => expect(within(team).getByText(/Refresh status expired/)).toBeTruthy())
+    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(2)
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+  })
+
+  it('does not duplicate exact source admissions under StrictMode, rapid clicks and combined refresh surfaces', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    api.sources.mockResolvedValue({ profile: 'support', sources: [sourceRecord('company'), sourceRecord('team')] })
+    h.route('refresh', 'service refresh')
+    const company = h.holdNextAdmission('refresh')
+    const team = h.holdNextAdmission('refresh')
+    renderLifecycleHarness(
+      <StrictMode>
+        <WorkflowMarketplaceView scope={scopeA} />
+      </StrictMode>,
+      h
+    )
+
+    const toolbarRefresh = await screen.findByRole('button', { name: /^Refresh$/ })
+    const manage = screen.getByRole('button', { name: 'Manage Sources' })
+    fireEvent.click(manage)
+    const dialog = await screen.findByRole('dialog', { name: 'Workflow sources' })
+    const refreshAll = within(dialog).getByRole('button', { name: 'Refresh all' })
+    fireEvent.click(refreshAll)
+    fireEvent.click(refreshAll)
+    await waitFor(() =>
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(1)
+    )
+    fireEvent.click(toolbarRefresh)
+    fireEvent.click(toolbarRefresh)
+
+    await act(async () => company.resolve())
+    await waitFor(() =>
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')).toHaveLength(2)
+    )
+    await act(async () => team.resolve())
+    await waitFor(() =>
+      expect(
+        h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh').map(call => call.input?.subject)
+      ).toEqual([
+        { type: 'source', source_name: 'company' },
+        { type: 'source', source_name: 'team' }
+      ])
+    )
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+  })
+
   it.each([
     ['failed', 'Refresh status unavailable'],
     ['cancelled', 'Cancelled']
@@ -762,6 +891,34 @@ describe('WorkflowMarketplaceView', () => {
       within(results).getByText('company: Refresh status expired. Source data has been reconciled; retry if needed.')
     ).toBeTruthy()
     expect(within(results).getByRole('button', { name: 'Manage Sources' })).toBeTruthy()
+  })
+
+  it('keeps a lost refresh response supervised through exact replay, list reconciliation and view detach', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    const listsBefore = h.calls.filter(call => call.type === 'list').length
+    h.route('refresh', 'service refresh')
+    h.loseResponse('refresh')
+    const firstView = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh' }))
+    const results = await screen.findByRole('status', { name: 'Workflow source refresh results' })
+    expect(within(results).getByText('company: Refresh status unavailable')).toBeTruthy()
+    const record = h.supervisor.$records.get().find(candidate => candidate.kind === 'refresh')!
+    firstView.unmount()
+    h.recoverResponses()
+
+    await h.supervisor.retry(record.key)
+    await h.bind()
+
+    const starts = h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')
+    expect(starts.map(call => call.input?.requestId)).toEqual([record.requestId, record.requestId])
+    expect(h.calls.filter(call => call.type === 'list')).toHaveLength(listsBefore + 1)
+    expect(h.supervisor.$records.get().find(candidate => candidate.requestId === record.requestId)).toMatchObject({
+      operationId: expect.any(String),
+      status: 'terminal'
+    })
+    expect(api.refreshSource).not.toHaveBeenCalled()
   })
 
   it('aborts an old-scope Refresh sequence before admitting its next source', async () => {
@@ -1134,7 +1291,7 @@ describe('WorkflowMarketplaceView', () => {
       await h.bind()
       h.route('inspect', state === 'cancelled' ? 'service inspect cancelled' : 'service read-only failure')
 
-      renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
       fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
 
       expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
@@ -1202,6 +1359,40 @@ describe('WorkflowMarketplaceView', () => {
     expect(inspections).toHaveLength(2)
     expect(inspections[1].input?.requestId).not.toBe(inspections[0].input?.requestId)
     expect(h.calls.some(call => call.type === 'cancel')).toBe(false)
+    expect(api.inspect).not.toHaveBeenCalled()
+  })
+
+  it('keeps a lost inspection response supervised through exact replay and starts a fresh read after detach', async () => {
+    const h = standaloneLifecycleHarness()
+    await h.bind()
+    const listsBefore = h.calls.filter(call => call.type === 'list').length
+    h.route('inspect', 'service inspect')
+    h.loseResponse('inspect')
+    const firstView = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
+    const record = h.supervisor.$records.get().find(candidate => candidate.kind === 'inspect')!
+    firstView.unmount()
+    h.recoverResponses()
+
+    await h.supervisor.retry(record.key)
+    await h.bind()
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
+    expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
+
+    const starts = h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect')
+    expect(starts.map(call => call.input?.requestId)).toEqual([
+      record.requestId,
+      record.requestId,
+      expect.not.stringMatching(record.requestId)
+    ])
+    expect(h.calls.filter(call => call.type === 'list')).toHaveLength(listsBefore + 1)
+    expect(h.supervisor.$records.get().find(candidate => candidate.requestId === record.requestId)).toMatchObject({
+      operationId: expect.any(String),
+      status: 'terminal'
+    })
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
     expect(api.inspect).not.toHaveBeenCalled()
   })
 
@@ -2402,31 +2593,80 @@ describe('workflow package lifecycle', () => {
     expect(h.tokens).not.toHaveBeenCalled()
   })
 
-  it.each(['disabled', 'static'] as const)('does not authorize from a skipped %s exact projection', async kind => {
-    let elapsed = 0
+  it.each(['disabled', 'static'] as const)(
+    'abandons lifecycle authorization when the same exact projection becomes %s during the authority probe',
+    async kind => {
+      let elapsed = 0
 
-    const h = await setupLifecycle(false, () => ({
-      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
-      monotonicNowMs: elapsed
-    }))
+      const h = await setupLifecycle(false, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
 
-    const view = renderLifecycleHarness(<ProjectionLifecycleProbe />, h)
-    let action = await screen.findByRole('button', { name: 'Install package' })
-    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
-    view.rerender(
-      <h.Providers>
-        <ProjectionLifecycleProbe enabled={kind !== 'disabled'} staticQuery={kind === 'static'} />
-      </h.Providers>
-    )
-    action = await screen.findByRole('button', { name: 'Install package' })
-    const before = h.capabilityCalls.length
-    elapsed = 300001
-    fireEvent.click(action)
-    await act(async () => Promise.resolve())
-    expect(h.capabilityCalls).toHaveLength(before)
-    expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
-    expect(h.tokens).not.toHaveBeenCalled()
-  })
+      const view = renderLifecycleHarness(<ProjectionLifecycleProbe />, h)
+      const action = await screen.findByRole('button', { name: 'Install package' })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      fireEvent.click(action)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      view.rerender(
+        <h.Providers>
+          <ProjectionLifecycleProbe enabled={kind !== 'disabled'} staticQuery={kind === 'static'} />
+        </h.Providers>
+      )
+      await act(async () => {
+        pending.resolve()
+        await pending.promise
+        await new Promise(resolve => setTimeout(resolve, 0))
+      })
+      expect(h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect')).toHaveLength(0)
+      expect(h.tokens).not.toHaveBeenCalled()
+      await act(async () => {
+        view.unmount()
+        h.dispose()
+      })
+    }
+  )
+
+  it.each(['disabled', 'static'] as const)(
+    'abandons trust authorization when the same exact projection becomes %s during the authority probe',
+    async kind => {
+      let elapsed = 0
+
+      const h = await setupLifecycle(true, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
+
+      h.state('service installed A trusted')
+      const view = renderLifecycleHarness(<ProjectionLifecycleProbe />, h)
+      const action = await screen.findByRole('button', { name: 'Review trust' })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      const before = h.capabilityCalls.length
+      const pending = h.holdCapabilities()
+      elapsed = 300001
+      fireEvent.click(action)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      view.rerender(
+        <h.Providers>
+          <ProjectionLifecycleProbe enabled={kind !== 'disabled'} staticQuery={kind === 'static'} />
+        </h.Providers>
+      )
+      await act(async () => {
+        pending.resolve()
+        await pending.promise
+        await new Promise(resolve => setTimeout(resolve, 0))
+      })
+      expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
+      expect(h.tokens).not.toHaveBeenCalled()
+      await act(async () => {
+        view.unmount()
+        h.dispose()
+      })
+    }
+  )
 
   it('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
     const h = await setupLifecycle()
@@ -3461,6 +3701,154 @@ describe('workflow package lifecycle', () => {
     expect(h.supervisor.$records.get()[0].status).toBe('terminal')
     expect(screen.queryByRole('dialog')).toBeNull()
   })
+
+  it.each(['install', 'update', 'remove', 'trust'] as const)(
+    'returns narrow pending %s close to the surviving package navigation target',
+    async kind => {
+      vi.stubGlobal('matchMedia', (query: string) => ({
+        addEventListener: vi.fn(),
+        matches: query.includes('max-width'),
+        media: query,
+        removeEventListener: vi.fn()
+      }))
+      const installed = kind !== 'install'
+      const h = await setupLifecycle(installed)
+      h.state(
+        kind === 'trust' ? 'service installed A trusted' : installed ? 'service installed untrusted' : 'service absent'
+      )
+      h.route(`${kind}_prepare`, kind === 'trust' ? 'service review all pending' : `service ${kind} prepare pending`)
+      const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      const back = await screen.findByRole('button', { name: 'Back to packages' })
+
+      const action = {
+        install: 'Install package',
+        remove: 'Remove package',
+        trust: 'Review trust',
+        update: 'Update package'
+      }[kind]
+
+      fireEvent.click(screen.getByRole('button', { name: action }))
+      await screen.findByText('queued 0%')
+
+      fireEvent.click(within(screen.getByRole('dialog')).getAllByRole('button', { name: 'Close' }).at(-1)!)
+
+      await waitFor(() => expect(globalThis.document.activeElement).toBe(back))
+      expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+      await act(async () => {
+        view.unmount()
+        h.dispose()
+      })
+    }
+  )
+
+  it('does not steal focus from a live navigation target when a pending lifecycle view unmounts', async () => {
+    const h = await setupLifecycle()
+    h.route('install_prepare', 'service install prepare pending')
+
+    function NavigationProbe() {
+      const [marketplace, setMarketplace] = useState(true)
+      const destinationRef = useRef<HTMLButtonElement>(null)
+
+      useLayoutEffect(() => {
+        if (!marketplace) {
+          destinationRef.current?.focus()
+        }
+      }, [marketplace])
+
+      return (
+        <>
+          <button onClick={() => setMarketplace(false)} ref={destinationRef} type="button">
+            Installed view
+          </button>
+          {marketplace ? <WorkflowMarketplaceView scope={scopeA} /> : <p>Installed packages view</p>}
+        </>
+      )
+    }
+
+    const view = renderLifecycleHarness(<NavigationProbe />, h)
+    await selectPackage()
+    fireEvent.click(screen.getByRole('button', { name: 'Install package' }))
+    await screen.findByText('queued 0%')
+    const destination = screen.getByText('Installed view').closest('button')!
+
+    fireEvent.click(destination)
+
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(destination))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+    await act(async () => {
+      view.unmount()
+      h.dispose()
+    })
+  })
+
+  it.each(['install', 'update', 'remove', 'trust'] as const)(
+    'keeps deferred %s confirmation owned until the real admission window becomes unknown',
+    async kind => {
+      vi.stubGlobal('matchMedia', (query: string) => ({
+        addEventListener: vi.fn(),
+        matches: query.includes('max-width'),
+        media: query,
+        removeEventListener: vi.fn()
+      }))
+
+      const labels = {
+        install: { action: 'Install package', confirm: 'Confirm install', dialog: 'Review installation' },
+        update: { action: 'Update package', confirm: 'Confirm update', dialog: 'Review update' },
+        remove: { action: 'Remove package', confirm: 'Remove package', dialog: 'Review removal' },
+        trust: { action: 'Review trust', confirm: 'Grant trust', dialog: 'Review trust' }
+      }[kind]
+
+      const h = await setupLifecycle(kind !== 'install')
+      h.state(
+        kind === 'install'
+          ? 'service absent'
+          : kind === 'trust'
+            ? 'service installed A trusted'
+            : 'service installed untrusted'
+      )
+      h.route('trust_prepare', 'service review all')
+      const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      const action = await screen.findByRole('button', { name: labels.action })
+      fireEvent.click(action)
+      const dialog = await screen.findByRole('dialog', { name: labels.dialog })
+      const admission = h.holdAdmission(`${kind}_confirm`)
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+      try {
+        fireEvent.click(within(dialog).getByRole('button', { name: labels.confirm }))
+        await act(async () => vi.advanceTimersByTimeAsync(0))
+        expect(h.calls.filter(call => call.input?.kind === `${kind}_confirm`)).toHaveLength(1)
+
+        fireEvent.keyDown(dialog, { bubbles: true, cancelable: true, key: 'Escape' })
+        const overlay = globalThis.document.querySelector('[data-slot="dialog-overlay"]')!
+        fireEvent.pointerDown(overlay)
+        fireEvent.click(overlay)
+        expect(screen.getByRole('dialog')).toBeTruthy()
+        expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+
+        await act(async () => vi.advanceTimersByTimeAsync(14999))
+        expect(screen.getByRole('dialog')).toBeTruthy()
+        await act(async () => vi.advanceTimersByTimeAsync(1))
+        expect(screen.getByRole('alert').textContent).toContain('State could not be confirmed')
+
+        fireEvent.keyDown(screen.getByRole('dialog'), { bubbles: true, cancelable: true, key: 'Escape' })
+        expect(screen.queryByRole('dialog')).toBeNull()
+        expect(screen.getByRole('button', { name: 'Back to packages' })).toBeTruthy()
+        expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
+      } finally {
+        await act(async () => {
+          admission.resolve()
+          await admission.promise
+          view.unmount()
+          h.dispose()
+        })
+        vi.useRealTimers()
+      }
+    }
+  )
 
   it('rejects a mismatched review identity and gates lifecycle controls on declared capabilities', async () => {
     const h = await setupLifecycle()

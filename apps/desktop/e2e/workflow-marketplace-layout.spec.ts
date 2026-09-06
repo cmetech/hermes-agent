@@ -156,12 +156,33 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
 
     const back = page.getByRole('button', { name: 'Back to packages', exact: true })
     const install = page.getByRole('button', { name: 'Install package', exact: true })
-    await expect(back).toBeInViewport()
-    await install.scrollIntoViewIfNeeded()
-    await expect(install).toBeInViewport()
-    await install.focus()
+    const repository = detail.getByRole('link').first()
+    const refreshState = page.getByRole('button', { name: 'Refresh state', exact: true })
+    const retry = page.getByRole('button', { name: 'Retry', exact: true })
+    const detailFocusOrder = [back, repository, install, refreshState, retry]
+
+    for (
+      let attempt = 0;
+      attempt < 40 && !(await back.evaluate(element => element === document.activeElement));
+      attempt++
+    ) {
+      await page.keyboard.press('Tab')
+    }
+
+    for (const [index, action] of detailFocusOrder.entries()) {
+      if (index > 0) {
+        await page.keyboard.press('Tab')
+      }
+
+      await expect(action).toBeFocused()
+      await expect(action).toBeInViewport()
+    }
+
+    await page.keyboard.press('Shift+Tab')
+    await expect(refreshState).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
     await expect(install).toBeFocused()
-    await install.click()
+    await page.keyboard.press('Enter')
 
     const review = page.locator('[data-marketplace-lifecycle-dialog][data-state="open"]')
     await expect(review).toBeVisible({ timeout: 60_000 })
@@ -187,13 +208,24 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
       noHorizontalOverflow: true,
       transitionDisabled: true
     })
-    const close = review.locator('button[data-slot="button"]').filter({ hasText: 'Close' }).first()
+    const close = review.locator('button[data-slot="button"]').filter({ hasText: 'Close' })
+    const retryPreparation = review.getByRole('button', { name: 'Prepare again', exact: true })
+    const iconClose = review.locator('button[data-slot="dialog-close-button"]')
+    await expect(retryPreparation).toBeVisible({ timeout: 60_000 })
     await expect(close).toBeFocused()
-    await close.press('Shift+Tab')
-    await expect(review.locator(':focus')).toBeVisible()
+
+    for (const action of [retryPreparation, iconClose, close]) {
+      await page.keyboard.press('Tab')
+      await expect(action).toBeFocused()
+      await expect(action).toBeInViewport()
+    }
+
+    await page.keyboard.press('Shift+Tab')
+    await expect(iconClose).toBeFocused()
     await page.keyboard.press('Escape')
     await expect(review).toBeHidden()
     await expect(detail).toBeVisible()
     await expect(back).toBeVisible()
+    await expect(install).toBeFocused()
   })
 })

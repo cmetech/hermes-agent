@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import { type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 
 import { profileScopeKey } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -87,10 +87,11 @@ function capabilityErrorKind(error: unknown): 'auth' | 'error' | 'unsupported' {
 }
 
 export interface WorkflowMarketplaceViewProps {
+  headingRef?: RefObject<HTMLElement | null>
   scope: WorkflowMarketplaceScope
 }
 
-export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps) {
+export function WorkflowMarketplaceView({ headingRef, scope }: WorkflowMarketplaceViewProps) {
   const { t } = useI18n()
   const copy = t.operations
   const scopeKey = profileScopeKey(scope)
@@ -111,6 +112,23 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
   const [actionContainer, setActionContainer] = useState<HTMLDivElement | null>(null)
   const [refreshingSourcesScope, setRefreshingSourcesScope] = useState<null | string>(null)
   const [refreshAttempt, setRefreshAttempt] = useState<null | ScopedRefreshAttempt>(null)
+
+  const lifecycleFallbackRef = useMemo<RefObject<HTMLElement | null>>(
+    () => ({
+      get current() {
+        const candidates = [
+          actionContainer?.querySelector<HTMLButtonElement>('button:not(:disabled)'),
+          backButtonRef.current,
+          searchRef.current,
+          rootRef.current?.querySelector<HTMLButtonElement>('[data-marketplace-package]:not(:disabled)'),
+          headingRef?.current
+        ]
+
+        return candidates.find(candidate => candidate?.isConnected) ?? null
+      }
+    }),
+    [actionContainer, headingRef]
+  )
 
   const filters = filterState.scopeKey === scopeKey ? filterState : { offset: 0, query: '', scopeKey, source: null }
 
@@ -589,10 +607,11 @@ export function WorkflowMarketplaceView({ scope }: WorkflowMarketplaceViewProps)
         actionContainer={actionContainer}
         binding={truth.binding}
         detail={detail}
-        focusFallbackRef={searchRef}
+        focusFallbackRef={lifecycleFallbackRef}
         identity={detail.identity}
         key={JSON.stringify([scopeKey, detail.identity])}
         projection={marketplaceKeys.detail(scopeKey, selection.sourceName, selection.packageId)}
+        projectionEligible={selection !== null && supportsInspection}
         sourceName={detail.source_name}
       />
     ) : null

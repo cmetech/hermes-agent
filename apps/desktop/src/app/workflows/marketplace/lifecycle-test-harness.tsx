@@ -100,6 +100,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   let afterPost: { callback: () => void; kind: LifecycleOperation['kind'] | null } | undefined
   let count = 0
   const routes = new Map<LifecycleOperation['kind'], string>()
+  const routeSequences = new Map<LifecycleOperation['kind'], string[]>()
   const rawRoutes = new Map<LifecycleOperation['kind'], string>()
   const oneShotRawRoutes = new Set<LifecycleOperation['kind']>()
   const rawRouteValues = new Map<LifecycleOperation['kind'], unknown>()
@@ -158,7 +159,11 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
           capabilities: declared
         }
       },
-      list: async () => ({ ...corpus.operationPageFinal, items: [] }),
+      list: async () => {
+        calls.push({ type: 'list' })
+
+        return { ...corpus.operationPageFinal, items: [] }
+      },
       start: async (input: LifecycleStart) => {
         calls.push({ type: 'start', input })
         const retained = receipts.get(input.requestId)
@@ -204,8 +209,23 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
         const defaultFixture =
           input.kind === 'inspect' ? 'service inspect' : input.kind === 'refresh' ? 'service refresh' : terminalName
 
+        const nextRoute = routeSequences.get(input.kind)?.shift()
+        const fixture = lifecycleFixture(nextRoute ?? routes.get(input.kind) ?? defaultFixture)
+
         const operation = decodeLifecycleOperation({
-          ...lifecycleFixture(routes.get(input.kind) ?? defaultFixture),
+          ...fixture,
+          ...(input.kind === 'refresh'
+            ? {
+                subject: input.subject,
+                result:
+                  fixture.result?.type === 'source_refresh' && input.subject.type === 'source'
+                    ? {
+                        ...fixture.result,
+                        value: { ...fixture.result.value, source_name: input.subject.source_name }
+                      }
+                    : fixture.result
+              }
+            : {}),
           ...(invalidTerminalEvidence
             ? {
                 outcome: { type: 'outcome_unknown', reason: 'terminal_invalid' },
@@ -290,8 +310,11 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
         const originalName = routes.get(earlier.kind)
         const name = originalName?.replace(/ pending$/, '')
 
+        const fixture = lifecycleFixture(`${name} cancelled`)
+
         const operation = decodeLifecycleOperation({
-          ...lifecycleFixture(`${name} cancelled`),
+          ...fixture,
+          ...(earlier.kind === 'refresh' ? { subject: earlier.subject } : {}),
           id,
           request_id: earlier.request_id
         })
@@ -401,6 +424,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     },
     receipts,
     route: (kind: LifecycleOperation['kind'], name: string) => routes.set(kind, name),
+    routeSequence: (kind: LifecycleOperation['kind'], names: string[]) => routeSequences.set(kind, [...names]),
     routeRaw: (kind: LifecycleOperation['kind'], name: string) => rawRoutes.set(kind, name),
     routeRawOnce: (kind: LifecycleOperation['kind'], name: string) => {
       rawRoutes.set(kind, name)
@@ -430,6 +454,9 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     },
     loseResponse: (kind?: LifecycleOperation['kind']) => {
       loseResponse = kind ?? null
+    },
+    recoverResponses: () => {
+      loseResponse = false
     },
     failOriginRefetches: () => {
       stateFailure = true
@@ -476,7 +503,25 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
           continue
         }
 
-        const value = decodeLifecycleOperation({ ...lifecycleFixture(name), id: earlier.id, request_id: id })
+        const fixture = lifecycleFixture(name)
+
+        const value = decodeLifecycleOperation({
+          ...fixture,
+          ...(earlier.kind === 'refresh'
+            ? {
+                subject: earlier.subject,
+                result:
+                  fixture.result?.type === 'source_refresh' && earlier.subject.type === 'source'
+                    ? {
+                        ...fixture.result,
+                        value: { ...fixture.result.value, source_name: earlier.subject.source_name }
+                      }
+                    : fixture.result
+              }
+            : {}),
+          id: earlier.id,
+          request_id: id
+        })
 
         if (!value) {
           throw new Error('Invalid completion fixture')

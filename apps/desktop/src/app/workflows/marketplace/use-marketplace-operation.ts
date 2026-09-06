@@ -241,40 +241,50 @@ export function useMarketplaceOperation(
 
   const cancel = useCallback(
     async (operationId: string) => {
+      const origin = captureOrigin()
       const record = exactRecord(operationId)
 
-      if (!available || !record || !supervisor || record.status === 'terminal') {
+      if (!available || !record || !supervisor || record.status === 'terminal' || !originIsCurrent(origin)) {
         return null
       }
 
       await supervisor.cancel(record.key)
 
+      if (!originIsCurrent(origin)) {
+        return null
+      }
+
       try {
         return await wait(record.key)
       } catch {
         return null
       }
     },
-    [available, exactRecord, supervisor, wait]
+    [available, captureOrigin, exactRecord, originIsCurrent, supervisor, wait]
   )
 
   const retry = useCallback(
     async (operationId: string) => {
+      const origin = captureOrigin()
       const record = exactRecord(operationId)
 
-      if (!available || !record || !supervisor || record.status === 'terminal') {
+      if (!available || !record || !supervisor || record.status === 'terminal' || !originIsCurrent(origin)) {
         return null
       }
 
       await supervisor.retry(record.key)
 
+      if (!originIsCurrent(origin)) {
+        return null
+      }
+
       try {
         return await wait(record.key)
       } catch {
         return null
       }
     },
-    [available, exactRecord, supervisor, wait]
+    [available, captureOrigin, exactRecord, originIsCurrent, supervisor, wait]
   )
 
   const operationForSource = useCallback(

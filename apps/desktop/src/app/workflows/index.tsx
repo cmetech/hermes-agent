@@ -458,7 +458,7 @@ export function WorkflowsView() {
         </div>
       ) : view === 'marketplace' ? (
         <div className="mt-4 min-h-0 flex-1 overflow-hidden">
-          <WorkflowMarketplaceView scope={marketplaceScope} />
+          <WorkflowMarketplaceView headingRef={headingRef} scope={marketplaceScope} />
         </div>
       ) : (
         <div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden" data-workflow-run-view>

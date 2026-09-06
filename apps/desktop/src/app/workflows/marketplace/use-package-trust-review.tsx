@@ -29,6 +29,7 @@ interface PackageTrustReviewProps {
   binding: LifecycleConnectionBinding
   identity: PackageIdentity
   projection?: QueryKey
+  projectionEligible: boolean
   focusFallbackRef: RefObject<HTMLElement | null>
 }
 
@@ -195,7 +196,13 @@ function successfulGrant(
 }
 
 /** Dialog-owned trust selection and token only; admission, polling and barriers stay application-scoped. */
-export function usePackageTrustReview({ binding, identity, projection, focusFallbackRef }: PackageTrustReviewProps) {
+export function usePackageTrustReview({
+  binding,
+  identity,
+  projection,
+  projectionEligible,
+  focusFallbackRef
+}: PackageTrustReviewProps) {
   const supervisor = useMarketplaceSupervisor()
   const queryClient = useQueryClient()
   const records = useSyncExternalStore(supervisor.$records.subscribe, supervisor.$records.get)
@@ -207,12 +214,12 @@ export function usePackageTrustReview({ binding, identity, projection, focusFall
   const confirming = useRef(false)
   const refreshing = useRef<object | null>(null)
   const [refreshPending, setRefreshPending] = useState(false)
-  const latest = useRef({ binding, identity, projection })
+  const latest = useRef({ binding, identity, projection, projectionEligible })
   const reconciled = useRef(new Set<string>())
 
   useLayoutEffect(() => {
-    latest.current = { binding, identity, projection }
-  }, [binding, identity, projection])
+    latest.current = { binding, identity, projection, projectionEligible }
+  }, [binding, identity, projection, projectionEligible])
 
   const gate = supervisor.getPackageGate(binding, identity, projection)
   const supported = supervisor.supports(binding, ['operations', 'admission_replay', 'package_state', 'trust'])
@@ -263,11 +270,12 @@ export function usePackageTrustReview({ binding, identity, projection, focusFall
     const current = supervisor.getPackageGate(binding, identity, projection)
 
     return (
+      projectionEligible &&
       current.state === 'ready' &&
       supervisor.supports(binding, ['operations', 'admission_replay', 'package_state', 'trust']) &&
       validInstalledState(current.packageState, identity)
     )
-  }, [binding, identity, projection, supervisor])
+  }, [binding, identity, projection, projectionEligible, supervisor])
 
   const withAuthority = useCallback(
     async (execute: () => void | Promise<void>) => {
@@ -296,7 +304,10 @@ export function usePackageTrustReview({ binding, identity, projection, focusFall
 
       const projectionQuery = projectionFilter ? queryClient.getQueryCache().find(projectionFilter) : null
 
-      if (projectionFilter && (!projectionQuery || projectionQuery.isDisabled() || projectionQuery.isStatic())) {
+      if (
+        !expected.projectionEligible ||
+        (projectionFilter && (!projectionQuery || projectionQuery.isDisabled() || projectionQuery.isStatic()))
+      ) {
         return
       }
 
@@ -309,7 +320,8 @@ export function usePackageTrustReview({ binding, identity, projection, focusFall
         owner.current === expectedOwner &&
         sameLifecycleValue(latest.current.binding, expected.binding) &&
         sameLifecycleIdentity(latest.current.identity, expected.identity) &&
-        sameLifecycleValue(latest.current.projection, expected.projection)
+        sameLifecycleValue(latest.current.projection, expected.projection) &&
+        latest.current.projectionEligible === expected.projectionEligible
 
       try {
         const fresh = await supervisor.reconcileScope({ connectionId: binding.connectionId, profile: binding.profile })

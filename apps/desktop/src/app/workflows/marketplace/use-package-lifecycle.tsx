@@ -30,6 +30,7 @@ interface PackageLifecycleProps {
   sourceName: string
   detail?: WorkflowMarketplacePackageDetail
   projection?: QueryKey
+  projectionEligible: boolean
   focusFallbackRef: RefObject<HTMLElement | null>
   actionContainer?: HTMLElement | null
 }
@@ -39,6 +40,7 @@ export function usePackageLifecycle({
   binding,
   identity,
   projection,
+  projectionEligible,
   focusFallbackRef,
   detail
 }: PackageLifecycleProps) {
@@ -53,10 +55,10 @@ export function usePackageLifecycle({
   const confirming = useRef(false)
   const refreshing = useRef<object | null>(null)
   const [refreshPending, setRefreshPending] = useState(false)
-  const latest = useRef({ binding, identity, detail, projection })
+  const latest = useRef({ binding, identity, detail, projection, projectionEligible })
   useLayoutEffect(() => {
-    latest.current = { binding, identity, detail, projection }
-  }, [binding, identity, detail, projection])
+    latest.current = { binding, identity, detail, projection, projectionEligible }
+  }, [binding, identity, detail, projection, projectionEligible])
   const advancedChecks = useRef(new Set<string>())
   const reconciled = useRef(new Set<string>())
   const gate = supervisor.getPackageGate(binding, identity, projection)
@@ -152,6 +154,7 @@ export function usePackageLifecycle({
       const current = supervisor.getPackageGate(binding, identity, projection)
 
       if (
+        !projectionEligible ||
         current.state !== 'ready' ||
         !current.packageState ||
         !supervisor.supports(binding, ['operations', 'admission_replay', 'package_state', 'transactions'])
@@ -172,7 +175,7 @@ export function usePackageLifecycle({
         (!current.packageState.installed.orphaned_source && supervisor.supports(binding, ['updates']))
       )
     },
-    [binding, detail, identity, projection, supervisor]
+    [binding, detail, identity, projection, projectionEligible, supervisor]
   )
 
   const withAuthority = useCallback(
@@ -205,7 +208,10 @@ export function usePackageLifecycle({
 
       // Capture the exact active projection before the authority probe temporarily
       // disables its observer. Missing, disabled, or static projections never authorize.
-      if (projectionFilter && (!projectionQuery || projectionQuery.isDisabled() || projectionQuery.isStatic())) {
+      if (
+        !expected.projectionEligible ||
+        (projectionFilter && (!projectionQuery || projectionQuery.isDisabled() || projectionQuery.isStatic()))
+      ) {
         return
       }
 
@@ -219,7 +225,8 @@ export function usePackageLifecycle({
         sameLifecycleValue(latest.current.binding, expected.binding) &&
         sameLifecycleIdentity(latest.current.identity, expected.identity) &&
         sameLifecycleValue(latest.current.detail, expected.detail) &&
-        sameLifecycleValue(latest.current.projection, expected.projection)
+        sameLifecycleValue(latest.current.projection, expected.projection) &&
+        latest.current.projectionEligible === expected.projectionEligible
 
       try {
         const fresh = await supervisor.reconcileScope({ connectionId: binding.connectionId, profile: binding.profile })

@@ -258,6 +258,7 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
               focusFallbackRef={focusFallbackRef}
               identity={cached.identity}
               key={JSON.stringify([scopeKey, cached.identity])}
+              projectionEligible
               sourceName={cached.source_name}
             />
           ))
