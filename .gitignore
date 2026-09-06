@@ -145,6 +145,7 @@ models-dev-upstream/
 .mcp.json
 opencode.json
 config/mcporter.json
+/.otto/workflow/forensics/
 
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
