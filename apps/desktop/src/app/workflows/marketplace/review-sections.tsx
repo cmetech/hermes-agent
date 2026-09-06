@@ -5,6 +5,7 @@ import type {
   WorkflowMarketplaceExternalRequirements,
   WorkflowMarketplaceTrustReviewItem
 } from '@/types/hermes'
+import type { WorkflowTrustReviewItem } from '@/types/workflow-marketplace-lifecycle'
 
 export function ReviewFacts({ items }: { items: ReadonlyArray<readonly [string, null | string]> }) {
   return (
@@ -106,7 +107,13 @@ export function ReviewRequirements({ requirements }: { requirements: WorkflowMar
   )
 }
 
-export function WorkflowRiskReview({ workflow }: { workflow: WorkflowMarketplaceTrustReviewItem }) {
+export function WorkflowRiskReview({
+  showTrustState = false,
+  workflow
+}: {
+  showTrustState?: boolean
+  workflow: WorkflowMarketplaceTrustReviewItem | WorkflowTrustReviewItem
+}) {
   const { t } = useI18n()
   const copy = t.operations
 
@@ -129,7 +136,16 @@ export function WorkflowRiskReview({ workflow }: { workflow: WorkflowMarketplace
 
   return (
     <article className="grid gap-3 rounded-md border border-(--ui-stroke-tertiary) p-3">
-      <h4 className="text-sm font-medium text-(--ui-text-primary)">{workflow.workflow_name}</h4>
+      {showTrustState ? (
+        <div className="flex items-center justify-between gap-2">
+          <h4 className="text-sm font-medium text-(--ui-text-primary)">{workflow.workflow_name}</h4>
+          <Badge variant={workflow.trust_state === 'trusted' ? 'default' : 'warn'}>
+            {workflow.trust_state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}
+          </Badge>
+        </div>
+      ) : (
+        <h4 className="text-sm font-medium text-(--ui-text-primary)">{workflow.workflow_name}</h4>
+      )}
       <ReviewFacts
         items={[
           [copy.workflowMarketplaceDefinitionPath, workflow.definition_path],

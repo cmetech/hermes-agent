@@ -10,17 +10,22 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { useI18n } from '@/i18n'
-import type { WorkflowMarketplaceTrustReview } from '@/types/hermes'
+import type {
+  AllTrustSelection,
+  OneTrustSelection,
+  TrustReviewProjection,
+  TrustWorkflowState
+} from '@/types/workflow-marketplace-lifecycle'
 
 import { ReviewFacts, ReviewValueList, WorkflowRiskReview } from './review-sections'
 
-export type TrustSelection = { kind: 'all' } | { kind: 'one'; workflowName: string }
+export type TrustSelection = AllTrustSelection | OneTrustSelection
 
 export type TrustReviewDialogView =
   | { kind: 'progress'; phase: string; progress: number; cancellable: boolean }
-  | { kind: 'review'; review: Omit<WorkflowMarketplaceTrustReview, 'confirmation_token'> }
-  | { kind: 'succeeded' }
-  | { kind: 'cancelled' | 'evicted' | 'failed' | 'stale' | 'status'; recoverable?: boolean }
+  | { kind: 'review'; review: TrustReviewProjection }
+  | { kind: 'succeeded'; selection: TrustSelection; workflows: readonly TrustWorkflowState[] }
+  | { kind: 'cancelled' | 'evicted' | 'failed' | 'stale' | 'status' | 'unconfirmed'; recoverable?: boolean }
 
 export interface TrustReviewDialogProps {
   availableWorkflowNames?: readonly string[]
@@ -28,6 +33,7 @@ export interface TrustReviewDialogProps {
   onClose: () => void
   onGrant: () => Promise<void>
   onPrepareAgain: () => void
+  onRestoreFocus?: () => void
   onRetryStatus?: () => void
   onSelectionChange: (selection: TrustSelection) => void
   open: boolean
@@ -41,6 +47,7 @@ export function TrustReviewDialog({
   onClose,
   onGrant,
   onPrepareAgain,
+  onRestoreFocus,
   onRetryStatus,
   onSelectionChange,
   open,
@@ -55,7 +62,7 @@ export function TrustReviewDialog({
   const [admissionBusy, setAdmissionBusy] = useState(false)
   const review = view.kind === 'review' ? view.review : null
   const workflowNames = availableWorkflowNames ?? review?.workflows.map(workflow => workflow.workflow_name) ?? []
-  const selectedWorkflow = selection.kind === 'one' ? selection.workflowName : (workflowNames[0] ?? '')
+  const selectedWorkflow = selection.type === 'one' ? selection.workflow_name : (workflowNames[0] ?? '')
 
   // eslint-disable-next-line no-restricted-syntax -- tracks component lifetime for guarded async admission cleanup
   useEffect(() => {
@@ -96,6 +103,12 @@ export function TrustReviewDialog({
     <Dialog onOpenChange={value => !value && close()} open={open}>
       <DialogContent
         className="w-[min(92vw,54rem)] max-w-4xl"
+        onCloseAutoFocus={event => {
+          if (onRestoreFocus) {
+            event.preventDefault()
+            onRestoreFocus()
+          }
+        }}
         onEscapeKeyDown={event => admissionBusy && event.preventDefault()}
         onOpenAutoFocus={event => {
           event.preventDefault()
@@ -139,33 +152,33 @@ export function TrustReviewDialog({
               <legend className="px-1 text-xs font-medium">{copy.workflowMarketplaceReviewTrust}</legend>
               <label className="flex items-center gap-2 text-xs">
                 <input
-                  checked={selection.kind === 'all'}
+                  checked={selection.type === 'all'}
                   name="workflow-trust-selection"
-                  onChange={() => onSelectionChange({ kind: 'all' })}
+                  onChange={() => onSelectionChange({ type: 'all' })}
                   type="radio"
                 />
                 {copy.workflowMarketplaceTrustAllWorkflows}
               </label>
               <label className="flex items-center gap-2 text-xs">
                 <input
-                  checked={selection.kind === 'one'}
+                  checked={selection.type === 'one'}
                   disabled={workflowNames.length === 0}
                   name="workflow-trust-selection"
                   onChange={() => {
                     if (workflowNames[0]) {
-                      onSelectionChange({ kind: 'one', workflowName: workflowNames[0] })
+                      onSelectionChange({ type: 'one', workflow_name: workflowNames[0] })
                     }
                   }}
                   type="radio"
                 />
                 {copy.workflowMarketplaceTrustOneWorkflow}
               </label>
-              {selection.kind === 'one' ? (
+              {selection.type === 'one' ? (
                 <label className="grid gap-1 text-xs">
                   {copy.workflowMarketplaceSelectWorkflow}
                   <select
                     className="rounded-md border border-(--ui-stroke-tertiary) bg-transparent px-2 py-1"
-                    onChange={event => onSelectionChange({ kind: 'one', workflowName: event.target.value })}
+                    onChange={event => onSelectionChange({ type: 'one', workflow_name: event.target.value })}
                     value={selectedWorkflow}
                   >
                     {workflowNames.map(name => (
@@ -180,22 +193,35 @@ export function TrustReviewDialog({
             <section className="grid gap-2">
               <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceWorkflowRisks}</h3>
               {view.review.workflows.map(workflow => (
-                <WorkflowRiskReview key={workflow.workflow_name} workflow={workflow} />
+                <WorkflowRiskReview key={workflow.workflow_name} showTrustState workflow={workflow} />
               ))}
             </section>
           </>
         ) : view.kind === 'succeeded' ? (
-          <p aria-live="polite" role="status">
-            {copy.workflowMarketplaceTrustGranted}
-          </p>
+          <>
+            <p aria-live="polite" role="status">
+              {view.selection.type === 'one'
+                ? `Trust granted for ${view.selection.workflow_name}.`
+                : 'Trust granted for all reviewed workflows.'}
+            </p>
+            <section aria-label="Current package trust" role="region">
+              <h3 className="text-xs font-medium">Current package trust</h3>
+              <ul className="mt-1 space-y-1 text-xs">
+                {view.workflows.map(workflow => (
+                  <li className="flex justify-between gap-2" key={workflow.workflow_name}>
+                    <span>{workflow.workflow_name}</span>
+                    <span>{workflow.state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          </>
         ) : (
           <div role="alert">
-            {view.kind === 'stale' ? (
+            {view.kind === 'unconfirmed' || view.kind === 'evicted' || view.kind === 'status' ? (
+              'State could not be confirmed. Refresh package state before trying again.'
+            ) : view.kind === 'stale' ? (
               copy.workflowMarketplaceTrustNotGranted
-            ) : view.kind === 'evicted' ? (
-              copy.workflowMarketplaceOperationStatusLost
-            ) : view.kind === 'status' ? (
-              copy.workflowMarketplaceOperationStatusUnavailable
             ) : (
               <>
                 {copy.workflowMarketplaceTrustNotGranted}

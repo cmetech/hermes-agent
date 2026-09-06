@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
-import type { WorkflowMarketplaceTrustReview } from '@/types/hermes'
+import type { TrustReviewProjection } from '@/types/workflow-marketplace-lifecycle'
 
 import { TrustReviewDialog, type TrustReviewDialogView } from './trust-review-dialog'
 
@@ -47,12 +47,17 @@ function workflow(name: string) {
   }
 }
 
-function trustReview(workflows = [workflow('diagnostic'), workflow('collector')]): WorkflowMarketplaceTrustReview {
+function trustReview(workflows = [workflow('diagnostic'), workflow('collector')]): TrustReviewProjection {
   return {
-    confirmation_token: TOKEN,
+    confirmation_available: true,
     distribution_digest: DIGEST,
+    expires_at: '2026-09-05T12:05:00Z',
     identity: { package_id: 'laptop-support', source_key: 'company' },
     package_resources: ['scripts/run.py', 'commands/run.md'],
+    package_workflows: workflows.map(item => ({
+      definition_path: item.definition_path,
+      workflow_name: item.workflow_name
+    })),
     resolved_commit: COMMIT,
     review_digest: REVIEW,
     source_name: 'company',
@@ -71,7 +76,7 @@ function renderDialog(view: TrustReviewDialogView, overrides: Partial<Parameters
         onPrepareAgain={vi.fn()}
         onSelectionChange={vi.fn()}
         open
-        selection={{ kind: 'all' }}
+        selection={{ type: 'all' }}
         view={view}
         {...overrides}
       />
@@ -123,6 +128,10 @@ describe('TrustReviewDialog', () => {
     }
 
     expect(dialog.textContent).not.toContain(TOKEN)
+
+    for (const article of within(dialog).getAllByRole('article')) {
+      expect(within(article).getByText('untrusted')).toBeTruthy()
+    }
   })
 
   it('offers only all workflows or exactly one workflow and requests a fresh review when selection changes', () => {
@@ -130,7 +139,7 @@ describe('TrustReviewDialog', () => {
     renderDialog({ kind: 'review', review: trustReview() }, { onSelectionChange })
 
     fireEvent.click(screen.getByRole('radio', { name: 'One workflow' }))
-    expect(onSelectionChange).toHaveBeenCalledWith({ kind: 'one', workflowName: 'diagnostic' })
+    expect(onSelectionChange).toHaveBeenCalledWith({ type: 'one', workflow_name: 'diagnostic' })
     expect(screen.queryByRole('checkbox')).toBeNull()
   })
 
@@ -155,7 +164,7 @@ describe('TrustReviewDialog', () => {
           onPrepareAgain={vi.fn()}
           onSelectionChange={vi.fn()}
           open
-          selection={{ kind: 'all' }}
+          selection={{ type: 'all' }}
           view={{ kind: 'stale' }}
         />
       </I18nProvider>

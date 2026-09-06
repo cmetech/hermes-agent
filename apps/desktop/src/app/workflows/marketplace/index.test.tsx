@@ -17,7 +17,6 @@ import type {
   WorkflowMarketplaceOperationResult,
   WorkflowMarketplacePackageDetail,
   WorkflowMarketplaceRemoveReview,
-  WorkflowMarketplaceTrustReview,
   WorkflowMarketplaceUpdateReview
 } from '@/types/hermes'
 
@@ -25,6 +24,7 @@ import { InstalledPackages } from './installed-packages'
 import {
   createLifecycleHarness,
   legacyInspectionFixture,
+  lifecycleFixture,
   lifecycleIdentity,
   lifecycleStateFixture,
   renderLifecycleHarness
@@ -402,24 +402,6 @@ function removeReview(item = installedPackage()): WorkflowMarketplaceRemoveRevie
     result: 'review_required',
     review_digest: 'f'.repeat(64),
     workflow_names: ['Laptop diagnostic']
-  }
-}
-
-function trustReview(item = installedPackage(), workflowName?: string): WorkflowMarketplaceTrustReview {
-  const workflows = packageDetail().workflows.filter(
-    workflow => workflowName === undefined || workflow.workflow_name === workflowName
-  )
-
-  return {
-    confirmation_token: workflowName ? `${TRUST_TOKEN}-one` : TRUST_TOKEN,
-    distribution_digest: item.distribution_digest,
-    identity: item.identity,
-    package_resources: packageDetail().resources.map(resource => resource.path),
-    resolved_commit: item.resolved_commit,
-    review_digest: 'f'.repeat(64),
-    source_name: item.source_name,
-    version: item.version,
-    workflows
   }
 }
 
@@ -1676,8 +1658,7 @@ describe('browse presentation components', () => {
   })
 })
 
-// Task 14C2 transitional gate makes these V1 mutation paths unreachable. Preserve their scenarios for the
-// supervisor-backed adapter migration in 14D/E; the read-only structural-blocker assertion remains active.
+// Application-supervisor lifecycle coverage, including every restored V1 migration-scenario intent.
 describe('workflow package lifecycle', () => {
   const lifecycleCleanups: Array<() => void> = []
   afterEach(() => {
@@ -1719,7 +1700,7 @@ describe('workflow package lifecycle', () => {
           selection: prepared.selection,
           review_digest: review.review_digest,
           expires_at: review.expires_at,
-          confirmation_token: INSTALL_TOKEN
+          confirmation_token: prepared.kind === 'trust_prepare' ? TRUST_TOKEN : INSTALL_TOKEN
         }
       }
     })
@@ -2333,63 +2314,206 @@ describe('workflow package lifecycle', () => {
     expect(h.tokens).not.toHaveBeenCalled()
   })
 
-  it.skip('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
-    const candidate = packageDetail({
-      install_status: 'not_installed',
-      installed: null,
-      update_status: 'not_applicable'
-    })
-
-    api.inspect.mockResolvedValueOnce(succeededDetail(candidate))
-    api.prepareInstall.mockResolvedValueOnce(
-      lifecycleOperation('install_prepare', { type: 'install_review', value: installReview(candidate) })
+  it('installs only after review, invalidates origin truth, and opens trust as a separate fresh operation', async () => {
+    const h = await setupLifecycle()
+    h.route('trust_prepare', 'service review all pending')
+    let inspection = 3001
+    api.inspect.mockImplementation(() =>
+      Promise.resolve(
+        legacyInspectionFixture('service inspect', `wmop_62e05a9a7e00_${(inspection++).toString(16).padStart(32, '0')}`)
+      )
     )
-    api.confirmInstall.mockResolvedValueOnce(
-      lifecycleOperation('install_confirm', {
-        type: 'installed_package',
-        value: installedPackage({ version: candidate.version })
-      })
-    )
-    api.reviewTrust.mockResolvedValueOnce(
-      lifecycleOperation('trust_prepare', { type: 'trust_review', value: trustReview() })
-    )
-    const rendered = renderMarketplace()
-    const invalidate = vi.spyOn(rendered.client, 'invalidateQueries')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
 
     await selectPackage()
     const action = screen.getByRole('button', { name: 'Install package' })
     fireEvent.click(action)
     fireEvent.click(action)
 
-    expect(api.prepareInstall).toHaveBeenCalledTimes(1)
-    expect(api.prepareInstall).toHaveBeenCalledWith({ identifier: 'company/laptop-support' }, scopeA)
     expect(await screen.findByRole('dialog', { name: 'Review installation' })).toBeTruthy()
     expect(globalThis.document.body.textContent).not.toContain(INSTALL_TOKEN)
+    expect(h.calls.filter(call => call.input?.kind === 'install_prepare')).toHaveLength(1)
 
     const confirm = screen.getByRole('button', { name: 'Confirm install' })
     fireEvent.click(confirm)
     fireEvent.click(confirm)
 
     await screen.findByText('Installed — trust required to run')
-    expect(api.confirmInstall).toHaveBeenCalledTimes(1)
-    expect(api.confirmInstall).toHaveBeenCalledWith(INSTALL_TOKEN, scopeA)
+    expect(h.calls.filter(call => call.input?.kind === 'install_confirm')).toHaveLength(1)
+    expect(h.tokens).toHaveBeenCalledTimes(1)
     expect(api.grantTrust).not.toHaveBeenCalled()
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: marketplaceKeys.installed('remote-a::support') })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: marketplaceKeys.searchRoot('remote-a::support') })
-    expect(invalidate).toHaveBeenCalledWith({
-      queryKey: marketplaceKeys.detail('remote-a::support', 'company', 'laptop-support')
-    })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['workflow-catalog', 'remote-a::support'] })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Review trust' }))
-    expect(await screen.findByRole('dialog', { name: 'Review trust' })).toBeTruthy()
-    expect(api.reviewTrust).toHaveBeenCalledWith(
-      { packageId: candidate.identity.package_id, sourceKey: candidate.identity.source_key },
-      undefined,
-      scopeA
-    )
+    const reviewTrust = screen.getByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(reviewTrust.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(reviewTrust)
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(1))
+    expect(await screen.findByRole('dialog', { name: 'Preparing trust review' })).toBeTruthy()
+    expect(await screen.findByText('queued 0%')).toBeTruthy()
+    expect(h.calls.filter(call => call.type === 'start').map(call => call.input?.kind)).toEqual([
+      'install_prepare',
+      'install_confirm',
+      'trust_prepare'
+    ])
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+    expect(api.reviewTrust).not.toHaveBeenCalled()
     expect(api.grantTrust).not.toHaveBeenCalled()
   })
+
+  it('renews overdue trust authority before preparing exactly once', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(true, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    h.state('service installed A trusted')
+    h.route('trust_prepare', 'service review all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    const before = h.capabilityCalls.length
+    const pending = h.holdCapabilities()
+    elapsed = 300001
+    fireEvent.click(action)
+    fireEvent.click(action)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+    expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
+    expect(h.tokens).not.toHaveBeenCalled()
+    pending.resolve()
+
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(1))
+    expect(await screen.findByRole('dialog', { name: 'Review trust' })).toBeTruthy()
+  })
+
+  it('renews overdue trust confirmation authority before token retrieval and admission', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(true, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    h.state('service installed A trusted')
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    const confirm = await screen.findByRole('button', { name: 'Grant trust' })
+    const before = h.capabilityCalls.length
+    const pending = h.holdCapabilities()
+    elapsed = 300001
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(h.calls.filter(call => call.input?.kind === 'trust_confirm')).toHaveLength(0)
+    pending.resolve()
+
+    expect(await screen.findByText('Trust granted for all reviewed workflows.')).toBeTruthy()
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+    expect(h.calls.filter(call => call.input?.kind === 'trust_confirm')).toHaveLength(1)
+  })
+
+  it('waits for the exact held Marketplace detail projection before trust preparation', async () => {
+    let elapsed = 0
+
+    const h = await setupLifecycle(true, () => ({
+      wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+      monotonicNowMs: elapsed
+    }))
+
+    h.state('service installed A trusted')
+    h.route('trust_prepare', 'service review all')
+    renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+    await selectPackage()
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    const projection = deferred<WorkflowMarketplaceOperation>()
+    const before = api.inspect.mock.calls.length
+    const capabilityBefore = h.capabilityCalls.length
+    const capabilities = h.holdCapabilities()
+    api.inspect.mockReturnValue(projection.promise)
+    elapsed = 300001
+    fireEvent.click(action)
+    await waitFor(() => expect(h.capabilityCalls).toHaveLength(capabilityBefore + 1))
+    expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
+    capabilities.resolve()
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(before + 1))
+    expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
+    expect(h.tokens).not.toHaveBeenCalled()
+    projection.resolve(legacyInspectionFixture('service inspect'))
+
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(1))
+    expect(await screen.findByRole('dialog', { name: 'Review trust' })).toBeTruthy()
+  })
+
+  it.each(['partial', 'changed'] as const)(
+    'abandons overdue trust preparation when renewed authority is %s',
+    async change => {
+      let elapsed = 0
+
+      const h = await setupLifecycle(true, () => ({
+        wallNowMs: Date.parse('2026-09-05T12:00:00Z') + elapsed,
+        monotonicNowMs: elapsed
+      }))
+
+      h.state('service installed A trusted')
+      h.route('trust_prepare', 'service review all')
+      api.installed.mockResolvedValue({
+        packages: [lifecycleStateFixture('service installed A trusted').installed],
+        profile: 'support'
+      })
+      renderLifecycleHarness(
+        <InstalledPackages scope={scopeA}>
+          <div />
+        </InstalledPackages>,
+        h
+      )
+      const action = await screen.findByRole('button', { name: 'Review trust' })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      const pending = h.holdCapabilities()
+      const before = h.capabilityCalls.length
+      elapsed = 300001
+      fireEvent.click(action)
+      await waitFor(() => expect(h.capabilityCalls).toHaveLength(before + 1))
+      const settled = h.supervisor.reconcileScope(scopeA)
+
+      if (change === 'partial') {
+        h.capabilities(['operations', 'admission_replay', 'package_state'])
+      } else {
+        h.stateFromOutcome('service update confirm')
+      }
+
+      await act(async () => {
+        pending.resolve()
+        await settled
+      })
+      expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(0)
+      expect(h.tokens).not.toHaveBeenCalled()
+      expect(screen.queryByRole('dialog')).toBeNull()
+    }
+  )
 
   it('shows prepare progress, cooperatively cancels, and stops old-scope polling without cross-publishing', async () => {
     const h = await setupLifecycle()
@@ -2487,7 +2611,7 @@ describe('workflow package lifecycle', () => {
     await waitFor(() =>
       expect(within(article).getByRole('button', { name: 'Remove package' }).hasAttribute('disabled')).toBe(false)
     )
-    expect(within(article).getByRole('button', { name: 'Review trust' }).hasAttribute('disabled')).toBe(true)
+    expect(within(article).getByRole('button', { name: 'Review trust' }).hasAttribute('disabled')).toBe(false)
     fireEvent.click(within(article).getByRole('button', { name: 'Remove package' }))
     const dialog = await screen.findByRole('dialog', { name: 'Review removal' })
     expect(within(dialog).getByText('2.0.0')).toBeTruthy()
@@ -2499,6 +2623,87 @@ describe('workflow package lifecycle', () => {
     expect(article.isConnected).toBe(true)
     expect(screen.queryByText(/remains installed|Package removal completed/)).toBeNull()
     expect(api.confirmRemove).not.toHaveBeenCalled()
+  })
+
+  it('grants all workflows from the real complete A/B trust result through the supervisor', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div>Loose workflow</div>
+      </InstalledPackages>,
+      h
+    )
+
+    const reviewTrust = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(reviewTrust.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(reviewTrust)
+
+    const review = await screen.findByRole('dialog', { name: 'Review trust' })
+    expect(within(review).getByText('A')).toBeTruthy()
+    expect(within(review).getByText('B')).toBeTruthy()
+    expect(within(review).getByText('trusted')).toBeTruthy()
+    expect(within(review).getByText('untrusted')).toBeTruthy()
+    expect(h.tokens).not.toHaveBeenCalled()
+
+    fireEvent.click(within(review).getByRole('button', { name: 'Grant trust' }))
+    expect(await screen.findByText('Trust granted for all reviewed workflows.')).toBeTruthy()
+    const current = screen.getByRole('region', { name: 'Current package trust' })
+    expect(within(current).getByText('A')).toBeTruthy()
+    expect(within(current).getByText('B')).toBeTruthy()
+    expect(within(current).getAllByText('trusted')).toHaveLength(2)
+    expect(h.calls.filter(call => call.type === 'start').map(call => call.input?.kind)).toEqual([
+      'trust_prepare',
+      'trust_confirm'
+    ])
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+    expect(api.reviewTrust).not.toHaveBeenCalled()
+    expect(api.grantTrust).not.toHaveBeenCalled()
+    expect(globalThis.document.body.textContent).not.toContain(TRUST_TOKEN)
+  })
+
+  it('re-prepares one selected workflow and preserves the non-selected trust state from the complete map', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant one A')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    await screen.findByRole('dialog', { name: 'Review trust' })
+    h.route('trust_prepare', 'service review one A')
+    const oneWorkflow = screen.getByRole('radio', { name: 'One workflow' })
+    fireEvent.click(oneWorkflow)
+    fireEvent.click(oneWorkflow)
+    const selectedReview = await screen.findByRole('dialog', { name: 'Review trust' })
+    await waitFor(() => expect(within(selectedReview).getAllByRole('article')).toHaveLength(1))
+    expect(within(selectedReview).getByRole('option', { name: 'B' })).toBeTruthy()
+    fireEvent.click(within(selectedReview).getByRole('button', { name: 'Grant trust' }))
+
+    expect(await screen.findByText('Trust granted for A.')).toBeTruthy()
+    const current = screen.getByRole('region', { name: 'Current package trust' })
+    expect(within(current).getByText('A')).toBeTruthy()
+    expect(within(current).getByText('trusted')).toBeTruthy()
+    expect(within(current).getByText('B')).toBeTruthy()
+    expect(within(current).getByText('untrusted')).toBeTruthy()
+    expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(2)
+    expect(h.tokens).toHaveBeenCalledTimes(1)
   })
 
   it('does not announce removal until the exact confirm operation reaches terminal success', async () => {
@@ -2529,52 +2734,538 @@ describe('workflow package lifecycle', () => {
     expect(screen.getByText('Loose project workflow')).toBeTruthy()
   })
 
-  it.skip('re-prepares trust for exactly one selected workflow and grants only the fresh token', async () => {
-    const allTrustReview = trustReview()
-    allTrustReview.workflows.push({
-      ...allTrustReview.workflows[0],
-      definition_path: 'workflows/battery-diagnostic.yml',
-      workflow_name: 'Battery diagnostic'
+  it('re-prepares trust for exactly one selected workflow and grants only the fresh token', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant one A')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
     })
-    api.reviewTrust
-      .mockResolvedValueOnce(lifecycleOperation('trust_prepare', { type: 'trust_review', value: allTrustReview }))
-      .mockResolvedValueOnce(
-        lifecycleOperation('trust_prepare', {
-          type: 'trust_review',
-          value: trustReview(installedPackage(), 'Laptop diagnostic')
-        })
-      )
-    api.grantTrust.mockResolvedValueOnce(
-      lifecycleOperation('trust_confirm', {
-        type: 'trust_grant',
-        value: { workflows: [{ state: 'trusted', workflow_name: 'Laptop diagnostic' }] }
-      })
-    )
-    renderWithProviders(
+    renderLifecycleHarness(
       <InstalledPackages scope={scopeA}>
         <div />
-      </InstalledPackages>
+      </InstalledPackages>,
+      h
     )
     const packageGroup = await screen.findByRole('article', { name: 'company/laptop-support installed package' })
+    await waitFor(() =>
+      expect(within(packageGroup).getByRole('button', { name: 'Review trust' }).hasAttribute('disabled')).toBe(false)
+    )
     fireEvent.click(within(packageGroup).getByRole('button', { name: 'Review trust' }))
     await screen.findByRole('dialog', { name: 'Review trust' })
+    h.route('trust_prepare', 'service review one A')
     fireEvent.click(screen.getByRole('radio', { name: 'One workflow' }))
 
-    await waitFor(() =>
-      expect(api.reviewTrust).toHaveBeenLastCalledWith(
-        {
-          packageId: installedPackage().identity.package_id,
-          sourceKey: installedPackage().identity.source_key
-        },
-        'Laptop diagnostic',
-        scopeA
-      )
-    )
-    expect(screen.getByRole('option', { name: 'Battery diagnostic' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Grant trust' }))
-    await screen.findByText('Trust granted for the reviewed installed bytes.')
-    expect(api.grantTrust).toHaveBeenCalledWith(`${TRUST_TOKEN}-one`, scopeA)
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(2))
+    expect(screen.getByRole('option', { name: 'B' })).toBeTruthy()
+    const grant = screen.getByRole('button', { name: 'Grant trust' })
+    fireEvent.click(grant)
+    fireEvent.click(grant)
+    await screen.findByText('Trust granted for A.')
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+    const confirm = h.calls.find(call => call.input?.kind === 'trust_confirm')!.input!
+
+    const fresh = [...h.receipts.values()].find(
+      value => value.kind === 'trust_prepare' && value.selection.type === 'one'
+    )!
+
+    expect(confirm.body).toMatchObject({
+      confirmation_token: TRUST_TOKEN,
+      prepare_operation_id: fresh.id,
+      review_digest: fresh.result?.type === 'trust_review' ? fresh.result.value.review_digest : null,
+      selection: { type: 'one', workflow_name: 'A' }
+    })
+    expect(api.reviewTrust).not.toHaveBeenCalled()
+    expect(api.grantTrust).not.toHaveBeenCalled()
     expect(globalThis.document.body.textContent).not.toContain(TRUST_TOKEN)
+  })
+
+  it('rejects a stale all-workflow token after selection is re-prepared for one workflow', async () => {
+    const h = await setupLifecycle(true)
+    h.state('service installed A trusted')
+    h.route('trust_prepare', 'service review all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    await screen.findByRole('dialog', { name: 'Review trust' })
+    h.route('trust_prepare', 'service review one A')
+    fireEvent.click(screen.getByRole('radio', { name: 'One workflow' }))
+    await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(2))
+    const respond = h.tokens.getMockImplementation()!
+    h.tokens.mockImplementationOnce(async input => {
+      const response = await respond(input)
+
+      return { ...response, value: { ...response.value, selection: { type: 'all' } } }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Grant trust' }))
+
+    expect(await screen.findByText('Trust was not granted. Prepare a fresh trust review.')).toBeTruthy()
+    expect(h.calls.filter(call => call.input?.kind === 'trust_confirm')).toHaveLength(0)
+    expect(h.tokens).toHaveBeenCalledTimes(1)
+    expect(globalThis.document.body.textContent).not.toContain(TRUST_TOKEN)
+  })
+
+  it('keeps trust independently disabled when the exact binding lacks trust capability', async () => {
+    const h = await setupLifecycle(true)
+    h.capabilities(['operations', 'admission_replay', 'package_state', 'transactions', 'updates'])
+    await h.bind()
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed untrusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    expect(action.hasAttribute('disabled')).toBe(true)
+    fireEvent.click(action)
+    expect(h.calls.filter(call => call.input?.kind.startsWith('trust_'))).toHaveLength(0)
+  })
+
+  it('keeps the token ephemeral and does not admit a grant when the exact review token is unavailable', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
+    h.tokens.mockRejectedValueOnce(new Error(`expired ${TRUST_TOKEN} /private/repository`))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
+
+    expect(await screen.findByText('Trust was not granted. Prepare a fresh trust review.')).toBeTruthy()
+    expect(h.calls.filter(call => call.input?.kind === 'trust_confirm')).toHaveLength(0)
+    expect(JSON.stringify(h.supervisor.$records.get())).not.toContain(TRUST_TOKEN)
+    expect(JSON.stringify(h.queryClient.getQueryCache().getAll())).not.toContain(TRUST_TOKEN)
+    expect(globalThis.document.body.innerHTML).not.toContain(TRUST_TOKEN)
+    expect(globalThis.document.body.textContent).not.toContain('/private/repository')
+  })
+
+  it('reports a lost trust preparation response as unconfirmed without claiming trust was not granted', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.loseResponse()
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust was not granted/)).toBeNull()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+  })
+
+  it('keeps a possibly admitted trust grant fenced when its POST response is lost', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
+    h.loseResponse()
+    h.failOriginRefetches()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust was not granted/)).toBeNull()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+    const binding = await h.bind()
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).not.toBe('ready')
+    expect(h.supervisor.$records.get().find(value => value.kind === 'trust_confirm')?.barrier).toBe(true)
+    const starts = h.calls.filter(call => call.input?.kind === 'trust_confirm')
+    expect(starts).toHaveLength(1)
+    expect([...h.receipts.values()].filter(value => value.kind === 'trust_confirm')).toHaveLength(1)
+  })
+
+  it('reports an evicted possibly admitted trust grant as unknown and retains its mutation barrier', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all pending')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.failOriginRefetches()
+    h.evict()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust was not granted/)).toBeNull()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+    const binding = await h.bind()
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe('unknown')
+  })
+
+  it('does not make stale trust actionable when terminal success cannot be reconciled', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
+    h.failOriginRefetches()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+    expect(screen.queryByText(/Trust was not granted/)).toBeNull()
+    expect(screen.getByText('company/laptop-support')).toBeTruthy()
+    const binding = await h.bind()
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe('reconciling')
+  })
+
+  it('reports an evicted trust operation as unconfirmed without a rollback claim', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all pending')
+    h.failStatus('marketplace_operation_not_found', 404)
+    h.evict()
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust was not granted/)).toBeNull()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+  })
+
+  it.each(['missing B', 'duplicate A', 'selected A untrusted', 'wrong digest'])(
+    'fails closed on generated %s complete-map evidence after possible grant admission',
+    async fixture => {
+      const h = await setupLifecycle(true)
+      h.route('trust_prepare', 'service review all')
+
+      if (fixture === 'selected A untrusted') {
+        const terminal = structuredClone(lifecycleFixture('service grant one A'))
+
+        if (
+          terminal.result?.type !== 'trust_grant' ||
+          terminal.outcome?.type !== 'committed' ||
+          !terminal.outcome.package_state?.trust
+        ) {
+          throw new Error('Expected generated one-workflow trust result')
+        }
+
+        terminal.result.value.workflows[0].state = 'untrusted'
+        terminal.outcome.package_state.trust.workflows[0].state = 'untrusted'
+        h.routeValue('trust_confirm', terminal)
+      } else {
+        h.routeRaw('trust_confirm', fixture)
+      }
+
+      api.installed.mockResolvedValue({
+        packages: [lifecycleStateFixture('service installed A trusted').installed],
+        profile: 'support'
+      })
+      renderLifecycleHarness(
+        <InstalledPackages scope={scopeA}>
+          <div />
+        </InstalledPackages>,
+        h
+      )
+      const action = await screen.findByRole('button', { name: 'Review trust' })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      fireEvent.click(action)
+      await screen.findByRole('dialog', { name: 'Review trust' })
+      h.route('trust_prepare', 'service review one A')
+      fireEvent.click(screen.getByRole('radio', { name: 'One workflow' }))
+      await waitFor(() => expect(h.calls.filter(call => call.input?.kind === 'trust_prepare')).toHaveLength(2))
+      fireEvent.click(screen.getByRole('button', { name: 'Grant trust' }))
+
+      expect(
+        await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+      ).toBeTruthy()
+      expect(screen.queryByText(/Trust was not granted/)).toBeNull()
+      expect(screen.queryByText(/Trust granted/)).toBeNull()
+    }
+  )
+
+  it('accepts a reordered complete trust map by canonical member identity rather than array position', async () => {
+    const h = await setupLifecycle(true)
+    const terminal = structuredClone(lifecycleFixture('service grant all'))
+
+    if (
+      terminal.result?.type !== 'trust_grant' ||
+      terminal.outcome?.type !== 'committed' ||
+      !terminal.outcome.package_state?.trust
+    ) {
+      throw new Error('Expected generated all-workflow trust result')
+    }
+
+    terminal.result.value.workflows.reverse()
+    terminal.outcome.package_state.trust.workflows.reverse()
+    h.route('trust_prepare', 'service review all')
+    h.routeValue('trust_confirm', terminal)
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    fireEvent.click(await screen.findByRole('button', { name: 'Grant trust' }))
+
+    expect(await screen.findByText('Trust granted for all reviewed workflows.')).toBeTruthy()
+    expect(within(screen.getByRole('region', { name: 'Current package trust' })).getAllByText('trusted')).toHaveLength(
+      2
+    )
+  })
+
+  it('rejects a generated one-workflow review correlated to the wrong requested selection', async () => {
+    const h = await setupLifecycle(true)
+    h.routeRaw('trust_prepare', 'service review one A wrong selection')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed untrusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(h.tokens).not.toHaveBeenCalled()
+    expect(h.calls.filter(call => call.input?.kind === 'trust_confirm')).toHaveLength(0)
+  })
+
+  it.each(['missing member', 'duplicate member', 'unknown member', 'wrong path'] as const)(
+    'fails closed on a relationship-invalid all-workflow review with %s',
+    async mutation => {
+      const h = await setupLifecycle(true)
+      const preparation = structuredClone(lifecycleFixture('service review all'))
+
+      if (preparation.result?.type !== 'trust_review') {
+        throw new Error('Expected generated all-workflow trust review')
+      }
+
+      const workflows = preparation.result.value.workflows
+
+      if (mutation === 'missing member') {
+        workflows.pop()
+      } else if (mutation === 'duplicate member') {
+        workflows[1] = { ...workflows[0] }
+      } else if (mutation === 'unknown member') {
+        workflows[1] = { ...workflows[1], workflow_name: 'C', definition_path: 'workflows/C.yaml' }
+      } else {
+        workflows[1] = { ...workflows[1], definition_path: 'workflows/renamed-B.yaml' }
+      }
+
+      h.routeValue('trust_prepare', preparation)
+      api.installed.mockResolvedValue({
+        packages: [lifecycleStateFixture('service installed A trusted').installed],
+        profile: 'support'
+      })
+      renderLifecycleHarness(
+        <InstalledPackages scope={scopeA}>
+          <div />
+        </InstalledPackages>,
+        h
+      )
+      const action = await screen.findByRole('button', { name: 'Review trust' })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      fireEvent.click(action)
+
+      expect(
+        await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+      ).toBeTruthy()
+      expect(h.tokens).not.toHaveBeenCalled()
+      expect(h.calls.filter(call => call.input?.kind === 'trust_confirm')).toHaveLength(0)
+    }
+  )
+
+  it('rejects a valid complete terminal map whose canonical path no longer matches the reviewed inventory', async () => {
+    const h = await setupLifecycle(true)
+    const terminal = structuredClone(lifecycleFixture('service grant all'))
+
+    if (
+      terminal.result?.type !== 'trust_grant' ||
+      terminal.outcome?.type !== 'committed' ||
+      !terminal.outcome.package_state?.installed ||
+      !terminal.outcome.package_state.trust
+    ) {
+      throw new Error('Expected generated all-workflow trust result')
+    }
+
+    terminal.result.value.workflows[1].definition_path = 'workflows/renamed-B.yaml'
+    terminal.outcome.package_state.trust.workflows[1].definition_path = 'workflows/renamed-B.yaml'
+    terminal.outcome.package_state.installed.workflow_paths[1] = 'workflows/renamed-B.yaml'
+    h.route('trust_prepare', 'service review all')
+    h.routeValue('trust_confirm', terminal)
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    fireEvent.click(await screen.findByRole('button', { name: 'Grant trust' }))
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+  })
+
+  it('rejects terminal trust success when the locked PackageState has a different complete trust map', async () => {
+    const h = await setupLifecycle(true)
+    h.state('service installed A trusted')
+    h.route('trust_prepare', 'service review all')
+    h.route('trust_confirm', 'service grant all')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+    renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    const dialog = await screen.findByRole('dialog', { name: 'Review trust' })
+    h.onPost(() => h.state('service installed A trusted'))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Grant trust' }))
+
+    expect(
+      await screen.findByText('State could not be confirmed. Refresh package state before trying again.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Trust granted/)).toBeNull()
+  })
+
+  it('discards a pending trust dialog and token-free attachment on profile navigation', async () => {
+    const h = await setupLifecycle(true)
+    h.route('trust_prepare', 'service review all pending')
+    api.installed.mockResolvedValue({
+      packages: [lifecycleStateFixture('service installed A trusted').installed],
+      profile: 'support'
+    })
+
+    const view = renderLifecycleHarness(
+      <InstalledPackages scope={scopeA}>
+        <div />
+      </InstalledPackages>,
+      h
+    )
+
+    const action = await screen.findByRole('button', { name: 'Review trust' })
+    await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(action)
+    await screen.findByText('queued 0%')
+    view.rerender(
+      <h.Providers>
+        <InstalledPackages scope={{ connectionId: 'remote-b', profile: 'other' }}>
+          <div />
+        </InstalledPackages>
+      </h.Providers>
+    )
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(h.tokens).not.toHaveBeenCalled()
   })
 
   it('polls admitted preparation, stops on status failure, and retries only the exact operation', async () => {

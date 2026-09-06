@@ -98,6 +98,8 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   let afterPost: (() => void) | undefined
   let count = 0
   const routes = new Map<LifecycleOperation['kind'], string>()
+  const rawRoutes = new Map<LifecycleOperation['kind'], string>()
+  const rawRouteValues = new Map<LifecycleOperation['kind'], unknown>()
   const calls: Array<{ type: string; input?: LifecycleStart; id?: string }> = []
   let getFailure: LifecycleApiError | null = null
   let admission: ReturnType<typeof deferredLifecycle<void>> | null = null
@@ -154,6 +156,35 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
 
         if (retained) {
           return retained
+        }
+
+        const rawName = rawRoutes.get(input.kind)
+        const rawValue = rawRouteValues.get(input.kind)
+
+        if (rawName || rawValue) {
+          const raw = rawValue ?? corpus.operationCases.find(item => item.name === rawName)?.value
+
+          if (!raw) {
+            throw new Error(`Unknown raw lifecycle fixture: ${rawName}`)
+          }
+
+          const correlated = {
+            ...raw,
+            request_id: input.requestId,
+            id: `wmop_aaaaaaaaaaaa_${(++count).toString(16).padStart(32, '0')}`
+          }
+
+          const decoded = decodeLifecycleOperation(correlated)
+
+          if (decoded) {
+            receipts.set(input.requestId, decoded)
+
+            if (decoded.outcome && 'package_state' in decoded.outcome && decoded.outcome.package_state) {
+              packageState = decoded.outcome.package_state
+            }
+          }
+
+          return correlated
         }
 
         const operation = decodeLifecycleOperation({
@@ -345,6 +376,8 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     },
     receipts,
     route: (kind: LifecycleOperation['kind'], name: string) => routes.set(kind, name),
+    routeRaw: (kind: LifecycleOperation['kind'], name: string) => rawRoutes.set(kind, name),
+    routeValue: (kind: LifecycleOperation['kind'], value: unknown) => rawRouteValues.set(kind, value),
     capabilities: (values: string[]) => {
       declared = values
     },

@@ -58,6 +58,7 @@ export interface InstallReviewDialogProps {
   onRetryCheck?: () => void
   onRetryStatus?: () => void
   onReviewTrust: () => void
+  reviewTrustDisabled?: boolean
   open: boolean
   view: InstallReviewDialogView
 }
@@ -226,6 +227,7 @@ export function InstallReviewDialog({
   onRetryCheck,
   onRetryStatus,
   onReviewTrust,
+  reviewTrustDisabled = true,
   open,
   view
 }: InstallReviewDialogProps) {
@@ -357,7 +359,7 @@ export function InstallReviewDialog({
             </Button>
           ) : null}
           {view.kind === 'succeeded' && view.trustRequired ? (
-            <Button disabled type="button">
+            <Button disabled={reviewTrustDisabled} onClick={onReviewTrust} type="button">
               {copy.workflowMarketplaceReviewTrustAction}
             </Button>
           ) : null}

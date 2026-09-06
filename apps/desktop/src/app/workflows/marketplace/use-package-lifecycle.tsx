@@ -14,6 +14,7 @@ import { InstallReviewDialog, type InstallReviewDialogView } from './install-rev
 import { packageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
 import { RemoveReviewDialog, type RemoveReviewDialogView } from './remove-review-dialog'
 import { useMarketplaceSupervisor } from './supervisor-provider'
+import { usePackageTrustReview } from './use-package-trust-review'
 
 type Mode = 'install' | 'update' | 'remove'
 interface Attachment {
@@ -479,6 +480,12 @@ export function usePackageLifecycle({
   } else if (attachment) {
     const mode = attachment.mode
     const result = !attachment.tokenUnavailable && record?.status === 'terminal' ? record.operation?.result : null
+
+    const committed =
+      presentation.kind === 'success' && record?.operation?.outcome?.type === 'committed'
+        ? record.operation.outcome.package_state
+        : null
+
     installView = progress
       ? {
           kind: 'progress',
@@ -494,7 +501,14 @@ export function usePackageLifecycle({
             result.value.result !== 'unchanged' &&
             mode === 'update'
           ? { kind: 'review', mode, review: result.value }
-          : { kind: 'terminal', mode, presentation, canRetry, canPrepareAgain, canRetryCheck }
+          : committed?.installed && mode === 'install'
+            ? {
+                kind: 'succeeded',
+                mode,
+                version: committed.installed.version,
+                trustRequired: Boolean(committed.trust?.workflows.some(item => item.state === 'untrusted'))
+              }
+            : { kind: 'terminal', mode, presentation, canRetry, canPrepareAgain, canRetryCheck }
   }
 
   return {
@@ -549,6 +563,7 @@ export function SupervisedPackageActions(
 
 function BoundPackageActions(props: PackageLifecycleProps) {
   const lifecycle = usePackageLifecycle(props)
+  const trust = usePackageTrustReview(props)
   const { t } = useI18n()
   const copy = t.operations
   const installed = lifecycle.gate.packageState?.installed
@@ -594,7 +609,13 @@ function BoundPackageActions(props: PackageLifecycleProps) {
             >
               {copy.workflowMarketplaceRemovePackage}
             </Button>
-            <Button disabled size="sm" type="button" variant="secondary">
+            <Button
+              disabled={!trust.ready}
+              onClick={event => trust.prepare({ type: 'all' }, event.currentTarget)}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
               {copy.workflowMarketplaceReviewTrustAction}
             </Button>
           </>
@@ -619,8 +640,12 @@ function BoundPackageActions(props: PackageLifecycleProps) {
           onRestoreFocus={lifecycle.restoreFocus}
           onRetryCheck={() => lifecycle.check()}
           onRetryStatus={lifecycle.retry}
-          onReviewTrust={() => undefined}
+          onReviewTrust={() => {
+            lifecycle.close()
+            trust.prepare()
+          }}
           open
+          reviewTrustDisabled={!trust.ready}
           view={lifecycle.installView}
         />
       ) : null}
@@ -638,6 +663,7 @@ function BoundPackageActions(props: PackageLifecycleProps) {
           view={lifecycle.removeView}
         />
       ) : null}
+      {trust.dialog}
     </>
   )
 }
