@@ -760,6 +760,10 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     if (owner) {
       acceptSupervisedOperation(operation, binding, owner.record)
+
+      if (!owner.record.operation && owner.record.status === 'admission_unknown') {
+        accept(owner, operation, binding)
+      }
     }
 
     return owner

@@ -106,6 +106,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   const rawRouteValues = new Map<LifecycleOperation['kind'], unknown>()
   const calls: Array<{ type: string; input?: LifecycleStart; id?: string }> = []
   let getFailure: LifecycleApiError | null = null
+  let lookupFailure: LifecycleApiError | null = null
 
   let admission: {
     deferred: ReturnType<typeof deferredLifecycle<void>>
@@ -118,6 +119,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   let mismatch: LifecycleOperation['kind'] | null | false = false
   let capabilityWait: ReturnType<typeof deferredLifecycle<void>> | null = null
   let capabilityFailure: LifecycleApiError['code'] | false = false
+  let listReceipts = false
   const capabilityCalls: Array<{ connectionId: string | null; profile: string; connectionGeneration: number }> = []
   const now = Date.parse(corpus.capabilities.server_time)
 
@@ -162,7 +164,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
       list: async () => {
         calls.push({ type: 'list' })
 
-        return { ...corpus.operationPageFinal, items: [] }
+        return { ...corpus.operationPageFinal, items: listReceipts ? [...receipts.values()] : [] }
       },
       start: async (input: LifecycleStart) => {
         calls.push({ type: 'start', input })
@@ -284,6 +286,13 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
       },
       lookup: async id => {
         calls.push({ type: 'lookup', id })
+
+        if (lookupFailure) {
+          const failure = lookupFailure
+          lookupFailure = null
+          throw failure
+        }
+
         const operation = receipts.get(id)
 
         return evicted && operation
@@ -440,6 +449,9 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     failStatus: (code: LifecycleApiError['code'] = 'marketplace_network_error', status = 0) => {
       getFailure = new LifecycleApiError(code, status)
     },
+    failLookup: (code: LifecycleApiError['code'] = 'marketplace_admission_not_found', status = 404) => {
+      lookupFailure = new LifecycleApiError(code, status)
+    },
     holdAdmission: (kind?: LifecycleOperation['kind']) => {
       const deferred = deferredLifecycle<void>()
       admission = { deferred, kind: kind ?? null }
@@ -457,6 +469,9 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     },
     recoverResponses: () => {
       loseResponse = false
+    },
+    listReceipts: () => {
+      listReceipts = true
     },
     failOriginRefetches: () => {
       stateFailure = true

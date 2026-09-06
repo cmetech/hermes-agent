@@ -893,7 +893,7 @@ describe('WorkflowMarketplaceView', () => {
     expect(within(results).getByRole('button', { name: 'Manage Sources' })).toBeTruthy()
   })
 
-  it('keeps a lost refresh response supervised through exact replay, list reconciliation and view detach', async () => {
+  it('reconciles a lost refresh response from the exact non-empty operation list after view detach', async () => {
     const h = standaloneLifecycleHarness()
     await h.bind()
     const listsBefore = h.calls.filter(call => call.type === 'list').length
@@ -905,19 +905,31 @@ describe('WorkflowMarketplaceView', () => {
     const results = await screen.findByRole('status', { name: 'Workflow source refresh results' })
     expect(within(results).getByText('company: Refresh status unavailable')).toBeTruthy()
     const record = h.supervisor.$records.get().find(candidate => candidate.kind === 'refresh')!
+    const admitted = h.receipts.get(record.requestId)!
     firstView.unmount()
     h.recoverResponses()
+    h.failLookup()
+    h.listReceipts()
 
-    await h.supervisor.retry(record.key)
     await h.bind()
 
     const starts = h.calls.filter(call => call.type === 'start' && call.input?.kind === 'refresh')
-    expect(starts.map(call => call.input?.requestId)).toEqual([record.requestId, record.requestId])
+    expect(starts.map(call => call.input?.requestId)).toEqual([record.requestId])
     expect(h.calls.filter(call => call.type === 'list')).toHaveLength(listsBefore + 1)
     expect(h.supervisor.$records.get().find(candidate => candidate.requestId === record.requestId)).toMatchObject({
-      operationId: expect.any(String),
-      status: 'terminal'
+      binding: record.binding,
+      kind: 'refresh',
+      operation: {
+        id: admitted.id,
+        kind: 'refresh',
+        request_id: record.requestId,
+        subject: { source_name: 'company', type: 'source' }
+      },
+      operationId: admitted.id,
+      status: 'terminal',
+      subject: { source_name: 'company', type: 'source' }
     })
+    expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
     expect(api.refreshSource).not.toHaveBeenCalled()
   })
 
@@ -1362,7 +1374,7 @@ describe('WorkflowMarketplaceView', () => {
     expect(api.inspect).not.toHaveBeenCalled()
   })
 
-  it('keeps a lost inspection response supervised through exact replay and starts a fresh read after detach', async () => {
+  it('reconciles a lost inspection response from the exact non-empty operation list before a fresh detached read', async () => {
     const h = standaloneLifecycleHarness()
     await h.bind()
     const listsBefore = h.calls.filter(call => call.type === 'list').length
@@ -1372,11 +1384,26 @@ describe('WorkflowMarketplaceView', () => {
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
     expect(await screen.findByText('Could not inspect this package')).toBeTruthy()
     const record = h.supervisor.$records.get().find(candidate => candidate.kind === 'inspect')!
+    const admitted = h.receipts.get(record.requestId)!
     firstView.unmount()
     h.recoverResponses()
+    h.failLookup()
+    h.listReceipts()
 
-    await h.supervisor.retry(record.key)
     await h.bind()
+    expect(h.supervisor.$records.get().find(candidate => candidate.requestId === record.requestId)).toMatchObject({
+      binding: record.binding,
+      kind: 'inspect',
+      operation: {
+        id: admitted.id,
+        kind: 'inspect',
+        request_id: record.requestId,
+        subject: { identity: lifecycleIdentity, type: 'package' }
+      },
+      operationId: admitted.id,
+      status: 'terminal',
+      subject: { identity: lifecycleIdentity, type: 'package' }
+    })
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
     expect(await screen.findByRole('region', { name: 'Laptop Support package details' })).toBeTruthy()
@@ -1384,14 +1411,9 @@ describe('WorkflowMarketplaceView', () => {
     const starts = h.calls.filter(call => call.type === 'start' && call.input?.kind === 'inspect')
     expect(starts.map(call => call.input?.requestId)).toEqual([
       record.requestId,
-      record.requestId,
       expect.not.stringMatching(record.requestId)
     ])
     expect(h.calls.filter(call => call.type === 'list')).toHaveLength(listsBefore + 1)
-    expect(h.supervisor.$records.get().find(candidate => candidate.requestId === record.requestId)).toMatchObject({
-      operationId: expect.any(String),
-      status: 'terminal'
-    })
     expect(h.calls.filter(call => call.type === 'cancel')).toHaveLength(0)
     expect(api.inspect).not.toHaveBeenCalled()
   })

@@ -630,6 +630,78 @@ describe('application marketplace operation supervision', () => {
     expect(h.supervisor.bindings.isCurrent(binding!)).toBe(true)
   })
 
+  it.each(['id', 'request', 'kind', 'subject', 'profile', 'epoch'] as const)(
+    'does not overwrite a known admission from a list record with the wrong %s correlation',
+    async change => {
+      const h = setup()
+      const binding = await h.bind()
+      await h.supervisor.start(h.intent, binding!)
+      const original = h.record().operation!
+      const otherEpoch = 'd'.repeat(32)
+
+      const value = {
+        ...(change === 'kind' ? fixture('service inspect pending') : original),
+        id: change === 'id' ? corpus.validOperationB.id : original.id,
+        request_id:
+          change === 'request'
+            ? corpus.validOperationB.request_id
+            : change === 'epoch'
+              ? original.request_id.replace(original.registry_epoch, otherEpoch)
+              : original.request_id,
+        ...(change === 'subject'
+          ? { subject: { type: 'package', identity: { ...identity, package_id: 'other-package' } } }
+          : {}),
+        ...(change === 'profile' ? { profile: 'other' } : {}),
+        ...(change === 'epoch' ? { registry_epoch: otherEpoch } : {})
+      }
+
+      const changed = decodeLifecycleOperation(value)
+
+      expect(changed).not.toBeNull()
+      h.list([changed!])
+
+      expect(await h.bind()).toBeNull()
+      expect(h.record().operation).toEqual(original)
+    }
+  )
+
+  it.each(['watching', 'terminal', 'evicted'] as const)(
+    'does not overwrite exact %s truth from a later list snapshot',
+    async state => {
+      const h = setup()
+      const binding = await h.bind()
+      await h.supervisor.start(h.intent, binding!)
+      const pending = h.record().operation!
+
+      const terminal = decodeLifecycleOperation({
+        ...fixture('service install confirm'),
+        id: pending.id,
+        request_id: pending.request_id
+      })!
+
+      if (state === 'terminal') {
+        h.terminal()
+        await h.supervisor.retry(h.record().key)
+        h.list([pending])
+      } else {
+        h.list([terminal])
+
+        if (state === 'evicted') {
+          h.evict()
+        }
+      }
+
+      expect(await h.bind()).toEqual(binding)
+      expect(h.record()).toMatchObject(
+        state === 'terminal'
+          ? { status: 'terminal', operation: terminal }
+          : state === 'evicted'
+            ? { status: 'evicted', operation: pending, operationId: pending.id }
+            : { status: 'watching', operation: pending }
+      )
+    }
+  )
+
   // Break caught: not-found plus a present-time state read prematurely fences a POST still admissible on the server.
   it('keeps a missing admission blocked until the server admission window closes and current state is read', async () => {
     const h = setup()
