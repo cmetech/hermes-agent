@@ -25,6 +25,37 @@ afterEach(() => {
 })
 
 describe('package mutation reconciliation', () => {
+  it.each(['other-source', 'renamed-source', 'Company'])(
+    'rejects wrong source admission lineage from %s for both candidate consumers',
+    async source => {
+      const h = harness()
+      const binding = await h.bind()
+      await h.mutate(binding, 'service update confirm')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      const detailKey = marketplaceKeys.detail(profileScopeKey(binding), source, 'laptop-support')
+      const completed = legacyInspectionFixture('service inspect')
+      const operationKey = marketplaceKeys.operation(profileScopeKey(binding), completed.id)
+      await h.queryClient.fetchQuery({
+        queryKey: detailKey,
+        queryFn: async () => legacyInspectionFixture('service inspect pending')
+      })
+      await h.queryClient.fetchQuery({ queryKey: operationKey, queryFn: async () => completed })
+      await h.queryClient.fetchQuery({ queryKey: detailKey, queryFn: async () => completed })
+      expect.soft(h.supervisor.getPackageGate(binding, lifecycleIdentity, detailKey).state).toBe('reconciling')
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, operationKey).state).toBe('reconciling')
+      const exactKey = marketplaceKeys.detail(profileScopeKey(binding), 'company', 'laptop-support')
+      await h.queryClient.fetchQuery({ queryKey: exactKey, queryFn: async () => completed })
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, exactKey).state).toBe('reconciling')
+      const next = legacyInspectionFixture('service inspect', 'wmop_62e05a9a7e00_00000000000000000000000000000bba')
+      await h.queryClient.fetchQuery({ queryKey: exactKey, queryFn: async () => next })
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, exactKey).state).toBe('ready')
+      const nextOperationKey = marketplaceKeys.operation(profileScopeKey(binding), next.id)
+      await h.queryClient.fetchQuery({ queryKey: nextOperationKey, queryFn: async () => next })
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, nextOperationKey).state).toBe('ready')
+      await h.queryClient.fetchQuery({ queryKey: detailKey, queryFn: async () => next })
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, detailKey).state).toBe('reconciling')
+    }
+  )
   it.each([
     ['service recovery required', false, 'recovery_required'],
     ['service installed A trusted', true, 'busy'],
@@ -356,7 +387,7 @@ describe('package mutation reconciliation', () => {
     await h.queryClient.fetchQuery({ queryKey: alias, queryFn: async () => lifecycleFixture('service refresh') })
     expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, alias).state).toBe('reconciling')
     await h.queryClient.fetchQuery({ queryKey: alias, queryFn: async () => lifecycleFixture('service inspect') })
-    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, alias).state).toBe('ready')
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, alias).state).toBe('reconciling')
   })
 
   it('does not promote stale detail completion or a successful installed-list refresh into current authority', async () => {

@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, type QueryKey } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { profileScopeKey } from '@/api/client'
 import { WorkflowMarketplaceApiError } from '@/api/workflow-marketplace'
 import type * as Hermes from '@/hermes'
 import { I18nProvider } from '@/i18n'
@@ -30,6 +31,7 @@ import {
 import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList } from './package-list'
 import { marketplaceKeys } from './query-keys'
+import { useMarketplaceReadOnlyScope } from './supervisor-provider'
 
 import { WorkflowMarketplaceView } from './index'
 
@@ -2205,6 +2207,52 @@ describe('workflow package lifecycle', () => {
 })
 
 describe('supervised marketplace readiness and transitional adapters', () => {
+  function Candidate({ detail, queryKey }: { detail: WorkflowMarketplacePackageDetail; queryKey: QueryKey }) {
+    const truth = useMarketplaceReadOnlyScope(scopeA)
+
+    return (
+      <MarketplacePackageDetail
+        detail={detail}
+        lastObserved={truth.packageGate(detail.identity, queryKey)?.state !== 'ready'}
+        lifecycleUnavailable
+        packageState={truth.packageGate(detail.identity)?.packageState}
+      />
+    )
+  }
+
+  it.each(['detail', 'operation'] as const)('keeps wrong source %s metadata visibly last observed', async consumer => {
+    const h = createLifecycleHarness()
+
+    try {
+      const binding = await h.bind()
+      await h.mutate(binding, 'service update confirm')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      const detailKey = marketplaceKeys.detail(profileScopeKey(binding), 'other-source', 'laptop-support')
+      const completed = legacyInspectionFixture('service inspect')
+
+      if (completed.result?.type !== 'package_detail') {
+        throw new Error('Expected genuine completed inspection')
+      }
+
+      const operationKey = marketplaceKeys.operation(profileScopeKey(binding), completed.id)
+      await h.queryClient.fetchQuery({
+        queryKey: detailKey,
+        queryFn: async () => legacyInspectionFixture('service inspect pending')
+      })
+      await h.queryClient.fetchQuery({ queryKey: operationKey, queryFn: async () => completed })
+      await h.queryClient.fetchQuery({ queryKey: detailKey, queryFn: async () => completed })
+      renderLifecycleHarness(
+        <Candidate detail={completed.result.value} queryKey={consumer === 'detail' ? detailKey : operationKey} />,
+        h
+      )
+      expect(screen.getByText(/Last observed —/)).toBeTruthy()
+      expect(screen.queryByRole('button', { name: 'Update package' })).toBeNull()
+    } finally {
+      cleanup()
+      h.dispose()
+    }
+  })
+
   it('keeps the old pending inspection last-observed after mutation, failed replacement admission and remount', async () => {
     const h = createLifecycleHarness()
 

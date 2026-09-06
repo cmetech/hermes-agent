@@ -162,6 +162,7 @@ export function createMarketplaceReconciliation(
         !sameLifecycleIdentity(operation.result.value.identity, identity) ||
         !admission ||
         admission.generation < generation ||
+        admission.queryKey[3] !== identity.source_key ||
         admission.queryKey[4] !== identity.package_id ||
         !sameLifecycleValue(admission.correlation, inspectionCorrelation(operation)) ||
         (queryKey[2] === 'operation' ? queryKey[3] !== operation.id : !sameLifecycleValue(queryKey, admission.queryKey))
