@@ -1,4 +1,8 @@
-import { type ConnectionGenerationRegistry, GENERATION_CHANGED } from './connection-generation'
+import {
+  type ConnectionGenerationRegistry,
+  type ConnectionRouteLease,
+  GENERATION_CHANGED
+} from './connection-generation'
 
 const ROOT = '/api/plugins/workflow/marketplace/lifecycle/v2'
 const PRINCIPAL_HEADER = 'X-Hermes-Marketplace-Principal-Binding'
@@ -34,7 +38,11 @@ interface TransportOptions {
 
 interface LifecycleTransportDeps {
   authority: ConnectionGenerationRegistry
-  resolve: (request: LifecycleRequest) => Promise<{ descriptor: Descriptor; path: string; routeKey: string }>
+  routeKey: (request: LifecycleRequest) => string
+  resolve: (
+    request: LifecycleRequest,
+    captured: ConnectionRouteLease
+  ) => Promise<{ descriptor: Descriptor; path: string; routeKey: string }>
   accessToken: (url: string) => Promise<string | null>
   fetchToken: (url: string, token: string | null, options: TransportOptions) => Promise<unknown>
   fetchCookie: (url: string, options: TransportOptions) => Promise<unknown>
@@ -232,17 +240,28 @@ export async function dispatchLifecycleRequest(
   // Reject already-obsolete or queued requests without initiating a new dial.
   deps.authority.assertCurrent(expected)
 
-  const route = await deps.resolve(request).catch(error => {
-    deps.authority.assertCurrent(expected)
-    throw error
-  })
+  const routeKey = deps.routeKey(request)
+  const captured = Object.freeze({ routeKey, lease: deps.authority.captureRoute(routeKey) })
 
-  const routeLease = deps.authority.captureRoute(route.routeKey)
+  const assertRequestCurrent = () => {
+    deps.authority.assertCurrent(expected)
+    deps.authority.assertRouteLease(captured.routeKey, captured.lease)
+  }
+
+  let route: Awaited<ReturnType<LifecycleTransportDeps['resolve']>>
+
+  try {
+    route = await deps.resolve(request, captured)
+  } catch (error) {
+    assertRequestCurrent()
+    throw error
+  }
 
   const assertCurrent = () => {
-    deps.authority.assertRouteCurrent(route.routeKey, expected, routeLease)
+    assertRequestCurrent()
+    deps.authority.assertRouteCurrent(captured.routeKey, expected, captured.lease)
 
-    if (route.descriptor.connectionGeneration !== expected || deps.authority.current(route.routeKey) !== expected) {
+    if (route.routeKey !== captured.routeKey || route.descriptor.connectionGeneration !== expected) {
       throw new Error(GENERATION_CHANGED)
     }
   }

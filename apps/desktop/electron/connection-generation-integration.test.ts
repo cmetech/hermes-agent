@@ -32,6 +32,7 @@ it('fences in-flight responses even if the retired alias returns to the same sha
     true,
     {
       authority,
+      routeKey: () => '[null,"support"]',
       resolve: async () => ({ descriptor, path: `${ROOT}/operations`, routeKey: '[null,"support"]' }),
       accessToken: async () => null,
       fetchToken: async () => {
@@ -126,6 +127,7 @@ it.each([false, true])(
       structured,
       {
         authority,
+        routeKey: () => '[null,"support"]',
         resolve: async () => ({
           descriptor: { ...descriptor, token: descriptor.token as string },
           path: `${ROOT}/operations?profile=support`,

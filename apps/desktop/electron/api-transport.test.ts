@@ -88,6 +88,7 @@ describe('native lifecycle IPC authority boundary', () => {
           structured,
           {
             authority,
+            routeKey: () => 'route',
             resolve: async () => {
               resolved++
               throw new Error('must not route')
@@ -128,6 +129,7 @@ describe('native lifecycle IPC authority boundary', () => {
           structured,
           {
             authority,
+            routeKey: () => 'route',
             resolve: async () => ({ descriptor, path: target.path, routeKey: 'route' }),
             accessToken: async () => {
               effects.push('auth')
@@ -160,6 +162,7 @@ describe('native lifecycle IPC authority boundary', () => {
         structured,
         {
           authority,
+          routeKey: () => 'route',
           resolve: async () => {
             await gate.promise
             throw new Error('private old endpoint error')
@@ -215,6 +218,7 @@ describe('native lifecycle IPC authority boundary', () => {
             structured,
             {
               authority,
+              routeKey: () => 'route',
               resolve: async () => {
                 await pause('resolve')
 
@@ -259,6 +263,7 @@ describe('native lifecycle IPC authority boundary', () => {
           structured,
           {
             authority,
+            routeKey: () => 'route',
             resolve: async () => {
               resolutions++
               throw new Error('must not resolve')
@@ -386,6 +391,7 @@ describe('native lifecycle IPC authority boundary', () => {
           true,
           {
             authority,
+            routeKey: () => 'route',
             resolve: async () => ({ descriptor, path: `${lifecycleRoot}/install/prepare`, routeKey: 'route' }),
             accessToken: async () => (transport === 'bearer' ? 'fixture-bearer' : null),
             fetchToken: (url, token, options) =>

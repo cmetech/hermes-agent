@@ -6,6 +6,11 @@ interface GenerationClaim {
   readonly generation: number
 }
 
+export interface ConnectionRouteLease {
+  readonly routeKey: string
+  readonly lease: object
+}
+
 /** Main-process authority. No credentials, persistence, or renderer-controlled counter. */
 export function createConnectionGenerationRegistry(
   onInvalidate: (reason: string, routes: readonly string[]) => void = () => {},
@@ -31,6 +36,14 @@ export function createConnectionGenerationRegistry(
     assertAvailable()
 
     if (!Number.isSafeInteger(generation) || generation <= 0 || !isCurrent(generation)) {
+      throw new Error(GENERATION_CHANGED)
+    }
+  }
+
+  function assertRouteLease(route: string, lease: object) {
+    assertAvailable()
+
+    if (routeLeases.get(route) !== lease) {
       throw new Error(GENERATION_CHANGED)
     }
   }
@@ -63,6 +76,7 @@ export function createConnectionGenerationRegistry(
   return {
     assertAvailable,
     assertCurrent,
+    assertRouteLease,
     isCurrent,
     invalidate,
     captureRoute(route: string) {
@@ -144,3 +158,32 @@ export function createConnectionGenerationRegistry(
 }
 
 export type ConnectionGenerationRegistry = ReturnType<typeof createConnectionGenerationRegistry>
+
+/** Backend wrapper shared by main's legacy and registry resolution paths. */
+export async function ensureConnectionGenerationRoute<T extends { connectionGeneration: number }>(
+  authority: ConnectionGenerationRegistry,
+  routeKey: string,
+  resolve: () => Promise<T>,
+  requestRoute?: ConnectionRouteLease
+): Promise<T> {
+  authority.assertAvailable()
+  const captured = requestRoute ?? { routeKey, lease: authority.captureRoute(routeKey) }
+  const assertLease = () => authority.assertRouteLease(captured.routeKey, captured.lease)
+  assertLease()
+  let descriptor: T
+
+  try {
+    descriptor = await resolve()
+  } finally {
+    assertLease()
+  }
+
+  authority.assertCurrent(descriptor.connectionGeneration)
+
+  // Lifecycle owns one final association after all nested resolution/reuse paths finish.
+  if (!requestRoute) {
+    authority.associate(routeKey, descriptor.connectionGeneration, captured.lease)
+  }
+
+  return descriptor
+}

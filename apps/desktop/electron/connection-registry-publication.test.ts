@@ -56,6 +56,7 @@ it.each(['changed', 'removed'])(
           structured,
           {
             authority,
+            routeKey: () => '["remote-a","support"]',
             resolve: async () => ({ descriptor, routeKey: '["remote-a","support"]', path: `${root}/operations` }),
             accessToken: async () => null,
             fetchToken: async () => {

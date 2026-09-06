@@ -130,7 +130,12 @@ import {
   withTransientRetries
 } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
-import { createConnectionGenerationRegistry, GENERATION_EXHAUSTED } from './connection-generation'
+import {
+  type ConnectionRouteLease,
+  createConnectionGenerationRegistry,
+  ensureConnectionGenerationRoute,
+  GENERATION_EXHAUSTED
+} from './connection-generation'
 import { broadcastConnectionGeneration } from './connection-generation-event'
 import { createConnectionGenerationRouting, invalidateSshGeneration } from './connection-generation-routing'
 import {
@@ -11429,18 +11434,16 @@ function profileRouteOptions(profile, request?) {
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
-async function ensureBackend(profile) {
-  connectionGenerations.assertAvailable()
-  const routeKey = lifecycleRouteKey(null, profile)
-  const routeLease = connectionGenerations.captureRoute(routeKey)
-  const connection = await resolveBackend(profile)
-  connectionGenerations.assertCurrent(connection.connectionGeneration)
-  connectionGenerations.associate(routeKey, connection.connectionGeneration, routeLease)
-
-  return connection
+async function ensureBackend(profile, requestRoute?: ConnectionRouteLease) {
+  return ensureConnectionGenerationRoute(
+    connectionGenerations,
+    lifecycleRouteKey(null, profile),
+    () => resolveBackend(profile, requestRoute),
+    requestRoute
+  )
 }
 
-async function resolveBackend(profile) {
+async function resolveBackend(profile, requestRoute?: ConnectionRouteLease) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
 
   profileDeletionGate.assertCanStart(key)
@@ -11478,7 +11481,7 @@ async function resolveBackend(profile) {
     if (!connectionGenerations.isCurrent(connection.connectionGeneration)) {
       await stopPoolBackend(key)
 
-      return ensureBackend(profile)
+      return ensureBackend(profile, requestRoute)
     }
 
     setWslBridgeProfileState(key, connection.mode !== 'remote')
@@ -11529,17 +11532,31 @@ async function resolveBackend(profile) {
 // a genuinely-local child when the v1 mode says remote; non-local connections
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
+async function ensureRegistryBackend(
+  connectionId,
+  profile,
+  managedUpdateCorrelation = '',
+  requestRoute?: ConnectionRouteLease
+) {
   connectionGenerations.assertAvailable()
   const id = String(connectionId || '').trim() || readDesktopConnectionsRegistry().primary
-  const connection = await resolveRegistryBackend(id, profile, managedUpdateCorrelation)
-  connectionGenerations.assertCurrent(connection.connectionGeneration)
-  connectionGenerations.associate(lifecycleRouteKey(id, profile || 'default'), connection.connectionGeneration)
+
+  const connection = await ensureConnectionGenerationRoute(
+    connectionGenerations,
+    lifecycleRouteKey(id, profile || 'default'),
+    () => resolveRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute),
+    requestRoute
+  )
 
   return { ...connection, connectionId: id }
 }
 
-async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrelation = '') {
+async function resolveRegistryBackend(
+  connectionId,
+  profile,
+  managedUpdateCorrelation = '',
+  requestRoute?: ConnectionRouteLease
+) {
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
   const source = registry.connections.find(c => c.id === id)
@@ -11596,7 +11613,7 @@ async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrel
   const primary = await reuseMatchingPrimarySshBackend({
     connectionId: id,
     effectiveFingerprint: resolveRegistryEffectiveFingerprint,
-    ensurePrimary: () => ensureBackend(profile),
+    ensurePrimary: () => ensureBackend(profile, requestRoute),
     profile,
     registry,
     source
@@ -11617,7 +11634,7 @@ async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrel
   // Desktop window starts two isolated servers whose transient runtime ids
   // are not interchangeable.
   if (id === registry.primary && source.kind !== 'local' && source.kind !== 'ssh') {
-    const primaryDescriptor = await ensureBackend(profile)
+    const primaryDescriptor = await ensureBackend(profile, requestRoute)
 
     if (registrySourceOwnsPrimaryBackend(registry, id, primaryDescriptor)) {
       return {
@@ -11647,7 +11664,7 @@ async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrel
     })
 
     if (localRoute.delegate) {
-      return ensureBackend(profile)
+      return ensureBackend(profile, requestRoute)
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
@@ -11665,7 +11682,7 @@ async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrel
       if (!connectionGenerations.isCurrent(connection.connectionGeneration)) {
         await stopPoolBackend(localRoute.poolKey)
 
-        return ensureRegistryBackend(id, profile, managedUpdateCorrelation)
+        return ensureRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute)
       }
 
       return connection
@@ -11717,7 +11734,7 @@ async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrel
     if (!connectionGenerations.isCurrent(descriptor.connectionGeneration)) {
       await stopPoolBackend(key)
 
-      return ensureRegistryBackend(id, profile, managedUpdateCorrelation)
+      return ensureRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute)
     }
 
     // A remote process can die while its local SSH forward stays LISTENing.
@@ -11729,7 +11746,7 @@ async function resolveRegistryBackend(connectionId, profile, managedUpdateCorrel
         connectionPromise,
         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
         probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
-        reconnect: () => ensureRegistryBackend(id, profile),
+        reconnect: () => ensureRegistryBackend(id, profile, '', requestRoute),
         retire: async (error: any) => {
           // A late failure from an old descriptor must never tear down a newer
           // entry that another caller has already installed.
@@ -16466,28 +16483,33 @@ async function handleHermesApiRequest(request, structured = false) {
   if (validateLifecycleRequest(request)) {
     return dispatchLifecycleRequest(request, structured, {
       authority: connectionGenerations,
-      resolve: async value => {
+      routeKey: value => {
+        const id = apiRequestRegistryConnectionId(value)
+
+        return lifecycleRouteKey(id, id ? value.profile || 'default' : value.profile)
+      },
+      resolve: async (value, captured) => {
         const id = apiRequestRegistryConnectionId(value)
 
         if (id) {
           const descriptor = await backendDialClaims.run(backendScopeKey(id, value.profile), () =>
-            ensureRegistryBackend(id, value.profile)
+            ensureRegistryBackend(id, value.profile, '', captured)
           )
+
+          connectionGenerations.associate(captured.routeKey, descriptor.connectionGeneration, captured.lease)
 
           return {
             descriptor,
             path: pathForRegistryBackendRequest(value.path, value.profile, descriptor),
-            routeKey: lifecycleRouteKey(id, value.profile || 'default')
+            routeKey: captured.routeKey
           }
         }
 
-        const routeKey = lifecycleRouteKey(null, value.profile)
-        const routeLease = connectionGenerations.captureRoute(routeKey)
         const route = resolveProfileApiRequest(value.profile, value.path, profileRouteOptions(value.profile, value))
-        const descriptor = await ensureBackend(route.backendProfile)
-        connectionGenerations.associate(routeKey, descriptor.connectionGeneration, routeLease)
+        const descriptor = await ensureBackend(route.backendProfile, captured)
+        connectionGenerations.associate(captured.routeKey, descriptor.connectionGeneration, captured.lease)
 
-        return { descriptor, path: route.requestPath, routeKey }
+        return { descriptor, path: route.requestPath, routeKey: captured.routeKey }
       },
       accessToken: ensureNativeAccessToken,
       fetchToken: (url, token, options) =>
