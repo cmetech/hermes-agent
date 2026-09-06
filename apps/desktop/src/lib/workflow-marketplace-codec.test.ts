@@ -9,6 +9,7 @@ import type {
   WorkflowMarketplaceOperationResult
 } from '@/types/hermes'
 
+import inspectionV1Corpus from '../../../../tests/fixtures/workflow-marketplace-inspection-v1.json'
 import diagnosticCorpus from '../../../../tests/fixtures/workflow-marketplace-source-diagnostics.json'
 
 import {
@@ -36,6 +37,199 @@ const REVIEW_DIGEST = '3'.repeat(64)
 const COMMIT = '4'.repeat(40)
 const TOKEN = 'confirmation-token-value-1234567890'
 const NOW = '2026-09-04T00:00:00Z'
+
+describe('backend-generated V1 inspection digest domains', () => {
+  const operation = inspectionV1Corpus.operationCases[0].value
+
+  it('preserves the exact V1 service operation and all distribution, workflow, and risk digests', () => {
+    // Break caught: imposing root/workflow digest equality on a valid V1 result.
+    expect(inspectionV1Corpus.operationCases[0].accepted).toBe(true)
+    const decoded = decodeMarketplaceOperation(operation)
+    expect(decoded).not.toBeNull()
+    expect(decoded).toEqual(operation)
+
+    if (decoded?.result?.type !== 'package_detail') {
+      throw new Error('Expected the generated V1 package detail')
+    }
+
+    expect(decoded.result.value.package_digest).toBe(operation.result.value.package_digest)
+    expect(
+      decoded.result.value.workflows.map(({ package_digest, risk_digest }) => ({ package_digest, risk_digest }))
+    ).toEqual(
+      operation.result.value.workflows.map(({ package_digest, risk_digest }) => ({ package_digest, risk_digest }))
+    )
+  })
+
+  it.each<[string, (value: typeof operation) => void]>([
+    [
+      'malformed root digest',
+      value => {
+        value.result.value.package_digest = 'g'.repeat(64)
+      }
+    ],
+    [
+      'uppercase root digest',
+      value => {
+        value.result.value.package_digest = 'A'.repeat(64)
+      }
+    ],
+    [
+      'short root digest',
+      value => {
+        value.result.value.package_digest = 'a'.repeat(63)
+      }
+    ],
+    [
+      'malformed workflow digest',
+      value => {
+        value.result.value.workflows[0].package_digest = 'g'.repeat(64)
+      }
+    ],
+    [
+      'uppercase workflow digest',
+      value => {
+        value.result.value.workflows[0].package_digest = 'A'.repeat(64)
+      }
+    ],
+    [
+      'short workflow digest',
+      value => {
+        value.result.value.workflows[0].package_digest = 'a'.repeat(63)
+      }
+    ],
+    [
+      'malformed risk digest',
+      value => {
+        value.result.value.workflows[0].risk_digest = 'g'.repeat(64)
+      }
+    ],
+    [
+      'extra operation field',
+      value => {
+        Object.assign(value, { unexpected: true })
+      }
+    ],
+    [
+      'extra detail field',
+      value => {
+        Object.assign(value.result.value, { unexpected: true })
+      }
+    ],
+    [
+      'extra workflow field',
+      value => {
+        Object.assign(value.result.value.workflows[0], { unexpected: true })
+      }
+    ],
+    [
+      'invalid operation ID',
+      value => {
+        value.id = 'not-an-operation-id'
+      }
+    ],
+    [
+      'wrong operation kind',
+      value => {
+        value.kind = 'refresh'
+      }
+    ],
+    [
+      'inconsistent operation status',
+      value => {
+        value.state = 'failed'
+      }
+    ],
+    [
+      'identity mismatch',
+      value => {
+        value.result.value.identity.package_id = 'other-package'
+      }
+    ],
+    [
+      'inconsistent installed status',
+      value => {
+        value.result.value.install_status = 'installed'
+      }
+    ],
+    [
+      'inconsistent update status',
+      value => {
+        value.result.value.update_status = 'current'
+      }
+    ],
+    [
+      'unsorted workflows',
+      value => {
+        value.result.value.workflows.reverse()
+      }
+    ],
+    [
+      'duplicate workflow name',
+      value => {
+        value.result.value.workflows[1].workflow_name = 'A'
+      }
+    ],
+    [
+      'case-folded duplicate workflow name',
+      value => {
+        value.result.value.workflows[1].workflow_name = 'a'
+      }
+    ],
+    [
+      'unsorted resources',
+      value => {
+        value.result.value.resources.reverse()
+      }
+    ],
+    [
+      'duplicate resource',
+      value => {
+        value.result.value.resources.splice(1, 0, value.result.value.resources[0])
+      }
+    ],
+    [
+      'unsafe package path',
+      value => {
+        value.result.value.package_path = '../laptop-support'
+      }
+    ],
+    [
+      'unsafe workflow path',
+      value => {
+        value.result.value.workflows[0].definition_path = '../A.yaml'
+      }
+    ],
+    [
+      'unsafe resource path',
+      value => {
+        value.result.value.resources[0].path = '../guide.md'
+      }
+    ],
+    [
+      'missing workflow resource',
+      value => {
+        value.result.value.resources = value.result.value.resources.filter(item => item.path !== 'workflows/A.yaml')
+      }
+    ],
+    [
+      'wrong workflow resource role',
+      value => {
+        value.result.value.resources[3].types = ['script']
+      }
+    ],
+    [
+      'unknown resource role',
+      value => {
+        value.result.value.resources[3].types = ['executable']
+      }
+    ]
+  ])('still rejects %s', (_name, mutate) => {
+    // Each case changes one independent property of the real backend payload.
+    const value = structuredClone(operation)
+    mutate(value)
+    expect(decodeMarketplaceOperation(value)).toBeNull()
+  })
+})
 
 const RESULT_KIND = {
   install_review: 'install_prepare',
@@ -1283,9 +1477,9 @@ describe('workflow marketplace codec', () => {
     ).not.toBeNull()
   })
 
-  it('rejects package detail resource, workflow identity, and digest incoherence', () => {
+  it('rejects package detail resource, workflow identity, and digest syntax errors', () => {
     const wrongDigest = packageDetail()
-    wrongDigest.workflows[0].package_digest = '9'.repeat(64)
+    wrongDigest.workflows[0].package_digest = 'g'.repeat(64)
     expect(decodeMarketplacePackageDetail(wrongDigest)).toBeNull()
 
     const duplicateWorkflow = packageDetail()

@@ -2030,8 +2030,7 @@ export function decodeMarketplacePackageDetail(value: unknown): WorkflowMarketpl
     !SEMVER.test(version) ||
     workflows === null ||
     !sortedUnique(workflows.map(item => item.workflow_name)) ||
-    !logicallyUnique(workflows.map(item => item.workflow_name)) ||
-    workflows.some(item => item.package_digest !== packageDigest)
+    !logicallyUnique(workflows.map(item => item.workflow_name))
   ) {
     return null
   }

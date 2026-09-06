@@ -3,6 +3,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -14,26 +16,45 @@ from plugins.workflow.marketplace.lifecycle_models import (
 )
 from plugins.workflow.marketplace import lifecycle_models as wire
 from plugins.workflow.marketplace.operations import (
+    MarketplaceOperation,
     AdmissionEvicted,
     AdmissionFound,
     LifecycleOperationPage,
     ReviewTokenResponse,
+    WorkflowMarketplaceOperationRegistry,
 )
 
 
 ROOT = Path(__file__).resolve().parents[3]
 CORPUS = ROOT / "tests/fixtures/workflow-marketplace-lifecycle-v2.json"
+INSPECTION_V1 = ROOT / "tests/fixtures/workflow-marketplace-inspection-v1.json"
 
 
-def test_generator_reproduces_actual_domain_projections():
+def test_generator_reproduces_actual_domain_projections(monkeypatch):
     # Break caught: a generator that omits service execution or emits stale bytes.
+    legacy_observations = []
+    get_legacy = WorkflowMarketplaceOperationRegistry.get_legacy
+
+    def observe_legacy(registry, operation_id, *, actor):
+        # Exercise the real admission-version gate; V2 starts cannot pass it.
+        result = get_legacy(registry, operation_id, actor=actor)
+        if result.kind == "package_detail" and result.state == "succeeded":
+            legacy_observations.append(result.model_dump(mode="json", by_alias=False))
+        return result
+
+    monkeypatch.setattr(
+        WorkflowMarketplaceOperationRegistry, "get_legacy", observe_legacy
+    )
     path = ROOT / "scripts/generate_workflow_marketplace_lifecycle_fixtures.py"
     assert path.exists(), "lifecycle fixture generator is missing"
     spec = importlib.util.spec_from_file_location("lifecycle_fixtures", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    generated = module.generate_corpus()
+    generated, inspection_v1 = module.generate_corpora()
     assert generated == json.loads(CORPUS.read_text(encoding="utf-8"))
+    assert module.render(inspection_v1) == INSPECTION_V1.read_text(encoding="utf-8")
+    v1_operation = inspection_v1["operationCases"][0]["value"]
+    assert legacy_observations == [v1_operation]
     assert generated["domains"]["lifecycle_relative_path"]["maxLength"] == 1024
     assert 0xFEFF not in generated["domains"]["clean_text"]["stripCodePoints"]
     assert generated["httpErrorCodes"] == sorted(wire.LIFECYCLE_HTTP_ERROR_CODES)
@@ -45,6 +66,10 @@ def test_generator_reproduces_actual_domain_projections():
         for case in generated["operationCases"]
     )
     by_name = {case["name"]: case for case in generated["operationCases"]}
+    assert (
+        v1_operation["result"]["value"]
+        == by_name["service inspect"]["value"]["result"]["value"]
+    )
     selected = by_name["service grant one A"]["value"]["result"]["value"]
     assert {item["workflow_name"]: item["state"] for item in selected["workflows"]} == {
         "A": "trusted",
@@ -92,6 +117,54 @@ def test_generator_reproduces_actual_domain_projections():
         found.operation.id,
         generated["legacyOperation"]["id"],
     }
+
+
+def test_v1_inspection_preserves_distribution_and_effective_workflow_digests():
+    # Break caught: conflating distribution identity with workflow trust identity.
+    corpus = json.loads(INSPECTION_V1.read_text(encoding="utf-8"))
+    case = corpus["operationCases"][0]
+    assert case["accepted"]
+    operation = MarketplaceOperation.model_validate_json(
+        json.dumps(case["value"]), by_alias=False, by_name=True
+    )
+    assert operation.kind == "package_detail" and operation.state == "succeeded"
+    assert operation.result.type == "package_detail"
+    detail = operation.result.value
+    first, second = detail.workflows
+    assert [first.workflow_name, second.workflow_name] == ["A", "B"]
+    digests = [detail.package_digest, first.package_digest, second.package_digest]
+    assert all(re.fullmatch(r"[a-f0-9]{64}", digest) for digest in digests)
+    assert len(set(digests)) == 3  # This real A/B fixture, not a schema inequality.
+    assert all(
+        re.fullmatch(r"[a-f0-9]{64}", item.risk_digest) for item in detail.workflows
+    )
+
+
+@pytest.mark.parametrize("missing", [True, False], ids=["missing", "changed"])
+def test_generator_check_detects_v1_inspection_drift(
+    tmp_path, monkeypatch, capsys, missing
+):
+    # Break caught: --check silently omitting the V1 artifact from its ownership.
+    spec = importlib.util.spec_from_file_location(
+        "inspection_fixture_drift",
+        ROOT / "scripts/generate_workflow_marketplace_lifecycle_fixtures.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    artifact = tmp_path / INSPECTION_V1.name
+    if not missing:
+        artifact.write_text(
+            INSPECTION_V1.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        )
+    monkeypatch.setattr(module, "INSPECTION_V1", artifact)
+    monkeypatch.setattr(sys, "argv", ["generate-fixtures", "--check"])
+    with pytest.raises(SystemExit) as error:
+        module.main()
+    assert error.value.code == 1
+    assert (
+        f"Lifecycle generated artifact drift: {artifact.name}"
+        in capsys.readouterr().err
+    )
 
 
 def test_checked_in_cases_follow_python_validation():

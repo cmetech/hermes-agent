@@ -1,4 +1,4 @@
-"""Generate token-free V2 fixtures through real temporary Git/service scenarios.
+"""Generate V1 inspection and token-free V2 fixtures through real Git/services.
 
 Run with the repository test interpreter and --write or --check. No user profile
 is opened. Structural Desktop types/schema are derived from the public models;
@@ -51,6 +51,7 @@ from plugins.workflow.marketplace.models import (  # noqa: E402
     WorkflowMarketplaceSource,
 )
 from plugins.workflow.marketplace.operations import (  # noqa: E402
+    MarketplaceOperation,
     AdmissionEvicted,
     AdmissionFound,
     LifecycleOperationPage,
@@ -69,12 +70,13 @@ NOW = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
 UTC = "2026-09-05T12:00:00Z"
 EPOCH = "e" * 32
 CORPUS = ROOT / "tests/fixtures/workflow-marketplace-lifecycle-v2.json"
+INSPECTION_V1 = ROOT / "tests/fixtures/workflow-marketplace-inspection-v1.json"
 TYPES = ROOT / "apps/desktop/src/types/workflow-marketplace-lifecycle.ts"
 
 
-def _case(name, value, model):
+def _case(name, value, model, **validation_options):
     try:
-        model.model_validate_json(json.dumps(value))
+        model.model_validate_json(json.dumps(value), **validation_options)
     except ValidationError:
         accepted = False
     else:
@@ -82,7 +84,61 @@ def _case(name, value, model):
     return {"name": name, "value": value, "accepted": accepted}
 
 
-def generate_corpus():
+def _inspect_v1(service, identity, subject):
+    # Fixed identity affects only this memory-only registry's public ID prefix.
+    registry_home = "/fixture-profile/support"
+    ids = iter(range(3000, 3020))
+    registry = WorkflowMarketplaceOperationRegistry(
+        profile_key=registry_home,
+        profile="support",
+        clock=lambda: NOW,
+        admissions=LifecycleAdmissionStore(
+            profile_key=registry_home,
+            epoch=EPOCH,
+            clock=lambda: NOW,
+            random_hex=lambda: f"{next(ids):032x}",
+        ),
+    )
+
+    def work(cancellation):
+        cancellation.set_progress("fetching", 10)
+        return _legacy_completion(
+            complete_read(
+                service,
+                kind="inspect",
+                subject=subject,
+                selection=None,
+                actor="alice",
+                call=lambda: service.inspect(
+                    "company/laptop-support", cancelled=cancellation.is_cancelled
+                ),
+            )
+        )
+
+    try:
+        # No caller request_id: this is an actual V1 admission, not a projection
+        # of a V2-started operation. get_legacy enforces that immutable eligibility.
+        current = registry.start(
+            "package_detail",
+            work,
+            actor="alice",
+            subject=subject,
+            canonical_body=identity.model_dump(mode="json"),
+        )
+        operation_id = current.id
+        deadline = time.monotonic() + 10
+        while True:
+            current = registry.get_legacy(operation_id, actor="alice")
+            if current.state not in {"pending", "running"}:
+                assert current.state == "succeeded"
+                return current.model_dump(mode="json", by_alias=False)
+            assert time.monotonic() < deadline, "V1 inspection did not complete"
+            time.sleep(0.001)
+    finally:
+        registry.close()
+
+
+def generate_corpora():
     operations = []
     states = []
     envelopes = {}
@@ -217,6 +273,17 @@ def generate_corpus():
                 "inspect",
                 lambda: service.inspect("company/laptop-support"),
             )
+            inspection_v1 = {
+                "operationCases": [
+                    _case(
+                        "service inspect",
+                        _inspect_v1(service, identity, subject),
+                        MarketplaceOperation,
+                        by_alias=False,
+                        by_name=True,
+                    )
+                ]
+            }
             repository_url = "https://fixtures.example/workflows.git"
             admissions = LifecycleAdmissionStore(
                 profile_key=str(service.home), epoch=EPOCH, clock=lambda: NOW
@@ -931,7 +998,7 @@ def generate_corpus():
         del metadata[field]
         token_case("token missing " + field, metadata)
         token_case("token malformed " + field, {**token_metadata, field: False})
-    return {
+    lifecycle_v2 = {
         **envelopes,
         "domains": generate_domains(),
         "httpErrorCodes": sorted(wire.LIFECYCLE_HTTP_ERROR_CODES),
@@ -944,6 +1011,11 @@ def generate_corpus():
         "validOperationA": genuine[0]["value"],
         "capabilities": capabilities,
     }
+    return lifecycle_v2, inspection_v1
+
+
+def generate_corpus():
+    return generate_corpora()[0]
 
 
 def render(value):
@@ -1299,7 +1371,12 @@ def main():
         check=True,
         cwd=ROOT / "apps/desktop",
     ).stdout
-    for path, content in ((CORPUS, render(generate_corpus())), (TYPES, types)):
+    lifecycle_v2, inspection_v1 = generate_corpora()
+    for path, content in (
+        (CORPUS, render(lifecycle_v2)),
+        (INSPECTION_V1, render(inspection_v1)),
+        (TYPES, types),
+    ):
         if args.write:
             path.write_text(content, encoding="utf-8")
         elif not path.exists() or path.read_text(encoding="utf-8") != content:
