@@ -2,13 +2,13 @@
 
 **Date:** 2026-09-05
 
-**Status:** The user approved the recommended design direction on 2026-09-05. This written contract awaits user review before the implementation plan is amended or production work resumes.
+**Status:** Approved by the user on 2026-09-05 for implementation in the existing Hermes worktree. This approval does not authorize Workflow Studio changes, merge, push, publication, release, history rewrite, or worktree deletion.
 
 **Baseline:** `eeba68e5c3521fa02a3cf6b5fb1cb56747c07b1f`, branch `feat/workflow-package-marketplace`.
 
 **Amends:** [lifecycle recovery amendment](2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), especially section 6, and [strict wire parity amendment](2026-09-05-workflow-marketplace-strict-wire-parity-amendment.md), especially its capabilities contract.
 
-**Execution:** After written approval, amend the [replacement remaining-work plan](../plans/2026-09-04-workflow-marketplace-lifecycle-recovery.md) before changing production or test code.
+**Execution:** The [replacement remaining-work plan](../plans/2026-09-04-workflow-marketplace-lifecycle-recovery.md) defines the Task 14C0a, 14C0b, and revised 14C1 sequencing and review gates.
 
 ## 1. Decision and scope
 
@@ -146,7 +146,7 @@ Desktop establishes a lifecycle binding in this order:
 
 Every API request captures the binding it started under. Get/cancel/list/admission responses must pass their existing exact operation/request/kind/subject/profile/epoch checks and the native pre-dispatch/pre-return generation checks. A delayed response from an old generation is discarded; it cannot update records, barriers, caches, dialogs, announcements, or focus in the new scope.
 
-Capabilities is the only lifecycle V2 request that does not yet have an expected principal binding. Every subsequent V2 request carries `expectedMarketplacePrincipalBinding` over IPC. Electron validates the 64-lowercase-hex domain and maps it only for the exact lifecycle V2 route prefix to the `X-Hermes-Marketplace-Principal-Binding` request header; it never accepts arbitrary renderer-supplied headers. The backend independently requires and validates that header as exactly 64 lowercase hexadecimal characters, authenticates the request normally, derives the actual binding from that request's exact authority/profile/process epoch, and compares it in constant time before list/get/state access, review-token retrieval, admission lookup, cancellation, or operation admission. Missing, malformed, uppercase, oversized, or unequal values all return the same fixed `409 marketplace_principal_changed` with neither expected nor actual value. The header is a non-authorizing precondition, not a credential.
+Capabilities is the only lifecycle V2 request that does not yet have an expected principal binding. Every subsequent V2 request carries `expectedMarketplacePrincipalBinding` over IPC. Electron validates the 64-lowercase-hex domain and maps it only for the exact lifecycle V2 route prefix to the `X-Hermes-Marketplace-Principal-Binding` request header; it never accepts arbitrary renderer-supplied headers. That header name is reserved case-insensitively: connection/configuration descriptor headers containing any casing of it are rejected at validation and stripped fail-closed at dispatch defense-in-depth. Electron injects exactly one native-owned value after sanitizing descriptor headers for token and OAuth/cookie transports, so merge order cannot override or duplicate it. The backend independently requires and validates that header as exactly 64 lowercase hexadecimal characters, authenticates the request normally, derives the actual binding from that request's exact authority/profile/process epoch, and compares it in constant time before list/get/state access, review-token retrieval, admission lookup, cancellation, or operation admission. Missing, malformed, uppercase, oversized, duplicated, or unequal values all return the same fixed `409 marketplace_principal_changed` with neither expected nor actual value. The header is a non-authorizing precondition, not a credential.
 
 This per-request check closes native OAuth bearer refresh and cookie-session races: a request may proceed when refreshed credentials resolve to the same backend actor, but it cannot silently run as a different actor under an older capabilities observation. Main still applies the generation checks independently because the same actor does not prove the same native route.
 
@@ -263,7 +263,8 @@ Tests use behavior assertions, backend-generated fixtures where applicable, dete
 | Native dispatch race | Capabilities and later V2 calls reject generation mismatch with exact local `marketplace_connection_generation_changed` both before fetch and before IPC return; expected generation never reaches HTTP; supervisor reprobes without terminal/outcome claims |
 | Defensive rollover | Global invalidation barrier clears all current descriptors before allocator restarts; no retained supervisor binding collides |
 | Capabilities race | Generation change before response acceptance rejects the response and branded clock observation; no POST occurs from stale observation |
-| Per-request actor precondition | Missing, malformed, uppercase, oversized, or unequal binding returns fixed `409 marketplace_principal_changed` before read/admission/cancel/token access; OAuth bearer/cookie change to same actor succeeds and different actor cannot act under the old observation |
+| Per-request actor precondition | Missing, malformed, uppercase, oversized, duplicated, or unequal binding returns fixed `409 marketplace_principal_changed` before read/admission/cancel/token access; OAuth bearer/cookie change to same actor succeeds and different actor cannot act under the old observation |
+| Reserved header ownership | Exact/lower/mixed-case descriptor collisions are rejected and stripped; token and OAuth/cookie dispatch each send exactly one native-owned expected-binding header after sanitization |
 | Compatibility | Missing generation or principal binding disables V2 lifecycle without synthetic fallback; browse/source controls retain their documented compatibility |
 | Supervisor rebind | Same ID/profile/principal/epoch under a new generation reattaches only exact known request/operation IDs after lookup |
 | Authority isolation | Changed principal or epoch never adopts old operations, announces old completion, releases new-scope barriers, or invalidates new-scope cache |
