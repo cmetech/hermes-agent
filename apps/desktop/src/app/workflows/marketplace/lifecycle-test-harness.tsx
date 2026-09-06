@@ -10,10 +10,12 @@ import {
   type LifecycleStart
 } from '@/api/workflow-marketplace-lifecycle'
 import { I18nProvider } from '@/i18n'
+import { decodeMarketplaceOperation } from '@/lib/workflow-marketplace-codec'
 import { decodeLifecycleOperation, decodeLifecyclePackageState } from '@/lib/workflow-marketplace-lifecycle-codec'
 import { createMarketplaceSupervisor, type MarketplaceIntent } from '@/store/workflow-marketplace-supervisor'
 import type { LifecycleOperation } from '@/types/workflow-marketplace-lifecycle'
 
+import inspectionCorpus from '../../../../../../tests/fixtures/workflow-marketplace-inspection-v1.json'
 import corpus from '../../../../../../tests/fixtures/workflow-marketplace-lifecycle-v2.json'
 
 import { MarketplaceSupervisorProvider } from './supervisor-provider'
@@ -41,6 +43,33 @@ export function lifecycleStateFixture(name: string) {
   return state
 }
 
+/** Genuine V1 admission fixture; only the pending shell removes terminal fields. */
+export function legacyInspectionFixture(name: 'service inspect' | 'service inspect pending', operationId?: string) {
+  const original = inspectionCorpus.operationCases[0].value
+  const value = operationId ? { ...original, id: operationId } : original
+
+  const operation = decodeMarketplaceOperation(
+    name === 'service inspect'
+      ? value
+      : {
+          ...value,
+          started_at: null,
+          finished_at: null,
+          state: 'pending',
+          phase: 'queued',
+          progress: 0,
+          result: null,
+          error: null
+        }
+  )
+
+  if (!operation) {
+    throw new Error('Invalid legacy inspection fixture')
+  }
+
+  return operation
+}
+
 export function deferredLifecycle<T>() {
   let resolve!: (value: T) => void
 
@@ -64,6 +93,7 @@ export function createLifecycleHarness() {
   let invalidTerminalEvidence = false
   let principal = corpus.capabilities.principal_binding
   let epoch = corpus.capabilities.registry_epoch
+  let connectionGeneration = 1
   let afterPost: (() => void) | undefined
   let count = 0
   const now = Date.parse(corpus.capabilities.server_time)
@@ -73,7 +103,7 @@ export function createLifecycleHarness() {
     visibility,
     clock: () => ({ wallNowMs: now, monotonicNowMs: 0 }),
     connections: {
-      resolveConnection: async scope => ({ connectionId: scope.connectionId, connectionGeneration: 1 }),
+      resolveConnection: async scope => ({ connectionId: scope.connectionId, connectionGeneration }),
       isConnected: () => true,
       subscribe: callback => {
         listeners.add(callback)
@@ -225,9 +255,13 @@ export function createLifecycleHarness() {
     failOriginRefetches: () => {
       stateFailure = true
     },
-    state: (name: string, orphaned = false) => {
+    state: (name: string, orphaned = false, busy = false) => {
       stateFailure = false
       packageState = lifecycleStateFixture(name)
+
+      if (busy) {
+        packageState = { ...packageState, busy: true }
+      }
 
       if (orphaned && packageState.installed) {
         packageState = { ...packageState, installed: { ...packageState.installed, orphaned_source: true } }
@@ -258,9 +292,11 @@ export function createLifecycleHarness() {
     invalidTerminalEvidence: () => {
       invalidTerminalEvidence = true
     },
-    changeAuthority: (kind: 'principal' | 'epoch') => {
+    changeAuthority: (kind: 'principal' | 'epoch' | 'generation') => {
       if (kind === 'principal') {
         principal = 'c'.repeat(64)
+      } else if (kind === 'generation') {
+        connectionGeneration += 1
       } else {
         epoch = 'd'.repeat(32)
       }

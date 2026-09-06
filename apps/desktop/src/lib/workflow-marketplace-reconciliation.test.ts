@@ -4,6 +4,7 @@ import { profileScopeKey } from '@/api/client'
 import {
   createLifecycleHarness,
   deferredLifecycle,
+  legacyInspectionFixture,
   lifecycleFixture,
   lifecycleIdentity,
   lifecycleStateFixture
@@ -24,6 +25,189 @@ afterEach(() => {
 })
 
 describe('package mutation reconciliation', () => {
+  it.each([
+    ['service recovery required', false, 'recovery_required'],
+    ['service installed A trusted', true, 'busy'],
+    ['service ambiguous state', false, 'unknown']
+  ] as const)(
+    'fences catalog after a later locked %s observation without a mutation record',
+    async (fixture, busy, expected) => {
+      const h = harness()
+      const binding = await h.bind()
+      const other = await h.bind({ connectionId: 'remote-b', profile: 'support' })
+      const profile = await h.bind({ connectionId: 'remote-a', profile: 'personal' })
+      const catalogKey = marketplaceKeys.catalog(profileScopeKey(binding))
+      const otherKey = marketplaceKeys.catalog(profileScopeKey(other))
+      const profileKey = marketplaceKeys.catalog(profileScopeKey(profile))
+      h.state('service installed A trusted')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      await h.supervisor.reconcilePackage(other, lifecycleIdentity)
+      await h.supervisor.reconcilePackage(profile, lifecycleIdentity)
+      await h.queryClient.fetchQuery({ queryKey: catalogKey, queryFn: async () => ({ items: [] }) })
+      await h.queryClient.fetchQuery({ queryKey: otherKey, queryFn: async () => ({ items: [] }) })
+      await h.queryClient.fetchQuery({ queryKey: profileKey, queryFn: async () => ({ items: [] }) })
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(true)
+      h.state(fixture, false, busy)
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(false)
+      h.state('service installed A trusted')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(false)
+      await h.queryClient.fetchQuery({ queryKey: catalogKey, queryFn: async () => ({ items: [] }) })
+      const held = deferredLifecycle<unknown>()
+
+      const oldRead = h.queryClient
+        .fetchQuery({ queryKey: catalogKey, queryFn: () => held.promise })
+        .catch(() => undefined)
+
+      h.state(fixture, false, busy)
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity).state).toBe(expected)
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(false)
+      expect(h.supervisor.canUseCatalog(other, otherKey)).toBe(true)
+      expect(h.supervisor.canUseCatalog(profile, profileKey)).toBe(true)
+      expect(h.supervisor.$records.get()).toEqual([])
+      h.state('service installed A trusted')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      held.resolve({ items: [] })
+      await oldRead
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(false)
+      await h.queryClient.fetchQuery({ queryKey: catalogKey, queryFn: async () => ({ items: [] }) })
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(true)
+    }
+  )
+  it('requires a new exact post-barrier inspection admission rather than re-admitting an old ID or swapping poll IDs', async () => {
+    const h = harness()
+    const binding = await h.bind()
+    const queryKey = marketplaceKeys.detail(profileScopeKey(binding), 'company', 'laptop-support')
+    const old = legacyInspectionFixture('service inspect')
+    await h.queryClient.fetchQuery({ queryKey, queryFn: async () => old })
+    await h.mutate(binding)
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    await h.queryClient.fetchQuery({ queryKey, queryFn: async () => old })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, queryKey).state).toBe('reconciling')
+    const nextId = 'wmop_62e05a9a7e00_00000000000000000000000000000bba'
+    await h.queryClient.fetchQuery({
+      queryKey,
+      queryFn: async () => legacyInspectionFixture('service inspect pending', nextId)
+    })
+    const pollKey = marketplaceKeys.operation(profileScopeKey(binding), nextId)
+    await h.queryClient.fetchQuery({ queryKey: pollKey, queryFn: async () => old })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, pollKey).state).toBe('reconciling')
+    await h.queryClient.fetchQuery({
+      queryKey: pollKey,
+      queryFn: async () => legacyInspectionFixture('service inspect', nextId)
+    })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, pollKey).state).toBe('ready')
+  })
+
+  it.each(['principal', 'epoch', 'generation'] as const)(
+    'cannot carry a known inspection admission across a changed %s',
+    async kind => {
+      const h = harness()
+      const binding = await h.bind()
+      const completed = legacyInspectionFixture('service inspect')
+      const queryKey = marketplaceKeys.detail(profileScopeKey(binding), 'company', 'laptop-support')
+      await h.queryClient.fetchQuery({ queryKey, queryFn: async () => completed })
+      h.disconnect()
+      h.changeAuthority(kind)
+      const fresh = await h.bind()
+      await h.supervisor.reconcilePackage(fresh, lifecycleIdentity)
+      const pollKey = marketplaceKeys.operation(profileScopeKey(fresh), completed.id)
+      await h.queryClient.fetchQuery({ queryKey: pollKey, queryFn: async () => completed })
+      expect(h.supervisor.getPackageGate(fresh, lifecycleIdentity, pollKey).state).toBe('reconciling')
+    }
+  )
+
+  it.each([
+    { connectionId: 'remote-b', profile: 'support' },
+    { connectionId: 'remote-a', profile: 'personal' }
+  ])('does not borrow inspection admission from another scope $connectionId/$profile', async scope => {
+    const h = harness()
+    const binding = await h.bind()
+    const completed = legacyInspectionFixture('service inspect')
+    await h.queryClient.fetchQuery({
+      queryKey: marketplaceKeys.detail(profileScopeKey(binding), 'company', 'laptop-support'),
+      queryFn: async () => completed
+    })
+    const other = await h.bind(scope)
+    await h.supervisor.reconcilePackage(other, lifecycleIdentity)
+    const pollKey = marketplaceKeys.operation(profileScopeKey(other), completed.id)
+    await h.queryClient.fetchQuery({ queryKey: pollKey, queryFn: async () => completed })
+    expect(h.supervisor.getPackageGate(other, lifecycleIdentity, pollKey).state).toBe('reconciling')
+  })
+
+  it('does not borrow a detail admission made for a different package query identity', async () => {
+    const h = harness()
+    const binding = await h.bind()
+    const completed = legacyInspectionFixture('service inspect')
+    await h.queryClient.fetchQuery({
+      queryKey: marketplaceKeys.detail(profileScopeKey(binding), 'company', 'different-package'),
+      queryFn: async () => legacyInspectionFixture('service inspect pending')
+    })
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    const pollKey = marketplaceKeys.operation(profileScopeKey(binding), completed.id)
+    await h.queryClient.fetchQuery({ queryKey: pollKey, queryFn: async () => completed })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, pollKey).state).toBe('reconciling')
+  })
+
+  it.each(['principal', 'epoch', 'generation'] as const)(
+    'does not carry an unsafe package observation across a changed %s',
+    async kind => {
+      const h = harness()
+      const binding = await h.bind()
+      h.state('service recovery required')
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      h.disconnect()
+      h.changeAuthority(kind)
+      const fresh = await h.bind()
+      h.state('service installed A trusted')
+      await h.supervisor.reconcilePackage(fresh, lifecycleIdentity)
+      const catalogKey = marketplaceKeys.catalog(profileScopeKey(fresh))
+      await h.queryClient.fetchQuery({ queryKey: catalogKey, queryFn: async () => ({ items: [] }) })
+      expect(h.supervisor.canUseCatalog(fresh, catalogKey)).toBe(true)
+      expect(h.supervisor.canUseCatalog(binding, catalogKey)).toBe(false)
+    }
+  )
+  it('never renews the admission generation by polling the same immutable inspection after a mutation', async () => {
+    const h = harness()
+    const binding = await h.bind()
+    const scope = profileScopeKey(binding)
+    const admissionKey = marketplaceKeys.detail(scope, 'company', 'laptop-support')
+    const pending = lifecycleFixture('service inspect pending')
+    const completed = lifecycleFixture('service inspect')
+    const operationKey = marketplaceKeys.operation(scope, pending.id)
+    await h.queryClient.fetchQuery({ queryKey: admissionKey, queryFn: async () => pending })
+    await h.queryClient.fetchQuery({ queryKey: operationKey, queryFn: async () => completed })
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, operationKey).state).toBe('ready')
+    await h.mutate(binding, 'service update confirm')
+    h.state('service installed A trusted')
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    await h.queryClient
+      .fetchQuery({
+        queryKey: admissionKey,
+        queryFn: async () => {
+          throw new Error('new inspection unavailable')
+        }
+      })
+      .catch(() => undefined)
+    await h.queryClient.fetchQuery({ queryKey: operationKey, queryFn: async () => completed })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, operationKey).state).toBe('reconciling')
+    h.queryClient.removeQueries({ queryKey: operationKey, exact: true })
+    await h.queryClient.fetchQuery({ queryKey: operationKey, queryFn: async () => completed })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, operationKey).state).toBe('reconciling')
+  })
+
+  it('does not treat historical inspection retrieval without a known admission as candidate freshness', async () => {
+    const h = harness()
+    const binding = await h.bind()
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    const completed = lifecycleFixture('service inspect')
+    const operationKey = marketplaceKeys.operation(profileScopeKey(binding), completed.id)
+    await h.queryClient.fetchQuery({ queryKey: operationKey, queryFn: async () => completed })
+    expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, operationKey).state).toBe('reconciling')
+  })
   it('keeps an explicit unknown terminal outcome unknown until a locked current-state read succeeds', async () => {
     const h = harness()
     const binding = await h.bind()

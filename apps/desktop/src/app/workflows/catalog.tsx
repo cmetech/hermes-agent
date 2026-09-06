@@ -311,7 +311,15 @@ export function WorkflowCatalog({
     <div>
       {stale ? (
         <div>
-          <p role="status">Last observed — Refreshing package state</p>
+          <p role="status">
+            {truth.catalogState === 'recovery_required'
+              ? 'Recovery required. Last observed catalog.'
+              : truth.catalogState === 'busy'
+                ? 'Package work in progress. Last observed catalog.'
+                : truth.catalogState === 'unknown'
+                  ? 'Package state is unconfirmed. Last observed catalog.'
+                  : 'Last observed — Refreshing package state'}
+          </p>
           <Button onClick={() => void catalog.refetch()} size="sm" type="button" variant="secondary">
             {t.operations.workflowCatalogRetry}
           </Button>

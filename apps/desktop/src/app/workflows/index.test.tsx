@@ -17,6 +17,53 @@ beforeAll(() => {
   Element.prototype.releasePointerCapture = vi.fn()
 })
 
+it.each([
+  ['service recovery required', false, /Recovery required/],
+  ['service installed A trusted', true, /Package work in progress/],
+  ['service ambiguous state', false, /Package state is unconfirmed/]
+] as const)('disables catalog presentation after a later authoritative %s read', async (fixture, busy, copy) => {
+  const h = createLifecycleHarness()
+
+  try {
+    const binding = await h.bind()
+    await h.mutate(binding)
+    h.state('service installed A trusted')
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    const history = h.supervisor.$records.get()
+    render(
+      <h.Providers>
+        <WorkflowCatalog
+          onRunWorkflow={vi.fn()}
+          onViewWorkflow={vi.fn()}
+          requestProfile="support"
+          scope={lifecycleScope}
+        />
+      </h.Providers>
+    )
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    listWorkflowDefinitions.mockRejectedValue(new Error('catalog offline'))
+    h.state(fixture, false, busy)
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText(copy)).toBeTruthy()
+    expect(h.supervisor.$records.get()).toEqual(history)
+    h.state('service installed A trusted')
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
 it('gates unbound catalog Run and Review while package truth is stale, without joining workflow names', async () => {
   const h = createLifecycleHarness()
 

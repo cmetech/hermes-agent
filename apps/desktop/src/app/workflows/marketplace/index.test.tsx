@@ -21,7 +21,12 @@ import type {
 } from '@/types/hermes'
 
 import { InstalledPackages } from './installed-packages'
-import { createLifecycleHarness, lifecycleIdentity, renderLifecycleHarness } from './lifecycle-test-harness'
+import {
+  createLifecycleHarness,
+  legacyInspectionFixture,
+  lifecycleIdentity,
+  renderLifecycleHarness
+} from './lifecycle-test-harness'
 import { MarketplacePackageDetail } from './package-detail'
 import { MarketplacePackageList } from './package-list'
 import { marketplaceKeys } from './query-keys'
@@ -2200,6 +2205,41 @@ describe('workflow package lifecycle', () => {
 })
 
 describe('supervised marketplace readiness and transitional adapters', () => {
+  it('keeps the old pending inspection last-observed after mutation, failed replacement admission and remount', async () => {
+    const h = createLifecycleHarness()
+
+    try {
+      const binding = await h.bind()
+      const pending = legacyInspectionFixture('service inspect pending')
+      const completed = legacyInspectionFixture('service inspect')
+      api.inspect.mockResolvedValue(pending)
+      api.getOperation.mockResolvedValue(completed)
+      const view = renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      const region = screen.getByRole('region', { name: 'Laptop Support package details' })
+      await waitFor(() => expect(within(region).queryByText(/Last observed —/)).toBeNull())
+      api.inspect.mockRejectedValue(new Error('replacement inspection unavailable'))
+      h.state('service installed A trusted')
+      await act(async () => {
+        await h.mutate(binding, 'service update confirm')
+        await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      })
+      await waitFor(() => expect(api.inspect.mock.calls.length).toBeGreaterThan(1))
+      expect(api.getOperation).toHaveBeenLastCalledWith(pending.id, scopeA)
+      expect(within(region).getByText(/Last observed —/)).toBeTruthy()
+      view.unmount()
+      renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
+      await selectPackage()
+      expect(
+        within(screen.getByRole('region', { name: 'Laptop Support package details' })).getByText(/Last observed —/)
+      ).toBeTruthy()
+      expect(screen.queryByRole('button', { name: 'Update package' })).toBeNull()
+    } finally {
+      cleanup()
+      h.dispose()
+    }
+  })
+
   async function selectPackage() {
     fireEvent.click(await screen.findByRole('option', { name: /Laptop Support/ }))
     await screen.findByRole('region', { name: 'Laptop Support package details' })

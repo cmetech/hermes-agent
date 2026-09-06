@@ -1099,6 +1099,7 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       return (
         usable(binding) &&
         scanned.has(scopeKey(binding)) &&
+        reconciliation.scopeState(binding) === 'clear' &&
         reconciliation.projectionFresh(binding, projection, reconciliation.scopeGeneration(binding)) &&
         ![...entries].some(
           ({ record }) => sameAuthority(record.binding, binding) && isMutation(record.kind) && record.barrier

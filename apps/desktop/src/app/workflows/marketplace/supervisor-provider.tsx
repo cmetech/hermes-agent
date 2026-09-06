@@ -63,6 +63,7 @@ function readOnlySnapshot(supervisor: Supervisor | null, scope: MarketplaceScope
     binding,
     revision,
     quarantined: Boolean(supervisor && !binding),
+    catalogState: supervisor && binding ? supervisor.reconciliation.scopeState(binding) : 'unknown',
     packageGate: (identity: PackageIdentity, projection?: QueryKey) =>
       supervisor && binding ? supervisor.getPackageGate(binding, identity, projection) : null,
     packageGeneration: (identity: PackageIdentity) =>

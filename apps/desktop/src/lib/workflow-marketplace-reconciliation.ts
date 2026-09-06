@@ -17,14 +17,60 @@ interface PackageObservation {
   packageState: PackageState | null
 }
 
+function inspectionOperation(value: unknown, binding: LifecycleConnectionBinding) {
+  const operation = decodeLifecycleOperation(value) ?? decodeMarketplaceOperation(value)
+
+  if (!operation || operation.profile !== binding.profile) {
+    return null
+  }
+
+  if (operation.schema_version === 2) {
+    return operation.kind === 'inspect' &&
+      operation.registry_epoch === binding.registryEpoch &&
+      operation.subject.type === 'package'
+      ? operation
+      : null
+  }
+
+  return operation.kind === 'package_detail' ? operation : null
+}
+
+function inspectionCorrelation(operation: NonNullable<ReturnType<typeof inspectionOperation>>) {
+  return operation.schema_version === 2
+    ? {
+        id: operation.id,
+        profile: operation.profile,
+        kind: operation.kind,
+        schema_version: 2,
+        request_id: operation.request_id,
+        registry_epoch: operation.registry_epoch,
+        subject: operation.subject,
+        selection: operation.selection
+      }
+    : {
+        id: operation.id,
+        profile: operation.profile,
+        kind: operation.kind,
+        schema_version: 1,
+        source_name: operation.source_name
+      }
+}
+
 /** Memory-only freshness evidence. Backend state and operation history keep their separate authorities. */
 export function createMarketplaceReconciliation(
   queryClient: QueryClient,
   isCurrent: (binding: LifecycleConnectionBinding) => boolean
 ) {
-  const packages = new Map<string, PackageObservation>()
+  const packages = new Map<string, { binding: LifecycleConnectionBinding; observation: PackageObservation }>()
   const scopes = new Map<string, { binding: LifecycleConnectionBinding; generation: number }>()
   const projections = new WeakMap<Query, { binding: LifecycleConnectionBinding; generation: number; fresh: boolean }>()
+
+  // Application-lifetime admission evidence, independent of query retention and later GET/list fetches.
+  const inspections = new Map<
+    string,
+    { generation: number; queryKey: QueryKey; correlation: ReturnType<typeof inspectionCorrelation> }
+  >()
+
   const revision = atom(0)
   const changed = () => revision.set(revision.get() + 1)
 
@@ -40,7 +86,17 @@ export function createMarketplaceReconciliation(
     ])
 
   const read = (binding: LifecycleConnectionBinding, identity: PackageIdentity): PackageObservation =>
-    packages.get(key(binding, identity)) ?? { generation: 0, packageState: null }
+    packages.get(key(binding, identity))?.observation ?? { generation: 0, packageState: null }
+
+  const inspectionKey = (binding: LifecycleConnectionBinding, id: string) =>
+    JSON.stringify([
+      binding.connectionId,
+      binding.connectionGeneration,
+      binding.profile,
+      binding.principalBinding,
+      binding.registryEpoch,
+      id
+    ])
 
   const off = queryClient.getQueryCache().subscribe(event => {
     if (event.type !== 'updated') {
@@ -60,6 +116,24 @@ export function createMarketplaceReconciliation(
 
       if (started && sameLifecycleValue(started.binding, origin.binding) && started.generation === origin.generation) {
         started.fresh = true
+        const queryKey = event.query.queryKey
+
+        if (queryKey[0] === 'workflow-marketplace' && queryKey[2] === 'detail') {
+          const operation = inspectionOperation(event.query.state.data, started.binding)
+
+          if (operation) {
+            const id = inspectionKey(started.binding, operation.id)
+
+            if (!inspections.has(id)) {
+              inspections.set(id, {
+                generation: started.generation,
+                queryKey: [...queryKey],
+                correlation: inspectionCorrelation(operation)
+              })
+            }
+          }
+        }
+
         changed()
       }
     }
@@ -79,12 +153,18 @@ export function createMarketplaceReconciliation(
     const receipt = query && projections.get(query)
 
     if (identity && (queryKey[2] === 'detail' || queryKey[2] === 'operation')) {
-      const operation = decodeLifecycleOperation(query?.state.data) ?? decodeMarketplaceOperation(query?.state.data)
+      const operation = inspectionOperation(query?.state.data, binding)
+      const admission = operation && inspections.get(inspectionKey(binding, operation.id))
 
       if (
         operation?.state !== 'succeeded' ||
         operation.result.type !== 'package_detail' ||
-        !sameLifecycleIdentity(operation.result.value.identity, identity)
+        !sameLifecycleIdentity(operation.result.value.identity, identity) ||
+        !admission ||
+        admission.generation < generation ||
+        admission.queryKey[4] !== identity.package_id ||
+        !sameLifecycleValue(admission.correlation, inspectionCorrelation(operation)) ||
+        (queryKey[2] === 'operation' ? queryKey[3] !== operation.id : !sameLifecycleValue(queryKey, admission.queryKey))
       ) {
         return false
       }
@@ -97,6 +177,43 @@ export function createMarketplaceReconciliation(
       query?.state.status === 'success' &&
       !query.state.isInvalidated
     )
+  }
+
+  function advance(binding: LifecycleConnectionBinding, identity: PackageIdentity) {
+    const scope = profileScopeKey(binding)
+    const generation = (scopes.get(scope)?.generation ?? 0) + 1
+    scopes.set(scope, { binding, generation })
+    packages.set(key(binding, identity), { binding, observation: { generation, packageState: null } })
+    changed()
+
+    const predicate = ({ queryKey }: { queryKey: readonly unknown[] }) =>
+      queryKey[1] === scope &&
+      (queryKey[0] === 'workflow-catalog' ||
+        (queryKey[0] === 'workflow-marketplace' && queryKey[2] !== 'sources' && queryKey[2] !== 'capabilities'))
+
+    // Cancel synchronously before admission dispatch. Invalidation schedules fresh reads without inventing state.
+    void queryClient.cancelQueries({ predicate })
+    void queryClient.invalidateQueries({ predicate })
+  }
+
+  function scopeState(binding: LifecycleConnectionBinding) {
+    const states = [...packages.values()]
+      .filter(value => sameLifecycleValue(value.binding, binding))
+      .map(value => value.observation.packageState)
+
+    if (states.some(state => state?.busy)) {
+      return 'busy'
+    }
+
+    if (states.some(state => state?.recovery === 'required')) {
+      return 'recovery_required'
+    }
+
+    if (states.some(state => !state || state.state === 'unconfirmed' || state.recovery !== 'clear')) {
+      return 'unknown'
+    }
+
+    return 'clear'
   }
 
   return {
@@ -119,36 +236,40 @@ export function createMarketplaceReconciliation(
       changed()
     },
     projectionFresh,
+    scopeState,
     scopeGeneration(binding: LifecycleConnectionBinding) {
       return scopes.get(profileScopeKey(binding))?.generation ?? 0
     },
-    advance(binding: LifecycleConnectionBinding, identity: PackageIdentity) {
-      const scope = profileScopeKey(binding)
-      const generation = (scopes.get(scope)?.generation ?? 0) + 1
-      scopes.set(scope, { binding, generation })
-      packages.set(key(binding, identity), { generation, packageState: null })
-      changed()
-
-      const predicate = ({ queryKey }: { queryKey: readonly unknown[] }) =>
-        queryKey[1] === scope &&
-        (queryKey[0] === 'workflow-catalog' ||
-          (queryKey[0] === 'workflow-marketplace' && queryKey[2] !== 'sources' && queryKey[2] !== 'capabilities'))
-
-      // Cancel synchronously before admission dispatch. Invalidation schedules fresh reads without inventing state.
-      void queryClient.cancelQueries({ predicate })
-      void queryClient.invalidateQueries({ predicate })
-    },
+    advance,
     accept(
       binding: LifecycleConnectionBinding,
       identity: PackageIdentity,
       generation: number,
       packageState: PackageState
     ) {
-      if (read(binding, identity).generation !== generation) {
+      const previous = read(binding, identity)
+
+      if (previous.generation !== generation) {
         return false
       }
 
-      packages.set(key(binding, identity), { generation, packageState })
+      const unsafe = packageState.busy || packageState.recovery !== 'clear' || packageState.state === 'unconfirmed'
+
+      // A new unsafe fact fences prior projections, even when no mutation record belongs to this renderer.
+      // Repeated identical unsafe classifications must not create a read/advance loop.
+      if (
+        unsafe &&
+        (previous.packageState?.busy !== packageState.busy ||
+          previous.packageState?.recovery !== packageState.recovery ||
+          previous.packageState?.state !== packageState.state)
+      ) {
+        advance(binding, identity)
+      }
+
+      packages.set(key(binding, identity), {
+        binding,
+        observation: { generation: read(binding, identity).generation, packageState }
+      })
       revision.set(revision.get() + 1)
 
       return true
