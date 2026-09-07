@@ -133,7 +133,7 @@ def _parser_package_lock(name: str = "gate-fixture") -> dict[str, object]:
 def _write_parser_dependencies(root: Path) -> None:
     playwright = root / "node_modules/@playwright/test"
     playwright.mkdir(parents=True, exist_ok=True)
-    (playwright / "package.json").write_text('{"name":"@playwright/test"}\n')
+    (playwright / "package.json").write_text('{"name":"@playwright/test"}\n', encoding="utf-8")
     (playwright / "cli.js").write_text(
         "const fs = require('node:fs');\n"
         "if (process.env.CAPTURE_LOG) fs.appendFileSync(process.env.CAPTURE_LOG, ['playwright', ...process.argv.slice(2)].join('\\t') + '\\n');\n"
@@ -145,7 +145,8 @@ def _write_parser_dependencies(root: Path) -> None:
         "  if (fs.readFileSync('brand.config.json', 'utf8') !== 'generated brand\\n') process.exit(44);\n"
         "  if (!fs.existsSync('../../plugins/model-providers/otto/generated.py')) process.exit(45);\n"
         "  if (process.env.GATE_BUILD_MODE === 'browser-fail') process.exit(43);\n"
-        "}\n"
+        "}\n",
+        encoding="utf-8",
     )
     for package, version in PARSER_VERSIONS.items():
         package_dir = root / "node_modules" / package
@@ -193,7 +194,7 @@ def test_live_customization_ledger_has_one_rehearsable_upstream_baseline() -> No
         ],
         cwd=ROOT,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         check=False,
     )
 
@@ -207,28 +208,32 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     (repo / "scripts").mkdir(parents=True)
     (repo / "docs/upstream-customizations").mkdir(parents=True)
     (repo / "apps/desktop/node_modules").mkdir(parents=True)
-    (repo / "apps/desktop/brand.config.json").write_text('"committed brand"\n')
+    (repo / "apps/desktop/brand.config.json").write_text('"committed brand"\n', encoding="utf-8")
     subprocess.run(["git", "init", "-b", "base"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Gate Contract"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "gate@localhost"], cwd=repo, check=True)
     (repo / "scripts/check_upstream_customizations.py").write_text(
-        _dependency_checker_source()
+        _dependency_checker_source(),
+        encoding="utf-8",
     )
-    (repo / "scripts/test_workflow_upstream_merge.sh").write_text("#!/bin/sh\nexit 0\n")
+    (repo / "scripts/test_workflow_upstream_merge.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (repo / "scripts/run_tests.sh").write_text(
         "#!/usr/bin/env bash\n"
-        "{ printf 'run_tests'; printf '\\t%s' \"$@\"; printf '\\n'; } >>\"$CAPTURE_LOG\"\n"
+        "{ printf 'run_tests'; printf '\\t%s' \"$@\"; printf '\\n'; } >>\"$CAPTURE_LOG\"\n",
+        encoding="utf-8",
     )
     (repo / "scripts/run_tests.sh").chmod(0o755)
     (repo / "docs/upstream-customizations/workflow-orchestration.yaml").write_text(
-        "schema_version: 1\n"
+        "schema_version: 1\n",
+        encoding="utf-8",
     )
-    (repo / "docs/upstream-customizations/merge-evidence.schema.json").write_text("{}\n")
+    (repo / "docs/upstream-customizations/merge-evidence.schema.json").write_text("{}\n", encoding="utf-8")
     fixture_bin = tmp_path / "fixture-bin"
     fixture_bin.mkdir()
     (fixture_bin / "npx").write_text(
         "#!/usr/bin/env bash\n"
-        "{ printf 'npx'; printf '\\t%s' \"$@\"; printf '\\n'; } >>\"$CAPTURE_LOG\"\n"
+        "{ printf 'npx'; printf '\\t%s' \"$@\"; printf '\\n'; } >>\"$CAPTURE_LOG\"\n",
+        encoding="utf-8",
     )
     (fixture_bin / "npx").chmod(0o755)
     shutil.copyfile(fixture_bin / "npx", fixture_bin / "npm")
@@ -238,27 +243,28 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
             f"#!{sys.executable}\n"
             "import os, signal\nfrom pathlib import Path\n"
             "root = Path.cwd().parents[1]\n"
-            "with open(os.environ['CAPTURE_LOG'], 'a') as log:\n"
+            "with open(os.environ['CAPTURE_LOG'], 'a', encoding='utf-8') as log:\n"
             "    log.write('build-root\\t' + str(root) + '\\n')\n"
-            "Path('brand.config.json').write_text('generated brand\\n')\n"
+            "Path('brand.config.json').write_text('generated brand\\n', encoding='utf-8')\n"
             "artifact = root / 'plugins/model-providers/otto/generated.py'\n"
             "artifact.parent.mkdir(parents=True, exist_ok=True)\n"
-            "artifact.write_text('generated provider\\n')\n"
+            "artifact.write_text('generated provider\\n', encoding='utf-8')\n"
             "mode = os.environ['GATE_BUILD_MODE']\n"
             "if mode == 'source-mutated':\n"
-            "    (Path(os.environ['GATE_SOURCE_ROOT']) / 'apps/desktop/brand.config.json').write_text('unexpected user edit\\n')\n"
+            "    (Path(os.environ['GATE_SOURCE_ROOT']) / 'apps/desktop/brand.config.json').write_text('unexpected user edit\\n', encoding='utf-8')\n"
             "if mode.startswith('signal-'):\n"
             "    os.kill(os.getppid(), getattr(signal, 'SIG' + mode.removeprefix('signal-')))\n"
             "if mode.startswith('gate-signal-'):\n"
             "    import sys\n"
             "    os.kill(int(sys.stdin.readline()), getattr(signal, 'SIG' + mode.removeprefix('gate-signal-')))\n"
             "if mode == 'ownership-changed':\n"
-            "    (root.parent / '.owner').write_text('unrecognized owner\\n')\n"
+            "    (root.parent / '.owner').write_text('unrecognized owner\\n', encoding='utf-8')\n"
             "if mode == 'source-read-fail':\n"
             "    Path(os.environ['GATE_READ_FAULT']).touch()\n"
-            "raise SystemExit(42 if mode == 'build-fail' else 0)\n"
+            "raise SystemExit(42 if mode == 'build-fail' else 0)\n",
+            encoding="utf-8",
         )
-        with (fixture_bin / "npx").open("a") as stream:
+        with (fixture_bin / "npx").open("a", encoding="utf-8") as stream:
             stream.write(
                 "if [[ \"$1\" == playwright ]]; then\n"
                 "  [[ \"$GATE_BUILD_MODE\" == source-mutated || $(<brand.config.json) == 'generated brand' ]] || exit 44\n"
@@ -273,7 +279,8 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
             "import os, sys\nfrom pathlib import Path\n"
             "if Path(os.environ['GATE_READ_FAULT']).exists() and ('status' in sys.argv or 'diff' in sys.argv):\n"
             "    raise SystemExit(47)\n"
-            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
         )
         (fixture_bin / "git").chmod(0o755)
     for generator in (
@@ -282,8 +289,9 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     ):
         (repo / "scripts" / generator).write_text(
             "import os, sys\n"
-            "with open(os.environ['CAPTURE_LOG'], 'a') as log:\n"
-            "    log.write('generator\\t' + os.path.basename(__file__) + '\\t' + '\\t'.join(sys.argv[1:]) + '\\n')\n"
+            "with open(os.environ['CAPTURE_LOG'], 'a', encoding='utf-8') as log:\n"
+            "    log.write('generator\\t' + os.path.basename(__file__) + '\\t' + '\\t'.join(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8",
         )
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
@@ -292,7 +300,7 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
         (repo / "node_modules/@playwright/test/cli.js").unlink()
     user_file = repo / "plugins/model-providers/otto/user.txt"
     user_file.parent.mkdir(parents=True)
-    user_file.write_text("preexisting user provider\n")
+    user_file.write_text("preexisting user provider\n", encoding="utf-8")
     capture = tmp_path / "commands.tsv"
     env = os.environ.copy()
     env.pop("WORKFLOW_MERGE_GATE_FAST", None)
@@ -308,7 +316,7 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     process = subprocess.Popen(
         [GATE, "--repo", repo, "--phase", "base"],
         cwd=repo,
-        text=True,
+        text=True, encoding="utf-8",
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -317,7 +325,7 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     # Exact process identity via inherited stdin: no timing sleep or process-name lookup.
     stdout, stderr = process.communicate(input=f"{process.pid}\n", timeout=30)
     result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-    commands = [line.split("\t") for line in capture.read_text().splitlines()]
+    commands = [line.split("\t") for line in capture.read_text(encoding="utf-8").splitlines()]
     return result, commands
 
 
@@ -329,9 +337,9 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
 def test_base_gate_isolates_generated_build_bytes_and_cleans_every_exit(tmp_path, build_mode):
     result, commands = _exercise_base_gate(tmp_path, build_mode)
     repo = tmp_path / "gate-contract-repo"
-    assert (repo / "apps/desktop/brand.config.json").read_text() == '"committed brand"\n'
+    assert (repo / "apps/desktop/brand.config.json").read_text(encoding="utf-8") == '"committed brand"\n'
     assert not (repo / "plugins/model-providers/otto/generated.py").exists()
-    assert (repo / "plugins/model-providers/otto/user.txt").read_text() == "preexisting user provider\n"
+    assert (repo / "plugins/model-providers/otto/user.txt").read_text(encoding="utf-8") == "preexisting user provider\n"
     assert subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo) == b""
     build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
     assert build_root != repo
@@ -339,7 +347,7 @@ def test_base_gate_isolates_generated_build_bytes_and_cleans_every_exit(tmp_path
     assert not list(tmp_path.glob("hermes-workflow-gate-build-*"))
     if build_mode == "pass":
         assert result.returncode == 0, result.stderr
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, encoding="utf-8").strip()
         assert f"TESTED_BASE_SHA={sha}" in result.stdout
     else:
         assert result.returncode != 0
@@ -351,7 +359,7 @@ def test_base_gate_preserves_unexpected_source_edits_and_refuses_receipt_after_c
     repo = tmp_path / "gate-contract-repo"
     assert result.returncode != 0
     assert "TESTED_BASE_SHA=" not in result.stdout
-    assert (repo / "apps/desktop/brand.config.json").read_text() == "unexpected user edit\n"
+    assert (repo / "apps/desktop/brand.config.json").read_text(encoding="utf-8") == "unexpected user edit\n"
     build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
     assert build_root != repo
     assert not build_root.exists()
@@ -365,10 +373,10 @@ def test_base_gate_preserves_build_workspace_when_cleanup_ownership_changes(tmp_
     assert "cleanup refused" in result.stderr
     build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
     assert build_root != repo
-    assert (build_root.parent / ".owner").read_text() == "unrecognized owner\n"
-    assert (build_root / "plugins/model-providers/otto/generated.py").read_text() == "generated provider\n"
-    assert (repo / "apps/desktop/brand.config.json").read_text() == '"committed brand"\n'
-    assert (repo / "plugins/model-providers/otto/user.txt").read_text() == "preexisting user provider\n"
+    assert (build_root.parent / ".owner").read_text(encoding="utf-8") == "unrecognized owner\n"
+    assert (build_root / "plugins/model-providers/otto/generated.py").read_text(encoding="utf-8") == "generated provider\n"
+    assert (repo / "apps/desktop/brand.config.json").read_text(encoding="utf-8") == '"committed brand"\n'
+    assert (repo / "plugins/model-providers/otto/user.txt").read_text(encoding="utf-8") == "preexisting user provider\n"
 
 
 def test_base_gate_refuses_receipt_when_post_cleanup_source_read_fails(tmp_path):
@@ -507,7 +515,7 @@ def test_base_gate_runs_marketplace_lifecycle_proof_without_moving_base(tmp_path
 
 
 def _portability_matrix() -> dict:
-    return yaml.safe_load(CI.read_text())["jobs"]["workflow-portability"]["strategy"][
+    return yaml.safe_load(CI.read_text(encoding="utf-8"))["jobs"]["workflow-portability"]["strategy"][
         "matrix"
     ]
 
@@ -533,7 +541,7 @@ def test_portability_slices_cover_every_pinned_file_exactly_once() -> None:
     # that already outgrew its budget once.
     assert len(files) == len(set(files)), "a test file is pinned in two slices"
     for path in files:
-        assert CI.read_text().count(path) == 1
+        assert CI.read_text(encoding="utf-8").count(path) == 1
     # The slice lists are hand-maintained, so a typo would otherwise only
     # surface as a confusing "file or directory not found" inside CI.
     missing = [path for path in files if not (ROOT / path).is_file()]
@@ -541,7 +549,7 @@ def test_portability_slices_cover_every_pinned_file_exactly_once() -> None:
 
 
 def test_portability_job_uses_uv_with_the_cross_platform_isolated_runner() -> None:
-    job = yaml.safe_load(CI.read_text())["jobs"]["workflow-portability"]
+    job = yaml.safe_load(CI.read_text(encoding="utf-8"))["jobs"]["workflow-portability"]
     step = next(
         item
         for item in job["steps"]
@@ -565,7 +573,7 @@ def test_phase_1_language_contracts_are_pinned_in_native_matrix() -> None:
 
 def test_phase_1_language_customizations_and_regression_gate_are_tracked() -> None:
     customization_ids = {
-        entry["id"] for entry in yaml.safe_load(MANIFEST.read_text())["upstream_changes"]
+        entry["id"] for entry in yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))["upstream_changes"]
     }
 
     assert PHASE_1_LANGUAGE_CUSTOMIZATION_IDS <= customization_ids
@@ -596,13 +604,13 @@ def test_native_workflow_matrix_covers_every_release_gate() -> None:
 
 
 def test_merge_gate_rejects_invalid_phase_and_unknown_brand() -> None:
-    invalid = subprocess.run([GATE, "--phase", "invalid"], cwd=ROOT, text=True, capture_output=True)
+    invalid = subprocess.run([GATE, "--phase", "invalid"], cwd=ROOT, text=True, encoding="utf-8", capture_output=True)
     assert invalid.returncode == 2
     assert "base or brand" in invalid.stderr
 
     brand = subprocess.run(
         [GATE, "--phase", "brand", "--brand", "missing"],
-        cwd=ROOT, text=True, capture_output=True,
+        cwd=ROOT, text=True, encoding="utf-8", capture_output=True,
         env={"PATH": "/usr/bin:/bin", "WORKFLOW_MERGE_GATE_FAST": "1"},
     )
     assert brand.returncode == 2
@@ -614,11 +622,11 @@ def test_base_gate_is_offline_and_reports_exact_tested_sha(tmp_path: Path) -> No
     env = os.environ.copy()
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
     result = subprocess.run(
-        [GATE, "--repo", repo], cwd=repo, text=True, capture_output=True, env=env
+        [GATE, "--repo", repo], cwd=repo, text=True, encoding="utf-8", capture_output=True, env=env
     )
     assert result.returncode == 0, result.stderr
     expected = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, encoding="utf-8"
     ).strip()
     assert f"TESTED_BASE_SHA={expected}" in result.stdout
 
@@ -628,9 +636,9 @@ def test_partial_gate_installation_fails_closed(tmp_path: Path) -> None:
     (repo / "scripts").mkdir(parents=True)
     (repo / "docs/upstream-customizations").mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    (repo / "scripts/check_upstream_customizations.py").write_text("raise SystemExit(0)\n")
-    (repo / "docs/upstream-customizations/workflow-orchestration.yaml").write_text("schema_version: 1\n")
-    result = subprocess.run([GATE, "--repo", repo, "--phase", "base"], cwd=ROOT, text=True, capture_output=True)
+    (repo / "scripts/check_upstream_customizations.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    (repo / "docs/upstream-customizations/workflow-orchestration.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    result = subprocess.run([GATE, "--repo", repo, "--phase", "base"], cwd=ROOT, text=True, encoding="utf-8", capture_output=True)
     assert result.returncode == 1
     assert "partial workflow merge gate" in result.stderr
 
@@ -646,25 +654,28 @@ def _brand_repo(tmp_path: Path) -> tuple[Path, str]:
     subprocess.run(["git", "config", "user.name", "Gate Test"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "gate@localhost"], cwd=repo, check=True)
     (repo / "scripts/check_upstream_customizations.py").write_text(
-        _dependency_checker_source()
+        _dependency_checker_source(),
+        encoding="utf-8",
     )
-    (repo / "scripts/test_workflow_upstream_merge.sh").write_text("#!/bin/sh\nexit 0\n")
-    (repo / "docs/upstream-customizations/workflow-orchestration.yaml").write_text("schema_version: 1\n")
-    (repo / "docs/upstream-customizations/merge-evidence.schema.json").write_text("{}\n")
-    (repo / "brands/otto.json").write_text('{"slug":"otto"}\n')
-    (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'base'\n")
-    (repo / "package.json").write_text('{"name":"gate-fixture"}\n')
+    (repo / "scripts/test_workflow_upstream_merge.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (repo / "docs/upstream-customizations/workflow-orchestration.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    (repo / "docs/upstream-customizations/merge-evidence.schema.json").write_text("{}\n", encoding="utf-8")
+    (repo / "brands/otto.json").write_text('{"slug":"otto"}\n', encoding="utf-8")
+    (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'base'\n", encoding="utf-8")
+    (repo / "package.json").write_text('{"name":"gate-fixture"}\n', encoding="utf-8")
     (repo / "package-lock.json").write_text(
-        f"{json.dumps(_parser_package_lock())}\n"
+        f"{json.dumps(_parser_package_lock())}\n",
+        encoding="utf-8",
     )
     (repo / "apps/desktop/package.json").write_text(
-        '{"name":"gate-desktop-fixture"}\n'
+        '{"name":"gate-desktop-fixture"}\n',
+        encoding="utf-8",
     )
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
-    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, encoding="utf-8").strip()
     subprocess.run(["git", "checkout", "-b", "otto"], cwd=repo, check=True, capture_output=True)
-    (repo / "brand.txt").write_text("otto\n")
+    (repo / "brand.txt").write_text("otto\n", encoding="utf-8")
     subprocess.run(["git", "add", "brand.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "brand"], cwd=repo, check=True, capture_output=True)
     _write_parser_dependencies(repo)
@@ -705,9 +716,10 @@ def _brand_parser_checkouts(
 ) -> tuple[Path, Path, Path, str]:
     shared_root, invocation, brand, base = _sibling_invocation_checkouts(tmp_path)
     _write_parser_dependencies(invocation)
-    (brand / "package.json").write_text('{"name":"otto-gate-fixture"}\n')
+    (brand / "package.json").write_text('{"name":"otto-gate-fixture"}\n', encoding="utf-8")
     (brand / "package-lock.json").write_text(
-        f"{json.dumps(_parser_package_lock('otto-gate-fixture'))}\n"
+        f"{json.dumps(_parser_package_lock('otto-gate-fixture'))}\n",
+        encoding="utf-8",
     )
     subprocess.run(
         ["git", "add", "package.json", "package-lock.json"],
@@ -736,7 +748,7 @@ def _run_gate_with_marker(
     return subprocess.run(
         [GATE, "--repo", repo, *arguments],
         cwd=repo,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -795,7 +807,7 @@ def test_gate_provisions_parser_dependencies_from_sibling_invocation_worktree(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env={
             **os.environ,
@@ -829,7 +841,7 @@ def _run_brand_parser_gate(
             base,
         ],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env={**os.environ, "WORKFLOW_MERGE_GATE_FAST": "1"},
     )
@@ -877,14 +889,14 @@ def test_brand_gate_rejects_unsealed_or_mismatched_parser_lock_entries(
         entry = '"node_modules/typescript":{"version":"6.0.3"}'
         serialized = json.dumps(payload, separators=(",", ":"))
         serialized = serialized.replace(entry, f"{entry},{entry}", 1)
-        target.write_text(f"{serialized}\n")
+        target.write_text(f"{serialized}\n", encoding="utf-8")
     elif malformation == "dirty-brand-lock":
         payload["name"] = "dirty-brand-lock"
     elif malformation == "dirty-source-lock":
         target = invocation / "package-lock.json"
-        target.write_text(f"{json.dumps(_parser_package_lock('dirty-source'))}\n")
+        target.write_text(f"{json.dumps(_parser_package_lock('dirty-source'))}\n", encoding="utf-8")
     if malformation not in {"duplicate-entry", "dirty-source-lock"}:
-        target.write_text(f"{json.dumps(payload)}\n")
+        target.write_text(f"{json.dumps(payload)}\n", encoding="utf-8")
     if not malformation.startswith("dirty-"):
         subprocess.run(
             ["git", "add", "package-lock.json"],
@@ -950,7 +962,7 @@ def test_gate_rejects_invocation_dependencies_from_different_repository(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=unrelated,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env={
             **os.environ,
@@ -980,7 +992,7 @@ def test_gate_rejects_escaping_sibling_invocation_dependency_view(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env={
             **os.environ,
@@ -1049,10 +1061,11 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     desktop_modules = invocation / "apps/desktop/node_modules"
     (desktop_modules / "fixture-package").mkdir(parents=True)
     (desktop_modules / "fixture-package/package.json").write_text(
-        '{"name":"fixture-package"}\n'
+        '{"name":"fixture-package"}\n',
+        encoding="utf-8",
     )
     (desktop_modules / ".vite").mkdir()
-    (desktop_modules / ".vite/source-cache").write_text("source-only\n")
+    (desktop_modules / ".vite/source-cache").write_text("source-only\n", encoding="utf-8")
     env = _install_full_gate_fixtures(detached, tmp_path)
     observation = tmp_path / "desktop-gate-observation.log"
     env["GATE_DESKTOP_OBSERVATION"] = str(observation)
@@ -1061,7 +1074,7 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     failed = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1072,7 +1085,7 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     retried = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1092,7 +1105,7 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
         "playwright",
     ]
     assert (desktop_modules / "fixture-package/package.json").is_file()
-    assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
+    assert (desktop_modules / ".vite/source-cache").read_text(encoding="utf-8") == "source-only\n"
 
 
 @pytest.mark.parametrize("failure_mode", ["test-fail", "typecheck-fail", pytest.param("signal", marks=pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only)])
@@ -1107,10 +1120,11 @@ def test_gate_cleans_provisioned_desktop_view_on_early_exit(
     desktop_modules = invocation / "apps/desktop/node_modules"
     (desktop_modules / "fixture-package").mkdir(parents=True)
     (desktop_modules / "fixture-package/package.json").write_text(
-        '{"name":"fixture-package"}\n'
+        '{"name":"fixture-package"}\n',
+        encoding="utf-8",
     )
     (desktop_modules / ".vite").mkdir()
-    (desktop_modules / ".vite/source-cache").write_text("source-only\n")
+    (desktop_modules / ".vite/source-cache").write_text("source-only\n", encoding="utf-8")
     env = _install_full_gate_fixtures(detached, tmp_path)
     env["GATE_DESKTOP_OBSERVATION"] = str(tmp_path / "observation.log")
     env["GATE_NPX_MODE"] = failure_mode
@@ -1118,7 +1132,7 @@ def test_gate_cleans_provisioned_desktop_view_on_early_exit(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1126,7 +1140,7 @@ def test_gate_cleans_provisioned_desktop_view_on_early_exit(
     assert result.returncode != 0
     assert not (detached / "apps/desktop/node_modules").exists()
     assert (desktop_modules / "fixture-package/package.json").is_file()
-    assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
+    assert (desktop_modules / ".vite/source-cache").read_text(encoding="utf-8") == "source-only\n"
 
 
 def test_gate_fails_closed_when_successful_desktop_handoff_source_disappears(
@@ -1139,7 +1153,8 @@ def test_gate_fails_closed_when_successful_desktop_handoff_source_disappears(
     desktop_modules = invocation / "apps/desktop/node_modules"
     (desktop_modules / "fixture-package").mkdir(parents=True)
     (desktop_modules / "fixture-package/package.json").write_text(
-        '{"name":"fixture-package"}\n'
+        '{"name":"fixture-package"}\n',
+        encoding="utf-8",
     )
     (desktop_modules / ".vite").mkdir()
     env = _install_full_gate_fixtures(detached, tmp_path)
@@ -1150,7 +1165,7 @@ def test_gate_fails_closed_when_successful_desktop_handoff_source_disappears(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1171,7 +1186,8 @@ def test_gate_refuses_to_replace_an_unowned_desktop_handoff_target(
     desktop_modules = invocation / "apps/desktop/node_modules"
     (desktop_modules / "fixture-package").mkdir(parents=True)
     (desktop_modules / "fixture-package/package.json").write_text(
-        '{"name":"fixture-package"}\n'
+        '{"name":"fixture-package"}\n',
+        encoding="utf-8",
     )
     (desktop_modules / ".vite").mkdir()
     replacement = tmp_path / "unowned-desktop-dependencies"
@@ -1184,7 +1200,7 @@ def test_gate_refuses_to_replace_an_unowned_desktop_handoff_target(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1213,7 +1229,7 @@ def test_gate_preserves_preexisting_external_desktop_dependency_symlink(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1239,7 +1255,7 @@ def test_gate_rejects_desktop_dependencies_from_different_repository(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=unrelated,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1266,7 +1282,7 @@ def test_gate_rejects_escaping_sibling_desktop_dependency_view(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1294,7 +1310,7 @@ def test_gate_rejects_sibling_desktop_view_with_missing_dependency_identity(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1312,7 +1328,8 @@ def test_gate_rejects_sibling_desktop_view_with_mismatched_dependency_identity(
     _write_parser_dependencies(detached)
     (invocation / "apps/desktop/node_modules").mkdir(parents=True)
     (invocation / "package-lock.json").write_text(
-        '{"name":"different","lockfileVersion":3,"packages":{}}\n'
+        '{"name":"different","lockfileVersion":3,"packages":{}}\n',
+        encoding="utf-8",
     )
     subprocess.run(
         ["git", "commit", "-am", "change dependency identity"],
@@ -1325,7 +1342,7 @@ def test_gate_rejects_sibling_desktop_view_with_mismatched_dependency_identity(
     result = subprocess.run(
         [GATE, "--repo", detached, "--phase", "base"],
         cwd=invocation,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1458,7 +1475,7 @@ def test_gate_rejects_esm_exports_entrypoint_escape_before_checker(
             str(repo / "scripts/extract_non_python_symbols.mjs"),
         ],
         cwd=repo,
-        text=True,
+        text=True, encoding="utf-8",
     )
     import_entrypoint = subprocess.check_output(
         [
@@ -1470,7 +1487,7 @@ def test_gate_rejects_esm_exports_entrypoint_escape_before_checker(
             "process.stdout.write(fileURLToPath(import.meta.resolve('unified')))",
         ],
         cwd=repo / "scripts",
-        text=True,
+        text=True, encoding="utf-8",
     )
     assert Path(require_entrypoint).resolve() == (package / "index.js").resolve()
     assert Path(import_entrypoint).resolve() == outside.resolve()
@@ -1555,7 +1572,7 @@ def _brand_gate(repo: Path, base: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [GATE, "--repo", repo, "--phase", "brand", "--brand", "otto", "--tested-base-sha", base],
         cwd=repo,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1565,7 +1582,7 @@ def test_brand_gate_accepts_exact_base_and_rejects_generic_divergence(tmp_path: 
     repo, base = _brand_repo(tmp_path)
     assert _brand_gate(repo, base).returncode == 0
 
-    (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'brand divergence'\n")
+    (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'brand divergence'\n", encoding="utf-8")
     subprocess.run(["git", "commit", "-am", "diverge generic runtime"], cwd=repo, check=True, capture_output=True)
     result = _brand_gate(repo, base)
     assert result.returncode == 1
@@ -1576,10 +1593,10 @@ def test_brand_gate_rejects_tested_commit_outside_brand_ancestry(tmp_path: Path)
     repo, base = _brand_repo(tmp_path)
     subprocess.run(["git", "checkout", "--orphan", "unrelated"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "rm", "-rf", "."], cwd=repo, check=True, capture_output=True)
-    (repo / "unrelated.txt").write_text("unrelated\n")
+    (repo / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "unrelated"], cwd=repo, check=True, capture_output=True)
-    unrelated = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    unrelated = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True, encoding="utf-8").strip()
     subprocess.run(["git", "checkout", "otto"], cwd=repo, check=True, capture_output=True)
     _write_parser_dependencies(repo)
 
@@ -1592,14 +1609,14 @@ def test_brand_gate_rejects_tested_commit_outside_brand_ancestry(tmp_path: Path)
 
 def test_base_gate_propagates_customization_checker_failure(tmp_path: Path) -> None:
     repo, _base = _brand_repo(tmp_path)
-    (repo / "FAIL_CHECK").write_text("fail\n")
+    (repo / "FAIL_CHECK").write_text("fail\n", encoding="utf-8")
     env = os.environ.copy()
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
 
     result = subprocess.run(
         [GATE, "--repo", repo, "--phase", "base"],
         cwd=repo,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1612,14 +1629,14 @@ def test_base_gate_refuses_tracked_dirty_tree_before_tested_sha(
 ) -> None:
     """A commit SHA must never be advertised for different tested bytes."""
     repo, _base = _brand_repo(tmp_path)
-    (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'dirty tested bytes'\n")
+    (repo / "plugins/workflow/runtime.py").write_text("VALUE = 'dirty tested bytes'\n", encoding="utf-8")
     env = os.environ.copy()
     env["WORKFLOW_MERGE_GATE_FAST"] = "1"
 
     result = subprocess.run(
         [GATE, "--repo", repo, "--phase", "base"],
         cwd=repo,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
@@ -1640,7 +1657,7 @@ def test_gate_resolves_relative_python_before_switching_repositories(
     result = subprocess.run(
         [GATE, "--repo", repo, "--phase", "base"],
         cwd=ROOT,
-        text=True,
+        text=True, encoding="utf-8",
         capture_output=True,
         env=env,
     )
