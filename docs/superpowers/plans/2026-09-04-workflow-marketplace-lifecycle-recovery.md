@@ -760,11 +760,41 @@ if (event.key === 'Escape' && narrow && selection) showPackageList()
 - [ ] Run GREEN, full workflow UI, source/operation/ConfirmDialog regressions, typecheck and lint. Inspect 320px and 200% zoom, RTL, reduced motion, and keyboard-only navigation using the actual UI/browser test harness. Record screenshots only if useful to review; do not substitute screenshots for assertions.
 - [ ] Fresh reviewer independently tests Escape during a deferred confirm and focus after successful removal/navigation. Commit `fix(desktop): preserve lifecycle keyboard ownership`. Mark original Task 14 complete only when 14A1–F are accepted with no blocking findings.
 
-## Task 15 — Localization, documentation, end-to-end proof and release gates
+## Task 15A — Isolate marketplace transaction workspaces
+
+**Spec:** `docs/superpowers/specs/2026-09-06-workflow-marketplace-transaction-workspace-isolation-amendment.md`
+
+**Files:** Modify `plugins/workflow/marketplace/transactions.py`; modify `tests/plugins/workflow/test_marketplace_transactions.py`; create/modify `tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py`. Do not modify `plugins/workflow/store.py` or its established paths.
+
+**Consumes:** `WorkflowSourceStore.root == <profile-home>/marketplace/workflows`, the existing marketplace lock/private-root authority, identity-bound transaction markers, and existing strict journal path validation.
+
+**Produces:** `MarketplaceTransactionStore.staging_root == self.root / ".staging"` and `MarketplaceTransactionStore.quarantine_root == self.root / ".quarantine"`, with existing private/no-follow/atomic ownership rules. Task 15B may initialize the real workflow runtime and marketplace service in either order without corrupting or rejecting a package transaction.
+
+- [ ] Preserve the genuine integration REDs in `test_marketplace_installed_distribution_e2e.py`: initialize `RunStore` before install preparation and assert prepare/confirm commits; prepare first, initialize `RunStore`, then assert the exact transaction envelope remains and confirm commits. Before production changes, run through the repository wrapper and record the exact `transaction_destination_invalid` and `transaction_candidate_changed` failures.
+
+```bash
+HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
+  tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py::test_real_workflow_backend_initialization_allows_marketplace_install \
+  tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py::test_workflow_runtime_recovery_preserves_live_marketplace_preparation
+```
+
+- [ ] Add focused transaction-store tests that assert the exact disjoint roots, `0700` marketplace modes where POSIX modes apply, and bidirectional non-enumeration: RunStore orphan cleanup cannot observe/move a live marketplace `owner.json` envelope, and marketplace abandoned-staging/recovery cannot observe/remove a RunStore `.snapshot-owner.json` directory.
+- [ ] Add a persisted pre-release path test. A prepared record or journal naming `<profile-home>/workflows/.staging` or `.quarantine` must fail strict consistency before filesystem mutation. Assert the legacy envelope and installed/provenance/trust state are unchanged; do not migrate, chmod, delete, or reinterpret the entry.
+- [ ] Change only the marketplace transaction root derivation to the existing private marketplace state root. Keep `RunStore.staging_root`/`quarantine_root`, marker formats, installed destinations, journal schema/version, lock order, public error/result schemas, and recovery algorithms otherwise unchanged.
+
+```python
+self.staging_root = self.root / ".staging"
+self.quarantine_root = self.root / ".quarantine"
+```
+
+- [ ] Run the two integration tests GREEN, then the complete marketplace transaction, operation, API, trust, CLI and RunStore recovery suites through `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh`. Include a restart/journal recovery case for install, update and remove using the new roots. Run `git diff --check`, changed-file formatting/lint, and a path audit proving marketplace production no longer constructs `<profile-home>/workflows/.staging` or `.quarantine`.
+- [ ] Commit only Task 15A code/tests as `fix(workflow): isolate marketplace transaction workspaces`. A fresh reviewer independently runs both initialization orders, recovery restart and foreign-artifact refusal. Do not resume locale/docs/Desktop/gate implementation until 15A is review-clean.
+
+## Task 15B — Localization, documentation, end-to-end proof and release gates
 
 **Files:** Modify `apps/desktop/src/i18n/{types,en,ar,ja,zh,zh-hant}.ts`, `languages.test.ts`, `docs/workflow-orchestration.md`, `website/docs/user-guide/features/workflows.md`, `website/docs/reference/cli-commands.md`; create `website/docs/user-guide/features/workflow-packages.md`, `tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py`, `apps/desktop/e2e/workflow-marketplace-lifecycle.spec.ts`; modify `scripts/test_workflow_merge_gate.sh`, related gate tests, and existing E2E fixtures only as needed.
 
-**Consumes:** All accepted Task 14 slices.
+**Consumes:** All accepted Task 14 slices and review-clean Task 15A workspace isolation.
 
 **Produces:** Complete locale copy, operator/publisher guidance, real Git/API/trust/admission/UI proof, reproducible branch review gates.
 
@@ -835,13 +865,14 @@ Read the current merge-gate script before invoking it; run only its local test/r
 | A public subject / G backend correlation                                | 14A1, 14A3, 14B                                       |
 | B admission/replay / epoch / eviction                                   | 14A2, 14A3, 14B, 14C0a, 14C0b, 14C1                   |
 | C stable supervisor and scope isolation                                 | 14C0a, 14C0b, 14C1, 14F                               |
-| D explicit outcomes/current state/recovery tooling                      | 14A3, 14C2, 14D, 15                                   |
+| D explicit outcomes/current state/recovery tooling                      | 14A3, 14C2, 14D, 15B                                  |
 | E mutation barriers                                                     | 14C2, 14D, 14E                                        |
 | F full-package trust / exact selection                                  | 14A1, 14A3, 14B, 14E                                  |
 | G exact get/cancel/prepare/confirm identity                             | 14A1–B, 14C0a, 14C0b, 14C1, 14D–E                     |
 | H keyboard/focus/capabilities/timer disposal                            | 14C1, 14E, 14F                                        |
-| I generated fixtures/differential/integration matrix                    | 14B, 14C0a, 14C0b, each task's independent review, 15 |
+| I generated fixtures/differential/integration matrix                    | 14B, 14C0a, 14C0b, each task's independent review, 15B |
 | Inspection distribution/effective-workflow digest domain parity         | 14C2P, resumed 14C2                                   |
-| Compatibility/token privacy/list stability                              | 14A2–B, 14C0a, 14C0b, 14C1, 15                        |
+| Compatibility/token privacy/list stability                              | 14A2–B, 14C0a, 14C0b, 14C1, 15B                       |
+| Marketplace transaction workspace ownership isolation                   | 15A                                                    |
 
 Implementation mode is selected and approved by the user: subagent-driven, one implementation agent at a time and a fresh reviewer per task. No further mode-selection question is required. Integration and publication remain separately approval-gated.
