@@ -59,10 +59,14 @@ _CONFIRMATION_DOMAIN = b"hermes.workflow-marketplace.confirmation.v1\0"
 _CONSUMED_LEASE_SECONDS = 300
 _DIRECTORY_FD_SUPPORTED = (
     hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
     and os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
+    and os.rename in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and shutil.rmtree.avoids_symlink_attacks
     and hasattr(os, "fchmod")
 )
 
@@ -524,6 +528,259 @@ def _require_private_directory_at(parent_descriptor: int, name: str) -> None:
         os.close(descriptor)
 
 
+class _PreparationWorkspace:
+    """Keep every staging mutation beneath one retained private authority."""
+
+    def __init__(self, store: MarketplaceTransactionStore, identity: tuple[int, int]):
+        self.store = store
+        self.identity = identity
+        self.guards = ExitStack()
+        self.directory_guards: dict[Path, ExitStack] = {}
+        self.directories: dict[Path, tuple[int | None, tuple[int, int]]] = {}
+        self.envelope: Path | None = None
+        self.marker_durable = False
+        self.marker_content: bytes | None = None
+
+    def open(self) -> None:
+        try:
+            self.store._require_root_identity(self.identity)
+            if _DIRECTORY_FD_SUPPORTED:
+                descriptor, identity = _open_no_follow_directory(self.store.root)
+                self.guards.callback(os.close, descriptor)
+                if identity != self.identity:
+                    _fail("transaction_state_invalid", "marketplace authority changed")
+                self.directories[self.store.root] = (descriptor, identity)
+            elif os.name == "nt":
+                # Pin the whole path before using Windows path APIs. No-delete
+                # sharing prevents both ordinary-directory and reparse swaps.
+                for parent in (*reversed(self.store.root.parents), self.store.root):
+                    kernel32, handle = _open_windows_directory_guard(parent)
+                    self.guards.callback(kernel32.CloseHandle, handle)
+                self.directories[self.store.root] = (None, self.identity)
+            else:
+                _fail(
+                    "transaction_state_invalid", "secure workspace access unavailable"
+                )
+            self.directory(self.store.staging_root)
+            self.validate()
+        except BaseException:
+            self.guards.close()
+            raise
+
+    def validate(self) -> None:
+        self.store._require_root_identity(self.identity)
+        for path, (descriptor, identity) in self.directories.items():
+            if path == self.store.root:
+                continue
+            parent_descriptor = self.directories[path.parent][0]
+            metadata = os.stat(
+                path if parent_descriptor is None else path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse_point(metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != identity
+                or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700)
+            ):
+                _fail("transaction_state_invalid", "staging authority changed")
+            if descriptor is not None:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != identity:
+                    _fail("transaction_state_invalid", "staging authority changed")
+
+    def directory(self, path: Path, *, create: bool = False) -> None:
+        parent_descriptor = self.directories[path.parent][0]
+        name = path if parent_descriptor is None else path.name
+        if create:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                _fail("transaction_path_occupied", "transaction path already exists")
+            if path.parent == self.store.staging_root:
+                self.envelope = path
+        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or _is_reparse_point(before)
+            or not stat.S_ISDIR(before.st_mode)
+        ):
+            _fail("transaction_state_invalid", "staging directory is invalid")
+        identity = (before.st_dev, before.st_ino)
+        descriptor = None
+        guards = ExitStack()
+        self.guards.callback(guards.close)
+        if parent_descriptor is not None:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            guards.callback(os.close, descriptor)
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != identity:
+                _fail("transaction_state_invalid", "staging directory changed")
+            if create:
+                os.fchmod(descriptor, 0o700)
+        else:
+            kernel32, handle = _open_windows_directory_guard(path)
+            guards.callback(kernel32.CloseHandle, handle)
+        self.directories[path] = (descriptor, identity)
+        self.directory_guards[path] = guards
+        self.validate()
+        if create:
+            self.fsync(path.parent)
+
+    def close_directory(self, path: Path) -> None:
+        self.fsync(path)
+        self.directory_guards.pop(path).close()
+        del self.directories[path]
+
+    def fsync(self, path: Path) -> None:
+        descriptor = self.directories[path][0]
+        if descriptor is not None:
+            os.fsync(descriptor)
+        self.validate()
+
+    def write_file(self, path: Path, content: bytes) -> None:
+        parent_descriptor = self.directories[path.parent][0]
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        for option in ("O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW", "O_BINARY"):
+            flags |= getattr(os, option, 0)
+        descriptor = os.open(
+            path if parent_descriptor is None else path.name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            if parent_descriptor is not None:
+                os.fchmod(descriptor, 0o600)
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("could not write staging bytes")
+                view = view[written:]
+            os.fsync(descriptor)
+            self.validate()
+        finally:
+            os.close(descriptor)
+
+    def write_marker(self, envelope: Path, text: str) -> None:
+        self.directory(envelope, create=True)
+        self.marker_content = text.encode("utf-8")
+        descriptor, identity = self.directories[envelope]
+        if descriptor is None:
+            atomic_write_text(
+                envelope / "owner.json",
+                text,
+                tmp_prefix="owner.json.tmp-",
+                create_mode=0o600,
+                no_follow=True,
+                expected_parent_identity=identity,
+            )
+        else:
+            temporary = f"owner.json.tmp-{secrets.token_hex(16)}"
+            created = False
+            try:
+                # Register only a temporary name this call successfully created.
+                # Publication stays relative to the retained envelope descriptor.
+                self.write_file(envelope / temporary, text.encode("utf-8"))
+                created = True
+                os.replace(
+                    temporary,
+                    "owner.json",
+                    src_dir_fd=descriptor,
+                    dst_dir_fd=descriptor,
+                )
+                created = False
+            finally:
+                if created:
+                    os.unlink(temporary, dir_fd=descriptor)
+        self.fsync(envelope)
+        self.marker_durable = True
+
+    def _read_marker_content(self) -> bytes | None:
+        if self.envelope is None or self.envelope not in self.directories:
+            raise OSError("ownership envelope could not be identified")
+        descriptor = self.directories[self.envelope][0]
+        if descriptor is None:
+            return _read_bounded(
+                self.envelope / "owner.json",
+                limit=_MAX_MARKER_BYTES,
+                size_code="transaction_marker_size_limit",
+            )
+        try:
+            marker = os.open(
+                "owner.json",
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            metadata = os.fstat(marker)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise OSError("ownership marker is invalid")
+            chunks = bytearray()
+            while len(chunks) <= _MAX_MARKER_BYTES:
+                chunk = os.read(marker, _MAX_MARKER_BYTES + 1 - len(chunks))
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            return bytes(chunks)
+        finally:
+            os.close(marker)
+
+    def has_durable_marker(self) -> bool:
+        try:
+            return (
+                self.marker_durable
+                and self._read_marker_content() == self.marker_content
+            )
+        except (OSError, WorkflowMarketplaceError):
+            return False
+
+    def cleanup(self) -> bool:
+        envelope = self.envelope
+        if envelope is None:
+            return True
+        if envelope not in self.directories:
+            return False
+        _, identity = self.directories[envelope]
+        parent_descriptor = self.directories[envelope.parent][0]
+        try:
+            current = os.stat(
+                envelope if parent_descriptor is None else envelope.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (current.st_dev, current.st_ino) != identity or _is_reparse_point(
+                current
+            ):
+                return False
+            marker = self._read_marker_content()
+            if marker is not None and marker != self.marker_content:
+                return False
+            if parent_descriptor is None:
+                # Windows cannot remove directories while their no-delete-share
+                # guards are held. Keep uncertain artifacts for recovery instead
+                # of releasing authority and deleting through an unpinned path.
+                return False
+            else:
+                shutil.rmtree(envelope.name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+                return True
+        except (OSError, WorkflowMarketplaceError):
+            # Uncertain artifacts remain under their original authority; never
+            # retry cleanup via a replacement absolute path.
+            return False
+
+
 def _confirmation_digest(record: _PreparedRecord) -> str:
     value = record.model_dump(mode="json", by_alias=True)
     value.pop("tokenDigest")
@@ -678,6 +935,8 @@ class MarketplaceTransactionStore:
             _fail("transaction_state_invalid", "marketplace state directory changed")
 
     def _ensure_workflow_roots(self) -> tuple[int, int]:
+        if not _DIRECTORY_FD_SUPPORTED and os.name != "nt":
+            _fail("transaction_state_invalid", "secure workspace access unavailable")
         _require_directory(self.home)
         workflows = self.home / "workflows"
         _require_directory(workflows)
@@ -705,7 +964,7 @@ class MarketplaceTransactionStore:
                             "marketplace state directory changed",
                         )
                 elif os.name == "nt":
-                    for parent in (self.home, self.root.parent, self.root):
+                    for parent in (*reversed(self.root.parents), self.root):
                         kernel32, handle = _open_windows_directory_guard(parent)
                         guards.callback(kernel32.CloseHandle, handle)
             except OSError:
@@ -870,7 +1129,26 @@ class MarketplaceTransactionStore:
         ):
             _fail("transaction_state_invalid", "journal paths are inconsistent")
 
-    def _write_marker(self, envelope: Path, marker: _OwnerMarker) -> None:
+    def _write_marker(
+        self,
+        envelope: Path,
+        marker: _OwnerMarker,
+        *,
+        workspace: _PreparationWorkspace | None = None,
+    ) -> None:
+        if workspace is not None:
+            workspace.write_marker(
+                envelope,
+                json.dumps(
+                    marker.model_dump(mode="json", by_alias=True),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+            )
+            return
         try:
             envelope.mkdir(mode=0o700)
         except FileExistsError:
@@ -998,33 +1276,29 @@ class MarketplaceTransactionStore:
         self,
         distribution: WorkflowDistribution,
         destination: Path,
+        *,
+        workspace: _PreparationWorkspace,
     ) -> None:
-        destination.mkdir(mode=0o700)
-        for item in distribution.files:
+        workspace.directory(destination, create=True)
+        active = [destination]
+        # Component ordering finishes each sibling subtree before closing its
+        # descriptor/handle. No completed branch is opened for writing again.
+        for item in sorted(
+            distribution.files, key=lambda item: tuple(item.relative_path.split("/"))
+        ):
             target = destination.joinpath(*item.relative_path.split("/"))
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            for option in ("O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW", "O_BINARY"):
-                flags |= getattr(os, option, 0)
-            descriptor = os.open(target, flags, 0o600)
-            try:
-                view = memoryview(item.content)
-                while view:
-                    written = os.write(descriptor, view)
-                    view = view[written:]
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        directories = sorted(
-            {
-                destination,
-                *(path.parent for path in destination.rglob("*") if path.is_file()),
-            },
-            key=lambda item: len(item.parts),
-            reverse=True,
-        )
-        for directory in directories:
-            _fsync_directory(directory)
+            while active[-1] not in target.parents:
+                workspace.close_directory(active.pop())
+            components = target.parent.relative_to(active[-1]).parts
+            for component in components:
+                parent = active[-1] / component
+                workspace.directory(parent, create=True)
+                active.append(parent)
+            workspace.write_file(target, item.content)
+        while len(active) > 1:
+            workspace.close_directory(active.pop())
+        for directory in reversed(workspace.directories):
+            workspace.fsync(directory)
 
     def _remove_owned_envelope(
         self,
@@ -1172,8 +1446,9 @@ class MarketplaceTransactionStore:
         root_identity = self._ensure_workflow_roots()
         self._validate_destination_parent(destination)
         self._require_root_identity(root_identity)
-        staging_owned = False
+        workspace = _PreparationWorkspace(self, root_identity)
         try:
+            workspace.open()
             staged = distribution
             if candidate.operation == "install":
                 self._write_marker(
@@ -1186,13 +1461,19 @@ class MarketplaceTransactionStore:
                         distribution.digest,
                         created_at,
                     ),
+                    workspace=workspace,
                 )
-                staging_owned = True
-                self._copy_verified_distribution(distribution, staging_path)
+                self._copy_verified_distribution(
+                    distribution,
+                    staging_path,
+                    workspace=workspace,
+                )
+                workspace.validate()
                 staged = load_distribution(
                     staging_path,
                     expected_digest=distribution.digest,
                 )
+                workspace.validate()
             raw = {
                 "transactionId": transaction_id,
                 "tokenDigest": hashlib.sha256(token.encode()).hexdigest(),
@@ -1272,18 +1553,27 @@ class MarketplaceTransactionStore:
                     [*state.transactions, record],
                     parent_identity=parent_identity,
                 )
+            workspace.validate()
             return _record_to_prepared(record, token=token, consumed=False)
-        except BaseException:
-            if candidate.operation == "install" and staging_owned:
-                self._remove_owned_envelope(
-                    staging_envelope,
-                    transaction_id=transaction_id,
-                    kind="staging",
-                    identity=candidate.identity,
-                    destination=destination,
-                    package_digest=distribution.digest,
-                )
+        except BaseException as error:
+            cleaned = workspace.cleanup()
+            # A package reader can discover a replacement before the next root
+            # check. Keep authority failures inside the transaction boundary.
+            self._require_root_identity(root_identity)
+            if isinstance(error, (OSError, WorkflowMarketplaceError)):
+                if not cleaned and not workspace.has_durable_marker():
+                    _fail(
+                        "transaction_recovery_inspection_incomplete",
+                        "failed preparation ownership could not be verified",
+                    )
+                if isinstance(error, OSError):
+                    raise WorkflowMarketplaceError(
+                        "transaction_state_write_failed",
+                        "could not write transaction preparation",
+                    ) from error
             raise
+        finally:
+            workspace.guards.close()
 
     def consume(
         self,

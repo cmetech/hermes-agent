@@ -297,20 +297,39 @@ def test_private_root_identity_is_rechecked_after_workspace_creation(
 
     original = transaction_module.workflow_lock
     displaced = tmp_path / "displaced-private-root"
+    blocked_by_guard = False
 
     @contextmanager
     def replace_after_validation(*args, **kwargs):
+        nonlocal blocked_by_guard
         with original(*args, **kwargs):
-            store.root.rename(displaced)
-            store.root.mkdir(mode=0o700)
+            try:
+                store.root.rename(displaced)
+            except PermissionError:
+                assert os.name == "nt"
+                blocked_by_guard = True
+            else:
+                store.root.mkdir(mode=0o700)
             yield
 
     monkeypatch.setattr(transaction_module, "workflow_lock", replace_after_validation)
-    with pytest.raises(WorkflowMarketplaceError) as error:
-        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
-    assert error.value.code == "transaction_state_invalid"
+    failure = None
+    try:
+        result = store.prepare(
+            candidate, review_digest=REVIEW, actor="alice", profile="p1"
+        )
+    except WorkflowMarketplaceError as error:
+        failure = error
+    if blocked_by_guard:
+        assert failure is None
+        assert (
+            load_distribution(result.staging_path).digest
+            == candidate.distribution.digest
+        )
+    else:
+        assert failure is not None and failure.code == "transaction_state_invalid"
+        assert not store.path.exists()
     assert not candidate.destination.exists()
-    assert not store.path.exists()
     assert not store.installed_store.path.exists()
 
 
@@ -333,6 +352,430 @@ def _workspace_entry_point(store, candidate, action):
     "action", ["prepare", "recover", "atomic_install", "atomic_remove"]
 )
 @pytest.mark.parametrize("replacement", ["symlink", "directory"])
+@pytest.mark.parametrize("native", [True, False])
+def test_scratch_mkdir_boundary_never_mutates_foreign_authority(
+    tmp_path, monkeypatch, action, replacement, native
+):
+    from plugins.workflow.marketplace import transactions as transaction_module
+
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    invoke = _workspace_entry_point(store, candidate, action)
+    original_identity = store._shared_store._ensure_private_root()
+    original_bytes = _snapshot(store.root)
+    destination_before = _snapshot(candidate.destination)
+    foreign = tmp_path / "foreign-authority"
+    foreign.mkdir(mode=0o700)
+    (foreign / "evidence").write_bytes(b"untouched foreign bytes")
+    foreign_identity = foreign.stat()
+    displaced = tmp_path / "displaced-authority"
+    attempted = False
+    blocked = False
+    observations = []
+    original_mkdir = os.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        nonlocal attempted, foreign, blocked
+        if Path(path).name == ".staging" and not attempted:
+            attempted = True
+            try:
+                store.root.rename(displaced)
+            except PermissionError:
+                assert os.name == "nt"
+                blocked = True
+            else:
+                if replacement == "symlink":
+                    store.root.symlink_to(foreign, target_is_directory=True)
+                else:
+                    foreign.rename(store.root)
+                    foreign = store.root
+        try:
+            return original_mkdir(path, *args, **kwargs)
+        finally:
+            observations.append(sorted(item.name for item in foreign.iterdir()))
+
+    if not native:
+        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
+    monkeypatch.setattr(os, "mkdir", mkdir)
+    error = None
+    try:
+        invoke()
+    except WorkflowMarketplaceError as failure:
+        error = failure
+    assert all(entries == ["evidence"] for entries in observations), observations
+    assert _snapshot(foreign) == {"evidence": b"untouched foreign bytes"}
+    after = foreign.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        foreign_identity.st_dev,
+        foreign_identity.st_ino,
+        foreign_identity.st_mode,
+    )
+    original = displaced if displaced.exists() else store.root
+    assert (original.stat().st_dev, original.stat().st_ino) == original_identity
+    if not blocked:
+        assert _snapshot(original) == original_bytes
+        assert _snapshot(candidate.destination) == destination_before
+        assert error is not None and error.code == "transaction_state_invalid"
+    if not native and os.name != "nt":
+        assert not attempted, "unsupported POSIX must refuse before scratch mkdir"
+    else:
+        assert attempted
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+@pytest.mark.parametrize(
+    "window",
+    [
+        "marker",
+        "envelope_mkdir",
+        "owner_open",
+        "owner_replace",
+        "copy",
+        "package_mkdir",
+        "file_open",
+        "file_write",
+        "fsync",
+        "state",
+    ],
+)
+@pytest.mark.parametrize("native", [True, False])
+def test_preparation_writes_stay_with_original_authority(
+    tmp_path, monkeypatch, replacement, window, native
+):
+    from plugins.workflow.marketplace import transactions as transaction_module
+
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    original_identity = store._shared_store._ensure_private_root()
+    foreign = tmp_path / "foreign-authority"
+    foreign.mkdir(mode=0o700)
+    (foreign / ".staging").mkdir(mode=0o700)
+    (foreign / "evidence").write_bytes(b"untouched foreign bytes")
+    foreign_identity = foreign.stat()
+    displaced = tmp_path / "displaced-authority"
+    attempted = False
+    blocked = False
+    observations = []
+    copying = False
+
+    def observe():
+        observations.append(
+            sorted(str(p.relative_to(foreign)) for p in foreign.rglob("*"))
+        )
+
+    def swap():
+        nonlocal attempted, blocked, foreign
+        if attempted:
+            return
+        attempted = True
+        try:
+            store.root.rename(displaced)
+        except PermissionError:
+            assert os.name == "nt"
+            blocked = True
+        else:
+            if replacement == "symlink":
+                store.root.symlink_to(foreign, target_is_directory=True)
+            else:
+                foreign.rename(store.root)
+                foreign = store.root
+
+    original_marker = store._write_marker
+    original_copy = store._copy_verified_distribution
+    original_state = store._write_prepared
+
+    def marker(*args, **kwargs):
+        if window == "marker":
+            swap()
+        return original_marker(*args, **kwargs)
+
+    def copy(*args, **kwargs):
+        nonlocal copying
+        copying = True
+        if window == "copy":
+            swap()
+        return original_copy(*args, **kwargs)
+
+    def state(*args, **kwargs):
+        if window == "state":
+            swap()
+        return original_state(*args, **kwargs)
+
+    def instrument(name):
+        original = getattr(os, name)
+
+        def wrapped(*args, **kwargs):
+            path = (
+                Path(os.fsdecode(args[0])).name
+                if isinstance(args[0], (str, bytes, os.PathLike))
+                else ""
+            )
+            if (
+                (window == "envelope_mkdir" and name == "mkdir" and len(path) == 32)
+                or (
+                    window == "owner_open"
+                    and name == "open"
+                    and path.startswith("owner.json.tmp-")
+                )
+                or (
+                    window == "owner_replace"
+                    and name == "replace"
+                    and path.startswith("owner.json.tmp-")
+                )
+                or (window == "package_mkdir" and name == "mkdir" and path == "package")
+                or (
+                    window == "file_open"
+                    and name == "open"
+                    and copying
+                    and args[1] & os.O_CREAT
+                )
+                or (window == "file_write" and name == "write" and copying)
+                or (window == "fsync" and name == "fsync" and copying)
+            ):
+                swap()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if attempted:
+                    observe()
+
+        monkeypatch.setattr(os, name, wrapped)
+
+    monkeypatch.setattr(store, "_write_marker", marker)
+    monkeypatch.setattr(store, "_copy_verified_distribution", copy)
+    monkeypatch.setattr(store, "_write_prepared", state)
+    for name in ("mkdir", "open", "write", "replace", "fsync"):
+        instrument(name)
+    if not native:
+        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
+    error = None
+    result = None
+    try:
+        result = store.prepare(
+            candidate, review_digest=REVIEW, actor="alice", profile="p1"
+        )
+    except (WorkflowMarketplaceError, OSError) as failure:
+        error = failure
+    observe()
+    assert all(entries == [".staging", "evidence"] for entries in observations), (
+        observations
+    )
+    assert _snapshot(foreign) == {"evidence": b"untouched foreign bytes"}
+    after = foreign.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        foreign_identity.st_dev,
+        foreign_identity.st_ino,
+        foreign_identity.st_mode,
+    )
+    original = displaced if displaced.exists() else store.root
+    assert (original.stat().st_dev, original.stat().st_ino) == original_identity
+    assert not candidate.destination.exists()
+    if blocked:
+        assert error is None and result is not None
+    else:
+        assert isinstance(error, WorkflowMarketplaceError)
+        assert error.code.startswith("transaction_state_")
+        assert not (original / "transactions.json").exists()
+    if not native and os.name != "nt":
+        assert not attempted
+    else:
+        assert attempted, (window, error)
+
+
+@pytest.mark.parametrize("marker_present", [True, False])
+def test_retained_failed_preparation_requires_durable_ownership_for_recovery(
+    tmp_path, monkeypatch, marker_present
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    original_open = os.open
+    original_rmtree = shutil.rmtree
+
+    def open_file(path, flags, *args, **kwargs):
+        name = Path(path).name
+        if flags & os.O_CREAT and (
+            (marker_present and name == "digests.json")
+            or (not marker_present and name.startswith("owner.json.tmp-"))
+        ):
+            raise OSError("injected staging write failure")
+        return original_open(path, flags, *args, **kwargs)
+
+    def unavailable_cleanup(*args, **kwargs):
+        raise PermissionError("owned directory cannot presently be deleted")
+
+    monkeypatch.setattr(os, "open", open_file)
+    monkeypatch.setattr(shutil, "rmtree", unavailable_cleanup)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+    assert error.value.code == (
+        "transaction_state_write_failed"
+        if marker_present
+        else "transaction_recovery_inspection_incomplete"
+    )
+    monkeypatch.setattr(os, "open", original_open)
+    monkeypatch.setattr(shutil, "rmtree", original_rmtree)
+    (envelope,) = store.staging_root.iterdir()
+    assert (envelope / "owner.json").exists() == marker_present
+    assert not store.path.exists()
+    assert not candidate.destination.exists()
+    before = _snapshot(envelope)
+    restarted = MarketplaceTransactionStore(tmp_path)
+    if marker_present:
+        inspection = restarted.inspect_recovery()
+        assert inspection.complete and len(inspection.entries) == 1
+        restarted.recover_transactions()
+        assert not envelope.exists()
+        assert restarted.inspect_recovery().entries == ()
+        assert restarted.recover_transactions() == ()
+    else:
+        with pytest.raises(WorkflowMarketplaceError) as inspection:
+            restarted.inspect_recovery()
+        assert inspection.value.code == "transaction_recovery_inspection_incomplete"
+        restarted.recover_transactions()
+        assert envelope.is_dir() and _snapshot(envelope) == before
+
+
+@pytest.mark.parametrize("failure", ["success", "marker", "copy", "state", "cancel"])
+def test_preparation_closes_retained_descriptors_and_cleans_owned_failures(
+    tmp_path, monkeypatch, failure
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    descriptors = set()
+    original_open, original_close = os.open, os.close
+
+    def open_file(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        descriptors.add(descriptor)
+        return descriptor
+
+    def close(descriptor):
+        try:
+            return original_close(descriptor)
+        finally:
+            descriptors.discard(descriptor)
+
+    def fail(*args, **kwargs):
+        if failure == "cancel":
+            raise SimulatedCrash("cancelled preparation")
+        raise OSError("injected preparation failure")
+
+    monkeypatch.setattr(os, "open", open_file)
+    monkeypatch.setattr(os, "close", close)
+    if failure != "success":
+        monkeypatch.setattr(
+            store,
+            {
+                "marker": "_write_marker",
+                "copy": "_copy_verified_distribution",
+                "state": "_write_prepared",
+                "cancel": "_copy_verified_distribution",
+            }[failure],
+            fail,
+        )
+        with pytest.raises(
+            SimulatedCrash if failure == "cancel" else WorkflowMarketplaceError
+        ):
+            store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+        if os.name != "nt":
+            assert list(store.staging_root.iterdir()) == []
+        assert not store.path.exists()
+    else:
+        prepared = store.prepare(
+            candidate, review_digest=REVIEW, actor="alice", profile="p1"
+        )
+        assert (
+            load_distribution(prepared.staging_path).digest
+            == candidate.distribution.digest
+        )
+    # fdopen closes at the file-object boundary, outside os.close's Python API.
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize("window", ["envelope_stat", "marker_tamper"])
+def test_unprovable_failed_preparation_is_preserved_for_inspection(
+    tmp_path, monkeypatch, window
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    envelope = None
+    original_stat = os.stat
+
+    def stat_path(path, *args, **kwargs):
+        if (
+            window == "envelope_stat"
+            and isinstance(path, (str, os.PathLike))
+            and len(Path(path).name) == 32
+        ):
+            raise OSError("cannot identify newly created envelope")
+        return original_stat(path, *args, **kwargs)
+
+    def tamper(distribution, destination, **kwargs):
+        nonlocal envelope
+        envelope = destination.parent
+        (envelope / "owner.json").write_bytes(b"foreign ownership evidence")
+        raise OSError("injected copy failure")
+
+    monkeypatch.setattr(os, "stat", stat_path)
+    if window == "marker_tamper":
+        monkeypatch.setattr(store, "_copy_verified_distribution", tamper)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+    assert error.value.code == "transaction_recovery_inspection_incomplete"
+    monkeypatch.setattr(os, "stat", original_stat)
+    (envelope,) = store.staging_root.iterdir()
+    if window == "marker_tamper":
+        assert (envelope / "owner.json").read_bytes() == b"foreign ownership evidence"
+    assert not store.path.exists()
+    with pytest.raises(WorkflowMarketplaceError) as inspection:
+        MarketplaceTransactionStore(tmp_path).inspect_recovery()
+    assert inspection.value.code == "transaction_recovery_inspection_incomplete"
+
+
+def test_preparation_keeps_descriptor_use_bounded_by_copy_depth(tmp_path, monkeypatch):
+    store = MarketplaceTransactionStore(tmp_path)
+    root = _package(tmp_path, "1.0.0")
+    for index in range(270):
+        directory = root / "fixtures" / f"member-{index:03d}"
+        directory.mkdir()
+        (directory / "sample.json").write_bytes(b"{}\n")
+    _publish(root)
+    candidate = _candidate(tmp_path, root)
+    original_open, original_close = os.open, os.close
+    retained = set()
+    maximum = 0
+
+    def open_file(*args, **kwargs):
+        nonlocal maximum
+        descriptor = original_open(*args, **kwargs)
+        retained.add(descriptor)
+        maximum = max(maximum, len(retained))
+        return descriptor
+
+    def close(descriptor):
+        try:
+            return original_close(descriptor)
+        finally:
+            retained.discard(descriptor)
+
+    monkeypatch.setattr(os, "open", open_file)
+    monkeypatch.setattr(os, "close", close)
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    assert (
+        load_distribution(prepared.staging_path).digest == candidate.distribution.digest
+    )
+    # This shallow package must not accumulate one live descriptor per sibling.
+    assert maximum < 32
+
+
+@pytest.mark.parametrize(
+    "action", ["prepare", "recover", "atomic_install", "atomic_remove"]
+)
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
 @pytest.mark.parametrize("window", ["first_validation", "after_children"])
 @pytest.mark.parametrize("descriptor_support", [True, False])
 def test_private_authority_replacement_never_writes_foreign_workspace(
@@ -340,13 +783,18 @@ def test_private_authority_replacement_never_writes_foreign_workspace(
 ):
     from plugins.workflow.marketplace import transactions as transaction_module
 
-    # Exercise the portable capability fallback on the real host too. Never
-    # enable descriptor operations on a host that does not support them.
-    if not descriptor_support:
-        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
     store = MarketplaceTransactionStore(tmp_path)
     candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
     invoke = _workspace_entry_point(store, candidate, action)
+    if not descriptor_support:
+        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
+        if os.name != "nt":
+            before = _snapshot(store.root)
+            with pytest.raises(WorkflowMarketplaceError) as unavailable:
+                invoke()
+            assert unavailable.value.code == "transaction_state_invalid"
+            assert _snapshot(store.root) == before
+            return
     destination_before = _snapshot(candidate.destination)
     foreign = tmp_path / "foreign-authority"
     foreign.mkdir(mode=0o700)
@@ -426,12 +874,19 @@ def test_original_workspace_authority_settles_normally(
 ):
     from plugins.workflow.marketplace import transactions as transaction_module
 
-    if not descriptor_support:
-        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
     store = MarketplaceTransactionStore(tmp_path)
     candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
     invoke = _workspace_entry_point(store, candidate, action)
     original_identity = store._shared_store._ensure_private_root()
+    if not descriptor_support:
+        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
+        if os.name != "nt":
+            before = _snapshot(store.root)
+            with pytest.raises(WorkflowMarketplaceError) as unavailable:
+                invoke()
+            assert unavailable.value.code == "transaction_state_invalid"
+            assert _snapshot(store.root) == before
+            return
     result = invoke()
     metadata = store.root.stat()
     assert (metadata.st_dev, metadata.st_ino) == original_identity
