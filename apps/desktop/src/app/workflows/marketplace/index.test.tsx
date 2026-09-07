@@ -2927,12 +2927,14 @@ describe('workflow package lifecycle', () => {
     expect(screen.queryByText(/Version 1.1.0 remains installed/)).toBeNull()
   })
 
-  it('uses an exact update check before preparing and leaves changed installed bytes untrusted', async () => {
+  it('advances a fresh registered update candidate to exact preparation and leaves changed installed bytes untrusted', async () => {
     const h = await setupLifecycle(true)
     renderLifecycleHarness(<WorkflowMarketplaceView scope={scopeA} />, h)
     await selectPackage()
     fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
-    await screen.findByRole('dialog', { name: 'Review update' })
+    const dialog = await screen.findByRole('dialog', { name: 'Review update' })
+    expect(within(dialog).getByText('2.0.0')).toBeTruthy()
+    expect(screen.queryByText(/is current|No update was installed/)).toBeNull()
     expect(
       h.calls.filter(call => call.type === 'start' && call.input?.kind !== 'inspect').map(call => call.input?.kind)
     ).toEqual(['update_check', 'update_prepare'])

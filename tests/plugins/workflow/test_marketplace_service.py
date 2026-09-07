@@ -1386,6 +1386,159 @@ def test_direct_update_checks_refetch_moved_branches_but_keep_exact_refs_current
     assert pinned_check.candidate_version == "1.0.0"
 
 
+def test_registered_update_check_fetches_fresh_moving_source_without_refresh(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    cached = service.catalog.inspect("company/laptop-support")
+    _write_package(published_repo.work, "laptop-support", version="2.0.0")
+    published_repo.publish("publish registered update")
+    before_home = _snapshot(service.home)
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.identity == installed.identity
+    assert check.status == "update_available"
+    assert check.installed_version == "1.0.0"
+    assert check.candidate_version == "2.0.0"
+    assert service.catalog.inspect("company/laptop-support") == cached
+    assert _snapshot(service.home) == before_home
+
+
+@pytest.mark.parametrize(
+    ("candidate_version", "expected_code"),
+    [("0.9.0", "package_version_regression"), ("1.0.0", "package_version_conflict")],
+)
+def test_registered_update_check_rejects_nonprogressing_candidate_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    candidate_version: str,
+    expected_code: str,
+) -> None:
+    installed = _install(service, published_repo)
+    _write_package(
+        published_repo.work,
+        "laptop-support",
+        version=candidate_version,
+        marker="changed-without-valid-progress",
+    )
+    published_repo.publish("publish nonprogressing registered candidate")
+    before_home = _snapshot(service.home)
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.identity == installed.identity
+    assert check.status == "error"
+    assert check.candidate_version is None
+    assert check.diagnostic_code == expected_code
+    assert _snapshot(service.home) == before_home
+
+
+def test_registered_update_check_continues_after_invalid_candidate_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    _write_package(published_repo.work, "stable-package", version="1.0.0")
+    published_repo.publish("publish second registered package")
+    _add_and_refresh(service, published_repo)
+    installs = []
+    for package_id in ("laptop-support", "stable-package"):
+        review = service.prepare_install(
+            InstallRequest(identifier=f"company/{package_id}"), actor="alice"
+        )
+        installs.append(
+            service.confirm_install(review.confirmation_token, actor="alice")
+        )
+    root = published_repo.work / "packages" / "laptop-support"
+    manifest = json.loads((root / "workflow-package.json").read_bytes())
+    manifest["version"] = "2.0.0"
+    (root / "workflow-package.json").write_bytes(_json_bytes(manifest))
+    (root / "workflows" / "diagnostic.yaml").write_text(
+        "name: diagnostic\nnodes: [not-a-node]\n", encoding="utf-8"
+    )
+    _publish(root)
+    published_repo.publish("publish invalid registered candidate")
+    before_home = _snapshot(service.home)
+
+    checks = service.check_updates()
+
+    assert checks[0].identity == installs[0].identity
+    assert checks[0].status == "error"
+    assert checks[0].candidate_version is None
+    assert checks[0].diagnostic_code == "package_workflow_invalid"
+    assert checks[1].identity == installs[1].identity
+    assert checks[1].status == "current"
+    assert checks[1].candidate_version == "1.0.0"
+    assert _snapshot(service.home) == before_home
+
+
+def test_registered_update_check_reports_sanitized_fetch_failure_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = _install(service, published_repo)
+    before_home = _snapshot(service.home)
+
+    def fail_fetch(*_args, **_kwargs):
+        raise WorkflowMarketplaceError(
+            "source_fetch_failed",
+            "fetch https://alice:top-secret@example.test/private.git?token=hidden failed",
+        )
+
+    monkeypatch.setattr(service.catalog.git_fetcher, "fetch", fail_fetch)
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.identity == installed.identity
+    assert check.status == "error"
+    assert check.candidate_version is None
+    assert check.diagnostic_code == "source_fetch_failed"
+    assert check.message is not None
+    assert "alice" not in check.message
+    assert "top-secret" not in check.message
+    assert "hidden" not in check.message
+    assert _snapshot(service.home) == before_home
+
+
+def test_registered_update_check_preserves_fetch_cancellation_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+) -> None:
+    installed = _install(service, published_repo)
+    before_home = _snapshot(service.home)
+
+    with pytest.raises(WorkflowMarketplaceError) as cancelled:
+        service.check_updates(installed.identity, cancelled=lambda: True)
+
+    assert cancelled.value.code == "source_cancelled"
+    assert _snapshot(service.home) == before_home
+
+
+@pytest.mark.parametrize("missing", ["source", "package"])
+def test_registered_update_check_reports_orphaned_missing_authority_without_mutation(
+    service: WorkflowMarketplaceService,
+    published_repo: PublishedRepository,
+    missing: str,
+) -> None:
+    installed = _install(service, published_repo)
+    if missing == "source":
+        service.remove_source("company")
+    else:
+        shutil.rmtree(published_repo.work / "packages" / "laptop-support")
+        published_repo.publish("remove registered package")
+    before_home = _snapshot(service.home)
+
+    check = service.check_updates(installed.identity)[0]
+
+    assert check.identity == installed.identity
+    assert check.status == "orphaned"
+    assert check.installed_version == "1.0.0"
+    assert check.candidate_version is None
+    assert _snapshot(service.home) == before_home
+
+
 def test_direct_update_check_reports_sanitized_non_destructive_failure(
     service: WorkflowMarketplaceService,
     published_repo: PublishedRepository,

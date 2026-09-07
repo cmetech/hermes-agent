@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-from test_marketplace_service import published_repo, service  # noqa: F401
+from test_marketplace_service import _write_package, published_repo, service  # noqa: F401
 from test_marketplace_api import _Authority, _verified_operator
 
 from plugins.workflow.marketplace.api import (
@@ -943,6 +943,39 @@ def test_remaining_routes_use_actual_domain_calls(lifecycle_api):
         api.client.get(V2 + "/packages/company/laptop-support/state").json()["state"]
         == "absent"
     )
+
+
+def test_registered_update_check_operation_publishes_fresh_candidate_without_refresh(
+    lifecycle_api,
+):
+    api = lifecycle_api
+    installed = api.install()["result"]["value"]
+    cached = api.service.catalog.inspect("company/laptop-support")
+    _write_package(api.repository.work, "laptop-support", version="2.0.0")
+    api.repository.publish("publish registered lifecycle update")
+
+    operation = api.start("/updates/check", {"identity": IDENTITY})
+
+    assert operation["kind"] == "update_check"
+    assert operation["subject"] == {"type": "package", "identity": IDENTITY}
+    assert operation["state"] == "succeeded"
+    assert operation["result"] == {
+        "type": "update_checks",
+        "value": {
+            "checks": [
+                {
+                    "identity": IDENTITY,
+                    "status": "update_available",
+                    "installed_version": "1.0.0",
+                    "candidate_version": "2.0.0",
+                    "diagnostic_code": None,
+                    "message": None,
+                }
+            ]
+        },
+    }
+    assert installed["version"] == "1.0.0"
+    assert api.service.catalog.inspect("company/laptop-support") == cached
 
 
 def test_invalid_bodies_and_read_only_authority_do_not_admit(lifecycle_api):

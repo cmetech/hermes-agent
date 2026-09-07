@@ -1912,66 +1912,52 @@ class WorkflowMarketplaceService:
         )
         checks = []
         for installed in installed_items:
-            if installed.identity.source_key.startswith(_DIRECT_PREFIX):
-                try:
-                    with self._fetch_update(installed, cancelled=cancelled) as fetched:
-                        _workflows, blockers = self._assess_distribution(
-                            fetched.distribution,
-                            installed.identity,
-                            installed.source_name,
+            try:
+                with self._fetch_update(installed, cancelled=cancelled) as fetched:
+                    _workflows, blockers = self._assess_distribution(
+                        fetched.distribution,
+                        installed.identity,
+                        installed.source_name,
+                    )
+                    if blockers:
+                        _fail(
+                            "package_review_blocked",
+                            "candidate package has structural compatibility blockers",
                         )
-                        if blockers:
-                            _fail(
-                                "package_review_blocked",
-                                "candidate package has structural compatibility blockers",
-                            )
-                        candidate_version = fetched.distribution.manifest.version
-                        candidate_key = _semver_key(candidate_version)
-                        installed_key = _semver_key(installed.package_version)
-                        if candidate_key < installed_key:
-                            _fail(
-                                "package_version_regression",
-                                "candidate package version is older than the installed version",
-                            )
-                        if (
-                            candidate_key == installed_key
-                            and fetched.distribution.digest
-                            != installed.distribution_digest
-                        ):
-                            _fail(
-                                "package_version_conflict",
-                                "candidate changed bytes without advancing package version",
-                            )
-                        checks.append(
-                            UpdateCheck.model_validate({
-                                "identity": installed.identity,
-                                "status": (
-                                    "update_available"
-                                    if candidate_key > installed_key
-                                    else "current"
-                                ),
-                                "installedVersion": installed.package_version,
-                                "candidateVersion": candidate_version,
-                            })
+                    candidate_version = fetched.distribution.manifest.version
+                    candidate_key = _semver_key(candidate_version)
+                    installed_key = _semver_key(installed.package_version)
+                    if candidate_key < installed_key:
+                        _fail(
+                            "package_version_regression",
+                            "candidate package version is older than the installed version",
                         )
-                except WorkflowMarketplaceError as error:
+                    if (
+                        candidate_key == installed_key
+                        and fetched.distribution.digest != installed.distribution_digest
+                    ):
+                        _fail(
+                            "package_version_conflict",
+                            "candidate changed bytes without advancing package version",
+                        )
                     checks.append(
                         UpdateCheck.model_validate({
                             "identity": installed.identity,
-                            "status": "error",
+                            "status": (
+                                "update_available"
+                                if candidate_key > installed_key
+                                else "current"
+                            ),
                             "installedVersion": installed.package_version,
-                            "candidateVersion": None,
-                            "diagnosticCode": error.code,
-                            "message": _safe_message(error, installed.repository_url),
+                            "candidateVersion": candidate_version,
                         })
                     )
-                continue
-            try:
-                item = self.catalog.inspect(
-                    f"{installed.source_name}/{installed.identity.package_id}"
-                )
             except WorkflowMarketplaceError as error:
-                if error.code in {"source_not_found", "catalog_package_not_found"}:
+                if error.code == "source_cancelled":
+                    raise
+                if not installed.identity.source_key.startswith(
+                    _DIRECT_PREFIX
+                ) and error.code in {"source_not_found", "catalog_package_not_found"}:
                     checks.append(
                         UpdateCheck(
                             identity=installed.identity,
@@ -1981,20 +1967,16 @@ class WorkflowMarketplaceService:
                         )
                     )
                     continue
-                raise
-            checks.append(
-                UpdateCheck(
-                    identity=installed.identity,
-                    status=(
-                        "update_available"
-                        if _semver_key(item.version)
-                        > _semver_key(installed.package_version)
-                        else "current"
-                    ),
-                    installedVersion=installed.package_version,
-                    candidateVersion=item.version,
+                checks.append(
+                    UpdateCheck.model_validate({
+                        "identity": installed.identity,
+                        "status": "error",
+                        "installedVersion": installed.package_version,
+                        "candidateVersion": None,
+                        "diagnosticCode": error.code,
+                        "message": _safe_message(error, installed.repository_url),
+                    })
                 )
-            )
         return tuple(
             sorted(
                 checks,
