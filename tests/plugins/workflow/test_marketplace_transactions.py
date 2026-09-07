@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -292,25 +293,275 @@ def test_private_root_identity_is_rechecked_after_workspace_creation(
     store = MarketplaceTransactionStore(tmp_path)
     candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
     store._shared_store._ensure_private_root()
-    original = store._shared_store._ensure_private_root
+    from plugins.workflow.marketplace import transactions as transaction_module
+
+    original = transaction_module.workflow_lock
     displaced = tmp_path / "displaced-private-root"
 
-    def replace_after_validation():
-        identity = original()
-        if store.staging_root.exists() and not displaced.exists():
+    @contextmanager
+    def replace_after_validation(*args, **kwargs):
+        with original(*args, **kwargs):
             store.root.rename(displaced)
             store.root.mkdir(mode=0o700)
-        return identity
+            yield
 
-    monkeypatch.setattr(
-        store._shared_store, "_ensure_private_root", replace_after_validation
-    )
+    monkeypatch.setattr(transaction_module, "workflow_lock", replace_after_validation)
     with pytest.raises(WorkflowMarketplaceError) as error:
         store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
     assert error.value.code == "transaction_state_invalid"
     assert not candidate.destination.exists()
     assert not store.path.exists()
     assert not store.installed_store.path.exists()
+
+
+def _workspace_entry_point(store, candidate, action):
+    if action == "prepare":
+        return lambda: store.prepare(
+            candidate, review_digest=REVIEW, actor="alice", profile="p1"
+        )
+    if action == "recover":
+        return store.recover_transactions
+    if action == "atomic_install":
+        prepared = _consume(store, candidate)
+        return lambda: store.atomic_install(prepared, review_digest=REVIEW)
+    installed = _install(store, candidate)
+    _, removal = _authorize_remove(store, installed)
+    return lambda: store.atomic_remove(removal, review_digest=REVIEW)
+
+
+@pytest.mark.parametrize(
+    "action", ["prepare", "recover", "atomic_install", "atomic_remove"]
+)
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+@pytest.mark.parametrize("window", ["first_validation", "after_children"])
+@pytest.mark.parametrize("descriptor_support", [True, False])
+def test_private_authority_replacement_never_writes_foreign_workspace(
+    tmp_path, monkeypatch, action, replacement, window, descriptor_support
+):
+    from plugins.workflow.marketplace import transactions as transaction_module
+
+    # Exercise the portable capability fallback on the real host too. Never
+    # enable descriptor operations on a host that does not support them.
+    if not descriptor_support:
+        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    invoke = _workspace_entry_point(store, candidate, action)
+    destination_before = _snapshot(candidate.destination)
+    foreign = tmp_path / "foreign-authority"
+    foreign.mkdir(mode=0o700)
+    (foreign / "evidence").write_bytes(b"foreign bytes")
+    (foreign / "marketplace.lock").touch(mode=0o600)
+    foreign_before = _snapshot(foreign)
+    foreign_metadata = foreign.stat()
+    displaced = tmp_path / "displaced-authority"
+    original_metadata = None
+    original_before = None
+    original_entries = None
+
+    def swap():
+        nonlocal foreign, original_metadata, original_before, original_entries
+        original_metadata = store.root.stat()
+        original_before = _snapshot(store.root)
+        original_entries = sorted(path.name for path in store.root.iterdir())
+        store.root.rename(displaced)
+        if replacement == "symlink":
+            store.root.symlink_to(foreign, target_is_directory=True)
+        else:
+            foreign.rename(store.root)
+            foreign = store.root
+
+    owner = store._shared_store if window == "first_validation" else store
+    method = (
+        "_ensure_private_root"
+        if window == "first_validation"
+        else "_ensure_workflow_roots"
+    )
+    original = getattr(owner, method)
+
+    def replace_after_return():
+        result = original()
+        if not displaced.exists():
+            swap()
+        return result
+
+    monkeypatch.setattr(owner, method, replace_after_return)
+    failure = None
+    try:
+        invoke()
+    except WorkflowMarketplaceError as error:
+        failure = error
+    # Check filesystem truth before the exception assertion so the original RED
+    # distinguishes a late refusal from a refusal before foreign mutation.
+    assert sorted(path.name for path in foreign.iterdir()) == [
+        "evidence",
+        "marketplace.lock",
+    ]
+    assert _snapshot(foreign) == foreign_before
+    after = foreign.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        foreign_metadata.st_dev,
+        foreign_metadata.st_ino,
+        foreign_metadata.st_mode,
+    )
+    assert original_metadata is not None
+    after = displaced.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        original_metadata.st_dev,
+        original_metadata.st_ino,
+        original_metadata.st_mode,
+    )
+    assert _snapshot(displaced) == original_before
+    assert sorted(path.name for path in displaced.iterdir()) == original_entries
+    assert _snapshot(candidate.destination) == destination_before
+    assert failure is not None and failure.code == "transaction_state_invalid"
+
+
+@pytest.mark.parametrize(
+    "action", ["prepare", "recover", "atomic_install", "atomic_remove"]
+)
+@pytest.mark.parametrize("descriptor_support", [True, False])
+def test_original_workspace_authority_settles_normally(
+    tmp_path, monkeypatch, action, descriptor_support
+):
+    from plugins.workflow.marketplace import transactions as transaction_module
+
+    if not descriptor_support:
+        monkeypatch.setattr(transaction_module, "_DIRECTORY_FD_SUPPORTED", False)
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    invoke = _workspace_entry_point(store, candidate, action)
+    original_identity = store._shared_store._ensure_private_root()
+    result = invoke()
+    metadata = store.root.stat()
+    assert (metadata.st_dev, metadata.st_ino) == original_identity
+    if action == "prepare":
+        assert (
+            store.inspect_token(result.token, actor="alice", profile="p1").identity
+            == candidate.identity
+        )
+        assert (
+            load_distribution(result.staging_path).digest
+            == candidate.distribution.digest
+        )
+    elif action == "atomic_install":
+        assert store.installed_store.get(candidate.identity) == result
+        assert (
+            load_distribution(candidate.destination).digest
+            == candidate.distribution.digest
+        )
+    else:
+        assert not candidate.destination.exists()
+        assert store.list_journals() == ()
+    assert store.staging_root.is_dir() and store.quarantine_root.is_dir()
+
+
+@pytest.mark.parametrize("action", ["prepare", "recover"])
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_workspace_mkdir_cannot_be_redirected_after_parent_open(
+    tmp_path, monkeypatch, action, replacement
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    foreign = tmp_path / "foreign-authority"
+    foreign.mkdir(mode=0o700)
+    (foreign / "evidence").write_bytes(b"foreign bytes")
+    before = _snapshot(foreign)
+    foreign_identity = foreign.stat()
+    displaced = tmp_path / "displaced-authority"
+    original_mkdir = os.mkdir
+    attempted = False
+    blocked_by_guard = False
+    original_identity = None
+
+    def replace_at_mkdir(path, *args, **kwargs):
+        nonlocal attempted, blocked_by_guard, foreign, original_identity
+        if Path(path).name == ".staging" and not attempted:
+            attempted = True
+            original_identity = store.root.stat()
+            try:
+                store.root.rename(displaced)
+            except PermissionError:
+                # A native Windows no-delete-share guard prevents the swap.
+                assert os.name == "nt"
+                blocked_by_guard = True
+            else:
+                if replacement == "symlink":
+                    store.root.symlink_to(foreign, target_is_directory=True)
+                else:
+                    foreign.rename(store.root)
+                    foreign = store.root
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", replace_at_mkdir)
+    error = None
+    try:
+        _workspace_entry_point(store, candidate, action)()
+    except WorkflowMarketplaceError as failure:
+        error = failure
+    assert attempted
+    assert sorted(path.name for path in foreign.iterdir()) == ["evidence"]
+    assert _snapshot(foreign) == before
+    after = foreign.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        foreign_identity.st_dev,
+        foreign_identity.st_ino,
+        foreign_identity.st_mode,
+    )
+    assert original_identity is not None
+    original = store.root if blocked_by_guard else displaced
+    after = original.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        original_identity.st_dev,
+        original_identity.st_ino,
+        original_identity.st_mode,
+    )
+    if blocked_by_guard:
+        assert error is None
+    else:
+        assert error is not None and error.code == "transaction_state_invalid"
+        assert sorted(path.name for path in original.iterdir()) == [
+            ".staging",
+            "marketplace.lock",
+        ]
+        assert list((original / ".staging").iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "action", ["prepare", "recover", "atomic_install", "atomic_remove"]
+)
+@pytest.mark.parametrize(
+    "damage", ["lock_symlink", *(["public_mode"] if os.name != "nt" else [])]
+)
+def test_retained_parent_authority_revalidates_permissions_and_lock(
+    tmp_path, monkeypatch, action, damage
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    invoke = _workspace_entry_point(store, candidate, action)
+    original = store._ensure_workflow_roots
+    foreign_lock = tmp_path / "foreign.lock"
+    foreign_lock.write_bytes(b"foreign lock bytes")
+    destination_before = _snapshot(candidate.destination)
+
+    def damage_after_creation():
+        identity = original()
+        if damage == "public_mode":
+            store.root.chmod(0o755)
+        else:
+            store.lock_path.unlink()
+            store.lock_path.symlink_to(foreign_lock)
+        return identity
+
+    monkeypatch.setattr(store, "_ensure_workflow_roots", damage_after_creation)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        invoke()
+    assert error.value.code == "transaction_state_invalid"
+    assert _snapshot(candidate.destination) == destination_before
+    assert foreign_lock.read_bytes() == b"foreign lock bytes"
+    if action == "prepare":
+        assert not store.path.exists()
+        assert list(store.staging_root.iterdir()) == []
 
 
 def _forbid_workspace_enumeration(monkeypatch, roots):

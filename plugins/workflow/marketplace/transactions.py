@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -22,7 +22,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from hermes_constants import get_hermes_home
 from plugins.workflow.locks import WorkflowLockTimeout, workflow_lock
 from plugins.workflow.trust import WorkflowTrustError, WorkflowTrustStore
-from utils import _is_reparse_point, atomic_write_text
+from utils import (
+    _is_reparse_point,
+    _open_no_follow_directory,
+    _open_windows_directory_guard,
+    _validate_no_follow_parent_path,
+    atomic_write_text,
+)
 
 from .models import InstalledPackageIdentity, InstalledPackageProvenance
 from .package import (
@@ -51,6 +57,14 @@ _TRUST_ORIGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}", re.ASCII)
 _OWNER = "hermes-workflow-marketplace"
 _CONFIRMATION_DOMAIN = b"hermes.workflow-marketplace.confirmation.v1\0"
 _CONSUMED_LEASE_SECONDS = 300
+_DIRECTORY_FD_SUPPORTED = (
+    hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+    and os.mkdir in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.stat in os.supports_follow_symlinks
+    and hasattr(os, "fchmod")
+)
 
 JournalPhase = Literal[
     "install_consumed",
@@ -471,6 +485,45 @@ def _require_existing_directory(path: Path, *, code: str) -> None:
         _fail(code, "transaction package path is invalid")
 
 
+def _require_private_directory_at(parent_descriptor: int, name: str) -> None:
+    created = False
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+        created = True
+    except FileExistsError:
+        pass
+    before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or _is_reparse_point(before)
+        or not stat.S_ISDIR(before.st_mode)
+    ):
+        _fail("transaction_destination_invalid", "transaction path must be a directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            _fail("transaction_destination_invalid", "transaction directory changed")
+        if created:
+            os.fchmod(descriptor, 0o700)
+        elif stat.S_IMODE(opened.st_mode) != 0o700:
+            _fail(
+                "transaction_destination_invalid",
+                "transaction state directory permissions are not private",
+            )
+        after = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or _is_reparse_point(after)
+            or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            _fail("transaction_destination_invalid", "transaction directory changed")
+    finally:
+        os.close(descriptor)
+
+
 def _confirmation_digest(record: _PreparedRecord) -> str:
     value = record.model_dump(mode="json", by_alias=True)
     value.pop("tokenDigest")
@@ -557,9 +610,21 @@ class MarketplaceTransactionStore:
         self.lock_timeout_seconds = lock_timeout_seconds
 
     @contextmanager
-    def _locked(self) -> Iterator[tuple[int, int]]:
+    def _locked(
+        self, expected_parent_identity: tuple[int, int] | None = None
+    ) -> Iterator[tuple[int, int]]:
         try:
+            if expected_parent_identity is not None:
+                self._require_root_identity(expected_parent_identity)
             root_identity = self._shared_store._ensure_private_root()
+            if (
+                expected_parent_identity is not None
+                and root_identity != expected_parent_identity
+            ):
+                _fail(
+                    "transaction_state_invalid", "marketplace state directory changed"
+                )
+            self._require_root_identity(root_identity)
             with workflow_lock(
                 self.lock_path,
                 timeout_seconds=self.lock_timeout_seconds,
@@ -592,12 +657,32 @@ class MarketplaceTransactionStore:
                 )
             raise
 
-    def _ensure_workflow_roots(self) -> None:
+    def _require_root_identity(self, expected: tuple[int, int]) -> None:
+        try:
+            actual = _validate_no_follow_parent_path(self.root)
+            metadata = self.root.lstat()
+            parent_metadata = self.root.parent.lstat()
+        except OSError:
+            _fail("transaction_state_invalid", "marketplace state directory changed")
+        if (
+            actual != expected
+            or (metadata.st_dev, metadata.st_ino) != expected
+            or (
+                os.name != "nt"
+                and any(
+                    stat.S_IMODE(item.st_mode) != 0o700
+                    for item in (metadata, parent_metadata)
+                )
+            )
+        ):
+            _fail("transaction_state_invalid", "marketplace state directory changed")
+
+    def _ensure_workflow_roots(self) -> tuple[int, int]:
         _require_directory(self.home)
         workflows = self.home / "workflows"
         _require_directory(workflows)
         try:
-            self._shared_store._ensure_private_root()
+            root_identity = self._shared_store._ensure_private_root()
         except WorkflowMarketplaceError as error:
             if error.code.startswith("source_state"):
                 _fail(
@@ -605,8 +690,36 @@ class MarketplaceTransactionStore:
                     "marketplace transaction state directory is invalid",
                 )
             raise
-        _require_directory(self.staging_root, private=True)
-        _require_directory(self.quarantine_root, private=True)
+        self._require_root_identity(root_identity)
+        with ExitStack() as guards:
+            parent_descriptor = None
+            try:
+                if _DIRECTORY_FD_SUPPORTED:
+                    parent_descriptor, opened_identity = _open_no_follow_directory(
+                        self.root
+                    )
+                    guards.callback(os.close, parent_descriptor)
+                    if opened_identity != root_identity:
+                        _fail(
+                            "transaction_state_invalid",
+                            "marketplace state directory changed",
+                        )
+                elif os.name == "nt":
+                    for parent in (self.home, self.root.parent, self.root):
+                        kernel32, handle = _open_windows_directory_guard(parent)
+                        guards.callback(kernel32.CloseHandle, handle)
+            except OSError:
+                _fail(
+                    "transaction_state_invalid", "marketplace state directory changed"
+                )
+            for root in (self.staging_root, self.quarantine_root):
+                self._require_root_identity(root_identity)
+                if parent_descriptor is None:
+                    _require_directory(root, private=True)
+                else:
+                    _require_private_directory_at(parent_descriptor, root.name)
+                self._require_root_identity(root_identity)
+        return root_identity
 
     def _empty_prepared(self) -> _PreparedState:
         return _PreparedState.model_validate({
@@ -1056,8 +1169,9 @@ class MarketplaceTransactionStore:
             _fail("transaction_state_invalid", "token generator returned invalid data")
         staging_envelope = self.staging_root / transaction_id
         staging_path = staging_envelope / "package"
-        self._ensure_workflow_roots()
+        root_identity = self._ensure_workflow_roots()
         self._validate_destination_parent(destination)
+        self._require_root_identity(root_identity)
         staging_owned = False
         try:
             staged = distribution
@@ -1109,7 +1223,7 @@ class MarketplaceTransactionStore:
                     else None
                 ),
             }
-            with self._locked() as parent_identity:
+            with self._locked(root_identity) as parent_identity:
                 state = self._read_prepared()
                 current = self._current_provenance(candidate.identity)
                 destination_metadata = _entry(destination)
@@ -1685,10 +1799,10 @@ class MarketplaceTransactionStore:
 
         prepared = self._require_authorization(prepared, "install")
         trust_origin = _validated_trust_origin(prepared.identity, trust_origin)
-        self._ensure_workflow_roots()
+        root_identity = self._ensure_workflow_roots()
         destination = prepared.destination
         writer = provenance_writer or self.installed_store.put
-        with self._locked() as parent_identity:
+        with self._locked(root_identity) as parent_identity:
             consumed = self._require_consumed_journal(prepared, "install")
             distribution = self._revalidate_prepared(
                 prepared,
@@ -1882,10 +1996,10 @@ class MarketplaceTransactionStore:
 
         prepared = self._require_authorization(prepared, "remove")
         trust_origin = _validated_trust_origin(prepared.identity, trust_origin)
-        self._ensure_workflow_roots()
+        root_identity = self._ensure_workflow_roots()
         destination = prepared.destination
         remover = provenance_remover or self.installed_store.remove
-        with self._locked() as parent_identity:
+        with self._locked(root_identity) as parent_identity:
             consumed = self._require_consumed_journal(prepared, "remove")
             _distribution, previous = self._revalidate_remove_prepared(
                 prepared,
@@ -2358,9 +2472,9 @@ class MarketplaceTransactionStore:
     def recover_transactions(self) -> tuple[str, ...]:
         """Complete or roll back only exact journals with matching owned markers."""
 
-        self._ensure_workflow_roots()
+        root_identity = self._ensure_workflow_roots()
         recovered: list[str] = []
-        with self._locked() as parent_identity:
+        with self._locked(root_identity) as parent_identity:
             prepared = self._read_prepared()
             journals = self._read_journals()
             now = self.clock()
