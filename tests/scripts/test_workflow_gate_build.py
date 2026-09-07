@@ -13,6 +13,158 @@ from scripts import workflow_gate_build as build
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
+@pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("scope_stop", [True, False, "raises"])
+@pytest.mark.parametrize("wait_mode", ["normal", "escalate", "fails"])
+def test_scoped_registry_setup_failure_reaps_only_wrapper_and_reports_cleanup(
+    tmp_path, monkeypatch, scope_stop, wait_mode
+):
+    import os
+    import tools.process_registry as registry_module
+
+    registry = registry_module.ProcessRegistry()
+    setup_error = RuntimeError("reader failed")
+    reader = Mock()
+    reader.start.side_effect = setup_error
+    monkeypatch.setattr(registry_module.threading, "Thread", lambda **kwargs: reader)
+    monkeypatch.setattr(registry_module, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(
+        registry_module, "_systemd_run_user_scope_available", lambda: True
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "_build_systemd_scope_argv",
+        lambda *args, **kwargs: ["fixture"],
+    )
+    stop_calls = []
+
+    def stop(unit):
+        stop_calls.append(unit)
+        if scope_stop == "raises":
+            raise OSError("scope stop unavailable")
+        return scope_stop
+
+    monkeypatch.setattr(registry_module, "_stop_systemd_unit", stop)
+    spawn = ManagedProcessTree.spawn
+    captured = []
+    waits = []
+    signals = []
+
+    def real_wrapper(*args, **kwargs):
+        tree = spawn(
+            [sys.executable, "-c", "import threading; threading.Event().wait(60)"],
+            **kwargs,
+        )
+        wait = tree.process.wait
+        captured.append((tree, tree.identity, wait))
+        terminate, kill = tree.process.terminate, tree.process.kill
+
+        def terminate_wrapper():
+            signals.append("terminate")
+            terminate()
+
+        def kill_wrapper():
+            signals.append("kill")
+            kill()
+
+        monkeypatch.setattr(tree.process, "terminate", terminate_wrapper)
+        monkeypatch.setattr(tree.process, "kill", kill_wrapper)
+
+        def bounded_wait(timeout=None):
+            waits.append(timeout)
+            if wait_mode == "fails" or (wait_mode == "escalate" and len(waits) == 1):
+                raise subprocess.TimeoutExpired("owned wrapper", timeout)
+            return wait(timeout=timeout)
+
+        monkeypatch.setattr(tree.process, "wait", bounded_wait)
+        return tree
+
+    monkeypatch.setattr(ManagedProcessTree, "spawn", real_wrapper)
+    killpg = Mock(wraps=getattr(os, "killpg"))
+    monkeypatch.setattr(os, "killpg", killpg)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            registry.spawn_local("fixture", cwd=str(tmp_path))
+        tree, identity, wait = captured[0]
+        assert stop_calls and stop_calls[0].startswith("hermes-worker-proc_")
+        assert tree.identity is identity
+        assert killpg.call_args_list == []
+        assert registry._running == {}
+        if scope_stop is True and wait_mode != "fails":
+            assert caught.value is setup_error
+        else:
+            assert "cleanup failed" in str(caught.value)
+            assert caught.value.__cause__ is setup_error
+        expected = [tree.policy.term_grace_seconds]
+        if wait_mode != "normal":
+            expected.append(tree.policy.kill_grace_seconds)
+        assert waits == expected
+        assert signals == (
+            ["terminate"] if wait_mode == "normal" else ["terminate", "kill"]
+        )
+        if wait_mode != "fails":
+            assert tree.process.poll() is not None
+    finally:
+        for tree, _identity, wait in captured:
+            tree.process.kill()
+            wait(timeout=5)
+            tree.process.stdout.close()
+
+
+@pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_ordinary_registry_setup_failure_reaps_lingering_new_session_group(
+    tmp_path, monkeypatch
+):
+    import tools.process_registry as registry_module
+
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(
+        registry_module, "_is_supervised_gateway_process", lambda: False
+    )
+    reader = Mock()
+    reader.start.side_effect = RuntimeError("reader failed")
+    monkeypatch.setattr(registry_module.threading, "Thread", lambda **kwargs: reader)
+    spawn = ManagedProcessTree.spawn
+    captured = []
+    descendants = []
+    child_code = "import threading; threading.Event().wait(60)"
+    parent_code = (
+        "import subprocess,sys;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        "print(p.pid,flush=True)"
+    )
+
+    def exited_wrapper(*args, **kwargs):
+        tree = spawn([sys.executable, "-c", parent_code], **kwargs)
+        captured.append(tree)
+        descendants.append(psutil.Process(int(tree.process.stdout.readline())))
+        tree.process.wait(timeout=5)
+        return tree
+
+    monkeypatch.setattr(ManagedProcessTree, "spawn", exited_wrapper)
+    try:
+        with pytest.raises(RuntimeError, match="reader failed"):
+            registry.spawn_local("fixture", cwd=str(tmp_path))
+        assert captured[0].reaped
+        descendant = descendants[0]
+        assert (
+            not descendant.is_running() or descendant.status() == psutil.STATUS_ZOMBIE
+        )
+    finally:
+        for descendant in descendants:
+            try:
+                descendant.kill()
+            except psutil.NoSuchProcess:
+                pass
+            descendant.wait(timeout=5)
+        for tree in captured:
+            tree.process.wait(timeout=5)
+            tree.process.stdout.close()
+
+
 def test_windows_job_does_not_infer_posix_group_from_new_session_option(monkeypatch):
     import tools.managed_process as managed
 
