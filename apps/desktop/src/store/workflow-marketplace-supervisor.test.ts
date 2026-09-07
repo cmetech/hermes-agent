@@ -856,6 +856,17 @@ describe('application marketplace operation supervision', () => {
     await h.supervisor.reconcilePackage(binding!, identity)
 
     expect(h.supervisor.getPackageGate(binding!, identity).state).toBe('ready')
+    await expect(
+      h.supervisor.start(
+        {
+          kind: 'remove_prepare',
+          subject,
+          selection: null,
+          body: { identity }
+        },
+        binding!
+      )
+    ).resolves.toEqual(expect.any(String))
   })
 
   it('blocks inspection behind active package work', async () => {
@@ -866,7 +877,105 @@ describe('application marketplace operation supervision', () => {
     await expect(
       h.supervisor.start({ kind: 'inspect', subject, selection: null, body: {} }, binding!)
     ).rejects.toMatchObject({ code: 'marketplace_request_conflict' })
+    expect(h.posts()).toBe(1)
+    expect(h.states()).toBeGreaterThan(0)
   })
+
+  it('does not classify a replay conflict after a lost POST as known non-admission', async () => {
+    const h = setup()
+    const binding = (await h.bind())!
+    h.lose()
+    const key = await h.supervisor.start(h.intent, binding)
+
+    h.api.start = async () => {
+      throw new LifecycleApiError('marketplace_request_conflict', 409)
+    }
+
+    await h.supervisor.retry(key)
+    expect(h.record()).toMatchObject({ status: 'admission_unknown', barrier: true })
+    expect(h.supervisor.$records.get()).toHaveLength(1)
+  })
+
+  it('reconciles a rejected inspection without suspending the active lifecycle admission', async () => {
+    const h = setup()
+    const binding = (await h.bind())!
+    const held = h.deferPost()
+    const lifecycle = h.supervisor.start(h.intent, binding)
+    await vi.advanceTimersByTimeAsync(0)
+    const request = h.record().requestId
+    await expect(
+      h.supervisor.start({ kind: 'inspect', subject, selection: null, body: {} }, binding)
+    ).rejects.toMatchObject({ code: 'marketplace_request_conflict' })
+    expect(h.record()).toMatchObject({ requestId: request, status: 'admitting', callPending: true })
+    expect(h.probes()).toBe(1)
+    const admitted = [...h.receipts.values()].find(value => value.request_id === request)!
+    held.resolve(admitted)
+    await lifecycle
+    expect(h.record()).toMatchObject({ operationId: admitted.id, status: 'watching', callPending: false })
+  })
+
+  it.each(['admitting', 'watching', 'admission_unknown'] as const)(
+    'admits lifecycle after an exact inspection is %s without replacing its watch',
+    async state => {
+      const h = setup()
+      const binding = (await h.bind())!
+      const held = state === 'admitting' ? deferred<void>() : null
+      const start = h.api.start
+
+      h.api.start = async (...args) => {
+        const result = await start(...args)
+
+        if (args[0].kind === 'inspect') {
+          await held?.promise
+        }
+
+        return result
+      }
+
+      if (state === 'admission_unknown') {
+        h.lose()
+      }
+
+      const inspection = h.supervisor.start({ kind: 'inspect', subject, selection: null, body: {} }, binding)
+
+      if (state === 'admitting') {
+        await vi.advanceTimersByTimeAsync(0)
+      } else {
+        await inspection
+      }
+
+      expect(h.record().status).toBe(state)
+      const old = h.record()
+      await h.supervisor.start(h.intent, binding)
+      expect(h.posts()).toBe(2)
+      expect(h.supervisor.$records.get()[0].requestId).toBe(old.requestId)
+      expect(h.supervisor.$records.get()).toHaveLength(2)
+      held?.resolve()
+      await inspection
+    }
+  )
+
+  it.each(['marketplace_operation_conflict', 'marketplace_request_conflict'] as const)(
+    'reconciles exact known non-admission on %s without retaining a replay',
+    async code => {
+      const h = setup()
+      const binding = (await h.bind())!
+      const error = new LifecycleApiError(code, 409)
+
+      h.api.start = async () => {
+        throw error
+      }
+
+      const oldStates = h.states()
+      await expect(h.supervisor.start(h.intent, binding)).rejects.toMatchObject({ code })
+      expect(h.supervisor.$records.get()).toHaveLength(0)
+      expect(h.states()).toBeGreaterThan(oldStates)
+      expect(h.calls.filter(call => call.type === 'list').length).toBeGreaterThan(1)
+      expect(h.supervisor.getPackageGate(binding, identity).state).toBe('ready')
+      await vi.advanceTimersByTimeAsync(15001)
+      expect(h.calls.some(call => call.type === 'lookup' || call.type === 'get')).toBe(false)
+    }
+  )
 
   it('admits a fresh exact inspection while an earlier detached inspection remains active', async () => {
     const h = setup()
@@ -889,6 +998,10 @@ describe('application marketplace operation supervision', () => {
     h.terminal()
     await vi.advanceTimersByTimeAsync(500)
     expect(h.record()).toMatchObject({ status: 'terminal', barrier: true })
+
+    h.api.packageState = async () => {
+      throw new LifecycleApiError('marketplace_network_error', 0)
+    }
 
     await expect(h.supervisor.start(h.intent, binding!)).rejects.toMatchObject({
       code: 'marketplace_request_conflict'

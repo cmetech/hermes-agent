@@ -597,6 +597,27 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       }
 
       if (
+        action === 'post' &&
+        entry.record.status === 'admitting' &&
+        !entry.record.operationId &&
+        failure.status === 409 &&
+        (failure.code === 'marketplace_operation_conflict' || failure.code === 'marketplace_request_conflict')
+      ) {
+        // This first POST was rejected before admission. There is no operation
+        // to watch/replay; the mutation generation still fences stale reads.
+        forgetReplay(entry)
+        entries.delete(entry)
+        publish()
+        await reconcileScope(target)
+
+        if (entry.record.subject.type === 'package' && usable(target)) {
+          await reconcilePackage(target, entry.record.subject.identity)
+        }
+
+        throw failure
+      }
+
+      if (
         !reprobe &&
         (failure.code === 'marketplace_admission_not_found' || failure.code === 'marketplace_request_expired')
       ) {
@@ -1026,11 +1047,18 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         entry =>
           sameAuthority(entry.record.binding, binding) &&
           entry.record.barrier &&
-          !(input.kind === 'inspect' && (entry.record.kind === 'inspect' || entry.record.status === 'terminal')) &&
+          entry.record.kind !== 'inspect' &&
+          !(input.kind === 'inspect' && entry.record.status === 'terminal') &&
           sameLifecycleValue(entry.record.subject, subject)
       )
     ) {
-      return Promise.reject(new LifecycleApiError('marketplace_request_conflict', 409))
+      // This binding is already proven; a new capability scan would suspend
+      // the lifecycle work that the rejected inspection is observing.
+      const currentState = subject.type === 'package' ? reconcilePackage(binding, subject.identity) : Promise.resolve()
+
+      return currentState.then(() => {
+        throw new LifecycleApiError('marketplace_request_conflict', 409)
+      })
     }
 
     const observation = observations.get(scopeKey(binding))

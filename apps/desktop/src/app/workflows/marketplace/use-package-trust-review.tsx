@@ -13,12 +13,14 @@ import type {
   WorkflowInventoryItem
 } from '@/types/workflow-marketplace-lifecycle'
 
+import { isPackageAdmissionConflict } from './package-lifecycle-presentation'
 import { useMarketplaceSupervisor } from './supervisor-provider'
 import { TrustReviewDialog, type TrustReviewDialogView, type TrustSelection } from './trust-review-dialog'
 
 interface TrustAttachment {
   requestId: string | null
   failed: boolean
+  conflict?: boolean
   selection: TrustSelection
   inventory: readonly WorkflowInventoryItem[] | null
   preparation?: LifecycleOperation
@@ -394,9 +396,9 @@ export function usePackageTrustReview({
         const next = { ...current, requestId: exact?.requestId ?? null, failed: !exact }
         owner.current = next
         setAttachment(next)
-      } catch {
+      } catch (error) {
         if (owner.current === current) {
-          const next = { ...current, failed: true }
+          const next = { ...current, failed: true, conflict: isPackageAdmissionConflict(error) }
           owner.current = next
           setAttachment(next)
         }
@@ -592,6 +594,8 @@ export function usePackageTrustReview({
       view = { kind: 'status', recoverable: false }
     } else if (record?.status === 'evicted') {
       view = { kind: 'evicted', recoverable: false }
+    } else if (attachment.conflict) {
+      view = { kind: 'conflict', recoverable: false }
     } else if (attachment.tokenUnavailable) {
       view = { kind: 'stale', recoverable: true }
     } else if (record?.operation?.outcome?.type === 'known_unchanged') {

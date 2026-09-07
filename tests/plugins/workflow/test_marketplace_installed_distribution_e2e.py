@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 
 from plugins.workflow.store import RunStore
 
@@ -72,6 +73,40 @@ def _state(api):
     response = api.client.get(V2 + "/packages/company/laptop-support/state")
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def test_local_removal_review_with_concurrent_read_only_inspection(
+    lifecycle_api, monkeypatch
+):
+    """A remote read must not contradict local verified removal availability."""
+    api = lifecycle_api
+    api.install()
+    entered, release = threading.Event(), threading.Event()
+    original = api.service.inspect
+
+    def inspect(*args, **kwargs):
+        result = original(*args, **kwargs)
+        entered.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(api.service, "inspect", inspect)
+    response = api.post("/packages/company/laptop-support", api.request({}))
+    assert response.status_code == 202, response.text
+    assert entered.wait(5)
+    try:
+        assert _state(api)["state"] == "installed"
+        assert _state(api)["busy"] is False
+        removal = api.post("/remove/prepare", api.request({"identity": IDENTITY}))
+        assert removal.status_code == 202, removal.text
+        review = api.wait(removal.json()["id"])
+        assert review["state"] == "succeeded"
+        _confirm(api, review, "/remove/confirm")
+        assert _state(api)["state"] == "absent"
+    finally:
+        release.set()
+    assert api.wait(response.json()["id"])["state"] == "succeeded"
+    assert _state(api)["state"] == "absent"
 
 
 def test_exact_admission_replay_trust_one_all_changed_update_and_removal(lifecycle_api):

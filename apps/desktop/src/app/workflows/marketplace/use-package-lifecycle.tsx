@@ -11,7 +11,12 @@ import type { WorkflowMarketplacePackageDetail } from '@/types/hermes'
 import type { LifecycleOperation, PackageIdentity, ReviewTokenResponse } from '@/types/workflow-marketplace-lifecycle'
 
 import { InstallReviewDialog, type InstallReviewDialogView } from './install-review-dialog'
-import { packageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
+import {
+  conflictingPackagePresentation,
+  isPackageAdmissionConflict,
+  packageLifecyclePresentation,
+  unconfirmedPackagePresentation
+} from './package-lifecycle-presentation'
 import { RemoveReviewDialog, type RemoveReviewDialogView } from './remove-review-dialog'
 import { useMarketplaceSupervisor } from './supervisor-provider'
 import { usePackageTrustReview } from './use-package-trust-review'
@@ -21,6 +26,7 @@ interface Attachment {
   mode: Mode
   requestId: string | null
   failed: boolean
+  conflict?: boolean
   preparation?: LifecycleOperation
   tokenUnavailable?: boolean
 }
@@ -132,12 +138,12 @@ export function usePackageLifecycle({
         const next = { ...current, requestId: exact?.requestId ?? null, failed: !exact }
         owner.current = next
         setAttachment(next)
-      } catch {
+      } catch (error) {
         if (owner.current !== current) {
           return
         }
 
-        const next = { ...current, failed: true }
+        const next = { ...current, failed: true, conflict: isPackageAdmissionConflict(error) }
         owner.current = next
         setAttachment(next)
       }
@@ -370,9 +376,11 @@ export function usePackageLifecycle({
         message: 'Review is unavailable. Prepare a fresh review.',
         canPrepareAgain: true
       }
-    : record
-      ? packageLifecyclePresentation(record, attachment?.preparation)
-      : unconfirmedPackagePresentation
+    : attachment?.conflict
+      ? conflictingPackagePresentation
+      : record
+        ? packageLifecyclePresentation(record, attachment?.preparation)
+        : unconfirmedPackagePresentation
 
   useEffect(() => {
     if (

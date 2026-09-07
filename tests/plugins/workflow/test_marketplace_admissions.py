@@ -100,6 +100,116 @@ def request_id(number=1, *, now=NOW, epoch=EPOCH):
     return f"wmreq_{epoch}_{int(now.timestamp() * 1000):013d}_{number:032x}"
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "first_kind,next_kind,allowed",
+    [
+        ("inspect", "inspect", True),
+        ("inspect", "remove_prepare", True),
+        ("remove_prepare", "inspect", False),
+        ("remove_prepare", "remove_prepare", False),
+    ],
+)
+def test_inspection_admission_matrix(tmp_path, legacy, first_kind, next_kind, allowed):
+    """An observation checks lifecycle ownership but never owns the target."""
+    registry = operations.WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support", max_workers=2, max_in_flight=3
+    )
+    release = threading.Event()
+    entered = threading.Event()
+
+    def worker(_token):
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("controlled failure before mutation")
+
+    def start(kind, request=None, actor="alice", subject=SUBJECT):
+        return registry.start(
+            "package_detail" if legacy and kind == "inspect" else kind,
+            worker,
+            actor=actor,
+            target=f"package:{subject.identity.source_key}/{subject.identity.package_id}",
+            subject=subject,
+            canonical_body={},
+            request_id=None
+            if legacy
+            else request or registry.admissions.new_request_id(),
+        )
+
+    try:
+        first_request = registry.admissions.new_request_id()
+        first = start(first_kind, first_request)
+        assert entered.wait(5)
+        if allowed:
+            second = start(next_kind)
+            assert second.id != first.id
+        else:
+            with pytest.raises(operations.MarketplaceOperationConflictError) as error:
+                start(next_kind)
+            assert error.value.code == "marketplace_operation_conflict"
+        if not legacy:
+            assert start(first_kind, first_request).id == first.id
+        other = PackageSubject(
+            type="package",
+            identity=PackageIdentity(source_key="company", package_id="other"),
+        )
+        assert start(next_kind, actor="bob", subject=other).id != first.id
+        with pytest.raises(operations.MarketplaceOperationNotFoundError):
+            registry.get(first.id, actor="bob")
+    finally:
+        release.set()
+        registry.close()
+
+
+def test_inspection_release_does_not_release_lifecycle_owner_and_replay_precedes_capacity(
+    tmp_path,
+):
+    """Finishing/cancelling an old observation cannot unlock a newer mutation."""
+    registry = operations.WorkflowMarketplaceOperationRegistry(
+        profile_key=str(tmp_path), profile="support", max_workers=2, max_in_flight=2
+    )
+    releases = [threading.Event(), threading.Event()]
+    entered = [threading.Event(), threading.Event()]
+
+    def start(kind, number, request=None):
+        def worker(token):
+            entered[number].set()
+            assert releases[number].wait(5)
+            token.checkpoint()
+            raise RuntimeError("controlled failure before mutation")
+
+        return registry.start(
+            kind,
+            worker,
+            actor="alice",
+            target="package:company/support",
+            subject=SUBJECT,
+            canonical_body={},
+            request_id=request or registry.admissions.new_request_id(),
+        )
+
+    try:
+        request = registry.admissions.new_request_id()
+        inspection = start("inspect", 0, request)
+        mutation = start("remove_prepare", 1)
+        assert all(event.wait(5) for event in entered)
+        assert start("inspect", 0, request).id == inspection.id
+        with pytest.raises(operations.MarketplaceOperationCapacityError):
+            start("inspect", 0)
+        registry.cancel(inspection.id, actor="alice")
+        releases[0].set()
+        registry._records[inspection.id].future.result(timeout=5)
+        with pytest.raises(operations.MarketplaceOperationConflictError):
+            start("inspect", 0)
+        releases[1].set()
+        registry._records[mutation.id].future.result(timeout=5)
+        assert start("inspect", 0).id != inspection.id
+    finally:
+        for release in releases:
+            release.set()
+        registry.close()
+
+
 class AdmittedConfirm:
     def __init__(self, tmp_path, **limits):
         from plugins.workflow.marketplace.admissions import LifecycleAdmissionStore

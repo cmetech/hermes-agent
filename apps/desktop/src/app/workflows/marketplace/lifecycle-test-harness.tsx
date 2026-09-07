@@ -107,6 +107,7 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
   const calls: Array<{ type: string; input?: LifecycleStart; id?: string }> = []
   let getFailure: LifecycleApiError | null = null
   let lookupFailure: LifecycleApiError | null = null
+  let startFailure: LifecycleApiError | null = null
 
   let admission: {
     deferred: ReturnType<typeof deferredLifecycle<void>>
@@ -168,6 +169,13 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
       },
       start: async (input: LifecycleStart) => {
         calls.push({ type: 'start', input })
+
+        if (startFailure) {
+          const error = startFailure
+          startFailure = null
+          throw error
+        }
+
         const retained = receipts.get(input.requestId)
 
         if (retained) {
@@ -448,6 +456,9 @@ export function createLifecycleHarness(clock?: () => LifecycleClockSample) {
     },
     failStatus: (code: LifecycleApiError['code'] = 'marketplace_network_error', status = 0) => {
       getFailure = new LifecycleApiError(code, status)
+    },
+    rejectNextStart: (code: 'marketplace_operation_conflict' | 'marketplace_request_conflict') => {
+      startFailure = new LifecycleApiError(code, 409)
     },
     failLookup: (code: LifecycleApiError['code'] = 'marketplace_admission_not_found', status = 404) => {
       lookupFailure = new LifecycleApiError(code, status)

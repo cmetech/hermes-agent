@@ -1188,6 +1188,19 @@ def test_state_reports_foreign_active_mutation_without_foreign_visibility(
         assert state.status_code == 200, state.text
         assert state.json()["busy"] is True
         assert state.json()["state"] == "absent"
+        for path, body in [
+            ("/packages/company/laptop-support", {}),
+            ("/remove/prepare", {"identity": IDENTITY}),
+        ]:
+            rejected = api.post(path, api.request(body))
+            assert rejected.status_code == 409
+            assert rejected.json() == {
+                "detail": {"code": "marketplace_operation_conflict"}
+            }
+        # Exact confirmation replay wins over the occupied lifecycle target.
+        assert (
+            api.post("/install/confirm", request).json()["id"] == response.json()["id"]
+        )
         assert api.client.get(V2 + "/operations", headers=other).json()["items"] == []
         assert (
             api.client.get(

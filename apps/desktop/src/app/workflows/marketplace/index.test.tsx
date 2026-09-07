@@ -2991,6 +2991,41 @@ describe('workflow package lifecycle', () => {
     expect(api.confirmRemove).not.toHaveBeenCalled()
   })
 
+  it.each(['Remove package', 'Review trust'])(
+    'renders a backend admission race as busy for %s and permits only explicit revalidated retry',
+    async actionName => {
+      const h = await setupLifecycle(true)
+      renderLifecycleHarness(
+        <InstalledPackages scope={scopeA}>
+          <div />
+        </InstalledPackages>,
+        h
+      )
+      const action = await screen.findByRole('button', { name: actionName })
+      await waitFor(() => expect(action.hasAttribute('disabled')).toBe(false))
+      h.rejectNextStart('marketplace_operation_conflict')
+      const before = h.calls.filter(call => call.type === 'start').length
+      fireEvent.click(action)
+      const dialog = await screen.findByRole('dialog')
+      await waitFor(() => expect(within(dialog).getByText(/Another package action is already running/)).toBeTruthy())
+      expect(within(dialog).queryByText(/State could not be confirmed|may have completed/)).toBeNull()
+      expect(h.calls.filter(call => call.type === 'start')).toHaveLength(before + 1)
+      expect(h.calls.filter(call => call.type === 'lookup' || call.type === 'cancel')).toHaveLength(0)
+      fireEvent.click(within(dialog).getAllByRole('button', { name: 'Close' })[0])
+      const retryAction = await screen.findByRole('button', { name: actionName })
+      await waitFor(() => expect(retryAction.hasAttribute('disabled')).toBe(false))
+      fireEvent.click(retryAction)
+      await waitFor(() => expect(h.calls.filter(call => call.type === 'start')).toHaveLength(before + 2))
+
+      const requests = h.calls
+        .filter(call => call.type === 'start')
+        .slice(-2)
+        .map(call => call.input!.requestId)
+
+      expect(requests[0]).not.toBe(requests[1])
+    }
+  )
+
   it('grants all workflows from the real complete A/B trust result through the supervisor', async () => {
     const h = await setupLifecycle(true)
     h.route('trust_prepare', 'service review all')

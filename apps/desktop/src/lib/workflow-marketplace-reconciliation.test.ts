@@ -1,3 +1,4 @@
+import { waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { profileScopeKey } from '@/api/client'
@@ -25,6 +26,82 @@ afterEach(() => {
 })
 
 describe('package mutation reconciliation', () => {
+  it.each(
+    ['service install confirm', 'service update confirm', 'service remove confirm', 'service grant one A'].flatMap(
+      mutation => [true, false].map(failedRefetch => ({ mutation, failedRefetch }))
+    )
+  )(
+    'keeps a late pre-mutation inspection historical after $mutation (failed refetch: $failedRefetch)',
+    async ({ mutation, failedRefetch }) => {
+      const h = harness()
+      const binding = await h.bind()
+      const detailKey = marketplaceKeys.detail(profileScopeKey(binding), 'company', 'laptop-support')
+      const held = h.holdNextAdmission('inspect')
+      const entered = deferredLifecycle<void>()
+      h.onPost(() => entered.resolve(), 'inspect')
+      let inspectionKey: string | undefined
+
+      const read = h.queryClient
+        .fetchQuery({
+          queryKey: detailKey,
+          queryFn: async ({ signal }) => {
+            inspectionKey = await h.supervisor.start(
+              {
+                kind: 'inspect',
+                subject: { type: 'package', identity: lifecycleIdentity },
+                selection: null,
+                body: {}
+              },
+              binding
+            )
+
+            return (await h.supervisor.waitForRecord(inspectionKey, signal)).operation
+          }
+        })
+        .catch(() => null)
+
+      await entered.promise
+      const oldRequest = h.calls.find(call => call.input?.kind === 'inspect')!.input!.requestId
+      await h.mutate(binding, mutation)
+      const generation = h.supervisor.reconciliation.read(binding, lifecycleIdentity).generation
+      expect(generation).toBeGreaterThan(0)
+      const outcome = lifecycleFixture(mutation).outcome
+
+      if (!outcome || !('package_state' in outcome)) {
+        throw new Error('Expected mutation state')
+      }
+
+      if (failedRefetch) {
+        h.failOriginRefetches()
+      } else {
+        h.stateFromOutcome(mutation)
+      }
+
+      expect(await h.supervisor.reconcilePackage(binding, lifecycleIdentity)).toEqual(
+        failedRefetch ? null : outcome.package_state
+      )
+      held.resolve()
+      await read
+      // The terminal operation is retained by exact request, while cancellation fences its old query.
+      await waitFor(() =>
+        expect(h.supervisor.$records.get().find(record => record.requestId === oldRequest)?.status).toBe('terminal')
+      )
+      expect(h.queryClient.getQueryData(detailKey)).toBeUndefined()
+      expect(h.supervisor.reconciliation.read(binding, lifecycleIdentity)).toEqual({
+        generation,
+        packageState: failedRefetch ? null : outcome.package_state
+      })
+      expect(h.supervisor.$records.get().find(record => record.kind !== 'inspect')?.barrier).toBe(failedRefetch)
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, detailKey).state).toBe('reconciling')
+      h.state('service absent')
+      h.stateFromOutcome(mutation)
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      const current = h.supervisor.getPackageGate(binding, lifecycleIdentity).packageState
+      expect(current).toEqual(outcome.package_state)
+      expect(h.supervisor.getPackageGate(binding, lifecycleIdentity, detailKey).state).toBe('reconciling')
+    }
+  )
+
   it('does not fill from an older same-generation read after the latest authoritative attempt fails', async () => {
     const h = harness()
     const binding = await h.bind()

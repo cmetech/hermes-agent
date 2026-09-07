@@ -1105,7 +1105,9 @@ class WorkflowMarketplaceOperationRegistry:
                 lifecycle=lifecycle,
             )
             self._records[operation_id] = record
-            if target is not None:
+            # Inspections observe lifecycle exclusivity without owning it. The
+            # shared check above still blocks reads admitted after lifecycle work.
+            if target is not None and _lifecycle_kind(kind) != "inspect":
                 self._active_targets[target] = operation_id
             projection = (
                 self._project_lifecycle_locked(record)

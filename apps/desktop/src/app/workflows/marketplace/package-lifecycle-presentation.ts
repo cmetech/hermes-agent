@@ -1,3 +1,4 @@
+import { LifecycleApiError } from '@/api/workflow-marketplace-lifecycle'
 import { decodeLifecycleOperation, sameLifecycleValue } from '@/lib/workflow-marketplace-lifecycle-codec'
 import { acceptSupervisedOperation } from '@/lib/workflow-marketplace-supervision'
 import type { SupervisedRecord } from '@/store/workflow-marketplace-supervisor'
@@ -24,6 +25,17 @@ export const unconfirmedPackagePresentation: PackageLifecyclePresentation = {
   message: 'State could not be confirmed. The operation may have completed.',
   canPrepareAgain: false
 }
+
+export const conflictingPackagePresentation: PackageLifecyclePresentation = {
+  kind: 'unchanged',
+  message: 'Another package action is already running. No changes were started. Refresh state before trying again.',
+  canPrepareAgain: true
+}
+
+export const isPackageAdmissionConflict = (error: unknown) =>
+  error instanceof LifecycleApiError &&
+  error.status === 409 &&
+  (error.code === 'marketplace_operation_conflict' || error.code === 'marketplace_request_conflict')
 
 /** Terminal history is independent of later current-state reconciliation and cached cards. */
 export function packageLifecyclePresentation(

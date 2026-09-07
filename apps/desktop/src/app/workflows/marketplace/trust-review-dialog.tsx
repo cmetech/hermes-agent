@@ -18,6 +18,7 @@ import type {
 } from '@/types/workflow-marketplace-lifecycle'
 
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
+import { conflictingPackagePresentation } from './package-lifecycle-presentation'
 import { ReviewFacts, ReviewValueList, WorkflowRiskReview } from './review-sections'
 
 export type TrustSelection = AllTrustSelection | OneTrustSelection
@@ -26,7 +27,10 @@ export type TrustReviewDialogView =
   | { kind: 'progress'; phase: string; progress: number; cancellable: boolean }
   | { kind: 'review'; review: TrustReviewProjection }
   | { kind: 'succeeded'; selection: TrustSelection; workflows: readonly TrustWorkflowState[] }
-  | { kind: 'cancelled' | 'evicted' | 'failed' | 'stale' | 'status' | 'unconfirmed'; recoverable?: boolean }
+  | {
+      kind: 'cancelled' | 'evicted' | 'failed' | 'stale' | 'status' | 'unconfirmed' | 'conflict'
+      recoverable?: boolean
+    }
 
 export interface TrustReviewDialogProps {
   availableWorkflowNames?: readonly string[]
@@ -227,7 +231,9 @@ export function TrustReviewDialog({
           </>
         ) : (
           <div role="alert">
-            {view.kind === 'unconfirmed' || view.kind === 'evicted' || view.kind === 'status' ? (
+            {view.kind === 'conflict' ? (
+              conflictingPackagePresentation.message
+            ) : view.kind === 'unconfirmed' || view.kind === 'evicted' || view.kind === 'status' ? (
               'State could not be confirmed. Refresh package state before trying again.'
             ) : view.kind === 'stale' ? (
               copy.workflowMarketplaceTrustNotGranted
