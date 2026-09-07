@@ -770,6 +770,8 @@ if (event.key === 'Escape' && narrow && selection) showPackageList()
 
 **Produces:** `MarketplaceTransactionStore.staging_root == self.root / ".staging"` and `MarketplaceTransactionStore.quarantine_root == self.root / ".quarantine"`, with existing private/no-follow/atomic ownership rules. Task 15B may initialize the real workflow runtime and marketplace service in either order without corrupting or rejecting a package transaction.
 
+**Threat boundary:** The private profile directory plus the marketplace lock is the supported concurrency authority. Defend against cooperating-process concurrency, RunStore activity, pre-existing hostile paths/artifacts, crashes and replacements at observable transaction phases. Do not claim portable atomic protection against a hostile same-OS-user process replacing a directory inside the interval between one filesystem syscall returning and the next identity check. Such a change must still prevent durable success/installed mutation once detected; cleanup retains anything whose current identity/marker is not proven.
+
 - [ ] Preserve the genuine integration REDs in `test_marketplace_installed_distribution_e2e.py`: initialize `RunStore` before install preparation and assert prepare/confirm commits; prepare first, initialize `RunStore`, then assert the exact transaction envelope remains and confirm commits. Before production changes, run through the repository wrapper and record the exact `transaction_destination_invalid` and `transaction_candidate_changed` failures.
 
 ```bash
@@ -780,6 +782,7 @@ HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh \
 
 - [ ] Add focused transaction-store tests that assert the exact disjoint roots, `0700` marketplace modes where POSIX modes apply, and bidirectional non-enumeration: RunStore orphan cleanup cannot observe/move a live marketplace `owner.json` envelope, and marketplace abandoned-staging/recovery cannot observe/remove a RunStore `.snapshot-owner.json` directory.
 - [ ] Add a persisted pre-release path test. A prepared record or journal naming `<profile-home>/workflows/.staging` or `.quarantine` must fail strict consistency before filesystem mutation. Assert the legacy envelope and installed/provenance/trust state are unchanged; do not migrate, chmod, delete, or reinterpret the entry.
+- [ ] Add fault tests at named observable phases: before scratch/envelope validation, before prepared/journal state publication, before installed swap, and before cleanup. A changed identity fails before a committed result or installed mutation; cleanup never removes a path whose identity/marker is already mismatched. Inject between phases, not by replacing the result of `mkdir`, `open`, or conditional removal from inside the filesystem call. Record same-account syscall-boundary replacement as outside the approved portable threat model rather than converting it into an unimplementable release gate.
 - [ ] Change only the marketplace transaction root derivation to the existing private marketplace state root. Keep `RunStore.staging_root`/`quarantine_root`, marker formats, installed destinations, journal schema/version, lock order, public error/result schemas, and recovery algorithms otherwise unchanged.
 
 ```python
@@ -788,7 +791,7 @@ self.quarantine_root = self.root / ".quarantine"
 ```
 
 - [ ] Run the two integration tests GREEN, then the complete marketplace transaction, operation, API, trust, CLI and RunStore recovery suites through `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh`. Include a restart/journal recovery case for install, update and remove using the new roots. Run `git diff --check`, changed-file formatting/lint, and a path audit proving marketplace production no longer constructs `<profile-home>/workflows/.staging` or `.quarantine`.
-- [ ] Commit only Task 15A code/tests as `fix(workflow): isolate marketplace transaction workspaces`. A fresh reviewer independently runs both initialization orders, recovery restart and foreign-artifact refusal. Do not resume locale/docs/Desktop/gate implementation until 15A is review-clean.
+- [ ] Commit only Task 15A code/tests as `fix(workflow): isolate marketplace transaction workspaces`. A fresh reviewer independently runs both initialization orders, recovery restart, foreign-artifact refusal and named phase-boundary changes against the documented threat model. Same-user syscall-boundary probes may be recorded as a nonblocking platform limitation but must not be reported as a supported guarantee. Do not resume locale/docs/Desktop/gate implementation until 15A is review-clean.
 
 ## Task 15B — Localization, documentation, end-to-end proof and release gates
 
