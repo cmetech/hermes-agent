@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 
-**Status:** Design direction approved; written amendment awaiting review
+**Status:** Approved
 
 **Amends:** [Workflow Marketplace Lifecycle Recovery Amendment](2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md)
 

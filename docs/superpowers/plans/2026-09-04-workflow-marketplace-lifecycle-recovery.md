@@ -1,6 +1,6 @@
 # Workflow Marketplace Lifecycle Recovery Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved the lifecycle recovery design on 2026-09-04, strict-wire correction on 2026-09-05, supervisor identity-binding design on 2026-09-05, inspection digest parity amendment on 2026-09-06, and the inspection-admission design direction on 2026-09-07 for implementation in the existing Hermes worktree only.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved the lifecycle recovery design on 2026-09-04, strict-wire correction on 2026-09-05, supervisor identity-binding design on 2026-09-05, inspection digest parity amendment on 2026-09-06, and the written inspection-admission amendment on 2026-09-07 for implementation in the existing Hermes worktree only.
 
 **Goal:** Finish the existing marketplace branch with truthful, recoverable lifecycle operations and independently reviewed release evidence.
 
