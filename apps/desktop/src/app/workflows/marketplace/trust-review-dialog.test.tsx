@@ -66,9 +66,13 @@ function trustReview(workflows = [workflow('diagnostic'), workflow('collector')]
   }
 }
 
-function renderDialog(view: TrustReviewDialogView, overrides: Partial<Parameters<typeof TrustReviewDialog>[0]> = {}) {
+function renderDialog(
+  view: TrustReviewDialogView,
+  overrides: Partial<Parameters<typeof TrustReviewDialog>[0]> = {},
+  locale = 'en'
+) {
   return render(
-    <I18nProvider configClient={null} initialLocale="en">
+    <I18nProvider configClient={null} initialLocale={locale}>
       <TrustReviewDialog
         onCancelOperation={vi.fn()}
         onClose={vi.fn()}
@@ -83,6 +87,28 @@ function renderDialog(view: TrustReviewDialogView, overrides: Partial<Parameters
     </I18nProvider>
   )
 }
+
+it.each(['ar', 'ja', 'zh', 'zh-hant'])(
+  'renders localized trust uncertainty and preserves selected identity in %s',
+  locale => {
+    const nativeScript = locale === 'ar' ? /[\u0600-\u06ff]/ : /[\u3040-\u30ff\u3400-\u9fff]/
+    const unknown = renderDialog({ kind: 'unconfirmed', recoverable: true }, {}, locale)
+    expect(screen.getByRole('alert').textContent).toMatch(nativeScript)
+    unknown.unmount()
+    renderDialog(
+      {
+        kind: 'succeeded',
+        selection: { type: 'one', workflow_name: 'diagnostic' },
+        workflows: [{ workflow_name: 'diagnostic', definition_path: 'workflows/diagnostic.yaml', state: 'trusted' }]
+      },
+      {},
+      locale
+    )
+    expect(screen.getByRole('status').textContent).toMatch(nativeScript)
+    expect(screen.getByRole('status').textContent).toContain('diagnostic')
+    expect(screen.getByRole('region').getAttribute('aria-label')).toMatch(nativeScript)
+  }
+)
 
 function deferred() {
   let resolve!: () => void

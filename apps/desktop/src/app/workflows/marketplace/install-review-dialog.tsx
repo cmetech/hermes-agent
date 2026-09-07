@@ -15,7 +15,7 @@ import type { WorkflowMarketplaceInstallReview, WorkflowMarketplaceUpdateReview 
 
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { marketplaceWebRepositoryHref } from './package-detail'
-import { type PackageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
+import type { PackageLifecyclePresentation } from './package-lifecycle-presentation'
 import {
   ReviewDiagnostics,
   ReviewFacts,
@@ -350,7 +350,7 @@ export function InstallReviewDialog({
           </p>
         ) : (
           <div role="alert">
-            <p>{unconfirmedPackagePresentation.message}</p>
+            <p>{copy.workflowMarketplaceUnconfirmed}</p>
           </div>
         )}
 
@@ -383,7 +383,7 @@ export function InstallReviewDialog({
             </Button>
           ) : view.kind === 'terminal' && view.canRetryCheck && onRetryCheck ? (
             <Button onClick={onRetryCheck} type="button">
-              Retry check
+              {copy.workflowMarketplaceRetryCheck}
             </Button>
           ) : view.kind === 'terminal' && view.canPrepareAgain ? (
             <Button onClick={onPrepareAgain} type="button">

@@ -385,6 +385,8 @@ _require_root_dependencies
 
 if [[ "$PHASE" == "base" ]]; then
   if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
+    "$PYTHON_BIN" scripts/generate_workflow_package_contract.py --check
+    "$PYTHON_BIN" scripts/generate_workflow_marketplace_lifecycle_fixtures.py --check
     if [[ ! -e "$ROOT/.venv" ]]; then
       SHARED_VENV="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd -P)"
       if [[ -f "$SHARED_VENV/bin/activate" ]]; then
@@ -470,6 +472,28 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
       tests/plugins/workflow/test_journal_reserve_fanout.py \
       tests/plugins/workflow/test_quarantine_replace_retry.py \
+      tests/plugins/workflow/test_marketplace_contract.py \
+      tests/plugins/workflow/test_marketplace_package.py \
+      tests/plugins/workflow/test_marketplace_git.py \
+      tests/plugins/workflow/test_marketplace_sources.py \
+      tests/plugins/workflow/test_marketplace_catalog.py \
+      tests/plugins/workflow/test_marketplace_provenance.py \
+      tests/plugins/workflow/test_marketplace_transactions.py \
+      tests/plugins/workflow/test_marketplace_service.py \
+      tests/plugins/workflow/test_marketplace_trust.py \
+      tests/plugins/workflow/test_marketplace_discovery.py \
+      tests/plugins/workflow/test_marketplace_cli.py \
+      tests/plugins/workflow/test_marketplace_api.py \
+      tests/plugins/workflow/test_marketplace_operations.py \
+      tests/plugins/workflow/test_marketplace_admissions.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_models.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_state.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_api.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py \
+      tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py \
+      tests/plugins/workflow/test_handoff_executor.py \
+      tests/plugins/workflow/test_local_handoff_e2e.py \
+      tests/plugins/workflow/test_remote_handoff_e2e.py \
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
       tests/test_packaging_metadata.py -q
@@ -516,6 +540,26 @@ if [[ "$PHASE" == "base" ]]; then
       src/app/kanban/adapter.test.ts \
       src/app/kanban/kanban-operations.e2e.test.tsx)
     (cd apps/desktop && npx tsc -p . --noEmit)
+    (cd apps/desktop && npx vitest run --project ui \
+      src/api/workflow-marketplace.test.ts \
+      src/api/workflow-marketplace-lifecycle.test.ts \
+      src/lib/workflow-marketplace-codec.test.ts \
+      src/lib/workflow-marketplace-lifecycle-codec.test.ts \
+      src/lib/workflow-marketplace-connection-binding.test.ts \
+      src/lib/workflow-marketplace-supervision.test.ts \
+      src/lib/workflow-marketplace-reconciliation.test.ts \
+      src/store/workflow-marketplace-supervisor.test.ts \
+      src/i18n/languages.test.ts \
+      src/app/workflows/marketplace/)
+    (cd apps/desktop && npx vitest run --project electron \
+      electron/connection-generation.test.ts electron/connection-apply.test.ts \
+      electron/connection-config-apply.test.ts electron/backend-connection-state.test.ts \
+      electron/api-transport.test.ts)
+    (cd apps/desktop && npx tsx --test electron/structured-api-channel.test.ts)
+    # Renderer/native build only: no packaging or publication command.
+    (cd apps/desktop && npm run build)
+    (cd apps/desktop && npx playwright test \
+      e2e/workflow-marketplace-lifecycle.spec.ts e2e/workflow-marketplace-layout.spec.ts)
   fi
   echo "TESTED_BASE_SHA=$(git rev-parse HEAD)"
   exit 0

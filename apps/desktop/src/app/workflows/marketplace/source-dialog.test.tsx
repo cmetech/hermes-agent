@@ -120,7 +120,7 @@ function deferred<T>() {
   return { promise, reject, resolve }
 }
 
-function renderDialog(controller = operations(), supported = true, requestedScope = scope) {
+function renderDialog(controller = operations(), supported = true, requestedScope = scope, locale = 'en') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   return {
@@ -128,7 +128,7 @@ function renderDialog(controller = operations(), supported = true, requestedScop
     controller,
     ...render(
       <QueryClientProvider client={client}>
-        <I18nProvider>
+        <I18nProvider configClient={null} initialLocale={locale}>
           <ManageWorkflowSourcesDialog
             onClose={vi.fn()}
             open
@@ -157,6 +157,13 @@ function rerenderDialog(
 }
 
 describe('ManageWorkflowSourcesDialog', () => {
+  it('localizes source progress without altering the reported phase or percentage', async () => {
+    const active = runningOperation()
+    renderDialog(operations({ operationForSource: () => active }), true, scope, 'ja')
+    const progress = await screen.findByText(/fetching.*40/)
+    expect(progress.textContent).toMatch(/[\u3040-\u30ff\u3400-\u9fff]/)
+  })
+
   beforeEach(() => {
     api.list.mockResolvedValue({ profile: 'support', sources: [source()] })
     api.add.mockResolvedValue({ profile: 'support', source: source() })
@@ -484,7 +491,9 @@ describe('ManageWorkflowSourcesDialog', () => {
     })
 
     renderDialog(controller)
-    fireEvent.click(await screen.findByRole('button', { name: 'Refresh all' }))
+    const refreshAll = await screen.findByRole('button', { name: 'Refresh all' })
+    await waitFor(() => expect((refreshAll as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(refreshAll)
     await waitFor(() => expect(order).toEqual(['company', 'team']))
     expect(screen.getByText('Refresh status unavailable')).toBeTruthy()
     expect(controller.start).not.toHaveBeenCalledWith('off', expect.anything())
@@ -515,7 +524,9 @@ describe('ManageWorkflowSourcesDialog', () => {
 
     const view = renderDialog(controller)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Refresh all' }))
+    const refreshAll = await screen.findByRole('button', { name: 'Refresh all' })
+    await waitFor(() => expect((refreshAll as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(refreshAll)
     await waitFor(() => expect(starts).toEqual([{ name: 'company', scopeKey: 'remote-a::support' }]))
 
     activeScopeKey = 'remote-b::support'

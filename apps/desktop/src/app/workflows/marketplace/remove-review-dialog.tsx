@@ -13,7 +13,7 @@ import { useI18n } from '@/i18n'
 import type { WorkflowMarketplaceRemoveReview } from '@/types/hermes'
 
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
-import { type PackageLifecyclePresentation, unconfirmedPackagePresentation } from './package-lifecycle-presentation'
+import type { PackageLifecyclePresentation } from './package-lifecycle-presentation'
 import { ReviewFacts, ReviewValueList } from './review-sections'
 
 export type RemoveReviewDialogView =
@@ -160,7 +160,7 @@ export function RemoveReviewDialog({
           <p role={view.presentation.kind === 'unconfirmed' ? 'alert' : 'status'}>{view.presentation.message}</p>
         ) : (
           <div role="alert">
-            <p>{unconfirmedPackagePresentation.message}</p>
+            <p>{copy.workflowMarketplaceUnconfirmed}</p>
           </div>
         )}
 

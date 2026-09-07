@@ -109,7 +109,7 @@ function CatalogRow({
   const runReasonId = useId()
 
   const runDisabledReason = stale
-    ? 'Refreshing package state'
+    ? t.operations.workflowMarketplaceRefreshingState
     : desktopWorkflowRunDisabledReason(item, t.operations, 'catalog')
 
   const inputCount = item.inputs.length
@@ -266,7 +266,7 @@ export function WorkflowCatalog({
   const rangeEnd = Math.min(filteredItems.length, currentPage * pageSize)
 
   if (truth.quarantined) {
-    return <p role="status">Refreshing package state</p>
+    return <p role="status">{t.operations.workflowMarketplaceRefreshingState}</p>
   }
 
   if (catalog.isLoading) {
@@ -313,12 +313,12 @@ export function WorkflowCatalog({
         <div>
           <p role="status">
             {truth.catalogState === 'recovery_required'
-              ? 'Recovery required. Last observed catalog.'
+              ? t.operations.workflowMarketplaceRecoveryCatalog
               : truth.catalogState === 'busy'
-                ? 'Package work in progress. Last observed catalog.'
+                ? t.operations.workflowMarketplaceBusyCatalog
                 : truth.catalogState === 'unknown'
-                  ? 'Package state is unconfirmed. Last observed catalog.'
-                  : 'Last observed — Refreshing package state'}
+                  ? t.operations.workflowMarketplaceUnconfirmedCatalog
+                  : t.operations.workflowMarketplaceLastObservedRefreshing}
           </p>
           <Button onClick={() => void catalog.refetch()} size="sm" type="button" variant="secondary">
             {t.operations.workflowCatalogRetry}

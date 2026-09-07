@@ -50,6 +50,8 @@ export function usePackageLifecycle({
   focusFallbackRef,
   detail
 }: PackageLifecycleProps) {
+  const { t } = useI18n()
+  const copy = t.operations
   const supervisor = useMarketplaceSupervisor()
   const queryClient = useQueryClient()
   const records = useSyncExternalStore(supervisor.$records.subscribe, supervisor.$records.get)
@@ -373,14 +375,14 @@ export function usePackageLifecycle({
   const presentation = attachment?.tokenUnavailable
     ? {
         ...unconfirmedPackagePresentation,
-        message: 'Review is unavailable. Prepare a fresh review.',
+        message: copy.workflowMarketplaceReviewUnavailable,
         canPrepareAgain: true
       }
     : attachment?.conflict
-      ? conflictingPackagePresentation
+      ? { ...conflictingPackagePresentation, message: copy.workflowMarketplaceConflict }
       : record
-        ? packageLifecyclePresentation(record, attachment?.preparation)
-        : unconfirmedPackagePresentation
+        ? packageLifecyclePresentation(record, attachment?.preparation, copy)
+        : { ...unconfirmedPackagePresentation, message: copy.workflowMarketplaceUnconfirmed }
 
   useEffect(() => {
     if (

@@ -8,6 +8,7 @@ import { profileScopeKey } from '@/api/client'
 import { WorkflowMarketplaceApiError } from '@/api/workflow-marketplace'
 import type * as Hermes from '@/hermes'
 import { I18nProvider } from '@/i18n'
+import { TRANSLATIONS } from '@/i18n/catalog'
 import type {
   WorkflowMarketplaceCatalogPackage,
   WorkflowMarketplaceInstalledPackage,
@@ -537,12 +538,13 @@ function page(
 
 function renderWithProviders(
   node: ReactNode,
-  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  locale = 'en'
 ) {
   return {
     client,
     ...render(
-      <I18nProvider configClient={null} initialLocale="en">
+      <I18nProvider configClient={null} initialLocale={locale}>
         <QueryClientProvider client={client}>{node}</QueryClientProvider>
       </I18nProvider>
     )
@@ -4209,6 +4211,73 @@ describe('workflow package lifecycle', () => {
 })
 
 describe('supervised marketplace readiness and transitional adapters', () => {
+  it.each(['ar', 'ja', 'zh', 'zh-hant'] as const)('localizes verified package trust and absence in %s', locale => {
+    const inspection = legacyInspectionFixture('service inspect')
+    const terminal = lifecycleFixture('service grant all')
+
+    if (
+      inspection.result?.type !== 'package_detail' ||
+      !terminal.outcome ||
+      !('package_state' in terminal.outcome) ||
+      !terminal.outcome.package_state
+    ) {
+      throw new Error('Expected verified package fixtures')
+    }
+
+    const nativeScript = locale === 'ar' ? /[\u0600-\u06ff]/ : /[\u3040-\u30ff\u3400-\u9fff]/
+    renderWithProviders(
+      <MarketplacePackageDetail
+        detail={inspection.result.value}
+        lifecycleUnavailable
+        packageState={terminal.outcome.package_state}
+      />,
+      undefined,
+      locale
+    )
+    const trust = screen.getByRole('region', { name: TRANSLATIONS[locale].operations.workflowMarketplaceCurrentTrust })
+    expect(trust.getAttribute('aria-label')).toMatch(nativeScript)
+    cleanup()
+    renderWithProviders(
+      <MarketplacePackageDetail
+        detail={inspection.result.value}
+        lifecycleUnavailable
+        packageState={{ ...terminal.outcome.package_state, state: 'absent', installed: null, trust: null }}
+      />,
+      undefined,
+      locale
+    )
+
+    for (const status of screen.getAllByRole('status')) {
+      expect(status.textContent).toMatch(nativeScript)
+    }
+  })
+
+  it.each(['ar', 'ja', 'zh', 'zh-hant'])(
+    'localizes last-observed metadata without changing package identity in %s',
+    locale => {
+      const operation = legacyInspectionFixture('service inspect')
+
+      if (operation.result?.type !== 'package_detail') {
+        throw new Error('Expected inspection')
+      }
+
+      const detail = operation.result.value
+      renderWithProviders(
+        <MarketplacePackageDetail detail={detail} lastObserved lifecycleUnavailable />,
+        undefined,
+        locale
+      )
+      const nativeScript = locale === 'ar' ? /[\u0600-\u06ff]/ : /[\u3040-\u30ff\u3400-\u9fff]/
+
+      for (const status of screen.getAllByRole('status')) {
+        expect(status.textContent).toMatch(nativeScript)
+      }
+
+      expect(screen.getByText(detail.identifier)).toBeTruthy()
+      expect(screen.queryByText(/Last observed/)).toBeNull()
+    }
+  )
+
   function Candidate({ detail, queryKey }: { detail: WorkflowMarketplacePackageDetail; queryKey: QueryKey }) {
     const truth = useMarketplaceReadOnlyScope(scopeA)
 

@@ -25,6 +25,39 @@ hermes workflow doctor ./portable-package/workflows/check.yaml --compat-report -
 
 `list`, `show`, `validate`, and `doctor` do not contact a model or network service.
 
+## Marketplace lifecycle and operator recovery
+
+Git-distributed packages use the shared CLI/Desktop marketplace service. See
+[Workflow packages](../website/docs/user-guide/features/workflow-packages.md) for
+publisher manifests, exact-byte digests/indexes, private Git authentication, and
+review → install → separate trust → update → removal. Publishers manage Git
+commits and pushes themselves. Installation never executes package scripts.
+
+Desktop actions target the selected backend/profile. Locked package state,
+installed provenance, origin-scoped trust, and owned transaction journals are
+authoritative; cached catalog cards and retained operation history are not.
+The V2 supervisor preserves the exact five-field binding and original request
+envelope for admission lookup/replay. Closing a dialog does not cancel work.
+Refresh failures retain visible last-observed data and keep affected actions
+gated. An existing inspection allows lifecycle admission, but an existing
+lifecycle operation blocks another inspect/lifecycle start for that package.
+Late inspection responses cannot restore pre-mutation current-state authority.
+
+```bash
+hermes --profile support workflow package-state company/laptop-support --json
+hermes --profile support workflow recover-packages --yes --json
+```
+
+Run these on the affected backend. State is a read-only locked observation;
+recovery is an explicit profile-wide operation that checks ownership, refuses
+active writers/live preparations, and revalidates the scope before mutation.
+Doctor does not recover marketplace transactions. A verified rollback can
+establish the previous version; rollback failure or ambiguous recovery cannot.
+Keep ambiguous artifacts and report unconfirmed state, not a presumed installed
+version. Refresh after recovery. Backend restart rotates the in-memory registry
+epoch; durable state/journals survive, but old admissions cannot be replayed
+across that new epoch.
+
 ## Trust and immutable execution
 
 External executable packages begin untrusted. `doctor` reports the exact package digest, a separately bound risk digest, shell/script use, tools, skills, local MCP processes, providers, outward actions, required secret *names*, execution mode, and effective limits without exposing prompt or secret bodies.

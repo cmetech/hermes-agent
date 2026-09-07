@@ -324,13 +324,14 @@ def _enumerate_workflow_candidates_for_catalog(
     consume_entry: Callable[[], None],
     directory_entries: Callable[[Path], Iterable[_DirectoryEntry]],
     follow_file_symlinks: bool,
+    binding_resolver: WorkflowBindingResolver | None = None,
 ) -> tuple[tuple[WorkflowCandidate | WorkflowCandidateFailure, ...], bool]:
     """Return a bounded catalog batch without loading later package roots."""
 
     return _enumerate_workflow_candidate_records(
         location,
         excluded_top_level=excluded_top_level,
-        binding_resolver=None,
+        binding_resolver=binding_resolver,
         consume_entry=consume_entry,
         directory_entries=directory_entries,
         follow_file_symlinks=follow_file_symlinks,

@@ -300,7 +300,7 @@ class LifecycleApi:
                 else WorkflowMarketplaceService(home, profile=profile)
             ),
             home_resolver=lambda: self.home,
-            profile_resolver=lambda home: "support",
+            profile_resolver=lambda home: service.profile,
             max_profiles=1,
             operation_limits={"max_workers": 2, "max_in_flight": 32},
         )

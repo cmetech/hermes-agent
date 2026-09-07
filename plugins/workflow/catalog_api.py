@@ -47,6 +47,7 @@ from plugins.workflow.marketplace.discovery import (
     WorkflowCandidate,
     WorkflowCandidateFailure,
     _enumerate_workflow_candidates_for_catalog,
+    installed_binding_resolver,
 )
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError
 from plugins.workflow.projection_limits import (
@@ -593,6 +594,9 @@ def _catalog_candidates(
                 consume_entry=scan_budget.consume,
                 directory_entries=_directory_entries,
                 follow_file_symlinks=False,
+                binding_resolver=installed_binding_resolver(hermes_home)
+                if profile
+                else None,
             )
         except WorkflowCatalogCapacityError:
             raise

@@ -484,7 +484,16 @@ def test_marketplace_mutation_route_groups_require_admin_scope(
     for response in (read, write):
         assert response.status_code == 403
         assert response.json()["detail"]["code"] == "workflow_admin_required"
-    assert admin.status_code in {201, 202, 404}
+    if any(
+        f"/marketplace/{group}/" in path
+        for group in ("install", "update", "remove", "trust")
+    ):
+        assert admin.status_code == 409
+        assert admin.json() == {
+            "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+        }
+    else:
+        assert admin.status_code in {201, 202, 404}
     assert admin.status_code not in {401, 403}
 
 

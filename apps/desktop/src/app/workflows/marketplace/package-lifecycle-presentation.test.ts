@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { TRANSLATIONS } from '@/i18n/catalog'
 import type { SupervisedRecord } from '@/store/workflow-marketplace-supervisor'
 
 import { lifecycleFixture } from './lifecycle-test-harness'
@@ -32,6 +33,43 @@ function record(name: string): SupervisedRecord {
 }
 
 describe('authoritative package lifecycle presentation', () => {
+  it.each(['ar', 'ja', 'zh', 'zh-hant'] as const)('localizes terminal and unknown evidence in %s', locale => {
+    const nativeScript = locale === 'ar' ? /[\u0600-\u06ff]/ : /[\u3040-\u30ff\u3400-\u9fff]/
+
+    for (const name of [
+      'service install confirm',
+      'service update confirm',
+      'service remove confirm',
+      'service verified rollback',
+      'service rollback failed',
+      'service recovery ambiguous',
+      'service install prepare cancelled',
+      'service unchanged update',
+      'service update check',
+      'service available update check',
+      'service orphaned update check',
+      'service failed update check'
+    ]) {
+      const actual = packageLifecyclePresentation(record(name), undefined, TRANSLATIONS[locale].operations)
+      expect(actual.message, name).toMatch(nativeScript)
+
+      if (name === 'service install confirm') {
+        expect(actual.message).toContain('1.0.0')
+      }
+
+      if (name === 'service update confirm') {
+        expect(actual.message).toContain('2.0.0')
+      }
+    }
+
+    const unknown = packageLifecyclePresentation(
+      { ...record('service update confirm'), status: 'status_unknown' },
+      undefined,
+      TRANSLATIONS[locale].operations
+    )
+    expect(unknown.message).toMatch(nativeScript)
+    expect(unknown.message).not.toContain('2.0.0')
+  })
   it('offers a new check, not preparation or status retry, after an authoritative check error', () => {
     const actual = packageLifecyclePresentation(record('service failed update check'))
     expect(actual.retryAction).toBe('check')

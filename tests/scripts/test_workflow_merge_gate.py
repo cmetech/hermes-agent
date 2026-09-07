@@ -214,6 +214,17 @@ def _exercise_base_gate(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str
         "{ printf 'npx'; printf '\\t%s' \"$@\"; printf '\\n'; } >>\"$CAPTURE_LOG\"\n"
     )
     (fixture_bin / "npx").chmod(0o755)
+    shutil.copyfile(fixture_bin / "npx", fixture_bin / "npm")
+    (fixture_bin / "npm").chmod(0o755)
+    for generator in (
+        "generate_workflow_package_contract.py",
+        "generate_workflow_marketplace_lifecycle_fixtures.py",
+    ):
+        (repo / "scripts" / generator).write_text(
+            "import os, sys\n"
+            "with open(os.environ['CAPTURE_LOG'], 'a') as log:\n"
+            "    log.write('generator\\t' + os.path.basename(__file__) + '\\t' + '\\t'.join(sys.argv[1:]) + '\\n')\n"
+        )
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     _write_parser_dependencies(repo)
@@ -249,6 +260,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         for command in commands
         if command[:3] == ["npx", "vitest", "run"]
         for path in command[3:]
+        if path.endswith((".ts", ".tsx", "/"))
     ]
     assert len(selected_python) == len(set(selected_python))
     assert len(selected_desktop) == len(set(selected_desktop))
@@ -311,7 +323,45 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     assert not (opted_out - workflow_inventory)
     assert not (opted_out & selected_workflow)
     assert not (set(PROHIBITED_WORKFLOW_GATE_SUITES) & selected_workflow)
-    assert not (workflow_inventory - selected_workflow - opted_out)
+    assert not (workflow_inventory - selected_workflow - opted_out), sorted(
+        workflow_inventory - selected_workflow - opted_out
+    )
+
+
+def test_base_gate_runs_marketplace_lifecycle_proof_without_moving_base(tmp_path):
+    result, commands = _exercise_base_gate(tmp_path)
+    assert result.returncode == 0, result.stderr
+    selected = [argument for command in commands for argument in command]
+    assert "tests/plugins/workflow/test_marketplace_lifecycle_api.py" in selected
+    assert (
+        "tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py"
+        in selected
+    )
+    assert "src/store/workflow-marketplace-supervisor.test.ts" in selected
+    assert "src/lib/workflow-marketplace-lifecycle-codec.test.ts" in selected
+    assert "e2e/workflow-marketplace-lifecycle.spec.ts" in selected
+    assert "e2e/workflow-marketplace-layout.spec.ts" in selected
+    assert ["generator", "generate_workflow_package_contract.py", "--check"] in commands
+    assert [
+        "generator",
+        "generate_workflow_marketplace_lifecycle_fixtures.py",
+        "--check",
+    ] in commands
+    repo = tmp_path / "gate-contract-repo"
+    assert (
+        subprocess.check_output(["git", "branch", "--show-current"], cwd=repo).strip()
+        == b"base"
+    )
+    assert (
+        subprocess.check_output(["git", "log", "--format=%s"], cwd=repo).strip()
+        == b"fixture"
+    )
+    assert (
+        subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo
+        )
+        == b""
+    )
 
 
 def _portability_matrix() -> dict:
@@ -803,6 +853,11 @@ def test_gate_rejects_escaping_sibling_invocation_dependency_view(
 
 
 def _install_full_gate_fixtures(repo: Path, tmp_path: Path) -> dict[str, str]:
+    for generator in (
+        "generate_workflow_package_contract.py",
+        "generate_workflow_marketplace_lifecycle_fixtures.py",
+    ):
+        (repo / "scripts" / generator).write_text("pass\n", encoding="utf-8")
     run_tests = repo / "scripts/run_tests.sh"
     run_tests.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     run_tests.chmod(0o755)
@@ -833,6 +888,8 @@ def _install_full_gate_fixtures(repo: Path, tmp_path: Path) -> dict[str, str]:
         encoding="utf-8",
     )
     npx.chmod(0o755)
+    shutil.copyfile(npx, fixture_bin / "npm")
+    (fixture_bin / "npm").chmod(0o755)
     env = os.environ.copy()
     env.pop("WORKFLOW_MERGE_GATE_FAST", None)
     env["PATH"] = f"{fixture_bin}{os.pathsep}{env['PATH']}"
@@ -886,6 +943,11 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
         "vitest",
         "vitest",
         "tsc",
+        "vitest",
+        "vitest",
+        "tsx",
+        "run",
+        "playwright",
     ]
     assert (desktop_modules / "fixture-package/package.json").is_file()
     assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"

@@ -2051,6 +2051,36 @@ export interface Translations {
     workflowViews: string
     workflowInstalled: string
     workflowMarketplace: string
+    workflowMarketplaceUnconfirmed: string
+    workflowMarketplaceConflict: string
+    workflowMarketplaceRecoveryRequired: string
+    workflowMarketplaceCancelledBeforeCommit: string
+    workflowMarketplaceRemovalCompleted: string
+    workflowMarketplaceInstalledVersionResult: (version: string) => string
+    workflowMarketplaceUpdatedVersionResult: (version: string) => string
+    workflowMarketplaceInstallationNoTrust: string
+    workflowMarketplaceUntrustedRunRequirement: string
+    workflowMarketplaceUpdateAvailableResult: string
+    workflowMarketplaceCheckError: string
+    workflowMarketplaceOrphaned: string
+    workflowMarketplaceCurrentlyInstalled: (version: string) => string
+    workflowMarketplaceRolledBack: string
+    workflowMarketplaceNoPackageChanges: string
+    workflowMarketplaceReviewUnavailable: string
+    workflowMarketplaceTrustOneGranted: (name: string) => string
+    workflowMarketplaceTrustAllGranted: string
+    workflowMarketplaceCurrentTrust: string
+    workflowMarketplaceUnconfirmedRefresh: string
+    workflowMarketplaceRefreshingState: string
+    workflowMarketplaceLastObservedRefreshing: string
+    workflowMarketplaceLastObservedPrefix: string
+    workflowMarketplaceAbsentLastObserved: string
+    workflowMarketplaceRecoveryUnconfirmed: string
+    workflowMarketplaceRefreshState: string
+    workflowMarketplaceLastObservedSearch: string
+    workflowMarketplaceRecoveryCatalog: string
+    workflowMarketplaceBusyCatalog: string
+    workflowMarketplaceUnconfirmedCatalog: string
     workflowMarketplaceCapabilityLoading: string
     workflowMarketplaceUpgradeTitle: string
     workflowMarketplaceUpgradeDescription: string
@@ -2205,6 +2235,8 @@ export interface Translations {
     workflowMarketplaceGrantTrust: string
     workflowMarketplacePrepareAgain: string
     workflowMarketplaceRetryStatus: string
+    workflowMarketplaceRetryCheck: string
+    workflowMarketplaceAbsent: string
     workflowMarketplaceReviewDigest: string
     workflowMarketplaceCandidateVersion: string
     workflowMarketplaceCandidateCommit: string

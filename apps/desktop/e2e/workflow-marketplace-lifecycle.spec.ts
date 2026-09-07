@@ -5,7 +5,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
-import { expect, test } from './test'
+import { allowErrorBanners, expect, test } from './test'
 
 const ROOT = path.resolve(import.meta.dirname, '../../..')
 
@@ -91,6 +91,7 @@ assert service.refresh_source("company").state == "fresh"
         if (request.path.includes('/lifecycle/v2/'))
           observed.push({
             path: request.path,
+            requestId: request.body?.request_id,
             id: response.value?.id,
             kind: response.value?.kind,
             ok: response.ok,
@@ -98,6 +99,31 @@ assert service.refresh_source("company").state == "fresh"
             state: response.value?.state,
             code: response.value?.error?.code ?? response.body?.detail?.code
           })
+        const fault = (
+          globalThis as unknown as {
+            lifecycleFault?: {
+              dropConfirm: boolean
+              failState: boolean
+              lookup: Promise<void>
+              failedReads: number
+              requestId?: string
+              operationId?: string
+            }
+          }
+        ).lifecycleFault
+        if (fault && request.path.includes('/lifecycle/v2/')) {
+          if (fault.dropConfirm && request.path.endsWith('/install/confirm') && response.ok) {
+            fault.dropConfirm = false
+            fault.requestId = request.body.request_id
+            fault.operationId = response.value?.id
+            throw new Error('deliberately lost confirmed admission response')
+          }
+          if (request.path.includes('/admissions/') || request.path.endsWith('/install/confirm')) await fault.lookup
+          if (fault.failState && request.path.endsWith('/state')) {
+            fault.failedReads += 1
+            return { ok: false, status: 503, body: { detail: { code: 'marketplace_internal_error' } } }
+          }
+        }
         const hold = (globalThis as unknown as { inspectionHold?: { id: string | null; promise: Promise<void> } })
           .inspectionHold
         if (hold && !hold.id && response.value?.kind === 'inspect' && response.value.id) {
@@ -119,7 +145,12 @@ assert service.refresh_source("company").state == "fresh"
 
   test.afterEach(async ({}, testInfo) => {
     await fixture.app.evaluate(() => {
-      ;(globalThis as unknown as { inspectionHold?: { release: () => void } }).inspectionHold?.release()
+      const controls = globalThis as unknown as {
+        inspectionHold?: { release: () => void }
+        lifecycleFault?: { release: () => void }
+      }
+      controls.inspectionHold?.release()
+      controls.lifecycleFault?.release()
     })
     const evidence = await fixture.app.evaluate(
       () => (globalThis as unknown as { marketplaceEvidence: unknown[] }).marketplaceEvidence
@@ -232,5 +263,87 @@ assert service.refresh_source("company").state == "fresh"
       ;(globalThis as unknown as { inspectionHold: { release: () => void } }).inspectionHold.release()
     })
     await expect(installed).toHaveCount(0)
+  })
+
+  test('recovers a lost confirmation across close and tab return without bypassing failed state reads', async () => {
+    allowErrorBanners()
+    const page = fixture.page
+    await page.getByRole('tab', { name: 'Marketplace', exact: true }).click()
+    await page.getByRole('option', { name: /Laptop Support/ }).click()
+    await page.getByRole('button', { name: 'Install package', exact: true }).click()
+    const dialog = page.locator('[data-marketplace-lifecycle-dialog][data-state="open"]')
+    await expect(dialog.getByRole('button', { name: 'Confirm install', exact: true })).toBeEnabled()
+    await fixture.app.evaluate(() => {
+      let release!: () => void
+      const lookup = new Promise<void>(resolve => {
+        release = resolve
+      })
+      ;(globalThis as unknown as { lifecycleFault: unknown }).lifecycleFault = {
+        dropConfirm: true,
+        failState: true,
+        lookup,
+        release,
+        failedReads: 0
+      }
+    })
+    await dialog.getByRole('button', { name: 'Confirm install', exact: true }).click()
+    await expect(dialog.getByText(/State could not be confirmed/)).toBeVisible()
+    await dialog.getByRole('button', { name: 'Retry status', exact: true }).click()
+    await dialog.getByRole('button', { name: 'Close', exact: true }).first().click()
+    await expect(dialog).toHaveCount(0)
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement !== document.body && document.activeElement !== null))
+      .toBe(true)
+    await page.getByRole('tab', { name: 'Installed', exact: true }).click()
+    await page.getByRole('tab', { name: 'Marketplace', exact: true }).click()
+    await fixture.app.evaluate(() => {
+      ;(globalThis as unknown as { lifecycleFault: { release: () => void } }).lifecycleFault.release()
+    })
+    const destination = path.join(fixture.sandbox.hermesHome, 'workflows/marketplace/company/laptop-support')
+    await expect.poll(() => fs.existsSync(path.join(destination, 'workflow-package.json'))).toBe(true)
+    await expect
+      .poll(() =>
+        fixture.app.evaluate(
+          () => (globalThis as unknown as { lifecycleFault: { failedReads: number } }).lifecycleFault.failedReads
+        )
+      )
+      .toBeGreaterThan(0)
+    await page.getByRole('option', { name: /Laptop Support/ }).click()
+    await expect(page.getByText(/Last observed/).first()).toBeVisible()
+    await expect(
+      page
+        .locator('button:enabled')
+        .filter({ hasText: /^(Install package|Update package|Review trust|Remove package)$/ })
+    ).toHaveCount(0)
+    const evidence = await fixture.app.evaluate(() => {
+      const state = globalThis as unknown as {
+        marketplaceEvidence: Array<{ path: string; id?: string; requestId?: string }>
+        lifecycleFault: { requestId: string; operationId: string }
+      }
+      return {
+        requestId: state.lifecycleFault.requestId,
+        operationId: state.lifecycleFault.operationId,
+        admissions: state.marketplaceEvidence
+          .filter(item => item.path.endsWith('/install/confirm') && item.requestId === state.lifecycleFault.requestId)
+          .map(item => item.id)
+      }
+    })
+    // Retry status replays the exact original request. Both responses identify
+    // one backend admission; the retry is not a new confirmation intent.
+    expect(evidence.admissions).toEqual([evidence.operationId, evidence.operationId])
+    expect(evidence.requestId).toEqual(expect.any(String))
+    await fixture.app.evaluate(() => {
+      ;(globalThis as unknown as { lifecycleFault: { failState: boolean } }).lifecycleFault.failState = false
+    })
+    await page.getByRole('button', { name: 'Refresh state', exact: true }).click()
+    await page.getByRole('tab', { name: 'Installed', exact: true }).click()
+    const installed = page.getByRole('article', { name: 'company/laptop-support installed package' })
+    await expect(installed.getByRole('button', { name: 'Review trust', exact: true })).toBeEnabled()
+    expect(JSON.parse(fs.readFileSync(path.join(destination, 'workflow-package.json'), 'utf8')).version).toBe('1.0.0')
+    const diagnostic = page
+      .getByRole('row')
+      .filter({ has: page.getByRole('cell', { name: 'diagnostic', exact: true }) })
+    await expect(diagnostic.getByRole('cell', { name: 'untrusted', exact: true })).toBeVisible()
+    await expect(diagnostic.getByRole('button', { name: 'Run', exact: true })).toBeDisabled()
   })
 })

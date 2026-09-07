@@ -537,7 +537,9 @@ export function ManageWorkflowSourcesDialog({
                           ) : null}
                           <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{statusLabel(source)}</span>
                           {active && (active.state === 'pending' || active.state === 'running') ? (
-                            <span role="status">{`${active.phase} ${active.progress}%`}</span>
+                            <span role="status">
+                              {copy.workflowMarketplaceOperationProgress(active.phase, active.progress)}
+                            </span>
                           ) : null}
                         </div>
                         <code className="truncate text-xs">{source.repository_url}</code>

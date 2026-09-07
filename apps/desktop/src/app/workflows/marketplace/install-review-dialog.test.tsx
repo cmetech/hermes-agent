@@ -129,10 +129,11 @@ function updateReview(): WorkflowMarketplaceUpdateReview {
 
 function renderDialog(
   view: InstallReviewDialogView,
-  overrides: Partial<Parameters<typeof InstallReviewDialog>[0]> = {}
+  overrides: Partial<Parameters<typeof InstallReviewDialog>[0]> = {},
+  locale = 'en'
 ) {
   return render(
-    <I18nProvider configClient={null} initialLocale="en">
+    <I18nProvider configClient={null} initialLocale={locale}>
       <InstallReviewDialog
         onCancelOperation={vi.fn()}
         onClose={vi.fn()}
@@ -160,6 +161,28 @@ function deferred() {
 afterEach(cleanup)
 
 describe('InstallReviewDialog', () => {
+  it('localizes the retry-check action without confusing it with preparation', () => {
+    renderDialog(
+      {
+        kind: 'terminal',
+        mode: 'update',
+        canPrepareAgain: false,
+        canRetry: false,
+        canRetryCheck: true,
+        presentation: { kind: 'check_error', message: '', canPrepareAgain: false, retryAction: 'check' }
+      },
+      { onRetryCheck: vi.fn() },
+      'ja'
+    )
+    expect(screen.queryByRole('button', { name: 'Retry check' })).toBeNull()
+    const buttons = screen.getAllByRole('button')
+    expect(
+      buttons.every(button =>
+        /[\u3040-\u30ff\u3400-\u9fff]/.test(button.textContent || button.getAttribute('aria-label') || '')
+      )
+    ).toBe(true)
+  })
+
   it('renders every exact install fact and risk surface without exposing the confirmation token', () => {
     renderDialog({ kind: 'review', mode: 'install', review: installReview() })
 

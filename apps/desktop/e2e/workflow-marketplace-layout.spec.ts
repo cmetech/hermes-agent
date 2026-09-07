@@ -209,17 +209,20 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
       transitionDisabled: true
     })
     const close = review.locator('button[data-slot="button"]').filter({ hasText: 'Close' })
-    const retryPreparation = review.getByRole('button', { name: 'Prepare again', exact: true })
+    const confirm = review.getByRole('button', { name: 'Confirm install', exact: true })
+    const reviewRepository = review.getByRole('link').first()
     const iconClose = review.locator('button[data-slot="dialog-close-button"]')
-    await expect(retryPreparation).toBeVisible({ timeout: 60_000 })
+    await expect(confirm).toBeEnabled({ timeout: 60_000 })
     await expect(close).toBeFocused()
 
-    for (const action of [retryPreparation, iconClose, close]) {
+    for (const action of [confirm, iconClose, reviewRepository, close]) {
       await page.keyboard.press('Tab')
       await expect(action).toBeFocused()
       await expect(action).toBeInViewport()
     }
 
+    await page.keyboard.press('Shift+Tab')
+    await expect(reviewRepository).toBeFocused()
     await page.keyboard.press('Shift+Tab')
     await expect(iconClose).toBeFocused()
     await page.keyboard.press('Escape')

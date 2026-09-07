@@ -554,7 +554,7 @@ export function WorkflowMarketplaceView({ headingRef, scope }: WorkflowMarketpla
       ) : detail ? (
         <div className={narrow ? 'mt-3' : undefined}>
           {truth.packageGate(detail.identity)?.state === 'recovery_required' ? (
-            <p role="status">Recovery required. Package state is unconfirmed.</p>
+            <p role="status">{copy.workflowMarketplaceRecoveryUnconfirmed}</p>
           ) : null}
           <MarketplacePackageDetail
             detail={detail}
@@ -581,7 +581,7 @@ export function WorkflowMarketplaceView({ headingRef, scope }: WorkflowMarketpla
                 type="button"
                 variant="secondary"
               >
-                Refresh state
+                {copy.workflowMarketplaceRefreshState}
               </Button>
               <Button onClick={retryDetail} size="sm" type="button" variant="secondary">
                 {copy.workflowCatalogRetry}
@@ -619,7 +619,7 @@ export function WorkflowMarketplaceView({ headingRef, scope }: WorkflowMarketpla
   if (truth.quarantined) {
     return (
       <>
-        <p role="status">Refreshing package state</p>
+        <p role="status">{copy.workflowMarketplaceRefreshingState}</p>
         {lifecycle}
       </>
     )
@@ -776,7 +776,7 @@ export function WorkflowMarketplaceView({ headingRef, scope }: WorkflowMarketpla
               <>
                 {truth.supervisor ? (
                   <p className="text-xs" role="status">
-                    Last observed search metadata
+                    {copy.workflowMarketplaceLastObservedSearch}
                   </p>
                 ) : null}
                 <MarketplacePackageList

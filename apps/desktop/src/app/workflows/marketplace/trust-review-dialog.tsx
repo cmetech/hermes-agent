@@ -18,7 +18,6 @@ import type {
 } from '@/types/workflow-marketplace-lifecycle'
 
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
-import { conflictingPackagePresentation } from './package-lifecycle-presentation'
 import { ReviewFacts, ReviewValueList, WorkflowRiskReview } from './review-sections'
 
 export type TrustSelection = AllTrustSelection | OneTrustSelection
@@ -214,11 +213,11 @@ export function TrustReviewDialog({
           <>
             <p role="status">
               {view.selection.type === 'one'
-                ? `Trust granted for ${view.selection.workflow_name}.`
-                : 'Trust granted for all reviewed workflows.'}
+                ? copy.workflowMarketplaceTrustOneGranted(view.selection.workflow_name)
+                : copy.workflowMarketplaceTrustAllGranted}
             </p>
-            <section aria-label="Current package trust" role="region">
-              <h3 className="text-xs font-medium">Current package trust</h3>
+            <section aria-label={copy.workflowMarketplaceCurrentTrust} role="region">
+              <h3 className="text-xs font-medium">{copy.workflowMarketplaceCurrentTrust}</h3>
               <ul className="mt-1 space-y-1 text-xs">
                 {view.workflows.map(workflow => (
                   <li className="flex justify-between gap-2" key={workflow.workflow_name}>
@@ -232,9 +231,9 @@ export function TrustReviewDialog({
         ) : (
           <div role="alert">
             {view.kind === 'conflict' ? (
-              conflictingPackagePresentation.message
+              copy.workflowMarketplaceConflict
             ) : view.kind === 'unconfirmed' || view.kind === 'evicted' || view.kind === 'status' ? (
-              'State could not be confirmed. Refresh package state before trying again.'
+              copy.workflowMarketplaceUnconfirmedRefresh
             ) : view.kind === 'stale' ? (
               copy.workflowMarketplaceTrustNotGranted
             ) : (

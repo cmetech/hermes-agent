@@ -133,7 +133,7 @@ export function MarketplacePackageDetail({
       role="region"
     >
       <header>
-        {lastObserved ? <p role="status">Last observed — Refreshing package state</p> : null}
+        {lastObserved ? <p role="status">{copy.workflowMarketplaceLastObservedRefreshing}</p> : null}
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div className="min-w-0">
             <h2 className="text-lg font-medium text-(--ui-text-primary)">{detail.display_name}</h2>
@@ -144,12 +144,12 @@ export function MarketplacePackageDetail({
             {installed ? <Badge variant="muted">{copy.workflowMarketplaceInstalled}</Badge> : null}
             {installed && detail.update_status === 'current' ? (
               <Badge variant="default">
-                {lastObserved ? 'Last observed: ' : ''}
+                {lastObserved ? copy.workflowMarketplaceLastObservedPrefix : ''}
                 {copy.workflowMarketplaceCurrent}
               </Badge>
             ) : installed && detail.update_status === 'update_available' ? (
               <Badge variant="warn">
-                {lastObserved ? 'Last observed: ' : ''}
+                {lastObserved ? copy.workflowMarketplaceLastObservedPrefix : ''}
                 {copy.workflowMarketplaceUpdateAvailable}
               </Badge>
             ) : null}
@@ -312,7 +312,7 @@ export function MarketplacePackageDetail({
               </span>
               {!packageState ? (
                 <Badge className="ms-2" size="xs" variant={workflow.trust_state === 'trusted' ? 'default' : 'warn'}>
-                  {lastObserved ? 'Last observed: ' : ''}
+                  {lastObserved ? copy.workflowMarketplaceLastObservedPrefix : ''}
                   {workflow.trust_state === 'trusted' ? copy.workflowTrusted : copy.workflowUntrusted}
                 </Badge>
               ) : null}
@@ -327,8 +327,8 @@ export function MarketplacePackageDetail({
       </section>
 
       {packageState?.trust ? (
-        <section aria-label="Current package trust" role="region">
-          <h3 className="text-xs font-medium">Current package trust</h3>
+        <section aria-label={copy.workflowMarketplaceCurrentTrust} role="region">
+          <h3 className="text-xs font-medium">{copy.workflowMarketplaceCurrentTrust}</h3>
           <ul>
             {packageState.trust.workflows.map(workflow => (
               <li key={workflow.definition_path}>
@@ -343,7 +343,7 @@ export function MarketplacePackageDetail({
           </ul>
         </section>
       ) : packageState?.state === 'absent' ? (
-        <p role="status">Package is absent.</p>
+        <p role="status">{copy.workflowMarketplaceAbsent}</p>
       ) : null}
 
       <div className="grid gap-4 sm:grid-cols-2">

@@ -69,6 +69,9 @@ export function useLifecycleDialogFocus(
   return (event: { target: EventTarget | null }) => {
     if (event.target instanceof HTMLElement) {
       lastDialogFocus.current = event.target
+      // Radix wraps focus with preventScroll. Long reviews still need the
+      // newly focused control visible inside their independent scroll body.
+      event.target.scrollIntoView?.({ block: 'nearest', inline: 'nearest', behavior: 'instant' })
     }
   }
 }

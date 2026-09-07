@@ -1,4 +1,6 @@
 import { LifecycleApiError } from '@/api/workflow-marketplace-lifecycle'
+import { en } from '@/i18n/en'
+import type { Translations } from '@/i18n/types'
 import { decodeLifecycleOperation, sameLifecycleValue } from '@/lib/workflow-marketplace-lifecycle-codec'
 import { acceptSupervisedOperation } from '@/lib/workflow-marketplace-supervision'
 import type { SupervisedRecord } from '@/store/workflow-marketplace-supervisor'
@@ -22,13 +24,13 @@ export interface PackageLifecyclePresentation {
 
 export const unconfirmedPackagePresentation: PackageLifecyclePresentation = {
   kind: 'unconfirmed',
-  message: 'State could not be confirmed. The operation may have completed.',
+  message: en.operations.workflowMarketplaceUnconfirmed,
   canPrepareAgain: false
 }
 
 export const conflictingPackagePresentation: PackageLifecyclePresentation = {
   kind: 'unchanged',
-  message: 'Another package action is already running. No changes were started. Refresh state before trying again.',
+  message: en.operations.workflowMarketplaceConflict,
   canPrepareAgain: true
 }
 
@@ -40,10 +42,12 @@ export const isPackageAdmissionConflict = (error: unknown) =>
 /** Terminal history is independent of later current-state reconciliation and cached cards. */
 export function packageLifecyclePresentation(
   record: SupervisedRecord,
-  preparation?: LifecycleOperation
+  preparation?: LifecycleOperation,
+  copy: Translations['operations'] = en.operations
 ): PackageLifecyclePresentation {
+  const unconfirmed = { ...unconfirmedPackagePresentation, message: copy.workflowMarketplaceUnconfirmed }
   if (record.status !== 'terminal' || !record.operationId) {
-    return unconfirmedPackagePresentation
+    return unconfirmed
   }
 
   let operation: LifecycleOperation
@@ -51,47 +55,47 @@ export function packageLifecyclePresentation(
   try {
     operation = acceptSupervisedOperation(record.operation, record.binding, record)
   } catch {
-    return unconfirmedPackagePresentation
+    return unconfirmed
   }
 
   if (!operation.outcome || operation.kind.startsWith('trust_')) {
-    return unconfirmedPackagePresentation
+    return unconfirmed
   }
 
   const outcome = operation.outcome
 
   switch (outcome.type) {
     case 'outcome_unknown':
-      return unconfirmedPackagePresentation
+      return unconfirmed
 
     case 'recovery_required':
       return {
-        ...unconfirmedPackagePresentation,
-        message: 'State could not be confirmed. Package recovery is required.'
+        ...unconfirmed,
+        message: copy.workflowMarketplaceRecoveryRequired
       }
 
     case 'cancelled_before_commit':
-      return { kind: 'cancelled', message: 'Cancelled before changes were committed.', canPrepareAgain: true }
+      return { kind: 'cancelled', message: copy.workflowMarketplaceCancelledBeforeCommit, canPrepareAgain: true }
     case 'committed': {
       const state = outcome.package_state
 
       if (!state || state.busy || state.recovery !== 'clear') {
-        return unconfirmedPackagePresentation
+        return unconfirmed
       }
 
       if (operation.kind === 'remove_confirm' && state.state === 'absent') {
-        return { kind: 'success', message: 'Package removal completed.', canPrepareAgain: false }
+        return { kind: 'success', message: copy.workflowMarketplaceRemovalCompleted, canPrepareAgain: false }
       }
 
       if ((operation.kind === 'install_confirm' || operation.kind === 'update_confirm') && state.installed) {
         return {
           kind: 'success',
-          message: `${operation.kind === 'install_confirm' ? 'Installed version' : 'Updated to version'} ${state.installed.version}. Installation does not grant trust.${state.trust?.workflows.some(item => item.state === 'untrusted') ? ' Trust required to run untrusted workflows.' : ''}`,
+          message: `${operation.kind === 'install_confirm' ? copy.workflowMarketplaceInstalledVersionResult(state.installed.version) : copy.workflowMarketplaceUpdatedVersionResult(state.installed.version)} ${copy.workflowMarketplaceInstallationNoTrust}${state.trust?.workflows.some(item => item.state === 'untrusted') ? ` ${copy.workflowMarketplaceUntrustedRunRequirement}` : ''}`,
           canPrepareAgain: false
         }
       }
 
-      return unconfirmedPackagePresentation
+      return unconfirmed
     }
 
     case 'known_unchanged': {
@@ -104,17 +108,21 @@ export function packageLifecyclePresentation(
           case 'current':
             return {
               kind: 'current',
-              message: `Version ${check.installed_version} is current. No update was installed.`,
+              message: copy.workflowMarketplacePackageCurrent(check.installed_version),
               canPrepareAgain: false
             }
 
           case 'update_available':
-            return { kind: 'update_available', message: 'An update is available.', canPrepareAgain: true }
+            return {
+              kind: 'update_available',
+              message: copy.workflowMarketplaceUpdateAvailableResult,
+              canPrepareAgain: true
+            }
 
           case 'error':
             return {
               kind: 'check_error',
-              message: 'Could not check for updates.',
+              message: copy.workflowMarketplaceCheckError,
               canPrepareAgain: false,
               retryAction: 'check'
             }
@@ -122,7 +130,7 @@ export function packageLifecyclePresentation(
           case 'orphaned':
             return {
               kind: 'orphaned',
-              message: "The installed package's source is unavailable.",
+              message: copy.workflowMarketplaceOrphaned,
               canPrepareAgain: false
             }
         }
@@ -131,7 +139,7 @@ export function packageLifecyclePresentation(
       if (result?.type === 'update_review' && result.value.result === 'unchanged') {
         return {
           kind: 'current',
-          message: `Version ${result.value.old_version} is current. No update was installed.`,
+          message: copy.workflowMarketplacePackageCurrent(result.value.old_version),
           canPrepareAgain: false
         }
       }
@@ -163,13 +171,13 @@ export function packageLifecyclePresentation(
 
       const version = installed
         ? installed.version === previous
-          ? `Version ${installed.version} remains installed.`
-          : `Currently installed: ${installed.version}.`
+          ? copy.workflowMarketplaceVersionRemainsInstalled(installed.version)
+          : copy.workflowMarketplaceCurrentlyInstalled(installed.version)
         : ''
 
       return {
         kind: 'unchanged',
-        message: `${outcome.evidence === 'rollback_verified' ? 'Changes were rolled back.' : 'This attempt made no package changes.'}${version ? ` ${version}` : ''}`,
+        message: `${outcome.evidence === 'rollback_verified' ? copy.workflowMarketplaceRolledBack : copy.workflowMarketplaceNoPackageChanges}${version ? ` ${version}` : ''}`,
         canPrepareAgain: true
       }
     }

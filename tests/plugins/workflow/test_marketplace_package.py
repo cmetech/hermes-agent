@@ -67,7 +67,9 @@ def _included_bytes(root: Path) -> list[tuple[str, bytes]]:
     return [
         (path.relative_to(root).as_posix(), path.read_bytes())
         for path in root.rglob("*")
-        if path.is_file() and not path.is_symlink() and path.name != "digests.json"
+        if path.is_file()
+        and not path.is_symlink()
+        and path.relative_to(root).as_posix() != "digests.json"
     ]
 
 
@@ -181,6 +183,24 @@ def test_load_distribution_verifies_every_package_owned_byte(
     )
     assert "digests.json" not in distribution.covered_paths
     assert "scripts/collect.py" in distribution.covered_paths
+
+
+def test_publisher_helper_includes_nested_digest_named_resources(
+    package_root: Path,
+) -> None:
+    nested = package_root / "fixtures" / "digests.json"
+    nested.parent.mkdir(exist_ok=True)
+    nested.write_bytes(b'{"fixture": "package-owned bytes"}\n')
+    expected = _publish_package(package_root)
+
+    distribution = load_distribution(package_root)
+    assert distribution.digest == expected
+    assert "fixtures/digests.json" in distribution.covered_paths
+    nested.write_bytes(b'{"fixture": "changed bytes"}\n')
+    with pytest.raises(WorkflowMarketplaceError, match="package_digest_mismatch"):
+        load_distribution(package_root)
+    assert _publish_package(package_root) != expected
+    assert load_distribution(package_root).digest != expected
 
 
 def test_scan_and_digest_preserve_binary_bytes_and_line_endings(tmp_path: Path) -> None:

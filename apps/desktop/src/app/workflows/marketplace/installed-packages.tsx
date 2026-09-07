@@ -170,7 +170,7 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
     <div className="space-y-5" ref={focusFallbackRef} tabIndex={-1}>
       {notice}
       {truth.quarantined ? (
-        <p role="status">Refreshing package state</p>
+        <p role="status">{copy.workflowMarketplaceRefreshingState}</p>
       ) : packages.length ? (
         <section aria-label={copy.workflowMarketplaceInstalledPackages}>
           <h2 className="text-sm font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceInstalledPackages}</h2>
@@ -189,12 +189,12 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                   key={identifier}
                 >
                   {current?.state === 'absent' ? (
-                    <p role="status">Package is absent. Last observed metadata</p>
+                    <p role="status">{copy.workflowMarketplaceAbsentLastObserved}</p>
                   ) : truth.binding && gate?.state !== 'ready' ? (
-                    <p role="status">Last observed — Refreshing package state</p>
+                    <p role="status">{copy.workflowMarketplaceLastObservedRefreshing}</p>
                   ) : null}
                   {gate?.state === 'recovery_required' ? (
-                    <p role="status">Recovery required. Package state is unconfirmed.</p>
+                    <p role="status">{copy.workflowMarketplaceRecoveryUnconfirmed}</p>
                   ) : null}
                   <div className="flex flex-wrap items-baseline justify-between gap-2">
                     <h3 className="break-all font-mono text-xs font-medium text-(--ui-text-primary)">{identifier}</h3>
@@ -241,7 +241,7 @@ export function InstalledPackages({ children, scope }: InstalledPackagesProps) {
                       type="button"
                       variant="secondary"
                     >
-                      Refresh state
+                      {copy.workflowMarketplaceRefreshState}
                     </Button>
                   ) : null}
                 </article>
