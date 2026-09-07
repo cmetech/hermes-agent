@@ -131,6 +131,22 @@ def _parser_package_lock(name: str = "gate-fixture") -> dict[str, object]:
 
 
 def _write_parser_dependencies(root: Path) -> None:
+    playwright = root / "node_modules/@playwright/test"
+    playwright.mkdir(parents=True, exist_ok=True)
+    (playwright / "package.json").write_text('{"name":"@playwright/test"}\n')
+    (playwright / "cli.js").write_text(
+        "const fs = require('node:fs');\n"
+        "if (process.env.CAPTURE_LOG) fs.appendFileSync(process.env.CAPTURE_LOG, ['playwright', ...process.argv.slice(2)].join('\\t') + '\\n');\n"
+        "if (process.env.GATE_DESKTOP_OBSERVATION) {\n"
+        "  if (fs.lstatSync('node_modules').isSymbolicLink() || !fs.lstatSync('node_modules/fixture-package').isSymbolicLink() || fs.existsSync('node_modules/.vite/source-cache')) process.exit(46);\n"
+        "  fs.appendFileSync(process.env.GATE_DESKTOP_OBSERVATION, 'playwright\\n');\n"
+        "}\n"
+        "if (process.env.GATE_BUILD_MODE) {\n"
+        "  if (fs.readFileSync('brand.config.json', 'utf8') !== 'generated brand\\n') process.exit(44);\n"
+        "  if (!fs.existsSync('../../plugins/model-providers/otto/generated.py')) process.exit(45);\n"
+        "  if (process.env.GATE_BUILD_MODE === 'browser-fail') process.exit(43);\n"
+        "}\n"
+    )
     for package, version in PARSER_VERSIONS.items():
         package_dir = root / "node_modules" / package
         package_dir.mkdir(parents=True, exist_ok=True)
@@ -272,6 +288,8 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     _write_parser_dependencies(repo)
+    if build_mode == "missing-playwright":
+        (repo / "node_modules/@playwright/test/cli.js").unlink()
     user_file = repo / "plugins/model-providers/otto/user.txt"
     user_file.parent.mkdir(parents=True)
     user_file.write_text("preexisting user provider\n")
@@ -303,7 +321,11 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     return result, commands
 
 
-@pytest.mark.parametrize("build_mode", ["pass", "build-fail", "browser-fail", "signal-HUP", "signal-INT", "signal-TERM", "gate-signal-HUP", "gate-signal-INT", "gate-signal-TERM"])
+@pytest.mark.parametrize("build_mode", [
+    "pass", "build-fail", "browser-fail",
+    *(pytest.param(mode, marks=pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only)
+      for mode in ("signal-HUP", "signal-INT", "signal-TERM", "gate-signal-HUP", "gate-signal-INT", "gate-signal-TERM")),
+])
 def test_base_gate_isolates_generated_build_bytes_and_cleans_every_exit(tmp_path, build_mode):
     result, commands = _exercise_base_gate(tmp_path, build_mode)
     repo = tmp_path / "gate-contract-repo"
@@ -357,6 +379,14 @@ def test_base_gate_refuses_receipt_when_post_cleanup_source_read_fails(tmp_path)
     assert not build_root.exists()
 
 
+def test_base_gate_missing_local_playwright_never_uses_package_runner_fallback(tmp_path):
+    result, commands = _exercise_base_gate(tmp_path, "missing-playwright")
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    assert not any(command[:2] == ["npx", "playwright"] for command in commands)
+    assert not list(tmp_path.glob("hermes-workflow-gate-build-*"))
+
+
 def test_base_gate_executes_the_release_contract_through_fixture_commands(
     tmp_path: Path,
 ) -> None:
@@ -383,6 +413,7 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
         "tests/hermes_cli/test_plugin_provider_hot_reload.py",
         "tests/agent/test_provider_attempt_transport.py",
         "tests/scripts/test_workflow_merge_gate.py",
+        "tests/scripts/test_workflow_gate_build.py",
         "tests/plugins/workflow/test_phase5_adversarial_remediation.py",
         "tests/plugins/workflow/test_catalog_api.py",
         "tests/plugins/workflow/test_workflow_detail_api.py",
@@ -1064,7 +1095,7 @@ def test_gate_provisions_desktop_dependencies_from_sibling_invocation_worktree(
     assert (desktop_modules / ".vite/source-cache").read_text() == "source-only\n"
 
 
-@pytest.mark.parametrize("failure_mode", ["test-fail", "typecheck-fail", "signal"])
+@pytest.mark.parametrize("failure_mode", ["test-fail", "typecheck-fail", pytest.param("signal", marks=pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only)])
 def test_gate_cleans_provisioned_desktop_view_on_early_exit(
     tmp_path: Path,
     failure_mode: str,

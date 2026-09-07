@@ -429,6 +429,7 @@ if [[ "$PHASE" == "base" ]]; then
       tests/gateway/test_plugin_delivery.py \
       tests/hermes_cli/test_plugin_provider_hot_reload.py \
       tests/scripts/test_workflow_merge_gate.py \
+      tests/scripts/test_workflow_gate_build.py \
       tests/plugins/workflow/test_language.py \
       tests/plugins/workflow/test_language_snapshot.py \
       tests/plugins/workflow/test_language_schema.py \
