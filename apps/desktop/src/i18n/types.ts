@@ -2246,6 +2246,24 @@ export interface Translations {
     workflowMarketplacePreviousDigest: string
     workflowMarketplaceChangedFiles: string
     workflowMarketplaceFileChange: (kind: string, path: string) => string
+    workflowMarketplacePhaseUnknown: string
+    workflowMarketplacePhaseQueued: string
+    workflowMarketplacePhaseRunning: string
+    workflowMarketplacePhaseFetching: string
+    workflowMarketplacePhaseReviewing: string
+    workflowMarketplacePhaseValidating: string
+    workflowMarketplacePhaseCommitting: string
+    workflowMarketplacePhaseRecovering: string
+    workflowMarketplacePhaseCompleted: string
+    workflowMarketplacePhaseFailed: string
+    workflowMarketplacePhaseCancelled: string
+    workflowMarketplacePhaseChecking: string
+    workflowMarketplaceChangeAdded: string
+    workflowMarketplaceChangeModified: string
+    workflowMarketplaceChangeRemoved: string
+    workflowMarketplaceChangeRenamed: string
+    workflowMarketplaceSeverityBlocker: string
+    workflowMarketplaceSeverityAdvisory: string
     workflowMarketplaceRenamedFrom: (path: string) => string
     workflowMarketplacePackageResources: string
     workflowMarketplaceWorkflowRisks: string

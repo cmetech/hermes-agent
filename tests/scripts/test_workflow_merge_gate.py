@@ -185,12 +185,13 @@ def test_live_customization_ledger_has_one_rehearsable_upstream_baseline() -> No
     assert re.fullmatch(r"[0-9a-f]{40}\n", result.stdout)
 
 
-def _exercise_base_gate(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
     """Run the real gate while executable fixtures record its child commands."""
     repo = tmp_path / "gate-contract-repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "docs/upstream-customizations").mkdir(parents=True)
     (repo / "apps/desktop/node_modules").mkdir(parents=True)
+    (repo / "apps/desktop/brand.config.json").write_text('"committed brand"\n')
     subprocess.run(["git", "init", "-b", "base"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Gate Contract"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "gate@localhost"], cwd=repo, check=True)
@@ -216,6 +217,49 @@ def _exercise_base_gate(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str
     (fixture_bin / "npx").chmod(0o755)
     shutil.copyfile(fixture_bin / "npx", fixture_bin / "npm")
     (fixture_bin / "npm").chmod(0o755)
+    if build_mode is not None:
+        (fixture_bin / "npm").write_text(
+            f"#!{sys.executable}\n"
+            "import os, signal\nfrom pathlib import Path\n"
+            "root = Path.cwd().parents[1]\n"
+            "with open(os.environ['CAPTURE_LOG'], 'a') as log:\n"
+            "    log.write('build-root\\t' + str(root) + '\\n')\n"
+            "Path('brand.config.json').write_text('generated brand\\n')\n"
+            "artifact = root / 'plugins/model-providers/otto/generated.py'\n"
+            "artifact.parent.mkdir(parents=True, exist_ok=True)\n"
+            "artifact.write_text('generated provider\\n')\n"
+            "mode = os.environ['GATE_BUILD_MODE']\n"
+            "if mode == 'source-mutated':\n"
+            "    (Path(os.environ['GATE_SOURCE_ROOT']) / 'apps/desktop/brand.config.json').write_text('unexpected user edit\\n')\n"
+            "if mode.startswith('signal-'):\n"
+            "    os.kill(os.getppid(), getattr(signal, 'SIG' + mode.removeprefix('signal-')))\n"
+            "if mode.startswith('gate-signal-'):\n"
+            "    import sys\n"
+            "    os.kill(int(sys.stdin.readline()), getattr(signal, 'SIG' + mode.removeprefix('gate-signal-')))\n"
+            "if mode == 'ownership-changed':\n"
+            "    (root.parent / '.owner').write_text('unrecognized owner\\n')\n"
+            "if mode == 'source-read-fail':\n"
+            "    Path(os.environ['GATE_READ_FAULT']).touch()\n"
+            "raise SystemExit(42 if mode == 'build-fail' else 0)\n"
+        )
+        with (fixture_bin / "npx").open("a") as stream:
+            stream.write(
+                "if [[ \"$1\" == playwright ]]; then\n"
+                "  [[ \"$GATE_BUILD_MODE\" == source-mutated || $(<brand.config.json) == 'generated brand' ]] || exit 44\n"
+                "  [[ -f ../../plugins/model-providers/otto/generated.py ]] || exit 45\n"
+                "  [[ \"$GATE_BUILD_MODE\" != browser-fail ]] || exit 43\n"
+                "fi\n"
+            )
+        real_git = shutil.which("git")
+        assert real_git
+        (fixture_bin / "git").write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys\nfrom pathlib import Path\n"
+            "if Path(os.environ['GATE_READ_FAULT']).exists() and ('status' in sys.argv or 'diff' in sys.argv):\n"
+            "    raise SystemExit(47)\n"
+            f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+        )
+        (fixture_bin / "git").chmod(0o755)
     for generator in (
         "generate_workflow_package_contract.py",
         "generate_workflow_marketplace_lifecycle_fixtures.py",
@@ -228,22 +272,89 @@ def _exercise_base_gate(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     _write_parser_dependencies(repo)
+    user_file = repo / "plugins/model-providers/otto/user.txt"
+    user_file.parent.mkdir(parents=True)
+    user_file.write_text("preexisting user provider\n")
     capture = tmp_path / "commands.tsv"
     env = os.environ.copy()
     env.pop("WORKFLOW_MERGE_GATE_FAST", None)
     env["CAPTURE_LOG"] = str(capture)
     env["PATH"] = f"{fixture_bin}{os.pathsep}{env['PATH']}"
     env["PYTHON_BIN"] = sys.executable
+    env["TMPDIR"] = str(tmp_path)
+    env["GATE_SOURCE_ROOT"] = str(repo)
+    env["GATE_READ_FAULT"] = str(tmp_path / "source-read-fault")
+    if build_mode is not None:
+        env["GATE_BUILD_MODE"] = build_mode
 
-    result = subprocess.run(
+    process = subprocess.Popen(
         [GATE, "--repo", repo, "--phase", "base"],
         cwd=repo,
         text=True,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         env=env,
     )
+    # Exact process identity via inherited stdin: no timing sleep or process-name lookup.
+    stdout, stderr = process.communicate(input=f"{process.pid}\n", timeout=30)
+    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     commands = [line.split("\t") for line in capture.read_text().splitlines()]
     return result, commands
+
+
+@pytest.mark.parametrize("build_mode", ["pass", "build-fail", "browser-fail", "signal-HUP", "signal-INT", "signal-TERM", "gate-signal-HUP", "gate-signal-INT", "gate-signal-TERM"])
+def test_base_gate_isolates_generated_build_bytes_and_cleans_every_exit(tmp_path, build_mode):
+    result, commands = _exercise_base_gate(tmp_path, build_mode)
+    repo = tmp_path / "gate-contract-repo"
+    assert (repo / "apps/desktop/brand.config.json").read_text() == '"committed brand"\n'
+    assert not (repo / "plugins/model-providers/otto/generated.py").exists()
+    assert (repo / "plugins/model-providers/otto/user.txt").read_text() == "preexisting user provider\n"
+    assert subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo) == b""
+    build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
+    assert build_root != repo
+    assert not build_root.exists()
+    assert not list(tmp_path.glob("hermes-workflow-gate-build-*"))
+    if build_mode == "pass":
+        assert result.returncode == 0, result.stderr
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        assert f"TESTED_BASE_SHA={sha}" in result.stdout
+    else:
+        assert result.returncode != 0
+        assert "TESTED_BASE_SHA=" not in result.stdout
+
+
+def test_base_gate_preserves_unexpected_source_edits_and_refuses_receipt_after_cleanup(tmp_path):
+    result, commands = _exercise_base_gate(tmp_path, "source-mutated")
+    repo = tmp_path / "gate-contract-repo"
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    assert (repo / "apps/desktop/brand.config.json").read_text() == "unexpected user edit\n"
+    build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
+    assert build_root != repo
+    assert not build_root.exists()
+
+
+def test_base_gate_preserves_build_workspace_when_cleanup_ownership_changes(tmp_path):
+    result, commands = _exercise_base_gate(tmp_path, "ownership-changed")
+    repo = tmp_path / "gate-contract-repo"
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    assert "cleanup refused" in result.stderr
+    build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
+    assert build_root != repo
+    assert (build_root.parent / ".owner").read_text() == "unrecognized owner\n"
+    assert (build_root / "plugins/model-providers/otto/generated.py").read_text() == "generated provider\n"
+    assert (repo / "apps/desktop/brand.config.json").read_text() == '"committed brand"\n'
+    assert (repo / "plugins/model-providers/otto/user.txt").read_text() == "preexisting user provider\n"
+
+
+def test_base_gate_refuses_receipt_when_post_cleanup_source_read_fails(tmp_path):
+    result, commands = _exercise_base_gate(tmp_path, "source-read-fail")
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    build_root = Path(next(command[1] for command in commands if command[0] == "build-root"))
+    assert not build_root.exists()
 
 
 def test_base_gate_executes_the_release_contract_through_fixture_commands(

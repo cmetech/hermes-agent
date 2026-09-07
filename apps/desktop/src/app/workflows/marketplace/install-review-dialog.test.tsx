@@ -161,6 +161,51 @@ function deferred() {
 afterEach(cleanup)
 
 describe('InstallReviewDialog', () => {
+  it.each([
+    ['ar', ['مضاف', 'معدّل', 'محذوف', 'أُعيدت تسميته'], ['مانع', 'تنبيه']],
+    ['ja', ['追加', '変更', '削除', '名前変更'], ['阻害要因', '注意事項']],
+    ['zh', ['已添加', '已修改', '已移除', '已重命名'], ['阻止项', '提示']],
+    ['zh-hant', ['已新增', '已修改', '已移除', '已重新命名'], ['阻擋項目', '提醒']]
+  ])(
+    'localizes update change kinds and severities in %s without translating publisher facts or diagnostic codes',
+    (locale, kinds, severities) => {
+      const review = updateReview()
+      review.file_changes = (['added', 'modified', 'removed', 'renamed'] as const).map(kind => ({
+        kind,
+        path: `publisher/${kind}.yaml`,
+        old_path: kind === 'renamed' ? 'publisher/old.yaml' : null,
+        candidate_digest: kind === 'removed' ? null : DIGEST,
+        old_digest: kind === 'added' ? null : OLD_DIGEST
+      }))
+      review.compatibility_changes = {
+        added: [{ workflow_name: 'publisher-added', code: 'runtime_missing', severity: 'blocker' }],
+        removed: [{ workflow_name: 'publisher-removed', code: 'provider_missing', severity: 'advisory' }]
+      }
+      renderDialog({ kind: 'review', mode: 'update', review }, {}, locale)
+
+      for (const [index, change] of review.file_changes.entries()) {
+        const row = screen.getByText(change.path).closest('li')!
+        expect(row.textContent).toContain(kinds[index])
+        expect(row.querySelector('span')?.textContent).not.toMatch(/added|modified|removed|renamed/)
+      }
+
+      expect(screen.getByText('publisher/old.yaml')).toBeTruthy()
+
+      for (const [index, identity] of [
+        ...review.compatibility_changes.added,
+        ...review.compatibility_changes.removed
+      ].entries()) {
+        const row = screen.getByText(text => text.includes(identity.workflow_name) && text.includes(identity.code))
+        expect(row.textContent).toContain(severities[index])
+        expect(row.textContent).not.toMatch(/blocker|advisory/)
+      }
+
+      for (const value of ['SUPPORT_TOKEN', 'openrouter', '2.0.0', DIGEST]) {
+        expect(screen.getAllByText(value).length).toBeGreaterThan(0)
+      }
+    }
+  )
+
   it('localizes the retry-check action without confusing it with preparation', () => {
     renderDialog(
       {

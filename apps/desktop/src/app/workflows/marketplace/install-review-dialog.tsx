@@ -13,6 +13,7 @@ import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import type { WorkflowMarketplaceInstallReview, WorkflowMarketplaceUpdateReview } from '@/types/hermes'
 
+import { marketplaceFileChangeLabel, marketplacePhaseLabel, marketplaceSeverityLabel } from './controlled-copy'
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { marketplaceWebRepositoryHref } from './package-detail'
 import type { PackageLifecyclePresentation } from './package-lifecycle-presentation'
@@ -120,10 +121,12 @@ function ChangeSets({ review }: { review: UpdateReviewPresentation }) {
           empty
           values={[
             ...review.compatibility_changes.added.map(
-              value => `${copy.workflowMarketplaceAdded}: ${value.workflow_name} ${value.code} ${value.severity}`
+              value =>
+                `${copy.workflowMarketplaceAdded}: ${value.workflow_name} ${value.code} ${marketplaceSeverityLabel(copy, value.severity)}`
             ),
             ...review.compatibility_changes.removed.map(
-              value => `${copy.workflowMarketplaceRemoved}: ${value.workflow_name} ${value.code} ${value.severity}`
+              value =>
+                `${copy.workflowMarketplaceRemoved}: ${value.workflow_name} ${value.code} ${marketplaceSeverityLabel(copy, value.severity)}`
             )
           ]}
         />
@@ -188,7 +191,7 @@ function ReviewContent({ view }: { view: Extract<InstallReviewDialogView, { kind
         <ul className="mt-1 space-y-1 text-xs text-(--ui-text-secondary)">
           {review.file_changes.map(change => (
             <li key={`${change.kind}:${change.old_path ?? ''}:${change.path}`}>
-              <span>{change.kind}: </span>
+              <span>{marketplaceFileChangeLabel(copy, change.kind)}: </span>
               <code>{change.path}</code>
               {change.old_path ? (
                 <span className="ms-2">
@@ -329,7 +332,9 @@ export function InstallReviewDialog({
         </DialogHeader>
 
         {view.kind === 'progress' ? (
-          <p role="status">{copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}</p>
+          <p role="status">
+            {copy.workflowMarketplaceOperationProgress(marketplacePhaseLabel(copy, view.phase), view.progress)}
+          </p>
         ) : view.kind === 'review' ? (
           <ReviewContent view={view} />
         ) : view.kind === 'succeeded' ? (

@@ -25,6 +25,7 @@ import { useI18n } from '@/i18n'
 import { Pencil, Plus, RefreshCw, Trash2 } from '@/lib/icons'
 import type { WorkflowMarketplaceSourceRecord } from '@/types/hermes'
 
+import { marketplacePhaseLabel } from './controlled-copy'
 import { marketplaceKeys } from './query-keys'
 import type { MarketplaceOperationController, MarketplaceOperationOrigin } from './use-marketplace-operation'
 
@@ -538,7 +539,10 @@ export function ManageWorkflowSourcesDialog({
                           <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{statusLabel(source)}</span>
                           {active && (active.state === 'pending' || active.state === 'running') ? (
                             <span role="status">
-                              {copy.workflowMarketplaceOperationProgress(active.phase, active.progress)}
+                              {copy.workflowMarketplaceOperationProgress(
+                                marketplacePhaseLabel(copy, active.phase),
+                                active.progress
+                              )}
                             </span>
                           ) : null}
                         </div>

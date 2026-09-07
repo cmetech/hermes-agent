@@ -2,6 +2,7 @@
 set -euo pipefail
 
 INVOCATION_ROOT="$(pwd -P)"
+GATE_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(git rev-parse --show-toplevel)"
 PHASE="base"
 BRAND=""
@@ -9,6 +10,9 @@ TESTED_BASE_SHA=""
 PROVISIONED_DESKTOP_VIEW=""
 PROVISIONED_DESKTOP_MARKER=""
 PROVISIONED_DESKTOP_SOURCE=""
+ISOLATED_BUILD_PID=""
+BASE_SOURCE_SHA=""
+BASE_READY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -354,18 +358,33 @@ _cleanup_desktop_dependency_view() {
 }
 
 _finish_gate() {
-  local status="$1" restore_external=0
+  local status="$1" restore_external=0 current_sha=""
   trap - EXIT HUP INT TERM
   [[ "$status" == "0" ]] && restore_external=1
   if ! _cleanup_desktop_dependency_view "$restore_external"; then
     echo "desktop dependency cleanup refused an unowned or escaping path" >&2
     status=1
   fi
+  if [[ "$PHASE" == "base" && "$BASE_READY" == "1" && "$status" == "0" ]]; then
+    if ! current_sha="$(git -C "$ROOT" rev-parse HEAD)" ||
+        [[ "$current_sha" != "$BASE_SOURCE_SHA" ]] ||
+        ! git -C "$ROOT" diff --quiet HEAD --; then
+      echo "source HEAD or tracked working tree changed; refusing source receipt after cleanup" >&2
+      status=1
+    else
+      echo "TESTED_BASE_SHA=$BASE_SOURCE_SHA"
+    fi
+  fi
   exit "$status"
 }
 
 _handle_gate_signal() {
   local status="$1"
+  if [[ -n "$ISOLATED_BUILD_PID" ]]; then
+    kill -TERM "$ISOLATED_BUILD_PID" 2>/dev/null || true
+    wait "$ISOLATED_BUILD_PID" || true
+    ISOLATED_BUILD_PID=""
+  fi
   _cleanup_desktop_dependency_view 0 || true
   exit "$status"
 }
@@ -379,6 +398,9 @@ cd "$ROOT"
 if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "tracked working tree is dirty; refusing to seal TESTED_BASE_SHA" >&2
   exit 1
+fi
+if [[ "$PHASE" == "base" ]]; then
+  BASE_SOURCE_SHA="$(git rev-parse HEAD)"
 fi
 _require_root_dependencies
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"
@@ -556,12 +578,14 @@ if [[ "$PHASE" == "base" ]]; then
       electron/connection-config-apply.test.ts electron/backend-connection-state.test.ts \
       electron/api-transport.test.ts)
     (cd apps/desktop && npx tsx --test electron/structured-api-channel.test.ts)
-    # Renderer/native build only: no packaging or publication command.
-    (cd apps/desktop && npm run build)
-    (cd apps/desktop && npx playwright test \
-      e2e/workflow-marketplace-lifecycle.spec.ts e2e/workflow-marketplace-layout.spec.ts)
+    # Deterministic generation and browser artifacts belong only to a private
+    # local source checkout. No packaging/publication or source-file restoration.
+    "$PYTHON_BIN" "$GATE_SCRIPT_ROOT/workflow_gate_build.py" "$ROOT" "$BASE_SOURCE_SHA" &
+    ISOLATED_BUILD_PID=$!
+    wait "$ISOLATED_BUILD_PID"
+    ISOLATED_BUILD_PID=""
   fi
-  echo "TESTED_BASE_SHA=$(git rev-parse HEAD)"
+  BASE_READY=1
   exit 0
 fi
 

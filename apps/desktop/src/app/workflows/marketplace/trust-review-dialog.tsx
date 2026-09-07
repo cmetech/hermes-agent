@@ -17,6 +17,7 @@ import type {
   TrustWorkflowState
 } from '@/types/workflow-marketplace-lifecycle'
 
+import { marketplacePhaseLabel } from './controlled-copy'
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { ReviewFacts, ReviewValueList, WorkflowRiskReview } from './review-sections'
 
@@ -138,7 +139,9 @@ export function TrustReviewDialog({
         </DialogHeader>
 
         {view.kind === 'progress' ? (
-          <p role="status">{copy.workflowMarketplaceOperationProgress(view.phase, view.progress)}</p>
+          <p role="status">
+            {copy.workflowMarketplaceOperationProgress(marketplacePhaseLabel(copy, view.phase), view.progress)}
+          </p>
         ) : view.kind === 'review' ? (
           <>
             <ReviewFacts

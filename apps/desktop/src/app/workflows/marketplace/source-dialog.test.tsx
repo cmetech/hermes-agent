@@ -157,12 +157,35 @@ function rerenderDialog(
 }
 
 describe('ManageWorkflowSourcesDialog', () => {
-  it('localizes source progress without altering the reported phase or percentage', async () => {
-    const active = runningOperation()
-    renderDialog(operations({ operationForSource: () => active }), true, scope, 'ja')
-    const progress = await screen.findByText(/fetching.*40/)
-    expect(progress.textContent).toMatch(/[\u3040-\u30ff\u3400-\u9fff]/)
-  })
+  it.each([
+    ['ar', ['قيد الانتظار', 'قيد التنفيذ', 'جارٍ الجلب']],
+    ['ja', ['待機中', '実行中', '取得中']],
+    ['zh', ['排队中', '运行中', '获取中']],
+    ['zh-hant', ['佇列中', '執行中', '取得中']]
+  ])(
+    'localizes every source progress phase in %s, preserving source identity and percentage',
+    async (locale, labels) => {
+      for (const [index, phase] of ['queued', 'running', 'fetching'].entries()) {
+        const active =
+          phase === 'queued'
+            ? {
+                ...runningOperation(),
+                state: 'pending' as const,
+                phase: 'queued' as const,
+                progress: 0,
+                started_at: null
+              }
+            : { ...runningOperation(), phase }
+        renderDialog(operations({ operationForSource: () => active }), true, scope, locale)
+        const progress = await screen.findByText(
+          text => text.includes(labels[index]) && text.includes(`${active.progress}%`)
+        )
+        expect(progress.textContent).not.toMatch(/queued|running|fetching/)
+        expect(screen.getByText('company')).toBeTruthy()
+        cleanup()
+      }
+    }
+  )
 
   beforeEach(() => {
     api.list.mockResolvedValue({ profile: 'support', sources: [source()] })
