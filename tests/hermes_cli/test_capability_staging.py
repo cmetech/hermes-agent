@@ -605,7 +605,9 @@ def test_complete_package_swap_is_atomic_and_distribution_trust_is_digest_bound(
     digest = compute_package_digest(package).sha256
     assert WorkflowTrustStore(home).check(digest) == "trusted"
     trust = json.loads((home / "workflow/trust.json").read_text())
-    assert trust["records"][digest]["actor"] == "trusted_distribution"
+    assert (
+        trust["records"][digest]["grants"]["manual"]["actor"] == "trusted_distribution"
+    )
 
 
 def test_trusted_distribution_stages_and_trusts_current_v6_composite_digest(
