@@ -3301,3 +3301,91 @@ def test_final_phase_preparation_cleanup_entry_requires_exact_marker(
         assert envelope.stat().st_ino == observed["inode"]
     assert not store.path.exists()
     assert not candidate.destination.exists()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("action", ["install", "update", "remove"])
+@pytest.mark.parametrize("damage", [True, False])
+@pytest.mark.parametrize("boundary", ["instance", "inherited"])
+def test_final_mutator_entry_preserves_phase_authority(
+    tmp_path, monkeypatch, restart, action, damage, boundary
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = None if action == "install" else _install(store, candidate)
+    if action == "remove":
+        _, prepared = _authorize_remove(store, installed)
+    else:
+        candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+        prepared = _consume(store, candidate)
+    point = (
+        "after_provenance_remove" if action == "remove" else "after_provenance_write"
+    )
+    # Force rollback authority for restart after a provenance write by crashing in
+    # the already-published rollback helper, before its first mutation.
+    helper = "_rollback_remove" if action == "remove" else "_rollback_install"
+    if restart:
+
+        def crash(*args, **kwargs):
+            raise SimulatedCrash()
+
+        monkeypatch.setattr(store, helper, crash)
+
+    def fault(phase):
+        if phase == point:
+            raise RuntimeError("ordinary failure after provenance write")
+
+    mutate = store.atomic_remove if action == "remove" else store.atomic_install
+    if restart:
+        with pytest.raises(SimulatedCrash):
+            mutate(prepared, review_digest=REVIEW, fault=fault)
+        store = MarketplaceTransactionStore(tmp_path)
+    target = (
+        ("remove" if action == "install" else "put") if restart else "_restore_snapshot"
+    )
+    owner = store.installed_store if boundary == "instance" else InstalledPackageStore
+    actual = getattr(owner, target)
+    observed = {}
+
+    def entry(*args, **kwargs):
+        if damage:
+            value = json.loads(store.journal_path.read_bytes())
+            value["journals"][0]["phase"] = f"{prepared.operation}_consumed"
+            store.journal_path.write_text(json.dumps(value))
+        observed["provenance"] = store.installed_store._snapshot()
+        observed["installed"] = _snapshot(candidate.destination)
+        observed["journal"] = store.journal_path.read_bytes()
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(owner, target, entry)
+    if restart:
+        result = store.recover_transactions()
+    else:
+        with pytest.raises((WorkflowMarketplaceError, RuntimeError)):
+            mutate(prepared, review_digest=REVIEW, fault=fault)
+        result = ()
+    assert observed
+    if damage:
+        assert result == ()
+        assert (
+            store.installed_store._snapshot() == observed["provenance"],
+            _snapshot(candidate.destination) == observed["installed"],
+            store.journal_path.read_bytes() == observed["journal"],
+        ) == (True, True, True), (
+            "provenance, package bytes and journal must remain unchanged after entry"
+        )
+        # An ordinary read must remain usable after the failed guarded mutation;
+        # a leaked phase context would reject it against the changed journal.
+        expected = next(
+            (
+                item.provenance
+                for item in observed["provenance"][1].packages
+                if item.provenance.identity == candidate.identity
+            ),
+            None,
+        )
+        assert store._current_provenance(candidate.identity) == expected
+    else:
+        assert result == ((prepared.transaction_id,) if restart else ())
+        assert store._current_provenance(candidate.identity) == installed
+        assert store.list_journals() == ()

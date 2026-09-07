@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -1032,6 +1033,63 @@ def _record_to_prepared(
     )
 
 
+class _TransactionInstalledStore(InstalledPackageStore):
+    """Carry transaction authority into the existing locked provenance mutators."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._authority: ContextVar[_TransactionPhases | None] = ContextVar(
+            "marketplace_provenance_authority", default=None
+        )
+
+    @contextmanager
+    def _mutation(self, authority: _TransactionPhases | None):
+        token = self._authority.set(authority)
+        try:
+            yield
+        finally:
+            self._authority.reset(token)
+
+    @contextmanager
+    def _locked(self) -> Iterator[tuple[int, int]]:
+        with super()._locked() as parent_identity:
+            authority = self._authority.get()
+            if authority is not None:
+                authority.validate()
+            yield parent_identity
+
+    def _write_state(self, state, *, parent_identity: tuple[int, int]) -> None:
+        authority = self._authority.get()
+        if authority is not None:
+            authority.validate()
+        super()._write_state(state, parent_identity=parent_identity)
+
+    def put(
+        self,
+        provenance: InstalledPackageProvenance,
+        *,
+        authority: _TransactionPhases | None = None,
+    ) -> InstalledPackageProvenance:
+        with self._mutation(authority):
+            return super().put(provenance)
+
+    def remove(
+        self,
+        identity: InstalledPackageIdentity,
+        *,
+        expected: InstalledPackageProvenance | None = None,
+        authority: _TransactionPhases | None = None,
+    ) -> InstalledPackageProvenance:
+        with self._mutation(authority):
+            return super().remove(identity, expected=expected)
+
+    def _restore_snapshot(
+        self, snapshot, *, authority: _TransactionPhases | None = None
+    ) -> None:
+        with self._mutation(authority):
+            super()._restore_snapshot(snapshot)
+
+
 class MarketplaceTransactionStore:
     """Persist confirmations and own install/remove recovery for one profile."""
 
@@ -1056,7 +1114,7 @@ class MarketplaceTransactionStore:
         self.journal_path = self.root / "transaction-journals.json"
         self.staging_root = self.root / ".staging"
         self.quarantine_root = self.root / ".quarantine"
-        self.installed_store = InstalledPackageStore(
+        self.installed_store = _TransactionInstalledStore(
             self.home,
             lock_timeout_seconds=lock_timeout_seconds,
         )
@@ -2295,7 +2353,9 @@ class MarketplaceTransactionStore:
                 _fsync_directory(destination.parent)
                 _fsync_directory(quarantine.parent)
         with authority.provenance_write(journal.previous_provenance):
-            self.installed_store._restore_snapshot(provenance_snapshot)
+            self.installed_store._restore_snapshot(
+                provenance_snapshot, authority=authority
+            )
 
     def _finish_install_cleanup(
         self, journal: _JournalRecord, *, authority: _TransactionPhases
@@ -2542,7 +2602,9 @@ class MarketplaceTransactionStore:
         else:
             load_distribution(destination, expected_digest=previous.distribution_digest)
         with authority.provenance_write(previous):
-            self.installed_store._restore_snapshot(provenance_snapshot)
+            self.installed_store._restore_snapshot(
+                provenance_snapshot, authority=authority
+            )
 
     def atomic_remove(
         self,
@@ -2776,7 +2838,9 @@ class MarketplaceTransactionStore:
                 return False
             if current is not None:
                 with authority.provenance_write(None):
-                    self.installed_store.remove(journal.identity, expected=current)
+                    self.installed_store.remove(
+                        journal.identity, expected=current, authority=authority
+                    )
         else:
             if destination_digest == candidate.distribution_digest:
                 if _entry(staging) is not None:
@@ -2798,7 +2862,7 @@ class MarketplaceTransactionStore:
             elif destination_digest != previous.distribution_digest:
                 return False
             with authority.provenance_write(previous):
-                self.installed_store.put(previous)
+                self.installed_store.put(previous, authority=authority)
         return self._finish_install_cleanup(journal, authority=authority)
 
     def _recover_remove(
@@ -2844,7 +2908,7 @@ class MarketplaceTransactionStore:
             except WorkflowMarketplaceError:
                 return False
         with authority.provenance_write(previous):
-            self.installed_store.put(previous)
+            self.installed_store.put(previous, authority=authority)
         return _entry(quarantine.parent) is None or self._remove_owned_envelope(
             quarantine.parent,
             transaction_id=journal.transaction_id,
