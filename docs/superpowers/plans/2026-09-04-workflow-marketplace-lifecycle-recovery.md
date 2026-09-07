@@ -1,14 +1,14 @@
 # Workflow Marketplace Lifecycle Recovery Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved the lifecycle recovery design on 2026-09-04, strict-wire correction on 2026-09-05, supervisor identity-binding design on 2026-09-05, and inspection digest parity amendment on 2026-09-06 for implementation in the existing Hermes worktree only.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development`. One implementation agent at a time; a fresh reviewer after every task. Use test-driven development and verification-before-completion. Steps use checkbox syntax. The user approved the lifecycle recovery design on 2026-09-04, strict-wire correction on 2026-09-05, supervisor identity-binding design on 2026-09-05, inspection digest parity amendment on 2026-09-06, and the inspection-admission design direction on 2026-09-07 for implementation in the existing Hermes worktree only.
 
 **Goal:** Finish the existing marketplace branch with truthful, recoverable lifecycle operations and independently reviewed release evidence.
 
-**Architecture:** Extend the backend operation registry with safe subjects, bounded admission receipts, strict outcomes, locked local-state reconciliation, and an epoch-scoped opaque actor binding. Electron owns a separate live native-route generation and enforces it before dispatch and response return. A feature-owned application supervisor binds both authorities, outlives Marketplace/Installed views, and retains no review secret. Shared cache barriers and identity-transition quarantine prevent stale or prior-actor projections from authorizing mutations or being disclosed. Inspection decoding preserves the backend's separate distribution and per-workflow trust digest domains; neither digest substitutes for supervisor-owned admission freshness.
+**Architecture:** Extend the backend operation registry with safe subjects, bounded admission receipts, strict outcomes, locked local-state reconciliation, and an epoch-scoped opaque actor binding. Electron owns a separate live native-route generation and enforces it before dispatch and response return. A feature-owned application supervisor binds both authorities, outlives Marketplace/Installed views, and retains no review secret. Shared cache barriers and identity-transition quarantine prevent stale or prior-actor projections from authorizing mutations or being disclosed. Inspection decoding preserves the backend's separate distribution and per-workflow trust digest domains; neither digest substitutes for supervisor-owned admission freshness. Read-only inspection is non-exclusive: an already-admitted inspection may finish across a later exact-package lifecycle operation, while an admitted lifecycle operation blocks every later inspection or lifecycle start until terminal.
 
 **Tech Stack:** Existing Python/Pydantic/FastAPI/transaction locks and Git fixtures; React/TypeScript/Nanostores/TanStack Query/Vitest/Testing Library/Playwright. No new runtime dependency is planned.
 
-**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), [strict wire parity amendment](../specs/2026-09-05-workflow-marketplace-strict-wire-parity-amendment.md), [supervisor identity-binding amendment](../specs/2026-09-05-workflow-marketplace-supervisor-identity-binding-amendment.md), [inspection digest parity amendment](../specs/2026-09-06-workflow-marketplace-inspection-digest-parity-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
+**Spec:** [Lifecycle recovery amendment](../specs/2026-09-04-workflow-marketplace-lifecycle-recovery-amendment.md), [strict wire parity amendment](../specs/2026-09-05-workflow-marketplace-strict-wire-parity-amendment.md), [supervisor identity-binding amendment](../specs/2026-09-05-workflow-marketplace-supervisor-identity-binding-amendment.md), [inspection digest parity amendment](../specs/2026-09-06-workflow-marketplace-inspection-digest-parity-amendment.md), [inspection admission amendment](../specs/2026-09-07-workflow-marketplace-inspection-admission-amendment.md), plus the unaffected parts of the [original approved design](../specs/2026-09-03-workflow-package-marketplace-design.md).
 
 ## Global constraints
 
@@ -37,6 +37,7 @@
 - Use `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh` for Python evidence, never direct pytest. Run Desktop commands from `apps/desktop`; dependencies belong to the existing root workspace install.
 - Every task requires observed RED, focused GREEN, fresh reviewer evidence, and ledger updates. No production fix is accepted only on implementer-authored tests. A new contract gap pauses dependent work for a recorded amendment.
 - Inspection `package_digest` is the verified distribution digest; each `workflows[i].package_digest` is that workflow's effective marketplace trust digest and may differ from the root and siblings. Desktop preserves both domains exactly and never uses digest equality as freshness evidence.
+- `inspect` is a non-exclusive exact-package observation. Earlier inspections may coexist with a later package lifecycle operation; an admitted lifecycle operation blocks new inspections and lifecycle starts until terminal. Backend and Desktop apply the same asymmetric matrix atomically. Late inspection results remain historical and cannot cross a newer package mutation generation.
 - Update locales `ar`, `en`, `ja`, `zh`, and `zh-hant` before completion.
 
 ## Execution and review protocol
@@ -793,11 +794,29 @@ self.quarantine_root = self.root / ".quarantine"
 - [ ] Run the two integration tests GREEN, then the complete marketplace transaction, operation, API, trust, CLI and RunStore recovery suites through `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh`. Include a restart/journal recovery case for install, update and remove using the new roots. Run `git diff --check`, changed-file formatting/lint, and a path audit proving marketplace production no longer constructs `<profile-home>/workflows/.staging` or `.quarantine`.
 - [ ] Commit only Task 15A code/tests as `fix(workflow): isolate marketplace transaction workspaces`. A fresh reviewer independently runs both initialization orders, recovery restart, foreign-artifact refusal and named phase-boundary changes against the documented threat model. Same-user syscall-boundary probes may be recorded as a nonblocking platform limitation but must not be reported as a supported guarantee. Do not resume locale/docs/Desktop/gate implementation until 15A is review-clean.
 
+## Task 15B0 — Align inspection and lifecycle admission
+
+**Spec:** `docs/superpowers/specs/2026-09-07-workflow-marketplace-inspection-admission-amendment.md`
+
+**Files:** Modify `plugins/workflow/marketplace/operations.py`, its focused registry tests, `plugins/workflow/marketplace/lifecycle_api.py` tests as needed, `apps/desktop/src/store/workflow-marketplace-supervisor.ts`, its focused tests, and the real API/Desktop lifecycle tests already preserved by Task 15B discovery. Do not change public/generated schemas.
+
+**Consumes:** Exact package subjects, admission receipt lookup-before-conflict ordering, backend active-target locking, the application supervisor, PackageState mutation barriers, and Task 14F exact inspection supervision.
+
+**Produces:** One backend/Desktop admission matrix: earlier inspection may coexist with a later lifecycle operation; active lifecycle work blocks later inspection/lifecycle starts; late inspection results cannot cross a newer mutation generation. Task 15B may then exercise the full real lifecycle without an enabled action failing before admission.
+
+- [ ] Preserve the checked-in discovery REDs. In the registry/authenticated API, event-hold a real exact-package inspection and prove that an exact removal preparation is currently rejected while locked state is installed and `busy: false`. In the real supervisor, prove `getPackageGate()` is ready but `start(remove_prepare)` currently rejects locally. Record the exact `marketplace_operation_conflict` and `marketplace_request_conflict` failures.
+- [ ] Add the complete asymmetric matrix before implementation: multiple inspections; inspection then lifecycle; lifecycle then inspection; lifecycle then lifecycle; terminal lifecycle reconciliation; different package/actor/profile; exact replay before conflict; capacity/cancellation/terminal release. Tests must use exact subjects and bounded synchronization, never timestamps or "latest operation."
+- [ ] Change backend private target ownership under the existing registry admission lock. Inspection checks for an active lifecycle target but never reserves it; other package lifecycle operations reserve/check the existing target. Receipt replay remains first, all records still count toward capacity, and terminal cleanup releases only a target owned by that operation. Apply the behavior to existing V1/V2 registry callers without changing V1 replay promises.
+- [ ] Mirror the matrix in Desktop `start()`: inspection records do not block lifecycle starts; nonterminal lifecycle barriers block new inspection and lifecycle starts; terminal lifecycle barriers retain their existing package-gate/reconciliation behavior. Preserve exact five-field binding, request/operation/subject/selection correlation and all action guard release paths.
+- [ ] Add cache-order tests where an inspection admitted first completes after install, update, remove, and trust. The historical read-only operation result may remain visible in operation history, but it must not publish detail/installed/trust/action caches across the lifecycle mutation generation, clear its barrier, or reopen a contradictory action after failed refetch.
+- [ ] Classify a genuine pre-admission conflict as known non-admission. Desktop reconciles exact package/scope and renders busy/conflict guidance, never unknown-outcome copy. Do not automatically retry, queue, cancel the earlier operation, or allocate another request until an explicit retry passes current eligibility.
+- [ ] Run focused RED/GREEN through the Python wrapper and Desktop Vitest, then the real temporary-Git API and Playwright removal sequence. Run lifecycle registry/API/supervisor/reconciliation/navigation regressions, typecheck, lint/format and diff/scope audits. Commit `fix(workflow): align inspection admission`. A fresh reviewer independently exercises both admission orders, replay ordering and late-result suppression before Task 15B resumes.
+
 ## Task 15B — Localization, documentation, end-to-end proof and release gates
 
 **Files:** Modify `apps/desktop/src/i18n/{types,en,ar,ja,zh,zh-hant}.ts`, `languages.test.ts`, `docs/workflow-orchestration.md`, `website/docs/user-guide/features/workflows.md`, `website/docs/reference/cli-commands.md`; create `website/docs/user-guide/features/workflow-packages.md`, `tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py`, `apps/desktop/e2e/workflow-marketplace-lifecycle.spec.ts`; modify `scripts/test_workflow_merge_gate.sh`, related gate tests, and existing E2E fixtures only as needed.
 
-**Consumes:** All accepted Task 14 slices and review-clean Task 15A workspace isolation.
+**Consumes:** All accepted Task 14 slices, review-clean Task 15A workspace isolation, and review-clean Task 15B0 inspection admission.
 
 **Produces:** Complete locale copy, operator/publisher guidance, real Git/API/trust/admission/UI proof, reproducible branch review gates.
 
@@ -815,6 +834,8 @@ def test_lost_confirm_response_installs_once_then_requires_trust(real_marketplac
 ```
 
 `real_marketplace` starts the actual authenticated API/service with existing safe temp Git fixtures and bounded event synchronization; instrumentation counts commits while the actual filesystem/provenance/trust writes occur. The Playwright fixture launches an isolated backend and renderer; response dropping happens at the test transport boundary after actual server admission, not by substituting success payloads. Cover tab-close-return and failed-refetch action gating in that real path.
+
+The real lifecycle also holds an already-admitted inspection while starting Remove from verified locked state. Removal must reach backend admission and terminal truth exactly once; the late inspection result remains historical and cannot overwrite the removed state or reopen Remove/Update.
 
 - [ ] Run RED with the repository wrapper for the new E2E file; from Desktop run `npx vitest run --project ui src/i18n/languages.test.ts` and focused Playwright lifecycle tests after building the renderer. Capture specific missing behavior, not unrelated environment failure.
 - [ ] Translate all source/browse/lifecycle/recovery copy in all five locales. Locale tests assert usable keys and interpolation behavior; do not write source-text scans or fixed enumeration counts.
@@ -877,5 +898,6 @@ Read the current merge-gate script before invoking it; run only its local test/r
 | Inspection distribution/effective-workflow digest domain parity         | 14C2P, resumed 14C2                                   |
 | Compatibility/token privacy/list stability                              | 14A2–B, 14C0a, 14C0b, 14C1, 15B                       |
 | Marketplace transaction workspace ownership isolation                   | 15A                                                    |
+| Inspection versus lifecycle admission and stale read suppression         | 15B0                                                   |
 
 Implementation mode is selected and approved by the user: subagent-driven, one implementation agent at a time and a fresh reviewer per task. No further mode-selection question is required. Integration and publication remain separately approval-gated.
