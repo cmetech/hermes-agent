@@ -529,7 +529,11 @@ def _require_private_directory_at(parent_descriptor: int, name: str) -> None:
 
 
 class _PreparationWorkspace:
-    """Keep every staging mutation beneath one retained private authority."""
+    """Phase-validated staging authority, with platform guards as defense in depth.
+
+    The private directory and marketplace lock are the concurrency boundary;
+    separate mkdir/open and check/delete syscalls are not an atomic primitive.
+    """
 
     def __init__(self, store: MarketplaceTransactionStore, identity: tuple[int, int]):
         self.store = store
@@ -779,6 +783,96 @@ class _PreparationWorkspace:
             # Uncertain artifacts remain under their original authority; never
             # retry cleanup via a replacement absolute path.
             return False
+
+
+class _TransactionPhases:
+    """Recheck locked authority between observable journal/mutation phases."""
+
+    def __init__(
+        self,
+        store: MarketplaceTransactionStore,
+        root_identity: tuple[int, int],
+        journal: _JournalRecord,
+    ):
+        self.store = store
+        self.root_identity = root_identity
+        self.journal = journal
+        self.paths: dict[Path, tuple[int, int]] = {}
+        self.packages: dict[Path, str] = {}
+        for path in (store.staging_root, store.quarantine_root):
+            self.track(path)
+        for path in (
+            Path(journal.staging_path).parent,
+            Path(journal.quarantine_path).parent,
+        ):
+            if _entry(path) is not None:
+                self.track(path)
+        if journal.candidate_provenance is not None:
+            self.packages[Path(journal.staging_path)] = (
+                journal.candidate_provenance.distribution_digest
+            )
+        if journal.previous_provenance is not None:
+            self.packages[Path(journal.destination)] = (
+                journal.previous_provenance.distribution_digest
+            )
+        for path in self.packages:
+            self.track(path)
+
+    def track(self, path: Path) -> None:
+        _require_existing_directory(path, code="transaction_recovery_ambiguous")
+        metadata = path.lstat()
+        self.paths[path] = (metadata.st_dev, metadata.st_ino)
+
+    def validate(self) -> None:
+        self.store._require_root_identity(self.root_identity)
+        for path, identity in self.paths.items():
+            _require_existing_directory(path, code="transaction_recovery_ambiguous")
+            metadata = path.lstat()
+            if (metadata.st_dev, metadata.st_ino) != identity or (
+                os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                _fail(
+                    "transaction_recovery_ambiguous",
+                    "transaction directory changed between phases",
+                )
+        current = next(
+            (
+                item
+                for item in self.store._read_journals().journals
+                if item.transaction_id == self.journal.transaction_id
+            ),
+            None,
+        )
+        if current != self.journal or not self.store._journal_markers_match(
+            self.journal
+        ):
+            _fail(
+                "transaction_recovery_ambiguous",
+                "transaction ownership changed between phases",
+            )
+        for path, digest in self.packages.items():
+            load_distribution(path, expected_digest=digest)
+
+    def publish(self, journal: _JournalRecord) -> None:
+        self.validate()
+        self.store._replace_journal(journal, parent_identity=self.root_identity)
+        self.journal = journal
+
+    def checkpoint(self, fault: Callable[[str], None], point: str) -> None:
+        fault(point)
+        self.validate()
+
+    def move(self, source: Path, destination: Path) -> None:
+        self.validate()
+        os.replace(source, destination)
+        self.paths[destination] = self.paths.pop(source)
+        self.packages[destination] = self.packages.pop(source)
+
+    def retired(self, envelope: Path) -> None:
+        for path in tuple(self.paths):
+            if path == envelope or envelope in path.parents:
+                self.paths.pop(path)
+                self.packages.pop(path, None)
 
 
 def _confirmation_digest(record: _PreparedRecord) -> str:
@@ -1082,7 +1176,27 @@ class MarketplaceTransactionStore:
         records: list[_PreparedRecord],
         *,
         parent_identity: tuple[int, int],
+        preparation: tuple[_PreparationWorkspace, _PreparedRecord] | None = None,
     ) -> None:
+        if preparation is not None:
+            workspace, record = preparation
+            workspace.validate()
+            if workspace.envelope is not None:
+                if not workspace.has_durable_marker():
+                    _fail("transaction_state_invalid", "preparation ownership changed")
+            load_distribution(
+                Path(
+                    record.destination
+                    if record.operation == "remove"
+                    else record.staging_path
+                ),
+                expected_digest=record.distribution_digest,
+            )
+            if self._current_provenance(record.identity) != record.installed_provenance:
+                _fail(
+                    "installed_package_changed",
+                    "installed state changed before preparation publication",
+                )
         records.sort(key=lambda item: item.transaction_id)
         self._write_model(
             self.path,
@@ -1309,7 +1423,16 @@ class MarketplaceTransactionStore:
         identity: InstalledPackageIdentity,
         destination: Path,
         package_digest: str | None,
+        authority: _TransactionPhases | None = None,
     ) -> bool:
+        if authority is not None:
+            authority.validate()
+            metadata = _entry(envelope)
+            if metadata is None or (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) != authority.paths.get(envelope):
+                return False
         if (
             self._read_marker(
                 envelope,
@@ -1552,6 +1675,7 @@ class MarketplaceTransactionStore:
                 self._write_prepared(
                     [*state.transactions, record],
                     parent_identity=parent_identity,
+                    preparation=(workspace, record),
                 )
             workspace.validate()
             return _record_to_prepared(record, token=token, consumed=False)
@@ -2128,14 +2252,15 @@ class MarketplaceTransactionStore:
                     "trust_origin": trust_origin,
                 }
             )
+            phases = _TransactionPhases(self, parent_identity, consumed)
             try:
                 if cancelled() or not enter_atomic():
                     _fail(
                         "marketplace_operation_cancelled",
                         "marketplace operation was cancelled",
                     )
-                fault("before_initial_journal")
-                self._replace_journal(journal, parent_identity=parent_identity)
+                phases.checkpoint(fault, "before_initial_journal")
+                phases.publish(journal)
                 if previous is not None:
                     quarantine = self._prepare_quarantine(
                         transaction_id=prepared.transaction_id,
@@ -2144,42 +2269,43 @@ class MarketplaceTransactionStore:
                         digest=previous.distribution_digest,
                         created_at=prepared.created_at,
                     )
-                fault("after_initial_journal")
+                    phases.track(quarantine.parent)
+                phases.checkpoint(fault, "after_initial_journal")
                 if previous is not None:
-                    os.replace(destination, quarantine)
+                    phases.move(destination, quarantine)
                     _fsync_directory(destination.parent)
                     _fsync_directory(quarantine.parent)
-                fault("after_backup_move")
+                phases.checkpoint(fault, "after_backup_move")
                 journal = journal.model_copy(
                     update={"phase": "install_candidate_swap_pending"}
                 )
-                self._replace_journal(journal, parent_identity=parent_identity)
-                os.replace(prepared.staging_path, destination)
+                phases.publish(journal)
+                phases.move(prepared.staging_path, destination)
                 _fsync_directory(destination.parent)
                 _fsync_directory(prepared.staging_path.parent)
-                fault("after_candidate_swap")
+                phases.checkpoint(fault, "after_candidate_swap")
                 journal = journal.model_copy(
                     update={"phase": "install_provenance_write_pending"}
                 )
-                self._replace_journal(journal, parent_identity=parent_identity)
+                phases.publish(journal)
                 writer(candidate_provenance)
                 if self.installed_store.get(prepared.identity) != candidate_provenance:
                     _fail(
                         "provenance_state_write_failed",
                         "provenance writer did not persist candidate identity",
                     )
-                fault("after_provenance_write")
+                phases.checkpoint(fault, "after_provenance_write")
                 if trust_origin is not None:
                     journal = journal.model_copy(
                         update={"phase": "install_trust_revoke_pending"}
                     )
-                    self._replace_journal(journal, parent_identity=parent_identity)
-                    fault("after_trust_revoke_pending")
+                    phases.publish(journal)
+                    phases.checkpoint(fault, "after_trust_revoke_pending")
                     self.trust_store.revoke_origin(trust_origin)
                 journal = journal.model_copy(update={"phase": "install_retire_pending"})
                 if trust_origin is not None:
-                    fault("after_trust_revoke")
-                self._replace_journal(journal, parent_identity=parent_identity)
+                    phases.checkpoint(fault, "after_trust_revoke")
+                phases.publish(journal)
                 if previous is not None:
                     quarantine_envelope = quarantine.parent
                     if _entry(quarantine_envelope) is not None and not (
@@ -2190,13 +2316,15 @@ class MarketplaceTransactionStore:
                             identity=prepared.identity,
                             destination=destination,
                             package_digest=previous.distribution_digest,
+                            authority=phases,
                         )
                     ):
                         _fail(
                             "transaction_recovery_ambiguous",
                             "quarantine ownership changed during installation",
                         )
-                fault("after_backup_retired")
+                    phases.retired(quarantine_envelope)
+                phases.checkpoint(fault, "after_backup_retired")
                 staging_envelope = prepared.staging_path.parent
                 if _entry(staging_envelope) is not None and not (
                     self._remove_owned_envelope(
@@ -2206,13 +2334,15 @@ class MarketplaceTransactionStore:
                         identity=prepared.identity,
                         destination=destination,
                         package_digest=distribution.digest,
+                        authority=phases,
                     )
                 ):
                     _fail(
                         "transaction_recovery_ambiguous",
                         "staging ownership changed during installation",
                     )
-                fault("after_staging_retired")
+                phases.retired(staging_envelope)
+                phases.checkpoint(fault, "after_staging_retired")
                 self._delete_journal(
                     prepared.transaction_id,
                     parent_identity=parent_identity,
@@ -2224,6 +2354,7 @@ class MarketplaceTransactionStore:
                         "transaction_rollback_failed",
                         "package installation cleanup requires recovery",
                     ) from original
+                phases.validate()
                 rollback_journal = journal.model_copy(
                     update={"phase": "install_rollback_pending"}
                 )
@@ -2309,14 +2440,15 @@ class MarketplaceTransactionStore:
                     "trust_origin": trust_origin,
                 }
             )
+            phases = _TransactionPhases(self, parent_identity, consumed)
             try:
                 if cancelled() or not enter_atomic():
                     _fail(
                         "marketplace_operation_cancelled",
                         "marketplace operation was cancelled",
                     )
-                fault("before_initial_journal")
-                self._replace_journal(journal, parent_identity=parent_identity)
+                phases.checkpoint(fault, "before_initial_journal")
+                phases.publish(journal)
                 quarantine = self._prepare_quarantine(
                     transaction_id=prepared.transaction_id,
                     identity=prepared.identity,
@@ -2324,33 +2456,34 @@ class MarketplaceTransactionStore:
                     digest=previous.distribution_digest,
                     created_at=prepared.created_at,
                 )
-                fault("after_initial_journal")
-                os.replace(destination, quarantine)
+                phases.track(quarantine.parent)
+                phases.checkpoint(fault, "after_initial_journal")
+                phases.move(destination, quarantine)
                 _fsync_directory(destination.parent)
                 _fsync_directory(quarantine.parent)
-                fault("after_backup_move")
+                phases.checkpoint(fault, "after_backup_move")
                 journal = journal.model_copy(
                     update={"phase": "remove_provenance_write_pending"}
                 )
-                self._replace_journal(journal, parent_identity=parent_identity)
+                phases.publish(journal)
                 remover(prepared.identity)
                 if self._current_provenance(prepared.identity) is not None:
                     _fail(
                         "provenance_state_write_failed",
                         "provenance remover did not remove installed identity",
                     )
-                fault("after_provenance_remove")
+                phases.checkpoint(fault, "after_provenance_remove")
                 if trust_origin is not None:
                     journal = journal.model_copy(
                         update={"phase": "remove_trust_revoke_pending"}
                     )
-                    self._replace_journal(journal, parent_identity=parent_identity)
-                    fault("after_trust_revoke_pending")
+                    phases.publish(journal)
+                    phases.checkpoint(fault, "after_trust_revoke_pending")
                     self.trust_store.revoke_origin(trust_origin)
                 journal = journal.model_copy(update={"phase": "remove_retire_pending"})
                 if trust_origin is not None:
-                    fault("after_trust_revoke")
-                self._replace_journal(journal, parent_identity=parent_identity)
+                    phases.checkpoint(fault, "after_trust_revoke")
+                phases.publish(journal)
                 quarantine_envelope = quarantine.parent
                 if _entry(quarantine_envelope) is not None and not (
                     self._remove_owned_envelope(
@@ -2360,13 +2493,15 @@ class MarketplaceTransactionStore:
                         identity=prepared.identity,
                         destination=destination,
                         package_digest=previous.distribution_digest,
+                        authority=phases,
                     )
                 ):
                     _fail(
                         "transaction_recovery_ambiguous",
                         "quarantine ownership changed during removal",
                     )
-                fault("after_backup_retired")
+                phases.retired(quarantine_envelope)
+                phases.checkpoint(fault, "after_backup_retired")
                 self._delete_journal(
                     prepared.transaction_id,
                     parent_identity=parent_identity,
@@ -2378,6 +2513,7 @@ class MarketplaceTransactionStore:
                         "transaction_rollback_failed",
                         "package removal cleanup requires recovery",
                     ) from original
+                phases.validate()
                 rollback_journal = journal.model_copy(
                     update={"phase": "remove_rollback_pending"}
                 )

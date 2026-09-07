@@ -353,9 +353,10 @@ def _workspace_entry_point(store, candidate, action):
 )
 @pytest.mark.parametrize("replacement", ["symlink", "directory"])
 @pytest.mark.parametrize("native", [True, False])
-def test_scratch_mkdir_boundary_never_mutates_foreign_authority(
+def test_defense_in_depth_scratch_mkdir_boundary_preserves_foreign_authority(
     tmp_path, monkeypatch, action, replacement, native
 ):
+    """Observed dir_fd defense, not a portable same-account syscall guarantee."""
     from plugins.workflow.marketplace import transactions as transaction_module
 
     store = MarketplaceTransactionStore(tmp_path)
@@ -442,6 +443,7 @@ def test_scratch_mkdir_boundary_never_mutates_foreign_authority(
 def test_preparation_writes_stay_with_original_authority(
     tmp_path, monkeypatch, replacement, window, native
 ):
+    """Phase checks plus extra syscall probes; only phase checks are portable."""
     from plugins.workflow.marketplace import transactions as transaction_module
 
     store = MarketplaceTransactionStore(tmp_path)
@@ -773,6 +775,213 @@ def test_preparation_keeps_descriptor_use_bounded_by_copy_depth(tmp_path, monkey
 
 
 @pytest.mark.parametrize(
+    "damage", ["marker", "package_bytes", "envelope", "remove_bytes", "provenance"]
+)
+def test_named_phase_before_prepared_publication_rechecks_authority(
+    tmp_path, monkeypatch, damage
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    if damage == "remove_bytes":
+        candidate = _removal_candidate(store, _install(store, candidate))
+    state_before = store.path.read_bytes() if store.path.exists() else None
+    destination_before = _snapshot(candidate.destination)
+    original = store._write_prepared
+    evidence = None
+    before = None
+
+    def before_publication(*args, **kwargs):
+        nonlocal evidence, before
+        if damage == "remove_bytes":
+            evidence = candidate.destination / "fixtures" / "sample.json"
+            evidence.write_bytes(b"changed installed package")
+            return original(*args, **kwargs)
+        (envelope,) = store.staging_root.iterdir()
+        if damage == "marker":
+            evidence = envelope / "owner.json"
+            evidence.write_bytes(b"foreign ownership")
+            before = evidence.read_bytes()
+        elif damage == "package_bytes":
+            evidence = envelope / "package" / "fixtures" / "sample.json"
+            evidence.write_bytes(b"changed candidate")
+        elif damage == "provenance":
+            evidence = store.installed_store.path
+            evidence.write_bytes(b"unproven installed state")
+            before = evidence.read_bytes()
+        else:
+            try:
+                envelope.rename(tmp_path / "displaced-envelope")
+            except PermissionError:
+                assert os.name == "nt"
+                return original(*args, **kwargs)
+            envelope.mkdir(mode=0o700)
+            evidence = envelope / "foreign-evidence"
+            evidence.write_bytes(b"foreign directory")
+            before = evidence.read_bytes()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_write_prepared", before_publication)
+    failure = None
+    try:
+        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+    except WorkflowMarketplaceError as error:
+        failure = error
+    if evidence is None:
+        assert os.name == "nt" and damage == "envelope"
+        assert failure is None
+    else:
+        assert failure is not None, "changed preparation must not publish success"
+        assert (
+            store.path.read_bytes() if store.path.exists() else None
+        ) == state_before, "changed preparation must not publish state"
+        if before is not None:
+            assert evidence.read_bytes() == before
+    if damage != "remove_bytes":
+        assert _snapshot(candidate.destination) == destination_before
+
+
+@pytest.mark.parametrize(
+    "action,phase,damage",
+    [
+        (action, phase, damage)
+        for action in ("install", "update", "remove")
+        for phase in (
+            "before_initial_journal",
+            "after_initial_journal",
+            "after_backup_move",
+        )
+        for damage in ("marker", "journal", "root", "envelope")
+        if not (
+            action == "remove"
+            and phase == "before_initial_journal"
+            and damage in {"marker", "envelope"}
+        )
+    ]
+    + (
+        [("install", "after_initial_journal", "workspace_mode")]
+        if os.name != "nt"
+        else []
+    ),
+)
+def test_named_phase_before_mutation_rechecks_transaction_authority(
+    tmp_path, action, phase, damage
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    if action == "install":
+        prepared = _consume(store, candidate)
+    else:
+        installed = _install(store, candidate)
+        if action == "update":
+            candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+            prepared = _consume(store, candidate)
+        else:
+            _, prepared = _authorize_remove(store, installed)
+    observed = None
+    evidence = None
+    evidence_before = None
+
+    def replace_at_phase(point):
+        nonlocal observed, evidence, evidence_before
+        if point != phase:
+            return
+        if damage == "root":
+            displaced = tmp_path / "displaced-root"
+            store.root.rename(displaced)
+            shutil.copytree(displaced, store.root)
+            evidence = store.root
+            evidence_before = _snapshot(evidence)
+        elif damage == "journal":
+            evidence = store.journal_path
+            state = json.loads(evidence.read_bytes())
+            state["journals"][0]["phase"] = (
+                f"{prepared.operation}_provenance_write_pending"
+            )
+            evidence.write_text(json.dumps(state))
+            evidence_before = evidence.read_bytes()
+        elif damage == "workspace_mode":
+            evidence = store.staging_root
+            evidence.chmod(0o755)
+            evidence_before = _snapshot(evidence)
+        elif damage == "envelope":
+            root = store.quarantine_root if action == "remove" else store.staging_root
+            evidence = root / prepared.transaction_id
+            displaced = tmp_path / "displaced-envelope"
+            evidence.rename(displaced)
+            shutil.copytree(displaced, evidence)
+            evidence_before = _snapshot(evidence)
+        else:
+            root = store.quarantine_root if action == "remove" else store.staging_root
+            evidence = root / prepared.transaction_id / "owner.json"
+            evidence.write_bytes(b"foreign ownership evidence")
+            evidence_before = evidence.read_bytes()
+        observed = _snapshot(candidate.destination)
+
+    failure = None
+    try:
+        mutation = store.atomic_remove if action == "remove" else store.atomic_install
+        mutation(prepared, review_digest=REVIEW, fault=replace_at_phase)
+    except WorkflowMarketplaceError as error:
+        failure = error
+    assert observed is not None, "named mutation phase must execute"
+    assert failure is not None, "changed authority must not commit"
+    assert _snapshot(candidate.destination) == observed, (
+        "no installed mutation after detection"
+    )
+    assert evidence is not None
+    assert (
+        _snapshot(evidence) if evidence.is_dir() else evidence.read_bytes()
+    ) == evidence_before
+
+
+@pytest.mark.parametrize("action", ["install", "update", "remove"])
+@pytest.mark.parametrize("damage", ["marker", "envelope", "journal"])
+def test_named_phase_before_cleanup_preserves_unproven_marker(
+    tmp_path, monkeypatch, action, damage
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    if action == "install":
+        prepared = _consume(store, candidate)
+    else:
+        installed = _install(store, candidate)
+        if action == "update":
+            candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+            prepared = _consume(store, candidate)
+        else:
+            _, prepared = _authorize_remove(store, installed)
+    original = store._remove_owned_envelope
+    evidence = None
+    before = None
+    installed_at_cleanup = None
+
+    def before_cleanup(envelope, **kwargs):
+        nonlocal evidence, before, installed_at_cleanup
+        evidence = envelope
+        if damage == "envelope":
+            displaced = tmp_path / "displaced-cleanup-envelope"
+            envelope.rename(displaced)
+            shutil.copytree(displaced, envelope)
+        elif damage == "journal":
+            state = json.loads(store.journal_path.read_bytes())
+            state["journals"][0]["phase"] = f"{prepared.operation}_consumed"
+            store.journal_path.write_text(json.dumps(state))
+        else:
+            (envelope / "owner.json").write_bytes(b"unproven cleanup ownership")
+        before = _snapshot(envelope)
+        installed_at_cleanup = _snapshot(candidate.destination)
+        return original(envelope, **kwargs)
+
+    monkeypatch.setattr(store, "_remove_owned_envelope", before_cleanup)
+    with pytest.raises(WorkflowMarketplaceError):
+        mutation = store.atomic_remove if action == "remove" else store.atomic_install
+        mutation(prepared, review_digest=REVIEW)
+    assert evidence is not None and _snapshot(evidence) == before
+    assert _snapshot(candidate.destination) == installed_at_cleanup
+    assert store.list_journals(), "uncertain cleanup remains journaled"
+
+
+@pytest.mark.parametrize(
     "action", ["prepare", "recover", "atomic_install", "atomic_remove"]
 )
 @pytest.mark.parametrize("replacement", ["symlink", "directory"])
@@ -913,9 +1122,10 @@ def test_original_workspace_authority_settles_normally(
 
 @pytest.mark.parametrize("action", ["prepare", "recover"])
 @pytest.mark.parametrize("replacement", ["symlink", "directory"])
-def test_workspace_mkdir_cannot_be_redirected_after_parent_open(
+def test_defense_in_depth_workspace_mkdir_after_parent_open(
     tmp_path, monkeypatch, action, replacement
 ):
+    """A useful supported-host defense, not atomic mkdir-and-open semantics."""
     store = MarketplaceTransactionStore(tmp_path)
     candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
     foreign = tmp_path / "foreign-authority"
