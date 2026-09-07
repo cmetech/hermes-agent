@@ -608,8 +608,9 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
         forgetReplay(entry)
         entries.delete(entry)
         publish()
-        await reconcileScope(target)
 
+        // The binding is already proven. A scope probe would quarantine other
+        // active calls; reconcile only this package unless its read requires revalidation.
         if (entry.record.subject.type === 'package' && usable(target)) {
           await reconcilePackage(target, entry.record.subject.identity)
         }

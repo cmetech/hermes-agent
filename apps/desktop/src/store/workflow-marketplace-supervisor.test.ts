@@ -970,10 +970,312 @@ describe('application marketplace operation supervision', () => {
       await expect(h.supervisor.start(h.intent, binding)).rejects.toMatchObject({ code })
       expect(h.supervisor.$records.get()).toHaveLength(0)
       expect(h.states()).toBeGreaterThan(oldStates)
-      expect(h.calls.filter(call => call.type === 'list').length).toBeGreaterThan(1)
+      expect(h.calls.filter(call => call.type === 'list')).toHaveLength(1)
+      expect(h.probes()).toBe(1)
       expect(h.supervisor.getPackageGate(binding, identity).state).toBe('ready')
       await vi.advanceTimersByTimeAsync(15001)
       expect(h.calls.some(call => call.type === 'lookup' || call.type === 'get')).toBe(false)
+    }
+  )
+
+  // R1: a rejected first POST must not capability-quarantine another call or destroy its replay/cadence owner.
+  describe.each(['different-package lifecycle', 'same-package inspection'] as const)('%s', scenario => {
+    it.each(['failed lookup', 'delayed lookup', 'failed snapshot', 'delayed snapshot'] as const)(
+      'preserves the original admission across backend conflict with %s recovery',
+      async recovery => {
+        const h = setup()
+        const binding = (await h.bind())!
+        const kind = scenario === 'different-package lifecycle' ? 'remove_prepare' : 'inspect'
+
+        const otherIdentity =
+          scenario === 'different-package lifecycle' ? { ...identity, package_id: 'neighbor' } : identity
+
+        const originalResponse = deferred<unknown>()
+        const recoveryResponse = deferred<unknown>()
+        const stateResponse = deferred<unknown>()
+        const entered = deferred<void>()
+        const starts: LifecycleStart[] = []
+        const recoveryCalls: string[] = []
+        const stateCalls: unknown[] = []
+        const conflict = new LifecycleApiError('marketplace_operation_conflict', 409)
+        let admitted!: LifecycleOperation
+
+        h.api.start = async input => {
+          starts.push(input)
+
+          if (starts.length !== 1) {
+            throw conflict
+          }
+
+          admitted = {
+            ...fixture(`service ${kind === 'inspect' ? 'inspect' : 'remove prepare'} pending`),
+            request_id: input.requestId
+          }
+          entered.resolve()
+
+          return originalResponse.promise
+        }
+
+        h.api.lookup = async () => {
+          recoveryCalls.push('lookup')
+
+          if (recovery === 'failed lookup') {
+            throw new LifecycleApiError('marketplace_network_error', 0)
+          }
+
+          return recovery === 'delayed lookup' ? recoveryResponse.promise : { state: 'found', operation: admitted }
+        }
+
+        h.api.list = async () => {
+          recoveryCalls.push('list')
+
+          if (recovery === 'failed snapshot') {
+            throw new LifecycleApiError('marketplace_network_error', 0)
+          }
+
+          return recovery === 'delayed snapshot'
+            ? recoveryResponse.promise
+            : { items: [], complete: true, next_cursor: null }
+        }
+
+        h.api.packageState = async (requestedIdentity, requestedBinding) => {
+          stateCalls.push({ identity: requestedIdentity, binding: requestedBinding })
+
+          return stateResponse.promise
+        }
+
+        const get = vi.fn(async () => admitted)
+        h.api.get = get
+
+        const original = h.supervisor.start(
+          kind === 'inspect'
+            ? { kind, subject, selection: null, body: {} }
+            : { kind, subject, selection: null, body: { identity } },
+          binding
+        )
+
+        await entered.promise
+        const before = h.record()
+        expect(before).toMatchObject({
+          status: 'admitting',
+          callPending: true,
+          operationId: null,
+          binding,
+          kind,
+          subject
+        })
+
+        const rejected = h.supervisor
+          .start(
+            {
+              subject: { type: 'package', identity: otherIdentity },
+              selection: null,
+              ...(kind === 'inspect'
+                ? { kind: 'remove_prepare', body: { identity: otherIdentity } }
+                : { kind: 'inspect', body: {} })
+            },
+            binding
+          )
+          .catch(error => error)
+
+        try {
+          await vi.advanceTimersByTimeAsync(0)
+          expect(h.record()).toEqual(before)
+          expect(h.supervisor.$records.get()).toHaveLength(1)
+          expect(h.supervisor.bindings.isCurrent(binding)).toBe(true)
+          expect(h.probes()).toBe(1)
+          expect(recoveryCalls).toEqual([])
+          expect(stateCalls).toEqual([{ identity: otherIdentity, binding }])
+          expect(starts).toHaveLength(2)
+
+          // The original response remains usable even while the conflicting exact state read is delayed.
+          originalResponse.resolve(admitted)
+          expect(await original).toBe(h.record().key)
+          expect(h.record()).toMatchObject({
+            requestId: before.requestId,
+            operationId: admitted.id,
+            binding,
+            status: 'watching',
+            callPending: false
+          })
+          await vi.advanceTimersByTimeAsync(499)
+          expect(get).not.toHaveBeenCalled()
+          await vi.advanceTimersByTimeAsync(1)
+          expect(get).toHaveBeenCalledExactlyOnceWith(admitted.id, binding)
+          stateResponse.reject(new LifecycleApiError('marketplace_network_error', 0))
+          expect(await rejected).toMatchObject({ code: conflict.code, status: 409 })
+          expect(h.record()).toMatchObject({
+            requestId: before.requestId,
+            operationId: admitted.id,
+            status: 'watching',
+            callPending: false,
+            binding
+          })
+          expect(starts).toHaveLength(2)
+          expect(recoveryCalls).toEqual([])
+        } finally {
+          originalResponse.resolve(admitted)
+          recoveryResponse.resolve({ items: [], complete: true, next_cursor: null })
+          stateResponse.resolve(null)
+          await Promise.all([original, rejected])
+        }
+      }
+    )
+
+    it('retains the original bounded replay after a backend conflict and a later lost response', async () => {
+      const h = setup()
+      const binding = (await h.bind())!
+      const pending = h.deferPost()
+
+      const originalIntent: MarketplaceIntent =
+        scenario === 'different-package lifecycle' ? h.intent : { kind: 'inspect', subject, selection: null, body: {} }
+
+      const original = h.supervisor.start(originalIntent, binding)
+      await vi.advanceTimersByTimeAsync(0)
+      const before = h.record()
+      const admitted = [...h.receipts.values()][0]
+
+      const replay = vi.fn(async (input: LifecycleStart, _binding: LifecycleConnectionBinding) => {
+        if (input.requestId !== before.requestId) {
+          throw new LifecycleApiError('marketplace_request_conflict', 409)
+        }
+
+        return admitted
+      })
+
+      h.api.start = replay
+
+      const otherIdentity =
+        scenario === 'different-package lifecycle' ? { ...identity, package_id: 'neighbor' } : identity
+
+      await expect(
+        h.supervisor.start(
+          {
+            kind: 'remove_prepare',
+            subject: { type: 'package', identity: otherIdentity },
+            selection: null,
+            body: { identity: otherIdentity }
+          },
+          binding
+        )
+      ).rejects.toMatchObject({ code: 'marketplace_request_conflict' })
+      pending.reject(new LifecycleApiError('marketplace_network_error', 0))
+      await original
+      expect(h.record()).toMatchObject({
+        key: before.key,
+        requestId: before.requestId,
+        status: 'admission_unknown',
+        callPending: false,
+        binding
+      })
+      expect(replay).toHaveBeenCalledTimes(1)
+      await h.supervisor.retry(before.key)
+      expect(replay).toHaveBeenCalledTimes(2)
+      expect(replay.mock.calls[1][0]).toMatchObject({
+        requestId: before.requestId,
+        ...originalIntent
+      })
+      expect(replay.mock.calls[1][1]).toEqual(binding)
+      expect(h.record()).toMatchObject({
+        requestId: before.requestId,
+        operationId: admitted.id,
+        binding,
+        status: 'watching'
+      })
+      expect(h.probes()).toBe(1)
+    })
+  })
+
+  it('preserves an existing inspection cadence across a same-package backend conflict', async () => {
+    const h = setup()
+    const binding = (await h.bind())!
+    await h.supervisor.start({ kind: 'inspect', subject, selection: null, body: {} }, binding)
+    const before = h.record()
+    await vi.advanceTimersByTimeAsync(200)
+
+    h.api.start = async () => {
+      throw new LifecycleApiError('marketplace_operation_conflict', 409)
+    }
+
+    h.fail(new LifecycleApiError('marketplace_network_error', 0))
+    h.list([])
+    await expect(
+      h.supervisor.start({ kind: 'remove_prepare', subject, selection: null, body: { identity } }, binding)
+    ).rejects.toMatchObject({ code: 'marketplace_operation_conflict' })
+    expect(h.record()).toEqual(before)
+    expect(h.reads()).toBe(0)
+    await vi.advanceTimersByTimeAsync(299)
+    expect(h.reads()).toBe(0)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.reads()).toBe(1)
+    expect(h.probes()).toBe(1)
+  })
+
+  // R1 inverse: package-local conflict handling must still honor real authorization/binding invalidation.
+  it.each([401, 403, 'generation'] as const)(
+    'quarantines pending work when conflict reconciliation encounters %s revalidation',
+    async boundary => {
+      const h = setup()
+      const binding = (await h.bind())!
+      const held = h.deferPost()
+      const original = h.supervisor.start(h.intent, binding)
+      await vi.advanceTimersByTimeAsync(0)
+      const before = h.record()
+      const admitted = [...h.receipts.values()][0]
+      const capabilities = h.deferCapabilities()
+      const state = deferred<unknown>()
+      const stateRead = vi.fn(() => state.promise)
+      h.api.packageState = stateRead
+
+      h.api.start = async () => {
+        throw new LifecycleApiError('marketplace_operation_conflict', 409)
+      }
+
+      const rejected = h.supervisor
+        .start(
+          {
+            kind: 'inspect',
+            subject: { type: 'package', identity: { ...identity, package_id: 'neighbor' } },
+            selection: null,
+            body: {}
+          },
+          binding
+        )
+        .catch(error => error)
+
+      try {
+        await vi.advanceTimersByTimeAsync(0)
+        expect(h.record()).toEqual(before)
+        expect(stateRead).toHaveBeenCalledExactlyOnceWith({ ...identity, package_id: 'neighbor' }, binding)
+
+        if (boundary === 'generation') {
+          h.changeGeneration()
+          state.resolve(null)
+        } else {
+          state.reject(new LifecycleApiError('marketplace_network_error', boundary))
+        }
+
+        await vi.advanceTimersByTimeAsync(0)
+        expect(h.record()).toMatchObject({
+          status: 'suspended',
+          callPending: false,
+          operationId: null,
+          requestId: before.requestId,
+          binding,
+          barrier: true
+        })
+        expect(h.supervisor.bindings.isCurrent(binding)).toBe(false)
+        expect(h.probes()).toBe(boundary === 'generation' ? 1 : 2)
+        held.resolve(admitted)
+        await original
+        expect(h.record().operationId).toBeNull()
+      } finally {
+        held.resolve(admitted)
+        state.resolve(null)
+        capabilities.resolve(null)
+        await original
+        expect(await rejected).toMatchObject({ code: 'marketplace_operation_conflict', status: 409 })
+      }
     }
   )
 
