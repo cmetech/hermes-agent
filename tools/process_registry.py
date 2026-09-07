@@ -286,7 +286,7 @@ def _is_supervised_gateway_process() -> bool:
 def _build_systemd_scope_argv(
     shell_argv: List[str],
     unit_suffix: str,
-) -> List[str]:
+) -> Optional[List[str]]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation.
 
     The resulting cgroup gets its own memory accounting so an OOM in the
@@ -298,9 +298,8 @@ def _build_systemd_scope_argv(
 
     binary = shutil.which("systemd-run")
     if binary is None:
-        # Caller should have checked _systemd_run_user_scope_available();
-        # guard anyway so we never pass None into Popen.
-        return shell_argv
+        # Availability is cached; absence here must not grant scope authority.
+        return None
     unit_name = f"hermes-worker-{unit_suffix}"
     memory_max = _worker_memory_max_bytes()
     return [
@@ -1006,12 +1005,17 @@ class ProcessRegistry:
                     pty_in_supervised_gateway and _systemd_run_user_scope_available()
                 )
 
+                pty_scope_argv = None
                 if pty_use_systemd_scope:
-                    pty_argv = _build_systemd_scope_argv(
+                    pty_scope_argv = _build_systemd_scope_argv(
                         pty_argv,
                         unit_suffix=session.id,
                     )
-                    session.systemd_unit = f"hermes-worker-{session.id}.scope"
+                if pty_scope_argv is not None:
+                    pty_argv = pty_scope_argv
+                    session.systemd_unit = (
+                        pty_scope_argv[pty_scope_argv.index("--unit") + 1] + ".scope"
+                    )
                     pty_scope_attempted = True
                 elif pty_in_supervised_gateway:
                     logger.debug(
@@ -1083,15 +1087,18 @@ class ProcessRegistry:
             in_supervised_gateway and _systemd_run_user_scope_available()
         )
 
+        scope_argv = None
         if use_systemd_scope:
             unit_suffix = (
                 f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
             )
-            spawn_argv = _build_systemd_scope_argv(
+            scope_argv = _build_systemd_scope_argv(
                 shell_argv,
                 unit_suffix=unit_suffix,
             )
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+        if scope_argv is not None:
+            spawn_argv = scope_argv
+            session.systemd_unit = scope_argv[scope_argv.index("--unit") + 1] + ".scope"
             # CRITICAL (#70716 regression): systemd-run --scope does NOT give
             # the worker a new session — the invoked process keeps the
             # parent's session and inherits its controlling terminal.  From an

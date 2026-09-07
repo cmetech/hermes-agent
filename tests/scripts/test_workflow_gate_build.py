@@ -13,6 +13,69 @@ from scripts import workflow_gate_build as build
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
 
 
+def test_systemd_builder_reports_absence_instead_of_unwrapped_authority(monkeypatch):
+    import shutil
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert (
+        registry_module._build_systemd_scope_argv(["/bin/sh", "-c", "fixture"], "owned")
+        is None
+    )
+
+
+@pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
+@pytest.mark.parametrize("use_pty", [False, True])
+@pytest.mark.parametrize("binary_present", [False, True])
+def test_registry_records_scope_only_from_exact_constructed_launch(
+    tmp_path, monkeypatch, use_pty, binary_present
+):
+    import shutil
+    from ptyprocess import PtyProcess
+    import tools.process_registry as registry_module
+
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "_is_supervised_gateway_process", lambda: True)
+    # The availability probe succeeds; the later builder resolution can fail.
+    monkeypatch.setattr(
+        registry_module, "_systemd_run_user_scope_available", lambda: True
+    )
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/fixture/systemd-run" if binary_present else None
+    )
+    monkeypatch.setattr(registry_module, "_find_shell", lambda: "/bin/sh")
+    monkeypatch.setattr(registry_module.threading, "Thread", lambda **kwargs: Mock())
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    captured = []
+
+    def launch(argv, **kwargs):
+        captured.append((argv, kwargs))
+        process = Mock(pid=4321)
+        return (
+            process
+            if use_pty
+            else SimpleNamespace(
+                process=process, identity=ProcessIdentity(4321, None, 4321)
+            )
+        )
+
+    monkeypatch.setattr(PtyProcess, "spawn", launch)
+    monkeypatch.setattr(ManagedProcessTree, "spawn", launch)
+    command = "printf '%s' 'literal;$(not-executed)'"
+    session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=use_pty)
+    argv, kwargs = captured[0]
+    assert argv[-3:] == ["/bin/sh", "-lic", f"set +m; {command}"]
+    if binary_present:
+        assert argv[:3] == ["/fixture/systemd-run", "--user", "--scope"]
+        assert argv[argv.index("--unit") + 1] == f"hermes-worker-{session.id}"
+        assert session.systemd_unit == argv[argv.index("--unit") + 1] + ".scope"
+    else:
+        assert argv == ["/bin/sh", "-lic", f"set +m; {command}"]
+        assert session.systemd_unit == ""
+    if not use_pty:
+        assert kwargs["start_new_session"] is True
+
+
 @pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize("scope_stop", [True, False, "raises"])
@@ -32,11 +95,9 @@ def test_scoped_registry_setup_failure_reaps_only_wrapper_and_reports_cleanup(
     monkeypatch.setattr(
         registry_module, "_systemd_run_user_scope_available", lambda: True
     )
-    monkeypatch.setattr(
-        registry_module,
-        "_build_systemd_scope_argv",
-        lambda *args, **kwargs: ["fixture"],
-    )
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/fixture/systemd-run")
     stop_calls = []
 
     def stop(unit):
@@ -52,6 +113,7 @@ def test_scoped_registry_setup_failure_reaps_only_wrapper_and_reports_cleanup(
     signals = []
 
     def real_wrapper(*args, **kwargs):
+        assert args[0][:3] == ["/fixture/systemd-run", "--user", "--scope"]
         tree = spawn(
             [sys.executable, "-c", "import threading; threading.Event().wait(60)"],
             **kwargs,
@@ -114,14 +176,26 @@ def test_scoped_registry_setup_failure_reaps_only_wrapper_and_reports_cleanup(
 
 @pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
 @pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("probe_race", [False, True])
 def test_ordinary_registry_setup_failure_reaps_lingering_new_session_group(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, probe_race
 ):
+    import shutil
     import tools.process_registry as registry_module
 
     registry = registry_module.ProcessRegistry()
     monkeypatch.setattr(
-        registry_module, "_is_supervised_gateway_process", lambda: False
+        registry_module, "_is_supervised_gateway_process", lambda: probe_race
+    )
+    monkeypatch.setattr(
+        registry_module, "_systemd_run_user_scope_available", lambda: True
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    stopped = []
+    monkeypatch.setattr(
+        registry_module,
+        "_stop_systemd_unit",
+        lambda unit: stopped.append(unit) or False,
     )
     reader = Mock()
     reader.start.side_effect = RuntimeError("reader failed")
@@ -146,13 +220,15 @@ def test_ordinary_registry_setup_failure_reaps_lingering_new_session_group(
 
     monkeypatch.setattr(ManagedProcessTree, "spawn", exited_wrapper)
     try:
-        with pytest.raises(RuntimeError, match="reader failed"):
+        with pytest.raises(RuntimeError) as caught:
             registry.spawn_local("fixture", cwd=str(tmp_path))
-        assert captured[0].reaped
         descendant = descendants[0]
         assert (
             not descendant.is_running() or descendant.status() == psutil.STATUS_ZOMBIE
         )
+        assert captured[0].reaped
+        assert str(caught.value) == "reader failed"
+        assert stopped == []
     finally:
         for descendant in descendants:
             try:
