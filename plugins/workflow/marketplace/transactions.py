@@ -544,8 +544,8 @@ class MarketplaceTransactionStore:
         self.lock_path = shared.lock_path
         self.path = self.root / "transactions.json"
         self.journal_path = self.root / "transaction-journals.json"
-        self.staging_root = self.home / "workflows" / ".staging"
-        self.quarantine_root = self.home / "workflows" / ".quarantine"
+        self.staging_root = self.root / ".staging"
+        self.quarantine_root = self.root / ".quarantine"
         self.installed_store = InstalledPackageStore(
             self.home,
             lock_timeout_seconds=lock_timeout_seconds,
@@ -596,6 +596,15 @@ class MarketplaceTransactionStore:
         _require_directory(self.home)
         workflows = self.home / "workflows"
         _require_directory(workflows)
+        try:
+            self._shared_store._ensure_private_root()
+        except WorkflowMarketplaceError as error:
+            if error.code.startswith("source_state"):
+                _fail(
+                    "transaction_state_invalid",
+                    "marketplace transaction state directory is invalid",
+                )
+            raise
         _require_directory(self.staging_root, private=True)
         _require_directory(self.quarantine_root, private=True)
 

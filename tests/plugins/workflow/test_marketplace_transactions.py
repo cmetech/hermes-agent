@@ -27,6 +27,7 @@ from plugins.workflow.marketplace.transactions import (
     TransactionCandidate,
 )
 from plugins.workflow.trust import WorkflowTrustStore
+from plugins.workflow.store import RunStore
 
 
 FIXTURE_PACKAGES = (
@@ -184,6 +185,399 @@ def _authorize_remove(
 ):
     candidate = _removal_candidate(store, installed)
     return candidate, _consume(store, candidate)
+
+
+def test_fresh_home_preparation_uses_private_marketplace_workspaces(tmp_path):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    marketplace_root = tmp_path / "marketplace" / "workflows"
+    assert store.staging_root == marketplace_root / ".staging"
+    assert store.quarantine_root == marketplace_root / ".quarantine"
+    assert prepared.staging_path == (
+        marketplace_root / ".staging" / prepared.transaction_id / "package"
+    )
+    if os.name != "nt":
+        for directory in (
+            marketplace_root,
+            store.staging_root,
+            store.quarantine_root,
+            prepared.staging_path.parent,
+        ):
+            assert directory.stat().st_mode & 0o777 == 0o700
+        assert (
+            prepared.staging_path.parent / "owner.json"
+        ).stat().st_mode & 0o777 == 0o600
+    installed = store.atomic_install(
+        store.consume(prepared.token, actor="alice", profile="p1"),
+        review_digest=REVIEW,
+    )
+    assert installed.distribution_digest == candidate.distribution.digest
+    assert not (tmp_path / "workflows" / ".staging").exists()
+    assert not (tmp_path / "workflows" / ".quarantine").exists()
+
+
+def test_fresh_home_recovery_establishes_private_marketplace_authority(tmp_path):
+    store = MarketplaceTransactionStore(tmp_path)
+    assert store.recover_transactions() == ()
+    assert (tmp_path / "marketplace" / "workflows" / ".staging").is_dir()
+    assert (tmp_path / "marketplace" / "workflows" / ".quarantine").is_dir()
+    assert not (tmp_path / "workflows" / ".staging").exists()
+
+
+@pytest.mark.parametrize(
+    "root_name", ["marketplace", "workflows", ".staging", ".quarantine"]
+)
+@pytest.mark.parametrize("damage", ["symlink", "public_mode", "file"])
+@pytest.mark.parametrize("entry_point", ["prepare", "recover"])
+def test_workspace_creation_refuses_hostile_marketplace_parent(
+    tmp_path, root_name, damage, entry_point
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store._shared_store._ensure_private_root()
+    store._ensure_workflow_roots()
+    root = {
+        "marketplace": store.root.parent,
+        "workflows": store.root,
+        ".staging": store.root / ".staging",
+        ".quarantine": store.root / ".quarantine",
+    }[root_name]
+    if damage == "public_mode":
+        root.chmod(0o755)
+    else:
+        target = tmp_path / "foreign-root"
+        root.rename(target)
+        if damage == "symlink":
+            root.symlink_to(target, target_is_directory=True)
+        else:
+            root.write_bytes(b"foreign parent file")
+    before = _snapshot(tmp_path)
+    malformed_authority = damage == "file" and root_name in {"marketplace", "workflows"}
+    if damage == "public_mode" and os.name == "nt":
+        # Native Windows does not enforce the POSIX directory mode policy.
+        assert store.recover_transactions() == ()
+    else:
+        # Preserve the shared authority's existing native mkdir refusal for a
+        # regular-file parent, without broadening its error contract here.
+        expected_error = (
+            FileExistsError if malformed_authority else WorkflowMarketplaceError
+        )
+        with pytest.raises(expected_error) as error:
+            if entry_point == "recover":
+                store.recover_transactions()
+            else:
+                store.prepare(
+                    candidate, review_digest=REVIEW, actor="alice", profile="p1"
+                )
+        if not malformed_authority:
+            assert isinstance(error.value, WorkflowMarketplaceError)
+            assert error.value.code == (
+                "transaction_state_invalid"
+                if root_name in {"marketplace", "workflows"}
+                else "transaction_destination_invalid"
+            )
+    assert _snapshot(tmp_path) == before
+    if damage == "symlink":
+        assert root.is_symlink()
+    elif damage == "public_mode" and os.name != "nt":
+        assert root.stat().st_mode & 0o777 == 0o755
+
+
+def test_private_root_identity_is_rechecked_after_workspace_creation(
+    tmp_path, monkeypatch
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    store._shared_store._ensure_private_root()
+    original = store._shared_store._ensure_private_root
+    displaced = tmp_path / "displaced-private-root"
+
+    def replace_after_validation():
+        identity = original()
+        if store.staging_root.exists() and not displaced.exists():
+            store.root.rename(displaced)
+            store.root.mkdir(mode=0o700)
+        return identity
+
+    monkeypatch.setattr(
+        store._shared_store, "_ensure_private_root", replace_after_validation
+    )
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+    assert error.value.code == "transaction_state_invalid"
+    assert not candidate.destination.exists()
+    assert not store.path.exists()
+    assert not store.installed_store.path.exists()
+
+
+def _forbid_workspace_enumeration(monkeypatch, roots):
+    original_scandir = os.scandir
+    original_iterdir = Path.iterdir
+
+    def check(path):
+        if isinstance(path, (str, bytes, os.PathLike)):
+            candidate = Path(os.fsdecode(path))
+            assert not any(
+                candidate == root or root in candidate.parents for root in roots
+            ), f"cross-authority workspace enumeration: {candidate}"
+
+    def scandir(path):
+        check(path)
+        return original_scandir(path)
+
+    def iterdir(path):
+        check(path)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+
+def test_run_reconciliation_never_enumerates_live_marketplace_envelopes(
+    tmp_path, monkeypatch
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    before = _snapshot(store.staging_root)
+    identity = prepared.staging_path.parent.stat()
+    with monkeypatch.context() as guard:
+        _forbid_workspace_enumeration(
+            guard, (store.staging_root, store.quarantine_root)
+        )
+        runs = RunStore(tmp_path)
+        RunStore(tmp_path)
+    assert runs.staging_root == tmp_path / "workflows" / ".staging"
+    assert runs.quarantine_root == tmp_path / "workflows" / ".quarantine"
+    assert _snapshot(store.staging_root) == before
+    after = prepared.staging_path.parent.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (
+        identity.st_dev,
+        identity.st_ino,
+        identity.st_mode,
+    )
+    assert not runs.list_admission_events()
+    assert list(runs.quarantine_root.iterdir()) == []
+    installed = store.atomic_install(
+        store.consume(prepared.token, actor="alice", profile="p1"), review_digest=REVIEW
+    )
+    assert installed.distribution_digest == candidate.distribution.digest
+
+
+def test_marketplace_recovery_never_enumerates_run_snapshots(tmp_path, monkeypatch):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    with store._locked() as identity:
+        store._write_prepared([], parent_identity=identity)
+    runs = RunStore(tmp_path)
+    for root in (runs.staging_root, runs.quarantine_root):
+        snapshot = root / ("e" * 32)
+        snapshot.mkdir()
+        (snapshot / ".snapshot-owner.json").write_text(
+            json.dumps({
+                "pid": os.getpid(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }),
+            encoding="utf-8",
+        )
+        (snapshot / "evidence").write_bytes(b"run snapshot")
+    before = (_snapshot(runs.staging_root), _snapshot(runs.quarantine_root))
+    modes = (runs.staging_root.stat().st_mode, runs.quarantine_root.stat().st_mode)
+    with monkeypatch.context() as guard:
+        _forbid_workspace_enumeration(guard, (runs.staging_root, runs.quarantine_root))
+        restarted = MarketplaceTransactionStore(tmp_path)
+        assert [
+            entry.transaction_id for entry in restarted.inspect_recovery().entries
+        ] == [prepared.transaction_id]
+        assert restarted.recover_transactions() == ()
+        assert restarted.inspect_recovery().entries == ()
+    assert not prepared.staging_path.parent.exists()
+    assert (_snapshot(runs.staging_root), _snapshot(runs.quarantine_root)) == before
+    assert (
+        runs.staging_root.stat().st_mode,
+        runs.quarantine_root.stat().st_mode,
+    ) == modes
+
+
+@pytest.mark.parametrize("operation", ["install", "update", "remove"])
+def test_restart_journal_recovery_uses_only_marketplace_workspaces(
+    tmp_path, operation, monkeypatch
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    if operation in {"update", "remove"}:
+        installed = _install(store, candidate)
+    if operation == "update":
+        candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+    if operation == "remove":
+        _, prepared = _authorize_remove(store, installed)
+    else:
+        prepared = _consume(store, candidate)
+
+    def crash(point):
+        if point == (
+            "after_provenance_remove"
+            if operation == "remove"
+            else "after_provenance_write"
+        ):
+            raise SimulatedCrash(point)
+
+    with pytest.raises(SimulatedCrash):
+        mutation = (
+            store.atomic_remove if operation == "remove" else store.atomic_install
+        )
+        mutation(prepared, review_digest=REVIEW, fault=crash)
+    journal = store.list_journals()[0]
+    if os.name != "nt":
+        for package in (journal.staging_path, journal.quarantine_path):
+            if package.parent.exists():
+                assert package.parent.stat().st_mode & 0o777 == 0o700
+                assert (package.parent / "owner.json").stat().st_mode & 0o777 == 0o600
+    assert (
+        journal.staging_path
+        == tmp_path
+        / "marketplace"
+        / "workflows"
+        / ".staging"
+        / prepared.transaction_id
+        / "package"
+    )
+    assert (
+        journal.quarantine_path
+        == tmp_path
+        / "marketplace"
+        / "workflows"
+        / ".quarantine"
+        / prepared.transaction_id
+        / "package"
+    )
+    runs = RunStore(tmp_path)
+    with monkeypatch.context() as guard:
+        _forbid_workspace_enumeration(guard, (runs.staging_root, runs.quarantine_root))
+        restarted = MarketplaceTransactionStore(tmp_path)
+        assert restarted.recover_transactions() == (prepared.transaction_id,)
+        assert restarted.recover_transactions() == ()
+        assert restarted.list_journals() == ()
+    if operation == "remove":
+        assert not candidate.destination.exists()
+    else:
+        assert (
+            load_distribution(candidate.destination).digest
+            == candidate.distribution.digest
+        )
+    assert list(store.staging_root.iterdir()) == []
+    assert list(store.quarantine_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "state_kind", ["prepared", "staging_journal", "quarantine_journal"]
+)
+def test_pre_release_shared_paths_fail_closed_without_migration(tmp_path, state_kind):
+    store = MarketplaceTransactionStore(tmp_path)
+    first = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    _install(store, first)
+    store.trust_store.trust("d" * 64, actor="manual", risk_digest="e" * 64)
+    second = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+    prepared = store.prepare(second, review_digest=REVIEW, actor="alice", profile="p1")
+    path, key, field = store.path, "transactions", "stagingPath"
+    if state_kind != "prepared":
+        consumed = store.consume(prepared.token, actor="alice", profile="p1")
+
+        def crash(point):
+            if point == "after_backup_move":
+                raise SimulatedCrash(point)
+
+        with pytest.raises(SimulatedCrash):
+            store.atomic_install(consumed, review_digest=REVIEW, fault=crash)
+        path, key = store.journal_path, "journals"
+        if state_kind == "quarantine_journal":
+            field = "quarantinePath"
+    state = json.loads(path.read_bytes())
+    record = state[key][0]
+    old_envelope = Path(record[field]).parent
+    legacy_root = (
+        tmp_path
+        / "workflows"
+        / (".quarantine" if field == "quarantinePath" else ".staging")
+    )
+    legacy_root.mkdir(mode=0o700, exist_ok=True)
+    legacy_envelope = legacy_root / prepared.transaction_id
+    if old_envelope != legacy_envelope:
+        old_envelope.rename(legacy_envelope)
+    record[field] = str(legacy_envelope / "package")
+    if state_kind == "prepared":
+        binding = {
+            key: value
+            for key, value in record.items()
+            if key not in {"tokenDigest", "confirmationDigest"}
+        }
+        encoded = json.dumps(
+            binding,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        record["confirmationDigest"] = hashlib.sha256(
+            b"hermes.workflow-marketplace.confirmation.v1\0" + encoded
+        ).hexdigest()
+    path.write_text(json.dumps(state), encoding="utf-8")
+    before = _snapshot(tmp_path)
+    metadata = legacy_envelope.stat()
+    restarted = MarketplaceTransactionStore(tmp_path)
+    for action in (restarted.inspect_recovery, restarted.recover_transactions):
+        with pytest.raises(
+            WorkflowMarketplaceError, match="paths are inconsistent"
+        ) as error:
+            action()
+        assert error.value.code == "transaction_state_invalid"
+        assert _snapshot(tmp_path) == before
+        after = legacy_envelope.stat()
+        assert (after.st_dev, after.st_ino, after.st_mode) == (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+        )
+
+
+@pytest.mark.parametrize("workspace", ["staging", "quarantine"])
+def test_restart_refuses_foreign_marker_in_isolated_workspace(tmp_path, workspace):
+    store = MarketplaceTransactionStore(tmp_path)
+    first = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    _install(store, first)
+    second = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+
+    def crash(point):
+        if point == "after_backup_move":
+            raise SimulatedCrash(point)
+
+    with pytest.raises(SimulatedCrash):
+        store.atomic_install(_consume(store, second), review_digest=REVIEW, fault=crash)
+    journal = store.list_journals()[0]
+    package = (
+        journal.staging_path if workspace == "staging" else journal.quarantine_path
+    )
+    assert package.is_relative_to(tmp_path / "marketplace" / "workflows")
+    marker = package.parent / "owner.json"
+    value = json.loads(marker.read_bytes())
+    value["owner"] = "foreign-authority"
+    marker.write_text(json.dumps(value), encoding="utf-8")
+    before = _snapshot(tmp_path)
+    restarted = MarketplaceTransactionStore(tmp_path)
+    assert (
+        restarted.inspect_recovery().entries[0].classification == "ownership_mismatch"
+    )
+    assert restarted.recover_transactions() == ()
+    assert restarted.list_journals() == (journal,)
+    assert _snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("consumed", [False, True])
@@ -547,7 +941,7 @@ def test_prepare_never_claims_or_removes_an_existing_staging_envelope(
 
     transaction_id = "a" * 32
     store = MarketplaceTransactionStore(tmp_path)
-    store.staging_root.mkdir(parents=True, mode=0o700)
+    store._ensure_workflow_roots()
     unrelated = store.staging_root / transaction_id / "unrelated"
     unrelated.mkdir(parents=True)
     keep = unrelated / "keep"
