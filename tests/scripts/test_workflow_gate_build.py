@@ -7,8 +7,260 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import psutil
 
 from scripts import workflow_gate_build as build
+from tools.managed_process import ManagedProcessTree, ProcessIdentity
+
+
+def test_windows_job_does_not_infer_posix_group_from_new_session_option(monkeypatch):
+    import tools.managed_process as managed
+
+    job = Mock(name="owned job")
+    job.name = "Local\\HermesManagedProcess-test"
+    child = Mock(pid=77, _handle=88)
+    monkeypatch.setattr(managed, "_IS_WINDOWS", True)
+    monkeypatch.setattr(managed._WindowsJob, "create", lambda: job)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(
+        ProcessIdentity, "capture", lambda pid: ProcessIdentity(pid, 7, None)
+    )
+
+    tree = ManagedProcessTree.spawn(["owned-child"], start_new_session=True)
+
+    assert tree.identity == ProcessIdentity(77, 7, None, job.name)
+
+
+@pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize(
+    ("launch", "owns_group"),
+    [
+        ({"start_new_session": True}, True),
+        ({}, True),
+        ({"start_new_session": False}, False),
+        ({"start_new_session": 0}, False),
+        ({"start_new_session": False, "process_group": 0}, False),
+    ],
+)
+def test_spawn_retains_new_session_after_leader_exits_before_capture(
+    monkeypatch, launch, owns_group
+) -> None:
+    real_popen = subprocess.Popen
+    children = []
+
+    def exited_before_capture(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        children.append(process)
+        process.wait(timeout=5)  # force the real leader-exit/getpgid boundary
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", exited_before_capture)
+    descendant_code = "import threading; threading.Event().wait(60)"
+    parent_code = (
+        "import subprocess,sys;"
+        f"p=subprocess.Popen([sys.executable,'-c',{descendant_code!r}],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        "print(p.pid,flush=True)"
+    )
+    tree = ManagedProcessTree.spawn([sys.executable, "-c", parent_code], **launch)
+    descendant = psutil.Process(int(tree.process.stdout.readline().decode("ascii")))
+    try:
+        assert tree.process.poll() == 0
+        assert ProcessIdentity.capture(tree.process.pid).group_id is None
+        assert descendant.is_running()
+        tree.close()
+        try:
+            alive = (
+                descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE
+            )
+        except psutil.NoSuchProcess:
+            alive = False
+        assert alive is not owns_group, (tree.identity, tree.reaped, alive)
+        assert tree.identity.group_id == (tree.process.pid if owns_group else None)
+        assert tree.reaped
+    finally:
+        try:
+            if descendant.is_running():
+                descendant.kill()
+        except psutil.NoSuchProcess:
+            pass
+        descendant.wait(timeout=5)
+        for child in children:
+            child.wait(timeout=5)
+            child.stdout.close()
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "regular",
+        "cli-contained-link",
+        "cli-escaping-link",
+        "manifest-contained-link",
+        "manifest-escaping-link",
+        "manifest-malformed",
+        "manifest-list",
+        "manifest-wrong-name",
+        "manifest-missing",
+        "cli-missing",
+        "manifest-directory",
+        "cli-directory",
+        "package-escape",
+    ],
+)
+def test_local_playwright_requires_regular_contained_identity_files(tmp_path, identity):
+    package = tmp_path / "node_modules/@playwright/test"
+    package.mkdir(parents=True)
+    manifest = package / "package.json"
+    cli = package / "cli.js"
+    manifest.write_text('{"name":"@playwright/test"}', encoding="utf-8")
+    cli.write_text("process.exit(0);", encoding="utf-8")
+    target = cli if identity.startswith("cli-") else manifest
+    if identity.endswith("link"):
+        destination = (package if "contained" in identity else tmp_path) / "actual"
+        target.rename(destination)
+        target.symlink_to(destination)
+    elif identity.endswith("missing") or identity.endswith("directory"):
+        target.unlink()
+        if identity.endswith("directory"):
+            target.mkdir()
+    elif identity == "manifest-malformed":
+        manifest.write_text("{", encoding="utf-8")
+    elif identity == "manifest-list":
+        manifest.write_text("[]", encoding="utf-8")
+    elif identity == "manifest-wrong-name":
+        manifest.write_text('{"name":"foreign"}', encoding="utf-8")
+    elif identity == "package-escape":
+        outside = tmp_path / "outside-package"
+        package.rename(outside)
+        package.symlink_to(outside, target_is_directory=True)
+    if identity == "regular":
+        assert build.local_playwright(tmp_path) == cli
+    else:
+        with pytest.raises((OSError, RuntimeError, ValueError)):
+            build.local_playwright(tmp_path)
+
+
+@pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
+@pytest.mark.parametrize("name", ["package.json", "cli.js"])
+def test_local_playwright_rejects_fifo_before_reading(tmp_path, monkeypatch, name):
+    package = tmp_path / "node_modules/@playwright/test"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        '{"name":"@playwright/test"}', encoding="utf-8"
+    )
+    (package / "cli.js").write_text("process.exit(0);", encoding="utf-8")
+    target = package / name
+    target.unlink()
+    getattr(build.os, "mkfifo")(target)
+    real_read = Path.read_text
+
+    def no_fifo_read(path, *args, **kwargs):
+        assert path != target, "resolver attempted to open a non-regular identity"
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", no_fifo_read)
+    with pytest.raises(RuntimeError):
+        build.local_playwright(tmp_path)
+
+
+@pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_gate_cleanup_waits_for_immediate_parent_lingering_descendant(
+    tmp_path, monkeypatch
+):
+    mkdtemp = build.tempfile.mkdtemp
+    monkeypatch.setattr(
+        build.tempfile, "mkdtemp", lambda **kwargs: mkdtemp(dir=tmp_path, **kwargs)
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "committed.txt").write_text("exact source\n", encoding="utf-8")
+    for command in (
+        ["git", "init", "-b", "fixture"],
+        ["git", "config", "user.name", "Gate Fixture"],
+        ["git", "config", "user.email", "fixture@localhost"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "fixture"],
+    ):
+        subprocess.run(command, cwd=source, check=True, capture_output=True)
+    sha = (
+        subprocess
+        .check_output(["git", "rev-parse", "HEAD"], cwd=source)
+        .decode("ascii")
+        .strip()
+    )
+    package = source / "node_modules/@playwright/test"
+    package.mkdir(parents=True)
+    (source / "apps/desktop/node_modules").mkdir(parents=True)
+    (package / "package.json").write_text(
+        '{"name":"@playwright/test"}', encoding="utf-8"
+    )
+    (package / "cli.js").write_text("process.exit(0);\n", encoding="utf-8")
+    descendant_file = tmp_path / "descendant.pid"
+    executable = tmp_path / "npm"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess,sys\nfrom pathlib import Path\n"
+        "p=subprocess.Popen([sys.executable,'-c','import threading; threading.Event().wait(60)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+        f"Path({str(descendant_file)!r}).write_text(str(p.pid), encoding='ascii')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    real_which = build.shutil.which
+    monkeypatch.setattr(
+        build.shutil,
+        "which",
+        lambda name: str(executable) if name == "npm" else real_which(name),
+    )
+    real_popen = subprocess.Popen
+
+    def parent_exited(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        if args[0][0] == str(executable):
+            process.wait(timeout=5)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", parent_exited)
+    real_remove = build.shutil.rmtree
+    removed = []
+
+    def remove_only_after_quiescence(root, *args, **kwargs):
+        assert Path(root).is_dir()
+        try:
+            descendant = (
+                psutil.Process(int(descendant_file.read_text(encoding="ascii")))
+                if descendant_file.exists()
+                else None
+            )
+            alive = (
+                descendant is not None
+                and descendant.is_running()
+                and descendant.status() != psutil.STATUS_ZOMBIE
+            )
+        except psutil.NoSuchProcess:
+            alive = False
+        assert not alive, "cleanup attempted with live descendant"
+        removed.append(Path(root))
+        return real_remove(root, *args, **kwargs)
+
+    monkeypatch.setattr(build.shutil, "rmtree", remove_only_after_quiescence)
+    monkeypatch.setattr(sys, "argv", ["worker", str(source), sha])
+    try:
+        assert build.main() == 0
+        assert removed and not removed[0].exists()
+    finally:
+        if descendant_file.exists():
+            try:
+                descendant = psutil.Process(
+                    int(descendant_file.read_text(encoding="ascii"))
+                )
+                descendant.kill()
+                descendant.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
 
 
 @pytest.mark.parametrize("fault", ["marker", "marker-write", "signals"])

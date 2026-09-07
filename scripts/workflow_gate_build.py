@@ -138,17 +138,19 @@ def local_playwright(source):
         package_root = package.resolve(strict=True)
         if not package_root.is_relative_to(modules.resolve(strict=True)):
             raise RuntimeError("local Playwright package escapes its dependency root")
-        manifest = json.loads(
-            (package_root / "package.json").read_text(encoding="utf-8")
-        )
-        cli = (package_root / "cli.js").resolve(strict=True)
-        if (
-            manifest.get("name") != "@playwright/test"
-            or not cli.is_file()
-            or not cli.is_relative_to(package_root)
-        ):
+        manifest_path = package_root / "package.json"
+        cli_path = package_root / "cli.js"
+        for path in (manifest_path, cli_path):
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise RuntimeError(
+                    "local Playwright identity must be a regular non-symlink file"
+                )
+            if not path.resolve(strict=True).is_relative_to(package_root):
+                raise RuntimeError("local Playwright identity escapes its package")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("name") != "@playwright/test":
             raise RuntimeError("invalid local Playwright executable")
-        return cli
+        return cli_path.resolve(strict=True)
     raise RuntimeError(
         "local Playwright executable is unavailable; no package-runner fallback"
     )

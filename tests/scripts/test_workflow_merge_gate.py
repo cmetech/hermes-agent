@@ -298,6 +298,28 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     _write_parser_dependencies(repo)
     if build_mode == "missing-playwright":
         (repo / "node_modules/@playwright/test/cli.js").unlink()
+    if build_mode and build_mode.startswith("invalid-playwright-"):
+        identity = build_mode.removeprefix("invalid-playwright-")
+        package = repo / "node_modules/@playwright/test"
+        target = package / ("cli.js" if identity.startswith("cli-") else "package.json")
+        if identity.endswith("link"):
+            destination = (package if "contained" in identity else tmp_path) / "actual"
+            target.rename(destination)
+            target.symlink_to(destination)
+        elif identity.endswith("missing") or identity.endswith("directory"):
+            target.unlink()
+            if identity.endswith("directory"):
+                target.mkdir()
+        elif identity == "manifest-malformed":
+            target.write_text("{", encoding="utf-8")
+        elif identity == "manifest-list":
+            target.write_text("[]", encoding="utf-8")
+        elif identity == "manifest-wrong-name":
+            target.write_text('{"name":"foreign"}', encoding="utf-8")
+        elif identity == "package-escape":
+            outside = tmp_path / "outside-package"
+            package.rename(outside)
+            package.symlink_to(outside, target_is_directory=True)
     user_file = repo / "plugins/model-providers/otto/user.txt"
     user_file.parent.mkdir(parents=True)
     user_file.write_text("preexisting user provider\n", encoding="utf-8")
@@ -392,6 +414,19 @@ def test_base_gate_missing_local_playwright_never_uses_package_runner_fallback(t
     assert result.returncode != 0
     assert "TESTED_BASE_SHA=" not in result.stdout
     assert not any(command[:2] == ["npx", "playwright"] for command in commands)
+    assert not list(tmp_path.glob("hermes-workflow-gate-build-*"))
+
+
+@pytest.mark.parametrize("identity", [
+    "cli-contained-link", "cli-escaping-link", "manifest-contained-link", "manifest-escaping-link",
+    "manifest-malformed", "manifest-list", "manifest-wrong-name", "manifest-missing", "cli-missing",
+    "manifest-directory", "cli-directory", "package-escape",
+])
+def test_base_gate_invalid_playwright_identity_suppresses_build_and_receipt(tmp_path, identity):
+    result, commands = _exercise_base_gate(tmp_path, f"invalid-playwright-{identity}")
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    assert not any(command[0] in {"build-root", "playwright"} or command[:2] == ["npx", "playwright"] for command in commands)
     assert not list(tmp_path.glob("hermes-workflow-gate-build-*"))
 
 
