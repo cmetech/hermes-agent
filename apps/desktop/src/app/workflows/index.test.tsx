@@ -7,7 +7,13 @@ import { I18nProvider, TRANSLATIONS } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
-import { createLifecycleHarness, lifecycleIdentity, lifecycleScope } from './marketplace/lifecycle-test-harness'
+import {
+  createLifecycleHarness,
+  deferredLifecycle,
+  lifecycleIdentity,
+  lifecycleScope
+} from './marketplace/lifecycle-test-harness'
+import { marketplaceKeys } from './marketplace/query-keys'
 import { isWorkflowAttemptEvidence, isWorkflowPersistentSessionRecoveryEvidence, RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
@@ -15,6 +21,194 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   Element.prototype.hasPointerCapture = vi.fn(() => false)
   Element.prototype.releasePointerCapture = vi.fn()
+})
+
+it('enables legacy Run and View only after an explicitly unsupported fresh catalog', async () => {
+  const h = createLifecycleHarness()
+
+  const run = vi.fn(),
+    view = vi.fn()
+
+  try {
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    render(
+      <h.Providers>
+        <WorkflowCatalog onRunWorkflow={run} onViewWorkflow={view} requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }))
+    fireEvent.click(screen.getByRole('button', { name: 'View' }))
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ name: 'Laptop diagnostic' }))
+    expect(view).toHaveBeenCalledWith(expect.objectContaining({ name: 'Laptop diagnostic' }))
+    expect(h.supervisor.bindings.state(lifecycleScope)).toEqual({ kind: 'unsupported' })
+    expect(h.calls).toEqual([])
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it('invalidates pre-transition legacy cache and rejects retained data after every failed refetch', async () => {
+  const h = createLifecycleHarness()
+  const key = marketplaceKeys.catalog('remote-a::support')
+
+  try {
+    h.queryClient.setQueryDefaults(key, { staleTime: Infinity })
+    h.queryClient.setQueryData(key, { items: [definition()], truncated: false })
+    listWorkflowDefinitions.mockRejectedValue(new Error('offline'))
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    await waitFor(() => expect(listWorkflowDefinitions).toHaveBeenCalledWith('support', 'remote-a'))
+    await waitFor(() => expect(h.queryClient.getQueryState(key)?.status).toBe('error'))
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(true)
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    listWorkflowDefinitions.mockRejectedValue(new Error('offline again'))
+    await act(async () => {
+      await h.queryClient.refetchQueries({ queryKey: key, exact: true })
+    })
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(true)
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each(['prior-v2', 'unavailable'] as const)('does not grant legacy actions for %s authority', async kind => {
+  const h = createLifecycleHarness()
+
+  try {
+    if (kind === 'prior-v2') {
+      await h.bind()
+    }
+
+    h.failCapabilities(kind === 'prior-v2' ? 'marketplace_lifecycle_unsupported' : 'marketplace_network_error')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
+    expect(listWorkflowDefinitions).not.toHaveBeenCalled()
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each(['reprobe', 'disconnect', 'route-transition', 'manual-cache'] as const)(
+  'revokes rendered legacy actions immediately on %s',
+  async transition => {
+    const h = createLifecycleHarness()
+    const key = marketplaceKeys.catalog('remote-a::support')
+
+    try {
+      h.failCapabilities('marketplace_lifecycle_unsupported')
+      await h.supervisor.reconcileScope(lifecycleScope)
+      render(
+        <h.Providers>
+          <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+        </h.Providers>
+      )
+      await waitFor(() =>
+        expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+      )
+      await act(async () => {
+        if (transition === 'disconnect') {
+          h.disconnect()
+        } else if (transition === 'route-transition') {
+          h.supervisor.invalidateLegacyCatalogAuthority()
+        } else if (transition === 'manual-cache') {
+          h.queryClient.setQueryData(key, { items: [definition()], truncated: false })
+        } else {
+          h.holdCapabilities()
+          void h.supervisor.reconcileScope(lifecycleScope)
+        }
+      })
+      const run = screen.queryByRole('button', { name: 'Run' }) as HTMLButtonElement | null
+      const view = screen.queryByRole('button', { name: 'View' }) as HTMLButtonElement | null
+      expect(run === null || run.disabled).toBe(true)
+      expect(view === null || view.disabled).toBe(true)
+      expect(h.calls).toEqual([])
+    } finally {
+      cleanup()
+      h.dispose()
+    }
+  }
+)
+
+it('cannot use a pre-transition in-flight legacy response as fresh authority', async () => {
+  const h = createLifecycleHarness()
+  const key = marketplaceKeys.catalog('remote-a::support')
+  const old = deferredLifecycle<{ items: WorkflowDefinition[]; truncated: boolean }>()
+
+  try {
+    const pending = h.queryClient.fetchQuery({ queryKey: key, queryFn: () => old.promise }).catch(() => undefined)
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    old.resolve({ items: [definition()], truncated: false })
+    await pending
+    listWorkflowDefinitions.mockRejectedValue(new Error('post-transition fetch failed'))
+    render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    await waitFor(() => expect(h.queryClient.getQueryState(key)?.status).toBe('error'))
+    expect(h.supervisor.canUseLegacyCatalog(lifecycleScope, key)).toBe(false)
+    const run = screen.queryByRole('button', { name: 'Run' }) as HTMLButtonElement | null
+    expect(run === null || run.disabled).toBe(true)
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each([
+  { connectionId: 'remote-a', profile: 'other' },
+  { connectionId: 'remote-b', profile: 'support' }
+])('keeps legacy catalog success isolated from $connectionId/$profile', async other => {
+  const h = createLifecycleHarness()
+
+  try {
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+
+    const rendered = render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    const key = marketplaceKeys.catalog(`${other.connectionId}::${other.profile}`)
+    h.queryClient.setQueryData(key, { items: [definition()], truncated: false })
+    listWorkflowDefinitions.mockRejectedValue(new Error('other scope offline'))
+    await act(async () => {
+      await h.supervisor.reconcileScope(other)
+    })
+    rendered.rerender(
+      <h.Providers>
+        <WorkflowCatalog requestProfile={other.profile} scope={other} />
+      </h.Providers>
+    )
+    await waitFor(() => expect(h.queryClient.getQueryState(key)?.status).toBe('error'))
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+  } finally {
+    cleanup()
+    h.dispose()
+  }
 })
 
 it.each([

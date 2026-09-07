@@ -33,6 +33,7 @@ interface ScopeEntry {
   scope: MarketplaceScope
   state: MarketplaceBindingState
   lastBinding?: LifecycleConnectionBinding
+  explicitLegacyUnsupported?: boolean
   attempt: object
 }
 
@@ -57,8 +58,13 @@ export function createMarketplaceBindingCoordinator(adapters: BindingAdapters) {
     return current
   }
 
-  function quarantine(current: ScopeEntry, kind: 'unavailable' | 'probing' | 'unsupported' | 'restart_required') {
+  function quarantine(
+    current: ScopeEntry,
+    kind: 'unavailable' | 'probing' | 'unsupported' | 'restart_required',
+    explicitLegacyUnsupported = false
+  ) {
     current.attempt = {}
+    current.explicitLegacyUnsupported = explicitLegacyUnsupported
     current.state = { kind }
     adapters.changed?.(current.scope)
 
@@ -93,6 +99,16 @@ export function createMarketplaceBindingCoordinator(adapters: BindingAdapters) {
   return {
     state,
     isCurrent,
+    legacyReadAttempt(scope: MarketplaceScope): object | null {
+      const current = entry(scope)
+
+      return !exhausted &&
+        current.state.kind === 'unsupported' &&
+        current.explicitLegacyUnsupported &&
+        !current.lastBinding
+        ? current.attempt
+        : null
+    },
     presentation<T>(scope: MarketplaceScope, data: T): T | undefined {
       return 'binding' in state(scope) ? data : undefined
     },
@@ -130,6 +146,7 @@ export function createMarketplaceBindingCoordinator(adapters: BindingAdapters) {
       const cancellation = quarantine(current, 'probing')
       const attempt = current.attempt
       const active = () => !exhausted && current.attempt === attempt
+      let resolvedGeneration: number | null = null
 
       try {
         await cancellation
@@ -157,6 +174,8 @@ export function createMarketplaceBindingCoordinator(adapters: BindingAdapters) {
 
           return null
         }
+
+        resolvedGeneration = generation
 
         const capabilities = decodeLifecycleCapabilities(
           await adapters.getCapabilities({ ...current.scope, connectionGeneration: generation })
@@ -236,7 +255,28 @@ export function createMarketplaceBindingCoordinator(adapters: BindingAdapters) {
         ) {
           exhaust()
         } else {
-          void quarantine(current, code === 'marketplace_lifecycle_unsupported' ? 'unsupported' : 'unavailable')
+          let explicitLegacyUnsupported = false
+
+          if (resolvedGeneration !== null && code === 'marketplace_lifecycle_unsupported') {
+            try {
+              const latest = await adapters.resolveConnection(current.scope)
+              explicitLegacyUnsupported =
+                (latest.connectionId ?? null) === current.scope.connectionId &&
+                latest.connectionGeneration === resolvedGeneration
+            } catch {
+              // A failed identity recheck cannot authorize legacy reads.
+            }
+          }
+
+          if (!active()) {
+            return null
+          }
+
+          void quarantine(
+            current,
+            code === 'marketplace_lifecycle_unsupported' ? 'unsupported' : 'unavailable',
+            explicitLegacyUnsupported
+          )
         }
 
         return null

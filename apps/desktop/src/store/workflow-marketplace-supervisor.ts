@@ -1,4 +1,4 @@
-import type { QueryClient, QueryKey } from '@tanstack/react-query'
+import type { Query, QueryClient, QueryKey } from '@tanstack/react-query'
 import { atom } from 'nanostores'
 
 import { profileScopeKey } from '@/api/client'
@@ -12,6 +12,7 @@ import {
   type LifecycleStart,
   observeLifecycleClock
 } from '@/api/workflow-marketplace-lifecycle'
+import { marketplaceKeys } from '@/app/workflows/marketplace/query-keys'
 import { createMarketplaceBindingCoordinator } from '@/lib/workflow-marketplace-connection-binding'
 import {
   decodeLifecycleAdmission,
@@ -186,6 +187,8 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
   const packageCalls = new Map<AbortController, LifecycleConnectionBinding>()
   const knownScopes = new Map<string, MarketplaceScope>()
   const scanned = new Set<string>()
+  const legacyScopes = new Map<string, { scope: MarketplaceScope; attempt: object }>()
+  let legacyReceipts = new WeakMap<Query, { origin: object; fresh: boolean }>()
   const reconciliation = createMarketplaceReconciliation(options.queryClient, binding => bindings.isCurrent(binding))
   let disposed = false
 
@@ -364,6 +367,23 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       return capabilities
     },
     changed: scope => {
+      if (scope) {
+        const key = profileScopeKey(scope)
+        legacyScopes.delete(key)
+        const attempt = bindings.legacyReadAttempt(scope)
+
+        if (attempt) {
+          legacyScopes.set(key, { scope: { ...scope }, attempt })
+          void options.queryClient.invalidateQueries({
+            queryKey: marketplaceKeys.catalog(key),
+            exact: true,
+            refetchType: 'none'
+          })
+        }
+      } else {
+        legacyScopes.clear()
+      }
+
       reconciliation.changed()
 
       for (const [key, renewal] of renewals) {
@@ -412,6 +432,57 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
       }
     }
   })
+
+  function legacyOrigin(scope: MarketplaceScope) {
+    const origin = legacyScopes.get(profileScopeKey(scope))
+
+    return !disposed &&
+      visibility.get() &&
+      connections.isConnected(scope) &&
+      origin?.attempt === bindings.legacyReadAttempt(scope)
+      ? origin
+      : undefined
+  }
+
+  const offLegacyCatalog = options.queryClient.getQueryCache().subscribe(event => {
+    if (event.type !== 'updated') {
+      return
+    }
+
+    const origin = legacyScopes.get(String(event.query.queryKey[1]))
+
+    if (
+      !origin ||
+      legacyOrigin(origin.scope) !== origin ||
+      !sameLifecycleValue(event.query.queryKey, marketplaceKeys.catalog(profileScopeKey(origin.scope)))
+    ) {
+      return
+    }
+
+    if (event.action.type === 'fetch') {
+      legacyReceipts.set(event.query, { origin, fresh: false })
+    } else if (event.action.type === 'success' || event.action.type === 'error') {
+      const receipt = legacyReceipts.get(event.query)
+
+      if (receipt?.origin === origin) {
+        receipt.fresh = event.action.type === 'success' && !event.action.manual
+      }
+    }
+
+    reconciliation.changed()
+  })
+
+  function invalidateLegacyCatalogAuthority() {
+    legacyReceipts = new WeakMap()
+
+    for (const [key] of legacyScopes) {
+      const queryKey = marketplaceKeys.catalog(key)
+      void options.queryClient.cancelQueries({ queryKey, exact: true })
+      void options.queryClient.invalidateQueries({ queryKey, exact: true, refetchType: 'none' })
+    }
+
+    reconciliation.changed()
+  }
 
   function usable(binding: LifecycleConnectionBinding) {
     return (
@@ -1290,6 +1361,8 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
 
     clearScopeWork(null)
     reconciliation.dispose()
+    offLegacyCatalog()
+    legacyScopes.clear()
     offConnections()
     offVisibility()
   }
@@ -1314,6 +1387,22 @@ export function createMarketplaceSupervisor(options: SupervisorOptions) {
     reconcileScope,
     reconcilePackage,
     getPackageGate,
+    invalidateLegacyCatalogAuthority,
+    canReadLegacyCatalog: (scope: MarketplaceScope) => Boolean(legacyOrigin(scope)),
+    canUseLegacyCatalog(scope: MarketplaceScope, projection: QueryKey) {
+      const origin = legacyOrigin(scope)
+
+      if (!origin || !sameLifecycleValue(projection, marketplaceKeys.catalog(profileScopeKey(scope)))) {
+        return false
+      }
+
+      const query = options.queryClient.getQueryCache().find({ queryKey: projection, exact: true })
+      const receipt = query && legacyReceipts.get(query)
+
+      return Boolean(
+        receipt?.origin === origin && receipt.fresh && query?.state.status === 'success' && !query.state.isInvalidated
+      )
+    },
     supports(
       binding: LifecycleConnectionBinding,
       requiredCapabilities: readonly LifecycleCapabilities['capabilities'][number][]

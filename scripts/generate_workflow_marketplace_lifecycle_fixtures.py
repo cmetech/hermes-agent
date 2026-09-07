@@ -650,7 +650,9 @@ def generate_corpora():
                     ambiguous_review.confirmation_token, actor="alice"
                 )
                 assert installed.version == "3.0.0"
-                ambiguous_service.transactions.journal_path.write_text("{incomplete")
+                ambiguous_service.transactions.journal_path.write_text(
+                    "{incomplete", encoding="utf-8"
+                )
                 raise WorkflowMarketplaceError(
                     "transaction_recovery_ambiguous", "private-recovery-location"
                 )

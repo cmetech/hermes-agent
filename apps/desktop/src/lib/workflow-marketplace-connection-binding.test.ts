@@ -1,6 +1,8 @@
 import { QueryClient } from '@tanstack/react-query'
 import { describe, expect, it } from 'vitest'
 
+import { LifecycleApiError } from '@/api/workflow-marketplace-lifecycle'
+
 import corpus from '../../../../tests/fixtures/workflow-marketplace-lifecycle-v2.json'
 
 const module = await import('./workflow-marketplace-connection-binding').catch(() => null)
@@ -57,6 +59,46 @@ function harness() {
 }
 
 describe('marketplace binding privacy transitions', () => {
+  it('rejects an unsupported response from a native generation that changed during the request', async () => {
+    const queries = new QueryClient()
+    let generation = 1
+
+    const coordinator = module!.createMarketplaceBindingCoordinator({
+      queries,
+      resolveConnection: async input => ({ connectionId: input.connectionId, connectionGeneration: generation }),
+      getCapabilities: async () => {
+        generation = 2
+        throw new LifecycleApiError('marketplace_lifecycle_unsupported', 0)
+      }
+    })
+
+    try {
+      await coordinator.probe(scope)
+      expect(coordinator.legacyReadAttempt(scope)).toBeNull()
+    } finally {
+      queries.clear()
+    }
+  })
+
+  it.each(['missing-generation', 'malformed', 'profile-mismatch'] as const)(
+    'does not infer legacy authority from %s',
+    async kind => {
+      const { coordinator, queries, setGeneration, setCapabilities } = harness()
+
+      try {
+        if (kind === 'missing-generation') {
+          setGeneration(undefined as never)
+        } else {
+          setCapabilities(kind === 'malformed' ? {} : { ...corpus.capabilities, profile: 'other' })
+        }
+
+        await coordinator.probe(scope)
+        expect(coordinator.legacyReadAttempt(scope)).toBeNull()
+      } finally {
+        queries.clear()
+      }
+    }
+  )
   // Break caught: settled package/source/trust values remain renderable while authority is unknown.
   it.each([
     'disconnect',

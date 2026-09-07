@@ -148,7 +148,7 @@ _validated_invocation_desktop_source() {
 
 _require_root_dependencies() {
   local shared_git_dir shared_root invocation_git_dir invocation_modules
-  local resolved_modules node_bin actual_versions
+  local resolved_modules node_bin actual_versions cli_paths
   shared_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
   shared_root="$(cd "$(dirname "$shared_git_dir")" && pwd -P)"
   invocation_git_dir="$(git -C "$INVOCATION_ROOT" rev-parse \
@@ -196,7 +196,18 @@ _require_root_dependencies() {
     echo "root parser dependencies require node before ledger validation" >&2
     return 1
   }
-  actual_versions="$(cd "$ROOT/scripts" && "$node_bin" \
+  cli_paths="$("$PYTHON_BIN" "$GATE_SCRIPT_ROOT/workflow_gate_clis.py" \
+    "$resolved_modules" "$node_bin")" || {
+    echo "root parser dependencies and local gate CLI identities are required before ledger validation" >&2
+    return 1
+  }
+  {
+    IFS= read -r NODE_BIN
+    IFS= read -r TSC_CLI
+    IFS= read -r VITEST_CLI
+    IFS= read -r TSX_CLI
+  } <<<"$cli_paths"
+  actual_versions="$(cd "$ROOT/scripts" && "$NODE_BIN" \
     --experimental-import-meta-resolve --input-type=module -e '
     import fs from "node:fs";
     import path from "node:path";
@@ -550,7 +561,7 @@ if [[ "$PHASE" == "base" ]]; then
       echo "desktop dependencies are required for the base merge gate" >&2
       exit 1
     }
-    (cd apps/desktop && npx vitest run \
+    (cd apps/desktop && "$NODE_BIN" "$VITEST_CLI" run \
       src/components/activity-board/activity-board.test.tsx \
       src/components/activity-board/activity-board.performance.test.tsx \
       src/components/assistant-ui/embeds/workflow-topology.test.tsx \
@@ -562,8 +573,8 @@ if [[ "$PHASE" == "base" ]]; then
       src/app/workflows/workflow-operations.e2e.test.tsx \
       src/app/kanban/adapter.test.ts \
       src/app/kanban/kanban-operations.e2e.test.tsx)
-    (cd apps/desktop && npx tsc -p . --noEmit)
-    (cd apps/desktop && npx vitest run --project ui \
+    (cd apps/desktop && "$NODE_BIN" "$TSC_CLI" -p . --noEmit)
+    (cd apps/desktop && "$NODE_BIN" "$VITEST_CLI" run --project ui \
       src/api/workflow-marketplace.test.ts \
       src/api/workflow-marketplace-lifecycle.test.ts \
       src/lib/workflow-marketplace-codec.test.ts \
@@ -574,11 +585,11 @@ if [[ "$PHASE" == "base" ]]; then
       src/store/workflow-marketplace-supervisor.test.ts \
       src/i18n/languages.test.ts \
       src/app/workflows/marketplace/)
-    (cd apps/desktop && npx vitest run --project electron \
+    (cd apps/desktop && "$NODE_BIN" "$VITEST_CLI" run --project electron \
       electron/connection-generation.test.ts electron/connection-apply.test.ts \
       electron/connection-config-apply.test.ts electron/backend-connection-state.test.ts \
       electron/api-transport.test.ts)
-    (cd apps/desktop && npx tsx --test electron/structured-api-channel.test.ts)
+    (cd apps/desktop && "$NODE_BIN" "$TSX_CLI" --test electron/structured-api-channel.test.ts)
     # Deterministic generation and browser artifacts belong only to a private
     # local source checkout. No packaging/publication or source-file restoration.
     "$PYTHON_BIN" "$GATE_SCRIPT_ROOT/workflow_gate_build.py" "$ROOT" "$BASE_SOURCE_SHA" &
@@ -606,7 +617,7 @@ git diff --quiet "$TESTED_BASE_SHA" -- "${GENERIC_PATHS[@]}" || {
 }
 
 if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
-  node scripts/brand/generate.mjs "$BRAND" --check
+  "$NODE_BIN" scripts/brand/generate.mjs "$BRAND" --check
   "$PYTHON_BIN" - <<'PY'
 from plugins.workflow.showcase import load_showcase_catalog
 catalog = load_showcase_catalog()

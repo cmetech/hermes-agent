@@ -63,7 +63,7 @@ function readOnlySnapshot(supervisor: Supervisor | null, scope: MarketplaceScope
     supervisor,
     binding,
     revision,
-    quarantined: Boolean(supervisor && !binding && !lifecycleUnsupported),
+    quarantined: Boolean(supervisor && !binding && !supervisor.canReadLegacyCatalog(scope)),
     lifecycleUnsupported,
     catalogState: supervisor && binding ? supervisor.reconciliation.scopeState(binding) : 'unknown',
     packageGate: (identity: PackageIdentity, projection?: QueryKey) =>
@@ -71,7 +71,8 @@ function readOnlySnapshot(supervisor: Supervisor | null, scope: MarketplaceScope
     packageGeneration: (identity: PackageIdentity) =>
       supervisor && binding ? supervisor.reconciliation.read(binding, identity).generation : 0,
     canUseCatalog: (projection: QueryKey) =>
-      !supervisor || Boolean(binding && supervisor.canUseCatalog(binding, projection))
+      !supervisor ||
+      (binding ? supervisor.canUseCatalog(binding, projection) : supervisor.canUseLegacyCatalog(scope, projection))
   }
 }
 
@@ -177,7 +178,11 @@ export function startMainWindowMarketplaceSupervision(queryClient: QueryClient):
   }
 
   // Read the completed explicit route after the routing stores settle together.
-  const changed = () => queueMicrotask(attachActive)
+  const changed = () => {
+    supervisor.invalidateLegacyCatalogAuthority()
+    queueMicrotask(attachActive)
+  }
+
   const offActive = [$gateway.listen(changed), $connection.listen(changed), $activeGatewayProfile.listen(changed)]
   const visible = () => visibility.set(document.visibilityState !== 'hidden')
   document.addEventListener('visibilitychange', visible)

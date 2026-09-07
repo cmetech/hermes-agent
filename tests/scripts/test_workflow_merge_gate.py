@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import re
 import shutil
@@ -113,6 +114,17 @@ PARSER_VERSIONS = {
     "remark-parse": "11.0.0",
     "micromark": "4.0.2",
 }
+CLI_IDENTITIES = {
+    "tsc": ("typescript", "6.0.3", "bin/tsc"),
+    "vitest": ("vitest", "4.1.10", "vitest.mjs"),
+    "tsx": ("tsx", "4.23.1", "dist/cli.mjs"),
+}
+_cli_spec = importlib.util.spec_from_file_location(
+    "workflow_gate_clis", ROOT / "scripts/workflow_gate_clis.py"
+)
+assert _cli_spec and _cli_spec.loader
+gate_clis = importlib.util.module_from_spec(_cli_spec)
+_cli_spec.loader.exec_module(gate_clis)
 
 
 def _parser_package_lock(name: str = "gate-fixture") -> dict[str, object]:
@@ -162,6 +174,69 @@ def _write_parser_dependencies(root: Path) -> None:
             json.dumps(manifest), encoding="utf-8"
         )
         (package_dir / "index.js").write_text(entrypoint, encoding="utf-8")
+    for cli, (name, version, entry) in CLI_IDENTITIES.items():
+        package = root / "node_modules" / name
+        package.mkdir(exist_ok=True)
+        manifest_path = package / "package.json"
+        manifest = (
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest_path.exists()
+            else {}
+        )
+        manifest.update(name=name, version=version, bin={cli: f"./{entry}"})
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        executable = package / entry
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_text(
+            "import('node:fs').then(({default: fs}) => {\n"
+            f"const cli = {cli!r};\n"
+            "if (process.env.CAPTURE_LOG) fs.appendFileSync(process.env.CAPTURE_LOG, [cli, ...process.argv.slice(2)].join('\\t') + '\\n');\n"
+            "if (process.env.GATE_DESKTOP_OBSERVATION) {\n"
+            "  if (fs.lstatSync('node_modules').isSymbolicLink() || !fs.lstatSync('node_modules/fixture-package').isSymbolicLink() || fs.lstatSync('node_modules/.vite').isSymbolicLink() || fs.existsSync('node_modules/.vite/source-cache')) process.exit(46);\n"
+            "  fs.appendFileSync(process.env.GATE_DESKTOP_OBSERVATION, cli + '\\n');\n"
+            "}\n"
+            "const mode = process.env.GATE_NPX_MODE;\n"
+            "if (mode === 'test-fail' && cli === 'vitest') process.exit(41);\n"
+            "if (mode === 'typecheck-fail' && cli === 'tsc') process.exit(42);\n"
+            "if (mode === 'signal' && cli === 'vitest') { process.kill(process.ppid, 'SIGTERM'); process.exit(143); }\n"
+            "if (mode === 'handoff-source-missing' && cli === 'tsc') fs.renameSync(process.env.GATE_DESKTOP_SOURCE, process.env.GATE_DESKTOP_SOURCE + '.moved');\n"
+            "if (mode === 'handoff-target-replaced' && cli === 'tsc') { fs.rmSync('node_modules', {recursive:true}); fs.symlinkSync(process.env.GATE_REPLACEMENT_SOURCE, 'node_modules'); }\n"
+            "});\n",
+            encoding="utf-8",
+        )
+
+
+def _invalidate_cli(root: Path, tmp_path: Path, cli: str, identity: str) -> None:
+    name, _version, entry = CLI_IDENTITIES[cli]
+    package = root / "node_modules" / name
+    target = package / (entry if identity.startswith("cli-") else "package.json")
+    if identity.endswith("link"):
+        destination = (
+            target.parent if "contained" in identity else tmp_path
+        ) / "actual"
+        target.rename(destination)
+        target.symlink_to(destination)
+    elif identity.endswith("missing") or identity.endswith("directory"):
+        target.unlink()
+        if identity.endswith("directory"):
+            target.mkdir()
+    elif identity == "manifest-malformed":
+        target.write_text("{", encoding="utf-8")
+    elif identity == "manifest-list":
+        target.write_text("[]", encoding="utf-8")
+    elif identity == "package-escape":
+        outside = tmp_path / "outside-cli-package"
+        package.rename(outside)
+        package.symlink_to(outside, target_is_directory=True)
+    else:
+        manifest = json.loads(target.read_text(encoding="utf-8"))
+        field, value = {
+            "manifest-wrong-name": ("name", "foreign"),
+            "manifest-wrong-version": ("version", "0.0.0"),
+            "manifest-wrong-bin": ("bin", {cli: "./other.js"}),
+        }[identity]
+        manifest[field] = value
+        target.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def _dependency_checker_source() -> str:
@@ -237,6 +312,11 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     )
     (fixture_bin / "npx").chmod(0o755)
     shutil.copyfile(fixture_bin / "npx", fixture_bin / "npm")
+    (fixture_bin / "npm").write_text(
+        "#!/usr/bin/env bash\n"
+        "{ printf 'npm'; printf '\\t%s' \"$@\"; printf '\\n'; } >>\"$CAPTURE_LOG\"\n",
+        encoding="utf-8",
+    )
     (fixture_bin / "npm").chmod(0o755)
     if build_mode is not None:
         (fixture_bin / "npm").write_text(
@@ -296,6 +376,9 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     _write_parser_dependencies(repo)
+    if build_mode and build_mode.startswith("invalid-local-"):
+        cli, identity = build_mode.removeprefix("invalid-local-").split(":", 1)
+        _invalidate_cli(repo, tmp_path, cli, identity)
     if build_mode == "missing-playwright":
         (repo / "node_modules/@playwright/test/cli.js").unlink()
     if build_mode and build_mode.startswith("invalid-playwright-"):
@@ -347,8 +430,119 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
     # Exact process identity via inherited stdin: no timing sleep or process-name lookup.
     stdout, stderr = process.communicate(input=f"{process.pid}\n", timeout=30)
     result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-    commands = [line.split("\t") for line in capture.read_text(encoding="utf-8").splitlines()]
+    commands = (
+        [line.split("\t") for line in capture.read_text(encoding="utf-8").splitlines()]
+        if capture.exists()
+        else []
+    )
     return result, commands
+
+
+@pytest.mark.parametrize("cli", CLI_IDENTITIES)
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "cli-missing",
+        "cli-directory",
+        "cli-contained-link",
+        "cli-escaping-link",
+        "manifest-missing",
+        "manifest-directory",
+        "manifest-contained-link",
+        "manifest-escaping-link",
+        "manifest-malformed",
+        "manifest-list",
+        "manifest-wrong-name",
+        "manifest-wrong-version",
+        "manifest-wrong-bin",
+        "package-escape",
+    ],
+)
+def test_gate_rejects_invalid_local_cli_before_any_gate_work(tmp_path, cli, identity):
+    result, commands = _exercise_base_gate(tmp_path, f"invalid-local-{cli}:{identity}")
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    assert commands == []
+
+
+def test_gate_executes_only_local_clis_without_package_runner(tmp_path):
+    result, commands = _exercise_base_gate(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert {"vitest", "tsc", "tsx"} <= {command[0] for command in commands}
+    assert not any(command[0] == "npx" for command in commands)
+
+
+@pytest.mark.parametrize("cli", CLI_IDENTITIES)
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "cli-missing",
+        "cli-directory",
+        "cli-contained-link",
+        "cli-escaping-link",
+        "manifest-missing",
+        "manifest-directory",
+        "manifest-contained-link",
+        "manifest-escaping-link",
+        "manifest-malformed",
+        "manifest-list",
+        "manifest-wrong-name",
+        "manifest-wrong-version",
+        "manifest-wrong-bin",
+        "package-escape",
+    ],
+)
+def test_local_cli_resolver_rejects_invalid_identity(tmp_path, cli, identity):
+    _write_parser_dependencies(tmp_path)
+    _invalidate_cli(tmp_path, tmp_path, cli, identity)
+    with pytest.raises((ValueError, OSError)):
+        gate_clis.local_clis(tmp_path / "node_modules", Path(shutil.which("node")))
+
+
+@pytest.mark.parametrize(
+    "identity", ["missing", "directory", "linked", "nonexecutable"]
+)
+def test_local_cli_resolver_rejects_invalid_node(tmp_path, identity):
+    _write_parser_dependencies(tmp_path)
+    node = tmp_path / "node"
+    if identity == "directory":
+        node.mkdir()
+    elif identity == "linked":
+        node.symlink_to(shutil.which("node"))
+    elif identity == "nonexecutable":
+        node.write_text("not executable", encoding="utf-8")
+    with pytest.raises((ValueError, OSError)):
+        gate_clis.local_clis(tmp_path / "node_modules", node)
+
+
+def test_local_cli_resolver_returns_only_exact_local_regular_files(tmp_path):
+    _write_parser_dependencies(tmp_path)
+    node = Path(shutil.which("node"))
+    assert gate_clis.local_clis(tmp_path / "node_modules", node) == (
+        node.resolve(),
+        *(
+            tmp_path / "node_modules" / package / entry
+            for package, _version, entry in CLI_IDENTITIES.values()
+        ),
+    )
+
+
+def test_gate_rejects_linked_node_before_checker(tmp_path):
+    repo, _base = _brand_repo(tmp_path)
+    fixture_bin = tmp_path / "linked-node-bin"
+    fixture_bin.mkdir()
+    (fixture_bin / "node").symlink_to(shutil.which("node"))
+    marker = tmp_path / "linked-node-checker.marker"
+    result = _run_gate_with_marker(
+        repo,
+        marker,
+        "--phase",
+        "base",
+        extra_env={"PATH": f"{fixture_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert result.returncode != 0
+    assert "TESTED_BASE_SHA=" not in result.stdout
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("build_mode", [
@@ -460,8 +654,8 @@ def test_base_gate_executes_the_release_contract_through_fixture_commands(
     selected_desktop = [
         path
         for command in commands
-        if command[:3] == ["npx", "vitest", "run"]
-        for path in command[3:]
+        if command[:2] == ["vitest", "run"]
+        for path in command[2:]
         if path.endswith((".ts", ".tsx", "/"))
     ]
     assert len(selected_python) == len(set(selected_python))

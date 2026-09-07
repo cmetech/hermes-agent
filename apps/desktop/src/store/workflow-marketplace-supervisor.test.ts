@@ -2236,6 +2236,68 @@ describe('application marketplace operation supervision', () => {
   })
 
   // Break caught: main-window startup uses ambient routing for subsequent native requests, or hidden startup never resumes.
+  it('clears legacy fetch authority synchronously on actual profile routing and does not restore it on return', async () => {
+    const provider = await import('@/app/workflows/marketplace/supervisor-provider')
+    const client = await import('@/api/client')
+    const gatewayStore = await import('@/store/gateway')
+    const profiles = await import('@/store/profile')
+    const { marketplaceKeys } = await import('@/app/workflows/marketplace/query-keys')
+
+    const oldDesktop = window.hermesDesktop,
+      oldGateway = gatewayStore.$gateway.get()
+
+    const oldConnection = client.getApiRequestConnection(),
+      oldProfile = client.getApiRequestProfile()
+
+    const oldActiveProfile = profiles.$activeGatewayProfile.get()
+    const gateway = new client.HermesGateway()
+    vi.spyOn(gateway, 'connectionState', 'get').mockReturnValue('open')
+    vi.spyOn(gateway, 'onState').mockImplementation(listener => {
+      listener('open')
+
+      return () => undefined
+    })
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        getConnectionFor: async () => ({ connectionId: 'remote-a', connectionGeneration: 7 }),
+        apiStructured: async () => ({ ok: false, status: 404, body: { detail: 'Not Found' } })
+      }
+    })
+    profiles.$activeGatewayProfile.set('support')
+    client.setApiRequestConnection('remote-a')
+    client.setApiRequestProfile('support')
+    gatewayStore.$gateway.set(gateway)
+    const queries = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const supervisor = provider.startMainWindowMarketplaceSupervision(queries)!
+    const key = marketplaceKeys.catalog('remote-a::support')
+
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      expect(supervisor.bindings.state(scope)).toEqual({ kind: 'unsupported' })
+      await queries.fetchQuery({ queryKey: key, queryFn: async () => ({ items: [], truncated: false }) })
+      expect(supervisor.canUseLegacyCatalog(scope, key)).toBe(true)
+      profiles.$activeGatewayProfile.set('other')
+      expect(supervisor.canUseLegacyCatalog(scope, key)).toBe(false)
+      profiles.$activeGatewayProfile.set('support')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(supervisor.canUseLegacyCatalog(scope, key)).toBe(false)
+      await queries.fetchQuery({ queryKey: key, queryFn: async () => ({ items: [], truncated: false }) })
+      expect(supervisor.canUseLegacyCatalog(scope, key)).toBe(true)
+    } finally {
+      supervisor.dispose()
+      queries.clear()
+      gatewayStore.$gateway.set(oldGateway)
+      profiles.$activeGatewayProfile.set(oldActiveProfile)
+      client.setApiRequestConnection(oldConnection)
+      client.setApiRequestProfile(oldProfile)
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: oldDesktop })
+      Reflect.deleteProperty(document, 'visibilityState')
+      vi.restoreAllMocks()
+    }
+  })
+
   it('binds native generation and backend actor through the real application API on visibility return', async () => {
     const provider = await import('@/app/workflows/marketplace/supervisor-provider')
     const client = await import('@/api/client')

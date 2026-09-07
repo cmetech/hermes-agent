@@ -5,6 +5,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
+import { marketplaceFixturePython } from './marketplace-fixture-paths'
 import { allowErrorBanners, expect, test } from './test'
 
 const ROOT = path.resolve(import.meta.dirname, '../../..')
@@ -22,7 +23,7 @@ test.describe('Workflow Marketplace real backend lifecycle', () => {
     fixture = await setupMockBackend({
       prepareHermesHome(home) {
         const repository = path.join(path.dirname(home), 'marketplace-publisher')
-        const python = path.join(ROOT, '.venv/bin/python')
+        const python = marketplaceFixturePython(ROOT)
         execFileSync(
           python,
           [
