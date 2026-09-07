@@ -2779,3 +2779,525 @@ def test_recovery_preserves_owned_marker_mismatch_and_ambiguous_swap(
     assert marker.exists()
     assert journal.quarantine_path.exists()
     assert store.list_journals() == (journal,)
+
+
+@pytest.mark.parametrize("marker_state", ["missing", "changed", "mismatched", "intact"])
+def test_final_phase_missing_marker_at_prepared_publication_is_retained(
+    tmp_path, monkeypatch, marker_state
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    original = store._write_prepared
+    observed = {}
+
+    def publication(*args, **kwargs):
+        (envelope,) = store.staging_root.iterdir()
+        if marker_state == "missing":
+            (envelope / "owner.json").unlink()
+        elif marker_state == "changed":
+            (envelope / "owner.json").write_bytes(b"unproven marker")
+        elif marker_state == "mismatched":
+            marker = json.loads((envelope / "owner.json").read_bytes())
+            marker["transactionId"] = "f" * 32
+            (envelope / "owner.json").write_text(json.dumps(marker))
+        observed["envelope"] = envelope
+        observed["bytes"] = _snapshot(envelope)
+        if marker_state == "intact":
+            raise OSError("ordinary publication failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_write_prepared", publication)
+    with pytest.raises(WorkflowMarketplaceError):
+        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+    assert not store.path.exists()
+    assert not candidate.destination.exists()
+    if marker_state == "intact":
+        assert not observed["envelope"].exists()
+    else:
+        assert observed["envelope"].is_dir(), "missing-marker evidence must be retained"
+        assert _snapshot(observed["envelope"]) == observed["bytes"]
+
+
+@pytest.mark.parametrize("action", ["update", "remove"])
+@pytest.mark.parametrize("damage", ["journal", "envelope", "none"])
+def test_final_phase_rollback_entry_rechecks_authority(
+    tmp_path, monkeypatch, action, damage
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = _install(store, candidate)
+    if action == "update":
+        candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+        prepared = _consume(store, candidate)
+    else:
+        _, prepared = _authorize_remove(store, installed)
+    helper = "_rollback_remove" if action == "remove" else "_rollback_install"
+    original = getattr(store, helper)
+    observed = {}
+
+    def rollback(*args, **kwargs):
+        envelope = store.quarantine_root / prepared.transaction_id
+        if damage == "journal":
+            payload = json.loads(store.journal_path.read_bytes())
+            payload["journals"][0]["phase"] = f"{prepared.operation}_consumed"
+            store.journal_path.write_text(json.dumps(payload))
+            observed["evidence"] = store.journal_path
+            observed["bytes"] = store.journal_path.read_bytes()
+        elif damage == "envelope":
+            displaced = tmp_path / "displaced-envelope"
+            envelope.rename(displaced)
+            shutil.copytree(displaced, envelope)
+            observed["evidence"] = envelope
+            observed["bytes"] = _snapshot(envelope)
+        observed["installed"] = _snapshot(candidate.destination)
+        return original(*args, **kwargs)
+
+    def fault(point):
+        if point == "after_backup_move":
+            raise RuntimeError("ordinary named-phase failure requiring rollback")
+
+    monkeypatch.setattr(store, helper, rollback)
+    with pytest.raises((WorkflowMarketplaceError, RuntimeError)):
+        mutation = store.atomic_remove if action == "remove" else store.atomic_install
+        mutation(prepared, review_digest=REVIEW, fault=fault)
+    assert observed
+    if damage == "none":
+        assert store.installed_store.get(installed.identity) == installed
+        assert _snapshot(candidate.destination)
+        assert store.list_journals() == ()
+    else:
+        assert _snapshot(candidate.destination) == observed["installed"], (
+            "rollback must not mutate installed bytes after authority changes"
+        )
+        evidence = observed["evidence"]
+        assert (
+            _snapshot(evidence) if evidence.is_dir() else evidence.read_bytes()
+        ) == observed["bytes"]
+
+
+@pytest.mark.parametrize("action", ["update", "remove"])
+@pytest.mark.parametrize("damage", ["journal", "envelope", "none"])
+def test_final_phase_restart_recovery_entry_rechecks_authority(
+    tmp_path, monkeypatch, action, damage
+):
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = _install(store, candidate)
+    if action == "update":
+        candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+        prepared = _consume(store, candidate)
+    else:
+        _, prepared = _authorize_remove(store, installed)
+
+    def crash(point):
+        if point == "after_backup_move":
+            raise SimulatedCrash(point)
+
+    with pytest.raises(SimulatedCrash):
+        mutation = store.atomic_remove if action == "remove" else store.atomic_install
+        mutation(prepared, review_digest=REVIEW, fault=crash)
+    restarted = MarketplaceTransactionStore(tmp_path)
+    helper = "_recover_remove" if action == "remove" else "_recover_install"
+    original = getattr(restarted, helper)
+    observed = {}
+
+    def recovery(journal, **kwargs):
+        if damage == "journal":
+            state = json.loads(restarted.journal_path.read_bytes())
+            state["journals"][0]["phase"] = f"{prepared.operation}_consumed"
+            restarted.journal_path.write_text(json.dumps(state))
+        elif damage == "envelope":
+            envelope = restarted.quarantine_root / prepared.transaction_id
+            displaced = tmp_path / "displaced-recovery-envelope"
+            envelope.rename(displaced)
+            shutil.copytree(displaced, envelope)
+        observed["installed"] = _snapshot(candidate.destination)
+        return original(journal, **kwargs)
+
+    monkeypatch.setattr(restarted, helper, recovery)
+    recovered = restarted.recover_transactions()
+    assert observed
+    if damage == "none":
+        assert recovered == (prepared.transaction_id,)
+        assert restarted.installed_store.get(installed.identity) == installed
+        assert _snapshot(candidate.destination)
+    else:
+        assert (
+            _snapshot(candidate.destination) == observed["installed"],
+            recovered,
+        ) == (True, ()), (
+            "changed recovery authority cannot mutate installed bytes or claim recovery success"
+        )
+
+
+@pytest.mark.parametrize("action", ["install", "update", "remove"])
+@pytest.mark.parametrize("restart", [False, True], ids=["rollback", "restart"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "root",
+        "installed_parent",
+        "journal",
+        "envelope",
+        "marker",
+        "package",
+        "provenance",
+        "none",
+    ],
+)
+def test_final_phase_settlement_entry_preserves_changed_authority(
+    tmp_path, monkeypatch, action, restart, damage
+):
+    """The rollback/restart helper entry is an observable phase, not a syscall gap."""
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = None if action == "install" else _install(store, candidate)
+    original_bytes = _snapshot(candidate.destination)
+    if action == "remove":
+        _, prepared = _authorize_remove(store, installed)
+    else:
+        candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+        prepared = _consume(store, candidate)
+    observed = {}
+    point = "after_candidate_swap" if action == "install" else "after_backup_move"
+
+    def fault(phase):
+        if phase == point:
+            if restart:
+                raise SimulatedCrash(phase)
+            raise RuntimeError("ordinary settlement failure")
+
+    mutation = store.atomic_remove if action == "remove" else store.atomic_install
+    if restart:
+        with pytest.raises(SimulatedCrash):
+            mutation(prepared, review_digest=REVIEW, fault=fault)
+        store = MarketplaceTransactionStore(tmp_path)
+    helper = ("_recover_" if restart else "_rollback_") + (
+        "remove" if action == "remove" else "install"
+    )
+    original = getattr(store, helper)
+
+    def settlement(*args, **kwargs):
+        envelope = (
+            store.staging_root if action == "install" else store.quarantine_root
+        ) / prepared.transaction_id
+        package = candidate.destination if action == "install" else envelope / "package"
+        if damage in {"root", "installed_parent", "envelope"}:
+            target = {
+                "root": store.root,
+                "installed_parent": candidate.destination.parent,
+                "envelope": envelope,
+            }[damage]
+            displaced = tmp_path / "displaced-authority"
+            target.rename(displaced)
+            shutil.copytree(displaced, target)
+            observed["displaced"] = (
+                displaced,
+                _snapshot(displaced),
+                displaced.stat().st_ino,
+            )
+            observed["replacement"] = (target, target.stat().st_ino)
+        elif damage == "journal":
+            state = json.loads(store.journal_path.read_bytes())
+            state["journals"][0]["phase"] = f"{prepared.operation}_consumed"
+            store.journal_path.write_text(json.dumps(state))
+        elif damage == "marker":
+            (envelope / "owner.json").unlink()
+        elif damage == "package":
+            (package / "workflow-package.yaml").write_bytes(b"changed package")
+        elif damage == "provenance":
+            if installed is not None:
+                store.installed_store.remove(installed.identity, expected=installed)
+            else:
+                store.installed_store.put(store._candidate_provenance(prepared))
+        observed["installed"] = _snapshot(candidate.destination)
+        observed["provenance"] = store.installed_store._snapshot()
+        observed["scratch"] = (
+            _snapshot(store.staging_root),
+            _snapshot(store.quarantine_root),
+        )
+        observed["journal"] = store.journal_path.read_bytes()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, helper, settlement)
+    if restart:
+        try:
+            recovered = store.recover_transactions()
+        except WorkflowMarketplaceError as error:
+            assert damage == "root"
+            assert error.code == "transaction_state_invalid"
+            recovered = ()
+    else:
+        with pytest.raises((WorkflowMarketplaceError, RuntimeError)):
+            mutation(prepared, review_digest=REVIEW, fault=fault)
+        recovered = ()
+    assert observed
+    if damage == "none":
+        assert recovered == ((prepared.transaction_id,) if restart else ())
+        assert _snapshot(candidate.destination) == original_bytes
+        assert store._current_provenance(candidate.identity) == installed
+        assert store.list_journals() == ()
+    else:
+        assert recovered == ()
+        assert _snapshot(candidate.destination) == observed["installed"]
+        assert store.installed_store._snapshot() == observed["provenance"]
+        assert (
+            _snapshot(store.staging_root),
+            _snapshot(store.quarantine_root),
+        ) == observed["scratch"]
+        assert store.journal_path.read_bytes() == observed["journal"]
+        if "displaced" in observed:
+            displaced, content, inode = observed["displaced"]
+            assert _snapshot(displaced) == content
+            assert displaced.stat().st_ino == inode
+            target, inode = observed["replacement"]
+            assert target.stat().st_ino == inode
+
+
+@pytest.mark.parametrize(
+    ("action", "restart", "boundary"),
+    [
+        (action, restart, boundary)
+        for action in ("install", "update", "remove")
+        for restart in (False, True)
+        for boundary in (
+            "move",
+            "provenance_write",
+            "cleanup",
+            "retirement",
+            "publication",
+            "journal_write",
+        )
+        # An uncommitted first install has no provenance record to restore.
+        if not (action == "install" and restart and boundary == "provenance_write")
+        and not (restart and boundary == "publication")
+    ],
+)
+@pytest.mark.parametrize("damage", ["journal", "none"])
+def test_final_phase_late_settlement_revalidates_before_mutation(
+    tmp_path, monkeypatch, action, restart, boundary, damage
+):
+    """Inject at named restore/cleanup/retirement helpers, after dispatch validation."""
+    import plugins.workflow.marketplace.transactions as transaction_module
+
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    installed = None if action == "install" else _install(store, candidate)
+    original_bytes = _snapshot(candidate.destination)
+    if action == "remove":
+        _, prepared = _authorize_remove(store, installed)
+    else:
+        candidate = _candidate(tmp_path, _package(tmp_path, "2.0.0"))
+        prepared = _consume(store, candidate)
+    point = "after_candidate_swap" if action == "install" else "after_backup_move"
+    active = False
+
+    def fault(phase):
+        nonlocal active
+        if phase == point:
+            if restart:
+                raise SimulatedCrash(phase)
+            if boundary == "publication":
+                active = True
+            raise RuntimeError("ordinary settlement failure")
+
+    mutation = store.atomic_remove if action == "remove" else store.atomic_install
+    if restart:
+        with pytest.raises(SimulatedCrash):
+            mutation(prepared, review_digest=REVIEW, fault=fault)
+        store = MarketplaceTransactionStore(tmp_path)
+    helper = ("_recover_" if restart else "_rollback_") + (
+        "remove" if action == "remove" else "install"
+    )
+    original = getattr(store, helper)
+    observed = {}
+
+    def settlement(*args, **kwargs):
+        nonlocal active
+        active = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, helper, settlement)
+    owner = (
+        transaction_module._TransactionPhases
+        if boundary in {"move", "provenance_write"}
+        else store
+    )
+    target = {
+        "cleanup": "_remove_owned_envelope",
+        "retirement": "_delete_journal",
+        "publication": "_replace_journal",
+        "journal_write": "_write_journals",
+    }.get(boundary, boundary)
+    actual = getattr(owner, target)
+
+    def late_phase(*args, **kwargs):
+        if active and not observed:
+            if damage == "journal":
+                state = json.loads(store.journal_path.read_bytes())
+                state["journals"][0]["phase"] = f"{prepared.operation}_consumed"
+                store.journal_path.write_text(json.dumps(state))
+            observed["installed"] = _snapshot(candidate.destination)
+            observed["provenance"] = store.installed_store._snapshot()
+            observed["scratch"] = (
+                _snapshot(store.staging_root),
+                _snapshot(store.quarantine_root),
+            )
+            observed["journal"] = store.journal_path.read_bytes()
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(owner, target, late_phase)
+    if restart:
+        recovered = store.recover_transactions()
+    else:
+        with pytest.raises((WorkflowMarketplaceError, RuntimeError)):
+            mutation(prepared, review_digest=REVIEW, fault=fault)
+        recovered = ()
+    assert observed
+    if damage == "none":
+        assert recovered == ((prepared.transaction_id,) if restart else ())
+        assert _snapshot(candidate.destination) == original_bytes
+        assert store._current_provenance(candidate.identity) == installed
+        assert store.list_journals() == ()
+    else:
+        assert recovered == ()
+        assert _snapshot(candidate.destination) == observed["installed"]
+        assert store.installed_store._snapshot() == observed["provenance"]
+        assert (
+            _snapshot(store.staging_root),
+            _snapshot(store.quarantine_root),
+        ) == observed["scratch"]
+        assert store.journal_path.read_bytes() == observed["journal"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "root",
+        "staging",
+        "envelope",
+        "missing",
+        "malformed",
+        "mismatched",
+        "changed",
+        "none",
+    ],
+)
+def test_final_phase_abandoned_cleanup_retains_changed_yielded_authority(
+    tmp_path, monkeypatch, damage
+):
+    """The validated-candidate yield is the handoff into abandoned cleanup."""
+    now = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    store = MarketplaceTransactionStore(tmp_path, clock=lambda: now)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    prepared = store.prepare(
+        candidate, review_digest=REVIEW, actor="alice", profile="p1"
+    )
+    restarted = MarketplaceTransactionStore(
+        tmp_path, clock=lambda: now + timedelta(hours=1)
+    )
+    original = restarted._abandoned_staging_candidates
+    observed = {}
+    envelope = prepared.staging_path.parent
+
+    def handoff(**kwargs):
+        for item in original(**kwargs):
+            if damage in {"root", "staging", "envelope"}:
+                target = {
+                    "root": restarted.root,
+                    "staging": restarted.staging_root,
+                    "envelope": envelope,
+                }[damage]
+                displaced = tmp_path / "displaced-abandoned"
+                target.rename(displaced)
+                shutil.copytree(displaced, target)
+                observed["displaced"] = (
+                    displaced,
+                    _snapshot(displaced),
+                    displaced.stat().st_ino,
+                )
+            elif damage == "missing":
+                (envelope / "owner.json").unlink()
+            elif damage == "malformed":
+                (envelope / "owner.json").write_bytes(b"not a marker")
+            elif damage in {"changed", "mismatched"}:
+                marker = json.loads((envelope / "owner.json").read_bytes())
+                if damage == "changed":
+                    marker["createdAt"] = "2026-09-07T00:00:01Z"
+                else:
+                    marker["transactionId"] = "f" * 32
+                (envelope / "owner.json").write_text(json.dumps(marker))
+            observed["bytes"] = _snapshot(envelope)
+            observed["inode"] = envelope.stat().st_ino
+            yield item
+
+    monkeypatch.setattr(restarted, "_abandoned_staging_candidates", handoff)
+    if damage == "none":
+        assert restarted.recover_transactions() == ()
+        assert observed
+        assert not envelope.exists()
+    else:
+        with pytest.raises(WorkflowMarketplaceError) as error:
+            restarted.recover_transactions()
+        assert error.value.code in {
+            "transaction_recovery_inspection_incomplete",
+            "transaction_recovery_ambiguous",
+            "transaction_state_invalid",
+        }
+        assert _snapshot(envelope) == observed["bytes"]
+        assert envelope.stat().st_ino == observed["inode"]
+        if "displaced" in observed:
+            displaced, content, inode = observed["displaced"]
+            assert _snapshot(displaced) == content
+            assert displaced.stat().st_ino == inode
+    assert not candidate.destination.exists()
+    assert restarted._current_provenance(candidate.identity) is None
+
+
+@pytest.mark.parametrize(
+    "marker_state", ["missing", "malformed", "mismatched", "intact"]
+)
+def test_final_phase_preparation_cleanup_entry_requires_exact_marker(
+    tmp_path, monkeypatch, marker_state
+):
+    import plugins.workflow.marketplace.transactions as transaction_module
+
+    store = MarketplaceTransactionStore(tmp_path)
+    candidate = _candidate(tmp_path, _package(tmp_path, "1.0.0"))
+    original = transaction_module._PreparationWorkspace.cleanup
+    observed = {}
+
+    def fail_publication(*args, **kwargs):
+        raise OSError("ordinary publication failure")
+
+    def cleanup(workspace):
+        envelope = workspace.envelope
+        assert envelope is not None
+        marker_path = envelope / "owner.json"
+        if marker_state == "missing":
+            marker_path.unlink()
+        elif marker_state == "malformed":
+            marker_path.write_bytes(b"unproven marker")
+        elif marker_state == "mismatched":
+            marker = json.loads(marker_path.read_bytes())
+            marker["transactionId"] = "f" * 32
+            marker_path.write_text(json.dumps(marker))
+        observed["envelope"] = envelope
+        observed["bytes"] = _snapshot(envelope)
+        observed["inode"] = envelope.stat().st_ino
+        return original(workspace)
+
+    monkeypatch.setattr(store, "_write_prepared", fail_publication)
+    monkeypatch.setattr(transaction_module._PreparationWorkspace, "cleanup", cleanup)
+    with pytest.raises(WorkflowMarketplaceError) as error:
+        store.prepare(candidate, review_digest=REVIEW, actor="alice", profile="p1")
+    envelope = observed["envelope"]
+    if marker_state == "intact":
+        assert error.value.code == "transaction_state_write_failed"
+        assert not envelope.exists()
+    else:
+        assert error.value.code == "transaction_recovery_inspection_incomplete"
+        assert _snapshot(envelope) == observed["bytes"]
+        assert envelope.stat().st_ino == observed["inode"]
+    assert not store.path.exists()
+    assert not candidate.destination.exists()

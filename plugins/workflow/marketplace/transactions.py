@@ -378,6 +378,14 @@ class _OwnerMarker(_StateModel):
         return self
 
 
+@dataclass(frozen=True)
+class _AbandonedStaging:
+    envelope: Path
+    marker: _OwnerMarker
+    identity: tuple[int, int]
+    marker_content: bytes
+
+
 def _fail(code: str, message: str) -> NoReturn:
     raise WorkflowMarketplaceError(code, message)
 
@@ -768,7 +776,7 @@ class _PreparationWorkspace:
             ):
                 return False
             marker = self._read_marker_content()
-            if marker is not None and marker != self.marker_content:
+            if marker is None or marker != self.marker_content:
                 return False
             if parent_descriptor is None:
                 # Windows cannot remove directories while their no-delete-share
@@ -786,7 +794,7 @@ class _PreparationWorkspace:
 
 
 class _TransactionPhases:
-    """Recheck locked authority between observable journal/mutation phases."""
+    """Retain authority across observable forward, rollback and restart phases."""
 
     def __init__(
         self,
@@ -797,37 +805,70 @@ class _TransactionPhases:
         self.store = store
         self.root_identity = root_identity
         self.journal = journal
-        self.paths: dict[Path, tuple[int, int]] = {}
+        self.journal_retired = False
+        self.paths: dict[Path, tuple[int, int] | None] = {}
         self.packages: dict[Path, str] = {}
-        for path in (store.staging_root, store.quarantine_root):
-            self.track(path)
-        for path in (
+        self.markers: dict[Path, bytes] = {}
+        self.provenance_snapshot = store.installed_store._snapshot()
+        self.envelopes = {
             Path(journal.staging_path).parent,
             Path(journal.quarantine_path).parent,
+        }
+        for path in (
+            store.staging_root,
+            store.quarantine_root,
+            Path(journal.destination).parent,
+            *self.envelopes,
         ):
-            if _entry(path) is not None:
-                self.track(path)
-        if journal.candidate_provenance is not None:
-            self.packages[Path(journal.staging_path)] = (
-                journal.candidate_provenance.distribution_digest
-            )
-        if journal.previous_provenance is not None:
-            self.packages[Path(journal.destination)] = (
-                journal.previous_provenance.distribution_digest
-            )
-        for path in self.packages:
             self.track(path)
+        candidate = journal.candidate_provenance
+        previous = journal.previous_provenance
+        for path, provenances in (
+            (Path(journal.staging_path), (candidate,)),
+            (Path(journal.quarantine_path), (previous,)),
+            (Path(journal.destination), (candidate, previous)),
+        ):
+            self.track(path)
+            if self.paths[path] is not None:
+                digest = load_distribution(path).digest
+                if not any(
+                    item is not None and item.distribution_digest == digest
+                    for item in provenances
+                ):
+                    _fail(
+                        "transaction_recovery_ambiguous",
+                        "transaction package authority is unproven",
+                    )
+                self.packages[path] = digest
+        self.validate()
 
     def track(self, path: Path) -> None:
+        metadata = _entry(path)
+        if metadata is None:
+            self.paths[path] = None
+            return
         _require_existing_directory(path, code="transaction_recovery_ambiguous")
-        metadata = path.lstat()
         self.paths[path] = (metadata.st_dev, metadata.st_ino)
+        if path in self.envelopes:
+            self.markers[path] = _read_bounded(
+                path / "owner.json",
+                limit=_MAX_MARKER_BYTES,
+                size_code="transaction_marker_size_limit",
+            )
 
     def validate(self) -> None:
         self.store._require_root_identity(self.root_identity)
         for path, identity in self.paths.items():
+            metadata = _entry(path)
+            if identity is None:
+                if metadata is not None:
+                    _fail(
+                        "transaction_recovery_ambiguous",
+                        "transaction path became occupied",
+                    )
+                continue
             _require_existing_directory(path, code="transaction_recovery_ambiguous")
-            metadata = path.lstat()
+            assert metadata is not None
             if (metadata.st_dev, metadata.st_ino) != identity or (
                 os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700
             ):
@@ -843,8 +884,29 @@ class _TransactionPhases:
             ),
             None,
         )
-        if current != self.journal or not self.store._journal_markers_match(
-            self.journal
+        if current != (None if self.journal_retired else self.journal):
+            _fail(
+                "transaction_recovery_ambiguous",
+                "transaction journal changed between phases",
+            )
+        for envelope, marker in self.markers.items():
+            if (
+                _read_bounded(
+                    envelope / "owner.json",
+                    limit=_MAX_MARKER_BYTES,
+                    size_code="transaction_marker_size_limit",
+                )
+                != marker
+            ):
+                _fail(
+                    "transaction_recovery_ambiguous",
+                    "transaction marker changed between phases",
+                )
+        # Markers may legitimately be absent after known cleanup transitions.
+        if (
+            not self.journal_retired
+            and self.markers
+            and not self.store._journal_markers_match(self.journal)
         ):
             _fail(
                 "transaction_recovery_ambiguous",
@@ -852,11 +914,19 @@ class _TransactionPhases:
             )
         for path, digest in self.packages.items():
             load_distribution(path, expected_digest=digest)
+        if self.store.installed_store._snapshot() != self.provenance_snapshot:
+            _fail(
+                "transaction_recovery_ambiguous",
+                "installed provenance changed between phases",
+            )
 
     def publish(self, journal: _JournalRecord) -> None:
         self.validate()
-        self.store._replace_journal(journal, parent_identity=self.root_identity)
+        self.store._replace_journal(
+            journal, parent_identity=self.root_identity, authority=self
+        )
         self.journal = journal
+        self.validate()
 
     def checkpoint(self, fault: Callable[[str], None], point: str) -> None:
         fault(point)
@@ -864,14 +934,50 @@ class _TransactionPhases:
 
     def move(self, source: Path, destination: Path) -> None:
         self.validate()
+        if self.paths.get(source) is None or self.paths.get(destination) is not None:
+            _fail(
+                "transaction_recovery_ambiguous",
+                "transaction move authority is unproven",
+            )
         os.replace(source, destination)
-        self.paths[destination] = self.paths.pop(source)
+        self.paths[destination] = self.paths[source]
+        self.paths[source] = None
         self.packages[destination] = self.packages.pop(source)
 
+    @contextmanager
+    def provenance_write(self, expected: InstalledPackageProvenance | None):
+        """Allow only this transaction's known write, including write-then-error."""
+        self.validate()
+        before = self.provenance_snapshot
+        old = self.store._current_provenance(self.journal.identity)
+        try:
+            yield
+        finally:
+            after = self.store.installed_store._snapshot()
+            other_before = [
+                item
+                for item in before[1].packages
+                if item.provenance.identity != self.journal.identity
+            ]
+            other_after = [
+                item
+                for item in after[1].packages
+                if item.provenance.identity != self.journal.identity
+            ]
+            current = self.store._current_provenance(self.journal.identity)
+            if other_after != other_before or current not in (old, expected):
+                _fail(
+                    "transaction_recovery_ambiguous",
+                    "provenance write changed unrelated authority",
+                )
+            self.provenance_snapshot = after
+            self.validate()
+
     def retired(self, envelope: Path) -> None:
+        self.markers.pop(envelope, None)
         for path in tuple(self.paths):
             if path == envelope or envelope in path.parents:
-                self.paths.pop(path)
+                self.paths[path] = None
                 self.packages.pop(path, None)
 
 
@@ -1212,7 +1318,10 @@ class MarketplaceTransactionStore:
         records: list[_JournalRecord],
         *,
         parent_identity: tuple[int, int],
+        authority: _TransactionPhases | None = None,
     ) -> None:
+        if authority is not None:
+            authority.validate()
         records.sort(key=lambda item: item.transaction_id)
         self._write_model(
             self.journal_path,
@@ -1447,6 +1556,8 @@ class MarketplaceTransactionStore:
             return False
         shutil.rmtree(envelope)
         _fsync_directory(envelope.parent)
+        if authority is not None:
+            authority.retired(envelope)
         return True
 
     def _candidate_provenance(
@@ -1877,21 +1988,28 @@ class MarketplaceTransactionStore:
         record: _JournalRecord,
         *,
         parent_identity: tuple[int, int],
+        authority: _TransactionPhases | None = None,
     ) -> None:
+        if authority is not None:
+            authority.validate()
         state = self._read_journals()
         records = [
             item
             for item in state.journals
             if item.transaction_id != record.transaction_id
         ]
-        self._write_journals([*records, record], parent_identity=parent_identity)
+        self._write_journals(
+            [*records, record], parent_identity=parent_identity, authority=authority
+        )
 
     def _delete_journal(
         self,
         transaction_id: str,
         *,
         parent_identity: tuple[int, int],
+        authority: _TransactionPhases,
     ) -> None:
+        authority.validate()
         self._write_journals(
             [
                 item
@@ -1899,7 +2017,10 @@ class MarketplaceTransactionStore:
                 if item.transaction_id != transaction_id
             ],
             parent_identity=parent_identity,
+            authority=authority,
         )
+        authority.journal_retired = True
+        authority.validate()
 
     def _require_authorization(
         self,
@@ -2137,7 +2258,10 @@ class MarketplaceTransactionStore:
         self,
         journal: _JournalRecord,
         provenance_snapshot,
+        *,
+        authority: _TransactionPhases,
     ) -> None:
+        authority.validate()
         destination = Path(journal.destination)
         staging = Path(journal.staging_path)
         quarantine = Path(journal.quarantine_path)
@@ -2150,7 +2274,7 @@ class MarketplaceTransactionStore:
                 destination_digest == candidate.distribution_digest
                 and _entry(staging) is None
             ):
-                os.replace(destination, staging)
+                authority.move(destination, staging)
                 _fsync_directory(destination.parent)
                 _fsync_directory(staging.parent)
                 destination_digest = None
@@ -2167,12 +2291,16 @@ class MarketplaceTransactionStore:
                 load_distribution(
                     quarantine, expected_digest=previous.distribution_digest
                 )
-                os.replace(quarantine, destination)
+                authority.move(quarantine, destination)
                 _fsync_directory(destination.parent)
                 _fsync_directory(quarantine.parent)
-        self.installed_store._restore_snapshot(provenance_snapshot)
+        with authority.provenance_write(journal.previous_provenance):
+            self.installed_store._restore_snapshot(provenance_snapshot)
 
-    def _finish_install_cleanup(self, journal: _JournalRecord) -> bool:
+    def _finish_install_cleanup(
+        self, journal: _JournalRecord, *, authority: _TransactionPhases
+    ) -> bool:
+        authority.validate()
         candidate = journal.candidate_provenance
         assert candidate is not None
         if journal.previous_provenance is not None:
@@ -2186,6 +2314,7 @@ class MarketplaceTransactionStore:
                 identity=journal.identity,
                 destination=Path(journal.destination),
                 package_digest=journal.previous_provenance.distribution_digest,
+                authority=authority,
             ):
                 return False
         staging_envelope = Path(journal.staging_path).parent
@@ -2196,6 +2325,7 @@ class MarketplaceTransactionStore:
             identity=journal.identity,
             destination=Path(journal.destination),
             package_digest=candidate.distribution_digest,
+            authority=authority,
         )
 
     def atomic_install(
@@ -2288,7 +2418,8 @@ class MarketplaceTransactionStore:
                     update={"phase": "install_provenance_write_pending"}
                 )
                 phases.publish(journal)
-                writer(candidate_provenance)
+                with phases.provenance_write(candidate_provenance):
+                    writer(candidate_provenance)
                 if self.installed_store.get(prepared.identity) != candidate_provenance:
                     _fail(
                         "provenance_state_write_failed",
@@ -2346,6 +2477,7 @@ class MarketplaceTransactionStore:
                 self._delete_journal(
                     prepared.transaction_id,
                     parent_identity=parent_identity,
+                    authority=phases,
                 )
                 return candidate_provenance
             except Exception as original:
@@ -2359,17 +2491,18 @@ class MarketplaceTransactionStore:
                     update={"phase": "install_rollback_pending"}
                 )
                 try:
-                    self._replace_journal(
-                        rollback_journal,
-                        parent_identity=parent_identity,
-                    )
+                    phases.publish(rollback_journal)
                     if not self._journal_markers_match(rollback_journal):
                         _fail(
                             "transaction_recovery_ambiguous",
                             "transaction ownership changed during rollback",
                         )
-                    self._rollback_install(rollback_journal, previous_snapshot)
-                    if not self._finish_install_cleanup(rollback_journal):
+                    self._rollback_install(
+                        rollback_journal, previous_snapshot, authority=phases
+                    )
+                    if not self._finish_install_cleanup(
+                        rollback_journal, authority=phases
+                    ):
                         _fail(
                             "transaction_recovery_ambiguous",
                             "transaction ownership changed during rollback",
@@ -2377,6 +2510,7 @@ class MarketplaceTransactionStore:
                     self._delete_journal(
                         prepared.transaction_id,
                         parent_identity=parent_identity,
+                        authority=phases,
                     )
                 except Exception as rollback_error:
                     raise WorkflowMarketplaceError(
@@ -2388,19 +2522,27 @@ class MarketplaceTransactionStore:
                 _record_rollback(self, prepared.identity, prepared.installed_provenance)
                 raise original
 
-    def _rollback_remove(self, journal: _JournalRecord, provenance_snapshot) -> None:
+    def _rollback_remove(
+        self,
+        journal: _JournalRecord,
+        provenance_snapshot,
+        *,
+        authority: _TransactionPhases,
+    ) -> None:
+        authority.validate()
         destination = Path(journal.destination)
         quarantine = Path(journal.quarantine_path)
         previous = journal.previous_provenance
         assert previous is not None
         if _entry(destination) is None:
             load_distribution(quarantine, expected_digest=previous.distribution_digest)
-            os.replace(quarantine, destination)
+            authority.move(quarantine, destination)
             _fsync_directory(destination.parent)
             _fsync_directory(quarantine.parent)
         else:
             load_distribution(destination, expected_digest=previous.distribution_digest)
-        self.installed_store._restore_snapshot(provenance_snapshot)
+        with authority.provenance_write(previous):
+            self.installed_store._restore_snapshot(provenance_snapshot)
 
     def atomic_remove(
         self,
@@ -2466,7 +2608,8 @@ class MarketplaceTransactionStore:
                     update={"phase": "remove_provenance_write_pending"}
                 )
                 phases.publish(journal)
-                remover(prepared.identity)
+                with phases.provenance_write(None):
+                    remover(prepared.identity)
                 if self._current_provenance(prepared.identity) is not None:
                     _fail(
                         "provenance_state_write_failed",
@@ -2505,6 +2648,7 @@ class MarketplaceTransactionStore:
                 self._delete_journal(
                     prepared.transaction_id,
                     parent_identity=parent_identity,
+                    authority=phases,
                 )
                 return previous
             except Exception as original:
@@ -2518,16 +2662,15 @@ class MarketplaceTransactionStore:
                     update={"phase": "remove_rollback_pending"}
                 )
                 try:
-                    self._replace_journal(
-                        rollback_journal,
-                        parent_identity=parent_identity,
-                    )
+                    phases.publish(rollback_journal)
                     if not self._journal_markers_match(rollback_journal):
                         _fail(
                             "transaction_recovery_ambiguous",
                             "transaction ownership changed during rollback",
                         )
-                    self._rollback_remove(rollback_journal, previous_snapshot)
+                    self._rollback_remove(
+                        rollback_journal, previous_snapshot, authority=phases
+                    )
                     if _entry(quarantine.parent) is not None and not (
                         self._remove_owned_envelope(
                             quarantine.parent,
@@ -2536,6 +2679,7 @@ class MarketplaceTransactionStore:
                             identity=prepared.identity,
                             destination=destination,
                             package_digest=previous.distribution_digest,
+                            authority=phases,
                         )
                     ):
                         _fail(
@@ -2545,6 +2689,7 @@ class MarketplaceTransactionStore:
                     self._delete_journal(
                         prepared.transaction_id,
                         parent_identity=parent_identity,
+                        authority=phases,
                     )
                 except Exception as rollback_error:
                     raise WorkflowMarketplaceError(
@@ -2594,7 +2739,10 @@ class MarketplaceTransactionStore:
                 return False
         return True
 
-    def _recover_install(self, journal: _JournalRecord) -> bool:
+    def _recover_install(
+        self, journal: _JournalRecord, *, authority: _TransactionPhases
+    ) -> bool:
+        authority.validate()
         candidate = journal.candidate_provenance
         assert candidate is not None
         destination = Path(journal.destination)
@@ -2615,24 +2763,25 @@ class MarketplaceTransactionStore:
         if committed:
             if journal.trust_origin is not None:
                 self.trust_store.revoke_origin(journal.trust_origin)
-            return self._finish_install_cleanup(journal)
+            return self._finish_install_cleanup(journal, authority=authority)
         previous = journal.previous_provenance
         if previous is None:
             if destination_digest == candidate.distribution_digest:
                 if _entry(staging) is not None:
                     return False
-                os.replace(destination, staging)
+                authority.move(destination, staging)
                 _fsync_directory(destination.parent)
                 _fsync_directory(staging.parent)
             elif destination_digest is not None:
                 return False
             if current is not None:
-                self.installed_store.remove(journal.identity, expected=current)
+                with authority.provenance_write(None):
+                    self.installed_store.remove(journal.identity, expected=current)
         else:
             if destination_digest == candidate.distribution_digest:
                 if _entry(staging) is not None:
                     return False
-                os.replace(destination, staging)
+                authority.move(destination, staging)
                 _fsync_directory(destination.parent)
                 _fsync_directory(staging.parent)
                 destination_digest = None
@@ -2643,15 +2792,19 @@ class MarketplaceTransactionStore:
                     )
                 except WorkflowMarketplaceError:
                     return False
-                os.replace(quarantine, destination)
+                authority.move(quarantine, destination)
                 _fsync_directory(destination.parent)
                 _fsync_directory(quarantine.parent)
             elif destination_digest != previous.distribution_digest:
                 return False
-            self.installed_store.put(previous)
-        return self._finish_install_cleanup(journal)
+            with authority.provenance_write(previous):
+                self.installed_store.put(previous)
+        return self._finish_install_cleanup(journal, authority=authority)
 
-    def _recover_remove(self, journal: _JournalRecord) -> bool:
+    def _recover_remove(
+        self, journal: _JournalRecord, *, authority: _TransactionPhases
+    ) -> bool:
+        authority.validate()
         previous = journal.previous_provenance
         assert previous is not None
         destination = Path(journal.destination)
@@ -2671,6 +2824,7 @@ class MarketplaceTransactionStore:
                 identity=journal.identity,
                 destination=destination,
                 package_digest=previous.distribution_digest,
+                authority=authority,
             )
         if _entry(destination) is None:
             try:
@@ -2679,7 +2833,7 @@ class MarketplaceTransactionStore:
                 )
             except WorkflowMarketplaceError:
                 return False
-            os.replace(quarantine, destination)
+            authority.move(quarantine, destination)
             _fsync_directory(destination.parent)
             _fsync_directory(quarantine.parent)
         else:
@@ -2689,7 +2843,8 @@ class MarketplaceTransactionStore:
                 )
             except WorkflowMarketplaceError:
                 return False
-        self.installed_store.put(previous)
+        with authority.provenance_write(previous):
+            self.installed_store.put(previous)
         return _entry(quarantine.parent) is None or self._remove_owned_envelope(
             quarantine.parent,
             transaction_id=journal.transaction_id,
@@ -2697,6 +2852,7 @@ class MarketplaceTransactionStore:
             identity=journal.identity,
             destination=destination,
             package_digest=previous.distribution_digest,
+            authority=authority,
         )
 
     def _abandoned_staging_candidates(
@@ -2705,7 +2861,7 @@ class MarketplaceTransactionStore:
         active_ids: set[str],
         journal_ids: set[str],
         require_complete: bool = False,
-    ) -> Iterator[tuple[Path, _OwnerMarker]]:
+    ) -> Iterator[_AbandonedStaging]:
         if require_complete and _entry(self.staging_root) is None:
             return
         try:
@@ -2739,12 +2895,14 @@ class MarketplaceTransactionStore:
                 continue
             path = envelope / "owner.json"
             try:
+                metadata = envelope.lstat()
+                marker_content = _read_bounded(
+                    path,
+                    limit=_MAX_MARKER_BYTES,
+                    size_code="transaction_marker_size_limit",
+                )
                 value = _strict_json(
-                    _read_bounded(
-                        path,
-                        limit=_MAX_MARKER_BYTES,
-                        size_code="transaction_marker_size_limit",
-                    ),
+                    marker_content,
                     code="transaction_marker_invalid",
                 )
                 if (
@@ -2792,7 +2950,9 @@ class MarketplaceTransactionStore:
                 )
                 is not None
             ):
-                yield envelope, marker
+                yield _AbandonedStaging(
+                    envelope, marker, (metadata.st_dev, metadata.st_ino), marker_content
+                )
             elif require_complete:
                 _fail(
                     "transaction_recovery_inspection_incomplete",
@@ -2804,11 +2964,49 @@ class MarketplaceTransactionStore:
         *,
         active_ids: set[str],
         journal_ids: set[str],
+        parent_identity: tuple[int, int],
     ) -> None:
-        for envelope, _marker in self._abandoned_staging_candidates(
+        self._require_root_identity(parent_identity)
+        staging_metadata = self.staging_root.lstat()
+        staging_identity = (staging_metadata.st_dev, staging_metadata.st_ino)
+        for candidate in self._abandoned_staging_candidates(
             active_ids=active_ids, journal_ids=journal_ids
         ):
-            shutil.rmtree(envelope)
+            try:
+                self._require_root_identity(parent_identity)
+                for path, identity in (
+                    (self.staging_root, staging_identity),
+                    (candidate.envelope, candidate.identity),
+                ):
+                    _require_existing_directory(
+                        path, code="transaction_recovery_inspection_incomplete"
+                    )
+                    metadata = path.lstat()
+                    if (metadata.st_dev, metadata.st_ino) != identity or (
+                        os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700
+                    ):
+                        _fail(
+                            "transaction_recovery_inspection_incomplete",
+                            "abandoned staging authority changed",
+                        )
+                if (
+                    _read_bounded(
+                        candidate.envelope / "owner.json",
+                        limit=_MAX_MARKER_BYTES,
+                        size_code="transaction_marker_size_limit",
+                    )
+                    != candidate.marker_content
+                ):
+                    _fail(
+                        "transaction_recovery_inspection_incomplete",
+                        "abandoned staging marker changed",
+                    )
+            except (OSError, WorkflowMarketplaceError) as error:
+                raise WorkflowMarketplaceError(
+                    "transaction_recovery_inspection_incomplete",
+                    "abandoned staging cleanup requires inspection",
+                ) from error
+            shutil.rmtree(candidate.envelope)
             _fsync_directory(self.staging_root)
 
     def inspect_recovery(self) -> _RecoveryInspection:
@@ -2883,9 +3081,12 @@ class MarketplaceTransactionStore:
                 )
             entries.extend(
                 _RecoveryEntry(
-                    marker.transaction_id, marker.identity, "abandoned_staging", "owned"
+                    item.marker.transaction_id,
+                    item.marker.identity,
+                    "abandoned_staging",
+                    "owned",
                 )
-                for _envelope, marker in abandoned
+                for item in abandoned
             )
             return _RecoveryInspection(
                 tuple(
@@ -2935,25 +3136,35 @@ class MarketplaceTransactionStore:
                     remaining.append(journal)
                     continue
                 try:
+                    authority = _TransactionPhases(self, parent_identity, journal)
                     if journal.phase == "install_consumed":
-                        completed = self._finish_install_cleanup(journal)
+                        completed = self._finish_install_cleanup(
+                            journal, authority=authority
+                        )
                     elif journal.phase == "remove_consumed":
                         completed = True
                     elif journal.operation == "install":
-                        completed = self._recover_install(journal)
+                        completed = self._recover_install(journal, authority=authority)
                     else:
-                        completed = self._recover_remove(journal)
+                        completed = self._recover_remove(journal, authority=authority)
+                    if completed:
+                        self._delete_journal(
+                            journal.transaction_id,
+                            parent_identity=parent_identity,
+                            authority=authority,
+                        )
+                        authority.validate()
                 except (OSError, WorkflowMarketplaceError, WorkflowTrustError):
                     completed = False
                 if completed:
                     recovered.append(journal.transaction_id)
                 else:
                     remaining.append(journal)
-            if remaining != journals.journals:
-                self._write_journals(remaining, parent_identity=parent_identity)
+            self._require_root_identity(parent_identity)
             self._clean_abandoned_staging(
                 active_ids=active_ids,
                 journal_ids={item.transaction_id for item in remaining},
+                parent_identity=parent_identity,
             )
         return tuple(recovered)
 
