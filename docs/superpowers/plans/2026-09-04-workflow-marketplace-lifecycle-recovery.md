@@ -843,6 +843,255 @@ The real lifecycle also holds an already-admitted inspection while starting Remo
 - [ ] Add fixture `--check`, lifecycle Python/UI/parity/supervisor/E2E tests to existing workflow gates. Keep all existing checks. Ensure gate tests use temporary repos and don't mutate the actual base/brand branches. Packaging/build commands must use publication-disabled paths; no release command is authorized.
 - [ ] Run focused GREEN and the final gates below. A fresh reviewer independently exercises the real temporary Git/API/Desktop lifecycle and verifies locale/docs match implemented recovery behavior. Commit `test(workflow): verify marketplace lifecycle end to end` (separate docs commit permitted).
 
+## Task 16A — Fresh registered-source update truth (CWM-001)
+
+**Files:** Modify `plugins/workflow/marketplace/service.py`,
+`tests/plugins/workflow/test_marketplace_service.py`,
+`tests/plugins/workflow/test_marketplace_lifecycle_api.py`, and
+`apps/desktop/src/app/workflows/marketplace/index.test.tsx`.
+
+**Interfaces:**
+
+- **Consumes:** Existing `_fetch_update(installed, cancelled=...)`, exact
+  `InstalledPackageIdentity`, `UpdateCheck`, registered/direct fetch budgets,
+  and Task 14D update-check presentation.
+- **Produces:** A check result whose `current`, `update_available`, `orphaned`,
+  or `error` status is based on a freshly fetched and validated candidate for
+  both direct and registered installed packages. It does not mutate installed
+  bytes, provenance, trust, or the retained browsing catalog.
+
+- [ ] **Step 1: Write a real temporary-Git registered-source regression.** Add
+  a service test that registers and refreshes `company`, installs package
+  version `1.0.0`, advances the configured moving branch to a valid `2.0.0`
+  with regenerated index/digests, does not refresh the source, and asserts:
+
+  ```python
+  check = service.check_updates(installed.identity)[0]
+  assert check.identity == installed.identity
+  assert check.status == "update_available"
+  assert check.installed_version == "1.0.0"
+  assert check.candidate_version == "2.0.0"
+  ```
+
+  Add inverse cases for same-version changed bytes, older candidate, fetch
+  failure, validation failure, cancellation, missing source/package, and
+  all-package checks continuing with an `error` row rather than certifying
+  stale cache as `current`. Snapshot package/provenance/trust before failures
+  and assert exact equality afterward.
+
+- [ ] **Step 2: Run RED through the repository wrapper.** Run
+  `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/plugins/workflow/test_marketplace_service.py -k 'registered and update' --tb=short` and record the
+  expected failure showing candidate `1.0.0`/`current` rather than freshly
+  published `2.0.0`/`update_available`.
+
+- [ ] **Step 3: Implement one fresh-candidate path.** Make both registered and
+  direct entries use `_fetch_update()` plus the existing distribution,
+  structural-blocker, SemVer regression, and same-version digest-conflict
+  checks. Preserve exact orphan classification for absent registered
+  source/package; convert other per-package fetch/validation failures to the
+  sanitized `UpdateCheck(status="error")` projection. Do not refresh or
+  overwrite the browsing cache as a side effect.
+
+- [ ] **Step 4: Prove operation and user-visible behavior.** Add the smallest
+  real lifecycle/API assertion needed to prove the admitted update-check
+  publishes candidate `2.0.0`, and a Desktop regression that a valid
+  `update_available` result advances to exact update preparation while
+  `error` never displays current-version copy. Use complete strict fixtures,
+  not subset casts or helper-call-count assertions.
+
+- [ ] **Step 5: Run GREEN and commit.** Run the service, lifecycle API, and
+  affected Desktop Marketplace suites; run Ruff/format, TypeScript typecheck,
+  `git diff --check`, and the changed-file Windows-footgun check. Commit
+  `fix(workflow): fetch registered update candidates`. A fresh reviewer must
+  independently advance a registered temporary Git source without refreshing
+  it and verify candidate truth, non-mutation, cancellation, sanitization, and
+  Desktop copy before Task 16B begins.
+
+## Task 16B — Prove the Playwright gate identity (CWM-002)
+
+**Files:** Modify `scripts/workflow_gate_build.py`,
+`tests/scripts/test_workflow_gate_build.py`, and
+`tests/scripts/test_workflow_merge_gate.py`.
+
+**Interfaces:**
+
+- **Consumes:** The committed exact dependency identity
+  `@playwright/test` version `1.62.1` with executable mapping
+  `playwright -> cli.js`, existing source/dependency-root containment,
+  regular-file checks, duplicate-free JSON pattern in
+  `scripts/workflow_gate_clis.py`, and receipt suppression in
+  `scripts/test_workflow_merge_gate.sh`.
+- **Produces:** `local_playwright(source)` returns an executable only after the
+  exact local package version and declared executable identity are proven. No
+  installer, package runner, global/cache fallback, or network lookup is added.
+
+- [ ] **Step 1: Write direct identity RED cases.** Replace the name-only
+  positive fixture with a complete manifest and add behavior cases for missing
+  or wrong version, missing or wrong `bin`, duplicate `name`/`version`/`bin`
+  keys, non-object `bin`, alternate executable mapping, linked/intermediate
+  package paths, and a contained zero-exit canary `cli.js`. The valid case is:
+
+  ```json
+  {
+    "name": "@playwright/test",
+    "version": "1.62.1",
+    "bin": {"playwright": "cli.js"}
+  }
+  ```
+
+  The test must execute the resolver/helper boundary and assert rejection,
+  not inspect Python source text.
+
+- [ ] **Step 2: Run RED.** Run
+  `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/scripts/test_workflow_gate_build.py -k playwright --tb=short`; record that wrong-version/wrong-bin/duplicate
+  manifests are currently accepted.
+
+- [ ] **Step 3: Implement strict identity admission.** Reuse or extract the
+  duplicate-key JSON object hook and regular contained-path checks already used
+  for other local CLIs. Validate the exact name, pinned version, exact
+  `playwright` bin target, package directory chain, manifest, and executable
+  before returning the resolved executable. Fail closed with a bounded generic
+  diagnostic that does not echo manifest content.
+
+- [ ] **Step 4: Prove receipt suppression.** In the real temporary-Git merge
+  gate fixture, substitute a wrong-version, wrong-bin, duplicate-key, and
+  zero-exit canary Playwright package. Assert browser work is not credited and
+  `TESTED_BASE_SHA=` is absent. Keep the genuine local CLI path green.
+
+- [ ] **Step 5: Run GREEN and commit.** Run both gate test files, Bash syntax,
+  Ruff/format, the Windows-footgun checker, and `git diff --check`. Commit
+  `fix(workflow): verify Playwright gate identity`. A fresh reviewer must
+  independently substitute an accepted-looking no-op CLI and verify rejection
+  before browser launch and receipt before Task 16C begins.
+
+## Task 16C — Reflow long Marketplace metadata (CWM-003)
+
+**Files:** Modify
+`apps/desktop/src/app/workflows/marketplace/package-detail.tsx`,
+`apps/desktop/src/app/workflows/marketplace/package-list.tsx`,
+`apps/desktop/src/app/workflows/marketplace/index.test.tsx`, and
+`apps/desktop/e2e/workflow-marketplace-layout.spec.ts`. Extend that spec's
+existing `prepareSource()` function to rewrite the generated manifest with legal
+long metadata before `_write_index()` runs.
+
+**Interfaces:**
+
+- **Consumes:** Existing `PackageDetail`, `PackageList`, `Badge`, `RowButton`,
+  responsive list/detail layout, `ShortText` maximum 256 characters, RTL,
+  application zoom, and design-system token/primitive rules.
+- **Produces:** Complete package display and publisher metadata remains readable
+  within its own cell at 320/768/1440 CSS pixels and 100%/200% zoom in LTR and
+  RTL. No page-level overflow assertion substitutes for cell-level proof.
+
+- [ ] **Step 1: Write component and rendered RED tests.** Publish an otherwise
+  valid package whose display name and publisher are legal unbroken values of
+  at least 111 characters. At list and detail surfaces assert each target
+  element's content is either fully reflowed or has an explicit keyboard- and
+  screen-reader-accessible full-value disclosure. In Playwright, measure the
+  target cells at 320, 768, and 1440 CSS pixels, at 100% and 200%, in English
+  LTR and Arabic RTL. Also assert action reachability and root/body containment.
+
+- [ ] **Step 2: Run RED.** Run the focused Marketplace component suite and the
+  isolated layout browser scenario; record the title/publisher
+  `scrollWidth > clientWidth` failures while root width remains green.
+
+- [ ] **Step 3: Implement the smallest caller-level reflow policy.** Give the
+  detail identity column a bounded flexible width and wrap unbroken display,
+  publisher, license, and source text without changing Badge globally. In the
+  compact list, either wrap the publisher badge or use the existing accessible
+  overflow disclosure primitive while retaining the full accessible name.
+  Use logical CSS and existing tokens; do not hide the content, fork a
+  primitive, add raw colors, or alter action order.
+
+- [ ] **Step 4: Run GREEN and commit.** Run focused UI tests, the layout browser
+  scenario, typecheck, quiet lint, formatting, and `git diff --check`. Commit
+  `fix(desktop): reflow marketplace metadata`. A fresh reviewer must render
+  independent maximum/long metadata across the required width/zoom/RTL/theme
+  matrix and inspect accessibility names before Task 16D begins.
+
+## Task 16D — Localize Marketplace diagnostic meanings (CWM-004)
+
+**Files:** Create
+`apps/desktop/src/app/workflows/marketplace/diagnostic-presentation.ts` and
+`apps/desktop/src/app/workflows/marketplace/diagnostic-presentation.test.ts`.
+Modify
+`apps/desktop/src/app/workflows/marketplace/review-sections.tsx`,
+`apps/desktop/src/app/workflows/marketplace/package-detail.tsx`,
+`apps/desktop/src/app/workflows/marketplace/install-review-dialog.test.tsx`,
+`apps/desktop/src/app/workflows/marketplace/index.test.tsx`,
+`apps/desktop/src/i18n/types.ts`, `apps/desktop/src/i18n/ar.ts`,
+`apps/desktop/src/i18n/en.ts`, `apps/desktop/src/i18n/ja.ts`,
+`apps/desktop/src/i18n/zh.ts`, and `apps/desktop/src/i18n/zh-hant.ts`. Modify the backend/public schema
+only after a separately recorded design interruption proves presentation-only
+localization cannot preserve required facts.
+
+**Interfaces:**
+
+- **Consumes:** Strict safe `WorkflowMarketplaceDiagnostic {code, message,
+  severity}`, backend-generated diagnostic fixtures, localized controlled enum
+  pattern used for phases/change kinds/severities, `useI18n()`, and the existing
+  full requirements lists that expose runtime/tool/provider/service/secret
+  identifiers separately from diagnostic prose.
+- **Produces:** A known diagnostic's primary warning is localized in `ar`, `en`,
+  `ja`, `zh`, and `zh-hant`; unknown safe diagnostics use localized honest
+  fallback copy. Raw code/message may appear only in a user-invoked technical
+  detail disclosure and never as the primary screen-reader warning. Literal
+  package/workflow/path/requirement identifiers are not translated.
+
+- [ ] **Step 1: Inventory real diagnostic codes by behavior.** Use generated
+  contract fixtures and real service/API scenarios to enumerate the diagnostic
+  codes that reach blockers, advisories, workflow compatibility, and update
+  compatibility changes. Group codes only when their user meaning is genuinely
+  identical. Do not create a fixed-count/change-detector test.
+
+- [ ] **Step 2: Write localization RED tests.** Replace the existing positive
+  assertion that raw diagnostic codes remain primary. Render backend-generated
+  known and unknown diagnostics in each non-English locale and assert the
+  primary list item/accessibility text contains localized meaning, contains no
+  raw code or backend English sentence, and retains any independently rendered
+  literal requirement/workflow identifiers. Assert technical detail is closed
+  by default and, when opened, is clearly labeled and contains only already
+  sanitized wire data.
+
+- [ ] **Step 3: Run RED.** From the repository root run
+  `npm run test:workflow-ui --workspace apps/desktop`. Record the raw-code/
+  backend-English failure in Arabic; do not start production work until the new
+  behavior test fails for that reason.
+
+- [ ] **Step 4: Implement presentation-only localization.** Add an exhaustive
+  typed mapping for the supported known codes and five-locale copy. Render a
+  localized fallback for unknown codes. Reuse one presentation component for
+  review and detail. Keep dynamic facts visible through existing structured
+  requirements/workflow fields and optional sanitized technical detail; never
+  parse backend English, fabricate a requirement name, or weaken codecs. If a
+  required dynamic fact exists only inside `message` and cannot be preserved by
+  this design, stop before production change, record the exact code/fixture as
+  a contract gap, and draft a bounded diagnostic-parameter amendment for user
+  approval.
+
+- [ ] **Step 5: Run GREEN and commit.** Run focused dialog/detail/locale tests,
+  the Arabic RTL browser scenario, full Marketplace UI tests, typecheck, quiet
+  lint, formatting, and `git diff --check`. Commit
+  `fix(desktop): localize marketplace diagnostics`. A fresh reviewer must use
+  actual backend-generated diagnostics in all five locales, inspect the
+  accessibility tree, and verify unknown-code honesty, sanitizer preservation,
+  and absence of English/raw-code primary warnings.
+
+## Adversarial remediation final review
+
+- [ ] Run the exact full safe merge gate at the final remediation head. A
+  transient first failure is reported, not hidden; no receipt is accepted until
+  the complete gate passes on the exact candidate.
+- [ ] Dispatch a fresh most-capable whole-branch reviewer over
+  `c1dc7a23e1e987f7f64a1bee89b224af4d4adf5d..HEAD`, explicitly including the
+  two adversarial reports, reconciliation, all Task 16 briefs/reports/reviews,
+  and ledger decisions. Require independent reproductions of CWM-001 through
+  CWM-004, plus regression review of all previously locked invariants.
+- [ ] Present the final branch, exact gate receipt, remaining host limitations,
+  and every recorded Ruling to the user. Keep the worktree intact. Do not merge,
+  push, publish, release, modify `base`, or modify Workflow Studio without
+  separate explicit approval.
+
 ## Final verification and whole-branch review
 
 Use the repository interpreter selected by `scripts/run_tests.sh`; if a generator needs it explicitly, set a task-specific interpreter path found through the same existing environment. Do not change user/global configuration or install a second dependency tree. The following commands are execution requirements after approval, not claims that they passed during drafting.
