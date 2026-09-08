@@ -10,6 +10,8 @@ import type {
 } from '@/types/hermes'
 import type { PackageState } from '@/types/workflow-marketplace-lifecycle'
 
+import { ReviewDiagnostics } from './review-sections'
+
 export interface MarketplacePackageDetailProps {
   actions?: {
     checkForUpdates?: (origin: HTMLButtonElement) => void
@@ -265,38 +267,15 @@ export function MarketplacePackageDetail({
       ) : null}
 
       {detail.blockers.length ? (
-        <section aria-label={copy.workflowMarketplaceBlockers}>
-          <h3 className="text-xs font-medium text-destructive">{copy.workflowMarketplaceBlockers}</h3>
-          <ul className="mt-1 space-y-1 text-xs text-(--ui-text-secondary)">
-            {detail.blockers.map(item => (
-              <li key={`${item.code}:${item.message}`}>{item.message}</li>
-            ))}
-          </ul>
-        </section>
+        <ReviewDiagnostics diagnostics={detail.blockers} title={copy.workflowMarketplaceBlockers} />
       ) : null}
 
       {detail.advisories.length ? (
-        <section aria-label={copy.workflowMarketplaceAdvisories}>
-          <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceAdvisories}</h3>
-          <ul className="mt-1 space-y-1 text-xs text-(--ui-text-secondary)">
-            {detail.advisories.map(item => (
-              <li key={`${item.code}:${item.message}`}>{item.message}</li>
-            ))}
-          </ul>
-        </section>
+        <ReviewDiagnostics diagnostics={detail.advisories} title={copy.workflowMarketplaceAdvisories} />
       ) : null}
 
       {compatibility.length ? (
-        <section aria-label={copy.workflowMarketplaceCompatibility}>
-          <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceCompatibility}</h3>
-          <ul className="mt-1 space-y-1 text-xs text-(--ui-text-secondary)">
-            {compatibility.map(item => (
-              <li key={`${item.workflowName}:${item.code}:${item.message}`}>
-                <span className="font-medium text-(--ui-text-primary)">{item.workflowName}:</span> {item.message}
-              </li>
-            ))}
-          </ul>
-        </section>
+        <ReviewDiagnostics diagnostics={compatibility} title={copy.workflowMarketplaceCompatibility} />
       ) : null}
 
       <section>

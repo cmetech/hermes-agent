@@ -1254,7 +1254,7 @@ describe('WorkflowMarketplaceView', () => {
     expect(within(candidate).getByText(NOW)).toBeTruthy()
     expect(within(candidate).getByRole('link', { name: /example\.test\/company\/workflows\.git/ })).toBeTruthy()
     expect(within(detail).getByText('Update available')).toBeTruthy()
-    expect(within(detail).getByText('Laptop diagnostic')).toBeTruthy()
+    expect(within(detail).getAllByText('Laptop diagnostic').length).toBeGreaterThan(0)
     expect(within(detail).getByText('workflows/laptop-diagnostic.companion.yml')).toBeTruthy()
     expect(within(detail).getByText('Python runtime must be available.')).toBeTruthy()
     expect(within(detail).getByText('commands/diagnose.md')).toBeTruthy()
@@ -1269,6 +1269,118 @@ describe('WorkflowMarketplaceView', () => {
       identity: lifecycleIdentity
     })
     expect(api.inspect).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [
+      'ar',
+      [
+        'يستخدم سير العمل قواعد لغة Hermes القديمة المتساهلة.',
+        'بيئة تشغيل مطلوبة غير متاحة.',
+        'سر مطلوب غير متاح.',
+        'أداة مطلوبة غير متاحة.'
+      ],
+      'التفاصيل الفنية'
+    ],
+    [
+      'en',
+      [
+        'The workflow uses permissive legacy Hermes language rules.',
+        'A required runtime is unavailable.',
+        'A required secret is unavailable.',
+        'A required tool is unavailable.'
+      ],
+      'Technical details'
+    ],
+    [
+      'ja',
+      [
+        'ワークフローは互換性のため従来の緩やかな Hermes 言語規則を使用します。',
+        '必要なランタイムを利用できません。',
+        '必要なシークレットを利用できません。',
+        '必要なツールを利用できません。'
+      ],
+      '技術的な詳細'
+    ],
+    [
+      'zh',
+      ['工作流使用宽松的旧版 Hermes 语言规则。', '所需运行时不可用。', '所需密钥不可用。', '所需工具不可用。'],
+      '技术详情'
+    ],
+    [
+      'zh-hant',
+      [
+        '工作流程使用寬鬆的舊版 Hermes 語言規則。',
+        '所需執行環境無法使用。',
+        '所需祕密無法使用。',
+        '所需工具無法使用。'
+      ],
+      '技術詳細資料'
+    ]
+  ])(
+    'localizes backend-generated package diagnostics in %s while preserving structured identifiers',
+    (locale, meanings, detailsLabel) => {
+      const operation = lifecycleFixture('service inspect')
+      if (operation.result?.type !== 'package_detail') {
+        throw new Error('Expected backend-generated package detail fixture')
+      }
+
+      renderWithProviders(<MarketplacePackageDetail detail={operation.result.value} />, undefined, locale)
+
+      const rawMessages = operation.result.value.advisories.map(diagnostic => diagnostic.message)
+      for (const meaning of meanings) {
+        const primary = screen.getAllByText(meaning)[0]
+        expect(primary.textContent).not.toMatch(
+          /legacy_language_profile|missing_provider|missing_runtime|missing_secret|missing_service|missing_tool/i
+        )
+        expect(rawMessages).not.toContain(primary.textContent)
+      }
+      for (const identifier of ['uv', 'SUPPORT_TOKEN', 'git', 'A', 'B']) {
+        expect(screen.getAllByText(identifier).length).toBeGreaterThan(0)
+      }
+
+      const disclosures = screen.getAllByText(detailsLabel).map(label => label.closest('details'))
+      expect(disclosures.length).toBeGreaterThan(0)
+      expect(disclosures.every(details => details?.open === false)).toBe(true)
+    }
+  )
+
+  it.each([
+    ['ar', 'أبلغ Hermes عن مشكلة توافق لا تحتوي هذه النسخة على وصف مترجم لها.', 'التفاصيل الفنية'],
+    [
+      'en',
+      'Hermes reported a compatibility issue that has no translated description in this version.',
+      'Technical details'
+    ],
+    ['ja', 'このバージョンには翻訳された説明がない互換性の問題が Hermes から報告されました。', '技術的な詳細'],
+    ['zh', 'Hermes 报告了此版本尚无翻译说明的兼容性问题。', '技术详情'],
+    ['zh-hant', 'Hermes 回報了此版本尚無翻譯說明的相容性問題。', '技術詳細資料']
+  ])('uses an honest localized fallback for a generated unknown diagnostic in %s', (locale, fallback, detailsLabel) => {
+    const inspection = lifecycleFixture('service inspect')
+    const boundary = lifecycleFixture('result UTF-8 budget boundary plus 0')
+    if (inspection.result?.type !== 'package_detail' || boundary.result?.type !== 'package_detail') {
+      throw new Error('Expected backend-generated package detail fixtures')
+    }
+    const unknown = boundary.result.value.advisories[0]
+    const detail = {
+      ...inspection.result.value,
+      advisories: [unknown],
+      blockers: [],
+      workflows: inspection.result.value.workflows.map(workflow => ({ ...workflow, compatibility: [] }))
+    }
+
+    renderWithProviders(<MarketplacePackageDetail detail={detail} />, undefined, locale)
+
+    const primary = screen.getByText(fallback)
+    expect(primary.textContent).not.toContain(unknown.code)
+    expect(primary.textContent).not.toContain(unknown.message)
+    const disclosure = screen.getByText(detailsLabel).closest('details')
+    expect(disclosure?.open).toBe(false)
+
+    fireEvent.click(screen.getByText(detailsLabel))
+    expect(disclosure?.open).toBe(true)
+    expect(within(disclosure!).getByText(unknown.code)).toBeTruthy()
+    expect(within(disclosure!).getByText(unknown.message)).toBeTruthy()
   })
 
   it('polls a bounded detail operation and never turns file, redacted, SSH, or SCP identities into links', async () => {

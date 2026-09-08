@@ -6,6 +6,7 @@ import { I18nProvider } from '@/i18n'
 import type { WorkflowMarketplaceInstallReview, WorkflowMarketplaceUpdateReview } from '@/types/hermes'
 
 import { InstallReviewDialog, type InstallReviewDialogView } from './install-review-dialog'
+import { lifecycleFixture } from './lifecycle-test-harness'
 
 const DIGEST = 'a'.repeat(64)
 const OLD_DIGEST = 'b'.repeat(64)
@@ -162,13 +163,33 @@ afterEach(cleanup)
 
 describe('InstallReviewDialog', () => {
   it.each([
-    ['ar', ['مضاف', 'معدّل', 'محذوف', 'أُعيدت تسميته'], ['مانع', 'تنبيه']],
-    ['ja', ['追加', '変更', '削除', '名前変更'], ['阻害要因', '注意事項']],
-    ['zh', ['已添加', '已修改', '已移除', '已重命名'], ['阻止项', '提示']],
-    ['zh-hant', ['已新增', '已修改', '已移除', '已重新命名'], ['阻擋項目', '提醒']]
+    [
+      'ar',
+      ['مضاف', 'معدّل', 'محذوف', 'أُعيدت تسميته'],
+      ['مانع', 'تنبيه'],
+      'أبلغ Hermes عن مشكلة توافق لا تحتوي هذه النسخة على وصف مترجم لها.'
+    ],
+    [
+      'ja',
+      ['追加', '変更', '削除', '名前変更'],
+      ['阻害要因', '注意事項'],
+      'このバージョンには翻訳された説明がない互換性の問題が Hermes から報告されました。'
+    ],
+    [
+      'zh',
+      ['已添加', '已修改', '已移除', '已重命名'],
+      ['阻止项', '提示'],
+      'Hermes 报告了此版本尚无翻译说明的兼容性问题。'
+    ],
+    [
+      'zh-hant',
+      ['已新增', '已修改', '已移除', '已重新命名'],
+      ['阻擋項目', '提醒'],
+      'Hermes 回報了此版本尚無翻譯說明的相容性問題。'
+    ]
   ])(
-    'localizes update change kinds and severities in %s without translating publisher facts or diagnostic codes',
-    (locale, kinds, severities) => {
+    'localizes update change kinds, severities, and unknown diagnostic meanings in %s',
+    (locale, kinds, severities, fallback) => {
       const review = updateReview()
       review.file_changes = (['added', 'modified', 'removed', 'renamed'] as const).map(kind => ({
         kind,
@@ -195,9 +216,12 @@ describe('InstallReviewDialog', () => {
         ...review.compatibility_changes.added,
         ...review.compatibility_changes.removed
       ].entries()) {
-        const row = screen.getByText(text => text.includes(identity.workflow_name) && text.includes(identity.code))
+        const row = screen.getByText(identity.workflow_name).closest('li')!
         expect(row.textContent).toContain(severities[index])
         expect(row.textContent).not.toMatch(/blocker|advisory/)
+        expect(row.querySelector('[data-marketplace-diagnostic-primary]')?.textContent).toBe(fallback)
+        const details = within(row).getByText(identity.code).closest('details')
+        expect(details?.open).toBe(false)
       }
 
       for (const value of ['SUPPORT_TOKEN', 'openrouter', '2.0.0', DIGEST]) {
@@ -205,6 +229,114 @@ describe('InstallReviewDialog', () => {
       }
     }
   )
+
+  it.each([
+    ['ar', 'يُفسَّر حد الخمول القديم بالثواني.', 'تغييرات التوافق'],
+    ['en', 'The legacy idle timeout is interpreted in seconds.', 'Compatibility changes'],
+    ['ja', '従来のアイドルタイムアウトは秒単位で解釈されます。', '互換性の変更'],
+    ['zh', '旧版空闲超时按秒解释。', '兼容性变更'],
+    ['zh-hant', '舊版閒置逾時會以秒為單位解讀。', '相容性變更']
+  ])('localizes a backend-generated update compatibility change in %s', (locale, localizedMeaning, title) => {
+    const operation = lifecycleFixture('service update prepare')
+    if (operation.result?.type !== 'update_review') {
+      throw new Error('Expected backend-generated update review fixture')
+    }
+
+    renderDialog({ kind: 'review', mode: 'update', review: operation.result.value }, {}, locale)
+
+    const section = screen.getByRole('heading', { name: title }).closest('section')
+    const meaning = within(section!).getByText(localizedMeaning)
+    const row = meaning.closest('li')
+    expect(row).toBeTruthy()
+    expect(row?.textContent).toContain('A')
+    expect(meaning.textContent).not.toContain('legacy_idle_timeout_seconds')
+    const details = row?.querySelector('details')
+    expect(details?.open).toBe(false)
+  })
+
+  it.each([
+    [
+      'ar',
+      [
+        'يستخدم سير العمل قواعد لغة Hermes القديمة المتساهلة.',
+        'مزوّد مطلوب غير متاح.',
+        'بيئة تشغيل مطلوبة غير متاحة.',
+        'سر مطلوب غير متاح.',
+        'خدمة مطلوبة غير متاحة.',
+        'أداة مطلوبة غير متاحة.'
+      ],
+      'التفاصيل الفنية'
+    ],
+    [
+      'en',
+      [
+        'The workflow uses permissive legacy Hermes language rules.',
+        'A required provider is unavailable.',
+        'A required runtime is unavailable.',
+        'A required secret is unavailable.',
+        'A required service is unavailable.',
+        'A required tool is unavailable.'
+      ],
+      'Technical details'
+    ],
+    [
+      'ja',
+      [
+        'ワークフローは互換性のため従来の緩やかな Hermes 言語規則を使用します。',
+        '必要なプロバイダーを利用できません。',
+        '必要なランタイムを利用できません。',
+        '必要なシークレットを利用できません。',
+        '必要なサービスを利用できません。',
+        '必要なツールを利用できません。'
+      ],
+      '技術的な詳細'
+    ],
+    [
+      'zh',
+      [
+        '工作流使用宽松的旧版 Hermes 语言规则。',
+        '所需提供商不可用。',
+        '所需运行时不可用。',
+        '所需密钥不可用。',
+        '所需服务不可用。',
+        '所需工具不可用。'
+      ],
+      '技术详情'
+    ],
+    [
+      'zh-hant',
+      [
+        '工作流程使用寬鬆的舊版 Hermes 語言規則。',
+        '所需提供者無法使用。',
+        '所需執行環境無法使用。',
+        '所需祕密無法使用。',
+        '所需服務無法使用。',
+        '所需工具無法使用。'
+      ],
+      '技術詳細資料'
+    ]
+  ])('localizes every backend-generated install diagnostic in %s', (locale, localizedMeanings, detailsLabel) => {
+    const operation = lifecycleFixture('service install prepare')
+    if (operation.result?.type !== 'install_review') {
+      throw new Error('Expected backend-generated install review fixture')
+    }
+
+    renderDialog({ kind: 'review', mode: 'install', review: operation.result.value }, {}, locale)
+
+    for (const meaning of localizedMeanings) {
+      const primary = screen.getAllByText(meaning)[0]
+      expect(primary.getAttribute('data-marketplace-diagnostic-primary')).toBe('true')
+      expect(primary.textContent).not.toMatch(
+        /legacy_language_profile|missing_provider|missing_runtime|missing_secret|missing_service|missing_tool/i
+      )
+    }
+    for (const identifier of ['openrouter', 'uv', 'SUPPORT_TOKEN', 'ticketing', 'git', 'A', 'B']) {
+      expect(screen.getAllByText(identifier).length).toBeGreaterThan(0)
+    }
+    const disclosures = screen.getAllByText(detailsLabel).map(label => label.closest('details'))
+    expect(disclosures.length).toBeGreaterThan(0)
+    expect(disclosures.every(details => details?.open === false)).toBe(true)
+  })
 
   it('localizes the retry-check action without confusing it with preparation', () => {
     renderDialog(

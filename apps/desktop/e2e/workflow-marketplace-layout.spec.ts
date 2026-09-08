@@ -13,6 +13,7 @@ const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const LONG_PACKAGE_DISPLAY_NAME = 'OperationalAutomationPackageIdentifier'.repeat(3)
 const LONG_PACKAGE_PUBLISHER = 'CorporateAutomationEngineeringDivision'.repeat(3)
+const EXPECTED_DIAGNOSTIC_DISCLOSURES = 6
 
 function prepareSource(hermesHome: string): void {
   const repository = path.join(path.dirname(hermesHome), 'marketplace-source')
@@ -229,7 +230,16 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     const repository = detail.getByRole('link').first()
     const refreshState = page.getByRole('button', { name: 'Refresh state', exact: true })
     const retry = page.getByRole('button', { name: 'Retry', exact: true })
-    const detailFocusOrder = [back, repository, install, refreshState, retry]
+    const technicalDetails = detail.getByText('Technical details', { exact: true })
+    await expect(technicalDetails).toHaveCount(EXPECTED_DIAGNOSTIC_DISCLOSURES)
+    const detailFocusOrder = [
+      back,
+      repository,
+      ...Array.from({ length: EXPECTED_DIAGNOSTIC_DISCLOSURES }, (_, index) => technicalDetails.nth(index)),
+      install,
+      refreshState,
+      retry
+    ]
 
     for (
       let attempt = 0;
@@ -251,6 +261,18 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     await page.keyboard.press('Shift+Tab')
     await expect(refreshState).toBeFocused()
     await page.keyboard.press('Shift+Tab')
+    await expect(install).toBeFocused()
+    for (let index = EXPECTED_DIAGNOSTIC_DISCLOSURES - 1; index >= 0; index--) {
+      await page.keyboard.press('Shift+Tab')
+      await expect(technicalDetails.nth(index)).toBeFocused()
+    }
+    await page.keyboard.press('Shift+Tab')
+    await expect(repository).toBeFocused()
+    for (let index = 0; index < EXPECTED_DIAGNOSTIC_DISCLOSURES; index++) {
+      await page.keyboard.press('Tab')
+      await expect(technicalDetails.nth(index)).toBeFocused()
+    }
+    await page.keyboard.press('Tab')
     await expect(install).toBeFocused()
     await page.keyboard.press('Enter')
 
@@ -282,15 +304,27 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     const confirm = review.getByRole('button', { name: 'Confirm install', exact: true })
     const reviewRepository = review.getByRole('link').first()
     const iconClose = review.locator('button[data-slot="dialog-close-button"]')
+    const reviewTechnicalDetails = review.getByText('Technical details', { exact: true })
+    await expect(reviewTechnicalDetails).toHaveCount(EXPECTED_DIAGNOSTIC_DISCLOSURES)
     await expect(confirm).toBeEnabled({ timeout: 60_000 })
     await expect(close).toBeFocused()
 
-    for (const action of [confirm, iconClose, reviewRepository, close]) {
+    for (const action of [
+      confirm,
+      iconClose,
+      reviewRepository,
+      ...Array.from({ length: EXPECTED_DIAGNOSTIC_DISCLOSURES }, (_, index) => reviewTechnicalDetails.nth(index)),
+      close
+    ]) {
       await page.keyboard.press('Tab')
       await expect(action).toBeFocused()
       await expect(action).toBeInViewport()
     }
 
+    for (let index = EXPECTED_DIAGNOSTIC_DISCLOSURES - 1; index >= 0; index--) {
+      await page.keyboard.press('Shift+Tab')
+      await expect(reviewTechnicalDetails.nth(index)).toBeFocused()
+    }
     await page.keyboard.press('Shift+Tab')
     await expect(reviewRepository).toBeFocused()
     await page.keyboard.press('Shift+Tab')
@@ -361,6 +395,9 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
               await expect(detail).toBeVisible({ timeout: 60_000 })
               await assertContainedReadableText(detail.getByRole('heading', { name: LONG_PACKAGE_DISPLAY_NAME }))
               await assertContainedReadableText(detail.getByText(LONG_PACKAGE_PUBLISHER, { exact: true }))
+              await expect(
+                detail.getByText(locale === 'ar' ? 'التفاصيل الفنية' : 'Technical details', { exact: true })
+              ).toHaveCount(EXPECTED_DIAGNOSTIC_DISCLOSURES)
 
               const install = page.getByRole('button', {
                 name: locale === 'ar' ? 'تثبيت الحزمة' : 'Install package',

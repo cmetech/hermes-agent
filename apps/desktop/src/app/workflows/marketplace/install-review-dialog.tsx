@@ -13,11 +13,12 @@ import { useI18n } from '@/i18n'
 import { ExternalLink } from '@/lib/external-link'
 import type { WorkflowMarketplaceInstallReview, WorkflowMarketplaceUpdateReview } from '@/types/hermes'
 
-import { marketplaceFileChangeLabel, marketplacePhaseLabel, marketplaceSeverityLabel } from './controlled-copy'
+import { marketplaceFileChangeLabel, marketplacePhaseLabel } from './controlled-copy'
 import { claimLifecycleEscape, useLifecycleDialogFocus } from './lifecycle-dialog-behavior'
 import { marketplaceWebRepositoryHref } from './package-detail'
 import type { PackageLifecyclePresentation } from './package-lifecycle-presentation'
 import {
+  MarketplaceDiagnosticPresentation,
   ReviewDiagnostics,
   ReviewFacts,
   ReviewRequirements,
@@ -117,19 +118,23 @@ function ChangeSets({ review }: { review: UpdateReviewPresentation }) {
       </section>
       <section>
         <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceCompatibilityChanges}</h3>
-        <ReviewValueList
-          empty
-          values={[
-            ...review.compatibility_changes.added.map(
-              value =>
-                `${copy.workflowMarketplaceAdded}: ${value.workflow_name} ${value.code} ${marketplaceSeverityLabel(copy, value.severity)}`
-            ),
-            ...review.compatibility_changes.removed.map(
-              value =>
-                `${copy.workflowMarketplaceRemoved}: ${value.workflow_name} ${value.code} ${marketplaceSeverityLabel(copy, value.severity)}`
-            )
-          ]}
-        />
+        {review.compatibility_changes.added.length || review.compatibility_changes.removed.length ? (
+          <ul className="mt-1 space-y-1 text-xs text-(--ui-text-secondary)">
+            {[
+              ...review.compatibility_changes.added.map(value => [copy.workflowMarketplaceAdded, value] as const),
+              ...review.compatibility_changes.removed.map(value => [copy.workflowMarketplaceRemoved, value] as const)
+            ].map(([kind, value]) => (
+              <li className="min-w-0" key={`${kind}:${value.workflow_name}:${value.code}:${value.severity}`}>
+                <span>
+                  {kind}: <code>{value.workflow_name}</code>
+                </span>
+                <MarketplaceDiagnosticPresentation diagnostic={value} />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <ReviewValueList empty values={[]} />
+        )}
       </section>
       <section>
         <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceRequirementChanges}</h3>

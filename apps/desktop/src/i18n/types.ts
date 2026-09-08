@@ -2264,6 +2264,17 @@ export interface Translations {
     workflowMarketplaceChangeRenamed: string
     workflowMarketplaceSeverityBlocker: string
     workflowMarketplaceSeverityAdvisory: string
+    workflowMarketplaceDiagnosticLegacyLanguage: string
+    workflowMarketplaceDiagnosticLegacyIdleTimeout: string
+    workflowMarketplaceDiagnosticMissingProvider: string
+    workflowMarketplaceDiagnosticMissingRuntime: string
+    workflowMarketplaceDiagnosticMissingSecret: string
+    workflowMarketplaceDiagnosticMissingService: string
+    workflowMarketplaceDiagnosticMissingTool: string
+    workflowMarketplaceDiagnosticUnknown: string
+    workflowMarketplaceDiagnosticTechnicalDetails: string
+    workflowMarketplaceDiagnosticCode: string
+    workflowMarketplaceDiagnosticMessage: string
     workflowMarketplaceRenamedFrom: (path: string) => string
     workflowMarketplacePackageResources: string
     workflowMarketplaceWorkflowRisks: string

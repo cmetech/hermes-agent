@@ -7,6 +7,44 @@ import type {
 } from '@/types/hermes'
 import type { WorkflowTrustReviewItem } from '@/types/workflow-marketplace-lifecycle'
 
+import { marketplaceSeverityLabel } from './controlled-copy'
+import { marketplaceDiagnosticMeaning } from './diagnostic-presentation'
+
+type DiagnosticPresentationValue = Pick<WorkflowMarketplaceDiagnostic, 'code' | 'severity'> & {
+  message?: string
+}
+
+export function MarketplaceDiagnosticPresentation({ diagnostic }: { diagnostic: DiagnosticPresentationValue }) {
+  const { t } = useI18n()
+  const copy = t.operations
+
+  return (
+    <div className="min-w-0">
+      <div className="flex min-w-0 items-start gap-1">
+        <Badge size="xs" variant={diagnostic.severity === 'blocker' ? 'destructive' : 'warn'}>
+          {marketplaceSeverityLabel(copy, diagnostic.severity)}
+        </Badge>
+        <span data-marketplace-diagnostic-primary="true">{marketplaceDiagnosticMeaning(copy, diagnostic.code)}</span>
+      </div>
+      <details className="mt-1 text-(--ui-text-tertiary)">
+        <summary className="w-fit cursor-pointer">{copy.workflowMarketplaceDiagnosticTechnicalDetails}</summary>
+        <dl className="mt-1 grid grid-cols-[minmax(6rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1">
+          <div className="contents">
+            <dt>{copy.workflowMarketplaceDiagnosticCode}</dt>
+            <dd className="min-w-0 break-all font-mono">{diagnostic.code}</dd>
+          </div>
+          {diagnostic.message ? (
+            <div className="contents">
+              <dt>{copy.workflowMarketplaceDiagnosticMessage}</dt>
+              <dd className="min-w-0 break-all">{diagnostic.message}</dd>
+            </div>
+          ) : null}
+        </dl>
+      </details>
+    </div>
+  )
+}
+
 export function ReviewFacts({ items }: { items: ReadonlyArray<readonly [string, null | string]> }) {
   return (
     <dl className="grid grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
@@ -44,7 +82,7 @@ export function ReviewDiagnostics({
   diagnostics,
   title
 }: {
-  diagnostics: readonly WorkflowMarketplaceDiagnostic[]
+  diagnostics: ReadonlyArray<WorkflowMarketplaceDiagnostic & { workflowName?: string }>
   title: string
 }) {
   if (!diagnostics.length) {
@@ -56,11 +94,11 @@ export function ReviewDiagnostics({
       <h3 className="text-xs font-medium text-(--ui-text-primary)">{title}</h3>
       <ul className="mt-1 space-y-1 text-xs text-(--ui-text-secondary)">
         {diagnostics.map(item => (
-          <li key={`${item.code}:${item.message}`}>
-            <Badge className="me-1" size="xs" variant={item.severity === 'blocker' ? 'destructive' : 'warn'}>
-              {item.code}
-            </Badge>
-            {item.message}
+          <li className="min-w-0" key={`${item.workflowName ?? ''}:${item.code}:${item.message}`}>
+            {item.workflowName ? (
+              <span className="mb-1 block font-medium text-(--ui-text-primary)">{item.workflowName}</span>
+            ) : null}
+            <MarketplaceDiagnosticPresentation diagnostic={item} />
           </li>
         ))}
       </ul>

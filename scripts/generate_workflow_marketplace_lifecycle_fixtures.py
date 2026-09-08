@@ -64,7 +64,7 @@ from plugins.workflow.marketplace.service import (
 )  # noqa: E402
 from plugins.workflow.marketplace.admissions import LifecycleAdmissionStore  # noqa: E402
 from plugins.workflow.marketplace.package import WorkflowMarketplaceError  # noqa: E402
-from test_marketplace_service import published_repo, _write_package  # noqa: E402
+from test_marketplace_service import published_repo, _publish, _write_package  # noqa: E402
 
 NOW = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
 UTC = "2026-09-05T12:00:00Z"
@@ -284,6 +284,21 @@ def generate_corpora():
                     )
                 ]
             }
+            _write_package(
+                repo.work,
+                "laptop-support",
+                version="1.0.0",
+                workflow_names=("A", "B"),
+                requirements={
+                    "runtimes": ["uv"],
+                    "tools": ["git"],
+                    "providers": ["openrouter"],
+                    "services": ["ticketing"],
+                    "secrets": ["SUPPORT_TOKEN"],
+                },
+            )
+            repo.publish("add provider and service requirements")
+            service.refresh_source("company")
             repository_url = "https://fixtures.example/workflows.git"
             admissions = LifecycleAdmissionStore(
                 profile_key=str(service.home), epoch=EPOCH, clock=lambda: NOW
@@ -436,6 +451,17 @@ def generate_corpora():
                 workflow_names=("A", "B"),
                 marker="v2",
             )
+            candidate_definition = (
+                repo.work / "packages" / "laptop-support" / "workflows" / "A.yaml"
+            )
+            candidate_definition.write_text(
+                candidate_definition.read_text(encoding="utf-8").replace(
+                    "  bash: printf 'v2'\n",
+                    "  bash: printf 'v2'\n  idle_timeout: 5\n",
+                ),
+                encoding="utf-8",
+            )
+            _publish(repo.work / "packages" / "laptop-support")
             repo.publish("publish v2")
             service.refresh_source("company")
             available_check = complete_read(
