@@ -102,6 +102,28 @@ def _router():
     return _module().router
 
 
+def test_workflow_dashboard_mounts_profile_scoped_marketplace_capability_route(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    response = TestClient(_app(_router())).get(
+        "/api/plugins/workflow/marketplace/capabilities"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == 1
+    assert response.json()["capabilities"] == [
+        "sources",
+        "search",
+        "installed",
+        "updates",
+        "transactions",
+        "trust",
+        "operations",
+    ]
+
+
 def _app(router, *, session=None, token=None, local_admin=None):
     app = FastAPI()
 

@@ -183,6 +183,11 @@ ${modelContextLength ? `  context_length: ${modelContextLength}\n` : ''}provider
     models:
       mock-model: {}
     context_length: 4096
+gateway:
+  # E2E owns the desktop backend process tree. Do not also launch the
+  # long-lived ambient gateway, which is unrelated to these scenarios and
+  # deliberately survives the desktop backend's process group.
+  autostart_with_desktop: false
 ${displaySection}${extraConfig ? `\n${extraConfig.trim()}\n` : ''}`
 
   fs.writeFileSync(configPath, config, 'utf8')

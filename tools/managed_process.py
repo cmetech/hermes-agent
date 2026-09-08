@@ -1013,6 +1013,19 @@ class ManagedProcessTree:
                 windows_job.assign(int(process._handle))
                 windows_job.resume_process(process.pid)
             identity = ProcessIdentity.capture(process.pid)
+            if (
+                not _IS_WINDOWS
+                and kwargs.get("start_new_session") is True
+                and identity.group_id is None
+            ):
+                # Successful setsid makes this child's PID its group ID even
+                # when the leader exits before live capture. Descendants keep
+                # that group alive; never lose the launch's cleanup authority.
+                identity = ProcessIdentity(
+                    pid=identity.pid,
+                    start_time=identity.start_time,
+                    group_id=process.pid,
+                )
             if windows_job is not None:
                 identity = ProcessIdentity(
                     pid=identity.pid,

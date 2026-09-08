@@ -1,6 +1,8 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
+import type { ConnectionGenerationEvent } from '../electron/connection-generation-event'
+
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
@@ -483,6 +485,7 @@ declare global {
       // Soft gateway-mode apply: primary backend was torn down without a window
       // reload. Wipe session lists (skeletons) and re-dial.
       onConnectionApplied?: (callback: () => void) => () => void
+      onConnectionGenerationChanged?: (callback: (event: ConnectionGenerationEvent) => void) => () => void
       onPowerResume?: (callback: () => void) => () => void
       getOnBattery?: () => Promise<boolean>
       onBatteryChanged?: (callback: (onBattery: boolean) => void) => () => void
@@ -726,6 +729,7 @@ export interface DesktopPluginProfileRoute {
 }
 
 export interface HermesConnection {
+  connectionGeneration: number
   baseUrl: string
   darwinMajor?: number
   isFullscreen: boolean
@@ -749,7 +753,7 @@ export interface HermesConnection {
   // The registry connection this descriptor resolves to. Registry-scoped
   // secondaries carry it directly; legacy primary remotes preserve it from
   // their selected stored route before dialing.
-  connectionId?: string
+  connectionId?: string | null
   // True only when getConnectionFor explicitly resolved a v2 registry route.
   // An inferred connectionId identifies the visible source but its v1 profile
   // name may still be a client-side routing alias rather than a backend profile.
@@ -1196,6 +1200,8 @@ export type DesktopBootstrapEvent =
     }
 
 export interface HermesApiRequest {
+  expectedConnectionGeneration?: number
+  expectedMarketplacePrincipalBinding?: string
   path: string
   method?: string
   body?: unknown

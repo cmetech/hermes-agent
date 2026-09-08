@@ -10,8 +10,16 @@ from plugins.workflow.compilation import (
     clear_compilation_cache,
     compile_workflow,
 )
+from plugins.workflow.marketplace.discovery import (
+    WorkflowBindingResolver,
+    WorkflowCandidate,
+    _contains_workflow_package_marker,
+    enumerate_workflow_candidates,
+    installed_binding_resolver,
+)
 from plugins.workflow.models import (
     ValidationIssue,
+    WorkflowMarketplaceBinding,
     WorkflowPackage,
     WorkflowSourceDocument,
     WorkflowValidationError,
@@ -20,7 +28,16 @@ from plugins.workflow.schema import parse_workflow_source_bytes
 
 _PARSE_CACHE: dict[
     tuple[str, str, int],
-    tuple[tuple[str, str | None], WorkflowSourceDocument],
+    tuple[
+        tuple[
+            str,
+            str | None,
+            str | None,
+            str | None,
+            WorkflowMarketplaceBinding | None,
+        ],
+        WorkflowSourceDocument,
+    ],
 ] = {}
 _PROFILE_STATE_DIRECTORIES = frozenset({"runs", ".staging", ".quarantine", ".locks"})
 
@@ -30,43 +47,45 @@ def clear_discovery_cache() -> None:
     clear_compilation_cache()
 
 
-def _yaml_paths(
-    location: Path,
-    *,
-    excluded_top_level: frozenset[str] = frozenset(),
-) -> tuple[Path, ...]:
-    if location.is_file():
-        return (location,) if location.suffix.lower() in {".yaml", ".yml"} else ()
-    if not location.is_dir():
-        return ()
-    paths = (
-        path
-        for path in location.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in {".yaml", ".yml"}
-        and not path.name.endswith(".hermes.yaml")
-        and (
-            not excluded_top_level
-            or path.relative_to(location).parts[0] not in excluded_top_level
-        )
-    )
-    return tuple(sorted(paths, key=lambda item: item.resolve().as_posix()))
-
-
 def _load_cached(
-    path: Path, *, source: str, precedence: int
+    candidate: WorkflowCandidate, *, source: str, precedence: int
 ) -> WorkflowSourceDocument:
-    resolved = path.resolve(strict=True)
-    workflow_bytes = resolved.read_bytes()
+    resolved = (
+        candidate.workflow_path.resolve(strict=True)
+        if candidate.package_root is None
+        else candidate.workflow_path
+    )
+    workflow_bytes = (
+        resolved.read_bytes()
+        if candidate.definition_bytes is None
+        else candidate.definition_bytes
+    )
     workflow_digest = hashlib.sha256(workflow_bytes).hexdigest()
-    companion = resolved.with_name(f"{resolved.stem}.hermes.yaml")
-    if companion.is_file():
+    companion = (
+        resolved.with_name(f"{resolved.stem}.hermes.yaml")
+        if candidate.package_root is None
+        else candidate.sidecar_path
+    )
+    if candidate.package_root is not None:
+        sidecar_bytes = candidate.sidecar_bytes
+        sidecar_digest = (
+            hashlib.sha256(sidecar_bytes).hexdigest()
+            if sidecar_bytes is not None
+            else None
+        )
+    elif companion is not None and companion.is_file():
         sidecar_bytes = companion.read_bytes()
         sidecar_digest = hashlib.sha256(sidecar_bytes).hexdigest()
     else:
         sidecar_bytes = None
         sidecar_digest = None
-    signature = (workflow_digest, sidecar_digest)
+    signature = (
+        workflow_digest,
+        sidecar_digest,
+        str(candidate.package_root) if candidate.package_root is not None else None,
+        str(companion) if companion is not None else None,
+        candidate.marketplace_binding,
+    )
     key = (str(resolved), source, precedence)
     cached = _PARSE_CACHE.get(key)
     if cached is not None and cached[0] == signature:
@@ -77,6 +96,9 @@ def _load_cached(
         sidecar_bytes=sidecar_bytes,
         source=source,
         precedence=precedence,
+        package_root=candidate.package_root,
+        sidecar_path=companion if sidecar_bytes is not None else None,
+        marketplace_binding=candidate.marketplace_binding,
     )
     _PARSE_CACHE[key] = (signature, source_document)
     return source_document
@@ -88,6 +110,7 @@ def discover_workflows(
     user_home: str | Path,
     *,
     explicit_path: str | Path | None = None,
+    binding_resolver: WorkflowBindingResolver | None = None,
 ) -> tuple[WorkflowPackage, ...]:
     """Discover workflows without creating directories or mutating profile state."""
     del (
@@ -100,23 +123,34 @@ def discover_workflows(
         ("project", 1, Path(workdir).expanduser() / ".hermes" / "workflows"),
         ("profile", 2, Path(hermes_home).expanduser() / "workflows"),
     ])
+    profile_binding_resolver = (
+        binding_resolver
+        if binding_resolver is not None
+        else installed_binding_resolver(Path(hermes_home).expanduser())
+    )
     source_documents: list[WorkflowSourceDocument] = []
     for source, precedence, location in locations:
         scan_location = location
         if (
             source == "explicit"
             and location.is_dir()
+            and not _contains_workflow_package_marker(location)
             and (location / "workflows").is_dir()
         ):
             scan_location = location / "workflows"
-        for path in _yaml_paths(
+        for candidate in enumerate_workflow_candidates(
             scan_location,
             excluded_top_level=(
                 _PROFILE_STATE_DIRECTORIES if source == "profile" else frozenset()
             ),
+            binding_resolver=(
+                binding_resolver
+                if binding_resolver is not None or source != "profile"
+                else profile_binding_resolver
+            ),
         ):
             source_documents.append(
-                _load_cached(path, source=source, precedence=precedence)
+                _load_cached(candidate, source=source, precedence=precedence)
             )
     snapshot = WorkflowCatalogSnapshot.capture(source_documents)
     if snapshot.ambiguous_names:

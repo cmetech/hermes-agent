@@ -13,6 +13,7 @@ export type PrimaryBackendStartupResult<RuntimeBackend, Connection> =
   { kind: 'local'; backend: RuntimeBackend } | { kind: 'remote'; connection: Connection }
 
 interface ResolvedPrimaryRemote {
+  headers?: Record<string, string>
   authMode?: 'oauth' | 'token'
   baseUrl: string
   connectionId?: string
@@ -34,9 +35,9 @@ interface ResolvedPrimaryRemote {
 }
 
 /**
- * Build the renderer-facing primary remote descriptor without dropping route
- * identity. Tests cross this same seam, so adding a field to the resolved
- * remote cannot silently disappear during primary startup.
+ * Build the native primary remote descriptor without dropping route identity
+ * or proxy headers (which main strips at renderer IPC return). Tests cross this
+ * same seam, so fields cannot silently disappear during primary startup.
  */
 export function createPrimaryRemoteConnection<State extends object>(
   remote: ResolvedPrimaryRemote,
@@ -54,6 +55,7 @@ export function createPrimaryRemoteConnection<State extends object>(
     ...(remote.connectionId ? { connectionId: remote.connectionId } : {}),
     ...(remote.ssh ? { ssh: remote.ssh } : {}),
     token: remote.token,
+    ...(remote.headers ? { headers: remote.headers } : {}),
     wsUrl: remote.wsUrl,
     logs,
     ...windowState

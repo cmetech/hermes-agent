@@ -75,6 +75,10 @@ export function createBackendConnectionState<TProcess, TConnection>() {
       return promise
     },
 
+    clearConnectionPromise(): void {
+      promise = null
+    },
+
     invalidate(): TProcess | null {
       const currentProcess = process
 

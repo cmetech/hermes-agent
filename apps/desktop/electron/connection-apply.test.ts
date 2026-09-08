@@ -18,6 +18,29 @@ function deferred() {
 }
 
 describe('applyConnectionChange', () => {
+  // Break caught: a config Apply publishes an obsolete descriptor while bootstrap cancellation is pending.
+  it('invalidates native authority synchronously before awaiting bootstrap cancellation', async () => {
+    const gate = deferred()
+    const events: string[] = []
+
+    const run = applyConnectionChange({
+      invalidate: () => events.push('invalidated'),
+      cancelAndWait: async () => {
+        events.push('cancel')
+        await gate.promise
+      },
+      isPrimary: false,
+      scope: 'support',
+      sendApplied: () => {},
+      stopPool: () => {},
+      teardownPrimary: async () => {},
+      teardownSsh: async () => {}
+    })
+
+    expect(events).toEqual(['invalidated', 'cancel'])
+    gate.resolve()
+    await run
+  })
   it.each([['SSH A to SSH B'], ['SSH to Cloud'], ['Cloud to SSH']])(
     'serializes %s behind bootstrap rollback before teardown and apply',
     async () => {

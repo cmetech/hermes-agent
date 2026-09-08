@@ -4,6 +4,35 @@ import { TRANSLATIONS } from './catalog'
 import { DEFAULT_LOCALE, isLocale, isSupportedLocaleValue, localeConfigValue, normalizeLocale } from './languages'
 
 describe('desktop i18n languages', () => {
+  for (const [locale, translation] of Object.entries(TRANSLATIONS)) {
+    it(`renders marketplace copy and preserves interpolation in ${locale}`, () => {
+      const nativeScript = {
+        ar: /[\u0600-\u06ff]/,
+        ja: /[\u3040-\u30ff\u3400-\u9fff]/,
+        zh: /[\u3400-\u9fff]/,
+        'zh-hant': /[\u3400-\u9fff]/
+      }[locale]
+
+      for (const [key, value] of Object.entries(translation.operations)) {
+        if (!key.startsWith('workflowMarketplace')) {
+          continue
+        }
+        const args = typeof value === 'function' ? Array.from({ length: value.length }, (_, i) => `sample-${i}`) : []
+        const rendered = typeof value === 'function' ? Reflect.apply(value, undefined, args) : value
+        expect(rendered, key).toBeTypeOf('string')
+        expect(rendered.trim(), key).not.toBe('')
+
+        for (const arg of args) {
+          expect(rendered, key).toContain(arg)
+        }
+
+        if (nativeScript) {
+          expect(rendered, key).toMatch(nativeScript)
+        }
+      }
+    })
+  }
+
   it('normalizes supported locale aliases', () => {
     expect(normalizeLocale('en')).toBe('en')
     expect(normalizeLocale('EN-US')).toBe('en')

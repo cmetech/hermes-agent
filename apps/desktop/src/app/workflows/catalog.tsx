@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { useId, useMemo, useState } from 'react'
 
+import { profileScopeKey } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -25,6 +26,7 @@ import { ExternalLink } from '@/lib/external-link'
 import { listWorkflowDefinitions } from '@/lib/hermes-api'
 import { Eye, Play } from '@/lib/icons'
 import { normalize } from '@/lib/text'
+import type { MarketplaceScope } from '@/store/workflow-marketplace-supervisor'
 import type { WorkflowDefinition, WorkflowDefinitionError } from '@/types/hermes'
 
 import {
@@ -33,6 +35,8 @@ import {
   isDesktopProviderCapabilityProjection,
   workflowTrustAllowsRun
 } from './catalog-run-policy'
+import { marketplaceKeys } from './marketplace/query-keys'
+import { useMarketplaceReadOnlyScope } from './marketplace/supervisor-provider'
 
 const WORKFLOW_DOCS_URL =
   'https://github.com/cmetech/hermes-agent/blob/base/website/docs/user-guide/features/workflows.md'
@@ -42,6 +46,8 @@ const PAGE_SIZE_OPTIONS = [10, 25, 50] as const
 const EMPTY_CATALOG_ITEMS: Array<WorkflowDefinition | WorkflowDefinitionError> = []
 
 export interface WorkflowCatalogProps {
+  scope?: MarketplaceScope
+  cacheScopeKey?: string
   onRunWorkflow?: (workflow: WorkflowDefinition) => void
   onViewWorkflow?: (workflow: WorkflowDefinition) => void
   requestProfile: string | null
@@ -90,17 +96,21 @@ function CatalogErrorRow({ item }: { item: WorkflowDefinitionError }) {
 
 function CatalogRow({
   item,
+  stale,
   onRunWorkflow,
   onViewWorkflow
 }: {
   item: WorkflowDefinition
+  stale: boolean
   onRunWorkflow?: (workflow: WorkflowDefinition) => void
   onViewWorkflow?: (workflow: WorkflowDefinition) => void
 }) {
   const { t } = useI18n()
   const runReasonId = useId()
 
-  const runDisabledReason = desktopWorkflowRunDisabledReason(item, t.operations, 'catalog')
+  const runDisabledReason = stale
+    ? t.operations.workflowMarketplaceRefreshingState
+    : desktopWorkflowRunDisabledReason(item, t.operations, 'catalog')
 
   const inputCount = item.inputs.length
 
@@ -161,6 +171,7 @@ function CatalogRow({
           <Tip label={t.operations.workflowView}>
             <Button
               aria-label={t.operations.workflowView}
+              disabled={stale}
               onClick={() => onViewWorkflow?.(item)}
               size="icon-xs"
               type="button"
@@ -212,18 +223,33 @@ function CatalogRow({
   )
 }
 
-export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile }: WorkflowCatalogProps) {
+export function WorkflowCatalog({
+  scope,
+  cacheScopeKey,
+  onRunWorkflow,
+  onViewWorkflow,
+  requestProfile
+}: WorkflowCatalogProps) {
   const { t } = useI18n()
   const pageSizeLabelId = useId()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
   const [query, setQuery] = useState('')
   const profile = requestProfile ?? 'default'
+  const truth = useMarketplaceReadOnlyScope(scope ?? requestProfile)
+
+  const queryKey = scope
+    ? marketplaceKeys.catalog(profileScopeKey(scope))
+    : ['workflow-catalog', cacheScopeKey ?? profile]
 
   const catalog = useQuery({
-    queryFn: () => listWorkflowDefinitions(requestProfile),
-    queryKey: ['workflow-catalog', profile]
+    enabled: !truth.quarantined,
+    queryFn: () =>
+      scope ? listWorkflowDefinitions(scope.profile, scope.connectionId) : listWorkflowDefinitions(requestProfile),
+    queryKey
   })
+
+  const stale = !truth.canUseCatalog(queryKey)
 
   const items = catalog.data?.items ?? EMPTY_CATALOG_ITEMS
   const normalizedQuery = normalize(query)
@@ -239,6 +265,10 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile 
   const rangeStart = (currentPage - 1) * pageSize + 1
   const rangeEnd = Math.min(filteredItems.length, currentPage * pageSize)
 
+  if (truth.quarantined) {
+    return <p role="status">{t.operations.workflowMarketplaceRefreshingState}</p>
+  }
+
   if (catalog.isLoading) {
     return (
       <div aria-label={t.operations.workflowCatalogLoading} className="grid min-h-48 place-items-center" role="status">
@@ -247,7 +277,7 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile 
     )
   }
 
-  if (catalog.isError) {
+  if (catalog.isError && !catalog.data) {
     return (
       <div className="grid min-h-48 place-items-center" role="alert">
         <ErrorState
@@ -279,6 +309,22 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile 
 
   return (
     <div>
+      {stale ? (
+        <div>
+          <p role="status">
+            {truth.catalogState === 'recovery_required'
+              ? t.operations.workflowMarketplaceRecoveryCatalog
+              : truth.catalogState === 'busy'
+                ? t.operations.workflowMarketplaceBusyCatalog
+                : truth.catalogState === 'unknown'
+                  ? t.operations.workflowMarketplaceUnconfirmedCatalog
+                  : t.operations.workflowMarketplaceLastObservedRefreshing}
+          </p>
+          <Button onClick={() => void catalog.refetch()} size="sm" type="button" variant="secondary">
+            {t.operations.workflowCatalogRetry}
+          </Button>
+        </div>
+      ) : null}
       {catalog.data?.truncated ? (
         <div className="mb-2">
           <Alert aria-label={t.operations.workflowCatalogPartialLabel} role="status" variant="warning">
@@ -364,6 +410,7 @@ export function WorkflowCatalog({ onRunWorkflow, onViewWorkflow, requestProfile 
                       key={`${item.name}-${item.source}-${item.version}`}
                       onRunWorkflow={onRunWorkflow}
                       onViewWorkflow={onViewWorkflow}
+                      stale={stale}
                     />
                   )
                 )}

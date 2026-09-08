@@ -12,6 +12,7 @@ import yaml
 
 from plugins.workflow.compilation import WorkflowCompilation
 from plugins.workflow.language import supports_phase4_semantics, supports_phase5_semantics
+from plugins.workflow.marketplace.trust_binding import bind_marketplace_package_digest
 from plugins.workflow.models import WorkflowPackage
 from plugins.workflow.provider_authority import (
     WorkflowProviderAuthority,
@@ -30,6 +31,7 @@ from plugins.workflow.trust import (
     WorkflowPackageDigest,
     WorkflowResourceReadBudget,
     WorkflowRiskSummary,
+    build_risk_summary,
     compute_package_digest,
 )
 from plugins.workflow.compat import CompatibilityReport
@@ -242,13 +244,18 @@ def assess_workflow_admission(
         package.language.effective_profile,
         package.language.normalizer_version,
     )
-    package_digest = (
+    base_package_digest = (
         WorkflowPackageDigest(
             compilation.composite_digest,
             compilation.covered_relative_paths,
         )
         if phase4
         else compute_package_digest(package, read_budget=read_budget)
+    )
+    package_digest = bind_marketplace_package_digest(
+        package,
+        base_package_digest,
+        read_budget=read_budget,
     )
     authority_error = None
     try:
@@ -272,6 +279,17 @@ def assess_workflow_admission(
         available_services=available_services,
         isolated_workdir=isolated_workdir,
     )
+    if package.marketplace_binding is not None:
+        risk = build_risk_summary(
+            package,
+            compatibility,
+            read_budget=read_budget,
+            compilation=compilation if phase4 else None,
+            provider_authority_digest=(
+                authority.authority_digest if authority is not None else None
+            ),
+            package_digest=package_digest,
+        )
     if risk.package_digest != package_digest.sha256:
         raise WorkflowAdmissionAssessmentError(
             "admission risk differs from compiled package identity"

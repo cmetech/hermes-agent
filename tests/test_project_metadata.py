@@ -3,6 +3,7 @@
 from pathlib import Path
 import tomllib
 
+
 def _load_optional_dependencies():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as handle:
@@ -15,6 +16,16 @@ def _load_package_data():
     with pyproject_path.open("rb") as handle:
         tool = tomllib.load(handle)["tool"]
     return tool["setuptools"]["package-data"]
+
+
+def test_workflow_contracts_ship_in_wheel_and_sdist():
+    package_data = _load_package_data()
+    manifest = (Path(__file__).resolve().parents[1] / "MANIFEST.in").read_text(
+        encoding="utf-8"
+    )
+
+    assert "workflow/contracts/*.json" in package_data["plugins"]
+    assert "recursive-include plugins/workflow/contracts *.json" in manifest
 
 
 def test_matrix_extra_not_in_all():

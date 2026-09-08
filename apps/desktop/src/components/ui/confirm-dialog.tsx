@@ -59,6 +59,7 @@ export function ConfirmDialog({
   const { t } = useI18n()
   const confirmRef = useRef<HTMLButtonElement>(null)
   const closeTimerRef = useRef<null | number>(null)
+  const lifecycleRef = useRef({ active: null as null | number, next: 0 })
   const [status, setStatus] = useState<'done' | 'idle' | 'saving'>('idle')
   const [error, setError] = useState<null | string>(null)
   const busy = status === 'saving' || status === 'done'
@@ -74,17 +75,23 @@ export function ConfirmDialog({
     }
   }, [open])
 
-  // Cancel the pending close timer on unmount. The timer below holds the
-  // "done" beat visible for 600ms, and an unmount inside that window used to
-  // leave it armed. It then called onClose on a tree that is gone, which
-  // reaches setState in the parent. Under vitest the environment can be torn
-  // down first, and React then reads `window` during the update and throws
-  // ReferenceError.
-  // The write below is a timer handle, and not a mirror of a reactive value.
-  // It happens on unmount only, and it clears the handle this component owns.
+  // Invalidate in-flight confirmations and clear an already-armed "done"
+  // timer on unmount. A generation per effect setup remains valid through
+  // StrictMode replay without letting an older async completion regain
+  // authority. These refs are imperative lifecycle handles, not reactive
+  // mirrors.
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
+    const lifecycle = lifecycleRef.current
+    const generation = lifecycle.next + 1
+    lifecycle.next = generation
+    lifecycle.active = generation
+
     return () => {
+      if (lifecycle.active === generation) {
+        lifecycle.active = null
+      }
+
       if (closeTimerRef.current !== null) {
         window.clearTimeout(closeTimerRef.current)
         closeTimerRef.current = null
@@ -93,18 +100,27 @@ export function ConfirmDialog({
   }, [])
 
   async function run() {
-    if (busy) {
+    const generation = lifecycleRef.current.active
+
+    if (busy || generation === null) {
       return
     }
+
+    const isCurrent = () => lifecycleRef.current.active === generation
 
     setError(null)
 
     if (dismissOnConfirm) {
       try {
         await onConfirm()
-        onClose()
+
+        if (isCurrent()) {
+          onClose()
+        }
       } catch (err) {
-        setError(err instanceof Error ? err.message : t.errors.genericFailure)
+        if (isCurrent()) {
+          setError(err instanceof Error ? err.message : t.errors.genericFailure)
+        }
       }
 
       return
@@ -114,14 +130,25 @@ export function ConfirmDialog({
 
     try {
       await onConfirm()
+
+      if (!isCurrent()) {
+        return
+      }
+
       setStatus('done')
       closeTimerRef.current = window.setTimeout(() => {
+        if (!isCurrent()) {
+          return
+        }
+
         closeTimerRef.current = null
         onClose()
       }, 600)
     } catch (err) {
-      setStatus('idle')
-      setError(err instanceof Error ? err.message : t.errors.genericFailure)
+      if (isCurrent()) {
+        setStatus('idle')
+        setError(err instanceof Error ? err.message : t.errors.genericFailure)
+      }
     }
   }
 

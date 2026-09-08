@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
+from importlib.resources import files
+import json
 import sys
 from pathlib import Path
 from typing import Iterable
 
 from plugins.workflow.language import CURRENT_NORMALIZER_BY_PROFILE
-from plugins.workflow.language_schema import workflow_authoring_contract
+from plugins.workflow.language_schema import (
+    canonical_contract_json,
+    workflow_authoring_contract,
+)
 from plugins.workflow.models import (
     SCOPED_COMPANION_UNKNOWN_NODE_SEMANTIC_CODE,
     SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
@@ -361,6 +367,379 @@ def _approval_work_body(count: int, attempts: int) -> str:
         )
         for index in range(count)
     )
+
+
+def _archon_reference_surface_cases(
+    profile: WorkflowLanguageProfile,
+) -> list[dict[str, object]]:
+    def root_missing(path: str) -> dict[str, object]:
+        return _diagnostic("output_reference_not_declared_dependency", path)
+
+    def scoped(code: str, path: str, semantic: str) -> dict[str, object]:
+        return _diagnostic(
+            code,
+            path,
+            scope="loop-group:group",
+            semantic_code=semantic,
+        )
+    phase4_options = """    systemPrompt: System $producer.output
+    agents:
+      first:
+        description: Describe $producer.output
+        prompt: Prompt $producer.output
+      second:
+        description: Second description $producer.output
+        prompt: Second prompt $producer.output
+    hooks:
+      PreToolUse:
+        - response:
+            systemMessage: System $producer.output
+            stopReason: Stop $producer.output
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              permissionDecisionReason: Reason $producer.output
+              additionalContext: Context $producer.output
+        - response:
+            systemMessage: Later $producer.output"""
+    return [
+        _case(
+            profile,
+            "reference-root-phase4-surfaces-valid",
+            _definition(
+                "reference-root-phase4-surfaces-valid",
+                f"""  - id: producer
+    prompt: Produce.
+  - id: consumer
+    depends_on: [producer]
+    prompt: Consume.
+{phase4_options}""",
+            ),
+            features=(
+                "reference:current-root",
+                "surface:root-agents",
+                "surface:root-hooks",
+                "surface:root-system-prompt",
+            ),
+        ),
+        _case(
+            profile,
+            "reference-root-phase4-container-order",
+            _definition(
+                "reference-root-phase4-container-order",
+                f"""  - id: producer
+    prompt: Produce.
+  - id: consumer
+    prompt: Consume.
+{phase4_options}""",
+            ),
+            diagnostics=tuple(
+                root_missing(path)
+                for path in (
+                    "nodes[1].systemPrompt",
+                    "nodes[1].agents.first.description",
+                    "nodes[1].agents.first.prompt",
+                    "nodes[1].agents.second.description",
+                    "nodes[1].agents.second.prompt",
+                    "nodes[1].hooks.PreToolUse[0].response.systemMessage",
+                    "nodes[1].hooks.PreToolUse[0].response.stopReason",
+                    (
+                        "nodes[1].hooks.PreToolUse[0].response."
+                        "hookSpecificOutput.permissionDecisionReason"
+                    ),
+                    (
+                        "nodes[1].hooks.PreToolUse[0].response."
+                        "hookSpecificOutput.additionalContext"
+                    ),
+                    "nodes[1].hooks.PreToolUse[1].response.systemMessage",
+                )
+            ),
+            features=(
+                "invalid:missing-dependency",
+                "ordering:container-major",
+                "reference:current-root",
+                "surface:root-agents",
+                "surface:root-hooks",
+                "surface:root-system-prompt",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-multimode-scopes-valid",
+            _group_definition(
+                "loop-group-multimode-scopes-valid",
+                """        - id: producer
+          prompt: Produce.
+        - id: text
+          depends_on: [producer]
+          prompt: Text $producer.output $outer.output $LOOP_PREV.producer.output
+          when: $producer.output == 'ready'
+          systemPrompt: System $outer.output
+          agents:
+            reviewer:
+              description: Describe $producer.output
+              prompt: Review $LOOP_PREV.producer.output
+          hooks:
+            PreToolUse:
+              - response:
+                  systemMessage: System $producer.output
+                  hookSpecificOutput:
+                    hookEventName: PreToolUse
+                    additionalContext: Context $outer.output
+        - id: shell
+          depends_on: [producer]
+          bash: test "$producer.output|$outer.output|$LOOP_PREV.producer.output" = ready
+        - id: inline
+          depends_on: [producer]
+          script: print('$producer.output', '$outer.output', '$LOOP_PREV.producer.output')
+          runtime: uv
+        - id: repeat
+          depends_on: [producer]
+          loop:
+            prompt: Retry $producer.output $outer.output $LOOP_PREV.producer.output
+            until: done
+            max_iterations: 2
+            until_bash: test -n '$producer.output'
+            interactive: true
+            gate_message: Gate $outer.output
+        - id: approve
+          depends_on: [producer]
+          approval:
+            message: Approve $producer.output $outer.output $LOOP_PREV.producer.output
+            on_reject:
+              prompt: Revise $producer.output $outer.output $LOOP_PREV.producer.output""",
+                outer_nodes="  - id: outer\n    prompt: Produce outer.",
+                group_fields=(
+                    "      until_bash: test \"$producer.output|$outer.output|"
+                    "$LOOP_PREV.producer.output\" = ready\n"
+                    "      gate_message: Gate $outer.output"
+                ),
+                group_options="    depends_on: [outer]",
+            ),
+            features=(
+                "mode:bash",
+                "mode:condition",
+                "mode:text",
+                "reference:current-body",
+                "reference:loop-prev",
+                "reference:outer",
+                "surface:body-phase4",
+                "surface:group-gate-message",
+                "surface:group-until-bash",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-multigroup-scope-isolation",
+            _definition(
+                "loop-group-multigroup-scope-isolation",
+                """  - id: outer
+    prompt: Produce outer.
+  - id: first-group
+    depends_on: [outer]
+    loop_group:
+      until: done
+      max_iterations: 2
+      until_bash: test "$item.output|$outer.output|$LOOP_PREV.item.output" = ready
+      nodes:
+        - id: item
+          prompt: First.
+        - id: consume
+          depends_on: [item]
+          prompt: First $item.output $outer.output $LOOP_PREV.item.output
+  - id: second-group
+    depends_on: [outer]
+    loop_group:
+      until: done
+      max_iterations: 2
+      until_bash: test "$item.output|$outer.output|$LOOP_PREV.item.output" = ready
+      nodes:
+        - id: item
+          prompt: Second.
+        - id: consume
+          depends_on: [item]
+          prompt: Second $item.output $outer.output $LOOP_PREV.item.output""",
+            ),
+            features=(
+                "reference:current-body",
+                "reference:loop-prev",
+                "reference:outer",
+                "scope:multiple-loop-groups",
+                "surface:group-until-bash",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-competing-previous-current-errors",
+            _group_definition(
+                "loop-group-competing-previous-current-errors",
+                """        - id: producer
+          prompt: Produce.
+        - id: consumer
+          prompt: Use $LOOP_PREV.missing.output and $producer.output""",
+            ),
+            diagnostics=(
+                scoped(
+                    "loop_group_scope_invalid",
+                    "nodes[0].loop_group.nodes[1].prompt",
+                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+                ),
+                scoped(
+                    "loop_group_scope_invalid",
+                    "nodes[0].loop_group.nodes[1].prompt",
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                ),
+            ),
+            features=(
+                "invalid:competing-diagnostics",
+                "ordering:previous-before-current",
+                "reference:current-body",
+                "reference:loop-prev",
+            ),
+        ),
+        _case(
+            profile,
+            "loop-group-scope-diagnostic-ordering",
+            _group_definition(
+                "loop-group-scope-diagnostic-ordering",
+                """        - id: first
+          prompt: Use $outer.output
+        - id: second
+          prompt: Use $LOOP_PREV.missing.output""",
+                outer_nodes="  - id: outer\n    prompt: Produce outer.",
+                group_fields="      until_bash: test -n '$outer.output'",
+            ),
+            diagnostics=(
+                scoped(
+                    "loop_group_scope_invalid",
+                    "nodes[1].loop_group.nodes[0].prompt",
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                ),
+                scoped(
+                    "loop_group_scope_invalid",
+                    "nodes[1].loop_group.nodes[1].prompt",
+                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+                ),
+                scoped(
+                    "output_reference_not_declared_dependency",
+                    "nodes[1].loop_group.until_bash",
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                ),
+            ),
+            features=(
+                "invalid:competing-diagnostics",
+                "ordering:body-before-group-control",
+                "reference:loop-prev",
+                "reference:outer",
+                "scope:multiple-surfaces",
+                "surface:group-until-bash",
+            ),
+        ),
+        _case(
+            profile,
+            "reference-root-when-quoted-current",
+            _definition(
+                "reference-root-when-quoted-current",
+                """  - id: a
+    prompt: Produce.
+  - id: b
+    depends_on: [a]
+    prompt: Consume.
+    when: $a.output == '$missing.output'""",
+            ),
+            features=("mode:condition", "reference:quoted-current", "scope:root"),
+        ),
+        _case(
+            profile,
+            "loop-group-when-quoted-current",
+            _group_definition(
+                "loop-group-when-quoted-current",
+                """        - id: a
+          prompt: Produce.
+        - id: b
+          depends_on: [a]
+          prompt: Consume.
+          when: $a.output == '$missing.output'""",
+            ),
+            diagnostics=(scoped(
+                "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+            ),),
+            features=("mode:condition", "reference:quoted-current", "scope:body"),
+        ),
+        _case(
+            profile,
+            "reference-root-when-quoted-previous",
+            _definition(
+                "reference-root-when-quoted-previous",
+                """  - id: a
+    prompt: Produce.
+  - id: b
+    depends_on: [a]
+    prompt: Consume.
+    when: $a.output == '$LOOP_PREV.missing.output'""",
+            ),
+            features=("mode:condition", "reference:quoted-previous", "scope:root"),
+        ),
+        _case(
+            profile,
+            "loop-group-when-quoted-previous",
+            _group_definition(
+                "loop-group-when-quoted-previous",
+                """        - id: a
+          prompt: Produce.
+        - id: b
+          depends_on: [a]
+          prompt: Consume.
+          when: $a.output == '$LOOP_PREV.missing.output'""",
+            ),
+            diagnostics=(scoped(
+                "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+            ),),
+            features=("mode:condition", "reference:quoted-previous", "scope:body"),
+        ),
+        _case(
+            profile,
+            "reference-root-when-quoted-current-previous",
+            _definition(
+                "reference-root-when-quoted-current-previous",
+                """  - id: a
+    prompt: Produce.
+  - id: b
+    depends_on: [a]
+    prompt: Consume.
+    when: $a.output == '$missing.output $LOOP_PREV.missing.output'""",
+            ),
+            features=("mode:condition", "reference:quoted-current-previous", "scope:root"),
+        ),
+        _case(
+            profile,
+            "loop-group-when-quoted-current-previous",
+            _group_definition(
+                "loop-group-when-quoted-current-previous",
+                """        - id: a
+          prompt: Produce.
+        - id: b
+          depends_on: [a]
+          prompt: Consume.
+          when: $a.output == '$missing.output $LOOP_PREV.missing.output'""",
+            ),
+            diagnostics=(
+                scoped(
+                    "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                    SCOPED_REFERENCE_UNKNOWN_PRODUCER_SEMANTIC_CODE,
+                ),
+                scoped(
+                    "loop_group_scope_invalid", "nodes[0].loop_group.nodes[1].when",
+                    SCOPED_REFERENCE_MISSING_DEPENDENCY_SEMANTIC_CODE,
+                ),
+            ),
+            features=(
+                "mode:condition", "reference:quoted-current-previous", "scope:body",
+                "ordering:previous-before-current",
+            ),
+        ),
+    ]
 
 
 def _archon_loop_group_cases(
@@ -1293,9 +1672,10 @@ def workflow_language_conformance(
     ]
     if selected is WorkflowLanguageProfile.ARCHON_2026_07:
         cases.extend(_archon_loop_group_cases(selected))
+        cases.extend(_archon_reference_surface_cases(selected))
     else:
         cases.extend(_legacy_specific_cases(selected))
-    return {
+    envelope: dict[str, object] = {
         "format_version": 1,
         "profile": selected.value,
         "normalizer_version": CURRENT_NORMALIZER_BY_PROFILE[selected],
@@ -1317,3 +1697,21 @@ def workflow_language_conformance(
             "fixture_authority": "plugins.workflow.language_conformance",
         },
     }
+    if selected is not WorkflowLanguageProfile.ARCHON_2026_07:
+        return envelope
+
+    literal_resource = files("plugins.workflow").joinpath(
+        "conformance/reference_scanner_v1.json"
+    )
+    literal_sections = json.loads(literal_resource.read_text(encoding="utf-8"))
+    envelope["format_version"] = 2
+    for section in (
+        "scanner_cases",
+        "substitution_cases",
+        "structured_path_cases",
+    ):
+        envelope[section] = literal_sections[section]
+    envelope["corpus_digest"] = "sha256:" + sha256(
+        canonical_contract_json(envelope).encode("utf-8")
+    ).hexdigest()
+    return envelope

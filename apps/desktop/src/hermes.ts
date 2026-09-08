@@ -24,7 +24,9 @@ export * from './api/sessions'
 export * from './api/skills'
 export * from './api/system'
 export * from './api/toolsets'
+export * from './api/workflow-marketplace'
 
+export * from '@/api/workflow-marketplace-lifecycle'
 export type {
   ActionResponse,
   ActionStatusResponse,
@@ -136,7 +138,60 @@ export type {
   WorkflowEventPage,
   WorkflowEvidenceKind,
   WorkflowEvidencePage,
+  WorkflowMarketplaceAssessment,
+  WorkflowMarketplaceCapabilities,
+  WorkflowMarketplaceCapability,
+  WorkflowMarketplaceCatalogPackage,
+  WorkflowMarketplaceCompatibilityChanges,
+  WorkflowMarketplaceCompatibilityIdentity,
+  WorkflowMarketplaceDiagnostic,
+  WorkflowMarketplaceErrorEnvelope,
+  WorkflowMarketplaceExternalRequirements,
+  WorkflowMarketplaceFileChange,
+  WorkflowMarketplaceInstalledPackage,
+  WorkflowMarketplaceInstalledPage,
+  WorkflowMarketplaceInstallReview,
+  WorkflowMarketplaceOperation,
+  WorkflowMarketplaceOperationError,
+  WorkflowMarketplaceOperationForKind,
+  WorkflowMarketplaceOperationKind,
+  WorkflowMarketplaceOperationPage,
+  WorkflowMarketplaceOperationResult,
+  WorkflowMarketplaceOperationResultFor,
+  WorkflowMarketplaceOperationResultTypeByKind,
+  WorkflowMarketplaceOperationState,
+  WorkflowMarketplacePackageDetail,
+  WorkflowMarketplacePackageIdentity,
+  WorkflowMarketplacePackageResource,
+  WorkflowMarketplaceRemoveReview,
+  WorkflowMarketplaceRequirementChanges,
+  WorkflowMarketplaceResourceType,
+  WorkflowMarketplaceRiskChanges,
+  WorkflowMarketplaceRiskIdentity,
+  WorkflowMarketplaceSearchPage,
+  WorkflowMarketplaceSource,
+  WorkflowMarketplaceSourceList,
+  WorkflowMarketplaceSourceRecord,
+  WorkflowMarketplaceSourceRefresh,
+  WorkflowMarketplaceSourceRefreshState,
+  WorkflowMarketplaceSourceResponse,
+  WorkflowMarketplaceStringSetChange,
+  WorkflowMarketplaceTrustReview,
+  WorkflowMarketplaceTrustReviewItem,
+  WorkflowMarketplaceTrustState,
+  WorkflowMarketplaceUpdateCheck,
+  WorkflowMarketplaceUpdateReview,
   WorkflowRunListView,
   WorkflowRunPage,
   WorkflowRunSnapshot
 } from '@/types/hermes'
+export type {
+  AdmissionEvicted as LifecycleAdmissionEvicted,
+  AdmissionFound as LifecycleAdmissionFound,
+  LifecycleCapabilities,
+  LifecycleOperation,
+  LifecycleOperationPage,
+  PackageIdentity as LifecyclePackageIdentity,
+  PackageState as LifecyclePackageState,
+  ReviewTokenResponse as LifecycleReviewTokenResponse
+} from '@/types/workflow-marketplace-lifecycle'

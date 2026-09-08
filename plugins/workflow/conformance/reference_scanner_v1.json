@@ -1,0 +1,5030 @@
+{
+  "scanner_cases": [
+    {
+      "id": "text.whole-output",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$build.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "build",
+            "path": [],
+            "start": 0,
+            "end": 13
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "text.path",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$_a-2.output.items.0",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "_a-2",
+            "path": [
+              "items",
+              "0"
+            ],
+            "start": 0,
+            "end": 20
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "text.repeated",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          },
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 10,
+            "end": 19
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "text.punctuation",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "($a.output),",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 1,
+            "end": 10
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "text.absent",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$HOME $1 $(date) ${HOME}",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "text.embedded-dollar",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-x",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.outputx",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-underscore",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output_",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-slash",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output/path",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-bracket",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output[0]",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-leading-zero",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output.01",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-backslash",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output\\x",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.suffix-hyphen",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output-x",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.producer-digit",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$1a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.producer-dot",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.b.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.producer-unicode",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$café.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.path-empty",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output.",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.path-double-dot",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output..x",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.non-ascii-suffix",
+      "requirements": [
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.outputé",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "text.valid-before-malformed.first",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $b.outputx",
+        "consume": "first"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "text.valid-before-malformed.drain",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $b.outputx",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 10,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "api.version-two",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 2,
+      "input": {
+        "text": "$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.version-bool",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": true,
+      "input": {
+        "text": "$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.version-unknown",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 99,
+      "input": {
+        "text": "$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.candidates-nested",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_reference_candidate_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "${x:-$a.output}$b.outputx",
+        "consume": "all"
+      },
+      "expected": {
+        "spans": [
+          [
+            5,
+            14
+          ],
+          [
+            15,
+            25
+          ]
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "api.spans-truncated",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "consume": "all",
+        "spans": [
+          [
+            0,
+            1
+          ]
+        ]
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "api.spans-valid",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "xx $a.output",
+        "consume": "all",
+        "spans": [
+          [
+            3,
+            12
+          ]
+        ]
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 3,
+            "end": 12
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "api.spans-overlap",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "consume": "all",
+        "spans": [
+          [
+            0,
+            9
+          ],
+          [
+            1,
+            9
+          ]
+        ]
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.spans-negative",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "consume": "all",
+        "spans": [
+          [
+            -1,
+            9
+          ]
+        ]
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.spans-outside",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "consume": "all",
+        "spans": [
+          [
+            0,
+            10
+          ]
+        ]
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.spans-error-after-yield",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $b.outputx",
+        "consume": "all",
+        "spans": [
+          [
+            0,
+            9
+          ],
+          [
+            10,
+            20
+          ]
+        ]
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 10,
+          "class": "WorkflowReferenceSyntaxError",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "api.classifier-span-bool",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "classify_bash_reference_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "spans": [
+          [
+            false,
+            9
+          ]
+        ]
+      },
+      "expected": {
+        "spans": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.classifier-span-overlap",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "classify_bash_reference_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "spans": [
+          [
+            0,
+            9
+          ],
+          [
+            1,
+            9
+          ]
+        ]
+      },
+      "expected": {
+        "spans": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.presence-valid-before",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "contains_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $b.outputx"
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "api.presence-valid-after",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "contains_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$b.outputx $a.output"
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "api.presence-malformed-only",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "contains_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$b.outputx"
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "api.condition-iterator-rhs-reference",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_when_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output == $b.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "api.condition-v3-rhs-reference",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_v3_condition_syntax",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output == $b.output"
+      },
+      "expected": {
+        "references": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9,
+            "kind": "current"
+          },
+          {
+            "node_id": "b",
+            "path": [],
+            "start": 13,
+            "end": 22,
+            "kind": "current"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "api.condition-v6-previous",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_v6_condition_syntax",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output == $a.output"
+      },
+      "expected": {
+        "references": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 19,
+            "kind": "previous"
+          },
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 23,
+            "end": 32,
+            "kind": "current"
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "api.condition-v3-previous",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_v3_condition_syntax",
+      "normalizer_version": 3,
+      "input": {
+        "text": "$LOOP_PREV.a.output == 1"
+      },
+      "expected": {
+        "references": [],
+        "error": {
+          "class": "WorkflowConditionError",
+          "code": "condition_runtime_syntax_invalid",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "api.condition-literal-rhs",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_when_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output == '$b.output'",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "api.condition-late-malformed",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_when_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output == 1 && $b.outputx == 2",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 18,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "api.condition-invalid",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_v3_condition_syntax",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output"
+      },
+      "expected": {
+        "references": [],
+        "error": {
+          "class": "WorkflowConditionError",
+          "code": "condition_runtime_syntax_invalid"
+        }
+      }
+    },
+    {
+      "id": "previous.whole",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_loop_previous_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 19
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "previous.path",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_loop_previous_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output.x",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [
+              "x"
+            ],
+            "start": 0,
+            "end": 21
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "previous.producer-malformed",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_loop_previous_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.1a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "previous.path-malformed",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_loop_previous_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output.01",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "previous.ordinary-overlap",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "previous.bash-whole",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_loop_previous_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $LOOP_PREV.a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 5,
+            "end": 24
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "previous.bash-spans",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_loop_previous_reference_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $LOOP_PREV.a.output"
+      },
+      "expected": {
+        "spans": [
+          [
+            5,
+            24
+          ]
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "previous.bash-masking",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $LOOP_PREV.a.output $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 25,
+            "end": 34
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "previous.pre-v6",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 5,
+      "input": {
+        "text": "echo $LOOP_PREV.a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 5,
+          "class": "WorkflowReferenceSyntaxError",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "bash.bare",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 5,
+            "end": 14
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.single",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo '$a.output'",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 6,
+            "end": 15
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.double",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$a.output\"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 6,
+            "end": 15
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.continued",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \\\n$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 7,
+            "end": 16
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.escaped",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \\$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.comment",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "# $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.dollar-double",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.literal-malformed",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \\$a.output[0]",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.live-malformed",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output[0]",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 5,
+          "class": "WorkflowReferenceSyntaxError",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "bash.quote-contexts",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "classify_bash_reference_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output '$a.output' \"$a.output\"",
+        "spans": [
+          [
+            5,
+            14
+          ],
+          [
+            16,
+            25
+          ],
+          [
+            28,
+            37
+          ]
+        ]
+      },
+      "expected": {
+        "spans": [
+          [
+            5,
+            14,
+            null
+          ],
+          [
+            16,
+            25,
+            "'"
+          ],
+          [
+            28,
+            37,
+            "\""
+          ]
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.command-substitution",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$(echo $a.output)\"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.backtick",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo `echo $a.output`",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.ansi-c",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $'$a.output'",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.parameter",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo ${x:-$a.output}",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.arithmetic",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $((1 + $a.output))",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.legacy-arithmetic",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $[$a.output]",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.bare-arithmetic",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "(( $a.output ))",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.conditional",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "[[ -n $a.output ]]",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.extglob",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo @($a.output|x)",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.braces",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo {$a.output,x}",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.process-in",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <(echo $a.output)",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.process-out",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo >($a.output)",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.nested-mixed",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$(echo `echo $a.output`)\"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.unterminated-quote",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.unterminated-command",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $(echo $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.command-position",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.array",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "items=([$a.output]=9)",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.subscript",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "items[$a.output]=9",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.declare-integer",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "declare -i \"x=$a.output\"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.let",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "let \"x=$a.output\"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.function",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "function f { items[$a.output]=9; }; f",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.coproc",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "coproc worker { items[$a.output]=9; }; wait",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.case-pattern",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "case x in $a.output) :;; esac",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 10,
+            "end": 19
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.heredoc-unquoted",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<EOF\n$a.output\nEOF\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-quoted",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<'EOF'\n$a.output\nEOF\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-tabs",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<-EOF\n\t$a.output\n\tEOF\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-multiple",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<'ONE' <<TWO\none\nONE\n$a.output\nTWO\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-delimiter",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<$a.output\nbody\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-quoted-delimiter",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<'$a.output'\nbody\n$a.output\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-missing",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<EOF\nbody\n",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.no-candidate-invalid",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "function 'f' { :; }",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.context-before-grammar",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $(echo $a.outputx)",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.assignment",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "x=$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 2,
+            "end": 11
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.case-action",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "case x in x) echo $a.output;; esac",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 18,
+            "end": 27
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.redirection",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output > /dev/null",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 5,
+            "end": 14
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.redirection-target",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo x > $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 9,
+            "end": 18
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.here-string",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<< $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 8,
+            "end": 17
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.heredoc-safe-tail",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<'EOF'\nbody\nEOF\necho $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 26,
+            "end": 35
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.quoted-extglob",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo '@($a.output|x)'",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 8,
+            "end": 17
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.nesting-64",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($(true))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.nesting-65",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($($(true)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.adjacent",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output$b.output$USER_MESSAGE",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 5,
+            "end": 14
+          },
+          {
+            "node_id": "b",
+            "path": [],
+            "start": 14,
+            "end": 23
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.eager-error",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output $b.outputx",
+        "consume": "first"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 15,
+          "class": "WorkflowReferenceSyntaxError",
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    },
+    {
+      "id": "unicode.astral-offset",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "😀 $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 2,
+            "end": 11
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "unicode.nbsp-suffix",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output ",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "code": "output_reference_path_unsupported",
+          "start": 0,
+          "class": "WorkflowReferenceSyntaxError"
+        }
+      }
+    },
+    {
+      "id": "unicode.condition-whitespace",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_when_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": " $a.output == 1",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 1,
+            "end": 10
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "unicode.superscript-digit",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "²>file echo $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 12,
+            "end": 21
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "unicode.kawi-u14",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "python-3.11-unicode-14.0.0"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "declare -i𑼂 x=$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 14,
+            "end": 23
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "unicode.kawi-u15",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "python-3.12-unicode-15.0.0",
+        "python-3.13-unicode-15.1.0"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "declare -i𑼂 x=$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "unicode.kawi-digit-u14",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "python-3.11-unicode-14.0.0"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "𑽐>file echo $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 12,
+            "end": 21
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "unicode.kawi-digit-u15",
+      "requirements": [
+        "H2",
+        "S10"
+      ],
+      "unicode_profiles": [
+        "python-3.12-unicode-15.0.0",
+        "python-3.13-unicode-15.1.0"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "𑽐>file echo $a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 12,
+            "end": 21
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "resource.command-v2",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 2,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    command: consume\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "consumer": "$producer.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": {
+          "command_bodies": {
+            "consumer": "$producer.output"
+          },
+          "named_script_bodies": {}
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "resource.command-v3-missing",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    command: consume\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "consumer": "$producer.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "output_reference_not_declared_dependency",
+              "path": "nodes[1].command"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.command-v3-valid",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    command: consume\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "consumer": "$producer.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": {
+          "command_bodies": {
+            "consumer": "$producer.output"
+          },
+          "named_script_bodies": {}
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "resource.script-v3",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {},
+        "named_script_bodies": {
+          "consumer": "$producer.output"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[1].script"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.script-v4",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 4,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {},
+        "named_script_bodies": {
+          "consumer": "$producer.output"
+        }
+      },
+      "expected": {
+        "value": {
+          "command_bodies": {},
+          "named_script_bodies": {
+            "consumer": "$producer.output"
+          }
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "resource.script-v6",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 6,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {},
+        "named_script_bodies": {
+          "consumer": "$producer.output"
+        }
+      },
+      "expected": {
+        "value": {
+          "command_bodies": {},
+          "named_script_bodies": {
+            "consumer": "$producer.output"
+          }
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "resource.digest-invalid-before",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "scripts/consume.py": "ff206265666f7265202470726f64756365722e6f757470757420616674657220fe0a"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[1].script"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.digest-invalid-after",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "scripts/consume.py": "2470726f64756365722e6f757470757420ff0a"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[1].script"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.digest-valid-before-malformed",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "scripts/consume.py": "2470726f64756365722e6f757470757420246261642e6f75747075742e0a"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[1].script"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.digest-valid-after-malformed",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "scripts/consume.py": "246261642e6f75747075742e202470726f64756365722e6f75747075740a"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[1].script"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.digest-reference-free",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    script: consume.py\n    runtime: uv\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "scripts/consume.py": "ff2024484f4d4520243120247b56414c55457d0a"
+        }
+      },
+      "expected": {
+        "value": {
+          "sha256_valid": true,
+          "covered_relative_paths": [
+            "example.hermes.yaml",
+            "example.yaml",
+            "scripts/consume.py"
+          ]
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "resource.digest-command-v2",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 2,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    command: consume\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "commands/consume.md": "ff2d2d2d0a6e6f743a207061727365640a"
+        }
+      },
+      "expected": {
+        "value": {
+          "sha256_valid": true,
+          "covered_relative_paths": [
+            "commands/consume.md",
+            "example.hermes.yaml",
+            "example.yaml"
+          ]
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "resource.digest-command-v3",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "compute_package_digest",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: conformance\ndescription: Literal resource policy fixture\nnodes:\n  - id: producer\n    prompt: produce\n  - id: consumer\n    command: consume\n    depends_on: [producer]\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "resource_hex": {
+          "commands/consume.md": "ff2d2d2d0a6e6f743a207061727365640a"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "invalid_command_resource",
+              "path": "nodes[1].command"
+            }
+          ],
+          "cause": {
+            "class": "UnicodeDecodeError"
+          }
+        }
+      }
+    },
+    {
+      "id": "bash.adjacent-previous-current-scalar",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $LOOP_PREV.a.output$a.output$USER_MESSAGE",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 24,
+            "end": 33
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.joined-command-substitution",
+      "requirements": [
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$\\\n(echo $a.output)\"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "api.spans-malformed-pair",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "spans": [
+          [
+            0
+          ]
+        ],
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "ValueError"
+        }
+      }
+    },
+    {
+      "id": "api.spans-bool",
+      "requirements": [
+        "H2",
+        "S2"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_output_references_in_spans",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "spans": [
+          [
+            false,
+            9
+          ]
+        ],
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 9
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "previous.v3-dedicated-api",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "iter_loop_previous_output_references",
+      "normalizer_version": 3,
+      "input": {
+        "text": "$LOOP_PREV.a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [
+          {
+            "node_id": "a",
+            "path": [],
+            "start": 0,
+            "end": 19
+          }
+        ],
+        "error": null
+      }
+    },
+    {
+      "id": "resource.ordered-script-errors",
+      "requirements": [
+        "H2",
+        "H5",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 3,
+      "input": {
+        "definition_yaml": "name: ordered\ndescription: Authored diagnostic order\nnodes:\n  - id: producer\n    prompt: produce\n  - id: first\n    script: first.py\n    runtime: uv\n  - id: second\n    script: second.py\n    runtime: uv\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {},
+        "named_script_bodies": {
+          "second": "$producer.output",
+          "first": "$producer.output"
+        }
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[1].script"
+            },
+            {
+              "code": "named_script_output_reference_unsupported",
+              "path": "nodes[2].script"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "bash.heredoc-eof-no-candidate",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "cat <<EOF",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.heredoc-eof-live",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $a.output; cat <<EOF",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "bash.quote-eof-no-candidate",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": null
+      }
+    },
+    {
+      "id": "bash.quote-eof-live",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "bash_output_references",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$a.output",
+        "consume": "all"
+      },
+      "expected": {
+        "tokens": [],
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "resource.body-command-current-missing",
+      "requirements": [
+        "H3",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 6,
+      "input": {
+        "definition_yaml": "name: scoped-auth\ndescription: Scoped authenticated references\nnodes:\n  - id: g\n    loop_group:\n      until: done\n      max_iterations: 2\n      nodes:\n        - id: a\n          prompt: Produce\n        - id: b\n          command: consume\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "g/b": "$a.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "loop_group_scope_invalid",
+              "path": "nodes[0].loop_group.nodes[1].command",
+              "semantic_code": "scoped-reference-missing-dependency"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "resource.body-command-previous-unknown",
+      "requirements": [
+        "H3",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "validate_authenticated_resource_references",
+      "normalizer_version": 6,
+      "input": {
+        "definition_yaml": "name: scoped-auth\ndescription: Scoped authenticated references\nnodes:\n  - id: g\n    loop_group:\n      until: done\n      max_iterations: 2\n      nodes:\n        - id: a\n          prompt: Produce\n        - id: b\n          command: consume\n",
+        "companion_yaml": "language_compatibility: archon-2026-07\n",
+        "command_bodies": {
+          "g/b": "$LOOP_PREV.missing.output"
+        },
+        "named_script_bodies": {}
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowValidationError",
+          "issues": [
+            {
+              "code": "loop_group_scope_invalid",
+              "path": "nodes[0].loop_group.nodes[1].command",
+              "semantic_code": "scoped-reference-unknown-producer"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "substitution_cases": [
+    {
+      "id": "previous.render-masking",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output $a.output",
+        "direct_dependencies": [
+          "a"
+        ],
+        "previous_body_outputs": {
+          "a": {
+            "value": "old"
+          }
+        },
+        "node_outputs": {
+          "a": {
+            "value": "new"
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": "old new",
+        "error": null
+      }
+    },
+    {
+      "id": "previous.first-whole",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output",
+        "direct_dependencies": [],
+        "previous_body_outputs": {
+          "a": null
+        }
+      },
+      "expected": {
+        "rendered_text": "",
+        "error": null
+      }
+    },
+    {
+      "id": "previous.first-field",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output.x",
+        "direct_dependencies": [],
+        "previous_body_outputs": {
+          "a": null
+        }
+      },
+      "expected": {
+        "rendered_text": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_missing",
+          "node_id": "a",
+          "path": [
+            "x"
+          ]
+        }
+      }
+    },
+    {
+      "id": "previous.unknown-producer",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$LOOP_PREV.a.output",
+        "direct_dependencies": []
+      },
+      "expected": {
+        "rendered_text": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_missing",
+          "node_id": "a",
+          "path": []
+        }
+      }
+    },
+    {
+      "id": "previous.shadowing",
+      "requirements": [
+        "H2",
+        "S2",
+        "S7"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output",
+        "direct_dependencies": [
+          "a"
+        ],
+        "current_body_outputs": {
+          "a": {
+            "value": "body"
+          }
+        },
+        "allowed_outer_outputs": {
+          "a": {
+            "value": "outer"
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": "body",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.names-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$ARGUMENTS $USER_MESSAGE $ARTIFACTS_DIR $WORKFLOW_ID $BASE_BRANCH $DOCS_DIR $CONTEXT $LOOP_USER_INPUT $LOOP_PREV_OUTPUT $REJECTION_REASON",
+        "direct_dependencies": [],
+        "scalars": {
+          "arguments": "arg",
+          "user_message": "message",
+          "artifacts_dir": "artifacts",
+          "workflow_id": "workflow",
+          "base_branch": "base",
+          "docs_dir": "docs",
+          "context": "context",
+          "loop_user_input": "input",
+          "loop_prev_output": "previous",
+          "rejection_reason": "rejection"
+        }
+      },
+      "expected": {
+        "rendered_text": "arg message artifacts workflow base docs context input previous rejection",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.names-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $ARGUMENTS $USER_MESSAGE $ARTIFACTS_DIR $WORKFLOW_ID $BASE_BRANCH $DOCS_DIR $CONTEXT $LOOP_USER_INPUT $LOOP_PREV_OUTPUT $REJECTION_REASON",
+        "direct_dependencies": [],
+        "scalars": {
+          "arguments": "arg",
+          "user_message": "message",
+          "artifacts_dir": "artifacts",
+          "workflow_id": "workflow",
+          "base_branch": "base",
+          "docs_dir": "docs",
+          "context": "context",
+          "loop_user_input": "input",
+          "loop_prev_output": "previous",
+          "rejection_reason": "rejection"
+        }
+      },
+      "expected": {
+        "rendered_text": "echo arg message artifacts workflow base docs context input previous rejection",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.unknown-maximal",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$USER_MESSAGE_X $UNKNOWN $USER_MESSAGE2 $USER_MESSAGE",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "value"
+        }
+      },
+      "expected": {
+        "rendered_text": "$USER_MESSAGE_X $UNKNOWN $USER_MESSAGE2 value",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.positional",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$1|$10|$0|$01|$11|$1abc",
+        "direct_dependencies": [],
+        "scalars": {
+          "arguments": "one two three four five six seven eight nine ten"
+        }
+      },
+      "expected": {
+        "rendered_text": "one|ten|$0|$01||oneabc",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.fallback-arguments",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$1|$2",
+        "direct_dependencies": [],
+        "scalars": {
+          "arguments": "\"one two"
+        }
+      },
+      "expected": {
+        "rendered_text": "\"one|two",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.comment-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "# $USER_MESSAGE",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "value"
+        }
+      },
+      "expected": {
+        "rendered_text": "# value",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.comment-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "# $USER_MESSAGE",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "value"
+        }
+      },
+      "expected": {
+        "rendered_text": "# $USER_MESSAGE",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.escape-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "\\$USER_MESSAGE",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "value"
+        }
+      },
+      "expected": {
+        "rendered_text": "\\value",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.escape-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \\$USER_MESSAGE",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "value"
+        }
+      },
+      "expected": {
+        "rendered_text": "echo \\$USER_MESSAGE",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.single",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo '$USER_MESSAGE'",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "a'b"
+        }
+      },
+      "expected": {
+        "rendered_text": "echo 'a'\\''b'",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.double",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$USER_MESSAGE\"",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "a$b\"c\\d`e"
+        }
+      },
+      "expected": {
+        "rendered_text": "echo \"a\\$b\\\"c\\\\d\\`e\"",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.bare",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $USER_MESSAGE",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "a b"
+        }
+      },
+      "expected": {
+        "rendered_text": "echo 'a b'",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.overlap-prompt",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$USER_MESSAGE.output.x $USER_MESSAGE",
+        "direct_dependencies": [
+          "USER_MESSAGE"
+        ],
+        "scalars": {
+          "user_message": "scalar"
+        },
+        "node_outputs": {
+          "USER_MESSAGE": {
+            "value": {
+              "x": "field"
+            }
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": "field scalar",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.overlap-bash",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo \"$USER_MESSAGE.output.x\" \"$USER_MESSAGE\"",
+        "direct_dependencies": [
+          "USER_MESSAGE"
+        ],
+        "scalars": {
+          "user_message": "scalar"
+        },
+        "node_outputs": {
+          "USER_MESSAGE": {
+            "value": {
+              "x": "field"
+            }
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": "echo \"field\" \"scalar\"",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.nonrecursive",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$USER_MESSAGE $a.output",
+        "direct_dependencies": [
+          "a"
+        ],
+        "scalars": {
+          "user_message": "$a.output"
+        },
+        "node_outputs": {
+          "a": {
+            "value": "$USER_MESSAGE"
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": "$a.output $USER_MESSAGE",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.outputs-only",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_outputs",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $USER_MESSAGE",
+        "direct_dependencies": [
+          "a"
+        ],
+        "scalars": {
+          "user_message": "scalar"
+        },
+        "node_outputs": {
+          "a": {
+            "value": "result"
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": "result $USER_MESSAGE",
+        "error": null
+      }
+    },
+    {
+      "id": "scalar.unsafe",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_bash",
+      "normalizer_version": 6,
+      "input": {
+        "text": "echo $($USER_MESSAGE)",
+        "direct_dependencies": [],
+        "scalars": {
+          "user_message": "echo hi"
+        }
+      },
+      "expected": {
+        "rendered_text": null,
+        "error": {
+          "class": "BashRenderingError",
+          "code": "bash_reference_context_unsupported"
+        }
+      }
+    },
+    {
+      "id": "scalar.malformed-cause",
+      "requirements": [
+        "H2",
+        "S3"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "StrictSubstitutionRenderer.render_prompt",
+      "normalizer_version": 6,
+      "input": {
+        "text": "$a.output $b.outputx",
+        "direct_dependencies": [
+          "a"
+        ],
+        "node_outputs": {
+          "a": {
+            "value": "ok"
+          }
+        }
+      },
+      "expected": {
+        "rendered_text": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_path_unsupported",
+          "node_id": "b",
+          "path": [],
+          "cause": {
+            "class": "WorkflowReferenceSyntaxError",
+            "code": "output_reference_path_unsupported"
+          }
+        }
+      }
+    }
+  ],
+  "structured_path_cases": [
+    {
+      "id": "path.whole",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "string"
+        },
+        "path": []
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.containing-type-ref",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "string",
+          "$defs": {
+            "open": {}
+          },
+          "$ref": "#/$defs/open"
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.ref-sibling",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "$defs": {
+            "open": {
+              "type": "object"
+            }
+          },
+          "$ref": "#/$defs/open",
+          "additionalProperties": false
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.allof",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "allOf": [
+            {},
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.anyof-possible",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.anyof-impossible",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false
+            }
+          ]
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.oneof-possible",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {}
+          ]
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.numeric-object",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "0": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "path": [
+          "0"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.numeric-array",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path": [
+          "0"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.numeric-both-impossible",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": [
+            "object",
+            "array"
+          ],
+          "additionalProperties": false,
+          "maxItems": 0
+        },
+        "path": [
+          "0"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.numeric-array-alternative",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": [
+            "object",
+            "array"
+          ],
+          "additionalProperties": false,
+          "items": {}
+        },
+        "path": [
+          "0"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.prefix-items",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            false
+          ]
+        },
+        "path": [
+          "1"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.tuple-items",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "array",
+          "items": [
+            {
+              "type": "string"
+            }
+          ],
+          "additionalItems": false
+        },
+        "path": [
+          "0"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.additional-items",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "array",
+          "items": [
+            {}
+          ],
+          "additionalItems": false
+        },
+        "path": [
+          "1"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.additional-properties",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "path": [
+          "x",
+          "y"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.dotted-key",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "a.b": {}
+          },
+          "additionalProperties": false
+        },
+        "path": [
+          "a",
+          "b"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    },
+    {
+      "id": "path.unresolved-ref",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "$ref": "#/$defs/absent"
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.cyclic-ref",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "$ref": "#/$defs/cycle",
+          "$defs": {
+            "cycle": {
+              "$ref": "#/$defs/cycle"
+            }
+          }
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.nonlocal-ref",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "$ref": "https://example.invalid/schema"
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.resolve-whole",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": {
+            "z": 1,
+            "a": false
+          }
+        },
+        "node_id": "a",
+        "path": []
+      },
+      "expected": {
+        "value": {
+          "typed_value": {
+            "z": 1,
+            "a": false
+          },
+          "rendered_text": "{\"a\":false,\"z\":1}"
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "path.resolve-mapping",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": {
+            "x": "ready"
+          }
+        },
+        "node_id": "a",
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": {
+          "typed_value": "ready",
+          "rendered_text": "ready"
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "path.resolve-array",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": {
+            "items": [
+              3
+            ]
+          }
+        },
+        "node_id": "a",
+        "path": [
+          "items",
+          "0"
+        ]
+      },
+      "expected": {
+        "value": {
+          "typed_value": 3,
+          "rendered_text": "3"
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "path.resolve-leading-zero-key",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": {
+            "01": "key"
+          }
+        },
+        "node_id": "a",
+        "path": [
+          "01"
+        ]
+      },
+      "expected": {
+        "value": {
+          "typed_value": "key",
+          "rendered_text": "key"
+        },
+        "error": null
+      }
+    },
+    {
+      "id": "path.resolve-leading-zero-index",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": [
+            "first"
+          ]
+        },
+        "node_id": "a",
+        "path": [
+          "01"
+        ]
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_path_type",
+          "node_id": "a",
+          "path": [
+            "01"
+          ]
+        }
+      }
+    },
+    {
+      "id": "path.resolve-missing",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": {}
+        },
+        "node_id": "a",
+        "path": [
+          "missing"
+        ]
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_field_missing",
+          "node_id": "a",
+          "path": [
+            "missing"
+          ]
+        }
+      }
+    },
+    {
+      "id": "path.resolve-schemaless",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": {
+          "value": "{\"x\":1}",
+          "structured": false
+        },
+        "node_id": "a",
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_not_structured",
+          "node_id": "a",
+          "path": [
+            "x"
+          ]
+        }
+      }
+    },
+    {
+      "id": "path.resolve-missing-output",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "resolve_output_reference",
+      "normalizer_version": 6,
+      "input": {
+        "output": null,
+        "node_id": "a",
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": null,
+        "error": {
+          "class": "WorkflowOutputReferenceError",
+          "code": "output_reference_missing",
+          "node_id": "a",
+          "path": [
+            "x"
+          ]
+        }
+      }
+    },
+    {
+      "id": "path.numeric-object-alternative",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": [
+            "object",
+            "array"
+          ],
+          "maxItems": 0,
+          "properties": {
+            "0": {}
+          },
+          "additionalProperties": false
+        },
+        "path": [
+          "0"
+        ]
+      },
+      "expected": {
+        "value": false,
+        "error": null
+      }
+    },
+    {
+      "id": "path.ref-target-constraint",
+      "requirements": [
+        "S4"
+      ],
+      "unicode_profiles": [
+        "all"
+      ],
+      "api": "_v3_output_path_impossible",
+      "normalizer_version": 6,
+      "input": {
+        "schema": {
+          "type": "object",
+          "$defs": {
+            "closed": {
+              "additionalProperties": false
+            }
+          },
+          "$ref": "#/$defs/closed"
+        },
+        "path": [
+          "x"
+        ]
+      },
+      "expected": {
+        "value": true,
+        "error": null
+      }
+    }
+  ]
+}

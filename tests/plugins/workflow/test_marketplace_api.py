@@ -1,0 +1,2559 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import threading
+import time
+import urllib.parse
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
+import pytest
+
+from test_marketplace_service import published_repo, service  # noqa: F401
+
+from plugins.workflow.marketplace.api import (
+    MarketplaceSourceRefreshProjection,
+    MarketplaceSourceEnabledRequest,
+    WorkflowMarketplaceApiContext,
+    _body,
+    _operation_result,
+    _safe_repository_url,
+    create_marketplace_router,
+)
+from plugins.workflow.marketplace.catalog import CatalogPackage, SourceRefreshResult
+from plugins.workflow.marketplace.models import (
+    ExternalRequirements,
+    FileDigestChange,
+    InstallRequest,
+    InstalledPackage,
+    InstalledPackageIdentity,
+    InstallReview,
+    PackageInspection,
+    PackageInspectionResource,
+    PackageReviewAssessment,
+    RemoveReview,
+    RequirementChanges,
+    StringSetChange,
+    TrustReview,
+    UpdateCheck,
+    UpdateReview,
+    WorkflowCompatibilityChanges,
+    WorkflowMarketplaceSource,
+    WorkflowRiskChanges,
+    WorkflowTrustReviewItem,
+)
+from plugins.workflow.marketplace.package import WorkflowMarketplaceError
+from plugins.workflow.marketplace.operations import (
+    MarketplaceOperation,
+    MarketplaceOperationRegistryError,
+    MarketplaceTrustRevokeOperationResult,
+    MarketplaceTrustRevocationValue,
+    validate_marketplace_operation_result,
+)
+from plugins.workflow.marketplace.service import (
+    ConfirmationTargetMetadata,
+    WorkflowMarketplaceService,
+    WorkflowMarketplaceSourceListing,
+)
+
+
+_DIGEST = "1" * 64
+_RISK_DIGEST = "2" * 64
+_REVIEW_DIGEST = "3" * 64
+_COMMIT = "4" * 40
+_TOKEN = "confirmation-token-value-1234567890"
+_NOW = datetime(2026, 9, 4, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+_DIAGNOSTIC_CORPUS = json.loads(
+    (
+        Path(__file__).parents[2]
+        / "fixtures/workflow-marketplace-source-diagnostics.json"
+    ).read_text()
+)
+
+
+@pytest.fixture
+def legacy_case(service, published_repo):
+    from plugins.workflow.marketplace.api import _actor
+
+    service.add_source(
+        WorkflowMarketplaceSource(
+            name="company", repositoryUrl=published_repo.remote.as_uri()
+        )
+    )
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda _home, _profile: service,
+        home_resolver=lambda: service.home,
+        profile_resolver=lambda _home: "support",
+        operation_limits={"max_workers": 1, "max_in_flight": 8, "max_terminal": 32},
+    )
+    app = FastAPI()
+    app.include_router(
+        create_marketplace_router(_verified_operator, context=context),
+        prefix="/api/plugins/workflow",
+    )
+    try:
+        with TestClient(app) as client:
+            key, _, _, registry = context.current()
+            actor = _actor(_Authority(frozenset({"admin"})), key)
+            yield client, service, registry, actor
+    finally:
+        context.close()
+
+
+_LEGACY_READS = [
+    ("post", "/sources/company/refresh", None, "refresh_source", "refresh"),
+    ("get", "/packages/company/laptop-support", None, "inspect", "inspect"),
+    ("post", "/updates/check", {}, "check_updates", "update_check"),
+    (
+        "post",
+        "/updates/check",
+        {"identity": {"sourceKey": "company", "packageId": "laptop-support"}},
+        "check_updates",
+        "update_check",
+    ),
+]
+
+
+def _install_legacy_test_package(service, actor):
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor=actor
+    )
+    return service.confirm_install(review.confirmation_token, actor=actor)
+
+
+def test_http_version_scoped_observation_and_pre_cancel_rejection(legacy_case):
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+
+    client, service, registry, actor = legacy_case
+    root = "/api/plugins/workflow/marketplace"
+    headers = {"X-Test-Authority": "admin"}
+    subject = AllPackagesSubject(type="all_packages")
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(token):
+        entered.set()
+        assert release.wait(10)
+        assert not token.is_cancelled()
+        return complete_read(
+            service,
+            kind="update_check",
+            subject=subject,
+            selection=None,
+            actor=actor,
+            call=lambda: [],
+        )
+
+    operation = registry.start(
+        "update_check",
+        blocked,
+        actor=actor,
+        subject=subject,
+        request_id=registry.admissions.new_request_id(),
+    )
+    assert entered.wait(5)
+    try:
+        for method, suffix in [("get", ""), ("post", "/cancel")]:
+            own = getattr(client, method)(
+                root + "/operations/" + operation.id + suffix, headers=headers
+            )
+            assert own.status_code == 409, own.text
+            assert own.json() == {
+                "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+            }
+            foreign = getattr(client, method)(
+                root + "/operations/" + operation.id + suffix,
+                headers={**headers, "X-Test-Actor": "foreign"},
+            )
+            assert foreign.status_code == 404
+        assert not registry._records[operation.id].cancellation.is_cancelled()
+        page = client.get(root + "/operations", headers=headers)
+        assert page.status_code == 200, page.text
+        assert page.json()["operations"] == []
+    finally:
+        release.set()
+
+
+def test_http_v1_pagination_filters_version_before_slicing(legacy_case):
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+
+    client, service, registry, actor = legacy_case
+    root = "/api/plugins/workflow/marketplace"
+    headers = {"X-Test-Authority": "admin"}
+    legacy_ids, all_ids = [], []
+    subject = AllPackagesSubject(type="all_packages")
+    for _ in range(5):
+        response = client.post(root + "/updates/check", json={}, headers=headers)
+        assert response.status_code == 202
+        operation_id = response.json()["id"]
+        registry._records[operation_id].future.result(timeout=10)
+        legacy_ids.append(operation_id)
+        all_ids.append(operation_id)
+        operation = registry.start(
+            "update_check",
+            lambda token: complete_read(
+                service,
+                kind="update_check",
+                subject=subject,
+                selection=None,
+                actor=actor,
+                call=lambda: [],
+            ),
+            actor=actor,
+            subject=subject,
+            request_id=registry.admissions.new_request_id(),
+        )
+        registry._records[operation.id].future.result(timeout=10)
+        all_ids.append(operation.id)
+    collected = []
+    for offset in range(0, 6, 2):
+        page = client.get(
+            root + f"/operations?offset={offset}&limit=2", headers=headers
+        )
+        assert page.status_code == 200, page.text
+        collected.extend(item["id"] for item in page.json()["operations"])
+    assert collected == list(reversed(legacy_ids))
+    capabilities = client.get(root + "/lifecycle/v2/capabilities", headers=headers)
+    assert capabilities.status_code == 200, capabilities.text
+    snapshot = client.get(
+        root + "/lifecycle/v2/operations",
+        headers={
+            **headers,
+            "X-Hermes-Marketplace-Principal-Binding": capabilities.json()[
+                "principal_binding"
+            ],
+        },
+    )
+    assert snapshot.status_code == 200, snapshot.text
+    assert {item["id"] for item in snapshot.json()["items"]} == set(all_ids)
+
+
+@pytest.mark.parametrize("method,path,body,service_method,kind", _LEGACY_READS)
+@pytest.mark.parametrize("cancel", [False, True])
+def test_legacy_bridge_queued_observation_and_cancellation(
+    legacy_case, monkeypatch, method, path, body, service_method, kind, cancel
+):
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    if service_method == "check_updates":
+        _install_legacy_test_package(service, actor)
+    entered, release, attempted = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    subject = AllPackagesSubject(type="all_packages")
+
+    def blocking(_token):
+        entered.set()
+        assert release.wait(5)
+        return complete_read(
+            service,
+            kind="update_check",
+            subject=subject,
+            selection=None,
+            actor="foreign",
+            call=lambda: [],
+        )
+
+    registry.start(
+        "update_check",
+        blocking,
+        actor="foreign",
+        subject=subject,
+        request_id=registry.admissions.new_request_id(),
+    )
+    assert entered.wait(5)
+    original = getattr(service, service_method)
+
+    def observed(*args, **kwargs):
+        attempted.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, service_method, observed)
+    try:
+        started = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        assert started.status_code == 202
+        operation_id = started.json()["id"]
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert lifecycle.state == started.json()["state"] == "pending"
+        assert lifecycle.phase == "queued" and lifecycle.outcome is None
+        assert registry.list_snapshot(actor=actor).items == (lifecycle,)
+        if cancel:
+            response = client.post(
+                f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+                headers=_headers(),
+            )
+            assert response.json()["state"] == "cancelled"
+        release.set()
+        terminal = _wait_operation(client, operation_id)
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert (
+            lifecycle.state
+            == terminal["state"]
+            == ("cancelled" if cancel else "succeeded")
+        )
+        assert attempted.is_set() is not cancel
+        assert registry.list_snapshot(actor=actor).items == (lifecycle,)
+    finally:
+        release.set()
+
+
+def test_legacy_bridge_mixed_terminal_snapshot_is_complete(legacy_case):
+    from plugins.workflow.marketplace.lifecycle_state import complete_read
+    from plugins.workflow.marketplace.lifecycle_models import AllPackagesSubject
+
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    _install_legacy_test_package(service, actor)
+    expected = set()
+    for method, path, body, _service_method, _kind in _LEGACY_READS:
+        started = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        operation_id = started.json()["id"]
+        assert _wait_operation(client, operation_id)["state"] == "succeeded"
+        expected.add(operation_id)
+    subject = AllPackagesSubject(type="all_packages")
+    operation = registry.start(
+        "update_check",
+        lambda token: complete_read(
+            service,
+            kind="update_check",
+            subject=subject,
+            selection=None,
+            actor=actor,
+            call=lambda: service.check_updates(cancelled=token.is_cancelled),
+        ),
+        actor=actor,
+        subject=subject,
+        request_id=registry.admissions.new_request_id(),
+    )
+    deadline = time.monotonic() + 5
+    while registry.get_lifecycle(operation.id, actor=actor).state not in {
+        "succeeded",
+        "failed",
+    }:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    expected.add(operation.id)
+    seen = set()
+    page = registry.list_snapshot(actor=actor, limit=2)
+    while True:
+        for item in page.items:
+            assert item.id not in seen
+            assert item.state == "succeeded" and item.outcome is not None
+            seen.add(item.id)
+        if page.complete:
+            break
+        page = registry.list_snapshot(actor=actor, limit=2, cursor=page.next_cursor)
+    assert seen == expected
+    assert (
+        client.get(
+            "/api/plugins/workflow/marketplace/lifecycle/v2/capabilities",
+            headers=_headers(),
+        ).status_code
+        == 200
+    )
+
+
+@pytest.mark.parametrize("method,path,body,service_method,kind", _LEGACY_READS)
+@pytest.mark.parametrize("exit_mode", ["success", "failed", "cancelled"])
+def test_legacy_bridge_running_and_terminal(
+    legacy_case, monkeypatch, method, path, body, service_method, kind, exit_mode
+):
+    from plugins.workflow.marketplace.operations import MarketplaceOperationCancelled
+
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    if service_method == "check_updates":
+        _install_legacy_test_package(service, actor)
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(service, service_method)
+
+    def controlled(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        if exit_mode == "failed":
+            raise WorkflowMarketplaceError("source_unavailable", "private failure")
+        if exit_mode == "cancelled" and service_method != "refresh_source":
+            if kwargs["cancelled"]():
+                raise MarketplaceOperationCancelled()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, service_method, controlled)
+    try:
+        response = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        assert response.status_code == 202, response.text
+        operation_id = response.json()["id"]
+        assert response.json()["state"] == "pending"
+        assert entered.wait(5)
+        running = registry.get_lifecycle(operation_id, actor=actor)
+        assert running.kind == kind and running.state == "running"
+        assert registry.list_snapshot(actor=actor).items[0].id == operation_id
+        if exit_mode == "cancelled":
+            client.post(
+                f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+                headers=_headers(),
+            )
+        release.set()
+        legacy = _wait_operation(client, operation_id)
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert (
+            lifecycle.state
+            == legacy["state"]
+            == {"success": "succeeded", "failed": "failed", "cancelled": "cancelled"}[
+                exit_mode
+            ]
+        )
+        assert lifecycle.outcome is not None
+        page = registry.list_snapshot(actor=actor)
+        assert page.complete and page.items[0] == lifecycle
+        if kind == "refresh":
+            assert legacy["source_name"] == lifecycle.subject.source_name == "company"
+        if exit_mode == "success":
+            assert lifecycle.outcome.type == (
+                "committed" if kind == "refresh" else "known_unchanged"
+            )
+            assert legacy["result"] == lifecycle.result.model_dump(mode="json")
+        elif exit_mode == "cancelled":
+            assert lifecycle.outcome.type == "cancelled_before_commit"
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    "after_publication", ["return", "cancel_error", "ordinary_error"]
+)
+def test_legacy_bridge_publication_survives_late_cancellation(
+    legacy_case, monkeypatch, after_publication
+):
+    client, service, registry, actor = legacy_case
+    published, release = threading.Event(), threading.Event()
+    original = service.refresh_source
+
+    def controlled(*args, **kwargs):
+        result = original(*args, **kwargs)
+        published.set()
+        assert release.wait(5)
+        if after_publication != "return":
+            raise WorkflowMarketplaceError(
+                "source_cancelled"
+                if after_publication == "cancel_error"
+                else "source_unavailable",
+                "private failure after publication",
+            )
+        return result
+
+    monkeypatch.setattr(service, "refresh_source", controlled)
+    try:
+        response = client.post(
+            "/api/plugins/workflow/marketplace/sources/company/refresh",
+            headers=_headers(),
+        )
+        operation_id = response.json()["id"]
+        assert published.wait(5)
+        client.post(
+            f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+            headers=_headers(),
+        )
+        release.set()
+        legacy = _wait_operation(client, operation_id)
+        lifecycle = registry.get_lifecycle(operation_id, actor=actor)
+        assert (
+            lifecycle.state
+            == legacy["state"]
+            == ("succeeded" if after_publication == "return" else "failed")
+        )
+        assert lifecycle.outcome.type == (
+            "committed" if after_publication == "return" else "outcome_unknown"
+        )
+        store = service.catalog.source_store
+        assert store.cached(store.get("company")).packages[0].id == "laptop-support"
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/install/prepare",
+        "/install/confirm",
+        "/update/prepare",
+        "/update/confirm",
+        "/remove/prepare",
+        "/remove/confirm",
+        "/trust/review",
+        "/trust/grant",
+        "/trust/revoke",
+    ],
+)
+def test_preview_retirement_precedes_admission_and_token_consumption(legacy_case, path):
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    review = service.prepare_install(
+        InstallRequest(identifier="company/laptop-support"), actor=actor
+    )
+    before = {
+        p.relative_to(service.home): p.read_bytes()
+        for p in service.home.rglob("*")
+        if p.is_file()
+    }
+    response = client.post(
+        "/api/plugins/workflow/marketplace" + path,
+        headers=_headers(),
+        json={
+            "confirmationToken": review.confirmation_token,
+            "identifier": "company/laptop-support",
+            "identity": {"sourceKey": "company", "packageId": "laptop-support"},
+        },
+    )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+    }
+    assert registry.list(actor=actor) == ()
+    assert not registry.admissions.has_live_receipts()
+    assert {
+        p.relative_to(service.home): p.read_bytes()
+        for p in service.home.rglob("*")
+        if p.is_file()
+    } == before
+    assert (
+        service.confirmation_metadata(
+            review.confirmation_token, actor=actor, operation="install"
+        ).identity
+        == review.identity
+    )
+
+
+def _encode_path_syntax(value: str, layers: int) -> str:
+    escapes = {"%": "%25", "/": "%2F", "\\": "%5C", ":": "%3A", ".": "%2E"}
+    for _ in range(layers):
+        value = "".join(escapes.get(character, character) for character in value)
+    return value
+
+
+@dataclass(frozen=True)
+class _Authority:
+    capabilities: frozenset[str]
+    authority_binding: str = "session:provider:org:raw-user-identity"
+
+    def require(self, capability: str) -> None:
+        if capability not in self.capabilities:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": f"workflow_{capability}_required"},
+            )
+
+
+def _verified_operator(request: Request, _requested_scope: str | None):
+    level = request.headers.get("X-Test-Authority", "none")
+    capabilities = {
+        "none": frozenset(),
+        "read": frozenset({"read"}),
+        "write": frozenset({"read", "write"}),
+        "admin": frozenset({"read", "write", "admin"}),
+    }[level]
+    return _Authority(
+        capabilities,
+        authority_binding=request.headers.get(
+            "X-Test-Actor", "session:provider:org:raw-user-identity"
+        ),
+    )
+
+
+def _identity() -> InstalledPackageIdentity:
+    return InstalledPackageIdentity(sourceKey="company", packageId="laptop-support")
+
+
+def _requirements() -> ExternalRequirements:
+    return ExternalRequirements(
+        runtimes=[], tools=[], providers=[], services=[], secrets=[]
+    )
+
+
+def _workflow_review() -> WorkflowTrustReviewItem:
+    return WorkflowTrustReviewItem(
+        workflowName="laptop-diagnostic",
+        definitionPath="workflows/laptop-diagnostic.yaml",
+        packageDigest=_DIGEST,
+        riskDigest=_RISK_DIGEST,
+        trustState="untrusted",
+        shellOrScriptNodes=["collect"],
+        commandNodes=[],
+        approvalNodes=[],
+        commandResources=[],
+        scriptResources=["scripts/collect.py"],
+        mcpResources=[],
+        mcpResourceFiles=[],
+        requestedTools=[],
+        requestedSkills=[],
+        localMcpServers=[],
+        remoteMcpServers=[],
+        providers=[],
+        outwardActionNodes=[],
+        requiredSecrets=[],
+        externalRequirements=_requirements(),
+        packageResourceSet="package",
+        compatibility=[],
+    )
+
+
+def _assessment() -> PackageReviewAssessment:
+    return PackageReviewAssessment(
+        packageDigest=_DIGEST,
+        reviewDigest=_REVIEW_DIGEST,
+        workflowNames=["laptop-diagnostic"],
+        blockers=[],
+        advisories=[],
+        externalRequirements=_requirements(),
+        packageResources=[
+            "scripts/collect.py",
+            "workflow-package.json",
+            "workflows/laptop-diagnostic.yaml",
+        ],
+    )
+
+
+def _install_review() -> InstallReview:
+    return InstallReview(
+        operation="install",
+        confirmationToken=_TOKEN,
+        reviewDigest=_REVIEW_DIGEST,
+        identity=_identity(),
+        sourceName="company",
+        repositoryUrl="ssh://git@example.test/team/workflows.git",
+        configuredRef="main",
+        resolvedCommit=_COMMIT,
+        packagePath="packages/laptop-support",
+        candidateVersion="1.0.0",
+        candidateDigest=_DIGEST,
+        assessment=_assessment(),
+        fileChanges=[
+            FileDigestChange(
+                path="workflow-package.json",
+                kind="added",
+                candidateDigest=_DIGEST,
+            )
+        ],
+        workflowReviews=[_workflow_review()],
+    )
+
+
+def _installed(*, version: str = "1.0.0") -> InstalledPackage:
+    return InstalledPackage(
+        identity=_identity(),
+        sourceName="company",
+        repositoryUrl="ssh://git@example.test/team/workflows.git",
+        configuredRef="main",
+        resolvedCommit=_COMMIT,
+        packagePath="packages/laptop-support",
+        version=version,
+        contractVersion=1,
+        distributionDigest=_DIGEST,
+        installedAt=_NOW,
+        actor="marketplace:actor",
+        workflowPaths=["workflows/laptop-diagnostic.yaml"],
+        orphanedSource=False,
+    )
+
+
+def _empty_change() -> StringSetChange:
+    return StringSetChange(added=[], removed=[])
+
+
+def _update_review() -> UpdateReview:
+    return UpdateReview(
+        operation="update",
+        result="update_available",
+        confirmationToken=_TOKEN,
+        reviewDigest=_REVIEW_DIGEST,
+        identity=_identity(),
+        sourceName="company",
+        repositoryUrl="ssh://git@example.test/team/workflows.git",
+        configuredRef="main",
+        oldVersion="1.0.0",
+        candidateVersion="2.0.0",
+        oldCommit="5" * 40,
+        candidateCommit=_COMMIT,
+        oldDigest="6" * 64,
+        candidateDigest=_DIGEST,
+        fileChanges=[],
+        workflowChanges=_empty_change(),
+        requirementChanges=RequirementChanges(
+            runtimes=_empty_change(),
+            tools=_empty_change(),
+            providers=_empty_change(),
+            services=_empty_change(),
+            secrets=_empty_change(),
+        ),
+        riskChanges=WorkflowRiskChanges(added=[], removed=[]),
+        compatibilityChanges=WorkflowCompatibilityChanges(added=[], removed=[]),
+        assessment=_assessment(),
+        workflowReviews=[_workflow_review()],
+    )
+
+
+def _remove_review() -> RemoveReview:
+    return RemoveReview(
+        operation="remove",
+        confirmationToken=_TOKEN,
+        reviewDigest=_REVIEW_DIGEST,
+        identity=_identity(),
+        currentVersion="1.0.0",
+        currentCommit=_COMMIT,
+        distributionDigest=_DIGEST,
+        workflowNames=["laptop-diagnostic"],
+    )
+
+
+def _trust_review() -> TrustReview:
+    return TrustReview(
+        confirmationToken=_TOKEN,
+        reviewDigest=_REVIEW_DIGEST,
+        identity=_identity(),
+        sourceName="company",
+        version="1.0.0",
+        resolvedCommit=_COMMIT,
+        distributionDigest=_DIGEST,
+        packageResources=[
+            "scripts/collect.py",
+            "workflow-package.json",
+            "workflows/laptop-diagnostic.yaml",
+        ],
+        workflows=[_workflow_review()],
+    )
+
+
+def _inspection() -> PackageInspection:
+    return PackageInspection(
+        identifier="company/laptop-support",
+        identity=_identity(),
+        sourceName="company",
+        repositoryUrl="ssh://git@example.test/team/workflows.git",
+        configuredRef="main",
+        resolvedCommit=_COMMIT,
+        verifiedAt=_NOW,
+        verified=True,
+        sourceState="fresh",
+        id="laptop-support",
+        version="1.0.0",
+        displayName="Laptop Support",
+        description="Support workflows",
+        license="MIT",
+        publisher="Example",
+        tags=["support"],
+        packagePath="packages/laptop-support",
+        contractVersion=1,
+        packageDigest=_DIGEST,
+        workflows=[_workflow_review()],
+        resources=[
+            PackageInspectionResource(path="scripts/collect.py", types=["script"]),
+            PackageInspectionResource(
+                path="workflows/laptop-diagnostic.yaml",
+                types=["workflow_definition"],
+            ),
+        ],
+        externalRequirements=_requirements(),
+        blockers=[],
+        advisories=[],
+        installStatus="not_installed",
+        updateStatus="not_applicable",
+    )
+
+
+class _FakeService:
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.sources: list[WorkflowMarketplaceSource] = []
+        self.confirm_error: WorkflowMarketplaceError | None = None
+
+    def canonical_install_target(self, request):
+        return f"package:{request.identifier}"
+
+    def confirmation_metadata(self, token, *, actor, operation):
+        return ConfirmationTargetMetadata(operation=operation, identity=_identity())
+
+    def add_source(self, source):
+        self.calls.append(("add_source", source))
+        self.sources.append(source)
+        return source
+
+    def list_sources(self):
+        self.calls.append(("list_sources",))
+        return tuple(self.sources)
+
+    def list_source_records(self):
+        self.calls.append(("list_source_records",))
+        return tuple(
+            WorkflowMarketplaceSourceListing(
+                name=source.name,
+                repository_url=source.repository_url,
+                ref=source.ref,
+                enabled=source.enabled,
+                refresh_state=None,
+                attempted_at=None,
+                resolved_commit=None,
+                verified_at=None,
+                verified_package_count=0,
+                diagnostic_code=None,
+                message=None,
+            )
+            for source in self.sources
+        )
+
+    def update_source(self, name, repository_url, *, ref, enabled):
+        self.calls.append(("update_source", name, repository_url, ref, enabled))
+        updated = WorkflowMarketplaceSource(
+            name=name, repositoryUrl=repository_url, ref=ref, enabled=enabled
+        )
+        self.sources = [updated if item.name == name else item for item in self.sources]
+        return updated
+
+    def set_source_enabled(self, name, enabled):
+        self.calls.append(("set_source_enabled", name, enabled))
+        source = next(item for item in self.sources if item.name == name)
+        updated = source.model_copy(update={"enabled": enabled})
+        self.sources = [updated if item.name == name else item for item in self.sources]
+        return updated
+
+    def remove_source(self, name):
+        self.calls.append(("remove_source", name))
+        source = next(item for item in self.sources if item.name == name)
+        self.sources.remove(source)
+        return source
+
+    def refresh_source(self, name, *, cancelled):
+        self.calls.append(("refresh_source", name, cancelled))
+        return SourceRefreshResult(
+            source_name=name,
+            repository_url="ssh://git@example.test/team/workflows.git",
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+
+    def search(self, query, *, source=None, limit=100):
+        self.calls.append(("search", query, source, limit))
+        return (
+            CatalogPackage(
+                identifier="company/laptop-support",
+                source_name="company",
+                repository_url="ssh://git@example.test/team/workflows.git",
+                configured_ref="main",
+                resolved_commit=_COMMIT,
+                verified_at=_NOW,
+                state="fresh",
+                id="laptop-support",
+                version="1.0.0",
+                display_name="Laptop Support",
+                description="Support workflows",
+                license="MIT",
+                publisher="Example",
+                tags=("support",),
+                package_path="packages/laptop-support",
+                contract_version=1,
+                package_digest=_DIGEST,
+            ),
+        )
+
+    def inspect(self, identifier, *, cancelled):
+        self.calls.append(("inspect", identifier, cancelled))
+        return _inspection()
+
+    def installed_packages(self):
+        self.calls.append(("installed_packages",))
+        return (_installed(),)
+
+    def check_updates(self, identity=None, *, cancelled):
+        self.calls.append(("check_updates", identity, cancelled))
+        return (
+            UpdateCheck(
+                identity=identity or _identity(),
+                status="update_available",
+                installedVersion="1.0.0",
+                candidateVersion="2.0.0",
+            ),
+        )
+
+    def prepare_install(self, request: InstallRequest, *, actor, cancelled):
+        self.calls.append(("prepare_install", request, actor, cancelled))
+        return _install_review()
+
+    def confirm_install(self, token, *, actor, cancelled, enter_atomic):
+        self.calls.append(("confirm_install", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        if self.confirm_error is not None:
+            raise self.confirm_error
+        return _installed()
+
+    def prepare_update(self, identity, *, actor, cancelled):
+        self.calls.append(("prepare_update", identity, actor, cancelled))
+        return _update_review()
+
+    def confirm_update(self, token, *, actor, cancelled, enter_atomic):
+        self.calls.append(("confirm_update", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return _installed(version="2.0.0")
+
+    def prepare_remove(self, identity, *, actor):
+        self.calls.append(("prepare_remove", identity, actor))
+        return _remove_review()
+
+    def confirm_remove(self, token, *, actor, cancelled, enter_atomic):
+        self.calls.append(("confirm_remove", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return _installed()
+
+    def review_trust(self, identity, *, actor, workflow_name=None):
+        self.calls.append(("review_trust", identity, actor, workflow_name))
+        return _trust_review()
+
+    def grant_trust(self, token, *, actor, cancelled, enter_atomic):
+        self.calls.append(("grant_trust", token, actor))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return {"laptop-diagnostic": "trusted"}
+
+    def revoke_trust(self, identity, *, workflow_name=None, cancelled, enter_atomic):
+        self.calls.append(("revoke_trust", identity, workflow_name))
+        if cancelled() or not enter_atomic():
+            raise WorkflowMarketplaceError(
+                "marketplace_operation_cancelled", "cancelled"
+            )
+        return 1
+
+
+@pytest.fixture
+def api(tmp_path):
+    service = _FakeService()
+    home = [tmp_path / "support"]
+    profile = ["support"]
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda _home, _profile: service,
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda _home: profile[0],
+        operation_limits={
+            "max_workers": 2,
+            "max_in_flight": 8,
+            "max_terminal": 16,
+        },
+    )
+    app = FastAPI()
+    app.include_router(
+        create_marketplace_router(_verified_operator, context=context),
+        prefix="/api/plugins/workflow",
+    )
+    with TestClient(app) as client:
+        yield client, service, context, home, profile
+    context.close()
+
+
+def _headers(authority: str = "admin", *, actor: str | None = None) -> dict[str, str]:
+    headers = {"X-Test-Authority": authority}
+    if actor is not None:
+        headers["X-Test-Actor"] = actor
+    return headers
+
+
+def _wait_operation(
+    client: TestClient,
+    operation_id: str,
+    *,
+    authority: str = "admin",
+    actor: str | None = None,
+):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        response = client.get(
+            f"/api/plugins/workflow/marketplace/operations/{operation_id}",
+            headers=_headers(authority, actor=actor),
+        )
+        assert response.status_code == 200, response.text
+        value = response.json()
+        if value["state"] in {"succeeded", "failed", "cancelled"}:
+            return value
+        time.sleep(0.01)
+    raise AssertionError("operation did not become terminal")
+
+
+def test_marketplace_reads_require_read_and_mutations_require_admin(api) -> None:
+    client, _service, _context, _home, _profile = api
+
+    assert (
+        client.get(
+            "/api/plugins/workflow/marketplace/packages", headers=_headers("none")
+        ).status_code
+        == 403
+    )
+    assert (
+        client.get(
+            "/api/plugins/workflow/marketplace/packages", headers=_headers("read")
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/plugins/workflow/marketplace/install/prepare",
+            json={"identifier": "company/laptop-support"},
+            headers=_headers("write"),
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/plugins/workflow/marketplace/install/prepare",
+            json={"identifier": "company/laptop-support"},
+            headers=_headers("admin"),
+        ).status_code
+        == 409
+    )
+
+
+def test_source_crud_is_strict_and_returns_credential_free_models(api) -> None:
+    client, _service, _context, _home, _profile = api
+    base = "/api/plugins/workflow/marketplace/sources"
+
+    invalid = client.post(
+        base,
+        json={
+            "name": "company",
+            "repositoryUrl": "https://example.test/repo.git",
+            "enabled": True,
+            "unexpected": "field",
+        },
+        headers=_headers(),
+    )
+    added = client.post(
+        base,
+        json={
+            "name": "company",
+            "repositoryUrl": "https://example.test/repo.git",
+            "enabled": True,
+        },
+        headers=_headers(),
+    )
+    updated = client.put(
+        f"{base}/company",
+        json={
+            "repositoryUrl": "https://example.test/updated.git",
+            "ref": "stable",
+            "enabled": True,
+        },
+        headers=_headers(),
+    )
+    disabled = client.post(
+        f"{base}/company/enabled",
+        json={"enabled": False},
+        headers=_headers(),
+    )
+    listed = client.get(base, headers=_headers("read"))
+    removed = client.delete(f"{base}/company", headers=_headers())
+
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"] == {"code": "marketplace_request_invalid"}
+    assert added.status_code == 201
+    assert added.json()["source"]["repository_url"] == ("https://example.test/repo.git")
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "updated"
+    assert updated.json()["source"]["ref"] == "stable"
+    assert disabled.status_code == 200
+    assert disabled.json()["source"]["enabled"] is False
+    assert listed.status_code == 200
+    assert listed.json()["sources"] == [
+        {
+            "attempted_at": None,
+            "diagnostic_code": None,
+            "enabled": False,
+            "message": None,
+            "name": "company",
+            "ref": "stable",
+            "refresh_state": None,
+            "repository_url": "https://example.test/updated.git",
+            "resolved_commit": None,
+            "verified_at": None,
+            "verified_package_count": 0,
+        }
+    ]
+    assert removed.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"enabled": 1},
+        {"enabled": "false"},
+        {"enabled": False, "extra": True},
+    ],
+)
+def test_source_enable_rejects_coercion_and_unknown_fields(api, body) -> None:
+    client, service, _context, _home, _profile = api
+    service.sources.append(
+        WorkflowMarketplaceSource(
+            name="company", repositoryUrl="https://example.test/repo.git"
+        )
+    )
+
+    response = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/enabled",
+        json=body,
+        headers=_headers(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {"code": "marketplace_request_invalid"}
+
+
+def test_source_list_projection_redacts_local_repository_and_diagnostic_secrets(
+    api,
+) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="file:///private/tmp/operator/repo.git",
+            ref=None,
+            enabled=True,
+            refresh_state="stale",
+            attempted_at=_NOW,
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            verified_package_count=1,
+            diagnostic_code="source_unavailable",
+            message="token=secret",
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    encoded = json.dumps(response.json())
+    assert response.json()["sources"][0]["repository_url"] == "file:///REDACTED"
+    assert "secret" not in encoded
+    assert "/private/tmp" not in encoded
+
+
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["unsafe"])
+def test_source_list_projection_canonically_redacts_punctuated_and_encoded_diagnostics(
+    api,
+    message: str,
+) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=message,
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    projected = response.json()["sources"][0]["message"]
+    assert projected != message
+    assert message not in json.dumps(response.json())
+
+
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["nested"]["unsafe"])
+@pytest.mark.parametrize("layers", range(1, 9))
+def test_source_list_projection_redacts_http_adjacent_identity_at_every_decode_layer(
+    api,
+    message: str,
+    layers: int,
+) -> None:
+    client, service, _context, _home, _profile = api
+    encoded = message
+    for _ in range(layers):
+        encoded = urllib.parse.quote(encoded, safe="")
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=encoded,
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["sources"][0]["message"]
+        == "workflow marketplace source refresh failed"
+    )
+
+
+@pytest.mark.parametrize("message", _DIAGNOSTIC_CORPUS["invalidHttp"])
+@pytest.mark.parametrize("layers", [0, 1, 8])
+def test_source_list_projection_never_raises_or_leaks_invalid_http_identity(
+    api,
+    message: str,
+    layers: int,
+) -> None:
+    client, service, _context, _home, _profile = api
+    encoded = message
+    for _ in range(layers):
+        encoded = urllib.parse.quote(encoded, safe="")
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=encoded,
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["sources"][0]["message"]
+        == "workflow marketplace source refresh failed"
+    )
+    assert encoded not in json.dumps(response.json())
+
+
+def test_source_list_projection_canonicalizes_control_bearing_diagnostics(api) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=" \tfatal:\r\n remote unavailable\x7f retry  ",
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    assert response.json()["sources"][0]["message"] == "fatal: remote unavailable retry"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        *_DIAGNOSTIC_CORPUS["byteOrderMark"]["raw"],
+        *_DIAGNOSTIC_CORPUS["byteOrderMark"]["encoded"],
+    ],
+)
+def test_source_list_projection_contains_no_raw_or_encoded_byte_order_mark(
+    api,
+    case: dict[str, str],
+) -> None:
+    client, service, _context, _home, _profile = api
+    service.list_source_records = lambda: (
+        WorkflowMarketplaceSourceListing(
+            name="private",
+            repository_url="https://example.test/private.git",
+            ref=None,
+            enabled=True,
+            refresh_state="unavailable",
+            attempted_at=_NOW,
+            resolved_commit=None,
+            verified_at=None,
+            verified_package_count=0,
+            diagnostic_code="source_unavailable",
+            message=case["message"],
+        ),
+    )
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources", headers=_headers("read")
+    )
+
+    assert response.status_code == 200
+    projected = response.json()["sources"][0]["message"]
+    assert projected == case["canonical"]
+    assert "\ufeff" not in projected
+    assert "%EF%BB%BF" not in projected.upper()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"enabled":true,"enabled":false}',
+        b'{"enabled":NaN}',
+        json.dumps({"unexpected": "x" * (65 * 1024)}).encode(),
+    ],
+)
+def test_request_json_rejects_duplicates_nonfinite_values_and_oversize(
+    api, raw
+) -> None:
+    client, _service, _context, _home, _profile = api
+
+    response = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/enabled",
+        content=raw,
+        headers={**_headers(), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {"code": "marketplace_request_invalid"}
+    assert "unexpected" not in response.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"confirmationToken": True},
+        {"confirmationToken": "too-short"},
+        {"confirmationToken": "A" * 40, "unexpected": "secret"},
+    ],
+)
+def test_retired_confirmation_does_not_echo_rejected_values(api, body) -> None:
+    client, _service, _context, _home, _profile = api
+    response = client.post(
+        "/api/plugins/workflow/marketplace/install/confirm",
+        json=body,
+        headers=_headers(),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "marketplace_lifecycle_upgrade_required"
+    }
+    assert "too-short" not in response.text
+    assert "secret" not in response.text
+
+
+def test_package_search_has_bounded_strict_pagination(api) -> None:
+    client, service, _context, _home, _profile = api
+
+    response = client.get(
+        "/api/plugins/workflow/marketplace/packages?q=laptop&offset=0&limit=20",
+        headers=_headers("read"),
+    )
+    bad_limit = client.get(
+        "/api/plugins/workflow/marketplace/packages?q=laptop&limit=true",
+        headers=_headers("read"),
+    )
+    unknown = client.get(
+        "/api/plugins/workflow/marketplace/packages?q=laptop&surprise=yes",
+        headers=_headers("read"),
+    )
+    repeated = client.get(
+        "/api/plugins/workflow/marketplace/packages?q=one&q=two",
+        headers=_headers("read"),
+    )
+    long_query = client.get(
+        f"/api/plugins/workflow/marketplace/packages?q={'x' * 257}",
+        headers=_headers("read"),
+    )
+    final_bounded_page = client.get(
+        "/api/plugins/workflow/marketplace/packages?offset=199&limit=1",
+        headers=_headers("read"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["profile"] == "support"
+    assert response.json()["items"][0]["identifier"] == ("company/laptop-support")
+    assert ("search", "laptop", None, 21) in service.calls
+    assert bad_limit.status_code == 422
+    assert unknown.status_code == 422
+    assert repeated.status_code == 422
+    assert long_query.status_code == 422
+    assert final_bounded_page.status_code == 200
+
+
+def test_package_detail_installed_and_update_check_have_strict_success_models(
+    api,
+) -> None:
+    client, service, _context, _home, _profile = api
+
+    detail_started = client.get(
+        "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+        headers=_headers("read"),
+    )
+    detail = _wait_operation(client, detail_started.json()["id"], authority="read")
+    installed = client.get(
+        "/api/plugins/workflow/marketplace/installed", headers=_headers("read")
+    )
+    checks_started = client.post(
+        "/api/plugins/workflow/marketplace/updates/check",
+        json={},
+        headers=_headers(),
+    )
+    checks = _wait_operation(client, checks_started.json()["id"])
+
+    assert detail_started.status_code == 202
+    assert detail["state"] == "succeeded"
+    assert detail["result"]["type"] == "package_detail"
+    assert detail["result"]["value"]["verified"] is True
+    assert installed.status_code == 200
+    assert installed.json()["packages"][0]["identity"] == {
+        "source_key": "company",
+        "package_id": "laptop-support",
+    }
+    assert checks_started.status_code == 202
+    assert checks["state"] == "succeeded"
+    assert checks["result"]["type"] == "update_checks"
+    assert checks["result"]["value"]["checks"][0]["status"] == ("update_available")
+    assert any(call[0] == "inspect" for call in service.calls)
+
+
+@pytest.mark.parametrize(
+    "method,path,body,service_method,subject",
+    [
+        (
+            "post",
+            "/sources/company/refresh",
+            None,
+            "refresh_source",
+            {"type": "source", "source_name": "company"},
+        ),
+        (
+            "get",
+            "/packages/company/laptop-support",
+            None,
+            "inspect",
+            {
+                "type": "package",
+                "identity": {"source_key": "company", "package_id": "laptop-support"},
+            },
+        ),
+        ("post", "/updates/check", {}, "check_updates", {"type": "all_packages"}),
+        (
+            "post",
+            "/updates/check",
+            {"identity": {"sourceKey": "company", "packageId": "laptop-support"}},
+            "check_updates",
+            {
+                "type": "package",
+                "identity": {"source_key": "company", "package_id": "laptop-support"},
+            },
+        ),
+    ],
+)
+def test_legacy_read_starts_supply_safe_receipt_subjects(
+    legacy_case, method, path, body, service_method, subject
+):
+    client, service, registry, actor = legacy_case
+    service.refresh_source("company")
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(service, service_method)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    setattr(service, service_method, blocked)
+    try:
+        response = client.request(
+            method,
+            "/api/plugins/workflow/marketplace" + path,
+            json=body,
+            headers=_headers(),
+        )
+        assert response.status_code == 202
+        assert entered.wait(5)
+        try:
+            operation = registry.get_lifecycle(response.json()["id"], actor=actor)
+        except MarketplaceOperationRegistryError as error:
+            pytest.fail(f"V1 read admission lacks lifecycle subject: {error.code}")
+        assert operation.subject.model_dump(mode="json") == subject
+        assert operation.request_id.startswith(f"wmreq_{operation.registry_epoch}_")
+        assert "request_id" not in response.json()
+        assert registry.retire_if_idle() is False
+    finally:
+        release.set()
+
+
+def test_update_check_rejects_a_service_projection_with_unknown_fields(api) -> None:
+    client, service, _context, _home, _profile = api
+
+    service.check_updates = lambda identity=None, *, cancelled: (
+        {
+            "identity": {
+                "sourceKey": "company",
+                "packageId": "laptop-support",
+            },
+            "status": "current",
+            "installedVersion": "1.0.0",
+            "candidateVersion": "1.0.0",
+            "unexpected": "must-not-cross-the-api-boundary",
+        },
+    )
+    started = client.post(
+        "/api/plugins/workflow/marketplace/updates/check",
+        json={},
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    assert terminal["state"] == "failed"
+    assert terminal["result"] is None
+    assert terminal["error"] == {
+        "code": "marketplace_operation_failed",
+        "message": "Workflow marketplace operation failed.",
+    }
+    assert "unexpected" not in json.dumps(terminal)
+
+
+def test_retired_prepare_never_returns_a_token(api) -> None:
+    client, service, context, _home, _profile = api
+    response = client.post(
+        "/api/plugins/workflow/marketplace/install/prepare",
+        json={"identifier": "company/laptop-support"},
+        headers=_headers(),
+    )
+    assert response.status_code == 409
+    assert "confirmation" not in response.text
+    assert service.calls == []
+    assert not context.registry_for_current_profile().admissions.has_live_receipts()
+
+
+def test_confirmation_failure_never_echoes_the_raw_token(api) -> None:
+    client, service, _context, _home, _profile = api
+    secret_token = "A" * 40
+    response = client.post(
+        "/api/plugins/workflow/marketplace/install/confirm",
+        json={"confirmationToken": secret_token},
+        headers=_headers(),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "marketplace_lifecycle_upgrade_required"
+    assert secret_token not in response.text
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "result_type", "call_name"),
+    [
+        (
+            "/install/confirm",
+            {"confirmationToken": _TOKEN},
+            "installed_package",
+            "confirm_install",
+        ),
+        (
+            "/update/prepare",
+            {"sourceKey": "company", "packageId": "laptop-support"},
+            "update_review",
+            "prepare_update",
+        ),
+        (
+            "/update/confirm",
+            {"confirmationToken": _TOKEN},
+            "updated_package",
+            "confirm_update",
+        ),
+        (
+            "/remove/prepare",
+            {"sourceKey": "company", "packageId": "laptop-support"},
+            "remove_review",
+            "prepare_remove",
+        ),
+        (
+            "/remove/confirm",
+            {"confirmationToken": _TOKEN},
+            "removed_package",
+            "confirm_remove",
+        ),
+        (
+            "/trust/review",
+            {
+                "identity": {
+                    "sourceKey": "company",
+                    "packageId": "laptop-support",
+                },
+                "workflowName": "laptop-diagnostic",
+            },
+            "trust_review",
+            "review_trust",
+        ),
+        (
+            "/trust/grant",
+            {"confirmationToken": _TOKEN},
+            "trust_grant",
+            "grant_trust",
+        ),
+        (
+            "/trust/revoke",
+            {
+                "identity": {
+                    "sourceKey": "company",
+                    "packageId": "laptop-support",
+                }
+            },
+            "trust_revoke",
+            "revoke_trust",
+        ),
+    ],
+)
+def test_preview_route_groups_reject_valid_old_requests(
+    api, path, body, result_type, call_name
+) -> None:
+    client, service, context, _home, _profile = api
+    response = client.post(
+        f"/api/plugins/workflow/marketplace{path}", json=body, headers=_headers()
+    )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+    }
+    assert service.calls == []
+    assert not context.registry_for_current_profile().has_in_flight()
+
+
+def test_operation_lookup_and_cancel_do_not_cross_actor_or_profile_scope(api) -> None:
+    client, _service, _context, home, profile = api
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(),
+    )
+    operation_id = started.json()["id"]
+    terminal = _wait_operation(client, operation_id)
+    listed = client.get(
+        "/api/plugins/workflow/marketplace/operations",
+        headers=_headers("read"),
+    ).json()["operations"]
+
+    assert started.json()["source_name"] == "company"
+    assert terminal["source_name"] == "company"
+    assert next(item for item in listed if item["id"] == operation_id) == terminal
+    assert "target" not in json.dumps(started.json())
+
+    profile[0] = "other"
+    home[0] = home[0].parent / "other"
+    other_profile = client.get(
+        f"/api/plugins/workflow/marketplace/operations/{operation_id}",
+        headers=_headers(),
+    )
+    profile[0] = "support"
+    home[0] = home[0].parent / "support"
+
+    assert other_profile.status_code == 404
+    assert other_profile.json()["detail"] == {"code": "marketplace_operation_not_found"}
+
+
+def test_refresh_operation_fails_closed_when_service_result_names_another_source(
+    api,
+) -> None:
+    client, service, _context, _home, _profile = api
+
+    def mismatched_refresh(_name, *, cancelled):
+        return SourceRefreshResult(
+            source_name="other",
+            repository_url="https://example.test/workflows.git",
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+
+    service.refresh_source = mismatched_refresh
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    assert terminal["source_name"] == "company"
+    assert terminal["state"] == "failed"
+    assert terminal["result"] is None
+
+
+def test_operation_lookup_and_cancel_are_indistinguishable_across_actors(api) -> None:
+    client, _service, _context, _home, _profile = api
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(actor="operator-a"),
+    )
+    operation_id = started.json()["id"]
+    _wait_operation(client, operation_id, actor="operator-a")
+
+    lookup = client.get(
+        f"/api/plugins/workflow/marketplace/operations/{operation_id}",
+        headers=_headers(actor="operator-b"),
+    )
+    cancel = client.post(
+        f"/api/plugins/workflow/marketplace/operations/{operation_id}/cancel",
+        headers=_headers(actor="operator-b"),
+    )
+    listed = client.get(
+        "/api/plugins/workflow/marketplace/operations",
+        headers=_headers("read", actor="operator-b"),
+    )
+
+    for response in (lookup, cancel):
+        assert response.status_code == 404
+        assert response.json()["detail"] == {"code": "marketplace_operation_not_found"}
+    assert listed.status_code == 200
+    assert listed.json()["operations"] == []
+
+
+def test_cancel_during_refresh_git_phase_is_result_free(
+    legacy_case, monkeypatch
+) -> None:
+    client, service, registry, actor = legacy_case
+    entered, release = threading.Event(), threading.Event()
+    original = service.catalog.git_fetcher.fetch
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.catalog.git_fetcher, "fetch", blocked)
+    try:
+        started = client.post(
+            "/api/plugins/workflow/marketplace/sources/company/refresh",
+            headers=_headers(),
+        )
+        assert entered.wait(5)
+        cancelled = client.post(
+            f"/api/plugins/workflow/marketplace/operations/{started.json()['id']}/cancel",
+            headers=_headers(),
+        )
+        release.set()
+        terminal = _wait_operation(client, started.json()["id"])
+        assert cancelled.status_code == 200
+        assert terminal["state"] == "cancelled"
+        assert terminal["result"] is None
+        assert (
+            registry.get_lifecycle(started.json()["id"], actor=actor).outcome.type
+            == "cancelled_before_commit"
+        )
+        assert not service.catalog.source_store.catalog_path.exists()
+    finally:
+        release.set()
+
+
+def test_refresh_auth_failure_projection_redacts_credentials_and_local_paths(
+    legacy_case, monkeypatch
+) -> None:
+    client, service, registry, actor = legacy_case
+
+    def failed_fetch(*args, **kwargs):
+        raise WorkflowMarketplaceError(
+            "source_authentication_failed",
+            "https://user:secret@example.test/private /private/tmp/marketplace/.staging access_token=secret clientSecret=hidden",
+        )
+
+    monkeypatch.setattr(service.catalog.git_fetcher, "fetch", failed_fetch)
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh", headers=_headers()
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+    encoded = json.dumps(terminal, sort_keys=True)
+    assert terminal["state"] == "succeeded"
+    assert terminal["result"]["value"]["state"] == "authentication-failed"
+    assert (
+        "secret" not in encoded
+        and "hidden" not in encoded
+        and "/private/tmp" not in encoded
+    )
+    lifecycle = registry.get_lifecycle(started.json()["id"], actor=actor)
+    assert lifecycle.outcome.type == "known_unchanged"
+    assert (
+        lifecycle.result.value.message
+        == service.catalog.source_store.status("company").message
+    )
+    assert terminal["result"] == lifecycle.result.model_dump(mode="json")
+
+
+def test_refresh_preserves_schema_valid_local_repository_identity(legacy_case) -> None:
+    client, service, registry, actor = legacy_case
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh", headers=_headers()
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+    assert terminal["state"] == "succeeded"
+    assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
+    assert str(service.home.parent) not in json.dumps(terminal)
+    assert (
+        registry.get_lifecycle(started.json()["id"], actor=actor).result.model_dump(
+            mode="json"
+        )
+        == terminal["result"]
+    )
+    MarketplaceOperation.model_validate(terminal, by_name=True)
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:///Users/operator/repository.git",
+        "file:/Users/operator/repository.git",
+        "FILE:/Users/operator/repository.git",
+        "file://localhost/Users/operator/repository.git",
+        "file://LOCALHOST/Users/operator/repository.git",
+        "file://LoCaLhOsT/Users/operator/repository.git",
+        "file:/Users/operator/cacheable/repository.git",
+        "file:/Users/operator/templates/repository.git",
+        "file:/Users/operator/staging-area/repository.git",
+    ],
+)
+def test_package_detail_and_installed_list_preserve_ordinary_local_source(
+    api, local_url
+) -> None:
+    client, service, _context, _home, _profile = api
+    inspection = _inspection().model_copy(update={"repository_url": local_url})
+    installed = _installed().model_copy(update={"repository_url": local_url})
+    service.inspect = lambda identifier, *, cancelled: inspection
+    service.installed_packages = lambda: (installed,)
+
+    detail_started = client.get(
+        "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+        headers=_headers("read"),
+    )
+    detail = _wait_operation(client, detail_started.json()["id"], authority="read")
+    listed = client.get(
+        "/api/plugins/workflow/marketplace/installed",
+        headers=_headers("read"),
+    )
+
+    assert detail["state"] == "succeeded"
+    assert detail["result"]["value"]["repository_url"] == local_url
+    MarketplaceOperation.model_validate(detail, by_name=True)
+    assert listed.status_code == 200
+    assert listed.json()["packages"][0]["repository_url"] == local_url
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:///C:/Users/alice/AppData/Local/Temp/repository.git",
+        "file:/C:/Users/alice/repository.git",
+        "file:C:/Users/alice/repository.git",
+        "file:C:Users/alice/repository.git",
+        "file:/%43%3A/Users/alice/repository.git",
+        "file:/C%3A%5CUsers%5Calice%5Crepository.git",
+        "file:/C%253A%255CUsers%255Calice/repository.git",
+        "file://localhost/C:/Users/alice/repository.git",
+        "file://LOCALHOST/C:/Users/alice/repository.git",
+        "file://server/share/repository.git",
+        "file:////server/share/repository.git",
+        "file://///server/share/repository.git",
+        r"file:///\\server\share\repository.git",
+        "file:/private/tmp/repository.git",
+        "file:/%2Fprivate%2Ftmp/repository.git",
+        "file:/%252Fprivate%252Ftmp/repository.git",
+        "file:/%5C%5Cserver%5Cshare%5Crepository.git",
+        "file:///var/cache/hermes/.staging/repository.git",
+        "file:/home/alice/tmp/repository.git",
+        "file:/home/alice/temp/repository.git",
+        "file:/home/alice/.cache/repository.git",
+        "file:/home/alice/cache/repository.git",
+        "file:/home/alice/caches/repository.git",
+        "file:/home/alice/.staging/repository.git",
+        "file:/home/alice/staging/repository.git",
+        "file:/home/alice/.quarantine/repository.git",
+        "file:/home/alice/quarantine/repository.git",
+        "file:/Users/operator/.hermes/marketplace/workflows/repository.git",
+        "file:/Users/operator/.hermes/workflows/marketplace/repository.git",
+        "FILE:/PRIVATE/TMP/repository.git",
+        "FiLe://LOCALHOST/%74mp/repository.git",
+        "file://LOCALHOST/private/tmp/repository.git",
+    ],
+)
+def test_installed_result_sanitizes_internal_windows_and_unc_file_urls(
+    api, local_url
+) -> None:
+    client, service, _context, _home, _profile = api
+    installed = _installed().model_copy(update={"repository_url": local_url})
+    inspection = _inspection().model_copy(
+        update={
+            "installed": installed,
+            "repository_url": local_url,
+            "install_status": "installed",
+            "update_status": "current",
+        }
+    )
+    service.inspect = lambda identifier, *, cancelled: inspection
+    started = client.get(
+        "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+    assert terminal["state"] == "succeeded"
+    assert (
+        terminal["result"]["value"]["installed"]["repository_url"] == "file:///REDACTED"
+    )
+    assert terminal["result"]["value"]["repository_url"] == "file:///REDACTED"
+    assert "Users" not in json.dumps(terminal)
+    assert "server" not in json.dumps(terminal["result"]["value"]["installed"])
+    assert ".staging" not in json.dumps(terminal)
+    MarketplaceOperation.model_validate(terminal, by_name=True)
+
+
+@pytest.mark.parametrize(
+    ("case", "raw_path"),
+    [
+        ("temp", "/private/tmp/repository.git"),
+        ("dot-cache", "/home/alice/.cache/repository.git"),
+        ("drive", r"C:\Users\alice\repository.git"),
+        ("unc", r"\\server\share\repository.git"),
+    ],
+)
+@pytest.mark.parametrize("layers", range(1, 9))
+def test_nested_encoded_local_source_syntax_is_always_sentinel_redacted(
+    api, case, raw_path, layers
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = f"file:/{_encode_path_syntax(raw_path, layers)}"
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+    public = revalidated.model_dump(mode="json", by_alias=False)
+
+    assert public["value"]["repository_url"] == "file:///REDACTED", case
+    assert "alice" not in json.dumps(public).casefold()
+    assert "server" not in json.dumps(public).casefold()
+
+
+def test_decode_cap_exhaustion_fails_closed_to_a_strict_sentinel(api) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = f"file:/{_encode_path_syntax('/Users/operator/repository.git', 9)}"
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+
+    assert (
+        revalidated.model_dump(mode="json", by_alias=False)["value"]["repository_url"]
+        == "file:///REDACTED"
+    )
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:/Users/operator/repository.git#/private/tmp/secret",
+        "file:/Users/operator/repository.git#../quarantine/secret",
+        "file:/Users/operator/repository.git#%252Fhome%252Falice%252F.cache%252Fsecret",
+        "file:/Users/operator/repository.git?path=/private/tmp/secret",
+        "file:/Users/operator/repository.git?access_token=secret",
+        "file:/Users/operator/%23%252Fprivate%252Ftmp%252Fsecret/repository.git",
+        "file:/Users/operator/%3Faccess_token%3Dsecret/repository.git",
+        "file:/Users/oper\tator/repository.git",
+        "file:/Users/oper\nator/repository.git",
+        "file:/Users/oper\rator/repository.git",
+        "file:/Users/oper\x01ator/repository.git",
+        "file:/Users/oper\x7fator/repository.git",
+        "file:/Users/operator/%00/repository.git",
+        "file:/Users/operator/%09/repository.git",
+        "file:/Users/operator/%0A/repository.git",
+        "file:/Users/operator/%7F/repository.git",
+        "file:/Users/operator/%FF/repository.git",
+    ],
+)
+def test_file_repository_projection_redacts_fragments_controls_and_ambiguity(
+    api, local_url
+) -> None:
+    _client, _service, _context, _home, _profile = api
+
+    assert _safe_repository_url(local_url) == "file:///REDACTED"
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file:/Users/operator/repository.git#/private/tmp/secret",
+        "file:/Users/operator/repository.git#%252Fhome%252Falice%252F.cache%252Fsecret",
+        "file:/Users/operator/%3Faccess_token%3Dsecret/repository.git",
+        "file:/Users/oper\tator/repository.git",
+        "file:/Users/oper\nator/repository.git",
+        "file:/Users/oper\rator/repository.git",
+        "file:/Users/oper\x01ator/repository.git",
+        "file:/Users/oper\x7fator/repository.git",
+        "file:/Users/operator/%09/repository.git",
+        "file:/Users/operator/%0A/repository.git",
+        "file:/Users/operator/%7F/repository.git",
+        "file:/Users/operator/%FF/repository.git",
+    ],
+)
+def test_file_repository_fragment_or_control_never_survives_operation_result(
+    api, local_url
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+
+    public = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    ).model_dump(mode="json", by_alias=False)
+
+    assert public["value"]["repository_url"] == "file:///REDACTED"
+    encoded = json.dumps(public)
+    assert "secret" not in encoded
+    assert "operator" not in encoded
+
+
+def test_file_repository_projection_preserves_ordinary_fragment_free_posix_identity(
+    api,
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = "file:/Users/operator/projects/workflows.git"
+
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    public = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    ).model_dump(mode="json", by_alias=False)
+
+    assert public["value"]["repository_url"] == local_url
+
+
+@pytest.mark.parametrize(
+    "result_type",
+    [
+        "source_refresh",
+        "package_detail",
+        "install_review",
+        "installed_package",
+        "update_review",
+        "updated_package",
+        "removed_package",
+    ],
+)
+def test_redacted_repository_url_revalidates_in_every_repository_result_variant(
+    api, result_type
+) -> None:
+    _client, _service, _context, _home, _profile = api
+    local_url = "file:/%252Fprivate%252Ftmp/repository.git"
+    if result_type == "source_refresh":
+        value = MarketplaceSourceRefreshProjection(
+            source_name="company",
+            repository_url=local_url,
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+    elif result_type == "package_detail":
+        value = _inspection().model_copy(update={"repository_url": local_url})
+    elif result_type == "install_review":
+        value = _install_review().model_copy(update={"repository_url": local_url})
+    elif result_type == "update_review":
+        value = _update_review().model_copy(update={"repository_url": local_url})
+    else:
+        value = _installed().model_copy(update={"repository_url": local_url})
+
+    result = _operation_result(result_type, value)
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+    public = revalidated.model_dump(mode="json", by_alias=False)
+
+    assert public["type"] == result_type
+    assert public["value"]["repository_url"] == "file:///REDACTED"
+
+
+@pytest.mark.parametrize(
+    "local_url",
+    [
+        "file://",
+        "file:///",
+        "file:relative/repository.git",
+        "file:/Users/operator/../repository.git",
+        "file:/Users/operator/%2E%2E/repository.git",
+        "file:/Users/operator/%25GG/repository.git",
+        "file:/Users/operator/%00/repository.git",
+        "file:/Users/operator/%09/repository.git",
+        "file:/Users/operator/%FF/repository.git",
+    ],
+)
+def test_ambiguous_shared_validated_file_uri_fails_closed(api, local_url) -> None:
+    _client, _service, _context, _home, _profile = api
+    result = _operation_result(
+        "installed_package",
+        _installed().model_copy(update={"repository_url": local_url}),
+    )
+    revalidated = validate_marketplace_operation_result(
+        result.model_dump(mode="json", by_alias=True)
+    )
+
+    assert (
+        revalidated.model_dump(mode="json", by_alias=False)["value"]["repository_url"]
+        == "file:///REDACTED"
+    )
+
+
+@pytest.mark.parametrize(
+    "repository_url",
+    [
+        "file://user:password@localhost/private/tmp/repository.git",
+        "https://user:secret@example.test/repository.git",
+        "file://[malformed/repository.git",
+    ],
+)
+def test_malformed_or_credential_bearing_result_identities_fail_without_leaking(
+    api, repository_url
+) -> None:
+    client, service, _context, _home, _profile = api
+
+    def unsafe_refresh(name, *, cancelled):
+        return SourceRefreshResult(
+            source_name=name,
+            repository_url=repository_url,
+            state="fresh",
+            resolved_commit=_COMMIT,
+            verified_at=_NOW,
+            package_count=1,
+        )
+
+    service.refresh_source = unsafe_refresh
+    started = client.post(
+        "/api/plugins/workflow/marketplace/sources/company/refresh",
+        headers=_headers(),
+    )
+    terminal = _wait_operation(client, started.json()["id"])
+
+    encoded = json.dumps(terminal)
+    assert terminal["state"] == "failed"
+    assert terminal["result"] is None
+    assert "password" not in encoded
+    assert "secret" not in encoded
+
+
+def test_read_check_reports_progress_and_same_profile_single_flight(api) -> None:
+    client, service, _context, _home, _profile = api
+    entered, release = threading.Event(), threading.Event()
+    original = service.check_updates
+
+    def blocked(identity=None, *, cancelled):
+        entered.set()
+        assert release.wait(5)
+        return original(identity, cancelled=cancelled)
+
+    service.check_updates = blocked
+    try:
+        first = client.post(
+            "/api/plugins/workflow/marketplace/updates/check",
+            json={},
+            headers=_headers(),
+        )
+        assert entered.wait(5)
+        running = client.get(
+            f"/api/plugins/workflow/marketplace/operations/{first.json()['id']}",
+            headers=_headers(),
+        )
+        conflict = client.post(
+            "/api/plugins/workflow/marketplace/updates/check",
+            json={},
+            headers=_headers(),
+        )
+        assert running.json()["state"] == "running"
+        assert running.json()["phase"] == "fetching"
+        assert running.json()["progress"] == 10
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"] == {"code": "marketplace_operation_conflict"}
+        release.set()
+        assert _wait_operation(client, first.json()["id"])["state"] == "succeeded"
+    finally:
+        release.set()
+
+
+def test_background_operation_reservation_capacity_returns_429(api) -> None:
+    client, service, _context, _home, _profile = api
+    entered, release = threading.Event(), threading.Event()
+    original = service.inspect
+
+    def blocked(identifier, *, cancelled):
+        entered.set()
+        assert release.wait(5)
+        return original(identifier, cancelled=cancelled)
+
+    service.inspect = blocked
+    try:
+        started = [
+            client.get(
+                "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+                headers=_headers(),
+            )
+            for _ in range(8)
+        ]
+        assert entered.wait(5)
+        rejected = client.get(
+            "/api/plugins/workflow/marketplace/packages/company/laptop-support",
+            headers=_headers(),
+        )
+        assert all(response.status_code == 202 for response in started)
+        assert rejected.status_code == 429
+        assert rejected.json()["detail"] == {"code": "marketplace_operation_capacity"}
+    finally:
+        release.set()
+
+
+def _streaming_request(chunks: list[bytes], *, content_length: int | None = None):
+    received = [0]
+
+    async def receive():
+        index = received[0]
+        received[0] += 1
+        if index < len(chunks):
+            return {
+                "type": "http.request",
+                "body": chunks[index],
+                "more_body": index + 1 < len(chunks),
+            }
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    headers = []
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode()))
+    return (
+        Request({"type": "http", "method": "POST", "headers": headers}),
+        receive,
+        received,
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_body_stops_at_cumulative_limit_without_trusting_length() -> (
+    None
+):
+    request, receive, received = _streaming_request(
+        [b"x" * 40_000, b"y" * 40_000, b"must-not-be-read"],
+        content_length=1,
+    )
+    request._receive = receive
+
+    with pytest.raises(HTTPException) as error:
+        await _body(request, MarketplaceSourceEnabledRequest)
+
+    assert error.value.status_code == 422
+    assert error.value.detail == {"code": "marketplace_request_invalid"}
+    assert received[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_streaming_body_accepts_exact_byte_boundary() -> None:
+    prefix = b'{"enabled":true}'
+    raw = prefix + b" " * (64 * 1024 - len(prefix))
+    request, receive, _received = _streaming_request([raw])
+    request._receive = receive
+
+    parsed = await _body(request, MarketplaceSourceEnabledRequest)
+
+    assert parsed.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_deep_json_nesting_has_stable_request_invalid_envelope() -> None:
+    raw = b"[" * 1000 + b"]" * 1000
+    request, receive, _received = _streaming_request([raw])
+    request._receive = receive
+
+    with pytest.raises(HTTPException) as error:
+        await _body(request, MarketplaceSourceEnabledRequest)
+
+    assert error.value.status_code == 422
+    assert error.value.detail == {"code": "marketplace_request_invalid"}
+
+
+def _registry_result():
+    return MarketplaceTrustRevokeOperationResult(
+        type="trust_revoke",
+        value=MarketplaceTrustRevocationValue(revoked=0),
+    )
+
+
+def test_profile_context_evicts_idle_lru_and_preserves_result_isolation(
+    tmp_path,
+) -> None:
+    home = [tmp_path / "a"]
+    created = []
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda current, _profile: (
+            created.append(current),
+            _FakeService(),
+        )[1],
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda current: current.name,
+        max_profiles=2,
+    )
+    try:
+        _key_a, _profile_a, _service_a, registry_a = context.current()
+        old = registry_a.start(
+            "refresh", lambda _token: _registry_result(), target="source:company"
+        )
+        _wait_terminal = time.monotonic() + 2
+        while registry_a.get(old.id).state not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            assert time.monotonic() < _wait_terminal
+            time.sleep(0.01)
+        home[0] = tmp_path / "b"
+        _key_b, _profile_b, _service_b, registry_b = context.current()
+        old_b = registry_b.start(
+            "refresh", lambda _token: _registry_result(), target="source:company"
+        )
+        deadline = time.monotonic() + 2
+        while registry_b.get(old_b.id).state not in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        home[0] = tmp_path / "a"
+        assert context.registry_for_current_profile() is registry_a
+        home[0] = tmp_path / "c"
+        context.current()
+
+        with pytest.raises(MarketplaceOperationRegistryError):
+            registry_b.start(
+                "refresh", lambda _token: _registry_result(), target="source:company"
+            )
+        home[0] = tmp_path / "b"
+        replacement = context.registry_for_current_profile()
+        assert replacement is not registry_b
+        with pytest.raises(MarketplaceOperationRegistryError):
+            replacement.get(old_b.id)
+        assert len(created) == 4
+    finally:
+        context.close()
+
+
+def test_profile_context_rejects_new_profile_while_capacity_is_active(
+    tmp_path,
+) -> None:
+    home = [tmp_path / "a"]
+    release = threading.Event()
+    created = []
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda current, _profile: (
+            created.append(current),
+            _FakeService(),
+        )[1],
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda current: current.name,
+        max_profiles=1,
+        shutdown_timeout=0.05,
+    )
+    try:
+        registry = context.registry_for_current_profile()
+        registry.start(
+            "refresh",
+            lambda _token: (release.wait(timeout=5), _registry_result())[-1],
+            target="source:company",
+        )
+        home[0] = tmp_path / "b"
+        with pytest.raises(HTTPException) as full:
+            context.current()
+        assert full.value.status_code == 429
+        assert full.value.detail == {"code": "marketplace_operation_capacity"}
+        assert len(created) == 1
+    finally:
+        release.set()
+        context.close()
+
+
+def test_profile_context_shutdown_uses_one_overall_deadline(tmp_path) -> None:
+    home = [tmp_path / "a"]
+    release = threading.Event()
+    entered = [threading.Event(), threading.Event()]
+    context = WorkflowMarketplaceApiContext(
+        service_factory=lambda _current, _profile: _FakeService(),
+        home_resolver=lambda: home[0],
+        profile_resolver=lambda current: current.name,
+        max_profiles=2,
+        shutdown_timeout=0.05,
+    )
+    try:
+        for index, name in enumerate(("a", "b")):
+            home[0] = tmp_path / name
+            registry = context.registry_for_current_profile()
+            registry.start(
+                "refresh",
+                lambda _token, marker=entered[index]: (
+                    marker.set(),
+                    release.wait(timeout=5),
+                    _registry_result(),
+                )[-1],
+                target="source:company",
+            )
+        assert all(marker.wait(timeout=2) for marker in entered)
+
+        started_at = time.monotonic()
+        context.close()
+        elapsed = time.monotonic() - started_at
+
+        assert elapsed < 0.2
+    finally:
+        release.set()
+        context.close()
+
+
+def test_sync_service_errors_use_stable_redacted_envelopes(api) -> None:
+    client, service, _context, _home, _profile = api
+
+    def fail(_source):
+        raise WorkflowMarketplaceError(
+            "source_authentication_failed",
+            "https://user:secret@example.test/private access_token=secret",
+        )
+
+    service.add_source = fail
+    response = client.post(
+        "/api/plugins/workflow/marketplace/sources",
+        json={
+            "name": "company",
+            "repositoryUrl": "https://example.test/repo.git",
+            "enabled": True,
+        },
+        headers=_headers(),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == {
+        "code": "source_authentication_failed",
+        "message": "Workflow marketplace request failed.",
+    }
+    assert "secret" not in response.text
+
+
+def test_unexpected_sync_exceptions_use_a_stable_redacted_json_envelope(api) -> None:
+    client, service, _context, _home, _profile = api
+
+    def fail():
+        raise RuntimeError(
+            "https://user:secret@example.test/private /tmp/.staging token=secret"
+        )
+
+    service.list_source_records = fail
+    response = client.get(
+        "/api/plugins/workflow/marketplace/sources",
+        headers=_headers("read"),
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "marketplace_internal_error",
+        "message": "Workflow marketplace request failed.",
+    }
+    assert "secret" not in response.text
+    assert "/tmp" not in response.text
+
+
+def test_real_service_source_crud_and_empty_search_follow_active_home(tmp_path) -> None:
+    context = WorkflowMarketplaceApiContext(
+        home_resolver=lambda: tmp_path / "profile",
+        profile_resolver=lambda _home: "support",
+    )
+    app = FastAPI()
+    app.include_router(
+        create_marketplace_router(_verified_operator, context=context),
+        prefix="/api/plugins/workflow",
+    )
+    try:
+        with TestClient(app) as client:
+            added = client.post(
+                "/api/plugins/workflow/marketplace/sources",
+                json={
+                    "name": "company",
+                    "repositoryUrl": "https://example.test/team/workflows.git",
+                    "ref": "main",
+                    "enabled": True,
+                },
+                headers=_headers(),
+            )
+            sources = client.get(
+                "/api/plugins/workflow/marketplace/sources",
+                headers=_headers("read"),
+            )
+            search = client.get(
+                "/api/plugins/workflow/marketplace/packages?q=support",
+                headers=_headers("read"),
+            )
+
+        assert added.status_code == 201
+        assert sources.json()["sources"][0]["name"] == "company"
+        assert search.status_code == 200
+        assert search.json()["items"] == []
+        persisted = tmp_path / "profile" / "marketplace" / "workflows" / "sources.json"
+        assert persisted.is_file()
+        assert isinstance(
+            context.service_for_current_profile(), WorkflowMarketplaceService
+        )
+    finally:
+        context.close()

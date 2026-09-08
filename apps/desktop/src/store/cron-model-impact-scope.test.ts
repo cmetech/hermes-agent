@@ -6,6 +6,7 @@ import { getCronModelImpactScope, syncCronModelImpactConnection } from './cron-m
 
 function connection(baseUrl: string, wsUrl: string, overrides: Partial<HermesConnection> = {}): HermesConnection {
   return {
+    connectionGeneration: 1,
     baseUrl,
     isFullscreen: false,
     mode: 'remote',

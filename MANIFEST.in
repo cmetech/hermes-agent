@@ -13,6 +13,7 @@ graft plugins
 # below covers the wheel; this covers the sdist. See #34034 / #28149.
 recursive-include plugins plugin.yaml plugin.yml
 recursive-include plugins/workflow/showcases *
+recursive-include plugins/workflow/contracts *.json
 # Gateway assets include images plus YAML catalogs such as status_phrases.yaml.
 recursive-include gateway/assets *
 global-exclude __pycache__

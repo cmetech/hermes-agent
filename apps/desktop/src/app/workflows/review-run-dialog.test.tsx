@@ -678,7 +678,7 @@ describe('Review & Run workflow dialog', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start workflow' }))
 
     await waitFor(() => expect(profileRouting.ensureGatewayProfile).toHaveBeenCalledWith('profile-a'))
-    expect(screen.getByRole('tab', { hidden: true, name: 'Workflows' }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tab', { hidden: true, name: 'Installed' }).getAttribute('aria-selected')).toBe('true')
     expect(api.mock.calls.filter(([request]) => request.profile === 'profile-b')).toHaveLength(0)
     pressSettingsShortcut()
     expect(screen.queryByText('Settings destination')).toBeNull()
@@ -838,7 +838,7 @@ describe('Review & Run workflow dialog', () => {
     expect(await within(dialog).findByText(copy)).toBeTruthy()
     expect(within(dialog).queryByText('The workflow inputs were not accepted.')).toBeNull()
     expect(within(dialog).queryByRole('button', { name: 'Retry' })).toBeNull()
-    expect(screen.getByRole('tab', { hidden: true, name: 'Workflows' }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tab', { hidden: true, name: 'Installed' }).getAttribute('aria-selected')).toBe('true')
     expect($workflowSelectedRunId.get()).toBeNull()
   })
 
@@ -889,7 +889,7 @@ describe('Review & Run workflow dialog', () => {
     const message = messages.find(item => item.id === count.getAttribute('aria-describedby'))
     expect(message).toBeTruthy()
     expect(count.getAttribute('aria-describedby')).toBe(message!.id)
-    expect(screen.getByRole('tab', { hidden: true, name: 'Workflows' }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tab', { hidden: true, name: 'Installed' }).getAttribute('aria-selected')).toBe('true')
   })
 
   it('surfaces an existing disposition and highlights that existing run', async () => {

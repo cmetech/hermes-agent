@@ -25,6 +25,7 @@ interface SearchFieldProps {
   inputRef?: RefObject<HTMLInputElement | null>
   trailingAction?: ReactNode
   'aria-label'?: string
+  role?: 'searchbox'
 }
 
 /**
@@ -45,7 +46,8 @@ export function SearchField({
   onClear,
   inputRef,
   trailingAction,
-  'aria-label': ariaLabel
+  'aria-label': ariaLabel,
+  role
 }: SearchFieldProps) {
   const { t } = useI18n()
   const clear = onClear ?? (() => onChange(''))
@@ -85,6 +87,7 @@ export function SearchField({
         onChange={event => onChange(event.target.value)}
         placeholder={effectivePlaceholder}
         ref={inputRef}
+        role={role}
         type="text"
         value={value}
       />

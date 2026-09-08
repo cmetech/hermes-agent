@@ -10,6 +10,34 @@ This page covers the **terminal commands** you run from your shell.
 
 For in-chat slash commands, see [Slash Commands Reference](./slash-commands.md).
 
+## Workflow marketplace commands
+
+Select the backend machine and `hermes --profile <name>` before these commands.
+Private sources use that machine's existing Git authentication, never credentials
+embedded in the URL. See [Workflow packages](../user-guide/features/workflow-packages.md).
+
+| Command after `hermes workflow` | Behavior |
+| --- | --- |
+| `source add <name> <git-url> [--ref <ref>]` | Register a source; no installation or trust. |
+| `source list`, `source refresh [name]`, `source remove <name>` | List, refresh one/all, or remove source configuration without uninstalling packages. |
+| `search [query] [--source <name>]`, `inspect <source/package>` | Search verified catalogs or inspect fresh package bytes. |
+| `install <source/package-or-git-url> [--ref <ref>] [--path <package-path>]` | Prepare, review, and explicitly confirm an exact distribution. |
+| `installed`, `check [source/package]` | List provenance or check one/all installed packages for updates. |
+| `update [source/package] [--all]`, `uninstall <source/package>` | Review and confirm changed bytes or local removal. |
+| `trust <source/package> --installed-package [--workflow <name>]` | Separately review/grant exact one/all workflow trust. |
+| `untrust <source/package> --installed-package [--workflow <name>]` | Revoke package-origin grants; independent grants can remain. |
+| `package-state <source-key/package-id>` | Read locked current installation/trust/recovery state. |
+| `recover-packages [--yes]` | Explicit profile-wide owned transaction recovery; refuses active writers/live reviews or changed/ambiguous scope. |
+
+These commands accept `--json`. Install/update/uninstall/installed-package trust
+also accept mutually exclusive `--prepare-only`, `--confirmation-token <token>`,
+or `--yes`. Protect confirmation tokens from logs and shell history. Without
+noninteractive confirmation, a mutation requires an interactive review.
+`recover-packages --yes --json` confirms recovery of the inspected profile-wide
+scope; it does not force ambiguous recovery. Doctor never performs this action.
+A rollback failure certifies no installed version: inspect current state and
+resolve recovery rather than relying on historical success output.
+
 ## Global entrypoint
 
 ```bash

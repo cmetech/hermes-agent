@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextvars import ContextVar
 import hashlib
+import io
 import json
 import os
 import re
@@ -160,22 +161,33 @@ class _WorkflowArgumentParser(argparse.ArgumentParser):
         return parsed, extras
 
     def error(self, message: str) -> None:
+        safe_message = "workflow command arguments are invalid"
         if not self._machine_mode:
-            argparse.ArgumentParser.error(self, message)
+            self.print_usage(sys.stderr)
+            self.exit(
+                EXIT_INVOCATION,
+                f"{self.prog}: error: {safe_message}\n",
+            )
         parts = self.prog.split()
         action = (
             " ".join(parts[-2:])
             if len(parts) >= 2 and parts[-2] == "showcase"
             else parts[-1]
         )
-        error = MachineError("invalid_request", message)
+        error = MachineError("invalid_request", safe_message)
+        # The top-level CLI first probes subcommand parsing with stderr replaced
+        # by a StringIO, then retries failures with the normal parser settings.
+        # Keep that discarded probe's machine envelope on the discarded stream
+        # so the real pass emits exactly one JSON document on stdout.
+        stream = sys.stderr if isinstance(sys.stderr, io.StringIO) else sys.stdout
         print(
             json.dumps(
                 error_envelope(f"workflow {action}", error),
                 sort_keys=True,
                 ensure_ascii=False,
                 indent=2,
-            )
+            ),
+            file=stream,
         )
         self.exit(EXIT_INVOCATION)
 
@@ -784,6 +796,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         dest="workflow_action", parser_class=_WorkflowArgumentParser
     )
 
+    from plugins.workflow.marketplace.cli import configure_marketplace_parsers
+
+    configure_marketplace_parsers(actions)
+
     schema_parser = actions.add_parser(
         "schema", help="Print the workflow authoring contract"
     )
@@ -819,15 +835,6 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     doctor_parser.add_argument("--compat-report", action="store_true")
     doctor_parser.add_argument("--mode", choices=("foreground", "background"))
     _json_flag(doctor_parser)
-
-    trust_parser = actions.add_parser("trust", help="Trust the current package digest")
-    trust_parser.add_argument("name")
-    trust_parser.add_argument("--digest", required=True)
-    _json_flag(trust_parser)
-
-    untrust_parser = actions.add_parser("untrust", help="Revoke package trust")
-    untrust_parser.add_argument("name")
-    _json_flag(untrust_parser)
 
     run_parser = actions.add_parser("run", help="Start a durable workflow run")
     run_parser.add_argument("name")
@@ -2935,7 +2942,11 @@ def workflow_command(
     action = getattr(args, "workflow_action", None)
     if not action:
         print(
-            "Usage: hermes workflow {schema|schema-corpus|list|show|validate|doctor|trust|untrust|run|runs|status|events|approve|reject|provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|reset-sessions|showcase}",
+            "Usage: hermes workflow "
+            "{schema|schema-corpus|list|show|validate|doctor|source|search|inspect|install|installed|"
+            "check|update|uninstall|trust|untrust|run|runs|status|events|approve|reject|"
+            "provide-input|resume|retry|reconcile|cancel|abandon|archive|restore|cleanup|"
+            "reset-sessions|showcase}",
             file=sys.stderr,
         )
         return 2
@@ -2944,6 +2955,12 @@ def workflow_command(
         command += f" {args.showcase_action}"
     _MACHINE_COMMAND.set(command)
     try:
+        from plugins.workflow.marketplace.cli import dispatch_marketplace_command
+
+        args._marketplace_profile = profile_name
+        marketplace_result = dispatch_marketplace_command(args)
+        if marketplace_result is not None:
+            return marketplace_result
         if action == "schema":
             return _cmd_schema(args)
         if action == "schema-corpus":

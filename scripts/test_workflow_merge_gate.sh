@@ -2,6 +2,7 @@
 set -euo pipefail
 
 INVOCATION_ROOT="$(pwd -P)"
+GATE_SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(git rev-parse --show-toplevel)"
 PHASE="base"
 BRAND=""
@@ -9,6 +10,9 @@ TESTED_BASE_SHA=""
 PROVISIONED_DESKTOP_VIEW=""
 PROVISIONED_DESKTOP_MARKER=""
 PROVISIONED_DESKTOP_SOURCE=""
+ISOLATED_BUILD_PID=""
+BASE_SOURCE_SHA=""
+BASE_READY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -144,7 +148,7 @@ _validated_invocation_desktop_source() {
 
 _require_root_dependencies() {
   local shared_git_dir shared_root invocation_git_dir invocation_modules
-  local resolved_modules node_bin actual_versions
+  local resolved_modules node_bin actual_versions cli_paths
   shared_git_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
   shared_root="$(cd "$(dirname "$shared_git_dir")" && pwd -P)"
   invocation_git_dir="$(git -C "$INVOCATION_ROOT" rev-parse \
@@ -192,7 +196,18 @@ _require_root_dependencies() {
     echo "root parser dependencies require node before ledger validation" >&2
     return 1
   }
-  actual_versions="$(cd "$ROOT/scripts" && "$node_bin" \
+  cli_paths="$("$PYTHON_BIN" "$GATE_SCRIPT_ROOT/workflow_gate_clis.py" \
+    "$resolved_modules" "$node_bin")" || {
+    echo "root parser dependencies and local gate CLI identities are required before ledger validation" >&2
+    return 1
+  }
+  {
+    IFS= read -r NODE_BIN
+    IFS= read -r TSC_CLI
+    IFS= read -r VITEST_CLI
+    IFS= read -r TSX_CLI
+  } <<<"$cli_paths"
+  actual_versions="$(cd "$ROOT/scripts" && "$NODE_BIN" \
     --experimental-import-meta-resolve --input-type=module -e '
     import fs from "node:fs";
     import path from "node:path";
@@ -354,18 +369,33 @@ _cleanup_desktop_dependency_view() {
 }
 
 _finish_gate() {
-  local status="$1" restore_external=0
+  local status="$1" restore_external=0 current_sha=""
   trap - EXIT HUP INT TERM
   [[ "$status" == "0" ]] && restore_external=1
   if ! _cleanup_desktop_dependency_view "$restore_external"; then
     echo "desktop dependency cleanup refused an unowned or escaping path" >&2
     status=1
   fi
+  if [[ "$PHASE" == "base" && "$BASE_READY" == "1" && "$status" == "0" ]]; then
+    if ! current_sha="$(git -C "$ROOT" rev-parse HEAD)" ||
+        [[ "$current_sha" != "$BASE_SOURCE_SHA" ]] ||
+        ! git -C "$ROOT" diff --quiet HEAD --; then
+      echo "source HEAD or tracked working tree changed; refusing source receipt after cleanup" >&2
+      status=1
+    else
+      echo "TESTED_BASE_SHA=$BASE_SOURCE_SHA"
+    fi
+  fi
   exit "$status"
 }
 
 _handle_gate_signal() {
   local status="$1"
+  if [[ -n "$ISOLATED_BUILD_PID" ]]; then
+    kill -TERM "$ISOLATED_BUILD_PID" 2>/dev/null || true
+    wait "$ISOLATED_BUILD_PID" || true
+    ISOLATED_BUILD_PID=""
+  fi
   _cleanup_desktop_dependency_view 0 || true
   exit "$status"
 }
@@ -380,11 +410,16 @@ if [[ "$PHASE" == "base" ]] && [[ -n "$(git status --porcelain --untracked-files
   echo "tracked working tree is dirty; refusing to seal TESTED_BASE_SHA" >&2
   exit 1
 fi
+if [[ "$PHASE" == "base" ]]; then
+  BASE_SOURCE_SHA="$(git rev-parse HEAD)"
+fi
 _require_root_dependencies
 "$PYTHON_BIN" "$CHECKER" --manifest "$MANIFEST"
 
 if [[ "$PHASE" == "base" ]]; then
   if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
+    "$PYTHON_BIN" scripts/generate_workflow_package_contract.py --check
+    "$PYTHON_BIN" scripts/generate_workflow_marketplace_lifecycle_fixtures.py --check
     if [[ ! -e "$ROOT/.venv" ]]; then
       SHARED_VENV="$(cd "$(dirname "$PYTHON_BIN")/.." && pwd -P)"
       if [[ -f "$SHARED_VENV/bin/activate" ]]; then
@@ -405,10 +440,14 @@ if [[ "$PHASE" == "base" ]]; then
       tests/gateway/test_plugin_delivery.py \
       tests/hermes_cli/test_plugin_provider_hot_reload.py \
       tests/scripts/test_workflow_merge_gate.py \
+      tests/scripts/test_workflow_gate_build.py \
       tests/plugins/workflow/test_language.py \
       tests/plugins/workflow/test_language_snapshot.py \
       tests/plugins/workflow/test_language_schema.py \
       tests/plugins/workflow/test_language_conformance.py \
+      tests/plugins/workflow/test_reference_scanner_baselines.py \
+      tests/plugins/workflow/test_reference_scanner_contract.py \
+      tests/plugins/workflow/test_reference_scanner_conformance.py \
       tests/plugins/workflow/test_phase3_language.py \
       tests/plugins/workflow/test_phase3_execution_semantics.py \
       tests/plugins/workflow/test_phase3_code_catalog.py \
@@ -474,6 +513,25 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_portable_compatibility_e2e.py \
       tests/plugins/workflow/test_journal_reserve_fanout.py \
       tests/plugins/workflow/test_quarantine_replace_retry.py \
+      tests/plugins/workflow/test_marketplace_contract.py \
+      tests/plugins/workflow/test_marketplace_package.py \
+      tests/plugins/workflow/test_marketplace_git.py \
+      tests/plugins/workflow/test_marketplace_sources.py \
+      tests/plugins/workflow/test_marketplace_catalog.py \
+      tests/plugins/workflow/test_marketplace_provenance.py \
+      tests/plugins/workflow/test_marketplace_transactions.py \
+      tests/plugins/workflow/test_marketplace_service.py \
+      tests/plugins/workflow/test_marketplace_trust.py \
+      tests/plugins/workflow/test_marketplace_discovery.py \
+      tests/plugins/workflow/test_marketplace_cli.py \
+      tests/plugins/workflow/test_marketplace_api.py \
+      tests/plugins/workflow/test_marketplace_operations.py \
+      tests/plugins/workflow/test_marketplace_admissions.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_models.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_state.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_api.py \
+      tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py \
+      tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py \
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
       tests/test_packaging_metadata.py -q
@@ -507,7 +565,7 @@ if [[ "$PHASE" == "base" ]]; then
       echo "desktop dependencies are required for the base merge gate" >&2
       exit 1
     }
-    (cd apps/desktop && npx vitest run \
+    (cd apps/desktop && "$NODE_BIN" "$VITEST_CLI" run \
       src/components/activity-board/activity-board.test.tsx \
       src/components/activity-board/activity-board.performance.test.tsx \
       src/components/assistant-ui/embeds/workflow-topology.test.tsx \
@@ -519,9 +577,31 @@ if [[ "$PHASE" == "base" ]]; then
       src/app/workflows/workflow-operations.e2e.test.tsx \
       src/app/kanban/adapter.test.ts \
       src/app/kanban/kanban-operations.e2e.test.tsx)
-    (cd apps/desktop && npx tsc -p . --noEmit)
+    (cd apps/desktop && "$NODE_BIN" "$TSC_CLI" -p . --noEmit)
+    (cd apps/desktop && "$NODE_BIN" "$VITEST_CLI" run --project ui \
+      src/api/workflow-marketplace.test.ts \
+      src/api/workflow-marketplace-lifecycle.test.ts \
+      src/lib/workflow-marketplace-codec.test.ts \
+      src/lib/workflow-marketplace-lifecycle-codec.test.ts \
+      src/lib/workflow-marketplace-connection-binding.test.ts \
+      src/lib/workflow-marketplace-supervision.test.ts \
+      src/lib/workflow-marketplace-reconciliation.test.ts \
+      src/store/workflow-marketplace-supervisor.test.ts \
+      src/i18n/languages.test.ts \
+      src/app/workflows/marketplace/)
+    (cd apps/desktop && "$NODE_BIN" "$VITEST_CLI" run --project electron \
+      electron/connection-generation.test.ts electron/connection-apply.test.ts \
+      electron/connection-config-apply.test.ts electron/backend-connection-state.test.ts \
+      electron/api-transport.test.ts)
+    (cd apps/desktop && "$NODE_BIN" "$TSX_CLI" --test electron/structured-api-channel.test.ts)
+    # Deterministic generation and browser artifacts belong only to a private
+    # local source checkout. No packaging/publication or source-file restoration.
+    "$PYTHON_BIN" "$GATE_SCRIPT_ROOT/workflow_gate_build.py" "$ROOT" "$BASE_SOURCE_SHA" &
+    ISOLATED_BUILD_PID=$!
+    wait "$ISOLATED_BUILD_PID"
+    ISOLATED_BUILD_PID=""
   fi
-  echo "TESTED_BASE_SHA=$(git rev-parse HEAD)"
+  BASE_READY=1
   exit 0
 fi
 
@@ -541,7 +621,7 @@ git diff --quiet "$TESTED_BASE_SHA" -- "${GENERIC_PATHS[@]}" || {
 }
 
 if [[ "${WORKFLOW_MERGE_GATE_FAST:-0}" != "1" ]]; then
-  node scripts/brand/generate.mjs "$BRAND" --check
+  "$NODE_BIN" scripts/brand/generate.mjs "$BRAND" --check
   "$PYTHON_BIN" - <<'PY'
 from plugins.workflow.showcase import load_showcase_catalog
 catalog = load_showcase_catalog()

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+import plugins.workflow.trust as workflow_trust
 from plugins.workflow.api_admission import (
     ApiAdmissionAuthority,
     ApiAdmissionError,
@@ -22,6 +23,7 @@ from plugins.workflow.models import WorkflowValidationError
 from plugins.workflow.schema import load_workflow, load_workflow_snapshot
 from plugins.workflow.store import RunStore
 from plugins.workflow.trust import (
+    WorkflowPackageDigest,
     WorkflowResourceReadBudget,
     WorkflowTrustError,
     WorkflowTrustStore,
@@ -84,6 +86,20 @@ def _package(workflow_writer, root):
         encoding="utf-8",
     )
     return load_workflow(path)
+
+
+def test_package_digest_override_retains_compilation_validation(
+    tmp_path, workflow_writer
+):
+    package = _package(workflow_writer, tmp_path / "invalid-compilation")
+
+    with pytest.raises(ValueError, match="immutable workflow compilation"):
+        build_risk_summary(
+            package,
+            assess_compatibility(package),
+            compilation=object(),
+            package_digest=WorkflowPackageDigest("a" * 64, ()),
+        )
 
 
 def test_archon_normalizer_upgrade_changes_risk_identity_without_source_change(
@@ -412,7 +428,8 @@ def test_trust_store_is_atomic_restrictive_and_contains_no_secrets(tmp_path):
 
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
     payload = json.loads(store.path.read_text(encoding="utf-8"))
-    assert payload["records"]["a" * 64]["actor"] == "user"
+    assert payload["version"] == 2
+    assert payload["records"]["a" * 64]["grants"]["manual"]["actor"] == "user"
     assert "secret" not in store.path.read_text(encoding="utf-8").lower()
     assert store.revoke("a" * 64) is True
     assert store.revoke("a" * 64) is False
@@ -443,6 +460,220 @@ def test_corrupt_store_fails_closed_and_concurrent_updates_remain_valid(tmp_path
             )
         )
     assert len(json.loads(store.path.read_text(encoding="utf-8"))["records"]) == 16
+
+
+def test_version_one_trust_is_normalized_read_only_then_persisted_as_version_two(
+    tmp_path,
+):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.path.parent.mkdir(parents=True)
+    legacy = {
+        "version": 1,
+        "records": {
+            "a" * 64: {
+                "actor": "legacy-operator",
+                "risk_digest": "b" * 64,
+                "trusted_at": "2026-09-03T12:00:00+00:00",
+            }
+        },
+    }
+    original = json.dumps(legacy, sort_keys=True).encode("utf-8")
+    store.path.write_bytes(original)
+
+    snapshot = store.snapshot_read_only(max_bytes=4096)
+
+    assert snapshot["version"] == 2
+    assert (
+        store.check_snapshot(snapshot, "a" * 64, risk_digest="b" * 64)
+        == "trusted"
+    )
+    assert store.path.read_bytes() == original
+    assert not store.lock_path.exists()
+
+    store.trust_origin(
+        "c" * 64,
+        risk_digest="d" * 64,
+        actor="desktop",
+        origin="marketplace:company/package",
+    )
+
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert persisted["version"] == 2
+    assert persisted["records"]["a" * 64]["grants"]["manual"] == legacy[
+        "records"
+    ]["a" * 64]
+
+
+def test_corrupt_read_only_trust_check_fails_closed_without_rewriting_store(tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.path.parent.mkdir(parents=True)
+    corrupt = b'{"version":2,"records":'
+    store.path.write_bytes(corrupt)
+
+    assert store.check_read_only("a" * 64, risk_digest="b" * 64) == "untrusted"
+    assert store.path.read_bytes() == corrupt
+    assert not store.lock_path.exists()
+
+
+@pytest.mark.parametrize("version", [True, 1.0], ids=("boolean", "float"))
+def test_non_integer_trust_store_version_fails_closed_without_replacement(
+    tmp_path, version
+):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.path.parent.mkdir(parents=True)
+    malformed = {
+        "version": version,
+        "records": {
+            "a" * 64: {
+                "actor": "legacy-operator",
+                "risk_digest": "b" * 64,
+                "trusted_at": "2026-09-03T12:00:00+00:00",
+            }
+        },
+    }
+    original = json.dumps(malformed, sort_keys=True).encode("utf-8")
+    store.path.write_bytes(original)
+
+    assert store.check_read_only("a" * 64, risk_digest="b" * 64) == "untrusted"
+    assert store.path.read_bytes() == original
+    assert not store.lock_path.exists()
+
+    with pytest.raises(WorkflowTrustError, match="corrupt"):
+        store.trust_origin(
+            "c" * 64,
+            risk_digest="d" * 64,
+            actor="desktop",
+            origin="marketplace:company/package",
+        )
+
+    assert store.path.read_bytes() == original
+
+
+def test_any_matching_origin_grant_trusts_and_manual_revoke_preserves_others(
+    tmp_path,
+):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    digest = "a" * 64
+    store.trust(digest, actor="operator", risk_digest="b" * 64)
+    store.trust_origin(
+        digest,
+        risk_digest="c" * 64,
+        actor="desktop",
+        origin="marketplace:company/package",
+    )
+
+    assert store.check(digest, risk_digest="b" * 64) == "trusted"
+    assert store.check(digest, risk_digest="c" * 64) == "trusted"
+    assert store.revoke(digest) is True
+    assert store.check(digest, risk_digest="b" * 64) == "untrusted"
+    assert store.check(digest, risk_digest="c" * 64) == "trusted"
+
+
+def test_revoking_one_install_origin_preserves_manual_and_other_install_grants(
+    tmp_path,
+):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    digest = "a" * 64
+    risk = "b" * 64
+    store.trust_origin(digest, risk_digest=risk, actor="operator", origin="manual")
+    store.trust_origin(
+        digest,
+        risk_digest=risk,
+        actor="desktop",
+        origin="marketplace:company/package",
+    )
+    store.trust_origin(
+        digest,
+        risk_digest=risk,
+        actor="desktop",
+        origin="marketplace:mirror/package",
+    )
+
+    assert store.revoke_origin("marketplace:company/package") == 1
+    assert store.check(digest, risk_digest=risk) == "trusted"
+    grants = json.loads(store.path.read_text(encoding="utf-8"))["records"][digest][
+        "grants"
+    ]
+    assert set(grants) == {"manual", "marketplace:mirror/package"}
+
+
+def test_update_origin_revocation_removes_old_and_candidate_digest_grants(tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    origin = "marketplace:company/package"
+    for digest, risk in (("a" * 64, "b" * 64), ("c" * 64, "d" * 64)):
+        store.trust_origin(
+            digest,
+            risk_digest=risk,
+            actor="desktop",
+            origin=origin,
+        )
+
+    assert store.revoke_origin(origin) == 2
+    assert store.check("a" * 64, risk_digest="b" * 64) == "untrusted"
+    assert store.check("c" * 64, risk_digest="d" * 64) == "untrusted"
+
+
+@pytest.mark.parametrize(
+    ("actor", "origin"),
+    [
+        ("", "manual"),
+        ("operator\nadmin", "manual"),
+        ("operator", ""),
+        ("operator", "marketplace:company/package?token=secret"),
+        ("x" * 129, "manual"),
+        ("operator", "x" * 257),
+    ],
+)
+def test_trust_grant_actor_and_origin_are_bounded(actor, origin, tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+
+    with pytest.raises(WorkflowTrustError, match="actor|origin"):
+        store.trust_origin(
+            "a" * 64,
+            risk_digest="b" * 64,
+            actor=actor,
+            origin=origin,
+        )
+
+    assert not store.path.exists()
+
+
+def test_oversized_version_two_records_and_grants_fail_closed(tmp_path):
+    store = WorkflowTrustStore(tmp_path / "profile")
+    store.path.parent.mkdir(parents=True)
+    grant = {
+        "actor": "operator",
+        "risk_digest": "b" * 64,
+        "trusted_at": "2026-09-03T12:00:00+00:00",
+    }
+    oversized_records = {
+        f"{index:064x}": {"grants": {"manual": grant}}
+        for index in range(workflow_trust.WORKFLOW_TRUST_MAX_RECORDS + 1)
+    }
+    store.path.write_text(
+        json.dumps({"version": 2, "records": oversized_records}),
+        encoding="utf-8",
+    )
+    before = store.path.read_bytes()
+
+    assert store.check_read_only("0" * 64, risk_digest="b" * 64) == "untrusted"
+    assert store.path.read_bytes() == before
+
+    oversized_grants = {
+        f"marketplace:source/package-{index}": grant
+        for index in range(workflow_trust.WORKFLOW_TRUST_MAX_GRANTS_PER_RECORD + 1)
+    }
+    store.path.write_text(
+        json.dumps({
+            "version": 2,
+            "records": {"a" * 64: {"grants": oversized_grants}},
+        }),
+        encoding="utf-8",
+    )
+    before = store.path.read_bytes()
+
+    assert store.check_read_only("a" * 64, risk_digest="b" * 64) == "untrusted"
+    assert store.path.read_bytes() == before
 
 
 def test_digest_rejects_symlink_escape(workflow_writer, tmp_path):

@@ -1,0 +1,17 @@
+{
+  "algorithm": "sha256",
+  "contractVersion": 1,
+  "files": [
+    {
+      "path": "workflow-package.json",
+      "sha256": "d70a6e6cbc4978c31567e4ea5f7cc553c1dc3fa1a226938be33a470fab66ec13",
+      "size": 463
+    },
+    {
+      "path": "workflows/triage.yaml",
+      "sha256": "7cc4493b05d8c4efb852354f10ddc8856614d18a10da51fb809b6b4918b640ce",
+      "size": 52
+    }
+  ],
+  "packageDigest": "766d18e8fb1cf20746583258963b631d8885cf5bd04977838d47e44afba2187e"
+}

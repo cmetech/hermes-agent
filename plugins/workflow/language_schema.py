@@ -35,6 +35,7 @@ from plugins.workflow.models import (
     WorkflowLanguageProfile,
     WorkflowLanguageSelection,
 )
+from plugins.workflow.reference_scanner_contract import reference_scanner_contract
 
 
 _DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -112,6 +113,12 @@ CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
     "definition_schema": 160_000,
     "node_kinds": 72_000,
     "compatibility_codes": 19_000,
+})
+REFERENCE_SCANNER_CONTRACT_READER_VERSION = 3
+REFERENCE_SCANNER_CONTRACT_MAX_BYTES = 328_000
+REFERENCE_SCANNER_CONTRACT_SECTION_MAX_BYTES = MappingProxyType({
+    **CONTRACT_SECTION_MAX_BYTES,
+    "reference_scanner_v1": 32_000,
 })
 _NO_DEFAULT = object()
 WHEN_REFERENCE_PATTERN = r"\$([\w.:-]+)\.output(?:\.[\w.-]+)*"
@@ -640,6 +647,9 @@ class InterpolationSurfaceSpec:
     phase4_only: bool = False
     value_discriminator: InterpolationValueDiscriminatorSpec | None = None
     ordered_leaf_paths: tuple[tuple[str, ...], ...] = ()
+    scanner_mode: str = "text"
+    caller_policy: str = "text-references"
+    authenticated_body_source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2272,12 +2282,19 @@ _INTERPOLATION_SURFACE_INVENTORY = (
         "authored-value",
         "reference-template",
         ("when",),
+        scanner_mode="condition",
+        caller_policy="condition-validation",
     ),
     InterpolationSurfaceSpec(
         ("prompt",), frozenset({"prompt"}), "authored-value", "reference-template"
     ),
     InterpolationSurfaceSpec(
-        ("bash",), frozenset({"bash"}), "authored-value", "reference-template"
+        ("bash",),
+        frozenset({"bash"}),
+        "authored-value",
+        "reference-template",
+        scanner_mode="bash",
+        caller_policy="bash-references",
     ),
     InterpolationSurfaceSpec(
         ("script",),
@@ -2285,6 +2302,7 @@ _INTERPOLATION_SURFACE_INVENTORY = (
         "inline-or-authenticated-script-body",
         "reference-template-if-inline-otherwise-literal-resource-name",
         value_discriminator=_SCRIPT_INLINE_VALUE_DISCRIMINATOR,
+        authenticated_body_source="named_script_bodies",
     ),
     InterpolationSurfaceSpec(
         ("loop", "prompt"),
@@ -2299,6 +2317,8 @@ _INTERPOLATION_SURFACE_INVENTORY = (
         "authored-value",
         "reference-template",
         ("until_bash",),
+        scanner_mode="bash",
+        caller_policy="bash-references",
     ),
     InterpolationSurfaceSpec(
         ("loop", "gate_message"),
@@ -2314,6 +2334,7 @@ _INTERPOLATION_SURFACE_INVENTORY = (
         "authenticated-command-body",
         "literal-resource-name",
         phase4_only=True,
+        authenticated_body_source="command_bodies",
     ),
     InterpolationSurfaceSpec(
         ("approval", "message"),
@@ -2334,6 +2355,7 @@ _INTERPOLATION_SURFACE_INVENTORY = (
         frozenset({"command"}),
         "authenticated-command-body",
         "literal-resource-name",
+        authenticated_body_source="command_bodies",
     ),
     InterpolationSurfaceSpec(
         ("loop_group", "until_bash"),
@@ -2341,6 +2363,8 @@ _INTERPOLATION_SURFACE_INVENTORY = (
         "authored-value",
         "reference-template",
         ("until_bash",),
+        scanner_mode="bash",
+        caller_policy="bash-references",
     ),
     InterpolationSurfaceSpec(
         ("loop_group", "gate_message"),
@@ -2501,6 +2525,131 @@ def iter_interpolation_surface_templates(
             yield _interpolation_path_text(
                 (*surface.field_path[:prefix_length], *concrete)
             ), template
+
+
+def _reference_scanner_scope_policy(
+    surface: InterpolationSurfaceSpec,
+    scope: str,
+) -> tuple[str, str, bool]:
+    if scope == "body":
+        return (
+            ("body-when" if surface.scanner_mode == "condition" else surface.scanner_mode),
+            {
+                "condition": "body-when",
+                "bash": "body-bash-references",
+                "text": "body-text-references",
+            }[surface.scanner_mode],
+            True,
+        )
+    if scope == "group-control":
+        if surface.scanner_mode == "bash":
+            return "bash", "group-until-bash-references", True
+        return "text", "group-gate-text-references", False
+    return (
+        ("condition-v3" if surface.scanner_mode == "condition" else surface.scanner_mode),
+        {
+            "condition": "root-condition-v3",
+            "bash": "root-bash-references",
+            "text": "root-text-references",
+        }[surface.scanner_mode],
+        False,
+    )
+
+
+def reference_scanner_interpolation_surface() -> dict[str, object]:
+    """Project the complete root, body and group-control scanner inventory."""
+    fields: list[dict[str, object]] = []
+    groups: list[dict[str, object]] = []
+    discriminators: dict[str, dict[str, object]] = {}
+
+    for surface in _INTERPOLATION_SURFACE_INVENTORY:
+        relative_path = _interpolation_path_text(surface.field_path)
+        leaf_paths = surface.ordered_leaf_paths or ((),)
+        if surface.field_path[0] == "loop_group":
+            scope_specs = (("group-control", "nodes[]", ("loop_group",)),)
+        else:
+            scope_specs = (
+                ("root", "nodes[]", tuple(sorted(surface.node_types))),
+                (
+                    "body",
+                    "nodes[].loop_group.nodes[]",
+                    tuple(sorted(surface.node_types.intersection(NODE_TYPES))),
+                ),
+            )
+
+        group_scopes: list[dict[str, object]] = []
+        for scope, prefix, node_types in scope_specs:
+            scanner_mode, caller_policy, previous_outputs = (
+                _reference_scanner_scope_policy(surface, scope)
+            )
+            group_scopes.append({
+                "scope": scope,
+                "node_types": list(node_types),
+            })
+            for leaf_path in leaf_paths:
+                leaf_text = _interpolation_path_text(leaf_path)
+                projected_relative_path = (
+                    f"{relative_path}.{leaf_text}" if leaf_text else relative_path
+                )
+                field: dict[str, object] = {
+                    "scope": scope,
+                    "relative_path": projected_relative_path,
+                    "field_path": f"{prefix}.{projected_relative_path}",
+                    "node_types": list(node_types),
+                    "scanner_mode": scanner_mode,
+                    "caller_policy": caller_policy,
+                    "previous_outputs": previous_outputs,
+                    "template_source": surface.value_source,
+                    "authored_value": surface.authored_value,
+                }
+                if surface.phase4_only:
+                    field["phase4_only"] = True
+                if surface.authenticated_body_source is not None:
+                    field["authenticated_body_source"] = (
+                        surface.authenticated_body_source
+                    )
+                if surface.value_discriminator is not None:
+                    field["value_discriminator"] = surface.value_discriminator.id
+                fields.append(field)
+
+        group: dict[str, object] = {
+            "relative_path": relative_path,
+            "lookup_path": list(surface.lookup_path),
+            "ordered_leaf_paths": [
+                _interpolation_path_text(path)
+                for path in surface.ordered_leaf_paths
+            ],
+            "scopes": group_scopes,
+        }
+        if surface.value_discriminator is not None:
+            discriminator = surface.value_discriminator
+            group["value_discriminator"] = discriminator.id
+            discriminators[discriminator.id] = {
+                "operation": discriminator.operation,
+                "codepoint_ranges": [
+                    list(bounds) for bounds in discriminator.codepoint_ranges
+                ],
+                "characters": discriminator.characters,
+                "match": discriminator.match,
+                "otherwise": discriminator.otherwise,
+            }
+        groups.append(group)
+
+    return {
+        "version": 1,
+        "field_defaults": {"phase4_only": False},
+        "fields": fields,
+        "groups": groups,
+        "traversal": {
+            "record_order": "inventory",
+            "mapping_container_order": "authored",
+            "sequence_container_order": "authored",
+            "leaf_order": "ordered_leaf_paths",
+            "nested_container_order": "container-major",
+        },
+        "value_discriminators_v1": discriminators,
+        "unlisted_authored_string_fields": "literal",
+    }
 
 
 def phase6_interpolation_surface() -> dict[str, object]:
@@ -4149,25 +4298,35 @@ def semantic_rule_descriptors(
                         "Every output reference names a direct dependency and uses "
                         "the closed ASCII node and path grammar."
                     ),
-                    "field_paths": [
-                        "nodes[].when",
-                        "nodes[].prompt",
-                        "nodes[].bash",
-                        "nodes[].script",
-                        "nodes[].command",
-                        "nodes[].loop.prompt",
-                        *(
-                            [
-                                "nodes[].loop.command",
-                                "nodes[].loop.gate_message",
+                    "field_paths": (
+                        [
+                            field["field_path"]
+                            for field in reference_scanner_interpolation_surface()[
+                                "fields"
                             ]
-                            if phase4
-                            else []
-                        ),
-                        "nodes[].loop.until_bash",
-                        "nodes[].approval.message",
-                        "nodes[].approval.on_reject.prompt",
-                    ],
+                            if field["scope"] == "root"
+                        ]
+                        if selected_version == 6
+                        else [
+                            "nodes[].when",
+                            "nodes[].prompt",
+                            "nodes[].bash",
+                            "nodes[].script",
+                            "nodes[].command",
+                            "nodes[].loop.prompt",
+                            *(
+                                [
+                                    "nodes[].loop.command",
+                                    "nodes[].loop.gate_message",
+                                ]
+                                if phase4
+                                else []
+                            ),
+                            "nodes[].loop.until_bash",
+                            "nodes[].approval.message",
+                            "nodes[].approval.on_reject.prompt",
+                        ]
+                    ),
                     "applicability": definition_applicability,
                     "status": "supported",
                     "parameters": {
@@ -4443,14 +4602,48 @@ def _contract_digest(envelope: dict[str, object]) -> str:
     return f"sha256:{sha256(canonical).hexdigest()}"
 
 
+def _uses_reference_scanner_contract(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> bool:
+    return (
+        profile is WorkflowLanguageProfile.ARCHON_2026_07
+        and normalizer_version == 6
+    )
+
+
+def _contract_publication_limits(
+    profile: WorkflowLanguageProfile,
+    normalizer_version: int,
+) -> tuple[int, int, Mapping[str, int]]:
+    if _uses_reference_scanner_contract(profile, normalizer_version):
+        return (
+            REFERENCE_SCANNER_CONTRACT_READER_VERSION,
+            REFERENCE_SCANNER_CONTRACT_MAX_BYTES,
+            REFERENCE_SCANNER_CONTRACT_SECTION_MAX_BYTES,
+        )
+    return CONTRACT_READER_VERSION, CONTRACT_MAX_BYTES, CONTRACT_SECTION_MAX_BYTES
+
+
 def _require_contract_bounds(contract: Mapping[str, object]) -> None:
+    try:
+        profile = WorkflowLanguageProfile(contract["profile"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("workflow authoring contract profile is invalid") from exc
+    normalizer_version = contract.get("normalizer_version")
+    if isinstance(normalizer_version, bool) or not isinstance(normalizer_version, int):
+        raise ValueError("workflow authoring contract normalizer version is invalid")
+    _reader_version, max_bytes, section_limits = _contract_publication_limits(
+        profile,
+        normalizer_version,
+    )
     total_bytes = len(canonical_contract_json(contract).encode())
-    usable_bytes = CONTRACT_MAX_BYTES - CONTRACT_RESERVED_GROWTH_BYTES
+    usable_bytes = max_bytes - CONTRACT_RESERVED_GROWTH_BYTES
     if total_bytes > usable_bytes:
         raise ValueError(
             f"workflow authoring contract exceeds {usable_bytes} bytes"
         )
-    for section, maximum in CONTRACT_SECTION_MAX_BYTES.items():
+    for section, maximum in section_limits.items():
         section_bytes = len(canonical_contract_json(contract[section]).encode())
         if section_bytes > maximum:
             raise ValueError(
@@ -4545,9 +4738,13 @@ def workflow_authoring_contract(
         for node_kind in node_kinds
         for field in node_kind["fields"]
     )
+    scanner_contract = _uses_reference_scanner_contract(selected, selected_version)
+    reader_version, max_contract_bytes, section_limits = (
+        _contract_publication_limits(selected, selected_version)
+    )
     envelope: dict[str, object] = {
         "schema_version": 1,
-        "contract_reader_version": CONTRACT_READER_VERSION,
+        "contract_reader_version": reader_version,
         "editor_projection_version": EDITOR_PROJECTION_VERSION,
         "profile": selected.value,
         "normalizer_version": selected_version,
@@ -4572,11 +4769,30 @@ def workflow_authoring_contract(
             selected,
             normalizer_version=selected_version,
         ),
+        **(
+            {
+                "reference_scanner_v1": reference_scanner_contract(
+                    grammar={
+                        "node_id": ARCHON_V3_NODE_ID_PATTERN,
+                        "path_segment": ARCHON_V3_OUTPUT_PATH_SEGMENT_PATTERN,
+                        "ordinary_reference": ARCHON_V3_OUTPUT_REFERENCE_PATTERN,
+                        "ecmascript_ordinary_reference": (
+                            ECMASCRIPT_ARCHON_V3_OUTPUT_REFERENCE_PATTERN
+                        ),
+                    },
+                    interpolation_surface=(
+                        reference_scanner_interpolation_surface()
+                    ),
+                )
+            }
+            if scanner_contract
+            else {}
+        ),
         "limits": {
             "max_document_bytes": MAX_WORKFLOW_DOCUMENT_BYTES,
-            "max_contract_bytes": CONTRACT_MAX_BYTES,
+            "max_contract_bytes": max_contract_bytes,
             "reserved_growth_bytes": CONTRACT_RESERVED_GROWTH_BYTES,
-            "section_max_bytes": dict(CONTRACT_SECTION_MAX_BYTES),
+            "section_max_bytes": dict(section_limits),
         },
         "x-hermes-provenance": {
             "producer": "hermes-agent",
