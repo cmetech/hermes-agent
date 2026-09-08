@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 from pathlib import Path
 import secrets
 import shutil
@@ -16,6 +16,7 @@ import tempfile
 
 # Standalone scripts do not otherwise have the repository on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.workflow_gate_clis import regular_file, unique_object
 from tools.managed_process import ManagedProcessTree
 
 
@@ -133,24 +134,42 @@ def local_playwright(source):
     """No npm/npx discovery: only the named local package's contained CLI."""
     for modules in (source / "apps/desktop/node_modules", source / "node_modules"):
         package = modules / "@playwright/test"
-        if not package.exists():
+        if not package.exists() and not package.is_symlink():
             continue
-        package_root = package.resolve(strict=True)
-        if not package_root.is_relative_to(modules.resolve(strict=True)):
-            raise RuntimeError("local Playwright package escapes its dependency root")
-        manifest_path = package_root / "package.json"
-        cli_path = package_root / "cli.js"
-        for path in (manifest_path, cli_path):
-            if not stat.S_ISREG(path.lstat().st_mode):
+        dependency_root = modules.resolve(strict=True)
+        parent = package
+        while parent != modules:
+            if not stat.S_ISDIR(parent.lstat().st_mode):
                 raise RuntimeError(
-                    "local Playwright identity must be a regular non-symlink file"
+                    "local Playwright package path must contain only directories"
                 )
-            if not path.resolve(strict=True).is_relative_to(package_root):
-                raise RuntimeError("local Playwright identity escapes its package")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or manifest.get("name") != "@playwright/test":
-            raise RuntimeError("invalid local Playwright executable")
-        return cli_path.resolve(strict=True)
+            parent = parent.parent
+        package_root = package.resolve(strict=True)
+        if not package_root.is_relative_to(dependency_root):
+            raise RuntimeError("local Playwright package escapes its dependency root")
+        try:
+            manifest_path = regular_file(package / "package.json")
+            cli_path = regular_file(package / "cli.js")
+        except ValueError as error:
+            raise RuntimeError("local Playwright identity is invalid") from error
+        if not manifest_path.is_relative_to(
+            package_root
+        ) or not cli_path.is_relative_to(package_root):
+            raise RuntimeError("local Playwright identity escapes its package")
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=unique_object,
+        )
+        declared = manifest.get("bin") if isinstance(manifest, dict) else None
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("name") != "@playwright/test"
+            or manifest.get("version") != "1.62.1"
+            or not isinstance(declared, dict)
+            or declared.get("playwright") != "cli.js"
+        ):
+            raise RuntimeError("local Playwright package identity does not match")
+        return cli_path
     raise RuntimeError(
         "local Playwright executable is unavailable; no package-runner fallback"
     )

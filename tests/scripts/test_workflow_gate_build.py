@@ -1,8 +1,11 @@
 """Platform policy tests use injected APIs, never a counterfeit host OS."""
 
-from pathlib import Path
+import json
+import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,6 +14,25 @@ import psutil
 
 from scripts import workflow_gate_build as build
 from tools.managed_process import ManagedProcessTree, ProcessIdentity
+
+
+PLAYWRIGHT_MANIFEST = {
+    "name": "@playwright/test",
+    "version": "1.62.1",
+    "bin": {"playwright": "cli.js"},
+}
+
+
+def _write_playwright_package(
+    root: Path, *, cli_source: str = "process.exit(0);\n"
+) -> Path:
+    package = root / "node_modules/@playwright/test"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text(
+        json.dumps(PLAYWRIGHT_MANIFEST), encoding="utf-8"
+    )
+    (package / "cli.js").write_text(cli_source, encoding="utf-8")
+    return package
 
 
 def test_systemd_builder_reports_absence_instead_of_unwrapped_authority(monkeypatch):
@@ -338,12 +360,9 @@ def test_spawn_retains_new_session_after_leader_exits_before_capture(
     ],
 )
 def test_local_playwright_requires_regular_contained_identity_files(tmp_path, identity):
-    package = tmp_path / "node_modules/@playwright/test"
-    package.mkdir(parents=True)
+    package = _write_playwright_package(tmp_path)
     manifest = package / "package.json"
     cli = package / "cli.js"
-    manifest.write_text('{"name":"@playwright/test"}', encoding="utf-8")
-    cli.write_text("process.exit(0);", encoding="utf-8")
     target = cli if identity.startswith("cli-") else manifest
     if identity.endswith("link"):
         destination = (package if "contained" in identity else tmp_path) / "actual"
@@ -370,15 +389,115 @@ def test_local_playwright_requires_regular_contained_identity_files(tmp_path, id
             build.local_playwright(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("identity", "manifest"),
+    [
+        (
+            "missing-version",
+            '{"name":"@playwright/test","bin":{"playwright":"cli.js"}}',
+        ),
+        (
+            "wrong-version",
+            '{"name":"@playwright/test","version":"0.0.0","bin":{"playwright":"cli.js"}}',
+        ),
+        ("missing-bin", '{"name":"@playwright/test","version":"1.62.1"}'),
+        (
+            "wrong-bin",
+            '{"name":"@playwright/test","version":"1.62.1","bin":{"playwright":"elsewhere.js"}}',
+        ),
+        (
+            "alternate-bin-target",
+            '{"name":"@playwright/test","version":"1.62.1","bin":{"playwright":"./cli.js"}}',
+        ),
+        (
+            "duplicate-name",
+            '{"name":"foreign","name":"@playwright/test","version":"1.62.1","bin":{"playwright":"cli.js"}}',
+        ),
+        (
+            "duplicate-version",
+            '{"name":"@playwright/test","version":"0.0.0","version":"1.62.1","bin":{"playwright":"cli.js"}}',
+        ),
+        (
+            "duplicate-bin",
+            '{"name":"@playwright/test","version":"1.62.1","bin":{"other":"elsewhere.js"},"bin":{"playwright":"cli.js"}}',
+        ),
+        (
+            "non-object-bin",
+            '{"name":"@playwright/test","version":"1.62.1","bin":"cli.js"}',
+        ),
+        (
+            "alternate-bin",
+            '{"name":"@playwright/test","version":"1.62.1","bin":{"playwright-test":"cli.js"}}',
+        ),
+    ],
+)
+def test_local_playwright_rejects_unproven_manifest_identity(
+    tmp_path, identity, manifest
+):
+    package = _write_playwright_package(tmp_path)
+    (package / "package.json").write_text(manifest, encoding="utf-8")
+
+    with pytest.raises((OSError, RuntimeError, ValueError)) as failure:
+        build.local_playwright(tmp_path)
+
+    assert len(str(failure.value)) <= 120, identity
+    assert "0.0.0" not in str(failure.value)
+    assert "elsewhere.js" not in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["package-contained-link", "scope-contained-link", "scope-escaping-link"],
+)
+def test_local_playwright_rejects_linked_package_directory_chain(tmp_path, identity):
+    package = _write_playwright_package(tmp_path)
+    modules = tmp_path / "node_modules"
+    scope = modules / "@playwright"
+    if identity == "package-contained-link":
+        destination = modules / "actual-playwright-test"
+        package.rename(destination)
+        package.symlink_to(destination, target_is_directory=True)
+    else:
+        destination = (
+            modules / "actual-playwright-scope"
+            if identity == "scope-contained-link"
+            else tmp_path / "outside-playwright-scope"
+        )
+        scope.rename(destination)
+        scope.symlink_to(destination, target_is_directory=True)
+
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        build.local_playwright(tmp_path)
+
+
+def test_local_playwright_rejects_zero_exit_canary_before_launch(tmp_path):
+    marker = tmp_path / "canary-ran"
+    package = _write_playwright_package(
+        tmp_path,
+        cli_source=(
+            "require('node:fs').writeFileSync(process.env.PLAYWRIGHT_CANARY, "
+            "'executed');\n"
+        ),
+    )
+    (package / "package.json").write_text(
+        '{"name":"@playwright/test","version":"0.0.0-review",'
+        '"bin":{"playwright":"alternate.js"}}',
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["PLAYWRIGHT_CANARY"] = str(marker)
+
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        executable = build.local_playwright(tmp_path)
+        subprocess.run([shutil.which("node"), str(executable)], env=env, check=True)
+
+    assert not marker.exists()
+
+
 @pytest.mark.macos_only if sys.platform == "darwin" else pytest.mark.linux_only
 @pytest.mark.parametrize("name", ["package.json", "cli.js"])
 def test_local_playwright_rejects_fifo_before_reading(tmp_path, monkeypatch, name):
-    package = tmp_path / "node_modules/@playwright/test"
-    package.mkdir(parents=True)
-    (package / "package.json").write_text(
-        '{"name":"@playwright/test"}', encoding="utf-8"
-    )
-    (package / "cli.js").write_text("process.exit(0);", encoding="utf-8")
+    package = _write_playwright_package(tmp_path)
     target = package / name
     target.unlink()
     getattr(build.os, "mkfifo")(target)
@@ -419,13 +538,8 @@ def test_gate_cleanup_waits_for_immediate_parent_lingering_descendant(
         .decode("ascii")
         .strip()
     )
-    package = source / "node_modules/@playwright/test"
-    package.mkdir(parents=True)
+    _write_playwright_package(source)
     (source / "apps/desktop/node_modules").mkdir(parents=True)
-    (package / "package.json").write_text(
-        '{"name":"@playwright/test"}', encoding="utf-8"
-    )
-    (package / "cli.js").write_text("process.exit(0);\n", encoding="utf-8")
     descendant_file = tmp_path / "descendant.pid"
     executable = tmp_path / "npm"
     executable.write_text(

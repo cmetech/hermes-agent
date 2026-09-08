@@ -145,7 +145,15 @@ def _parser_package_lock(name: str = "gate-fixture") -> dict[str, object]:
 def _write_parser_dependencies(root: Path) -> None:
     playwright = root / "node_modules/@playwright/test"
     playwright.mkdir(parents=True, exist_ok=True)
-    (playwright / "package.json").write_text('{"name":"@playwright/test"}\n', encoding="utf-8")
+    (playwright / "package.json").write_text(
+        json.dumps({
+            "name": "@playwright/test",
+            "version": "1.62.1",
+            "bin": {"playwright": "cli.js"},
+        })
+        + "\n",
+        encoding="utf-8",
+    )
     (playwright / "cli.js").write_text(
         "const fs = require('node:fs');\n"
         "if (process.env.CAPTURE_LOG) fs.appendFileSync(process.env.CAPTURE_LOG, ['playwright', ...process.argv.slice(2)].join('\\t') + '\\n');\n"
@@ -399,6 +407,32 @@ def _exercise_base_gate(tmp_path: Path, build_mode: str | None = None) -> tuple[
             target.write_text("[]", encoding="utf-8")
         elif identity == "manifest-wrong-name":
             target.write_text('{"name":"foreign"}', encoding="utf-8")
+        elif identity == "manifest-wrong-version":
+            manifest = json.loads(target.read_text(encoding="utf-8"))
+            manifest["version"] = "0.0.0-review"
+            target.write_text(json.dumps(manifest), encoding="utf-8")
+        elif identity == "manifest-wrong-bin":
+            manifest = json.loads(target.read_text(encoding="utf-8"))
+            manifest["bin"] = {"playwright": "alternate.js"}
+            target.write_text(json.dumps(manifest), encoding="utf-8")
+        elif identity == "manifest-duplicate-version":
+            target.write_text(
+                '{"name":"@playwright/test","version":"0.0.0-review",'
+                '"version":"1.62.1","bin":{"playwright":"cli.js"}}',
+                encoding="utf-8",
+            )
+        elif identity == "zero-exit-canary":
+            target.write_text(
+                '{"name":"@playwright/test","version":"0.0.0-review",'
+                '"bin":{"playwright":"alternate.js"}}',
+                encoding="utf-8",
+            )
+            (package / "cli.js").write_text(
+                "const fs = require('node:fs');\n"
+                "fs.appendFileSync(process.env.CAPTURE_LOG, 'playwright-canary\\n');\n"
+                "process.exit(0);\n",
+                encoding="utf-8",
+            )
         elif identity == "package-escape":
             outside = tmp_path / "outside-package"
             package.rename(outside)
@@ -621,6 +655,10 @@ def test_base_gate_missing_local_playwright_never_uses_package_runner_fallback(t
         "manifest-malformed",
         "manifest-list",
         "manifest-wrong-name",
+        "manifest-wrong-version",
+        "manifest-wrong-bin",
+        "manifest-duplicate-version",
+        "zero-exit-canary",
         "manifest-missing",
         "cli-missing",
         "manifest-directory",
@@ -635,7 +673,7 @@ def test_base_gate_invalid_playwright_identity_suppresses_build_and_receipt(
     assert result.returncode != 0
     assert "TESTED_BASE_SHA=" not in result.stdout
     assert not any(
-        command[0] in {"build-root", "playwright"}
+        command[0] in {"build-root", "playwright", "playwright-canary"}
         or command[:2] == ["npx", "playwright"]
         for command in commands
     )
