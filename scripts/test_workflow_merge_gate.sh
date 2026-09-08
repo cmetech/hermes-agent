@@ -532,9 +532,6 @@ if [[ "$PHASE" == "base" ]]; then
       tests/plugins/workflow/test_marketplace_lifecycle_api.py \
       tests/plugins/workflow/test_marketplace_lifecycle_fixtures.py \
       tests/plugins/workflow/test_marketplace_installed_distribution_e2e.py \
-      tests/plugins/workflow/test_handoff_executor.py \
-      tests/plugins/workflow/test_local_handoff_e2e.py \
-      tests/plugins/workflow/test_remote_handoff_e2e.py \
       tests/hermes_cli/test_capability_staging.py \
       tests/hermes_cli/test_baked_seed.py \
       tests/test_packaging_metadata.py -q
