@@ -135,8 +135,8 @@ export function MarketplacePackageDetail({
       <header>
         {lastObserved ? <p role="status">{copy.workflowMarketplaceLastObservedRefreshing}</p> : null}
         <div className="flex flex-wrap items-start justify-between gap-2">
-          <div className="min-w-0">
-            <h2 className="text-lg font-medium text-(--ui-text-primary)">{detail.display_name}</h2>
+          <div className="min-w-0 flex-1">
+            <h2 className="break-all text-lg font-medium text-(--ui-text-primary)">{detail.display_name}</h2>
             <p className="break-all font-mono text-[0.6875rem] text-(--ui-text-tertiary)">{detail.identifier}</p>
           </div>
           <span className="flex flex-wrap gap-1">
@@ -202,11 +202,11 @@ export function MarketplacePackageDetail({
         <h3 className="text-xs font-medium text-(--ui-text-primary)">{copy.workflowMarketplaceCandidateIdentity}</h3>
         <dl className="mt-1 grid grid-cols-[minmax(6rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
           <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplacePublisher}</dt>
-          <dd>{detail.publisher}</dd>
+          <dd className="min-w-0 break-all">{detail.publisher}</dd>
           <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceLicense}</dt>
-          <dd>{detail.license}</dd>
+          <dd className="min-w-0 break-all">{detail.license}</dd>
           <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceSource}</dt>
-          <dd>{detail.source_name}</dd>
+          <dd className="min-w-0 break-all">{detail.source_name}</dd>
           <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceRepository}</dt>
           <dd className="min-w-0 break-all">
             {repositoryHref ? (
@@ -241,7 +241,7 @@ export function MarketplacePackageDetail({
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledVersionLabel}</dt>
             <dd>{installed.version}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledSource}</dt>
-            <dd>{installed.source_name}</dd>
+            <dd className="min-w-0 break-all">{installed.source_name}</dd>
             <dt className="text-(--ui-text-tertiary)">{copy.workflowMarketplaceInstalledRepository}</dt>
             <dd className="min-w-0 break-all">
               {installedRepositoryHref ? (

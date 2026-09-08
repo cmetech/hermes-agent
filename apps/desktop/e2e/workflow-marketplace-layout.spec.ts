@@ -4,25 +4,37 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import type { Locator } from '@playwright/test'
+
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
 import { expect, test } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
+const LONG_PACKAGE_DISPLAY_NAME = 'OperationalAutomationPackageIdentifier'.repeat(3)
+const LONG_PACKAGE_PUBLISHER = 'CorporateAutomationEngineeringDivision'.repeat(3)
 
 function prepareSource(hermesHome: string): void {
   const repository = path.join(path.dirname(hermesHome), 'marketplace-source')
   const python = path.join(REPO_ROOT, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
 
   const generate = String.raw`
+import json
 import sys
 from pathlib import Path
 
-from tests.plugins.workflow.test_marketplace_service import _write_index, _write_package
+from tests.plugins.workflow.test_marketplace_service import _publish, _write_index, _write_package
 
 repository = Path(sys.argv[1])
 repository.mkdir(parents=True)
 _write_package(repository, "laptop-support", version="1.2.3")
+package_root = repository / "packages" / "laptop-support"
+manifest_path = package_root / "workflow-package.json"
+manifest = json.loads(manifest_path.read_bytes())
+manifest["displayName"] = ${JSON.stringify(LONG_PACKAGE_DISPLAY_NAME)}
+manifest["publisher"] = ${JSON.stringify(LONG_PACKAGE_PUBLISHER)}
+manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+_publish(package_root)
 _write_index(repository)
 `
 
@@ -76,6 +88,65 @@ async function setContentSize(fixture: MockBackendFixture, width: number, height
   )
 }
 
+async function setZoomPercent(fixture: MockBackendFixture, percent: 100 | 200): Promise<void> {
+  await fixture.page.evaluate(value => {
+    const desktop = window as unknown as {
+      hermesDesktop: { zoom: { setPercent: (nextPercent: number) => void } }
+    }
+
+    desktop.hermesDesktop.zoom.setPercent(value)
+  }, percent)
+}
+
+async function openMarketplace(fixture: MockBackendFixture, locale: 'ar' | 'en') {
+  const page = fixture.page
+  const marketplaceTab = page.getByRole('tab', {
+    name: locale === 'ar' ? 'سوق الحزم' : 'Marketplace',
+    exact: true
+  })
+
+  if (!(await marketplaceTab.isVisible())) {
+    await page.getByRole('button', { name: 'Workflows', exact: true }).first().click()
+  }
+
+  await marketplaceTab.click()
+
+  const back = page.getByRole('button', {
+    name: locale === 'ar' ? 'العودة إلى الحزم' : 'Back to packages',
+    exact: true
+  })
+
+  if (await back.isVisible()) {
+    await back.click()
+  }
+
+  const packageOption = page.getByRole('option', { name: new RegExp(LONG_PACKAGE_DISPLAY_NAME) })
+  await expect(packageOption).toBeVisible({ timeout: 60_000 })
+
+  return packageOption
+}
+
+async function assertContainedReadableText(locator: Locator) {
+  const metrics = await locator.evaluate(element => {
+    const bounds = element.getBoundingClientRect()
+    const container = element.closest('[role="option"]') ?? element.parentElement
+    const containerBounds = container?.getBoundingClientRect()
+
+    return {
+      clientWidth: element.clientWidth,
+      contained:
+        bounds.left >= -1 &&
+        bounds.right <= window.innerWidth + 1 &&
+        (!containerBounds || (bounds.left >= containerBounds.left - 1 && bounds.right <= containerBounds.right + 1)),
+      scrollWidth: element.scrollWidth,
+      visible: bounds.width > 0 && bounds.height > 0
+    }
+  })
+
+  expect(metrics).toMatchObject({ contained: true, visible: true })
+  expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth + 1)
+}
+
 test.describe('Workflow Marketplace responsive browser behavior', () => {
   test.describe.configure({ mode: 'serial', timeout: 180_000 })
 
@@ -114,7 +185,7 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     }
   })
 
-  test('keeps V2 package actions reachable at 320 CSS px, 200% zoom, RTL and reduced motion', async () => {
+  test('keeps V2 package actions reachable at 320 CSS px, 200% zoom and reduced motion', async () => {
     const page = fixture.page
     await page.emulateMedia({ reducedMotion: 'reduce' })
 
@@ -122,7 +193,7 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     await expect(page.getByRole('heading', { name: 'Workflows', exact: true })).toBeVisible()
     await page.getByRole('tab', { name: 'Marketplace', exact: true }).click()
 
-    const packageOption = page.getByRole('option', { name: /Laptop Support/ })
+    const packageOption = page.getByRole('option', { name: new RegExp(LONG_PACKAGE_DISPLAY_NAME) })
     await expect(packageOption).toBeVisible({ timeout: 60_000 })
     const refresh = page.getByRole('button', { name: 'Refresh', exact: true })
     await refresh.click()
@@ -130,7 +201,7 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     await expect(refresh).toHaveAttribute('aria-busy', 'false', { timeout: 60_000 })
     await expect(packageOption).toBeVisible({ timeout: 60_000 })
     await packageOption.click()
-    const detail = page.getByRole('region', { name: 'Laptop Support package details' })
+    const detail = page.getByRole('region', { name: new RegExp(`${LONG_PACKAGE_DISPLAY_NAME} package details`) })
     await expect(detail).toBeVisible({ timeout: 60_000 })
 
     await page.evaluate(() => {
@@ -139,7 +210,6 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
       }
 
       desktop.hermesDesktop.zoom.setPercent(200)
-      document.documentElement.dir = 'rtl'
     })
     await setContentSize(fixture, 640, 900)
     await expect.poll(() => page.evaluate(() => window.innerWidth)).toBe(320)
@@ -152,7 +222,7 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
           document.body.scrollWidth <= window.innerWidth + 1,
         reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches
       }))
-    ).toEqual({ direction: 'rtl', noHorizontalOverflow: true, reducedMotion: true })
+    ).toEqual({ direction: 'ltr', noHorizontalOverflow: true, reducedMotion: true })
 
     const back = page.getByRole('button', { name: 'Back to packages', exact: true })
     const install = page.getByRole('button', { name: 'Install package', exact: true })
@@ -230,5 +300,99 @@ test.describe('Workflow Marketplace responsive browser behavior', () => {
     await expect(detail).toBeVisible()
     await expect(back).toBeVisible()
     await expect(install).toBeFocused()
+  })
+
+  test('reflows complete long list and detail metadata across width, zoom, locale, direction, and theme', async () => {
+    const locales = ['en', 'ar'] as const
+
+    for (const locale of locales) {
+      const localeFixture =
+        locale === 'en'
+          ? fixture
+          : await setupMockBackend({
+              extraDisplayConfig: '  language: ar',
+              prepareHermesHome: prepareSource
+            })
+
+      try {
+        if (locale === 'ar') {
+          await waitForAppReady(localeFixture, 120_000)
+        }
+
+        const page = localeFixture.page
+        await openMarketplace(localeFixture, locale)
+
+        for (const colorScheme of ['light', 'dark'] as const) {
+          await page.evaluate(mode => {
+            localStorage.setItem('hermes-desktop-mode-v1', mode)
+            window.dispatchEvent(new StorageEvent('storage', { key: 'hermes-desktop-mode-v1', newValue: mode }))
+          }, colorScheme)
+          await expect.poll(() => page.evaluate(() => document.documentElement.dataset.hermesMode)).toBe(colorScheme)
+          await expect
+            .poll(() => page.evaluate(() => document.documentElement.classList.contains('dark')))
+            .toBe(colorScheme === 'dark')
+
+          for (const zoom of [100, 200] as const) {
+            await setZoomPercent(localeFixture, zoom)
+
+            for (const width of [320, 768, 1440]) {
+              await setContentSize(localeFixture, width * (zoom / 100), 900)
+              await expect.poll(() => page.evaluate(() => window.innerWidth)).toBe(width)
+
+              const back = page.getByRole('button', {
+                name: locale === 'ar' ? 'العودة إلى الحزم' : 'Back to packages',
+                exact: true
+              })
+
+              if (await back.isVisible()) {
+                await back.click()
+              }
+
+              const packageOption = page.getByRole('option', { name: new RegExp(LONG_PACKAGE_DISPLAY_NAME) })
+              await expect(packageOption).toBeVisible()
+              await assertContainedReadableText(packageOption.getByText(LONG_PACKAGE_DISPLAY_NAME, { exact: true }))
+              await assertContainedReadableText(packageOption.getByText(LONG_PACKAGE_PUBLISHER, { exact: true }))
+              await expect(packageOption).toHaveAccessibleName(
+                `${LONG_PACKAGE_DISPLAY_NAME} company/laptop-support ${LONG_PACKAGE_PUBLISHER}`
+              )
+
+              await packageOption.click()
+              const detail = page.getByRole('region', { name: new RegExp(LONG_PACKAGE_DISPLAY_NAME) })
+              await expect(detail).toBeVisible({ timeout: 60_000 })
+              await assertContainedReadableText(detail.getByRole('heading', { name: LONG_PACKAGE_DISPLAY_NAME }))
+              await assertContainedReadableText(detail.getByText(LONG_PACKAGE_PUBLISHER, { exact: true }))
+
+              const install = page.getByRole('button', {
+                name: locale === 'ar' ? 'تثبيت الحزمة' : 'Install package',
+                exact: true
+              })
+              await install.scrollIntoViewIfNeeded()
+              await expect(install).toBeVisible()
+              await expect(install).toBeInViewport()
+
+              expect(
+                await page.evaluate(() => ({
+                  direction: getComputedStyle(document.documentElement).direction,
+                  language: document.documentElement.lang,
+                  noHorizontalOverflow:
+                    document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1 &&
+                    document.body.scrollWidth <= window.innerWidth + 1,
+                  renderedMode: document.documentElement.dataset.hermesMode
+                }))
+              ).toEqual({
+                direction: locale === 'ar' ? 'rtl' : 'ltr',
+                language: locale,
+                noHorizontalOverflow: true,
+                renderedMode: colorScheme
+              })
+            }
+          }
+        }
+      } finally {
+        if (locale === 'ar') {
+          await localeFixture.cleanup()
+        }
+      }
+    }
   })
 })

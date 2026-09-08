@@ -63,7 +63,7 @@ export function MarketplacePackageList({
 
         return (
           <RowButton
-            aria-label={`${item.display_name} ${item.identifier}`}
+            aria-label={`${item.display_name} ${item.identifier} ${item.publisher}`}
             aria-selected={selected}
             className="w-full rounded-md px-2.5 py-2 text-start outline-none transition-colors hover:bg-(--chrome-action-hover) focus-visible:ring-2 focus-visible:ring-(--ui-accent) data-[selected=true]:bg-(--ui-bg-quaternary)"
             data-marketplace-package={item.identifier}
@@ -90,15 +90,19 @@ export function MarketplacePackageList({
             tabIndex={selected || (!selectedIdentifier && index === 0) ? 0 : -1}
           >
             <span className="flex min-w-0 items-baseline justify-between gap-2">
-              <span className="truncate text-sm font-medium text-(--ui-text-primary)">{item.display_name}</span>
+              <span className="min-w-0 break-all text-sm font-medium text-(--ui-text-primary)">
+                {item.display_name}
+              </span>
               <span className="shrink-0 font-mono text-[0.65rem] text-(--ui-text-tertiary)">v{item.version}</span>
             </span>
             <span className="mt-0.5 block truncate font-mono text-[0.6875rem] text-(--ui-text-secondary)">
               {item.identifier}
             </span>
             <span className="mt-1 block line-clamp-2 text-xs text-(--ui-text-secondary)">{item.description}</span>
-            <span className="mt-1.5 flex flex-wrap items-center gap-1">
-              <Badge variant="muted">{item.publisher}</Badge>
+            <span className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1">
+              <Badge className="max-w-full break-all whitespace-normal" variant="muted">
+                {item.publisher}
+              </Badge>
               {item.tags.map(tag => (
                 <Badge key={tag} size="xs" variant="outline">
                   {tag}

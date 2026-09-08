@@ -93,6 +93,10 @@ const INSTALL_TOKEN = 'install-confirmation-token-value-1234567890'
 const UPDATE_TOKEN = 'update-confirmation-token-value-1234567890'
 const REMOVE_TOKEN = 'remove-confirmation-token-value-1234567890'
 const TRUST_TOKEN = 'trust-confirmation-token-value-1234567890'
+const LONG_PACKAGE_DISPLAY_NAME = 'OperationalAutomationPackageIdentifier'.repeat(3)
+const LONG_PACKAGE_PUBLISHER = 'CorporateAutomationEngineeringDivision'.repeat(3)
+const LONG_PACKAGE_LICENSE = 'EnterpriseAutomationLicenseIdentifier'.repeat(3)
+const LONG_PACKAGE_SOURCE = 'enterprise-automation-source-identifier'.repeat(3)
 const scopeA = { connectionId: 'remote-a', profile: 'support' }
 const originalHasPointerCapture = Element.prototype.hasPointerCapture
 const originalReleasePointerCapture = Element.prototype.releasePointerCapture
@@ -1671,6 +1675,43 @@ describe('WorkflowMarketplaceView', () => {
 })
 
 describe('browse presentation components', () => {
+  it('keeps complete long package identity metadata available to sighted and screen-reader users', () => {
+    renderWithProviders(
+      <>
+        <MarketplacePackageList
+          installedPackages={[]}
+          items={[
+            packageItem({
+              display_name: LONG_PACKAGE_DISPLAY_NAME,
+              publisher: LONG_PACKAGE_PUBLISHER
+            })
+          ]}
+          onSelect={vi.fn()}
+          selectedIdentifier={null}
+        />
+        <MarketplacePackageDetail
+          detail={packageDetail({
+            display_name: LONG_PACKAGE_DISPLAY_NAME,
+            license: LONG_PACKAGE_LICENSE,
+            publisher: LONG_PACKAGE_PUBLISHER,
+            source_name: LONG_PACKAGE_SOURCE
+          })}
+        />
+      </>
+    )
+
+    expect(
+      screen.getByRole('option', {
+        name: `${LONG_PACKAGE_DISPLAY_NAME} company/laptop-support ${LONG_PACKAGE_PUBLISHER}`
+      })
+    ).toBeTruthy()
+    expect(screen.getByRole('heading', { name: LONG_PACKAGE_DISPLAY_NAME })).toBeTruthy()
+    const candidate = screen.getByRole('region', { name: 'Candidate package identity' })
+    expect(within(candidate).getByText(LONG_PACKAGE_PUBLISHER).textContent).toBe(LONG_PACKAGE_PUBLISHER)
+    expect(within(candidate).getByText(LONG_PACKAGE_LICENSE).textContent).toBe(LONG_PACKAGE_LICENSE)
+    expect(within(candidate).getByText(LONG_PACKAGE_SOURCE).textContent).toBe(LONG_PACKAGE_SOURCE)
+  })
+
   it('keeps loose workflows visible while installed provenance loads', async () => {
     const pending = deferred<Awaited<ReturnType<typeof api.installed>>>()
     api.installed.mockReturnValueOnce(pending.promise)
