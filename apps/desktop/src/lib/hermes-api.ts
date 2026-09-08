@@ -72,10 +72,12 @@ async function requestWorkflowApi<T>(request: Parameters<Window['hermesDesktop']
 }
 
 export async function listWorkflowDefinitions(
-  profile: string | null = getApiRequestProfile()
+  profile: string | null = getApiRequestProfile(),
+  connectionId?: string | null
 ): Promise<WorkflowCatalogPage> {
   const catalog = await requestWorkflowApi<WorkflowCatalogPage>({
     path: '/api/plugins/workflow/workflows',
+    ...(connectionId === undefined ? {} : { connectionId }),
     ...profileScoped(profile)
   })
 

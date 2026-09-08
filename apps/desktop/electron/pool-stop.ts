@@ -27,6 +27,7 @@ export interface PoolStopEntry {
 }
 
 export interface PoolStopperDeps {
+  invalidate?: (key: string) => void
   /** The live backend pool. Entries are evicted synchronously on stop. */
   pool: Map<string, PoolStopEntry>
   /** Signal the child (tree/group kill per platform). Synchronous. */
@@ -62,6 +63,7 @@ export function createPoolStopper(deps: PoolStopperDeps): PoolStopper {
 
     // Evict now: routing must not hand out a dying backend. The stop promise
     // below retains the process handle until the bounded exit completes.
+    deps.invalidate?.(key)
     deps.pool.delete(key)
 
     const stopping = (async () => {

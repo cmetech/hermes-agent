@@ -4,6 +4,7 @@ import errno
 import json
 import logging
 import os
+import secrets
 import shutil
 import stat
 import tempfile
@@ -90,6 +91,256 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
 
 
 _IS_WINDOWS = os.name == "nt"
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
+def _raise_unsafe_write_path(path: Path) -> None:
+    raise OSError(errno.ELOOP, "atomic no-follow path is unsafe", str(path))
+
+
+def _validate_no_follow_entry(path: Path, metadata: os.stat_result) -> None:
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        _raise_unsafe_write_path(path)
+
+
+def _validate_no_follow_parent_path(path: Path) -> tuple[int, int]:
+    absolute = Path(os.path.abspath(path))
+    for component in reversed((absolute, *absolute.parents)):
+        metadata = os.lstat(component)
+        _validate_no_follow_entry(component, metadata)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(str(component))
+    metadata = os.lstat(absolute)
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o222 == 0:
+        raise PermissionError(errno.EACCES, "state directory is read-only", str(path))
+    return metadata.st_dev, metadata.st_ino
+
+
+def _open_no_follow_directory(path: Path) -> tuple[int, tuple[int, int]]:
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            metadata = os.fstat(descriptor)
+            _validate_no_follow_entry(absolute, metadata)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise NotADirectoryError(str(absolute))
+        metadata = os.fstat(descriptor)
+        if stat.S_IMODE(metadata.st_mode) & 0o222 == 0:
+            raise PermissionError(
+                errno.EACCES, "state directory is read-only", str(absolute)
+            )
+        return descriptor, (metadata.st_dev, metadata.st_ino)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _same_directory_identity(path: Path, expected: tuple[int, int]) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        return False
+    return (metadata.st_dev, metadata.st_ino) == expected
+
+
+def _open_windows_directory_guard(path: Path):
+    """Hold a no-delete-share directory handle during path-based replacement."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = getattr(ctypes, "windll").kernel32
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80,
+        0x1 | 0x2,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise getattr(ctypes, "WinError")()
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32, handle
+
+
+def _atomic_write_text_no_follow(
+    path: Path,
+    content: str,
+    *,
+    encoding: str,
+    tmp_prefix: str,
+    create_mode: int | None,
+    expected_parent_identity: tuple[int, int] | None,
+) -> None:
+    """Replace one regular file without following or racing its directory path."""
+
+    parent = Path(os.path.abspath(path.parent))
+    target_name = path.name
+    if not target_name or target_name in {".", ".."}:
+        _raise_unsafe_write_path(path)
+
+    if os.name == "posix":
+        parent_descriptor, parent_identity = _open_no_follow_directory(parent)
+        temporary_name: str | None = None
+        try:
+            if (
+                expected_parent_identity is not None
+                and parent_identity != expected_parent_identity
+            ):
+                _raise_unsafe_write_path(parent)
+            try:
+                target_metadata = os.stat(
+                    target_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                target_metadata = None
+            if target_metadata is not None:
+                _validate_no_follow_entry(path, target_metadata)
+                if not stat.S_ISREG(target_metadata.st_mode):
+                    _raise_unsafe_write_path(path)
+                if stat.S_IMODE(target_metadata.st_mode) & 0o222 == 0:
+                    raise PermissionError(
+                        errno.EACCES, "state file is read-only", str(path)
+                    )
+                if (
+                    create_mode is not None
+                    and stat.S_IMODE(target_metadata.st_mode) != create_mode
+                ):
+                    raise PermissionError(
+                        errno.EACCES,
+                        "state file permissions do not match the required mode",
+                        str(path),
+                    )
+            mode = (
+                stat.S_IMODE(target_metadata.st_mode)
+                if target_metadata is not None
+                else create_mode or 0o600
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            for _attempt in range(32):
+                candidate = f"{tmp_prefix}{secrets.token_hex(8)}.tmp"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        flags,
+                        mode,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                temporary_name = candidate
+                break
+            else:
+                raise FileExistsError("could not allocate atomic temporary file")
+            with os.fdopen(descriptor, "w", encoding=encoding) as handle:
+                os.fchmod(handle.fileno(), mode)
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if not _same_directory_identity(parent, parent_identity):
+                _raise_unsafe_write_path(parent)
+            os.replace(
+                temporary_name,
+                target_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            temporary_name = None
+            if not _same_directory_identity(parent, parent_identity):
+                _raise_unsafe_write_path(parent)
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            os.close(parent_descriptor)
+        return
+
+    parent_identity = _validate_no_follow_parent_path(parent)
+    if (
+        expected_parent_identity is not None
+        and parent_identity != expected_parent_identity
+    ):
+        _raise_unsafe_write_path(parent)
+    kernel32, guard = _open_windows_directory_guard(parent)
+    temporary_path: str | None = None
+    try:
+        if not _same_directory_identity(parent, parent_identity):
+            _raise_unsafe_write_path(parent)
+        try:
+            target_metadata = os.lstat(path)
+        except FileNotFoundError:
+            target_metadata = None
+        if target_metadata is not None:
+            _validate_no_follow_entry(path, target_metadata)
+            if not stat.S_ISREG(target_metadata.st_mode):
+                _raise_unsafe_write_path(path)
+            if not os.access(path, os.W_OK):
+                raise PermissionError(
+                    errno.EACCES, "state file is read-only", str(path)
+                )
+        mode = (
+            stat.S_IMODE(target_metadata.st_mode)
+            if target_metadata is not None
+            else create_mode or 0o600
+        )
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=str(parent), prefix=tmp_prefix, suffix=".tmp"
+        )
+        with os.fdopen(descriptor, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not _same_directory_identity(parent, parent_identity):
+            _raise_unsafe_write_path(parent)
+        os.replace(temporary_path, path)
+        temporary_path = None
+        if not _same_directory_identity(parent, parent_identity):
+            _raise_unsafe_write_path(parent)
+        _restore_file_mode(path, mode)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        kernel32.CloseHandle(guard)
+
 
 # Windows rename failures that can be caused by another handle on the target
 # rather than by a permission problem.  ``os.replace`` onto a file that any
@@ -284,6 +535,8 @@ def atomic_write_text(
     tmp_prefix: str = ".tmp_",
     preserve_mode: bool = False,
     create_mode: "int | None" = None,
+    no_follow: bool = False,
+    expected_parent_identity: "tuple[int, int] | None" = None,
 ) -> None:
     """Write *content* to *path* via temp file + fsync + atomic rename.
 
@@ -307,8 +560,27 @@ def atomic_write_text(
         create_mode: Permission bits to apply when the target does not yet
             exist (otherwise the new file keeps mkstemp's 0600).  Never
             applied to an existing file.
+        no_follow: Opt into descriptor-anchored replacement that rejects
+            symbolic links, Windows reparse points, and read-only state rather
+            than following or replacing them. Existing/default behavior is
+            unchanged.
+        expected_parent_identity: Optional ``(device, inode)`` authority
+            captured by the caller before locking. Valid only with
+            ``no_follow=True``.
     """
     path = Path(path)
+    if expected_parent_identity is not None and not no_follow:
+        raise ValueError("expected parent identity requires no-follow mode")
+    if no_follow:
+        _atomic_write_text_no_follow(
+            path,
+            content,
+            encoding=encoding,
+            tmp_prefix=tmp_prefix,
+            create_mode=create_mode,
+            expected_parent_identity=expected_parent_identity,
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
 
     original_mode = _preserve_file_mode(path) if preserve_mode else None

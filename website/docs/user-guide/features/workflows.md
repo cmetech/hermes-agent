@@ -8,6 +8,22 @@ description: "Discover, inspect, trust, run, and operate durable workflow packag
 
 Hermes workflows are durable, resumable packages that coordinate commands, prompts, scripts, approvals, and other supported nodes. The same profile-scoped catalog and run state back the CLI and the Desktop app.
 
+## Install and manage workflow packages
+
+Open **Workflows → Marketplace** to browse verified Git sources and review an
+exact package before confirming installation. Installation and workflow trust
+are separate decisions. Use **Review trust** to grant one workflow or all
+reviewed workflows; changed package bytes require renewed package-associated
+trust. The **Installed** tab supports local removal even if a source is offline.
+
+All actions use the selected backend and profile, including that backend's Git
+authentication. Closing a dialog does not cancel backend work. Last-observed
+metadata stays visibly historical while current state is refreshed; unavailable
+or ambiguous state does not authorize another mutation. See
+[Workflow packages](./workflow-packages.md) for publishing, private sources,
+CLI commands, exact replay, and profile-wide recovery. Doctor is diagnostic;
+`workflow recover-packages` is the explicit transaction recovery command.
+
 ## Language profiles
 
 Existing unversioned packages retain `hermes-legacy` behavior. New packages can

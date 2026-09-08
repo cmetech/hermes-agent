@@ -70,8 +70,8 @@ def test_archon_authoring_contract_is_bounded_and_versioned():
         == "https://json-schema.org/draft/2020-12/schema"
     )
     assert len(language_schema.canonical_contract_json(contract).encode()) <= (
-        language_schema.CONTRACT_MAX_BYTES
-        - language_schema.CONTRACT_RESERVED_GROWTH_BYTES
+        contract["limits"]["max_contract_bytes"]
+        - contract["limits"]["reserved_growth_bytes"]
     )
 
 
@@ -980,7 +980,10 @@ def _padded_contract_value(value, target_bytes):
 
 
 def test_contract_total_bound_accepts_the_exact_boundary_and_rejects_overflow():
-    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=5,
+    )
     boundary = _padded_contract_value(
         contract,
         language_schema.CONTRACT_MAX_BYTES
@@ -1000,7 +1003,10 @@ def test_contract_total_bound_accepts_the_exact_boundary_and_rejects_overflow():
     tuple(language_schema.CONTRACT_SECTION_MAX_BYTES),
 )
 def test_contract_section_bounds_accept_exact_boundaries_and_reject_overflow(section):
-    contract = workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07)
+    contract = workflow_authoring_contract(
+        WorkflowLanguageProfile.ARCHON_2026_07,
+        normalizer_version=5,
+    )
     boundary_section = _padded_contract_value(
         {}, language_schema.CONTRACT_SECTION_MAX_BYTES[section]
     )
@@ -1067,7 +1073,7 @@ def test_editor_projection_version_makes_v1_rejection_and_v2_resolution_explicit
         json.dumps(workflow_authoring_contract(WorkflowLanguageProfile.ARCHON_2026_07))
     )
 
-    assert wire["contract_reader_version"] == 2
+    assert wire["contract_reader_version"] == 3
     assert wire["editor_projection_version"] == 2
     assert wire["contract_reader_version"] > 1  # A v1 reader must reject this envelope.
     first = wire["node_kinds"][0]["fields"][0]
@@ -1247,18 +1253,31 @@ def test_authoring_contract_publishes_a_self_verifying_editor_envelope(profile):
         language_schema.canonical_contract_json(digest_payload).encode()
     ).hexdigest()
 
-    assert contract["contract_reader_version"] == 2
+    expected_reader_version = (
+        2
+        if profile is WorkflowLanguageProfile.HERMES_LEGACY
+        else 3
+    )
+    expected_max_bytes = 288_000 if expected_reader_version == 2 else 328_000
+    expected_sections = {
+        "definition_schema": 160_000,
+        "node_kinds": 72_000,
+        "compatibility_codes": 19_000,
+        **(
+            {"reference_scanner_v1": 32_000}
+            if expected_reader_version == 3
+            else {}
+        ),
+    }
+
+    assert contract["contract_reader_version"] == expected_reader_version
     assert contract["editor_projection_version"] == 2
     assert contract["contract_digest"] == f"sha256:{expected_digest}"
     assert contract["limits"] == {
         "max_document_bytes": 2 * 1024 * 1024,
-        "max_contract_bytes": 288_000,
+        "max_contract_bytes": expected_max_bytes,
         "reserved_growth_bytes": 4_000,
-        "section_max_bytes": {
-            "definition_schema": 160_000,
-            "node_kinds": 72_000,
-            "compatibility_codes": 19_000,
-        },
+        "section_max_bytes": expected_sections,
     }
     assert contract["x-hermes-provenance"]["field_authority"] == (
         "plugins.workflow.language_schema.FIELD_INVENTORY"
@@ -1522,8 +1541,8 @@ def test_archon_condition_contract_projects_runtime_bounds_and_typed_rules():
         "structured_strings_coerce_to_number": False,
     }
     assert len(language_schema.canonical_contract_json(contract).encode()) <= (
-        language_schema.CONTRACT_MAX_BYTES
-        - language_schema.CONTRACT_RESERVED_GROWTH_BYTES
+        contract["limits"]["max_contract_bytes"]
+        - contract["limits"]["reserved_growth_bytes"]
     )
 
 
@@ -2709,5 +2728,19 @@ def test_language_schema_dependency_direction_stays_neutral():
         "typing",
         "plugins.workflow.language",
         "plugins.workflow.models",
+        "plugins.workflow.reference_scanner_contract",
     }
     assert "plugins.workflow.schema" not in imported_modules
+
+    scanner_source = (
+        Path(__file__).parents[3]
+        / "plugins"
+        / "workflow"
+        / "reference_scanner_contract.py"
+    ).read_text(encoding="utf-8")
+    scanner_imports = {
+        node.module
+        for node in ast.walk(ast.parse(scanner_source))
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert scanner_imports <= {"__future__", "collections.abc"}

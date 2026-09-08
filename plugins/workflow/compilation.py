@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType
 
 from plugins.workflow.dependency_manifest import (
@@ -22,6 +22,11 @@ def _source_signature(source: WorkflowSourceDocument) -> str:
         "definition_digest": hashlib.sha256(source.definition_bytes).hexdigest(),
         "definition_location": source.definition_location,
         "name": source.name,
+        "marketplace_binding": (
+            asdict(source.marketplace_binding)
+            if source.marketplace_binding is not None
+            else None
+        ),
         "precedence": source.precedence,
         "sidecar_digest": (
             hashlib.sha256(source.sidecar_bytes).hexdigest()

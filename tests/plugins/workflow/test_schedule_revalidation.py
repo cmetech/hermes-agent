@@ -1082,7 +1082,18 @@ def test_scheduled_user_with_catalog_sized_trust_store_promotes(
     )
     trust = WorkflowTrustStore(home)
     payload = json.loads(trust.path.read_text(encoding="utf-8"))
-    payload["padding"] = "x" * (1024 * 1024)
+    # Fill with valid independent V2 grants, not an unknown top-level field:
+    # strict parsing must continue to reject malformed stores at every size.
+    for index in range(4094):
+        payload["records"][f"{index:064x}"] = {
+            "grants": {
+                "manual": {
+                    "actor": "fixture-" + "x" * 120,
+                    "risk_digest": "a" * 64,
+                    "trusted_at": "2026-09-07T00:00:00Z",
+                }
+            }
+        }
     trust.path.write_text(json.dumps(payload), encoding="utf-8")
     trust.lock_path.unlink()
 

@@ -318,6 +318,10 @@ function normalizeRemoteHeaders(raw) {
     const headerName = String(name || '').trim()
     const lower = headerName.toLowerCase()
 
+    if (lower === 'x-hermes-marketplace-principal-binding') {
+      throw new Error('Reserved workflow marketplace request header.')
+    }
+
     if (!headerName || !REMOTE_HEADER_NAME_RE.test(headerName) || FORBIDDEN_REMOTE_HEADER_NAMES.has(lower)) {
       continue
     }

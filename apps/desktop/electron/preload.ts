@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
+import { subscribeConnectionGeneration } from './connection-generation-event'
+
 // Which translucency the OS can back. Asked synchronously because the renderer
 // needs it before its first paint, and answered by main because deciding it
 // needs `os.release()` — a sandboxed preload may only require electron, events,
@@ -450,6 +452,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:connection:applied', listener)
   },
+  onConnectionGenerationChanged: callback => subscribeConnectionGeneration(ipcRenderer, callback),
   onPowerResume: callback => {
     const listener = () => callback()
     ipcRenderer.on('hermes:power-resume', listener)

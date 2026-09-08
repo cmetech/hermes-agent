@@ -41,6 +41,7 @@ const registry: DesktopConnectionsRegistry = {
 
 beforeEach(() => {
   $connection.set({
+    connectionGeneration: 1,
     baseUrl: 'http://homelab.lan:9119',
     connectionId: 'homelab',
     isFullscreen: false,

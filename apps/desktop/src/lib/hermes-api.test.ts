@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setApiRequestProfile } from '@/hermes'
 
 interface WorkflowApiModule {
-  listWorkflowDefinitions: (profile?: string | null) => Promise<unknown>
+  listWorkflowDefinitions: (profile?: string | null, connectionId?: string | null) => Promise<unknown>
   preflightWorkflow: (
     name: string,
     source: 'profile' | 'project' | 'showcase',
@@ -109,6 +109,20 @@ describe('workflow catalog authenticated API', () => {
       'profile-a'
     ])
   })
+
+  it.each(['remote-origin', null])(
+    'keeps the captured catalog connection %s alongside its profile',
+    async connectionId => {
+      setApiRequestProfile('profile-b')
+      const { listWorkflowDefinitions } = await workflowApi()
+      await listWorkflowDefinitions('profile-a', connectionId)
+      expect(apiStructured).toHaveBeenCalledWith({
+        path: '/api/plugins/workflow/workflows',
+        profile: 'profile-a',
+        connectionId
+      })
+    }
+  )
 
   it('preflights an encoded workflow name with GET semantics', async () => {
     const detail = { name: 'deploy safe' }

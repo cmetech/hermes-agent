@@ -1,0 +1,215 @@
+{
+  "operationCases": [
+    {
+      "accepted": true,
+      "name": "service inspect",
+      "value": {
+        "created_at": "2026-09-05T12:00:00Z",
+        "error": null,
+        "finished_at": "2026-09-05T12:00:00Z",
+        "id": "wmop_62e05a9a7e00_00000000000000000000000000000bb9",
+        "kind": "package_detail",
+        "phase": "completed",
+        "profile": "support",
+        "progress": 100,
+        "result": {
+          "type": "package_detail",
+          "value": {
+            "advisories": [
+              {
+                "code": "legacy_language_profile",
+                "message": "workflow uses permissive Hermes legacy language semantics",
+                "severity": "advisory"
+              },
+              {
+                "code": "missing_runtime",
+                "message": "destination does not currently provide runtime 'uv'",
+                "severity": "advisory"
+              },
+              {
+                "code": "missing_secret",
+                "message": "destination does not currently provide secret 'SUPPORT_TOKEN'",
+                "severity": "advisory"
+              },
+              {
+                "code": "missing_tool",
+                "message": "destination does not currently provide tool 'git'",
+                "severity": "advisory"
+              }
+            ],
+            "blockers": [],
+            "configured_ref": null,
+            "contract_version": 1,
+            "description": "laptop-support package",
+            "display_name": "Laptop Support",
+            "external_requirements": {
+              "providers": [],
+              "runtimes": [
+                "uv"
+              ],
+              "secrets": [
+                "SUPPORT_TOKEN"
+              ],
+              "services": [],
+              "tools": [
+                "git"
+              ]
+            },
+            "id": "laptop-support",
+            "identifier": "company/laptop-support",
+            "identity": {
+              "package_id": "laptop-support",
+              "source_key": "company"
+            },
+            "install_status": "not_installed",
+            "installed": null,
+            "license": "MIT",
+            "package_digest": "a430672aca08ad77c25f03e1c57bf39bef255c3a14d59a6f89cce9268c404395",
+            "package_path": "packages/laptop-support",
+            "publisher": "example-company",
+            "repository_url": "https://fixtures.example/workflows.git",
+            "resolved_commit": "8952affa7d73aa41ecc01917715ee1ffd727b72b",
+            "resources": [
+              {
+                "path": "commands/guide.md",
+                "types": [
+                  "other"
+                ]
+              },
+              {
+                "path": "scripts/never-run.py",
+                "types": [
+                  "other"
+                ]
+              },
+              {
+                "path": "workflow-package.json",
+                "types": [
+                  "other"
+                ]
+              },
+              {
+                "path": "workflows/A.yaml",
+                "types": [
+                  "workflow_definition"
+                ]
+              },
+              {
+                "path": "workflows/B.yaml",
+                "types": [
+                  "workflow_definition"
+                ]
+              }
+            ],
+            "source_name": "company",
+            "source_state": "fresh",
+            "tags": [
+              "support"
+            ],
+            "update_status": "not_applicable",
+            "verified": true,
+            "verified_at": "2026-09-05T12:00:00Z",
+            "version": "1.0.0",
+            "workflows": [
+              {
+                "approval_nodes": [],
+                "command_nodes": [],
+                "command_resources": [],
+                "companion_path": null,
+                "compatibility": [
+                  {
+                    "code": "legacy_language_profile",
+                    "message": "workflow uses permissive Hermes legacy language semantics",
+                    "severity": "advisory"
+                  }
+                ],
+                "definition_path": "workflows/A.yaml",
+                "external_requirements": {
+                  "providers": [],
+                  "runtimes": [
+                    "uv"
+                  ],
+                  "secrets": [
+                    "SUPPORT_TOKEN"
+                  ],
+                  "services": [],
+                  "tools": [
+                    "git"
+                  ]
+                },
+                "local_mcp_servers": [],
+                "mcp_resource_files": [],
+                "mcp_resources": [],
+                "outward_action_nodes": [],
+                "package_digest": "5fc71713174f222672ccce00f572ce3f23dcd83e7134cbaff9c01129968c6191",
+                "package_resource_set": "package",
+                "providers": [],
+                "remote_mcp_servers": [],
+                "requested_skills": [],
+                "requested_tools": [],
+                "required_secrets": [],
+                "risk_digest": "c10e9d2b734fd9a9ae21b89b8b90632e9a85135b0994bd85aebe2a9745e5c938",
+                "script_resources": [],
+                "shell_or_script_nodes": [
+                  "execute"
+                ],
+                "trust_state": "untrusted",
+                "workflow_name": "A"
+              },
+              {
+                "approval_nodes": [
+                  "approve"
+                ],
+                "command_nodes": [],
+                "command_resources": [],
+                "companion_path": null,
+                "compatibility": [
+                  {
+                    "code": "legacy_language_profile",
+                    "message": "workflow uses permissive Hermes legacy language semantics",
+                    "severity": "advisory"
+                  }
+                ],
+                "definition_path": "workflows/B.yaml",
+                "external_requirements": {
+                  "providers": [],
+                  "runtimes": [
+                    "uv"
+                  ],
+                  "secrets": [
+                    "SUPPORT_TOKEN"
+                  ],
+                  "services": [],
+                  "tools": [
+                    "git"
+                  ]
+                },
+                "local_mcp_servers": [],
+                "mcp_resource_files": [],
+                "mcp_resources": [],
+                "outward_action_nodes": [],
+                "package_digest": "bade48acb1bf58ab2a1640940b007218007cb82ff4216bfb10d5e9280dae819d",
+                "package_resource_set": "package",
+                "providers": [],
+                "remote_mcp_servers": [],
+                "requested_skills": [],
+                "requested_tools": [],
+                "required_secrets": [],
+                "risk_digest": "d64ddd7c116acd108430085b83291de6bfe4d7a49951a0370ebd1e90c0369892",
+                "script_resources": [],
+                "shell_or_script_nodes": [],
+                "trust_state": "untrusted",
+                "workflow_name": "B"
+              }
+            ]
+          }
+        },
+        "schema_version": 1,
+        "source_name": null,
+        "started_at": "2026-09-05T12:00:00Z",
+        "state": "succeeded",
+        "updated_at": "2026-09-05T12:00:00Z"
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+name: collect-support-bundle
+nodes:
+  collect:
+    type: script
+    script: scripts/collect.py

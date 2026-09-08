@@ -11,12 +11,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from hermes_cli.git_source import resolve_git_executable
 from hermes_cli.plugins_cmd import (
     PluginOperationError,
     _copy_example_files,
     _read_manifest,
     _repo_name_from_url,
-    _resolve_git_executable,
     _resolve_git_url,
     _resolve_subdir_within,
     _sanitize_plugin_name,
@@ -120,33 +120,35 @@ class TestResolveGitExecutable:
     """Fallback resolution when bare ``git`` is not discoverable via ``PATH``."""
 
     def teardown_method(self):
-        _resolve_git_executable.cache_clear()
+        resolve_git_executable.cache_clear()
 
     def test_prefers_shutil_which(self):
-        import hermes_cli.plugins_cmd as pc
+        from hermes_cli import git_source
 
-        _resolve_git_executable.cache_clear()
-        with patch.object(pc.shutil, "which", return_value="/usr/local/bin/git"):
-            assert pc._resolve_git_executable() == "/usr/local/bin/git"
+        resolve_git_executable.cache_clear()
+        with patch.object(
+            git_source.shutil, "which", return_value="/usr/local/bin/git"
+        ):
+            assert resolve_git_executable() == "/usr/local/bin/git"
 
     def test_fallback_posix_first_matching_path(self):
-        import hermes_cli.plugins_cmd as pc
+        from hermes_cli import git_source
 
-        _resolve_git_executable.cache_clear()
+        resolve_git_executable.cache_clear()
 
         def _isfile(p: str) -> bool:
             return p == "/usr/local/bin/git"
 
-        with patch.object(pc.shutil, "which", return_value=None):
-            with patch.object(pc.os, "name", "posix"):
-                with patch.object(pc.os.path, "isfile", side_effect=_isfile):
-                    assert pc._resolve_git_executable() == "/usr/local/bin/git"
+        with patch.object(git_source.shutil, "which", return_value=None):
+            with patch.object(git_source.os, "name", "posix"):
+                with patch.object(git_source.os.path, "isfile", side_effect=_isfile):
+                    assert resolve_git_executable() == "/usr/local/bin/git"
 
 
     def test_git_pull_uses_resolved_executable(self, tmp_path):
         import hermes_cli.plugins_cmd as pc
 
-        _resolve_git_executable.cache_clear()
+        resolve_git_executable.cache_clear()
         with patch.object(
             pc,
             "_resolve_git_executable",
@@ -169,7 +171,7 @@ class TestResolveGitExecutable:
     def test_git_pull_clean_tree_never_stashes(self, tmp_path):
         import hermes_cli.plugins_cmd as pc
 
-        _resolve_git_executable.cache_clear()
+        resolve_git_executable.cache_clear()
         with patch.object(pc, "_resolve_git_executable", return_value="/g"):
             with patch.object(pc.subprocess, "run") as run:
                 run.side_effect = [

@@ -1,0 +1,78 @@
+{
+  "source_commit": "74fed08f91014ca7fc80ee9ea4427568ec95b04f",
+  "capture": "canonical_contract_json(publication).encode(\"utf-8\")",
+  "artifacts": {
+    "legacy-1.json": {
+      "publication": "authoring-contract",
+      "profile": "hermes-legacy",
+      "normalizer_version": 1,
+      "preservation": "immutable",
+      "bytes": 227906,
+      "sha256": "cfe6d0e58c4589b3f30292a2676dfa2ed3f99c68b0e06ab9db6ff1aa28a78446"
+    },
+    "legacy-2.json": {
+      "publication": "authoring-contract",
+      "profile": "hermes-legacy",
+      "normalizer_version": 2,
+      "preservation": "immutable",
+      "bytes": 227906,
+      "sha256": "e42f3403329a1513d1a5c857c6367a212ae00bc911701f5c7a14a3d69fac1e45"
+    },
+    "archon-1.json": {
+      "publication": "authoring-contract",
+      "profile": "archon-2026-07",
+      "normalizer_version": 1,
+      "preservation": "immutable",
+      "bytes": 224201,
+      "sha256": "de20da803ed6b073565b768d13cc5d98af07056a2a71cbf23f0738f58b08f1b3"
+    },
+    "archon-2.json": {
+      "publication": "authoring-contract",
+      "profile": "archon-2026-07",
+      "normalizer_version": 2,
+      "preservation": "immutable",
+      "bytes": 224201,
+      "sha256": "2b82101f8d7df05658758cca9fc7a953f2bd94d25df492d9a76d7081542f5751"
+    },
+    "archon-3.json": {
+      "publication": "authoring-contract",
+      "profile": "archon-2026-07",
+      "normalizer_version": 3,
+      "preservation": "immutable",
+      "bytes": 236325,
+      "sha256": "2950684e6bfe2f5192177809140b99149e4ef1a6471ed3a9b7cf201d98a48899"
+    },
+    "archon-4.json": {
+      "publication": "authoring-contract",
+      "profile": "archon-2026-07",
+      "normalizer_version": 4,
+      "preservation": "immutable",
+      "bytes": 242648,
+      "sha256": "be44ec97cc010d25cc00bde43d54c5da948023a247be24c974a0936d9f183959"
+    },
+    "archon-5.json": {
+      "publication": "authoring-contract",
+      "profile": "archon-2026-07",
+      "normalizer_version": 5,
+      "preservation": "immutable",
+      "bytes": 243698,
+      "sha256": "cea17e92c695125c889e4d6e859bcaee08381c7a58694f35873a6872d518aec1"
+    },
+    "archon-6.json": {
+      "publication": "authoring-contract",
+      "profile": "archon-2026-07",
+      "normalizer_version": 6,
+      "preservation": "characterization-only",
+      "bytes": 283522,
+      "sha256": "171fe68bc4c8c4e5ca8a27be7212d8af556c263739f37a17235344a8e57717cc"
+    },
+    "legacy-corpus-1.json": {
+      "publication": "language-conformance",
+      "profile": "hermes-legacy",
+      "format_version": 1,
+      "preservation": "immutable",
+      "bytes": 7265,
+      "sha256": "c193258148699fbcbc42c909dee10001632377272e57a0ff3b79f3493f158a3b"
+    }
+  }
+}

@@ -94,6 +94,7 @@ from plugins.workflow.models import (
     WorkflowNodeOrigin,
     WorkflowPackage,
     WorkflowLanguageProfile,
+    WorkflowMarketplaceBinding,
     WorkflowRuntimeConfig,
     WorkflowSourceDocument,
     WorkflowSourceNode,
@@ -2842,6 +2843,9 @@ def parse_workflow_source_bytes(
     sidecar_bytes: bytes | None,
     source: str = "explicit",
     precedence: int = 0,
+    package_root: str | Path | None = None,
+    sidecar_path: str | Path | None = None,
+    marketplace_binding: WorkflowMarketplaceBinding | None = None,
 ) -> WorkflowSourceDocument:
     """Parse bounded authenticated bytes without selecting language authority."""
     workflow_path = Path(path).expanduser().absolute()
@@ -2884,15 +2888,25 @@ def parse_workflow_source_bytes(
             "self_trust",
             "workflow package cannot declare trust",
         )
-    sidecar_path = (
-        workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
-        if sidecar_bytes is not None
-        else None
-    )
+    if sidecar_bytes is None:
+        if sidecar_path is not None:
+            _fail(
+                "sidecar",
+                "invalid_sidecar",
+                "workflow sidecar path requires authenticated bytes",
+            )
+        resolved_sidecar_path = None
+    else:
+        resolved_sidecar_path = (
+            Path(sidecar_path).expanduser().absolute()
+            if sidecar_path is not None
+            else workflow_path.with_name(f"{workflow_path.stem}.hermes.yaml")
+        )
     if sidecar_bytes is None:
         sidecar = freeze_value({})
     else:
-        _, sidecar = _parse_sidecar(sidecar_path, sidecar_bytes)
+        assert resolved_sidecar_path is not None
+        _, sidecar = _parse_sidecar(resolved_sidecar_path, sidecar_bytes)
     try:
         resolve_language_profile(sidecar)
     except WorkflowLanguageCompatibilityError as exc:
@@ -2917,7 +2931,22 @@ def parse_workflow_source_bytes(
         )
         for index, node in enumerate(raw_nodes)
     )
-    root = _package_root(workflow_path)
+    root = (
+        Path(package_root).expanduser().absolute()
+        if package_root is not None
+        else _package_root(workflow_path)
+    )
+    if package_root is not None:
+        try:
+            workflow_path.relative_to(root)
+            if resolved_sidecar_path is not None:
+                resolved_sidecar_path.relative_to(root)
+        except ValueError:
+            _fail(
+                "path",
+                "invalid_workflow_path",
+                "package workflow paths must remain inside the package root",
+            )
     definition_location = _logical_source_location(workflow_path, root)
     nodes = tuple(
         replace(
@@ -2948,7 +2977,7 @@ def parse_workflow_source_bytes(
         options=freeze_value(options),
         root=root,
         workflow_path=workflow_path,
-        sidecar_path=sidecar_path,
+        sidecar_path=resolved_sidecar_path,
         sidecar=sidecar,
         source=source,
         precedence=precedence,
@@ -2956,10 +2985,11 @@ def parse_workflow_source_bytes(
         sidecar_bytes=sidecar_bytes,
         definition_location=definition_location,
         sidecar_location=(
-            _logical_source_location(sidecar_path, root)
-            if sidecar_path is not None
+            _logical_source_location(resolved_sidecar_path, root)
+            if resolved_sidecar_path is not None
             else None
         ),
+        marketplace_binding=marketplace_binding,
         field_lines=top_lines,
     )
 
@@ -3119,6 +3149,7 @@ def _compile_workflow_source_document(
             definition, normalized.metadata
         ),
         validation_issues=issues,
+        marketplace_binding=source_document.marketplace_binding,
     )
 
 

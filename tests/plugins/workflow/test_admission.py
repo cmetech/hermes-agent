@@ -20,11 +20,16 @@ import plugins.workflow.admission as workflow_admission
 from hermes_cli.handoff import EndpointAssessment
 from plugins.workflow.admission import RunAdmissionRequest
 from plugins.workflow.cli import build_catalog, show_package
+from plugins.workflow.compilation import WorkflowCatalogSnapshot, compile_workflow
 from plugins.workflow.compat import assess_compatibility
-from plugins.workflow.models import WorkflowValidationError
+from plugins.workflow.models import WorkflowMarketplaceBinding, WorkflowValidationError
 from plugins.workflow.scheduler import RunScheduler
-from plugins.workflow.schema import load_workflow
-from plugins.workflow.store import RunStore
+from plugins.workflow.schema import (
+    load_workflow,
+    parse_workflow_source_bytes,
+)
+from plugins.workflow.store import InputSnapshotError, RunStore
+from plugins.workflow.trust import WorkflowPackageDigest
 
 
 def _prepared(store: RunStore, workflow_writer, tmp_path, *, name="demo"):
@@ -35,6 +40,140 @@ def _prepared(store: RunStore, workflow_writer, tmp_path, *, name="demo"):
     )
     package = load_workflow(path)
     return store.prepare_run_snapshot(package)
+
+
+def _marketplace_format2_compilation(tmp_path, workflow_writer):
+    root = tmp_path / "marketplace-package"
+    path = workflow_writer(
+        root / "workflows",
+        name="marketplace-snapshot",
+        filename="marketplace-snapshot.yaml",
+    )
+    sidecar = path.with_name("marketplace-snapshot.hermes.yaml")
+    sidecar.write_text(
+        "language_compatibility: archon-2026-07\n",
+        encoding="utf-8",
+    )
+    source = parse_workflow_source_bytes(
+        path,
+        workflow_bytes=path.read_bytes(),
+        sidecar_bytes=sidecar.read_bytes(),
+        source="profile",
+        precedence=2,
+        package_root=root,
+        sidecar_path=sidecar,
+    )
+    compilation = compile_workflow(
+        source,
+        WorkflowCatalogSnapshot.capture((source,)),
+        normalizer_version=4,
+    )
+    bound_package = replace(
+        compilation.package,
+        marketplace_binding=WorkflowMarketplaceBinding(
+            installation_key="company/package",
+            source_name="company",
+            package_id="package",
+            package_version="1.0.0",
+            workflow_relative_path="workflows/marketplace-snapshot.yaml",
+            distribution_digest="a" * 64,
+        ),
+    )
+    return replace(compilation, package=bound_package)
+
+
+def _effective_marketplace_snapshot_digest(compilation, *, covered_paths=None):
+    from plugins.workflow.marketplace.trust_binding import (
+        effective_marketplace_digest,
+    )
+
+    binding = compilation.package.marketplace_binding
+    assert binding is not None
+    return WorkflowPackageDigest(
+        effective_marketplace_digest(
+            distribution_digest=binding.distribution_digest,
+            workflow_relative_path=binding.workflow_relative_path,
+            closure_digest=compilation.composite_digest,
+        ),
+        tuple(
+            covered_paths
+            if covered_paths is not None
+            else sorted({*compilation.covered_relative_paths, "fixtures/unused.json"})
+        ),
+    )
+
+
+def test_format2_snapshot_accepts_canonical_marketplace_effective_digest(
+    tmp_path, workflow_writer
+):
+    from plugins.workflow.language import make_language_snapshot
+
+    compilation = _marketplace_format2_compilation(tmp_path, workflow_writer)
+    trusted = _effective_marketplace_snapshot_digest(compilation)
+
+    prepared = RunStore(tmp_path / "home").prepare_run_snapshot(
+        compilation.package,
+        compilation=compilation,
+        trusted_package_digest=trusted,
+    )
+
+    resources = json.loads(
+        (prepared.staging_directory / "resources.json").read_text(encoding="utf-8")
+    )
+    assert prepared.definition_digest == trusted.sha256
+    assert resources["language"] == make_language_snapshot(
+        compilation.package,
+        trusted.sha256,
+    ).to_dict()
+
+
+def test_format2_snapshot_rejects_wrong_marketplace_effective_sha(
+    tmp_path, workflow_writer
+):
+    compilation = _marketplace_format2_compilation(tmp_path, workflow_writer)
+    trusted = _effective_marketplace_snapshot_digest(compilation)
+
+    with pytest.raises(InputSnapshotError, match="trusted workflow identity"):
+        RunStore(tmp_path / "home").prepare_run_snapshot(
+            compilation.package,
+            compilation=compilation,
+            trusted_package_digest=replace(trusted, sha256="b" * 64),
+        )
+
+
+def test_format2_snapshot_rejects_marketplace_digest_missing_closure_path(
+    tmp_path, workflow_writer
+):
+    compilation = _marketplace_format2_compilation(tmp_path, workflow_writer)
+    trusted = _effective_marketplace_snapshot_digest(
+        compilation,
+        covered_paths=compilation.covered_relative_paths[1:],
+    )
+
+    with pytest.raises(InputSnapshotError, match="trusted workflow identity"):
+        RunStore(tmp_path / "home").prepare_run_snapshot(
+            compilation.package,
+            compilation=compilation,
+            trusted_package_digest=trusted,
+        )
+
+
+def test_format2_snapshot_keeps_exact_digest_equality_for_loose_workflows(
+    tmp_path, workflow_writer
+):
+    marketplace = _marketplace_format2_compilation(tmp_path, workflow_writer)
+    compilation = replace(
+        marketplace,
+        package=replace(marketplace.package, marketplace_binding=None),
+    )
+    trusted = _effective_marketplace_snapshot_digest(marketplace)
+
+    with pytest.raises(InputSnapshotError, match="trusted workflow identity"):
+        RunStore(tmp_path / "home").prepare_run_snapshot(
+            compilation.package,
+            compilation=compilation,
+            trusted_package_digest=trusted,
+        )
 
 
 def _request(snapshot, *, key="delivery-1", policy="queue", name="demo"):
