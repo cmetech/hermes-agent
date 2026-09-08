@@ -166,6 +166,26 @@ def test_profile_catalog_ignores_workflow_owned_runtime_directories(
     assert all("snapshot" not in str(package.workflow_path) for package in packages)
 
 
+def test_packages_directory_without_a_manifest_remains_ordinary_loose_discovery(
+    workflow_writer, tmp_path
+) -> None:
+    profile = tmp_path / "profile"
+    workflow_writer(
+        profile / "workflows" / "packages" / "ordinary",
+        name="ordinary-loose",
+    )
+
+    packages = discover_workflows(
+        tmp_path / "repo",
+        profile,
+        tmp_path / "home",
+    )
+
+    assert [package.definition.name for package in packages] == ["ordinary-loose"]
+    assert packages[0].root == profile.resolve()
+    assert packages[0].marketplace_binding is None
+
+
 def test_successful_parse_cache_invalidates_on_content_change(
     workflow_writer, tmp_path
 ):

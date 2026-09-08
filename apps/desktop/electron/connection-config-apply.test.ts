@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { normalizeRemoteHeaders } from './connection-config'
 import { applyConnectionConfigAtomically } from './connection-config-apply'
 
 describe('applyConnectionConfigAtomically', () => {
@@ -115,4 +116,13 @@ describe('applyConnectionConfigAtomically', () => {
     expect(writeRegistry).not.toHaveBeenCalled()
     expect(apply).not.toHaveBeenCalled()
   })
+})
+
+// Break caught: saved configuration can override or duplicate the native actor precondition.
+it.each([
+  'X-Hermes-Marketplace-Principal-Binding',
+  'x-hermes-marketplace-principal-binding',
+  'x-HeRmEs-MaRkEtPlAcE-PrInCiPaL-BiNdInG'
+])('rejects reserved descriptor header %s', name => {
+  expect(() => normalizeRemoteHeaders({ [name]: 'a'.repeat(64) })).toThrow()
 })

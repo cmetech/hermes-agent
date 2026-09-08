@@ -657,6 +657,8 @@ plugins = [
   "workflow/conformance/*.json",
   # Authenticated, read-only workflow showcase catalog and package resources.
   "workflow/showcases/**/*",
+  # Canonical cross-language workflow package schemas and conformance vectors.
+  "workflow/contracts/*.json",
 ]
 [tool.setuptools.exclude-package-data]
 plugins = [

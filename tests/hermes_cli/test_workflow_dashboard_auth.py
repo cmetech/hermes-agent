@@ -285,6 +285,218 @@ def test_write_token_cannot_execute_cleanup(tmp_path, monkeypatch) -> None:
     assert response.json()["detail"]["code"] == "workflow_admin_required"
 
 
+def test_marketplace_read_routes_accept_read_scope_and_require_authentication(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    paths = {
+        "/api/plugins/workflow/marketplace/capabilities",
+        "/api/plugins/workflow/marketplace/sources",
+        "/api/plugins/workflow/marketplace/packages",
+        "/api/plugins/workflow/marketplace/installed",
+        "/api/plugins/workflow/marketplace/operations",
+    }
+    app = _real_token_app(
+        paths=paths,
+        principals={
+            "read-secret": TokenPrincipal(
+                principal="reader",
+                provider="workflow-token",
+                scopes=("workflow:read",),
+            ),
+            "write-secret": TokenPrincipal(
+                principal="writer",
+                provider="workflow-token",
+                scopes=("workflow:write",),
+            ),
+            "admin-secret": TokenPrincipal(
+                principal="admin",
+                provider="workflow-token",
+                scopes=("workflow:admin",),
+            ),
+        },
+    )
+    client = TestClient(app)
+
+    for path in sorted(paths):
+        unauthenticated = client.get(path)
+        allowed = client.get(
+            path,
+            headers={"Authorization": "Bearer read-secret"},
+        )
+        write = client.get(
+            path,
+            headers={"Authorization": "Bearer write-secret"},
+        )
+        admin = client.get(
+            path,
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+
+        assert unauthenticated.status_code == 401, path
+        assert allowed.status_code == 200, path
+        assert write.status_code == 200, path
+        assert admin.status_code == 200, path
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/sources",
+            {
+                "name": "company",
+                "repositoryUrl": "https://example.test/repo.git",
+                "enabled": True,
+            },
+        ),
+        (
+            "PUT",
+            "/api/plugins/workflow/marketplace/sources/company",
+            {
+                "repositoryUrl": "https://example.test/repo.git",
+                "enabled": True,
+            },
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/sources/company/enabled",
+            {"enabled": False},
+        ),
+        (
+            "DELETE",
+            "/api/plugins/workflow/marketplace/sources/company",
+            None,
+        ),
+        ("POST", "/api/plugins/workflow/marketplace/sources/company/refresh", None),
+        ("POST", "/api/plugins/workflow/marketplace/updates/check", {}),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/install/prepare",
+            {"identifier": "company/laptop-support"},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/install/confirm",
+            {"confirmationToken": "A" * 40},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/update/prepare",
+            {"sourceKey": "company", "packageId": "laptop-support"},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/update/confirm",
+            {"confirmationToken": "A" * 40},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/remove/prepare",
+            {"sourceKey": "company", "packageId": "laptop-support"},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/remove/confirm",
+            {"confirmationToken": "A" * 40},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/trust/review",
+            {
+                "identity": {
+                    "sourceKey": "company",
+                    "packageId": "laptop-support",
+                }
+            },
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/trust/grant",
+            {"confirmationToken": "A" * 40},
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/trust/revoke",
+            {
+                "identity": {
+                    "sourceKey": "company",
+                    "packageId": "laptop-support",
+                }
+            },
+        ),
+        (
+            "POST",
+            "/api/plugins/workflow/marketplace/operations/"
+            "wmop_0123456789ab_0123456789abcdef0123456789abcdef/cancel",
+            None,
+        ),
+    ],
+)
+def test_marketplace_mutation_route_groups_require_admin_scope(
+    tmp_path, monkeypatch, method, path, body
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    app = _real_token_app(
+        paths={path},
+        principals={
+            "read-secret": TokenPrincipal(
+                principal="reader",
+                provider="workflow-token",
+                scopes=("workflow:read",),
+            ),
+            "write-secret": TokenPrincipal(
+                principal="writer",
+                provider="workflow-token",
+                scopes=("workflow:write",),
+            ),
+            "admin-secret": TokenPrincipal(
+                principal="admin",
+                provider="workflow-token",
+                scopes=("workflow:admin",),
+            ),
+        },
+    )
+    client = TestClient(app)
+
+    unauthenticated = client.request(method, path, json=body)
+    read = client.request(
+        method,
+        path,
+        headers={"Authorization": "Bearer read-secret"},
+        json=body,
+    )
+    write = client.request(
+        method,
+        path,
+        headers={"Authorization": "Bearer write-secret"},
+        json=body,
+    )
+    admin = client.request(
+        method,
+        path,
+        headers={"Authorization": "Bearer admin-secret"},
+        json=body,
+    )
+
+    assert unauthenticated.status_code == 401
+    for response in (read, write):
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "workflow_admin_required"
+    if any(
+        f"/marketplace/{group}/" in path
+        for group in ("install", "update", "remove", "trust")
+    ):
+        assert admin.status_code == 409
+        assert admin.json() == {
+            "detail": {"code": "marketplace_lifecycle_upgrade_required"}
+        }
+    else:
+        assert admin.status_code in {201, 202, 404}
+    assert admin.status_code not in {401, 403}
+
+
 def test_post_runs_real_middleware_requires_workflow_write_scope(
     tmp_path, monkeypatch
 ) -> None:

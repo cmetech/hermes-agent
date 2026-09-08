@@ -286,7 +286,7 @@ def _is_supervised_gateway_process() -> bool:
 def _build_systemd_scope_argv(
     shell_argv: List[str],
     unit_suffix: str,
-) -> List[str]:
+) -> Optional[List[str]]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation.
 
     The resulting cgroup gets its own memory accounting so an OOM in the
@@ -298,9 +298,8 @@ def _build_systemd_scope_argv(
 
     binary = shutil.which("systemd-run")
     if binary is None:
-        # Caller should have checked _systemd_run_user_scope_available();
-        # guard anyway so we never pass None into Popen.
-        return shell_argv
+        # Availability is cached; absence here must not grant scope authority.
+        return None
     unit_name = f"hermes-worker-{unit_suffix}"
     memory_max = _worker_memory_max_bytes()
     return [
@@ -903,6 +902,27 @@ class ProcessRegistry:
             proc_alive=cls._proc_alive,
         )
 
+    @staticmethod
+    def _terminate_scoped_wrapper(
+        proc: subprocess.Popen,
+        *,
+        term_grace_seconds: float,
+        kill_grace_seconds: float,
+    ) -> None:
+        """Reap only the owned handle; systemd owns the scoped worker tree."""
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=term_grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=kill_grace_seconds)
+
     # ----- Spawn -----
 
     @staticmethod
@@ -985,12 +1005,17 @@ class ProcessRegistry:
                     pty_in_supervised_gateway and _systemd_run_user_scope_available()
                 )
 
+                pty_scope_argv = None
                 if pty_use_systemd_scope:
-                    pty_argv = _build_systemd_scope_argv(
+                    pty_scope_argv = _build_systemd_scope_argv(
                         pty_argv,
                         unit_suffix=session.id,
                     )
-                    session.systemd_unit = f"hermes-worker-{session.id}.scope"
+                if pty_scope_argv is not None:
+                    pty_argv = pty_scope_argv
+                    session.systemd_unit = (
+                        pty_scope_argv[pty_scope_argv.index("--unit") + 1] + ".scope"
+                    )
                     pty_scope_attempted = True
                 elif pty_in_supervised_gateway:
                     logger.debug(
@@ -1062,15 +1087,18 @@ class ProcessRegistry:
             in_supervised_gateway and _systemd_run_user_scope_available()
         )
 
+        scope_argv = None
         if use_systemd_scope:
             unit_suffix = (
                 f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
             )
-            spawn_argv = _build_systemd_scope_argv(
+            scope_argv = _build_systemd_scope_argv(
                 shell_argv,
                 unit_suffix=unit_suffix,
             )
-            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
+        if scope_argv is not None:
+            spawn_argv = scope_argv
+            session.systemd_unit = scope_argv[scope_argv.index("--unit") + 1] + ".scope"
             # CRITICAL (#70716 regression): systemd-run --scope does NOT give
             # the worker a new session — the invoked process keeps the
             # parent's session and inherits its controlling terminal.  From an
@@ -1133,19 +1161,38 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
-        except Exception:
+        except Exception as setup_error:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
+            if session.systemd_unit:
+                # Scope teardown, never process-group signaling, owns these
+                # workers. Clean the direct wrapper even when teardown fails.
+                try:
+                    scope_stopped = _stop_systemd_unit(session.systemd_unit)
+                except Exception:
+                    scope_stopped = False
+                wrapper_reaped = False
+                try:
+                    self._terminate_scoped_wrapper(
+                        proc,
+                        term_grace_seconds=managed_process.policy.term_grace_seconds,
+                        kill_grace_seconds=managed_process.policy.kill_grace_seconds,
+                    )
+                    wrapper_reaped = True
+                except Exception:
+                    pass
+                if not scope_stopped or not wrapper_reaped:
+                    logger.error(
+                        "Scoped process cleanup failed: scope_stopped=%s wrapper_reaped=%s",
+                        scope_stopped,
+                        wrapper_reaped,
+                    )
+                    raise RuntimeError(
+                        "Scoped process cleanup failed after setup failure"
+                    ) from setup_error
+                raise
             try:
-                if session.systemd_unit:
-                    # The worker runs in its own systemd scope and, since the
-                    # #70716 session-isolation fix, its own session.  Stop the
-                    # scope (kills every process in the worker cgroup), then
-                    # terminate the systemd-run wrapper PID as fallback.
-                    # Never killpg: scope teardown is the authoritative
-                    # cleanup for the worker cgroup.
-                    _stop_systemd_unit(session.systemd_unit)
                 managed_process.terminate("process registry setup failed")
             except Exception:
                 pass

@@ -38,6 +38,10 @@ from plugins.workflow.compat import (
 )
 from plugins.workflow.evidence import EVIDENCE_KINDS, EvidenceReader
 from plugins.workflow.language import WorkflowLanguageCompatibilityError
+from plugins.workflow.marketplace.api import (
+    WorkflowMarketplaceApiContext,
+    create_marketplace_router,
+)
 from plugins.workflow.notifications import NotificationOutbox
 from plugins.workflow.output_resolution import ArchonOutputUnavailableError
 from plugins.workflow.runtime import (
@@ -67,6 +71,7 @@ from plugins.workflow.store import (
 _CURSOR_SECRET = secrets.token_bytes(32)
 _RUNTIME: WorkflowApiRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
+_MARKETPLACE_API_CONTEXT = WorkflowMarketplaceApiContext()
 _WORKFLOW_RESPONSE_TEXT_MAX = 16_384
 _ARTIFACT_PREVIEW_BYTES_MAX = 64 * 1024
 WORKFLOW_COMPATIBILITY_UNKNOWN_PATH = "<unknown-path>"
@@ -115,6 +120,7 @@ async def _router_lifespan(_app):
         yield
     finally:
         _close_runtime()
+        _MARKETPLACE_API_CONTEXT.close()
 
 
 router = APIRouter(lifespan=_router_lifespan)
@@ -3111,3 +3117,11 @@ def mutate_run(
             _load_authorized(store, run_id, operator, now=observed_at),
             now=observed_at,
         )
+
+
+router.include_router(
+    create_marketplace_router(
+        _verified_operator,
+        context=_MARKETPLACE_API_CONTEXT,
+    )
+)

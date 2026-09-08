@@ -1,4 +1,5 @@
 async function applyConnectionChange({
+  invalidate = () => {},
   cancelAndWait,
   isPrimary,
   rehomePrimary = null,
@@ -8,6 +9,7 @@ async function applyConnectionChange({
   teardownPrimary,
   teardownSsh
 }) {
+  invalidate()
   await cancelAndWait(scope)
   await teardownSsh(scope)
 

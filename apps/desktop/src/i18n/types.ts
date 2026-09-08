@@ -6,8 +6,8 @@
 // fall back to English while new keys remain type-checked.
 
 import type { ModelEligibilityReasonKey } from '@/lib/model-eligibility'
-import type { ModelCapabilityCatalogStatus } from '@/types/hermes'
 import type { TipId } from '@/lib/tips/catalog'
+import type { ModelCapabilityCatalogStatus } from '@/types/hermes'
 
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
 
@@ -2049,6 +2049,286 @@ export interface Translations {
   operations: {
     workflows: string
     workflowViews: string
+    workflowInstalled: string
+    workflowMarketplace: string
+    workflowMarketplaceUnconfirmed: string
+    workflowMarketplaceConflict: string
+    workflowMarketplaceRecoveryRequired: string
+    workflowMarketplaceCancelledBeforeCommit: string
+    workflowMarketplaceRemovalCompleted: string
+    workflowMarketplaceInstalledVersionResult: (version: string) => string
+    workflowMarketplaceUpdatedVersionResult: (version: string) => string
+    workflowMarketplaceInstallationNoTrust: string
+    workflowMarketplaceUntrustedRunRequirement: string
+    workflowMarketplaceUpdateAvailableResult: string
+    workflowMarketplaceCheckError: string
+    workflowMarketplaceOrphaned: string
+    workflowMarketplaceCurrentlyInstalled: (version: string) => string
+    workflowMarketplaceRolledBack: string
+    workflowMarketplaceNoPackageChanges: string
+    workflowMarketplaceReviewUnavailable: string
+    workflowMarketplaceTrustOneGranted: (name: string) => string
+    workflowMarketplaceTrustAllGranted: string
+    workflowMarketplaceCurrentTrust: string
+    workflowMarketplaceUnconfirmedRefresh: string
+    workflowMarketplaceRefreshingState: string
+    workflowMarketplaceLastObservedRefreshing: string
+    workflowMarketplaceLastObservedPrefix: string
+    workflowMarketplaceAbsentLastObserved: string
+    workflowMarketplaceRecoveryUnconfirmed: string
+    workflowMarketplaceRefreshState: string
+    workflowMarketplaceLastObservedSearch: string
+    workflowMarketplaceRecoveryCatalog: string
+    workflowMarketplaceBusyCatalog: string
+    workflowMarketplaceUnconfirmedCatalog: string
+    workflowMarketplaceCapabilityLoading: string
+    workflowMarketplaceUpgradeTitle: string
+    workflowMarketplaceUpgradeDescription: string
+    workflowMarketplaceAuthTitle: string
+    workflowMarketplaceAuthDescription: string
+    workflowMarketplaceErrorTitle: string
+    workflowMarketplaceErrorDescription: string
+    workflowMarketplaceSearch: string
+    workflowMarketplaceSource: string
+    workflowMarketplaceAllSources: string
+    workflowMarketplaceDisabledSource: (source: string) => string
+    workflowMarketplaceLoading: string
+    workflowMarketplaceCatalogErrorTitle: string
+    workflowMarketplaceCatalogErrorDescription: string
+    workflowMarketplaceSourceAuthTitle: string
+    workflowMarketplaceSourceDisabledTitle: string
+    workflowMarketplaceEmptyTitle: string
+    workflowMarketplaceEmptyDescription: string
+    workflowMarketplaceNoMatchTitle: string
+    workflowMarketplaceNoMatchDescription: string
+    workflowMarketplaceStale: string
+    workflowMarketplaceStaleLabel: string
+    workflowMarketplaceStaleDescription: string
+    workflowMarketplacePackages: string
+    workflowMarketplacePagination: string
+    workflowMarketplacePreviousPage: string
+    workflowMarketplaceNextPage: string
+    workflowMarketplacePage: (page: number) => string
+    workflowMarketplaceSelectTitle: string
+    workflowMarketplaceSelectDescription: string
+    workflowMarketplaceBack: string
+    workflowMarketplaceDetailLoading: string
+    workflowMarketplaceDetailErrorTitle: string
+    workflowMarketplaceDetailErrorDescription: string
+    workflowMarketplaceDetailLabel: (name: string) => string
+    workflowMarketplaceCurrent: string
+    workflowMarketplaceInstalled: string
+    workflowMarketplaceInstalledVersion: (version: string) => string
+    workflowMarketplaceInstalledStatusLoading: string
+    workflowMarketplaceInstalledStatusUnavailableTitle: string
+    workflowMarketplaceInstalledStatusUnsupportedDescription: string
+    workflowMarketplaceInstalledStatusAuthTitle: string
+    workflowMarketplaceInstalledStatusAuthDescription: string
+    workflowMarketplaceInstalledStatusErrorDescription: string
+    workflowMarketplaceInstalledProvenanceLoading: string
+    workflowMarketplaceInstalledProvenanceUnavailableTitle: string
+    workflowMarketplaceInstalledProvenanceUnsupportedDescription: string
+    workflowMarketplaceInstalledProvenanceAuthTitle: string
+    workflowMarketplaceInstalledProvenanceAuthDescription: string
+    workflowMarketplaceInstalledProvenanceErrorTitle: string
+    workflowMarketplaceInstalledProvenanceErrorDescription: string
+    workflowMarketplaceUpdateAvailable: string
+    workflowMarketplacePublisher: string
+    workflowMarketplaceLicense: string
+    workflowMarketplaceCandidateIdentity: string
+    workflowMarketplacePackageDigest: string
+    workflowMarketplacePackagePath: string
+    workflowMarketplaceInstalledProvenance: string
+    workflowMarketplaceInstalledIdentity: string
+    workflowMarketplaceInstalledVersionLabel: string
+    workflowMarketplaceInstalledSource: string
+    workflowMarketplaceInstalledRepository: string
+    workflowMarketplaceInstalledRef: string
+    workflowMarketplaceInstalledCommit: string
+    workflowMarketplaceDistributionDigest: string
+    workflowMarketplaceInstalledAt: string
+    workflowMarketplaceInstalledPackagePath: string
+    workflowMarketplaceRepository: string
+    workflowMarketplaceRef: string
+    workflowMarketplaceDefaultRef: string
+    workflowMarketplaceCommit: string
+    workflowMarketplaceVerified: string
+    workflowMarketplaceBlockers: string
+    workflowMarketplaceAdvisories: string
+    workflowMarketplaceCompatibility: string
+    workflowMarketplaceWorkflowCount: (count: number) => string
+    workflowMarketplaceCommands: string
+    workflowMarketplaceScripts: string
+    workflowMarketplaceMcpResources: string
+    workflowMarketplaceOtherResources: string
+    workflowMarketplaceRequirements: string
+    workflowMarketplaceProviders: string
+    workflowMarketplaceRuntimes: string
+    workflowMarketplaceSecrets: string
+    workflowMarketplaceServices: string
+    workflowMarketplaceTools: string
+    workflowMarketplaceNoRequirements: string
+    workflowMarketplaceInstalledPackages: string
+    workflowMarketplaceSourceUnavailable: string
+    workflowMarketplaceManageSources: string
+    workflowMarketplaceRefresh: string
+    workflowMarketplaceRefreshAll: string
+    workflowMarketplaceSourcesTitle: string
+    workflowMarketplaceSourcesDescription: string
+    workflowMarketplaceAddSource: string
+    workflowMarketplaceEditSource: (source: string) => string
+    workflowMarketplaceRemoveSource: (source: string) => string
+    workflowMarketplaceRemoveSourceAction: string
+    workflowMarketplaceRemovingSource: string
+    workflowMarketplaceEnableSource: (source: string) => string
+    workflowMarketplaceDisableSource: (source: string) => string
+    workflowMarketplaceEnableAction: string
+    workflowMarketplaceDisableAction: string
+    workflowMarketplaceRefreshSource: (source: string) => string
+    workflowMarketplaceSourceArticle: (source: string) => string
+    workflowMarketplaceSourceName: string
+    workflowMarketplaceRepositoryUrl: string
+    workflowMarketplaceGitRef: string
+    workflowMarketplaceSaveSource: string
+    workflowMarketplaceEnabled: string
+    workflowMarketplaceDisabled: string
+    workflowMarketplaceDefaultBranch: string
+    workflowMarketplaceLastVerified: (timestamp: string) => string
+    workflowMarketplaceLastAttempted: (timestamp: string) => string
+    workflowMarketplaceNeverVerified: string
+    workflowMarketplacePackageCount: (count: number) => string
+    workflowMarketplaceFresh: string
+    workflowMarketplaceAuthenticationRequired: string
+    workflowMarketplaceCancelled: string
+    workflowMarketplaceIncompatible: string
+    workflowMarketplaceMalformed: string
+    workflowMarketplaceUnavailable: string
+    workflowMarketplaceNeverRefreshed: string
+    workflowMarketplaceRefreshStatusUnavailable: string
+    workflowMarketplaceOperationEvicted: string
+    workflowMarketplaceRefreshResultsLabel: string
+    workflowMarketplaceRefreshResult: (source: string, state: string) => string
+    workflowMarketplaceAuthGuidance: string
+    workflowMarketplaceSafeError: string
+    workflowMarketplaceRemoveTitle: (source: string) => string
+    workflowMarketplaceRemoveDescription: string
+    workflowMarketplaceSourceRemoved: string
+    workflowMarketplaceUnsupportedSources: string
+    workflowMarketplaceReviewInstallation: string
+    workflowMarketplaceReviewInstallationDescription: string
+    workflowMarketplaceReviewUpdate: string
+    workflowMarketplaceReviewUpdateDescription: string
+    workflowMarketplaceReviewRemoval: string
+    workflowMarketplaceReviewRemovalDescription: string
+    workflowMarketplaceReviewTrust: string
+    workflowMarketplaceReviewTrustDescription: string
+    workflowMarketplacePreparingInstallation: string
+    workflowMarketplacePreparingUpdate: string
+    workflowMarketplaceCheckingUpdates: string
+    workflowMarketplacePreparingRemoval: string
+    workflowMarketplacePreparingTrust: string
+    workflowMarketplaceOperationProgress: (phase: string, progress: number) => string
+    workflowMarketplaceCancelOperation: string
+    workflowMarketplaceConfirmInstall: string
+    workflowMarketplaceConfirmUpdate: string
+    workflowMarketplaceConfirmRemoval: string
+    workflowMarketplaceGrantTrust: string
+    workflowMarketplacePrepareAgain: string
+    workflowMarketplaceRetryStatus: string
+    workflowMarketplaceRetryCheck: string
+    workflowMarketplaceAbsent: string
+    workflowMarketplaceReviewDigest: string
+    workflowMarketplaceCandidateVersion: string
+    workflowMarketplaceCandidateCommit: string
+    workflowMarketplaceCandidateDigest: string
+    workflowMarketplacePreviousVersion: string
+    workflowMarketplacePreviousCommit: string
+    workflowMarketplacePreviousDigest: string
+    workflowMarketplaceChangedFiles: string
+    workflowMarketplaceFileChange: (kind: string, path: string) => string
+    workflowMarketplacePhaseUnknown: string
+    workflowMarketplacePhaseQueued: string
+    workflowMarketplacePhaseRunning: string
+    workflowMarketplacePhaseFetching: string
+    workflowMarketplacePhaseReviewing: string
+    workflowMarketplacePhaseValidating: string
+    workflowMarketplacePhaseCommitting: string
+    workflowMarketplacePhaseRecovering: string
+    workflowMarketplacePhaseCompleted: string
+    workflowMarketplacePhaseFailed: string
+    workflowMarketplacePhaseCancelled: string
+    workflowMarketplacePhaseChecking: string
+    workflowMarketplaceChangeAdded: string
+    workflowMarketplaceChangeModified: string
+    workflowMarketplaceChangeRemoved: string
+    workflowMarketplaceChangeRenamed: string
+    workflowMarketplaceSeverityBlocker: string
+    workflowMarketplaceSeverityAdvisory: string
+    workflowMarketplaceDiagnosticLegacyLanguage: string
+    workflowMarketplaceDiagnosticLegacyIdleTimeout: string
+    workflowMarketplaceDiagnosticMissingProvider: string
+    workflowMarketplaceDiagnosticMissingRuntime: string
+    workflowMarketplaceDiagnosticMissingSecret: string
+    workflowMarketplaceDiagnosticMissingService: string
+    workflowMarketplaceDiagnosticMissingTool: string
+    workflowMarketplaceDiagnosticUnknown: string
+    workflowMarketplaceDiagnosticTechnicalDetails: string
+    workflowMarketplaceDiagnosticCode: string
+    workflowMarketplaceDiagnosticMessage: string
+    workflowMarketplaceRenamedFrom: (path: string) => string
+    workflowMarketplacePackageResources: string
+    workflowMarketplaceWorkflowRisks: string
+    workflowMarketplaceDefinitionPath: string
+    workflowMarketplaceCompanionPath: string
+    workflowMarketplaceRiskDigest: string
+    workflowMarketplaceShellScriptNodes: string
+    workflowMarketplaceScriptResources: string
+    workflowMarketplaceCommandNodes: string
+    workflowMarketplaceCommandResources: string
+    workflowMarketplaceLocalMcp: string
+    workflowMarketplaceRemoteMcp: string
+    workflowMarketplaceMcpDefinitions: string
+    workflowMarketplaceMcpResourceFiles: string
+    workflowMarketplaceRequestedSkills: string
+    workflowMarketplaceOutwardActions: string
+    workflowMarketplaceApprovalNodes: string
+    workflowMarketplaceRequiredSecrets: string
+    workflowMarketplaceWorkflowChanges: string
+    workflowMarketplaceRequirementChanges: string
+    workflowMarketplaceRiskChanges: string
+    workflowMarketplaceCompatibilityChanges: string
+    workflowMarketplaceAdded: string
+    workflowMarketplaceRemoved: string
+    workflowMarketplaceNoChanges: string
+    workflowMarketplaceInstalledTrustRequired: string
+    workflowMarketplaceUpdatedTrustRequired: (version: string) => string
+    workflowMarketplaceReviewTrustAction: string
+    workflowMarketplaceInstallFailed: string
+    workflowMarketplaceInstallCancelled: string
+    workflowMarketplaceUpdateFailed: string
+    workflowMarketplaceUpdateCancelled: string
+    workflowMarketplaceVersionRemainsInstalled: (version: string) => string
+    workflowMarketplaceNothingInstalled: string
+    workflowMarketplaceOperationStatusLost: string
+    workflowMarketplaceOperationStatusUnavailable: string
+    workflowMarketplaceReviewStale: string
+    workflowMarketplacePackageCurrent: (version: string) => string
+    workflowMarketplaceTrustAllWorkflows: string
+    workflowMarketplaceTrustOneWorkflow: string
+    workflowMarketplaceSelectWorkflow: string
+    workflowMarketplaceTrustNotGranted: string
+    workflowMarketplaceTrustGranted: string
+    workflowMarketplaceRemovalScope: string
+    workflowMarketplaceRemovalPreserves: string
+    workflowMarketplacePackageRemoved: string
+    workflowMarketplaceRemovalFailed: string
+    workflowMarketplaceRemovalCancelled: string
+    workflowMarketplaceInstallPackage: string
+    workflowMarketplaceUpdatePackage: string
+    workflowMarketplaceCheckUpdates: string
+    workflowMarketplaceRemovePackage: string
+    workflowMarketplaceInstalledPackageLabel: (identifier: string) => string
+    workflowMarketplaceLifecycleUnavailable: string
     workflowCatalog: string
     workflowCatalogLoading: string
     workflowCatalogErrorTitle: string

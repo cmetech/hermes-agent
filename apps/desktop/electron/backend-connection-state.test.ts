@@ -105,3 +105,15 @@ test('an invalidated attempt cannot attach a late-spawned process', () => {
   assert.equal(state.attachProcess(staleAttempt, { id: 'late' }), null)
   assert.equal(state.getProcess(), null)
 })
+// Break caught: exhaustion either retains a publishable descriptor or loses the child needed for orderly shutdown.
+test('can clear only the descriptor cache while retaining native process ownership', () => {
+  const state = createBackendConnectionState<object, object>()
+  const attempt = state.startAttempt()
+  const process = {}
+  state.attachProcess(attempt, process)
+  state.setPromise(attempt, Promise.resolve({}))
+  assert.equal(typeof state.clearConnectionPromise, 'function')
+  state.clearConnectionPromise()
+  assert.equal(state.getPromise(), null)
+  assert.equal(state.getProcess(), process)
+})

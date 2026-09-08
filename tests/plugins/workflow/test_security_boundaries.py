@@ -148,7 +148,8 @@ def test_distribution_identity_does_not_trust_a_changed_executable(tmp_path: Pat
     assert after != before
     assert store.check(after, risk_digest=after) == "untrusted"
     records = json.loads(store.path.read_text())["records"]
-    assert records[before]["actor"] == "trusted_distribution"
+    assert records[before]["grants"]["manual"]["actor"] == "trusted_distribution"
+    assert store.check(before, risk_digest=before) == "trusted"
 
 
 def test_even_digest_consistent_bundle_rejects_live_inventory_commands(

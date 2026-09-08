@@ -1,0 +1,31 @@
+{
+  "description": "Diagnostic and support-bundle workflows for laptops.",
+  "displayName": "Laptop Support",
+  "externalRequirements": {
+    "providers": [],
+    "runtimes": [
+      "uv"
+    ],
+    "secrets": [],
+    "services": [],
+    "tools": []
+  },
+  "id": "laptop-support",
+  "license": "MIT",
+  "publisher": "example-company",
+  "schemaVersion": 1,
+  "tags": [
+    "diagnostics",
+    "support"
+  ],
+  "version": "1.2.3",
+  "workflows": [
+    {
+      "companion": "workflows/laptop-diagnostic.hermes.yaml",
+      "definition": "workflows/laptop-diagnostic.yaml"
+    },
+    {
+      "definition": "workflows/collect-support-bundle.yaml"
+    }
+  ]
+}

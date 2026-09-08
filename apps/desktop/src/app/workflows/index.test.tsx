@@ -7,6 +7,13 @@ import { I18nProvider, TRANSLATIONS } from '@/i18n'
 import type { WorkflowDefinition, WorkflowDetail, WorkflowRunSnapshot } from '@/types/hermes'
 
 import { WorkflowCatalog } from './catalog'
+import {
+  createLifecycleHarness,
+  deferredLifecycle,
+  lifecycleIdentity,
+  lifecycleScope
+} from './marketplace/lifecycle-test-harness'
+import { marketplaceKeys } from './marketplace/query-keys'
 import { isWorkflowAttemptEvidence, isWorkflowPersistentSessionRecoveryEvidence, RunInspector } from './run-inspector'
 import { $workflowSelectedRunId } from './store'
 
@@ -14,6 +21,334 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   Element.prototype.hasPointerCapture = vi.fn(() => false)
   Element.prototype.releasePointerCapture = vi.fn()
+})
+
+it('enables legacy Run and View only after an explicitly unsupported fresh catalog', async () => {
+  const h = createLifecycleHarness()
+
+  const run = vi.fn(),
+    view = vi.fn()
+
+  try {
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    render(
+      <h.Providers>
+        <WorkflowCatalog onRunWorkflow={run} onViewWorkflow={view} requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }))
+    fireEvent.click(screen.getByRole('button', { name: 'View' }))
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ name: 'Laptop diagnostic' }))
+    expect(view).toHaveBeenCalledWith(expect.objectContaining({ name: 'Laptop diagnostic' }))
+    expect(h.supervisor.bindings.state(lifecycleScope)).toEqual({ kind: 'unsupported' })
+    expect(h.calls).toEqual([])
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it('invalidates pre-transition legacy cache and rejects retained data after every failed refetch', async () => {
+  const h = createLifecycleHarness()
+  const key = marketplaceKeys.catalog('remote-a::support')
+
+  try {
+    h.queryClient.setQueryDefaults(key, { staleTime: Infinity })
+    h.queryClient.setQueryData(key, { items: [definition()], truncated: false })
+    listWorkflowDefinitions.mockRejectedValue(new Error('offline'))
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    await waitFor(() => expect(listWorkflowDefinitions).toHaveBeenCalledWith('support', 'remote-a'))
+    await waitFor(() => expect(h.queryClient.getQueryState(key)?.status).toBe('error'))
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(true)
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    listWorkflowDefinitions.mockRejectedValue(new Error('offline again'))
+    await act(async () => {
+      await h.queryClient.refetchQueries({ queryKey: key, exact: true })
+    })
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(true)
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each(['prior-v2', 'unavailable'] as const)('does not grant legacy actions for %s authority', async kind => {
+  const h = createLifecycleHarness()
+
+  try {
+    if (kind === 'prior-v2') {
+      await h.bind()
+    }
+
+    h.failCapabilities(kind === 'prior-v2' ? 'marketplace_lifecycle_unsupported' : 'marketplace_network_error')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
+    expect(listWorkflowDefinitions).not.toHaveBeenCalled()
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each(['reprobe', 'disconnect', 'route-transition', 'manual-cache'] as const)(
+  'revokes rendered legacy actions immediately on %s',
+  async transition => {
+    const h = createLifecycleHarness()
+    const key = marketplaceKeys.catalog('remote-a::support')
+
+    try {
+      h.failCapabilities('marketplace_lifecycle_unsupported')
+      await h.supervisor.reconcileScope(lifecycleScope)
+      render(
+        <h.Providers>
+          <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+        </h.Providers>
+      )
+      await waitFor(() =>
+        expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false)
+      )
+      await act(async () => {
+        if (transition === 'disconnect') {
+          h.disconnect()
+        } else if (transition === 'route-transition') {
+          h.supervisor.invalidateLegacyCatalogAuthority()
+        } else if (transition === 'manual-cache') {
+          h.queryClient.setQueryData(key, { items: [definition()], truncated: false })
+        } else {
+          h.holdCapabilities()
+          void h.supervisor.reconcileScope(lifecycleScope)
+        }
+      })
+      const run = screen.queryByRole('button', { name: 'Run' }) as HTMLButtonElement | null
+      const view = screen.queryByRole('button', { name: 'View' }) as HTMLButtonElement | null
+      expect(run === null || run.disabled).toBe(true)
+      expect(view === null || view.disabled).toBe(true)
+      expect(h.calls).toEqual([])
+    } finally {
+      cleanup()
+      h.dispose()
+    }
+  }
+)
+
+it('cannot use a pre-transition in-flight legacy response as fresh authority', async () => {
+  const h = createLifecycleHarness()
+  const key = marketplaceKeys.catalog('remote-a::support')
+  const old = deferredLifecycle<{ items: WorkflowDefinition[]; truncated: boolean }>()
+
+  try {
+    const pending = h.queryClient.fetchQuery({ queryKey: key, queryFn: () => old.promise }).catch(() => undefined)
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+    old.resolve({ items: [definition()], truncated: false })
+    await pending
+    listWorkflowDefinitions.mockRejectedValue(new Error('post-transition fetch failed'))
+    render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+    await waitFor(() => expect(h.queryClient.getQueryState(key)?.status).toBe('error'))
+    expect(h.supervisor.canUseLegacyCatalog(lifecycleScope, key)).toBe(false)
+    const run = screen.queryByRole('button', { name: 'Run' }) as HTMLButtonElement | null
+    expect(run === null || run.disabled).toBe(true)
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each([
+  { connectionId: 'remote-a', profile: 'other' },
+  { connectionId: 'remote-b', profile: 'support' }
+])('keeps legacy catalog success isolated from $connectionId/$profile', async other => {
+  const h = createLifecycleHarness()
+
+  try {
+    h.failCapabilities('marketplace_lifecycle_unsupported')
+    await h.supervisor.reconcileScope(lifecycleScope)
+
+    const rendered = render(
+      <h.Providers>
+        <WorkflowCatalog requestProfile="support" scope={lifecycleScope} />
+      </h.Providers>
+    )
+
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    const key = marketplaceKeys.catalog(`${other.connectionId}::${other.profile}`)
+    h.queryClient.setQueryData(key, { items: [definition()], truncated: false })
+    listWorkflowDefinitions.mockRejectedValue(new Error('other scope offline'))
+    await act(async () => {
+      await h.supervisor.reconcileScope(other)
+    })
+    rendered.rerender(
+      <h.Providers>
+        <WorkflowCatalog requestProfile={other.profile} scope={other} />
+      </h.Providers>
+    )
+    await waitFor(() => expect(h.queryClient.getQueryState(key)?.status).toBe('error'))
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it.each([
+  ['service recovery required', false, /Recovery required/],
+  ['service installed A trusted', true, /Package work in progress/],
+  ['service ambiguous state', false, /Package state is unconfirmed/]
+] as const)('disables catalog presentation after a later authoritative %s read', async (fixture, busy, copy) => {
+  const h = createLifecycleHarness()
+
+  try {
+    const binding = await h.bind()
+    await h.mutate(binding)
+    h.state('service installed A trusted')
+    await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    const history = h.supervisor.$records.get()
+    render(
+      <h.Providers>
+        <WorkflowCatalog
+          onRunWorkflow={vi.fn()}
+          onViewWorkflow={vi.fn()}
+          requestProfile="support"
+          scope={lifecycleScope}
+        />
+      </h.Providers>
+    )
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+    listWorkflowDefinitions.mockRejectedValue(new Error('catalog offline'))
+    h.state(fixture, false, busy)
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText(copy)).toBeTruthy()
+    expect(h.supervisor.$records.get()).toEqual(history)
+    h.state('service installed A trusted')
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(true)
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Run' }) as HTMLButtonElement).disabled).toBe(false))
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it('gates unbound catalog Run and Review while package truth is stale, without joining workflow names', async () => {
+  const h = createLifecycleHarness()
+
+  try {
+    const binding = await h.bind()
+    listWorkflowDefinitions.mockResolvedValue({
+      items: [definition({ name: 'A' }), definition({ name: 'unrelated loose workflow' })],
+      truncated: false
+    })
+    render(
+      <h.Providers>
+        <WorkflowCatalog
+          cacheScopeKey="remote-a::support"
+          onRunWorkflow={vi.fn()}
+          onViewWorkflow={vi.fn()}
+          requestProfile="support"
+          scope={lifecycleScope}
+        />
+      </h.Providers>
+    )
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByRole('button', { name: workflowCopy.workflowRun })
+          .every(button => !(button as HTMLButtonElement).disabled)
+      ).toBe(true)
+    )
+    listWorkflowDefinitions.mockRejectedValue(new Error('offline'))
+    h.failOriginRefetches()
+    await act(async () => {
+      await h.mutate(binding)
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    expect(
+      screen
+        .getAllByRole('button', { name: workflowCopy.workflowRun })
+        .every(button => (button as HTMLButtonElement).disabled)
+    ).toBe(true)
+    expect(
+      screen
+        .getAllByRole('button', { name: workflowCopy.workflowView })
+        .every(button => (button as HTMLButtonElement).disabled)
+    ).toBe(true)
+    expect(screen.getByText(/Last observed/)).toBeTruthy()
+    listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
+    h.state('service installed A trusted')
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: workflowCopy.workflowRun }) as HTMLButtonElement).disabled).toBe(false)
+    )
+  } finally {
+    cleanup()
+    h.dispose()
+  }
+})
+
+it('discards open catalog presentation when a mutation fences it, without reopening an old intent after refresh', async () => {
+  const h = createLifecycleHarness()
+
+  try {
+    apiRequestState.profile = 'support'
+    const binding = await h.bind()
+    const { WorkflowsView } = await import('./index')
+    render(
+      <h.Providers>
+        <WorkflowsView />
+      </h.Providers>
+    )
+    const view = await screen.findByRole('button', { name: 'View' })
+    await waitFor(() => expect((view as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(view)
+    await screen.findByRole('dialog')
+    await act(async () => {
+      await h.mutate(binding)
+    })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await act(async () => {
+      await h.supervisor.reconcilePackage(binding, lifecycleIdentity)
+      await h.queryClient.refetchQueries()
+    })
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: 'View' }) as HTMLButtonElement).disabled).toBe(false)
+    )
+    expect(screen.queryByRole('dialog')).toBeNull()
+  } finally {
+    cleanup()
+    h.dispose()
+  }
 })
 
 const getWorkflowRun = vi.fn()
@@ -27,6 +362,10 @@ const preflightWorkflow = vi.fn()
 const mutateWorkflowRun = vi.fn()
 const previewWorkflowCleanup = vi.fn()
 const executeWorkflowCleanup = vi.fn()
+const getWorkflowMarketplaceCapabilities = vi.fn()
+const listInstalledWorkflowPackages = vi.fn()
+const listWorkflowMarketplaceSources = vi.fn()
+const searchWorkflowPackages = vi.fn()
 const apiRequestState = vi.hoisted(() => ({ profile: 'default' as string | null }))
 const profileRouting = vi.hoisted(() => ({ ensureGatewayProfile: vi.fn() }))
 const workflowCopy = TRANSLATIONS.en.operations
@@ -34,16 +373,31 @@ const workflowCopy = TRANSLATIONS.en.operations
 vi.mock('@/hermes', () => ({
   cancelWorkflowArtifactDownload: vi.fn().mockResolvedValue({ cancelled: true }),
   downloadWorkflowArtifact: vi.fn().mockResolvedValue({ status: 'cancelled' }),
+  getApiRequestConnection: () => 'remote-a',
   getApiRequestProfile: () => apiRequestState.profile,
+  getWorkflowMarketplaceCapabilities: (...args: unknown[]) => getWorkflowMarketplaceCapabilities(...args),
+  getWorkflowMarketplaceOperation: vi.fn(),
   getWorkflowArtifactPreview: (...args: unknown[]) => getWorkflowArtifactPreview(...args),
   getWorkflowEvidence: (...args: unknown[]) => getWorkflowEvidence(...args),
   getWorkflowRun: (...args: unknown[]) => getWorkflowRun(...args),
   listWorkflowAttention: (...args: unknown[]) => listWorkflowAttention(...args),
   listWorkflowEvents: (...args: unknown[]) => listWorkflowEvents(...args),
+  listInstalledWorkflowPackages: (...args: unknown[]) => listInstalledWorkflowPackages(...args),
+  listWorkflowMarketplaceOperations: vi.fn().mockResolvedValue({
+    limit: 100,
+    offset: 0,
+    operations: [],
+    profile: 'default'
+  }),
+  listWorkflowMarketplaceSources: (...args: unknown[]) => listWorkflowMarketplaceSources(...args),
   listWorkflowRuns: (...args: unknown[]) => listWorkflowRuns(...args),
   mutateWorkflowRun: (...args: unknown[]) => mutateWorkflowRun(...args),
   previewWorkflowCleanup: (...args: unknown[]) => previewWorkflowCleanup(...args),
-  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args)
+  executeWorkflowCleanup: (...args: unknown[]) => executeWorkflowCleanup(...args),
+  inspectWorkflowPackage: vi.fn(),
+  isWorkflowMarketplaceUnsupportedError: (error: unknown) =>
+    typeof error === 'object' && error !== null && 'code' in error && error.code === 'marketplace_unsupported',
+  searchWorkflowPackages: (...args: unknown[]) => searchWorkflowPackages(...args)
 }))
 
 vi.mock('@/lib/hermes-api', () => ({
@@ -148,8 +502,8 @@ async function renderView(client: QueryClient, initialTab: 'board' | 'workflows'
 }
 
 function setVisibility(value: 'hidden' | 'visible') {
-  Object.defineProperty(document, 'visibilityState', { configurable: true, value })
-  document.dispatchEvent(new Event('visibilitychange'))
+  Object.defineProperty(globalThis.document, 'visibilityState', { configurable: true, value })
+  globalThis.document.dispatchEvent(new Event('visibilitychange'))
 }
 
 beforeEach(() => {
@@ -167,12 +521,16 @@ beforeEach(() => {
     preflightWorkflow,
     mutateWorkflowRun,
     previewWorkflowCleanup,
-    executeWorkflowCleanup
+    executeWorkflowCleanup,
+    getWorkflowMarketplaceCapabilities,
+    listInstalledWorkflowPackages,
+    listWorkflowMarketplaceSources,
+    searchWorkflowPackages
   ]) {
     mock.mockReset()
   }
 
-  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+  Object.defineProperty(globalThis.document, 'visibilityState', { configurable: true, value: 'hidden' })
   $workflowSelectedRunId.set('run-1')
   getWorkflowRun.mockResolvedValue(run())
   getWorkflowEvidence.mockResolvedValue({
@@ -195,6 +553,22 @@ beforeEach(() => {
   listWorkflowRuns.mockResolvedValue({ next_cursor: null, runs: [run()], schema_version: 1 })
   listWorkflowDefinitions.mockResolvedValue({ items: [definition()], truncated: false })
   preflightWorkflow.mockRejectedValue(new Error('detail unavailable'))
+  getWorkflowMarketplaceCapabilities.mockResolvedValue({
+    capabilities: ['sources', 'search', 'installed', 'updates', 'transactions', 'trust', 'operations'],
+    profile: 'default',
+    schema_version: 1
+  })
+  listInstalledWorkflowPackages.mockResolvedValue({ packages: [], profile: 'default' })
+  listWorkflowMarketplaceSources.mockResolvedValue({ profile: 'default', sources: [] })
+  searchWorkflowPackages.mockResolvedValue({
+    items: [],
+    limit: 50,
+    next_offset: null,
+    offset: 0,
+    profile: 'default',
+    query: '',
+    source: null
+  })
 })
 
 afterEach(() => {
@@ -295,6 +669,23 @@ describe('WorkflowsView', () => {
     expect(screen.queryByRole('button', { name: 'Run filters coming soon' })).toBeNull()
   })
 
+  it('shows Installed and Marketplace without disturbing the established run views', async () => {
+    $workflowSelectedRunId.set(null)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+
+    await renderView(client, 'workflows')
+
+    expect(screen.getByRole('tab', { name: 'Installed' }).getAttribute('aria-selected')).toBe('true')
+    expect(screen.getByRole('tab', { name: 'Active board' })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'History' })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: 'Archive' })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Marketplace' }))
+
+    expect(await screen.findByRole('searchbox', { name: 'Search workflow packages' })).toBeTruthy()
+    expect(listWorkflowRuns).not.toHaveBeenCalled()
+  })
+
   it('keeps navigation mounted around a bounded initial run-list loader', async () => {
     const pending = deferred<Awaited<ReturnType<typeof listWorkflowRuns>>>()
 
@@ -370,8 +761,8 @@ describe('WorkflowsView', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Laptop diagnostic/ }))
     await screen.findByRole('complementary', { name: 'Laptop diagnostic run details' })
 
-    const outside = document.createElement('button')
-    document.body.append(outside)
+    const outside = globalThis.document.createElement('button')
+    globalThis.document.body.append(outside)
 
     try {
       outside.focus()
@@ -379,7 +770,7 @@ describe('WorkflowsView', () => {
 
       await waitFor(() => expect($workflowSelectedRunId.get()).toBeNull())
       await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
-      expect(document.activeElement).toBe(outside)
+      expect(globalThis.document.activeElement).toBe(outside)
     } finally {
       outside.remove()
     }
@@ -399,6 +790,7 @@ describe('WorkflowsView', () => {
     close.focus()
 
     const frames: FrameRequestCallback[] = []
+
     const requestFrame = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation(callback => {
       frames.push(callback)
 
@@ -553,7 +945,7 @@ describe('WorkflowsView', () => {
     await renderView(client, 'workflows')
 
     const tabs = await screen.findAllByRole('tab')
-    expect(tabs.map(tab => tab.textContent)).toEqual(['Workflows', 'Active board', 'History', 'Archive'])
+    expect(tabs.map(tab => tab.textContent)).toEqual(['Installed', 'Marketplace', 'Active board', 'History', 'Archive'])
     expect(tabs[0]?.getAttribute('aria-selected')).toBe('true')
     const table = await screen.findByRole('table', { name: 'Workflow catalog' })
     expect(
@@ -878,7 +1270,9 @@ describe('WorkflowsView', () => {
       expect(within(row).getByText(aiCopy)).toBeTruthy()
       const button = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(button.disabled).toBe(true)
-      expect(document.getElementById(button.getAttribute('aria-describedby')!)?.textContent).toBe(expectedReason)
+      expect(globalThis.document.getElementById(button.getAttribute('aria-describedby')!)?.textContent).toBe(
+        expectedReason
+      )
     }
   })
 
@@ -949,7 +1343,7 @@ describe('WorkflowsView', () => {
     for (const row of rows.slice(3, 4)) {
       const runButton = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(runButton.disabled).toBe(true)
-      expect(document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
+      expect(globalThis.document.getElementById(runButton.getAttribute('aria-describedby')!)?.textContent).toBe(
         'Run this bundled showcase from the CLI.'
       )
     }
@@ -981,7 +1375,7 @@ describe('WorkflowsView', () => {
     const reviewDialog = await screen.findByRole('dialog', { name: 'Review & Run Laptop diagnostic' })
     fireEvent.click(within(reviewDialog).getByRole('button', { name: 'Close' }))
 
-    await waitFor(() => expect(document.activeElement).toBe(viewTrigger))
+    await waitFor(() => expect(globalThis.document.activeElement).toBe(viewTrigger))
   })
 
   it('derives semantic input badges and explains unsupported input shapes accessibly', async () => {
@@ -1017,7 +1411,7 @@ describe('WorkflowsView', () => {
     expect(within(rows[1]!).getByText('3 inputs')).toBeTruthy()
     expect(within(rows[2]!).getByText('1 input').getAttribute('data-slot')).toBe('badge')
     const disabledRun = within(rows[2]!).getByRole('button', { name: 'Run' })
-    expect(document.getElementById(disabledRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(disabledRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
     )
   })
@@ -1050,11 +1444,11 @@ describe('WorkflowsView', () => {
     const incompatibleRun = within(rows[1]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
 
     expect(unsupportedRun.disabled).toBe(true)
-    expect(document.getElementById(unsupportedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(unsupportedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
     )
     expect(incompatibleRun.disabled).toBe(true)
-    expect(document.getElementById(incompatibleRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(incompatibleRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       workflowCopy.workflowRunIncompatible
     )
   })
@@ -1073,7 +1467,7 @@ describe('WorkflowsView', () => {
     expect(within(row).getByRole('button', { name: 'View' })).toBeTruthy()
     const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(run.disabled).toBe(true)
-    expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
       workflowCopy.workflowRunSupportUnavailable
     )
   })
@@ -1093,7 +1487,7 @@ describe('WorkflowsView', () => {
       const row = within(await screen.findByRole('table', { name: 'Workflow catalog' })).getAllByRole('row')[1]!
       const run = within(row).getByRole('button', { name: 'Run' }) as HTMLButtonElement
       expect(run.disabled).toBe(true)
-      expect(document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
+      expect(globalThis.document.getElementById(run.getAttribute('aria-describedby')!)?.textContent).toBe(
         workflowCopy.workflowRunIncompatible
       )
     }
@@ -1213,7 +1607,7 @@ describe('WorkflowsView', () => {
     expect(runExplanation.getAttribute('aria-disabled')).toBe('true')
     const reasonId = runButton.getAttribute('aria-describedby')
     expect(reasonId).toBeTruthy()
-    expect(document.getElementById(reasonId!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(reasonId!)?.textContent).toBe(
       'Run is unavailable because this workflow uses unsupported input fields.'
     )
 
@@ -1238,7 +1632,7 @@ describe('WorkflowsView', () => {
     // is behaviourally a boolean predicate, so cast it back onto the slot.
     HTMLElement.prototype.matches = function (this: HTMLElement, selector: string): boolean {
       if (selector === ':focus-visible') {
-        return this === document.activeElement
+        return this === globalThis.document.activeElement
       }
 
       return originalMatches.call(this, selector)
@@ -1247,9 +1641,9 @@ describe('WorkflowsView', () => {
     try {
       fireEvent.keyDown(globalThis.document, { key: 'Tab' })
       act(() => keyboardStops[0]!.focus())
-      expect(document.activeElement).toBe(view)
+      expect(globalThis.document.activeElement).toBe(view)
       act(() => keyboardStops[1]!.focus())
-      expect(document.activeElement).toBe(runExplanation)
+      expect(globalThis.document.activeElement).toBe(runExplanation)
       expect((await screen.findByRole('tooltip')).textContent).toContain(
         'Run is unavailable because this workflow uses unsupported input fields.'
       )
@@ -1261,7 +1655,7 @@ describe('WorkflowsView', () => {
     const untrustedRun = within(rows[2]!).getByRole('button', { name: 'Run' }) as HTMLButtonElement
     expect(untrustedView.disabled).toBe(false)
     expect(untrustedRun.disabled).toBe(true)
-    expect(document.getElementById(untrustedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
+    expect(globalThis.document.getElementById(untrustedRun.getAttribute('aria-describedby')!)?.textContent).toBe(
       'Run is unavailable because this workflow failed trust verification.'
     )
   })
@@ -1285,20 +1679,22 @@ describe('WorkflowsView', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const rendered = await renderView(client, 'workflows')
 
-    expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-a')
+    expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-a', 'remote-a')
     apiRequestState.profile = 'profile-b'
     rendered.rerender(
       <QueryClientProvider client={client}>
         {await import('./index').then(({ WorkflowsView }) => <WorkflowsView />)}
       </QueryClientProvider>
     )
-    await waitFor(() => expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-b'))
+    await waitFor(() => expect(listWorkflowDefinitions).toHaveBeenCalledWith('profile-b', 'remote-a'))
 
     profileB.resolve({ items: [definition({ name: 'Profile B workflow' })], truncated: false })
     expect(await screen.findByText('Profile B workflow')).toBeTruthy()
     const profileAResult = { items: [definition({ name: 'Profile A workflow' })], truncated: false }
     profileA.resolve(profileAResult)
-    await waitFor(() => expect(client.getQueryData(['workflow-catalog', 'profile-a'])).toEqual(profileAResult))
+    await waitFor(() =>
+      expect(client.getQueryData(['workflow-marketplace', 'remote-a::profile-a', 'catalog'])).toEqual(profileAResult)
+    )
     expect(screen.queryByText('Profile A workflow')).toBeNull()
 
     apiRequestState.profile = 'profile-a'

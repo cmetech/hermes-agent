@@ -1,9 +1,14 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterEach, expect, test, vi } from 'vitest'
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -53,5 +58,90 @@ test('the close timer does not fire after unmount', async () => {
   vi.advanceTimersByTime(1000)
 
   expect(onClose).not.toHaveBeenCalled()
-  vi.useRealTimers()
+})
+
+function deferred() {
+  let resolve!: () => void
+
+  const promise = new Promise<void>(resolvePromise => {
+    resolve = resolvePromise
+  })
+
+  return { promise, resolve }
+}
+
+test('a deferred confirmation resolving after unmount cannot arm a close timer or invoke onClose', async () => {
+  vi.useFakeTimers()
+  const confirmation = deferred()
+  const onClose = vi.fn()
+
+  const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+
+  const view = render(
+    <ConfirmDialog
+      confirmLabel="Delete"
+      onClose={onClose}
+      onConfirm={() => confirmation.promise}
+      open
+      title="Delete session"
+    />
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+  expect((screen.getByRole('button', { name: 'Working' }) as HTMLButtonElement).disabled).toBe(true)
+  view.unmount()
+
+  await act(async () => confirmation.resolve())
+  vi.advanceTimersByTime(1000)
+
+  expect(setTimeoutSpy).not.toHaveBeenCalledWith(expect.any(Function), 600)
+  expect(onClose).not.toHaveBeenCalled()
+})
+
+test('dismiss-on-confirm does not invoke a stale onClose when its deferred work resolves after unmount', async () => {
+  const confirmation = deferred()
+  const onClose = vi.fn()
+
+  const view = render(
+    <ConfirmDialog
+      confirmLabel="Remove"
+      dismissOnConfirm
+      onClose={onClose}
+      onConfirm={() => confirmation.promise}
+      open
+      title="Remove session"
+    />
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+  view.unmount()
+
+  await act(async () => confirmation.resolve())
+
+  expect(onClose).not.toHaveBeenCalled()
+})
+
+test('the lifecycle guard remains active after StrictMode effect replay', async () => {
+  vi.useFakeTimers()
+  const confirmation = deferred()
+  const onClose = vi.fn()
+  render(
+    <StrictMode>
+      <ConfirmDialog
+        confirmLabel="Delete"
+        onClose={onClose}
+        onConfirm={() => confirmation.promise}
+        open
+        title="Delete session"
+      />
+    </StrictMode>
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+  await act(async () => confirmation.resolve())
+
+  expect(screen.getByRole('button', { name: 'Done' })).toBeTruthy()
+  vi.advanceTimersByTime(600)
+
+  expect(onClose).toHaveBeenCalledTimes(1)
 })

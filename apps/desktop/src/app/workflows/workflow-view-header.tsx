@@ -15,7 +15,7 @@ interface WorkflowViewHeaderProps {
   view: WorkflowRunView
 }
 
-const VIEWS = ['workflows', 'board', 'history', 'archive'] as const
+const VIEWS = ['workflows', 'marketplace', 'board', 'history', 'archive'] as const
 
 export function WorkflowViewHeader({
   headingRef,
@@ -30,12 +30,14 @@ export function WorkflowViewHeader({
 
   const label = (candidate: WorkflowRunView) =>
     candidate === 'workflows'
-      ? copy.workflows
-      : candidate === 'board'
-        ? copy.activeBoard
-        : candidate === 'history'
-          ? copy.history
-          : copy.archive
+      ? copy.workflowInstalled
+      : candidate === 'marketplace'
+        ? copy.workflowMarketplace
+        : candidate === 'board'
+          ? copy.activeBoard
+          : candidate === 'history'
+            ? copy.history
+            : copy.archive
 
   return (
     <header className="flex shrink-0 flex-wrap items-center gap-2">
@@ -56,7 +58,7 @@ export function WorkflowViewHeader({
           </Button>
         ))}
       </div>
-      {view !== 'workflows' && (
+      {view !== 'workflows' && view !== 'marketplace' && (
         <div className="ms-auto flex min-w-0 items-center gap-1.5" data-workflow-run-toolbar>
           <span
             aria-label={copy.workflowLoadedRunCount(loadedRunCount)}

@@ -1,0 +1,4 @@
+name: inbox-triage
+nodes:
+  summarize:
+    type: ai
