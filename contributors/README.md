@@ -36,3 +36,29 @@ janedoe
   `<login>@users.noreply.github.com`) auto-resolve — no file needed.
 - The `Contributor Attribution Check` CI job fails a PR whose commits carry
   an unmapped email; the failure message prints the exact command to run.
+
+## Emails that differ only in case
+
+Two emails differing only in case (the same Mac reporting its hostname as both
+`Foo-Mac-mini.local` and `foo-Mac-mini.local`) would need two filenames
+differing only in case. Git tracks those fine, but NTFS and APFS cannot check
+out both, so a clone on Windows or macOS prints
+
+```
+warning: the following paths have collided (e.g. case-sensitive paths
+on a case-insensitive filesystem) ...
+```
+
+and leaves one entry permanently `modified` in `git status`.
+
+Those entries live in `contributors/case-collisions.tsv` instead — one
+`<exact email><TAB><login>` row each. `add_contributor.py` routes them there
+automatically, moving the already-present file into the same file, so you do
+not need to notice the collision yourself.
+
+The entries are **not** merged. Emails differing only in case can belong to
+different people (`agent@Agents-Mac-mini.local` and
+`agent@agents-Mac-mini.local` are two distinct GitHub users), so each exact
+spelling keeps its own login. Release tooling matches the exact email first
+and only falls back to a case-insensitive match when that email's casefolded
+group maps to a single login.

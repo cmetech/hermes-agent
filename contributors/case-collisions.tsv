@@ -1,0 +1,17 @@
+# Contributor mappings that cannot live in contributors/emails/.
+#
+# Two commit-author emails differing only in case (e.g. the same Mac reporting
+# its hostname as both "Foo-Mac-mini.local" and "foo-Mac-mini.local") would
+# need two filenames differing only in case. Git can track those, but NTFS and
+# APFS cannot materialize both, so a clone on Windows/macOS prints
+#
+#   warning: the following paths have collided ...
+#
+# and leaves one entry permanently "modified" in git status. Entries that would
+# collide live here instead, keyed by the exact email.
+#
+# Format: <exact commit-author email><TAB><github-login>. "#" starts a comment.
+# Everything else still goes in contributors/emails/<email> — see README.md.
+
+agent@Agents-Mac-mini.local	skip-agent
+agent@agents-Mac-mini.local	momomojo
