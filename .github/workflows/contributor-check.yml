@@ -38,7 +38,8 @@ jobs:
           fi
 
           # An email is mapped if it has a file in contributors/emails/
-          # (one file per email — conflict-free) or an entry in the frozen
+          # (one file per email — conflict-free), a row in
+          # contributors/case-collisions.tsv, or an entry in the frozen
           # legacy AUTHOR_MAP in scripts/release.py.
           MISSING=""
           while IFS= read -r email; do
@@ -54,6 +55,16 @@ jobs:
 
             if [ -f "contributors/emails/${email}" ]; then
               continue  # mapped via the contributors directory
+            fi
+
+            # Emails differing only in case cannot both be filenames on the
+            # contributors' NTFS/APFS checkouts, so those few live as
+            # tab-delimited rows in contributors/case-collisions.tsv instead.
+            if [ -f contributors/case-collisions.tsv ] && awk -F'\t' \
+               -v e="$email" '!/^[[:space:]]*#/ && $1 == e { hit = 1 }
+                              END { exit !hit }' \
+               contributors/case-collisions.tsv; then
+              continue
             fi
 
             if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then

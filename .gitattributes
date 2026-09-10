@@ -32,3 +32,7 @@ docker/entrypoint.sh text eol=lf
 *.html  text eol=lf
 *.svg   text eol=lf
 *.ps1   text eol=crlf
+
+# Tab-delimited contributor data: LF so the tab columns and the parser
+# behave identically on every platform.
+contributors/case-collisions.tsv text eol=lf
