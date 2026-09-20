@@ -1,7 +1,7 @@
 # Desktop Connection Lifecycle and Page Responsiveness Design
 
 Date: 2026-09-19
-Status: Awaiting written-spec approval
+Status: Approved by the user on 2026-09-19
 Target branch: `base`
 
 ## Intent
