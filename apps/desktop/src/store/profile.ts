@@ -3,6 +3,7 @@ import { atom, batch, computed } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
 import { getProfiles, hermesApi, setApiRequestProfile, STARTUP_REQUEST_TIMEOUT_MS } from '@/hermes'
+import { ensureDesktopConnection } from '@/lib/desktop-connection'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import {
   arraysEqual,
@@ -13,7 +14,6 @@ import {
   storedStringArray,
   storedStringRecord
 } from '@/lib/storage'
-import { withTimeout } from '@/lib/with-timeout'
 import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-scope'
 import {
   $gateway,
@@ -429,12 +429,8 @@ export function prewarmProfileBackend(name: string): void {
 
 let gatewaySwitch: Promise<void> | null = null
 
-// Descriptor lookups are IPC round-trips into Electron main. A wedged main
-// (the #93454 class: a ticket mint that never answers) must not latch the
-// gatewaySwitch mutex — and, through it, every later profile/source switch
-// and the switch barrier — so they are bounded and fail open like any other
-// lookup failure.
-const DESCRIPTOR_LOOKUP_TIMEOUT_MS = 20_000
+// Descriptor lookups join Electron's scoped lifecycle and fail open here only
+// after that authority reports a typed terminal result.
 
 // The target profile's connection descriptor (mode / baseUrl / …), resolved
 // CONCURRENTLY with the socket work so the switch can publish the profile
@@ -452,18 +448,12 @@ const DESCRIPTOR_LOOKUP_TIMEOUT_MS = 20_000
 // clicks (#89622) — reverted in #89785. Do not reintroduce fail-closed
 // switching at this seam.
 async function resolveConnectionForProfile(profile: string): Promise<HermesConnection | null> {
-  const getConnection = window.hermesDesktop?.getConnection
-
-  if (!getConnection) {
+  if (!window.hermesDesktop) {
     return null
   }
 
   try {
-    return await withTimeout(
-      getConnection(profile),
-      DESCRIPTOR_LOOKUP_TIMEOUT_MS,
-      `Timed out resolving the connection descriptor for profile "${profile}"`
-    )
+    return await ensureDesktopConnection({ connectionId: null, profile })
   } catch (err) {
     console.warn(`[profile] descriptor lookup for "${profile}" failed; keeping the previous connection`, err)
 
@@ -550,18 +540,14 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
 // resolveConnectionForProfile: a failed lookup resolves null and keeps the
 // previous descriptor.
 async function resolveConnectionForAgent(connectionId: string, profile: string): Promise<HermesConnection | null> {
-  const getConnectionFor = window.hermesDesktop?.getConnectionFor
+  const desktop = window.hermesDesktop
 
-  if (!getConnectionFor) {
+  if (!desktop?.ensureConnection && !desktop?.getConnectionFor) {
     return null
   }
 
   try {
-    return await withTimeout(
-      getConnectionFor({ connectionId, profile }),
-      DESCRIPTOR_LOOKUP_TIMEOUT_MS,
-      `Timed out resolving the connection descriptor for agent "${connectionId}:${profile}"`
-    )
+    return await ensureDesktopConnection({ connectionId, profile })
   } catch (err) {
     console.warn(
       `[profile] descriptor lookup for agent "${connectionId}:${profile}" failed; keeping the previous connection`,

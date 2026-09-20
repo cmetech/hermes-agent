@@ -19,9 +19,9 @@ declare global {
     hermesDesktop: {
       // Electron-main is the single owner of connection attempts. These calls
       // expose its authoritative lifecycle without letting inspection dial.
-      ensureConnection: (scope: DesktopConnectionScopeInput) => Promise<HermesConnection>
-      inspectConnection: (scope: DesktopConnectionScopeInput) => Promise<DesktopConnectionLifecycleSnapshot>
-      onConnectionLifecycle: (callback: (snapshot: DesktopConnectionLifecycleSnapshot) => void) => () => void
+      ensureConnection?: (scope: DesktopConnectionScopeInput) => Promise<HermesConnection>
+      inspectConnection?: (scope: DesktopConnectionScopeInput) => Promise<DesktopConnectionLifecycleSnapshot>
+      onConnectionLifecycle?: (callback: (snapshot: DesktopConnectionLifecycleSnapshot) => void) => () => void
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.

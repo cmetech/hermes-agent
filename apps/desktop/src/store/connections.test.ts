@@ -764,13 +764,17 @@ describe('selectConnection', () => {
     list.mockResolvedValueOnce({ ...registry, lastUsed: 'homelab', launchMode: 'last-used' })
     $showAllProfiles.set(true)
 
+    const descriptor = deferred<Record<string, unknown>>()
+
+    ;(window.hermesDesktop as unknown as Record<string, unknown>).ensureConnection = vi.fn(() => descriptor.promise)
+
     const restoring = initializeConnectionsRegistry()
 
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(openGatewayAgent).not.toHaveBeenCalled()
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
 
-    $connection.set({ connectionId: 'homelab', mode: 'remote' })
+    descriptor.resolve({ connectionId: 'homelab', mode: 'remote' })
     await restoring
 
     expect(openGatewayAgent).not.toHaveBeenCalled()
@@ -779,28 +783,20 @@ describe('selectConnection', () => {
     expect($showAllProfiles.get()).toBe(true)
   })
 
-  it('boot restore proceeds after the descriptor wait deadline (bounded wait)', async () => {
-    // A primary that never publishes (spawn failure, dead SSH target) must
-    // not strand the registry restore forever: after the deadline the restore
-    // runs exactly as it did before the wait existed.
-    vi.useFakeTimers()
+  it('boot restore proceeds after Electron reports a typed terminal descriptor failure', async () => {
+    list.mockResolvedValueOnce({ ...registry, lastUsed: 'homelab', launchMode: 'last-used' })
 
-    try {
-      list.mockResolvedValueOnce({ ...registry, lastUsed: 'homelab', launchMode: 'last-used' })
+    const failure = Object.assign(new Error('connection attempt timed out'), {
+      data: { attemptId: 9, code: 'attempt_timeout', retryable: true }
+    })
 
-      const restoring = initializeConnectionsRegistry()
+    ;(window.hermesDesktop as unknown as Record<string, unknown>).ensureConnection = vi
+      .fn()
+      .mockRejectedValue(failure)
 
-      await vi.advanceTimersByTimeAsync(1_000)
-      expect(ensureGatewayAgent).not.toHaveBeenCalled()
+    await initializeConnectionsRegistry()
 
-      // Descriptor never arrives; deadline elapses.
-      await vi.advanceTimersByTimeAsync(60_000)
-      await restoring
-
-      expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
-    } finally {
-      vi.useRealTimers()
-    }
+    expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
   })
 
   it('a user-initiated source switch still collapses "All profiles"', async () => {

@@ -3,8 +3,8 @@ import { atom } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
+import { ensureDesktopConnection, invalidateDesktopConnection } from '@/lib/desktop-connection'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
 
@@ -321,11 +321,7 @@ async function isAttachedSharedRemote(connectionId: null | string, profile: stri
   }
 
   try {
-    const conn = await withTimeout(
-      desktop.getConnectionFor({ connectionId: id, profile: key }),
-      RECONNECT_ATTEMPT_TIMEOUT_MS,
-      `Timed out resolving shared-remote route for "${key}"`
-    )
+    const conn = await ensureDesktopConnection({ connectionId: id, profile: key })
 
     return Boolean(conn && typeof conn === 'object' && (conn as { sharedRemote?: boolean }).sharedRemote === true)
   } catch {
@@ -545,26 +541,12 @@ async function openSecondary(entry: Secondary): Promise<void> {
         })
     }
 
-    // Registry-scoped entries dial through getConnectionFor when the bridge has
-    // it. Local/legacy entries retain the existing getConnection path. Both are
-    // IPC round-trips into the main process with no timeout of their own
-    // (#93454) — a wedged main-process round-trip otherwise hangs this await
-    // forever, latching entry.connectPromise so every routed action against
-    // this secondary (SSH terminal, messaging DELETE, session send, …) never
-    // settles either. Bound the same way use-gateway-boot.ts bounds the
-    // primary's equivalent awaits.
-    const conn =
-      entry.connectionId && desktop.getConnectionFor
-        ? await withTimeout(
-            desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile }),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
-            `Timed out connecting to profile "${entry.profile}"`
-          )
-        : await withTimeout(
-            desktop.getConnection(entry.profile),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
-            `Timed out connecting to profile "${entry.profile}"`
-          )
+    // Join the renderer's scope-aware client. Electron owns the bounded dial;
+    // entry.connectPromise owns only this socket's local sharing/retry state.
+    const conn = await ensureDesktopConnection({
+      connectionId: entry.connectionId,
+      profile: entry.profile
+    })
 
     entry.connection = conn
 
@@ -578,11 +560,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
           ? {}
           : desktop
 
-    const wsUrl = await withTimeout(
-      resolveGatewayWsUrl(wsDeps, conn),
-      RECONNECT_ATTEMPT_TIMEOUT_MS,
-      `Timed out re-minting the gateway WebSocket URL for profile "${entry.profile}"`
-    )
+    const wsUrl = await resolveGatewayWsUrl(wsDeps, conn)
 
     try {
       await entry.gateway.connect(wsUrl)
@@ -773,15 +751,8 @@ async function sharedPrimaryRoute(profile: string): Promise<boolean> {
   }
 
   try {
-    // Unbounded IPC round-trip into main (#93454) — a wedge here must reject
-    // like any other failure, not hang the route decision forever, since
-    // every caller (gatewayForProfile → requestGatewayForProfile/Agent) awaits
-    // this before it can fall back to dialing a secondary.
-    const conn = await withTimeout(
-      desktop.getConnection(profile),
-      RECONNECT_ATTEMPT_TIMEOUT_MS,
-      `Timed out resolving the shared-primary route for profile "${profile}"`
-    )
+    // Reuse the same scoped descriptor promise as the secondary open below.
+    const conn = await ensureDesktopConnection({ connectionId: null, profile })
 
     return Boolean(conn && typeof conn === 'object' && (conn as { sharedPrimary?: boolean }).sharedPrimary === true)
   } catch {
@@ -1584,6 +1555,7 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
       entry.gateway.close()
     }
 
+    invalidateDesktopConnection({ connectionId: entry.connectionId, profile: entry.profile })
     entry.reconnectAttempt = 0
     clearTimer(entry)
     void reconnectSecondary(entry)
@@ -1805,6 +1777,10 @@ export function disposeSecondariesForConnection(connectionId: string, opts: { re
 
     const wasActive = key === g.activeKey
     activeInvalidated ||= wasActive
+
+    if (opts.redial) {
+      invalidateDesktopConnection({ connectionId: entry.connectionId, profile: entry.profile })
+    }
 
     if (opts.redial && (entry.activeRequests > 0 || relayRetained(entry) || foregroundPinned(entry))) {
       entry.pendingConnectionRedial = true

@@ -5,15 +5,14 @@ import { shouldApplyPostBootProgressError } from '@/components/boot-failure-reau
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
+import {
+  ensureDesktopConnection,
+  invalidateDesktopConnection,
+  revalidateDesktopConnection
+} from '@/lib/desktop-connection'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import {
-  BACKEND_BOOT_WAIT_TIMEOUT_MS,
-  isTimeoutError,
-  RECONNECT_ATTEMPT_TIMEOUT_MS,
-  withTimeout
-} from '@/lib/with-timeout'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -121,13 +120,6 @@ const BOOT_RETRY_MAX_ATTEMPTS = 5
 // Base delay for boot retries. Deliberately slower than the socket reconnect
 // loop's 300ms: each attempt may rebuild an SSH master + remote dashboard.
 const BOOT_RETRY_BASE_DELAY_MS = 2_000
-
-// While any of the RECONNECT_ATTEMPT_TIMEOUT_MS-bounded awaits below is
-// pending, `reconnecting` never clears, so scheduleReconnect()/
-// attemptReconnect() early-return permanently and the backoff loop is
-// latched — the UI stays "reconnecting" until the app is restarted even
-// though the gateway is reachable again. gateway.connect() already has its
-// own connect timeout.
 
 /** Registry identity whose runtimes died with the primary connection. */
 export function primaryRuntimeConnectionId(connection: Pick<HermesConnection, 'connectionId' | 'mode'>): null | string {
@@ -315,23 +307,16 @@ export function useGatewayBoot({
         // whose 'exit' would clear the main process's cached descriptor — without
         // this the renderer re-dials the same dead endpoint forever and stays on
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
-        // Bounded like the two awaits below: a wedged revalidation (#93454) is
-        // the specific hang this loop must survive, not just a rejection.
-        await withTimeout(
-          desktop.revalidateConnection?.() ?? Promise.resolve(),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out revalidating the gateway connection'
-        ).catch(() => undefined)
+        // Electron/preload own the bound, so this cannot outlive the
+        // authoritative lifecycle while a healthy backend is still starting.
+        await revalidateDesktopConnection().catch(() => undefined)
+        invalidateDesktopConnection({ connectionId: null, profile: null })
 
         // Primary sleep/wake reconnect must dial the WINDOW-owned primary backend
         // (same as boot/softSwitch). Passing $activeGatewayProfile would retarget
         // this primary socket at a secondary profile's backend after a live swap.
         // Secondaries reconnect via reconnectSecondaryGateways().
-        const conn = await withTimeout(
-          desktop.getConnection(),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out reconnecting to Hermes backend'
-        )
+        const conn = await ensureDesktopConnection({ connectionId: null, profile: null })
 
         setPrimaryGatewayConnection(conn)
 
@@ -354,11 +339,7 @@ export function useGatewayBoot({
         // explicit auth rejection asks for sign-in; transport failures stay in
         // this reconnect loop. For local/token gateways the URL carries a
         // long-lived token and the re-mint is a cheap no-op.
-        const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out re-minting the gateway WebSocket URL'
-        )
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
 
         await gateway.connect(wsUrl)
 
@@ -576,6 +557,11 @@ export function useGatewayBoot({
         return
       }
 
+      invalidateDesktopConnection({
+        connectionId: null,
+        profile: windowProfileOverride() ?? undefined
+      })
+
       let switchToken: null | ReturnType<typeof beginGatewaySwitch> = null
 
       try {
@@ -604,16 +590,12 @@ export function useGatewayBoot({
 
         // Same override rule as boot(): a profile-pinned helper window stays
         // on its pinned profile's backend across a soft switch.
-        // Bounded for the same reason as attemptReconnect() (#93454): a wedged
-        // main-process round-trip must not latch $gatewaySwitching stuck —
-        // the `finally` below only runs once this promise settles. Uses the
-        // shared backend-boot budget rather than the reconnect budget because
-        // ensureBackend may cold-spawn a pooled helper backend here.
-        const conn = await withTimeout(
-          desktop.getConnection(windowProfileOverride() ?? undefined),
-          BACKEND_BOOT_WAIT_TIMEOUT_MS,
-          'Timed out reconnecting to Hermes backend'
-        )
+        // Join Electron's scoped attempt; a helper backend may legitimately
+        // cold-start here, so no shorter renderer deadline competes with it.
+        const conn = await ensureDesktopConnection({
+          connectionId: null,
+          profile: windowProfileOverride() ?? undefined
+        })
 
         if (!ownsSwitch()) {
           return
@@ -622,13 +604,8 @@ export function useGatewayBoot({
         publish(conn)
         setPrimaryGatewayConnection(conn)
 
-        // Bounded for the same reason as attemptReconnect() (#93454): a wedged
-        // ticket mint would otherwise hang the gateway switch forever.
-        const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out re-minting the gateway WebSocket URL'
-        )
+        // Preload applies the emergency IPC watchdog outside Electron's bound.
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
 
         if (!ownsSwitch()) {
           return
@@ -781,15 +758,9 @@ export function useGatewayBoot({
       },
       onActiveConnectionInvalidated: (fallbackProfile, invalidationEpoch) => {
         $activeGatewayProfile.set(fallbackProfile)
-        // Bounded like every other getConnection() call in this file (#93454):
-        // an eviction fallback (idle reap, connection removal, profile delete)
-        // must not latch the profile atom to a connection that never resolves
-        // if the main-process IPC round-trip wedges.
-        void withTimeout(
-          desktop.getConnection(fallbackProfile),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out resolving the fallback gateway connection'
-        )
+        // The fallback joins the same scoped Electron attempt and retains the
+        // activation-epoch fence below for a late/superseded result.
+        void ensureDesktopConnection({ connectionId: null, profile: fallbackProfile })
           .then(connection => {
             if (!cancelled && gatewayActivationEpoch() === invalidationEpoch) {
               publish(connection)
@@ -977,42 +948,12 @@ export function useGatewayBoot({
         // A profile-pinned helper window (the HUD) dials its target profile's
         // backend directly — ensureBackend spawns/reuses it from the pool.
         // Everything else keeps dialing the primary.
-        // Bounded like the reconnect path (#93454): a wedged main-process
-        // round-trip must not hang "Starting Hermes…" forever. Initial boot
-        // rides out a full backend cold spawn, so it gets the shared 45s
-        // backend-boot budget, not the 20s reconnect budget.
-        const connectionStartedAt = Date.now()
-        const connection = desktop.getConnection(windowProfileOverride() ?? undefined)
-        let extendedForCompletionAt: number | null = null
-        let conn: HermesConnection
-
-        while (true) {
-          try {
-            conn = await withTimeout(connection, BACKEND_BOOT_WAIT_TIMEOUT_MS, 'Timed out connecting to Hermes backend')
-
-            break
-          } catch (error) {
-            if (!isTimeoutError(error)) {
-              throw error
-            }
-
-            const bootstrap = await desktop.getBootstrapState()
-
-            const completedThisAttempt =
-              bootstrap.error === null &&
-              bootstrap.completedAt !== null &&
-              bootstrap.completedAt >= connectionStartedAt &&
-              bootstrap.completedAt !== extendedForCompletionAt
-
-            if (!bootstrap.active && !completedThisAttempt) {
-              throw error
-            }
-
-            if (completedThisAttempt) {
-              extendedForCompletionAt = bootstrap.completedAt
-            }
-          }
-        }
+        // Electron owns the cold-start deadline. The renderer joins that
+        // attempt and waits for its typed terminal result.
+        const conn = await ensureDesktopConnection({
+          connectionId: null,
+          profile: windowProfileOverride() ?? undefined
+        })
 
         if (cancelled) {
           return
@@ -1044,13 +985,8 @@ export function useGatewayBoot({
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it rather than
         // connecting with a dead ticket. Auth rejection asks for sign-in;
         // connectivity failures remain retryable. Bounded like the reconnect
-        // path (#93454) so a wedged mint fails into boot retry instead of
-        // hanging "Starting Hermes…" forever.
-        const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out minting the gateway WebSocket URL'
-        )
+        // path; preload's watchdog remains outside Electron's attempt bound.
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
 
         await gateway.connect(wsUrl)
 
