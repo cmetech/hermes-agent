@@ -139,6 +139,19 @@ import {
 import { broadcastConnectionGeneration } from './connection-generation-event'
 import { createConnectionGenerationRouting, invalidateSshGeneration } from './connection-generation-routing'
 import {
+  ConnectionLifecycleCoordinator,
+  type DesktopConnectionPhase,
+  type DesktopConnectionScopeInput
+} from './connection-lifecycle'
+import {
+  CONNECTION_LIFECYCLE_CHANNEL,
+  createConnectionLifecycleBridge,
+  normalizeMainConnectionScope,
+  sanitizeConnectionErrorMessage,
+  sanitizeConnectionLifecycleSnapshot
+} from './connection-lifecycle-bridge'
+import { resolveConnectionLifecyclePolicy } from './connection-lifecycle-policy'
+import {
   backendScopeKey,
   backendScopePrefix,
   buildAgentRoster,
@@ -1443,10 +1456,7 @@ function registerMediaProtocol() {
     // Claim-guarded (#90812): a media stream load can race a renderer's own
     // reconnect dial for the same (connectionId, profile) scope; coalescing
     // here avoids bootstrapping a second SSH tunnel / remote dashboard.
-    resolveRemoteConnection: ({ connectionId, profile }) =>
-      backendDialClaims.run(backendScopeKey(connectionId, profile), () =>
-        connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
-      )
+    resolveRemoteConnection: ({ connectionId, profile }) => ensureDesktopConnection({ connectionId, profile })
   })
 
   protocol.handle(MEDIA_PROTOCOL, handler)
@@ -1458,6 +1468,7 @@ const backendConnectionState = createBackendConnectionState<ReturnType<typeof sp
 const connectionGenerations = createConnectionGenerationRegistry((reason, routes) => {
   if (reason === GENERATION_EXHAUSTED) {
     backendConnectionState.clearConnectionPromise()
+    desktopConnectionCoordinator.invalidateAll()
 
     for (const entry of backendPool.values()) {
       entry.connectionPromise = null
@@ -1470,6 +1481,7 @@ const connectionGenerations = createConnectionGenerationRegistry((reason, routes
 
   for (const route of routes) {
     const [connectionId, profile] = JSON.parse(route)
+    desktopConnectionCoordinator.invalidate({ connectionId, profile })
     broadcastConnectionGeneration(BrowserWindow.getAllWindows(), { kind: 'scope_invalidated', connectionId, profile })
   }
 })
@@ -1508,6 +1520,115 @@ const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
 // lifecycles, so concurrent dials for one (connectionId, profile) scope
 // coalesce here — the second caller awaits the first spawn's result.
 const backendDialClaims = new BackendDialClaims()
+
+type ConnectionAttemptReporter = (phase: DesktopConnectionPhase) => void
+
+function classifyDesktopConnectionError(error: unknown) {
+  const message = sanitizeConnectionErrorMessage(error instanceof Error ? error.message : error)
+  const lower = message.toLowerCase()
+
+  if (isReauthRequiredError(error) || /\bauth(?:entication|orization)?\b|sign[ -]?in|unauthorized/.test(lower)) {
+    return { code: 'auth_required' as const, message, retryable: false }
+  }
+
+  if (/no connection with id|missing connection/.test(lower)) {
+    return { code: 'missing_connection' as const, message, retryable: false }
+  }
+
+  if (/profile.+(?:missing|not found|does not exist)/.test(lower)) {
+    return { code: 'missing_profile' as const, message, retryable: false }
+  }
+
+  if (/port.+(?:announce|timeout|timed out)|announce.+port/.test(lower)) {
+    return { code: 'port_timeout' as const, message, retryable: true }
+  }
+
+  if (/ssh|remote|econn|enotfound|host unreachable|network/.test(lower)) {
+    return { code: 'remote_unreachable' as const, message, retryable: true }
+  }
+
+  if (/health|became ready|readiness|\/api\/status/.test(lower)) {
+    return { code: 'health_timeout' as const, message, retryable: true }
+  }
+
+  return { code: 'launch_failed' as const, message, retryable: true }
+}
+
+function desktopConnectionScope(scope: DesktopConnectionScopeInput) {
+  const registry = readDesktopConnectionsRegistry()
+
+  return normalizeMainConnectionScope(scope, primaryProfileKey(), registry.primary)
+}
+
+function serializeRendererConnection(connection) {
+  const { headers: _headers, ...rendererConnection } = connection
+
+  return rendererConnection
+}
+
+async function dialDesktopConnection(scope, reportPhase: ConnectionAttemptReporter) {
+  reportPhase('resolve')
+
+  if (scope.connectionId) {
+    const registry = readDesktopConnectionsRegistry()
+    const source = registry.connections.find(connection => connection.id === scope.connectionId)
+
+    reportPhase(source?.kind === 'local' ? 'launch' : 'remote')
+
+    const connection = await backendDialClaims.run(backendScopeKey(scope.connectionId, scope.profile), () =>
+      ensureRegistryBackend(scope.connectionId, scope.profile, '', undefined, reportPhase)
+    )
+
+    connectionGenerations.assertCurrent(connection.connectionGeneration)
+
+    return { ...connection, connectionId: scope.connectionId, registryScoped: true }
+  }
+
+  reportPhase(primaryBackendIsRemote() ? 'remote' : 'launch')
+
+  const connection = await backendDialClaims.run(backendScopeKey(null, scope.profile), () =>
+    ensureBackend(scope.profile, undefined, reportPhase)
+  )
+
+  const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
+
+  connectionGenerations.assertCurrent(connection.connectionGeneration)
+  connectionGenerations.associate(lifecycleRouteKey(connectionId, scope.profile), connection.connectionGeneration)
+
+  return { ...connection, connectionId: connectionId || null }
+}
+
+const desktopConnectionPolicy = resolveConnectionLifecyclePolicy()
+
+const desktopConnectionCoordinator = new ConnectionLifecycleCoordinator<any>({
+  classifyError: classifyDesktopConnectionError,
+  clearTimer: timer => clearTimeout(timer),
+  clock: () => Date.now(),
+  dial: dialDesktopConnection,
+  log: record => rememberLog(`[connection-lifecycle] ${JSON.stringify(record)}`),
+  policy: desktopConnectionPolicy,
+  publish: snapshot => {
+    const payload = sanitizeConnectionLifecycleSnapshot(snapshot)
+
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.webContents.isDestroyed()) {
+        window.webContents.send(CONNECTION_LIFECYCLE_CHANNEL, payload)
+      }
+    }
+  },
+  setTimer: (callback, ms) => setTimeout(callback, ms)
+})
+
+const desktopConnectionBridge = createConnectionLifecycleBridge({
+  coordinator: desktopConnectionCoordinator,
+  normalizeScope: desktopConnectionScope,
+  serializeConnection: serializeRendererConnection
+})
+
+function ensureDesktopConnection(scope: DesktopConnectionScopeInput) {
+  return desktopConnectionCoordinator.ensure(desktopConnectionScope(scope))
+}
+
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -8369,7 +8490,7 @@ async function freshGatewayWsUrl(profile) {
   // silently lands back on the primary (default) backend and writes sessions to
   // the wrong profile's DB. A null/empty profile resolves to the primary, so
   // legacy callers and single-profile users are unchanged.
-  const connection = await ensureBackend(profile)
+  const connection = await ensureDesktopConnection({ connectionId: null, profile })
 
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers)
@@ -10413,14 +10534,15 @@ async function ensureTerminalBackend(webContentsId: number) {
   // reconnect dial for the same (connectionId, profile) scope; coalescing
   // here avoids bootstrapping a second SSH tunnel / remote dashboard.
   if (windowRoute?.registryScoped && windowRoute.connectionId) {
-    return backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile), () =>
-      ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)
-    )
+    return ensureDesktopConnection({
+      connectionId: windowRoute.connectionId,
+      profile: windowRoute.profile
+    })
   }
 
   const profile = windowRoute?.profile ?? primaryProfileKey()
 
-  return backendDialClaims.run(backendScopeKey(null, profile), () => ensureBackend(profile))
+  return ensureDesktopConnection({ connectionId: null, profile })
 }
 
 // Loopback reach for the browser pane. Scoped to the SSH connection that
@@ -11002,7 +11124,7 @@ async function fetchJsonForProfile(profile, path) {
 
 // Issue an arbitrary method against a profile's resolved backend, parsed JSON.
 async function requestJsonForProfile(profile: string, path: string, method: string, body?: string) {
-  const conn = await ensureBackend(profile)
+  const conn = await ensureDesktopConnection({ connectionId: null, profile })
   const url = `${conn.baseUrl}${path}`
   const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
 
@@ -11434,16 +11556,24 @@ function profileRouteOptions(profile, request?) {
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
-async function ensureBackend(profile, requestRoute?: ConnectionRouteLease) {
+async function ensureBackend(
+  profile,
+  requestRoute?: ConnectionRouteLease,
+  reportPhase?: ConnectionAttemptReporter
+) {
   return ensureConnectionGenerationRoute(
     connectionGenerations,
     lifecycleRouteKey(null, profile),
-    () => resolveBackend(profile, requestRoute),
+    () => resolveBackend(profile, requestRoute, reportPhase),
     requestRoute
   )
 }
 
-async function resolveBackend(profile, requestRoute?: ConnectionRouteLease) {
+async function resolveBackend(
+  profile,
+  requestRoute?: ConnectionRouteLease,
+  reportPhase?: ConnectionAttemptReporter
+) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
 
   profileDeletionGate.assertCanStart(key)
@@ -11451,7 +11581,7 @@ async function resolveBackend(profile, requestRoute?: ConnectionRouteLease) {
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
   if (route.backend === 'primary') {
-    const connection = await startHermes()
+    const connection = await startHermes(reportPhase)
     setWslBridgeProfileState(key, connection.mode !== 'remote')
 
     // A shared backend still owes the caller its profile scope, so renderer-side
@@ -11481,7 +11611,7 @@ async function resolveBackend(profile, requestRoute?: ConnectionRouteLease) {
     if (!connectionGenerations.isCurrent(connection.connectionGeneration)) {
       await stopPoolBackend(key)
 
-      return ensureBackend(profile, requestRoute)
+      return ensureBackend(profile, requestRoute, reportPhase)
     }
 
     setWslBridgeProfileState(key, connection.mode !== 'remote')
@@ -11500,7 +11630,7 @@ async function resolveBackend(profile, requestRoute?: ConnectionRouteLease) {
     remoteBaseUrl: null
   }
 
-  entry.connectionPromise = spawnPoolBackend(key, entry).catch(async error => {
+  entry.connectionPromise = spawnPoolBackend(key, entry, { reportPhase }).catch(async error => {
     // Land the failure in desktop.log: without this a spawn that dies before
     // its child exists (guard rejection, runtime resolution) leaves no trace
     // beyond renderer-side rejections users never see in a bundle.
@@ -11536,7 +11666,8 @@ async function ensureRegistryBackend(
   connectionId,
   profile,
   managedUpdateCorrelation = '',
-  requestRoute?: ConnectionRouteLease
+  requestRoute?: ConnectionRouteLease,
+  reportPhase?: ConnectionAttemptReporter
 ) {
   connectionGenerations.assertAvailable()
   const id = String(connectionId || '').trim() || readDesktopConnectionsRegistry().primary
@@ -11544,7 +11675,7 @@ async function ensureRegistryBackend(
   const connection = await ensureConnectionGenerationRoute(
     connectionGenerations,
     lifecycleRouteKey(id, profile || 'default'),
-    () => resolveRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute),
+    () => resolveRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute, reportPhase),
     requestRoute
   )
 
@@ -11555,7 +11686,8 @@ async function resolveRegistryBackend(
   connectionId,
   profile,
   managedUpdateCorrelation = '',
-  requestRoute?: ConnectionRouteLease
+  requestRoute?: ConnectionRouteLease,
+  reportPhase?: ConnectionAttemptReporter
 ) {
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
@@ -11613,7 +11745,7 @@ async function resolveRegistryBackend(
   const primary = await reuseMatchingPrimarySshBackend({
     connectionId: id,
     effectiveFingerprint: resolveRegistryEffectiveFingerprint,
-    ensurePrimary: () => ensureBackend(profile, requestRoute),
+    ensurePrimary: () => ensureBackend(profile, requestRoute, reportPhase),
     profile,
     registry,
     source
@@ -11634,7 +11766,7 @@ async function resolveRegistryBackend(
   // Desktop window starts two isolated servers whose transient runtime ids
   // are not interchangeable.
   if (id === registry.primary && source.kind !== 'local' && source.kind !== 'ssh') {
-    const primaryDescriptor = await ensureBackend(profile, requestRoute)
+    const primaryDescriptor = await ensureBackend(profile, requestRoute, reportPhase)
 
     if (registrySourceOwnsPrimaryBackend(registry, id, primaryDescriptor)) {
       return {
@@ -11664,7 +11796,7 @@ async function resolveRegistryBackend(
     })
 
     if (localRoute.delegate) {
-      return ensureBackend(profile, requestRoute)
+      return ensureBackend(profile, requestRoute, reportPhase)
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
@@ -11682,7 +11814,7 @@ async function resolveRegistryBackend(
       if (!connectionGenerations.isCurrent(connection.connectionGeneration)) {
         await stopPoolBackend(localRoute.poolKey)
 
-        return ensureRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute)
+        return ensureRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute, reportPhase)
       }
 
       return connection
@@ -11701,7 +11833,8 @@ async function resolveRegistryBackend(
 
     localEntry.connectionPromise = spawnPoolBackend(profileKey, localEntry, {
       forceLocal: true,
-      poolKey: localRoute.poolKey
+      poolKey: localRoute.poolKey,
+      reportPhase
     }).catch(async error => {
       // Same trace rule as the v1 pool path: a forced-local child whose spawn
       // rejects before the child exists must still land in desktop.log.
@@ -11734,7 +11867,7 @@ async function resolveRegistryBackend(
     if (!connectionGenerations.isCurrent(descriptor.connectionGeneration)) {
       await stopPoolBackend(key)
 
-      return ensureRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute)
+      return ensureRegistryBackend(id, profile, managedUpdateCorrelation, requestRoute, reportPhase)
     }
 
     // A remote process can die while its local SSH forward stays LISTENing.
@@ -11746,7 +11879,7 @@ async function resolveRegistryBackend(
         connectionPromise,
         currentConnectionPromise: () => backendPool.get(key)?.connectionPromise || null,
         probe: (connection, requestPath, options) => fetchJsonForBackend(connection, requestPath, options),
-        reconnect: () => ensureRegistryBackend(id, profile, '', requestRoute),
+        reconnect: () => ensureRegistryBackend(id, profile, '', requestRoute, reportPhase),
         retire: async (error: any) => {
           // A late failure from an old descriptor must never tear down a newer
           // entry that another caller has already installed.
@@ -12464,7 +12597,11 @@ function startPoolIdleReaper() {
 // entry means THIS machine regardless of the v1 routing table); `opts.poolKey`
 // is the backendPool key when it differs from the profile name (composite
 // registry scopes) so the exit/error cleanup evicts the right entry.
-async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; poolKey?: string } = {}) {
+async function spawnPoolBackend(
+  profile,
+  entry,
+  opts: { forceLocal?: boolean; poolKey?: string; reportPhase?: ConnectionAttemptReporter } = {}
+) {
   const poolKey = opts.poolKey || profile
   const generationClaim = connectionGenerations.begin(`pool:${poolKey}`)
 
@@ -12481,6 +12618,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   profileDeletionGate.assertCanStart(profile)
 
   if (remote) {
+    opts.reportPhase?.('remote')
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
 
     // Recorded on the entry so revalidation can probe this descriptor without
@@ -12540,6 +12678,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   )
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+  opts.reportPhase?.('launch')
 
   const parentStartMarker = await desktopParentStartMarker()
   const backendNonce = crypto.randomBytes(16).toString('hex')
@@ -12624,6 +12763,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   })
 
   // Discover the ephemeral port the child bound to
+  opts.reportPhase?.('port')
+
   const port = await Promise.race([
     waitForDashboardPortAnnouncement(child, { describeOutputTail: () => outputTail.describe(), readyFile }),
     startFailed
@@ -12636,6 +12777,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   entry.port = port
 
   const baseUrl = `http://127.0.0.1:${port}`
+  opts.reportPhase?.('health')
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
   ready = true
 
@@ -12769,7 +12911,7 @@ async function prepareProfileRenameRequest(request) {
   })
 }
 
-async function startHermes() {
+async function startHermes(reportPhase?: ConnectionAttemptReporter) {
   connectionGenerations.assertAvailable()
 
   // Only the single-instance lock holder may reap/spawn/claim the desktop
@@ -12826,7 +12968,7 @@ async function startHermes() {
     connectionGenerations.assertAvailable()
     await teardownPrimaryBackendAndWait({ soft: true })
 
-    return startHermes()
+    return startHermes(reportPhase)
   }
 
   const connectionAttempt = backendConnectionState.startAttempt()
@@ -12844,6 +12986,8 @@ async function startHermes() {
 
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
+      reportPhase?.('remote')
+
       // resolveRemote() may take arbitrarily long (settings resolve / ws-ticket
       // mint). If a newer attempt started meanwhile (e.g. the user switched
       // remotes and Apply invalidated this attempt), bail before probing.
@@ -12949,6 +13093,7 @@ async function startHermes() {
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
+    reportPhase?.('launch')
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
     const profile = primaryProfileKey()
@@ -13082,6 +13227,7 @@ async function startHermes() {
     })
 
     await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
+    reportPhase?.('port')
 
     // Discover the ephemeral port the child bound to
     const port = await Promise.race([
@@ -13098,6 +13244,7 @@ async function startHermes() {
 
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
+    reportPhase?.('health')
     await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
     backendReady = true
     backendStartFailure = null
@@ -14710,7 +14857,9 @@ function createWindow() {
   // shared (backendConnectionState), so the renderer's getConnection() joins
   // this in-flight boot instead of duplicating it; early boot-progress events
   // the renderer misses are recovered by its getBootProgress() pull on mount.
-  startHermes().catch(error => rememberLog(error.stack || error.message))
+  ensureDesktopConnection({ connectionId: null, profile: primaryProfileKey() }).catch(error =>
+    rememberLog(error.stack || error.message)
+  )
 
   mainWindow.webContents.once('did-finish-load', () => {
     // Zoom restore is handled by wireCommonWindowHandlers (shared with session
@@ -14721,19 +14870,9 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => {
-  // Coalesce concurrent renderer dials for one profile scope (#90812): the
-  // renderer-side reconnect lock is per-window, so two windows waking at once
-  // both land here. The claim key mirrors ensureBackend()'s own profile
-  // normalization so every spelling of the primary coalesces onto one dial.
-  const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
-  const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
-  const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
-  connectionGenerations.assertCurrent(connection.connectionGeneration)
-  connectionGenerations.associate(lifecycleRouteKey(connectionId, profileKey), connection.connectionGeneration)
-  // Proxy headers are native dispatch material, never renderer identity.
-  const { headers: _headers, ...rendererConnection } = connection
+  const connection = await ensureDesktopConnection({ connectionId: null, profile })
 
-  return { ...rendererConnection, connectionId: connectionId || null }
+  return serializeRendererConnection(connection)
 })
 // Registry-scoped variant: resolve a backend for (connectionId, profile).
 // connectionId '' / 'local' / the registry primary all behave sensibly; the
@@ -14744,15 +14883,17 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
-  // Same single-owner claim as 'hermes:connection', keyed by the composite
-  // (connectionId, profile) scope (#90812): concurrent registry dials for one
-  // scope share the first spawn instead of bootstrapping duplicate remotes.
-  const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
+  const connection = await ensureDesktopConnection({ connectionId: id, profile })
 
-  connectionGenerations.assertCurrent(connection.connectionGeneration)
-  const { headers: _headers, ...rendererConnection } = connection
+  return serializeRendererConnection(connection)
+})
 
-  return { ...rendererConnection, connectionId: id, registryScoped: true }
+ipcMain.handle('hermes:connection:ensure', async (_event, scope) => desktopConnectionBridge.ensure(scope || {}))
+ipcMain.handle('hermes:connection:inspect', async (_event, scope) =>
+  sanitizeConnectionLifecycleSnapshot(desktopConnectionBridge.inspect(scope || {}))
+)
+ipcMain.on('hermes:connection:policy', event => {
+  event.returnValue = { preloadWatchdogMs: desktopConnectionPolicy.preloadWatchdogMs }
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
@@ -14849,9 +14990,9 @@ function revalidatePool() {
 function redialPoolBackendAfterResume(poolKey: string) {
   const { connectionId, profile } = parseBackendScopeKey(poolKey)
 
-  return backendDialClaims.run(poolKey, () =>
-    connectionId ? ensureRegistryBackend(connectionId, profile) : ensureBackend(profile)
-  )
+  desktopConnectionCoordinator.invalidate({ connectionId, profile })
+
+  return ensureDesktopConnection({ connectionId, profile })
 }
 
 // Identity for coalescing post-resume sweeps in the shared revalidation
@@ -15548,11 +15689,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           // own reconnect dial for the same connection; coalescing avoids
           // bootstrapping a second SSH tunnel / remote dashboard.
           const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-                ensureRegistryBackend(connection.id, null)
-              )
-            )
+            ensureDesktopConnection({ connectionId: connection.id, profile: null })
           )
 
           const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
@@ -15658,7 +15795,11 @@ ipcMain.handle('hermes:agents:roster', async () => {
 // Registry-scoped fresh WS URL: the (connectionId, profile) analogue of
 // hermes:gateway:ws-url. Same single-use-ticket discipline for OAuth sources.
 const registryGatewayWsUrlHandler = createRegistryGatewayWsUrlHandler({
-  ensureBackend: ensureRegistryBackend,
+  ensureBackend: (connectionId, profile) =>
+    ensureDesktopConnection({
+      connectionId: String(connectionId ?? ''),
+      profile: String(profile ?? '')
+    }),
   mintTicket: mintGatewayWsTicket,
   buildTicketUrl: buildGatewayWsUrlWithTicket,
   rememberHeaders: rememberRemoteWsHeaders
@@ -15769,9 +15910,7 @@ ipcMain.handle('hermes:connections:update-all', async (_event, payload) => {
 
           // Claim-guarded (#90812): coalesce with a concurrent renderer dial
           // for the same connection instead of bootstrapping a second backend.
-          const descriptor: any = await backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-            ensureRegistryBackend(connection.id, null)
-          )
+          const descriptor: any = await ensureDesktopConnection({ connectionId: connection.id, profile: null })
 
           const body: any = await postJsonForBackend(descriptor, '/api/hermes/update', {}, { timeoutMs: 15_000 })
 
@@ -16441,9 +16580,7 @@ async function dispatchRegistryApiRequest(
   // here, so it can race a renderer's own WS reconnect dial for the same
   // (connectionId, profile) scope; coalescing avoids bootstrapping a second
   // SSH tunnel / remote dashboard.
-  const connection: any = await backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile), () =>
-    ensureRegistryBackend(registryConnectionId, routeProfile)
-  )
+  const connection: any = await ensureDesktopConnection({ connectionId: registryConnectionId, profile: routeProfile })
 
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
 
@@ -16492,6 +16629,10 @@ async function handleHermesApiRequest(request, structured = false) {
         const id = apiRequestRegistryConnectionId(value)
 
         if (id) {
+          // Lifecycle mutations carry a captured route lease. They intentionally
+          // stay inside the raw resolver so the request can prove that exact
+          // generation before dispatch; entering the process-wide ready cache
+          // here would discard the lease and weaken stale-request fencing.
           const descriptor = await backendDialClaims.run(backendScopeKey(id, value.profile), () =>
             ensureRegistryBackend(id, value.profile, '', captured)
           )
@@ -16506,6 +16647,7 @@ async function handleHermesApiRequest(request, structured = false) {
         }
 
         const route = resolveProfileApiRequest(value.profile, value.path, profileRouteOptions(value.profile, value))
+        // Same lease-preserving exception for legacy/profile lifecycle routes.
         const descriptor = await ensureBackend(route.backendProfile, captured)
         connectionGenerations.associate(captured.routeKey, descriptor.connectionGeneration, captured.lease)
 
@@ -16577,7 +16719,7 @@ async function handleHermesApiRequest(request, structured = false) {
   let response
 
   try {
-    const connection = await ensureBackend(routeProfile)
+    const connection = await ensureDesktopConnection({ connectionId: null, profile: routeProfile })
     const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const url = `${connection.baseUrl}${apiRoute.requestPath}`

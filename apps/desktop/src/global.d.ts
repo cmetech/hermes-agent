@@ -17,6 +17,11 @@ export {}
 declare global {
   interface Window {
     hermesDesktop: {
+      // Electron-main is the single owner of connection attempts. These calls
+      // expose its authoritative lifecycle without letting inspection dial.
+      ensureConnection: (scope: DesktopConnectionScopeInput) => Promise<HermesConnection>
+      inspectConnection: (scope: DesktopConnectionScopeInput) => Promise<DesktopConnectionLifecycleSnapshot>
+      onConnectionLifecycle: (callback: (snapshot: DesktopConnectionLifecycleSnapshot) => void) => () => void
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
       // profile's backend from the pool.
@@ -726,6 +731,44 @@ export interface DesktopPluginProfileRoute {
   mode: 'local' | 'remote'
   profile: string
   targetProfile: string
+}
+
+export interface DesktopConnectionScopeInput {
+  connectionId?: null | string
+  profile?: null | string
+}
+
+export type DesktopConnectionLifecyclePhase = 'resolve' | 'launch' | 'port' | 'health' | 'remote'
+export type DesktopConnectionLifecycleState = 'absent' | 'starting' | 'ready' | 'failed'
+export type DesktopConnectionLifecycleErrorCode =
+  | 'launch_failed'
+  | 'port_timeout'
+  | 'health_timeout'
+  | 'remote_unreachable'
+  | 'auth_required'
+  | 'missing_connection'
+  | 'missing_profile'
+  | 'invalidated'
+  | 'attempt_timeout'
+  | 'ipc_timeout'
+
+export interface DesktopConnectionLifecycleError {
+  attemptId: number | null
+  code: DesktopConnectionLifecycleErrorCode
+  elapsedMs: number
+  message: string
+  phase: DesktopConnectionLifecyclePhase
+  retryable: boolean
+  scope: { connectionId: null | string; profile: string }
+}
+
+export interface DesktopConnectionLifecycleSnapshot {
+  attemptId: number | null
+  elapsedMs: number
+  error?: DesktopConnectionLifecycleError
+  phase: DesktopConnectionLifecyclePhase | null
+  scope: { connectionId: null | string; profile: string }
+  state: DesktopConnectionLifecycleState
 }
 
 export interface HermesConnection {

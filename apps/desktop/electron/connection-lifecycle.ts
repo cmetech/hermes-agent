@@ -32,7 +32,7 @@ export interface ClassifiedConnectionError {
 }
 
 export interface DesktopConnectionErrorData extends ClassifiedConnectionError {
-  attemptId: number
+  attemptId: number | null
   elapsedMs: number
   phase: DesktopConnectionPhase
   scope: DesktopConnectionScope
@@ -294,6 +294,19 @@ export class ConnectionLifecycleCoordinator<TConnection> {
     reject?.(error)
 
     return true
+  }
+
+  invalidateAll(): number {
+    const scopes = [...this.#entries.values()].map(entry => entry.scope)
+    let invalidated = 0
+
+    for (const scope of scopes) {
+      if (this.invalidate(scope)) {
+        invalidated += 1
+      }
+    }
+
+    return invalidated
   }
 
   #clearTimer(entry: ConnectionLifecycleEntry<TConnection>): void {
