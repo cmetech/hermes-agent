@@ -20,7 +20,8 @@ interface IdleRoutePrefetchOptions {
 
 export function createRouteIntentPrefetch(
   enabled: boolean,
-  prefetch: typeof prefetchDesktopRoute = prefetchDesktopRoute
+  prefetch: typeof prefetchDesktopRoute = prefetchDesktopRoute,
+  onIntent?: (route: string) => void
 ): (route: null | string | undefined) => void {
   const seen = new Set<string>()
 
@@ -30,6 +31,7 @@ export function createRouteIntentPrefetch(
     }
 
     seen.add(route)
+    onIntent?.(route)
     void prefetch(route)?.catch(() => undefined)
   }
 }
@@ -37,9 +39,7 @@ export function createRouteIntentPrefetch(
 function browserScheduler(): RoutePrefetchScheduler {
   return {
     cancelIdle:
-      typeof window.cancelIdleCallback === 'function'
-        ? handle => window.cancelIdleCallback(handle)
-        : undefined,
+      typeof window.cancelIdleCallback === 'function' ? handle => window.cancelIdleCallback(handle) : undefined,
     clearTimer: handle => window.clearTimeout(handle),
     requestIdle:
       typeof window.requestIdleCallback === 'function'

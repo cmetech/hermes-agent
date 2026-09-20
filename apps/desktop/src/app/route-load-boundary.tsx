@@ -2,6 +2,7 @@ import { type ReactNode, Suspense, useEffect } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { useI18n } from '@/i18n'
+import { noteDesktopRouteSettled, noteDesktopRouteVisible } from '@/lib/desktop-performance'
 
 export type RouteLoadBoundaryVariant = 'overlay' | 'tile' | 'workspace'
 
@@ -23,7 +24,7 @@ function RouteLoading({ onVisible, route, variant }: Omit<RouteLoadBoundaryProps
   const { t } = useI18n()
 
   useEffect(() => {
-    onVisible?.(route)
+    ;(onVisible ?? noteDesktopRouteVisible)(route)
   }, [onVisible, route])
 
   return <PageLoader className={VARIANT_CLASS[variant]} label={t.common.loading} />
@@ -31,19 +32,13 @@ function RouteLoading({ onVisible, route, variant }: Omit<RouteLoadBoundaryProps
 
 function RouteSettled({ onSettled, route }: Pick<RouteLoadBoundaryProps, 'onSettled' | 'route'>) {
   useEffect(() => {
-    onSettled?.(route)
+    ;(onSettled ?? noteDesktopRouteSettled)(route)
   }, [onSettled, route])
 
   return null
 }
 
-export function RouteLoadBoundary({
-  children,
-  onSettled,
-  onVisible,
-  route,
-  variant
-}: RouteLoadBoundaryProps) {
+export function RouteLoadBoundary({ children, onSettled, onVisible, route, variant }: RouteLoadBoundaryProps) {
   return (
     <Suspense fallback={<RouteLoading onVisible={onVisible} route={route} variant={variant} />}>
       <RouteSettled onSettled={onSettled} route={route} />

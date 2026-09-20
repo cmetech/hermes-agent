@@ -29,10 +29,9 @@ describe('useIdleDesktopRoutePrefetch', () => {
       setTimer: vi.fn()
     }
 
-    const { rerender } = renderHook(
-      ({ enabled }) => useIdleDesktopRoutePrefetch(enabled, { prefetch, scheduler }),
-      { initialProps: { enabled: false } }
-    )
+    const { rerender } = renderHook(({ enabled }) => useIdleDesktopRoutePrefetch(enabled, { prefetch, scheduler }), {
+      initialProps: { enabled: false }
+    })
 
     expect(scheduler.requestIdle).not.toHaveBeenCalled()
     rerender({ enabled: true })
@@ -54,9 +53,7 @@ describe('useIdleDesktopRoutePrefetch', () => {
       setTimer: vi.fn()
     }
 
-    const { unmount } = renderHook(() =>
-      useIdleDesktopRoutePrefetch(true, { prefetch: vi.fn(), scheduler })
-    )
+    const { unmount } = renderHook(() => useIdleDesktopRoutePrefetch(true, { prefetch: vi.fn(), scheduler }))
 
     unmount()
     expect(scheduler.cancelIdle).toHaveBeenCalledWith(12)
@@ -69,9 +66,7 @@ describe('useIdleDesktopRoutePrefetch', () => {
       setTimer: vi.fn(() => 23)
     }
 
-    const { unmount } = renderHook(() =>
-      useIdleDesktopRoutePrefetch(true, { prefetch: vi.fn(), scheduler })
-    )
+    const { unmount } = renderHook(() => useIdleDesktopRoutePrefetch(true, { prefetch: vi.fn(), scheduler }))
 
     expect(scheduler.setTimer).toHaveBeenCalledTimes(1)
     unmount()
@@ -80,8 +75,9 @@ describe('useIdleDesktopRoutePrefetch', () => {
 
   it('gates repeated pointer/focus intent behind connection readiness', () => {
     const prefetch = vi.fn(() => Promise.resolve())
+    const onIntent = vi.fn()
     const disabled = createRouteIntentPrefetch(false, prefetch)
-    const enabled = createRouteIntentPrefetch(true, prefetch)
+    const enabled = createRouteIntentPrefetch(true, prefetch, onIntent)
 
     disabled(SKILLS_ROUTE)
     enabled(SKILLS_ROUTE)
@@ -90,5 +86,7 @@ describe('useIdleDesktopRoutePrefetch', () => {
 
     expect(prefetch).toHaveBeenCalledTimes(1)
     expect(prefetch).toHaveBeenCalledWith(SKILLS_ROUTE)
+    expect(onIntent).toHaveBeenCalledOnce()
+    expect(onIntent).toHaveBeenCalledWith(SKILLS_ROUTE)
   })
 })

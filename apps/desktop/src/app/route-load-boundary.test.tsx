@@ -4,7 +4,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { RouteLoadBoundary } from './route-load-boundary'
 
+const routePerformance = vi.hoisted(() => ({ settled: vi.fn(), visible: vi.fn() }))
+
 vi.mock('@/i18n', () => ({ useI18n: () => ({ t: { common: { loading: 'Loading Hermes' } } }) }))
+vi.mock('@/lib/desktop-performance', () => ({
+  noteDesktopRouteSettled: routePerformance.settled,
+  noteDesktopRouteVisible: routePerformance.visible
+}))
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -19,6 +25,8 @@ function deferred<T>() {
 describe('RouteLoadBoundary', () => {
   afterEach(() => {
     vi.restoreAllMocks()
+    routePerformance.settled.mockClear()
+    routePerformance.visible.mockClear()
   })
 
   it.each([
@@ -32,12 +40,7 @@ describe('RouteLoadBoundary', () => {
     const onSettled = vi.fn()
 
     render(
-      <RouteLoadBoundary
-        onSettled={onSettled}
-        onVisible={onVisible}
-        route="/skills"
-        variant={variant}
-      >
+      <RouteLoadBoundary onSettled={onSettled} onVisible={onVisible} route="/skills" variant={variant}>
         <View />
       </RouteLoadBoundary>
     )
@@ -53,5 +56,23 @@ describe('RouteLoadBoundary', () => {
     expect(await screen.findByText('Capabilities ready')).toBeTruthy()
     await waitFor(() => expect(onSettled).toHaveBeenCalledWith('/skills'))
     expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('reports fallback visibility and settlement to the local route tracker by default', async () => {
+    const module = deferred<{ default: () => React.JSX.Element }>()
+    const View = lazy(() => module.promise)
+
+    render(
+      <RouteLoadBoundary route="/settings?tab=models" variant="overlay">
+        <View />
+      </RouteLoadBoundary>
+    )
+
+    await waitFor(() => expect(routePerformance.visible).toHaveBeenCalledWith('/settings?tab=models'))
+    expect(routePerformance.settled).not.toHaveBeenCalled()
+
+    module.resolve({ default: () => <div>Settings ready</div> })
+    expect(await screen.findByText('Settings ready')).toBeTruthy()
+    await waitFor(() => expect(routePerformance.settled).toHaveBeenCalledWith('/settings?tab=models'))
   })
 })

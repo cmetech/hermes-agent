@@ -25,6 +25,7 @@ import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { noteDesktopRouteIntent } from '@/lib/desktop-performance'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
@@ -134,6 +135,7 @@ import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
 import { createRouteIntentPrefetch } from '../../hooks/use-route-prefetch'
+import { prefetchDesktopRoute } from '../../lazy-pages'
 import {
   type AppView,
   ARTIFACTS_ROUTE,
@@ -367,10 +369,7 @@ export function ChatSidebar({
   const navItems = useMemo<SidebarNavItem[]>(() => {
     const contributedPaths = new Set(contributedNav.map(item => item.route))
 
-    return [
-      ...SIDEBAR_NAV.filter(item => !(item.route && contributedPaths.has(item.route))),
-      ...contributedNav
-    ]
+    return [...SIDEBAR_NAV.filter(item => !(item.route && contributedPaths.has(item.route))), ...contributedNav]
   }, [contributedNav])
 
   const panesFlipped = useStore($panesFlipped)
@@ -740,7 +739,11 @@ export function ChatSidebar({
   // workspaceParentOrderIds; worktrees within a parent via workspaceOrderIds.
   const worktreeGroupingActive = agentsGrouped && !showArchived
   const gatewayReady = gatewayState === 'open'
-  const prefetchRoute = useMemo(() => createRouteIntentPrefetch(gatewayReady), [gatewayReady])
+
+  const prefetchRoute = useMemo(
+    () => createRouteIntentPrefetch(gatewayReady, prefetchDesktopRoute, noteDesktopRouteIntent),
+    [gatewayReady]
+  )
 
   // The backend project tree is a structural snapshot, NOT a per-message feed.
   // Refresh it on structural edges only — entering the grouped view, a profile
@@ -1531,6 +1534,8 @@ export function ChatSidebar({
                     // word; the row is what it's actually about.
                     data-tip-region=""
                     onClick={() => {
+                      prefetchRoute(item.route)
+
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →
                       // no swap. The switcher header is the single place to
