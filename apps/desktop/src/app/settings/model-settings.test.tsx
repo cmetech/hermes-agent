@@ -31,8 +31,7 @@ let profileSwitchHandler: (() => void) | null = null
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: (profile?: null | string) => getGlobalModelInfo(profile),
-  getGlobalModelOptions: (options?: unknown, profile?: null | string) =>
-    getGlobalModelOptions(options, profile),
+  getGlobalModelOptions: (options?: unknown, profile?: null | string) => getGlobalModelOptions(options, profile),
   getApiRequestProfile: () => apiRequestProfile,
   getAuxiliaryModels: (profile?: null | string) => getAuxiliaryModels(profile),
   getMoaModels: (profile?: null | string) => getMoaModels(profile),
@@ -105,11 +104,11 @@ afterEach(() => {
   profileSwitchHandler = null
 })
 
-async function renderModelSettings(scopeProfile?: string) {
+async function renderModelSettings(scopeProfile?: string, waitForSecondary = true) {
   const { ModelSettings } = await import('./model-settings')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
-  return render(
+  const result = render(
     // The aux-task deep-link highlight reads useSearchParams, so the page
     // needs a router context in tests (the app provides HashRouter at root).
     <MemoryRouter>
@@ -118,6 +117,20 @@ async function renderModelSettings(scopeProfile?: string) {
       </QueryClientProvider>
     </MemoryRouter>
   )
+
+  if (waitForSecondary) {
+    await waitFor(() => {
+      if (
+        result.container.querySelector('[data-slot="model-settings-skeleton"]') ||
+        result.container.querySelector('[data-slot="auxiliary-models-loading"]') ||
+        result.container.querySelector('[data-slot="moa-models-loading"]')
+      ) {
+        throw new Error('Secondary model settings are still loading')
+      }
+    })
+  }
+
+  return result
 }
 
 const ALL_SUPPORTED = {
@@ -261,6 +274,40 @@ describe('ModelSettings profile scope', () => {
 })
 
 describe('ModelSettings', () => {
+  it('reveals primary model controls while auxiliary sections are still loading', async () => {
+    const auxiliaryModels = deferred<Awaited<ReturnType<typeof getAuxiliaryModels>>>()
+    const moaModels = deferred<Awaited<ReturnType<typeof getMoaModels>>>()
+    getAuxiliaryModels.mockReturnValueOnce(auxiliaryModels.promise)
+    getMoaModels.mockReturnValueOnce(moaModels.promise)
+
+    const { container } = await renderModelSettings(undefined, false)
+
+    expect(await screen.findByText('hermes-4')).toBeTruthy()
+    expect(container.querySelector('[data-slot="model-settings-skeleton"]')).toBeNull()
+    expect(container.querySelector('[data-slot="auxiliary-models-loading"]')).toBeTruthy()
+    expect(container.querySelector('[data-slot="moa-models-loading"]')).toBeTruthy()
+
+    await act(async () => {
+      auxiliaryModels.resolve({
+        main: { provider: 'nous', model: 'hermes-4' },
+        tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
+      })
+      moaModels.resolve(null)
+    })
+  })
+
+  it('keeps primary model controls usable when an auxiliary section fails', async () => {
+    getAuxiliaryModels.mockRejectedValueOnce(new Error('auxiliary catalog unavailable'))
+
+    const { container } = await renderModelSettings()
+
+    expect(await screen.findByText('hermes-4')).toBeTruthy()
+    expect(container.querySelector('[data-slot="model-settings-skeleton"]')).toBeNull()
+    expect(container.querySelector('[data-slot="auxiliary-models-error"]')?.textContent).toContain(
+      'auxiliary catalog unavailable'
+    )
+  })
+
   it('loads the current main model and lists configured providers only', async () => {
     await renderModelSettings()
 
@@ -706,7 +753,7 @@ describe('ModelSettings', () => {
       ]
     })
 
-    await renderModelSettings()
+    await renderModelSettings(undefined, false)
     await waitFor(() => expect(profileSwitch.callback).not.toBeNull())
     profileSwitch.callback?.()
 

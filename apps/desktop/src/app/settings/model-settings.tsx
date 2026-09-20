@@ -205,8 +205,13 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   const { t } = useI18n()
   const m = t.settings.model
   const requestProfile = scopeProfile ?? undefined
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
+  const [primaryLoading, setPrimaryLoading] = useState(true)
+  const [primaryError, setPrimaryError] = useState('')
+  const [auxiliaryLoading, setAuxiliaryLoading] = useState(true)
+  const [auxiliaryError, setAuxiliaryError] = useState('')
+  const [moaLoading, setMoaLoading] = useState(true)
+  const [moaError, setMoaError] = useState('')
+  const [actionError, setActionError] = useState('')
   const [mainModel, setMainModel] = useState<{ model: string; provider: string } | null>(null)
   const [providers, setProviders] = useState<ModelOptionProvider[]>([])
   const [selectedProvider, setSelectedProvider] = useState('')
@@ -254,53 +259,91 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       replaceSelection = false
     }: { preserveDraft?: boolean; refreshCatalog?: boolean; replaceSelection?: boolean } = {}) => {
       const epoch = profileEpoch.current
-      setLoading(true)
-      setError('')
+      setPrimaryLoading(true)
+      setPrimaryError('')
+      setAuxiliaryLoading(true)
+      setAuxiliaryError('')
+      setMoaLoading(true)
+      setMoaError('')
 
-      try {
-        const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
-          getGlobalModelInfo(requestProfile),
-          getGlobalModelOptions(refreshCatalog ? { refresh: true } : undefined, requestProfile),
-          getAuxiliaryModels(requestProfile),
-          getMoaModels(requestProfile).catch(() => null)
-        ])
-
-        if (profileEpoch.current !== epoch) {
-          return
-        }
-
-        setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
-        setProviders(modelOptions.providers || [])
-
-        if (!preserveDraft) {
-          if (replaceSelection) {
-            setSelectedProvider(modelInfo.provider)
-            setSelectedModel(modelInfo.model)
-          } else {
-            setSelectedProvider(prev => prev || modelInfo.provider)
-            setSelectedModel(prev => prev || modelInfo.model)
+      const primaryRequest = Promise.all([
+        getGlobalModelInfo(requestProfile),
+        getGlobalModelOptions(refreshCatalog ? { refresh: true } : undefined, requestProfile)
+      ])
+        .then(([modelInfo, modelOptions]) => {
+          if (profileEpoch.current !== epoch) {
+            return
           }
-        }
 
-        setAuxiliary(auxiliaryModels)
-        setMoa(moaModels)
+          setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
+          setProviders(modelOptions.providers || [])
 
-        if (moaModels) {
-          setSelectedMoaPreset(prev => (prev && moaModels.presets[prev] ? prev : moaModels.default_preset))
-        }
+          if (!preserveDraft) {
+            if (replaceSelection) {
+              setSelectedProvider(modelInfo.provider)
+              setSelectedModel(modelInfo.model)
+            } else {
+              setSelectedProvider(prev => prev || modelInfo.provider)
+              setSelectedModel(prev => prev || modelInfo.model)
+            }
+          }
 
-        // The config record loads via its own shared query; a model switch can
-        // change it server-side (aux slots), so nudge that cache to refetch.
-        void invalidateHermesConfig(scopeProfile)
-      } catch (err) {
-        if (profileEpoch.current === epoch) {
-          setError(err instanceof Error ? err.message : String(err))
-        }
-      } finally {
-        if (profileEpoch.current === epoch) {
-          setLoading(false)
-        }
-      }
+          // The config record loads via its own shared query; a model switch can
+          // change it server-side (aux slots), so nudge that cache to refetch.
+          void invalidateHermesConfig(scopeProfile)
+        })
+        .catch(err => {
+          if (profileEpoch.current === epoch) {
+            setPrimaryError(err instanceof Error ? err.message : String(err))
+          }
+        })
+        .finally(() => {
+          if (profileEpoch.current === epoch) {
+            setPrimaryLoading(false)
+          }
+        })
+
+      const auxiliaryRequest = getAuxiliaryModels(requestProfile)
+        .then(auxiliaryModels => {
+          if (profileEpoch.current === epoch) {
+            setAuxiliary(auxiliaryModels)
+          }
+        })
+        .catch(err => {
+          if (profileEpoch.current === epoch) {
+            setAuxiliaryError(err instanceof Error ? err.message : String(err))
+          }
+        })
+        .finally(() => {
+          if (profileEpoch.current === epoch) {
+            setAuxiliaryLoading(false)
+          }
+        })
+
+      const moaRequest = getMoaModels(requestProfile)
+        .then(moaModels => {
+          if (profileEpoch.current !== epoch) {
+            return
+          }
+
+          setMoa(moaModels)
+
+          if (moaModels) {
+            setSelectedMoaPreset(prev => (prev && moaModels.presets[prev] ? prev : moaModels.default_preset))
+          }
+        })
+        .catch(err => {
+          if (profileEpoch.current === epoch) {
+            setMoaError(err instanceof Error ? err.message : String(err))
+          }
+        })
+        .finally(() => {
+          if (profileEpoch.current === epoch) {
+            setMoaLoading(false)
+          }
+        })
+
+      await Promise.allSettled([primaryRequest, auxiliaryRequest, moaRequest])
     },
     [requestProfile, scopeProfile]
   )
@@ -334,6 +377,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     setMoa(null)
     setEditingAuxTask(null)
     setSelectionWarning(false)
+    setActionError('')
     void refresh({ replaceSelection: true })
   })
 
@@ -468,12 +512,13 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             if (profileEpoch.current !== epoch || moaSaveGeneration.current !== generation) {
               return
             }
+
             moaRef.current = saved
             setMoa(saved)
           })
           .catch(err => {
             if (profileEpoch.current === epoch && moaSaveGeneration.current === generation) {
-              setError(err instanceof Error ? err.message : String(err))
+              setActionError(err instanceof Error ? err.message : String(err))
             }
           })
       }, 600)
@@ -532,7 +577,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
       moaSaveGeneration.current += 1
       setApplying(true)
-      setError('')
+      setActionError('')
 
       try {
         const saved = await saveMoaModels(next, requestProfile)
@@ -543,7 +588,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
         setMoa(saved)
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setActionError(err instanceof Error ? err.message : String(err))
       } finally {
         setApplying(false)
       }
@@ -710,7 +755,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
     const epoch = profileEpoch.current
     setActivating(true)
-    setError('')
+    setActionError('')
 
     try {
       await setEnvVar(keyEnv, apiKeyDraft.trim(), requestProfile)
@@ -739,7 +784,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       const fallbackModel = refreshedRow?.models?.[0] ?? ''
       setSelectedModel(nextModel || fallbackModel)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setActionError(err instanceof Error ? err.message : String(err))
     } finally {
       setActivating(false)
     }
@@ -778,7 +823,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
     const epoch = profileEpoch.current
     setApplying(true)
-    setError('')
+    setActionError('')
     setSelectionWarning(false)
 
     try {
@@ -809,7 +854,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
       await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setActionError(err instanceof Error ? err.message : String(err))
     } finally {
       setApplying(false)
     }
@@ -836,7 +881,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       }
 
       setApplying(true)
-      setError('')
+      setActionError('')
       setSelectionWarning(false)
 
       try {
@@ -850,7 +895,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
         await refresh()
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setActionError(err instanceof Error ? err.message : String(err))
       } finally {
         setApplying(false)
       }
@@ -865,7 +910,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       }
 
       setApplying(true)
-      setError('')
+      setActionError('')
       setSelectionWarning(false)
 
       try {
@@ -884,7 +929,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        setActionError(err instanceof Error ? err.message : String(err))
       } finally {
         setApplying(false)
       }
@@ -912,7 +957,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     }
 
     setApplying(true)
-    setError('')
+    setActionError('')
     setSelectionWarning(false)
 
     try {
@@ -930,13 +975,13 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setSelectionWarning(result.selection_warning?.code === 'grandfathered-model-assignment')
       await refresh()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setActionError(err instanceof Error ? err.message : String(err))
     } finally {
       setApplying(false)
     }
   }, [mainModel, refresh, requestProfile])
 
-  if (loading && !mainModel) {
+  if (primaryLoading && !mainModel) {
     return <ModelSettingsSkeleton />
   }
 
@@ -1027,7 +1072,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span>{providerReadiness}</span>
             <Button
-              disabled={loading}
+              disabled={primaryLoading}
               onClick={() => void refresh({ preserveDraft: true, refreshCatalog: true })}
               size="sm"
               variant="textStrong"
@@ -1078,7 +1123,8 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             )}
           </div>
         )}
-        {error && <div className="mt-2 text-xs text-destructive">{error}</div>}
+        {primaryError && <div className="mt-2 text-xs text-destructive">{primaryError}</div>}
+        {actionError && <div className="mt-2 text-xs text-destructive">{actionError}</div>}
         {selectionWarning && (
           <div className="mt-2 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
             <AlertTriangle className="size-3.5 shrink-0" />
@@ -1110,7 +1156,22 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           </Button>
         </div>
         <p className="mb-2 text-xs text-muted-foreground">{m.auxiliaryDesc}</p>
-        {switchStaleAux.length === 0 && persistentStaleAux.length > 0 && (
+        {auxiliaryLoading && (
+          <div
+            className="flex items-center gap-2 py-3 text-xs text-muted-foreground"
+            data-slot="auxiliary-models-loading"
+            role="status"
+          >
+            <Loader2 className="size-3.5 animate-spin" />
+            {t.common.loading}
+          </div>
+        )}
+        {auxiliaryError && (
+          <div className="py-3 text-xs text-destructive" data-slot="auxiliary-models-error" role="alert">
+            {auxiliaryError}
+          </div>
+        )}
+        {!auxiliaryLoading && !auxiliaryError && switchStaleAux.length === 0 && persistentStaleAux.length > 0 && (
           <div className="mb-2.5">
             <StaleAuxWarning
               applying={applying}
@@ -1120,113 +1181,132 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             />
           </div>
         )}
-        <div className="grid gap-1">
-          {AUX_TASKS.map(meta => {
-            const copy = m.tasks[meta.key] ?? { label: meta.key, hint: meta.key }
-            const current = auxiliary?.tasks.find(entry => entry.task === meta.key)
-            const isAuto = !current || !current.provider || current.provider === 'auto'
-            const isEditing = editingAuxTask === meta.key
+        {!auxiliaryLoading && !auxiliaryError && (
+          <div className="grid gap-1">
+            {AUX_TASKS.map(meta => {
+              const copy = m.tasks[meta.key] ?? { label: meta.key, hint: meta.key }
+              const current = auxiliary?.tasks.find(entry => entry.task === meta.key)
+              const isAuto = !current || !current.provider || current.provider === 'auto'
+              const isEditing = editingAuxTask === meta.key
 
-            return (
-              <div className="scroll-mt-6 rounded-lg" id={`aux-task-${meta.key}`} key={meta.key}>
-                <ListRow
-                  action={
-                    !isEditing && (
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        <Button
-                          disabled={!mainModel || applying}
-                          onClick={() => void setAuxiliaryToMain(meta.key)}
-                          size="sm"
-                          variant="text"
-                        >
-                          {m.setToMain}
-                        </Button>
-                        <Button
-                          disabled={!providers.length || applying}
-                          onClick={() => beginAuxiliaryEdit(meta.key)}
-                          size="sm"
-                          variant="textStrong"
-                        >
-                          {m.change}
-                        </Button>
-                      </div>
-                    )
-                  }
-                  below={
-                    isEditing && (
-                      <div className="mt-2 flex flex-wrap items-center gap-2 pt-1">
-                        <Select
-                          onValueChange={value => setAuxDraft(prev => ({ ...prev, provider: value, model: '' }))}
-                          value={auxDraft.provider}
-                        >
-                          <SelectTrigger className={cn('min-w-32', CONTROL_TEXT)}>
-                            <SelectValue placeholder={m.provider} />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {providerOptions.map(provider => (
-                              <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
-                                {provider.name}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        <Select
-                          onValueChange={value => setAuxDraft(prev => ({ ...prev, model: value }))}
-                          value={auxDraft.model}
-                        >
-                          <SelectTrigger className={cn('min-w-48', CONTROL_TEXT)}>
-                            <SelectValue placeholder={m.model} />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {auxDraftProviderRow &&
-                              withActive(auxDraftProviderModels, auxDraft.model).map(model =>
-                                renderModelOption(
-                                  auxDraftProviderRow,
-                                  model,
-                                  auxDraftUsage,
-                                  currentAuxDraftAssignment?.provider === auxDraft.provider &&
-                                    currentAuxDraftAssignment.model === model
-                                )
-                              )}
-                          </SelectContent>
-                        </Select>
-                        <Button
-                          disabled={
-                            !auxDraft.provider ||
-                            !auxDraft.model ||
-                            applying ||
-                            (!!auxDraftEligibility &&
-                              !auxDraftEligibility.eligible &&
-                              !auxDraftEligibility.grandfathered)
-                          }
-                          onClick={() => void applyAuxiliaryDraft(meta.key)}
-                          size="sm"
-                        >
-                          {applying ? m.applying : t.common.apply}
-                        </Button>
-                        <Button onClick={() => setEditingAuxTask(null)} size="sm" variant="ghost">
-                          {t.common.cancel}
-                        </Button>
-                      </div>
-                    )
-                  }
-                  description={
-                    <span className="font-mono text-[0.68rem]">
-                      {isAuto ? m.autoUseMain : `${current.provider} · ${current.model || m.providerDefault}`}
-                    </span>
-                  }
-                  title={
-                    <span className="flex items-baseline gap-2">
-                      {copy.label}
-                      <Pill>{copy.hint}</Pill>
-                    </span>
-                  }
-                />
-              </div>
-            )
-          })}
-        </div>
+              return (
+                <div className="scroll-mt-6 rounded-lg" id={`aux-task-${meta.key}`} key={meta.key}>
+                  <ListRow
+                    action={
+                      !isEditing && (
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <Button
+                            disabled={!mainModel || applying}
+                            onClick={() => void setAuxiliaryToMain(meta.key)}
+                            size="sm"
+                            variant="text"
+                          >
+                            {m.setToMain}
+                          </Button>
+                          <Button
+                            disabled={!providers.length || applying}
+                            onClick={() => beginAuxiliaryEdit(meta.key)}
+                            size="sm"
+                            variant="textStrong"
+                          >
+                            {m.change}
+                          </Button>
+                        </div>
+                      )
+                    }
+                    below={
+                      isEditing && (
+                        <div className="mt-2 flex flex-wrap items-center gap-2 pt-1">
+                          <Select
+                            onValueChange={value => setAuxDraft(prev => ({ ...prev, provider: value, model: '' }))}
+                            value={auxDraft.provider}
+                          >
+                            <SelectTrigger className={cn('min-w-32', CONTROL_TEXT)}>
+                              <SelectValue placeholder={m.provider} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {providerOptions.map(provider => (
+                                <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
+                                  {provider.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Select
+                            onValueChange={value => setAuxDraft(prev => ({ ...prev, model: value }))}
+                            value={auxDraft.model}
+                          >
+                            <SelectTrigger className={cn('min-w-48', CONTROL_TEXT)}>
+                              <SelectValue placeholder={m.model} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {auxDraftProviderRow &&
+                                withActive(auxDraftProviderModels, auxDraft.model).map(model =>
+                                  renderModelOption(
+                                    auxDraftProviderRow,
+                                    model,
+                                    auxDraftUsage,
+                                    currentAuxDraftAssignment?.provider === auxDraft.provider &&
+                                      currentAuxDraftAssignment.model === model
+                                  )
+                                )}
+                            </SelectContent>
+                          </Select>
+                          <Button
+                            disabled={
+                              !auxDraft.provider ||
+                              !auxDraft.model ||
+                              applying ||
+                              (!!auxDraftEligibility &&
+                                !auxDraftEligibility.eligible &&
+                                !auxDraftEligibility.grandfathered)
+                            }
+                            onClick={() => void applyAuxiliaryDraft(meta.key)}
+                            size="sm"
+                          >
+                            {applying ? m.applying : t.common.apply}
+                          </Button>
+                          <Button onClick={() => setEditingAuxTask(null)} size="sm" variant="ghost">
+                            {t.common.cancel}
+                          </Button>
+                        </div>
+                      )
+                    }
+                    description={
+                      <span className="font-mono text-[0.68rem]">
+                        {isAuto ? m.autoUseMain : `${current.provider} · ${current.model || m.providerDefault}`}
+                      </span>
+                    }
+                    title={
+                      <span className="flex items-baseline gap-2">
+                        {copy.label}
+                        <Pill>{copy.hint}</Pill>
+                      </span>
+                    }
+                  />
+                </div>
+              )
+            })}
+          </div>
+        )}
       </section>
+      {moaLoading && (
+        <section data-slot="moa-models-loading">
+          <SectionHeading icon={Cpu} title="Mixture of Agents" />
+          <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground" role="status">
+            <Loader2 className="size-3.5 animate-spin" />
+            {t.common.loading}
+          </div>
+        </section>
+      )}
+      {moaError && (
+        <section data-slot="moa-models-error">
+          <SectionHeading icon={Cpu} title="Mixture of Agents" />
+          <div className="py-3 text-xs text-destructive" role="alert">
+            {moaError}
+          </div>
+        </section>
+      )}
       {moa && currentMoaPreset && (
         <section>
           <SectionHeading icon={Cpu} title="Mixture of Agents" />
