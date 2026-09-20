@@ -1,8 +1,4 @@
-import type {
-  DesktopConnectionLifecycleSnapshot,
-  DesktopConnectionScopeInput,
-  HermesConnection
-} from '@/global'
+import type { DesktopConnectionLifecycleSnapshot, DesktopConnectionScopeInput, HermesConnection } from '@/global'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
 
 interface RendererConnectionScope {
@@ -36,7 +32,10 @@ export function normalizeDesktopConnectionScope(scope: DesktopConnectionScopeInp
 export function desktopConnectionScopeKey(scope: DesktopConnectionScopeInput): string {
   const normalized = normalizeDesktopConnectionScope(scope)
 
-  return JSON.stringify([normalized.connectionId, normalized.profile])
+  return JSON.stringify([
+    normalized.connectionId,
+    normalized.connectionId === null && !String(scope.profile ?? '').trim() ? null : normalized.profile
+  ])
 }
 
 function invalidateKey(key: string): void {
@@ -52,6 +51,12 @@ function invalidateKey(key: string): void {
 }
 
 function consumeLifecycle(snapshot: DesktopConnectionLifecycleSnapshot): void {
+  // Omitted primary is an Electron-resolved identity, never an alias for default.
+  // It is only coalesced while pending, so any primary invalidation fences it.
+  if (snapshot.scope.connectionId === null && (snapshot.state === 'failed' || snapshot.state === 'absent')) {
+    invalidateKey(desktopConnectionScopeKey({}))
+  }
+
   const key = desktopConnectionScopeKey(snapshot.scope)
   const attemptId = snapshot.attemptId
   const latestAttemptId = latestAttemptIds.get(key)
@@ -104,10 +109,7 @@ function subscribeToLifecycle(desktop: Window['hermesDesktop']): void {
   subscribedBridge = desktop
 }
 
-function invokeEnsure(
-  desktop: Window['hermesDesktop'],
-  scope: DesktopConnectionScopeInput
-): Promise<HermesConnection> {
+function invokeEnsure(desktop: Window['hermesDesktop'], scope: DesktopConnectionScopeInput): Promise<HermesConnection> {
   if (desktop.ensureConnection) {
     return desktop.ensureConnection(scope)
   }
@@ -140,13 +142,10 @@ export function ensureDesktopConnection(scopeInput: DesktopConnectionScopeInput)
 
   const requestScope: DesktopConnectionScopeInput = {
     connectionId: scope.connectionId,
-    profile:
-      scope.connectionId === null && !String(scopeInput.profile ?? '').trim()
-        ? null
-        : scope.profile
+    profile: scope.connectionId === null && !String(scopeInput.profile ?? '').trim() ? null : scope.profile
   }
 
-  const key = desktopConnectionScopeKey(scope)
+  const key = desktopConnectionScopeKey(requestScope)
   const current = entries.get(key)
 
   if (current?.connection) {
@@ -171,26 +170,26 @@ export function ensureDesktopConnection(scopeInput: DesktopConnectionScopeInput)
   }
 
   const promise = Promise.resolve(invoked).then(
-      connection => {
-        if (entries.get(key) === entry && entry.revision === (revisions.get(key) ?? 0)) {
-          if (desktop.ensureConnection) {
-            entry.connection = connection
-            entry.promise = undefined
-          } else {
-            entries.delete(key)
-          }
-        }
-
-        return connection
-      },
-      error => {
-        if (entries.get(key) === entry) {
+    connection => {
+      if (entries.get(key) === entry && entry.revision === (revisions.get(key) ?? 0)) {
+        if (desktop.ensureConnection && connection.mode !== 'remote' && requestScope.profile !== null) {
+          entry.connection = connection
+          entry.promise = undefined
+        } else {
           entries.delete(key)
         }
-
-        throw error
       }
-    )
+
+      return connection
+    },
+    error => {
+      if (entries.get(key) === entry) {
+        entries.delete(key)
+      }
+
+      throw error
+    }
+  )
 
   entry.promise = promise
   entries.set(key, entry)
@@ -233,7 +232,7 @@ export function inspectDesktopConnection(
   if (desktop?.inspectConnection) {
     subscribeToLifecycle(desktop)
 
-    return desktop.inspectConnection(scope)
+    return desktop.inspectConnection(scopeInput)
   }
 
   return Promise.resolve({

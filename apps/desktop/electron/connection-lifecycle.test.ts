@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { BackendDialClaims } from './backend-dial-claim'
 import { DEFAULT_BACKEND_READY_TIMEOUT_MS } from './backend-health'
 import { DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS } from './backend-ready'
+import { createConnectionGenerationRegistry, ensureConnectionGenerationRoute } from './connection-generation'
 import {
   ConnectionLifecycleCoordinator,
   ConnectionLifecycleError,
@@ -18,6 +20,7 @@ import {
 } from './connection-lifecycle-bridge'
 import { resolveConnectionLifecyclePolicy } from './connection-lifecycle-policy'
 import { DEFAULT_CONNECT_TIMEOUT_MS as DEFAULT_GATEWAY_WS_CONNECT_TIMEOUT_MS } from './gateway-ws-probe'
+import { runPrimaryBackendStartup } from './primary-backend-startup'
 import {
   DEFAULT_CONNECT_TIMEOUT_MS as DEFAULT_SSH_CONNECT_TIMEOUT_MS,
   DEFAULT_EXEC_TIMEOUT_MS as DEFAULT_SSH_EXEC_TIMEOUT_MS,
@@ -35,9 +38,7 @@ describe('connection lifecycle deadline policy', () => {
 
     for (const policy of policies) {
       expect(policy.localAttemptTimeoutMs).toBeGreaterThanOrEqual(
-        DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS +
-          DEFAULT_BACKEND_READY_TIMEOUT_MS +
-          DEFAULT_GATEWAY_WS_CONNECT_TIMEOUT_MS
+        DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS + DEFAULT_BACKEND_READY_TIMEOUT_MS + DEFAULT_GATEWAY_WS_CONNECT_TIMEOUT_MS
       )
       expect(policy.attemptTimeoutMs).toBeGreaterThanOrEqual(policy.localAttemptTimeoutMs)
     }
@@ -64,10 +65,7 @@ describe('connection lifecycle deadline policy', () => {
   it('derives the Electron and preload bounds from the existing port-announcement override', () => {
     const baseline = resolveConnectionLifecyclePolicy({}, 'win32')
 
-    const extended = resolveConnectionLifecyclePolicy(
-      { HERMES_DESKTOP_PORT_ANNOUNCE_TIMEOUT_MS: '180000' },
-      'win32'
-    )
+    const extended = resolveConnectionLifecyclePolicy({ HERMES_DESKTOP_PORT_ANNOUNCE_TIMEOUT_MS: '180000' }, 'win32')
 
     expect(extended.portAnnounceTimeoutMs).toBe(180_000)
     expect(extended.localAttemptTimeoutMs).toBeGreaterThan(baseline.localAttemptTimeoutMs)
@@ -94,7 +92,11 @@ function deferred<T>() {
 }
 
 function lifecycleHarness(
-  dial: (scope: { connectionId: string | null; profile: string }, report: (phase: any) => void) => Promise<TestConnection>
+  dial: (
+    scope: { connectionId: string | null; profile: string },
+    report: (phase: any) => void
+  ) => Promise<TestConnection>,
+  options: { reuseReady?: (connection: TestConnection) => boolean; retire?: (scope: any) => Promise<void> } = {}
 ) {
   const snapshots: DesktopConnectionSnapshot<TestConnection>[] = []
   const logs: ConnectionLifecycleTerminalLog[] = []
@@ -111,7 +113,8 @@ function lifecycleHarness(
     log: record => logs.push(record),
     policy: resolveConnectionLifecyclePolicy({}, 'win32'),
     publish: snapshot => snapshots.push(snapshot),
-    setTimer: (callback, ms) => setTimeout(callback, ms)
+    setTimer: (callback, ms) => setTimeout(callback, ms),
+    ...options
   })
 
   return { coordinator, logs, snapshots }
@@ -125,6 +128,142 @@ describe('ConnectionLifecycleCoordinator', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('revalidates ready remotes through the dial authority and shares concurrent recovery', async () => {
+    const recovery = deferred<TestConnection>()
+    let dials = 0
+
+    const { coordinator } = lifecycleHarness(
+      () => (++dials === 1 ? Promise.resolve({ baseUrl: 'https://dead', token: 'old' }) : recovery.promise),
+      { reuseReady: () => false }
+    )
+
+    const scope = { connectionId: 'ssh', profile: 'default' }
+    await coordinator.ensure(scope)
+    const first = coordinator.ensure(scope)
+    const second = coordinator.ensure(scope)
+    expect(first).toBe(second)
+    recovery.resolve({ baseUrl: 'https://recovered', token: 'fresh' })
+    await expect(first).resolves.toMatchObject({ baseUrl: 'https://recovered' })
+  })
+
+  it.each(['choice', 'update', 'install'] as const)(
+    'excludes %s preparation while retaining the remaining active deadline',
+    async stage => {
+      const preparation = deferred<any>()
+      const launch = deferred<TestConnection>()
+      const timeout = resolveConnectionLifecyclePolicy({}).attemptTimeoutMs
+
+      const { coordinator } = lifecycleHarness(async (_scope, report) => {
+        await new Promise(resolve => setTimeout(resolve, 1_000))
+        await runPrimaryBackendStartup({
+          connectRemote: async () => {
+            throw new Error('unexpected remote')
+          },
+          ensureLocalRuntime: () => (stage === 'install' ? preparation.promise : Promise.resolve({})),
+          prepareLocalBackend: () => ({}),
+          resolveRemote: async () => null,
+          waitForDecision: () => (stage === 'choice' ? preparation.promise : Promise.resolve('continue-local')),
+          waitForLocalStart: () => (stage === 'update' ? preparation.promise : Promise.resolve()),
+          requiresInstall: () => stage === 'install',
+          reportPreparation: preparing => report(preparing ? 'preparing' : 'launch')
+        })
+
+        return launch.promise
+      })
+
+      const pending = coordinator.ensure({ profile: 'default' })
+      const rejected = expect(pending).rejects.toMatchObject({ data: { code: 'attempt_timeout' } })
+      await vi.advanceTimersByTimeAsync(timeout * 2)
+      expect(coordinator.inspect({}).state).toBe('starting')
+      preparation.resolve(stage === 'choice' ? 'continue-local' : {})
+      await vi.advanceTimersByTimeAsync(timeout - 1_001)
+      expect(coordinator.inspect({}).state).toBe('starting')
+      await vi.advanceTimersByTimeAsync(1)
+      await rejected
+    }
+  )
+
+  it('retires an underlying dial claim before retry and fences late settlement', async () => {
+    const claims = new BackendDialClaims()
+    const old = deferred<TestConnection>()
+    const retirement = deferred<void>()
+    let attempts = 0
+    const fresh = { baseUrl: 'http://fresh', token: 'fresh' }
+
+    const { coordinator } = lifecycleHarness(
+      () => claims.run('work', () => (++attempts === 1 ? old.promise : Promise.resolve(fresh))),
+      {
+        retire: () => claims.retire('work', () => retirement.promise)
+      }
+    )
+
+    const failed = expect(coordinator.ensure({ profile: 'work' })).rejects.toMatchObject({
+      data: { code: 'attempt_timeout' }
+    })
+
+    await vi.advanceTimersByTimeAsync(resolveConnectionLifecyclePolicy({}).attemptTimeoutMs)
+    await failed
+    const retry = coordinator.ensure({ profile: 'work' })
+    expect(attempts).toBe(1)
+    retirement.resolve()
+    await expect(retry).resolves.toBe(fresh)
+    old.resolve({ baseUrl: 'http://obsolete', token: 'old' })
+    await Promise.resolve()
+    await expect(coordinator.ensure({ profile: 'work' })).resolves.toBe(fresh)
+    expect(attempts).toBe(2)
+  })
+
+  it('coalesces a lease-held API ensure with renderer startup without losing the captured fence', async () => {
+    const authority = createConnectionGenerationRegistry()
+    const routeKey = '["office","work"]'
+    const captured = { routeKey, lease: authority.captureRoute(routeKey) }
+    const claim = authority.begin('pool:office')
+    const pending = deferred<TestConnection & { connectionGeneration: number }>()
+    const { coordinator } = lifecycleHarness(() => pending.promise)
+    const scope = { connectionId: 'office', profile: 'work' }
+
+    const api = ensureConnectionGenerationRoute(authority, routeKey,
+      async () => await coordinator.ensure(scope) as TestConnection & { connectionGeneration: number }, captured)
+
+    const renderer = coordinator.ensure(scope)
+    authority.retireRoute(routeKey)
+    pending.resolve(authority.publish(claim, { baseUrl: 'https://office', token: 'safe' }))
+    await expect(api).rejects.toThrow('marketplace_connection_generation_changed')
+    await expect(renderer).resolves.toMatchObject({ baseUrl: 'https://office' })
+    expect(authority.current(routeKey)).toBeUndefined()
+  })
+
+  it.each(['invalidated', 'timed out'])('never dials a retry %s while retirement was pending', async outcome => {
+    const retirement = deferred<void>()
+    let attempts = 0
+
+    const { coordinator } = lifecycleHarness(
+      () => {
+        attempts += 1
+
+        return new Promise(() => {})
+      },
+      { retire: () => retirement.promise }
+    )
+
+    const scope = { profile: 'work' }
+    const first = coordinator.ensure(scope).catch(error => error)
+    await vi.advanceTimersByTimeAsync(resolveConnectionLifecyclePolicy({}).attemptTimeoutMs)
+    await first
+    const retry = coordinator.ensure(scope).catch(error => error)
+
+    if (outcome === 'invalidated') {
+      coordinator.invalidate(scope)
+    } else {
+      await vi.advanceTimersByTimeAsync(resolveConnectionLifecyclePolicy({}).attemptTimeoutMs)
+    }
+
+    await retry
+    retirement.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(attempts).toBe(1)
   })
 
   it('lets a healthy 53-second Windows cold start finish instead of applying the old renderer deadline', async () => {
@@ -318,6 +457,122 @@ describe('connection lifecycle IPC bridge', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('replays already-active primary preparation and keeps preload alive until startup resumes', async () => {
+    const choice = deferred<any>()
+    const ready = { baseUrl: 'http://ready', token: 'safe' }
+
+    const { coordinator } = lifecycleHarness(async (_scope, report) => {
+      await runPrimaryBackendStartup({
+        connectRemote: async () => ready,
+        ensureLocalRuntime: async backend => backend,
+        prepareLocalBackend: () => ({}),
+        resolveRemote: async () => null,
+        waitForDecision: () => choice.promise,
+        waitForLocalStart: async () => {},
+        reportPreparation: preparing => report(preparing ? 'preparing' : 'launch')
+      })
+
+      return ready
+    })
+
+    const bridge = createConnectionLifecycleBridge({
+      coordinator,
+      normalizeScope: scope => normalizeMainConnectionScope(scope, 'work', 'local')
+    })
+
+    const boot = bridge.ensure({})
+    await vi.advanceTimersByTimeAsync(0)
+    const policy = resolveConnectionLifecyclePolicy({})
+
+    const pending = invokeWithConnectionWatchdog(() => boot, {}, policy.preloadWatchdogMs, {
+      inspect: async () => bridge.inspect({}),
+      subscribe: () => () => {},
+      checkTimeoutMs: policy.ipcDeliveryMarginMs
+    })
+
+    void pending.catch(() => {})
+    await vi.advanceTimersByTimeAsync(policy.preloadWatchdogMs * 3)
+    choice.resolve('continue-local')
+    await expect(pending).resolves.toBe(ready)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('bounds a main process that stops answering inspection during preparation', async () => {
+    const scope = { connectionId: null, profile: 'work' }
+    let inspections = 0
+
+    const pending = invokeWithConnectionWatchdog(() => new Promise(() => {}), scope, 100, {
+      inspect: () =>
+        ++inspections === 1
+          ? Promise.resolve({ attemptId: 1, elapsedMs: 0, phase: 'preparing', scope, state: 'starting' })
+          : new Promise(() => {}),
+      subscribe: () => () => {},
+      checkTimeoutMs: 20
+    })
+
+    const rejected = expect(pending).rejects.toMatchObject({ data: { code: 'ipc_timeout' } })
+    await vi.advanceTimersByTimeAsync(40)
+    await rejected
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('cleans up inspection timers when ensure settles first', async () => {
+    const connection = { baseUrl: 'http://ready', token: 'safe' }
+    await expect(
+      invokeWithConnectionWatchdog(async () => ({ ok: true, connection }), {}, 100, {
+        inspect: () => new Promise(() => {}),
+        subscribe: () => () => {},
+        checkTimeoutMs: 20
+      })
+    ).resolves.toBe(connection)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not shorten the active watchdog when the initial inspection is slow', async () => {
+    const ready = { baseUrl: 'http://ready', token: 'safe' }
+    const result = deferred<{ ok: true; connection: TestConnection }>()
+
+    const pending = invokeWithConnectionWatchdog(() => result.promise, {}, 100, {
+      inspect: () => new Promise(() => {}),
+      subscribe: () => () => {},
+      checkTimeoutMs: 20
+    })
+
+    void pending.catch(() => {})
+    await vi.advanceTimersByTimeAsync(50)
+    result.resolve({ ok: true, connection: ready })
+    await expect(pending).resolves.toBe(ready)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('ignores other scopes and does not renew the active preload budget on progress', async () => {
+    let listener!: (snapshot: any) => void
+    const scope = { connectionId: 'office', profile: 'work' }
+
+    const pending = invokeWithConnectionWatchdog(() => new Promise(() => {}), scope, 100, {
+      inspect: async () => ({ attemptId: 1, elapsedMs: 0, phase: 'launch', scope, state: 'starting' }),
+      subscribe: callback => {
+        listener = callback
+
+        return () => {}
+      },
+      checkTimeoutMs: 20
+    })
+
+    const rejected = expect(pending).rejects.toMatchObject({ data: { code: 'ipc_timeout' } })
+    await vi.advanceTimersByTimeAsync(50)
+    listener({
+      attemptId: 2,
+      elapsedMs: 0,
+      phase: 'preparing',
+      scope: { ...scope, profile: 'other' },
+      state: 'starting'
+    })
+    listener({ attemptId: 1, elapsedMs: 50, phase: 'health', scope, state: 'starting' })
+    await vi.advanceTimersByTimeAsync(50)
+    await rejected
   })
 
   it('normalizes primary and registry scopes without conflating their profile defaults', () => {

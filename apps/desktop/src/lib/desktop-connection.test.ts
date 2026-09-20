@@ -86,7 +86,9 @@ describe('desktop connection client', () => {
       connectionId: 'office',
       profile: 'work'
     })
-    expect(desktopConnectionScopeKey({ connectionId: null, profile: null })).toBe('[null,"default"]')
+    expect(desktopConnectionScopeKey({ connectionId: null, profile: null })).not.toBe(
+      desktopConnectionScopeKey({ profile: 'default' })
+    )
   })
 
   it('shares one exact promise for concurrent callers in the same scope', async () => {
@@ -109,6 +111,36 @@ describe('desktop connection client', () => {
     await expect(ensureDesktopConnection({ profile: 'default' })).resolves.toBe(ready)
     await expect(ensureDesktopConnection({ profile: 'default' })).resolves.toBe(ready)
     expect(bridge.ensureConnection).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([true, false])(
+    'keeps a named primary separate from explicit default (primary first: %s)',
+    async primaryFirst => {
+      installBridge({ ensureConnection: vi.fn(scope => Promise.resolve(connection(scope.profile ?? 'work'))) })
+      const scopes = primaryFirst ? [{}, { profile: 'default' }] : [{ profile: 'default' }, {}]
+      const results = []
+
+      for (const scope of scopes) {
+        results.push(await ensureDesktopConnection(scope))
+      }
+
+      expect(results.map(result => result.baseUrl)).toEqual(
+        primaryFirst ? ['http://work', 'http://default'] : ['http://default', 'http://work']
+      )
+    }
+  )
+
+  it('re-enters Electron for remote dispatch while coalescing concurrent callers', async () => {
+    const remote = { ...connection('old-remote'), mode: 'remote' as const }
+    const recovered = { ...connection('recovered-remote'), mode: 'remote' as const }
+    const next = deferred<HermesConnection>()
+    installBridge({ ensureConnection: vi.fn().mockResolvedValueOnce(remote).mockReturnValueOnce(next.promise) })
+    await ensureDesktopConnection({ connectionId: 'ssh', profile: 'default' })
+    const first = ensureDesktopConnection({ connectionId: 'ssh', profile: 'default' })
+    const second = ensureDesktopConnection({ connectionId: 'ssh', profile: 'default' })
+    expect(first).toBe(second)
+    next.resolve(recovered)
+    await expect(first).resolves.toBe(recovered)
   })
 
   it('drops a ready descriptor when Electron publishes invalidation', async () => {

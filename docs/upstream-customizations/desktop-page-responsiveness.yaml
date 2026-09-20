@@ -61,6 +61,8 @@ upstream_changes:
   - Intent and idle prefetch remain disabled until the gateway is open, and idle warming remains limited to Settings and Capabilities.
   - Capabilities caches remain keyed by both connection and profile; same-scope revisits may paint stale data while refetching but cross-scope data never flashes.
   - Primary, auxiliary, and MoA Model Settings reads publish independently and reject every late prior-profile state write through the profile epoch.
+  - Same-profile refresh generations and main-model mutations fence stale successes, failures, and finalizers; successful auxiliary editors survive nonblocking refresh and error states.
+  - Only actual navigation starts route measurements, including repeated warm clicks; hover/focus import deduplication cannot suppress measurements or add hover dwell to route latency. Warm page content marks visible before settled.
   - Route performance evidence is local-only, strips query and hash data, and emits a bounded slow-route log only at or above 500 milliseconds.
   tests:
   - apps/desktop/src/app/lazy-pages.test.tsx

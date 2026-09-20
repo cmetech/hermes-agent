@@ -1534,7 +1534,7 @@ export function ChatSidebar({
                     // word; the row is what it's actually about.
                     data-tip-region=""
                     onClick={() => {
-                      prefetchRoute(item.route)
+                      prefetchRoute(item.route, true)
 
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →

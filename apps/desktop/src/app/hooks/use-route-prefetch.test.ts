@@ -81,12 +81,14 @@ describe('useIdleDesktopRoutePrefetch', () => {
 
     disabled(SKILLS_ROUTE)
     enabled(SKILLS_ROUTE)
-    enabled(SKILLS_ROUTE)
+    expect(onIntent).not.toHaveBeenCalled()
+    enabled(SKILLS_ROUTE, true)
+    enabled(SKILLS_ROUTE, true)
     enabled(null)
 
     expect(prefetch).toHaveBeenCalledTimes(1)
     expect(prefetch).toHaveBeenCalledWith(SKILLS_ROUTE)
-    expect(onIntent).toHaveBeenCalledOnce()
+    expect(onIntent).toHaveBeenCalledTimes(2)
     expect(onIntent).toHaveBeenCalledWith(SKILLS_ROUTE)
   })
 })

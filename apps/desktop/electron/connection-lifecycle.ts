@@ -10,7 +10,7 @@ export interface DesktopConnectionScope {
   profile: string
 }
 
-export type DesktopConnectionPhase = 'resolve' | 'launch' | 'port' | 'health' | 'remote'
+export type DesktopConnectionPhase = 'resolve' | 'preparing' | 'launch' | 'port' | 'health' | 'remote'
 export type DesktopConnectionState = 'absent' | 'starting' | 'ready' | 'failed'
 
 export type DesktopConnectionErrorCode =
@@ -75,11 +75,14 @@ interface ConnectionLifecycleDependencies<TConnection> {
   clock: () => number
   dial: (
     scope: DesktopConnectionScope,
-    reportPhase: (phase: DesktopConnectionPhase) => void
+    reportPhase: (phase: DesktopConnectionPhase) => void,
+    signal: AbortSignal
   ) => Promise<TConnection> | TConnection
   log: (record: ConnectionLifecycleTerminalLog) => void
   policy: ConnectionLifecyclePolicy
   publish: (snapshot: DesktopConnectionSnapshot<TConnection>) => void
+  reuseReady?: (connection: TConnection) => boolean
+  retire?: (scope: DesktopConnectionScope) => Promise<void>
   setTimer: (callback: () => void, ms: number) => TimerHandle
 }
 
@@ -116,6 +119,7 @@ export function desktopConnectionScopeKey(scope: DesktopConnectionScopeInput): s
 export class ConnectionLifecycleCoordinator<TConnection> {
   readonly #dependencies: ConnectionLifecycleDependencies<TConnection>
   readonly #entries = new Map<string, ConnectionLifecycleEntry<TConnection>>()
+  readonly #retiring = new Map<string, Promise<void>>()
   #nextAttemptId = 1
 
   constructor(dependencies: ConnectionLifecycleDependencies<TConnection>) {
@@ -144,7 +148,11 @@ export class ConnectionLifecycleCoordinator<TConnection> {
     const key = desktopConnectionScopeKey(scope)
     const current = this.#entries.get(key)
 
-    if (current?.state === 'ready' && current.connection !== undefined) {
+    if (
+      current?.state === 'ready' &&
+      current.connection !== undefined &&
+      (this.#dependencies.reuseReady?.(current.connection) ?? true)
+    ) {
       return Promise.resolve(current.connection)
     }
 
@@ -162,10 +170,47 @@ export class ConnectionLifecycleCoordinator<TConnection> {
 
     this.#entries.set(key, entry)
     this.#publish(entry)
+    const controller = new AbortController()
+
+    let remainingMs = this.#dependencies.policy.attemptTimeoutMs
+    let activeSince = this.#dependencies.clock()
+    let rejectTimeout!: (error: ConnectionLifecycleError) => void
+
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      rejectTimeout = reject
+    })
+
+    const armTimer = () => {
+      activeSince = this.#dependencies.clock()
+      entry.timer = this.#dependencies.setTimer(
+        () => {
+          controller.abort()
+          rejectTimeout(
+            new ConnectionLifecycleError(
+              this.#errorData(entry, {
+                code: 'attempt_timeout',
+                message: 'Hermes connection attempt exceeded its Electron lifecycle deadline.',
+                retryable: true
+              })
+            )
+          )
+        },
+        Math.max(0, remainingMs)
+      )
+    }
+
+    armTimer()
 
     const reportPhase = (phase: DesktopConnectionPhase) => {
       if (this.#entries.get(key) !== entry || entry.state !== 'starting' || entry.phase === phase) {
         return
+      }
+
+      if (phase === 'preparing') {
+        remainingMs -= this.#dependencies.clock() - activeSince
+        this.#clearTimer(entry)
+      } else if (entry.phase === 'preparing') {
+        armTimer()
       }
 
       entry.phase = phase
@@ -175,27 +220,32 @@ export class ConnectionLifecycleCoordinator<TConnection> {
     let dialPromise: Promise<TConnection>
 
     try {
-      dialPromise = Promise.resolve(this.#dependencies.dial(scope, reportPhase))
+      const retiring = this.#retiring.get(key)
+
+      const dial = () => {
+        if (this.#entries.get(key) !== entry || entry.state !== 'starting') {
+          throw new ConnectionLifecycleError(
+            this.#errorData(entry, {
+              code: 'invalidated',
+              message: 'Hermes connection attempt was invalidated.',
+              retryable: true
+            })
+          )
+        }
+
+        return this.#dependencies.dial(scope, reportPhase, controller.signal)
+      }
+
+      dialPromise = retiring ? retiring.then(dial) : Promise.resolve(dial())
     } catch (error) {
       dialPromise = Promise.reject(error)
     }
 
-    const timeoutPromise = new Promise<never>((_resolve, reject) => {
-      entry.timer = this.#dependencies.setTimer(() => {
-        reject(
-          new ConnectionLifecycleError(
-            this.#errorData(entry, {
-              code: 'attempt_timeout',
-              message: 'Hermes connection attempt exceeded its Electron lifecycle deadline.',
-              retryable: true
-            })
-          )
-        )
-      }, this.#dependencies.policy.attemptTimeoutMs)
-    })
-
     const invalidationPromise = new Promise<never>((_resolve, reject) => {
-      entry.invalidate = reject
+      entry.invalidate = error => {
+        controller.abort()
+        reject(error)
+      }
     })
 
     const inFlight = Promise.race([dialPromise, timeoutPromise, invalidationPromise]).then(
@@ -240,6 +290,21 @@ export class ConnectionLifecycleCoordinator<TConnection> {
         entry.state = 'failed'
         this.#publish(entry)
         this.#logTerminal(entry, lifecycleError.data.code)
+
+        if (lifecycleError.data.code === 'attempt_timeout' && this.#dependencies.retire && !this.#retiring.has(key)) {
+          const retirement = Promise.resolve().then(() => this.#dependencies.retire!(scope))
+          this.#retiring.set(key, retirement)
+          void retirement.then(
+            () => {
+              if (this.#retiring.get(key) === retirement) {
+                this.#retiring.delete(key)
+              }
+            },
+            () => {
+              /* Keep failed teardown as a fail-closed barrier. */
+            }
+          )
+        }
 
         throw lifecycleError
       }

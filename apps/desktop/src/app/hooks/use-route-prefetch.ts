@@ -22,16 +22,19 @@ export function createRouteIntentPrefetch(
   enabled: boolean,
   prefetch: typeof prefetchDesktopRoute = prefetchDesktopRoute,
   onIntent?: (route: string) => void
-): (route: null | string | undefined) => void {
+): (route: null | string | undefined, navigating?: boolean) => void {
   const seen = new Set<string>()
 
-  return route => {
+  return (route, navigating = false) => {
+    if (route && navigating) {
+      onIntent?.(route)
+    }
+
     if (!enabled || !route || seen.has(route)) {
       return
     }
 
     seen.add(route)
-    onIntent?.(route)
     void prefetch(route)?.catch(() => undefined)
   }
 }

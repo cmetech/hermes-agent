@@ -738,7 +738,7 @@ export interface DesktopConnectionScopeInput {
   profile?: null | string
 }
 
-export type DesktopConnectionLifecyclePhase = 'resolve' | 'launch' | 'port' | 'health' | 'remote'
+export type DesktopConnectionLifecyclePhase = 'resolve' | 'preparing' | 'launch' | 'port' | 'health' | 'remote'
 export type DesktopConnectionLifecycleState = 'absent' | 'starting' | 'ready' | 'failed'
 export type DesktopConnectionLifecycleErrorCode =
   | 'launch_failed'

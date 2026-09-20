@@ -23,6 +23,20 @@ function deferred<T>() {
 }
 
 describe('RouteLoadBoundary', () => {
+  it('reports already-warm content as visible before settlement', () => {
+    const events: string[] = []
+    render(
+      <RouteLoadBoundary
+        onSettled={() => events.push('settled')}
+        onVisible={() => events.push('visible')}
+        route="/skills"
+        variant="workspace"
+      >
+        <div>Warm page</div>
+      </RouteLoadBoundary>
+    )
+    expect(events).toEqual(['visible', 'settled'])
+  })
   afterEach(() => {
     vi.restoreAllMocks()
     routePerformance.settled.mockClear()

@@ -1521,7 +1521,12 @@ const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
 // coalesce here — the second caller awaits the first spawn's result.
 const backendDialClaims = new BackendDialClaims()
 
-type ConnectionAttemptReporter = (phase: DesktopConnectionPhase) => void
+type ConnectionAttemptReporter = ((phase: DesktopConnectionPhase) => void) & {
+  backend?: (kind: 'primary' | 'pool', key?: string) => void
+  assertCurrent?: () => void
+  sshScope?: (scope: string) => void
+}
+const desktopAttemptBackends = new Map<string, { kind: 'primary' | 'pool'; key?: string; sshScope?: string }>()
 
 function classifyDesktopConnectionError(error: unknown) {
   const message = sanitizeConnectionErrorMessage(error instanceof Error ? error.message : error)
@@ -1566,7 +1571,31 @@ function serializeRendererConnection(connection) {
   return rendererConnection
 }
 
-async function dialDesktopConnection(scope, reportPhase: ConnectionAttemptReporter) {
+async function dialDesktopConnection(scope, report: ConnectionAttemptReporter, signal: AbortSignal) {
+  const claimKey = backendScopeKey(scope.connectionId, scope.profile)
+  desktopAttemptBackends.delete(claimKey)
+
+  const reportPhase: ConnectionAttemptReporter = phase => {
+    signal.throwIfAborted()
+    report(phase)
+  }
+
+  reportPhase.assertCurrent = () => signal.throwIfAborted()
+
+  reportPhase.backend = (kind, key) => {
+    signal.throwIfAborted()
+    desktopAttemptBackends.set(claimKey, { kind, key })
+  }
+
+  reportPhase.sshScope = sshScope => {
+    signal.throwIfAborted()
+    const backend = desktopAttemptBackends.get(claimKey)
+
+    if (backend) {
+      backend.sshScope = sshScope
+    }
+  }
+
   reportPhase('resolve')
 
   if (scope.connectionId) {
@@ -1607,6 +1636,25 @@ const desktopConnectionCoordinator = new ConnectionLifecycleCoordinator<any>({
   dial: dialDesktopConnection,
   log: record => rememberLog(`[connection-lifecycle] ${JSON.stringify(record)}`),
   policy: desktopConnectionPolicy,
+  reuseReady: connection => connection.mode !== 'remote',
+  retire: scope =>
+    backendDialClaims.retire(backendScopeKey(scope.connectionId, scope.profile), async () => {
+      const claimKey = backendScopeKey(scope.connectionId, scope.profile)
+      const backend = desktopAttemptBackends.get(claimKey)
+      desktopAttemptBackends.delete(claimKey)
+      connectionGenerations.retireRoute(lifecycleRouteKey(scope.connectionId, scope.profile))
+
+      if (backend?.kind === 'primary') {
+        await teardownPrimaryBackendAndWait({ soft: true })
+      } else if (backend?.key) {
+        await stopPoolBackend(backend.key)
+      }
+
+      if (backend?.sshScope !== undefined) {
+        await sshBootstrapCoordinator.cancelAndWait(backend.sshScope)
+        await teardownSshConnection(backend.sshScope)
+      }
+    }),
   publish: snapshot => {
     const payload = sanitizeConnectionLifecycleSnapshot(snapshot)
 
@@ -10651,6 +10699,8 @@ async function bootstrapSshConnection(
 ) {
   const scope = sshScopeKey(profile)
   const effectiveConfigFingerprint = resolvedEffectiveFingerprint || (await effectiveSshConfigFingerprint(sshConfig))
+  metadata.assertConnectionCurrent?.()
+  metadata.onSshScope?.(scope)
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
 
@@ -10949,7 +10999,15 @@ function persistSshConnectionToken(profile, source, token, registryConnectionId 
 //   3. global remote (connection.json `mode: 'remote'`)
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
-async function resolveRemoteBackend(profile, options: { poolKey?: string; primary?: boolean } = {}) {
+async function resolveRemoteBackend(
+  profile,
+  options: {
+    poolKey?: string
+    primary?: boolean
+    assertCurrent?: () => void
+    onSshScope?: (scope: string) => void
+  } = {}
+) {
   const profileKey = String(profile || '').trim() || 'default'
 
   const managedPrimary = options.primary
@@ -10993,7 +11051,9 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
         managedScope: 'primary',
         managedUpdateCorrelation: managedPrimary.correlationId,
         primaryRegistryScope: true,
-        registryConnectionId: source.id
+        registryConnectionId: source.id,
+        assertConnectionCurrent: options.assertCurrent,
+        onSshScope: options.onSshScope
       }
     )
 
@@ -11033,7 +11093,9 @@ async function resolveRemoteBackend(profile, options: { poolKey?: string; primar
         managedScope: options.primary ? 'primary' : options.poolKey ? 'pool' : 'transient',
         poolKey: options.poolKey || '',
         primaryRegistryScope: options.primary === true && Boolean(route.connectionId),
-        registryConnectionId: route.connectionId || ''
+        registryConnectionId: route.connectionId || '',
+        assertConnectionCurrent: options.assertCurrent,
+        onSshScope: options.onSshScope
       }
     )
   } else {
@@ -11556,11 +11618,7 @@ function profileRouteOptions(profile, request?) {
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
-async function ensureBackend(
-  profile,
-  requestRoute?: ConnectionRouteLease,
-  reportPhase?: ConnectionAttemptReporter
-) {
+async function ensureBackend(profile, requestRoute?: ConnectionRouteLease, reportPhase?: ConnectionAttemptReporter) {
   return ensureConnectionGenerationRoute(
     connectionGenerations,
     lifecycleRouteKey(null, profile),
@@ -11569,18 +11627,16 @@ async function ensureBackend(
   )
 }
 
-async function resolveBackend(
-  profile,
-  requestRoute?: ConnectionRouteLease,
-  reportPhase?: ConnectionAttemptReporter
-) {
+async function resolveBackend(profile, requestRoute?: ConnectionRouteLease, reportPhase?: ConnectionAttemptReporter) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
 
   profileDeletionGate.assertCanStart(key)
 
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
+  reportPhase?.assertCurrent?.()
 
   if (route.backend === 'primary') {
+    reportPhase?.backend?.('primary')
     const connection = await startHermes(reportPhase)
     setWslBridgeProfileState(key, connection.mode !== 'remote')
 
@@ -11601,6 +11657,8 @@ async function resolveBackend(
   if (stopping) {
     await stopping
   }
+
+  reportPhase?.backend?.('pool', key)
 
   const existing = backendPool.get(key)
 
@@ -11805,6 +11863,8 @@ async function resolveRegistryBackend(
       await stoppingLocal
     }
 
+    reportPhase?.backend?.('pool', localRoute.poolKey)
+
     const existingLocal = backendPool.get(localRoute.poolKey)
 
     if (existingLocal) {
@@ -11857,6 +11917,12 @@ async function resolveRegistryBackend(
   }
 
   const key = backendScopeKey(id, profile)
+  reportPhase?.backend?.('pool', key)
+
+  if (source.kind === 'ssh') {
+    reportPhase?.sshScope?.(key)
+  }
+
   const existing = backendPool.get(key)
 
   if (existing) {
@@ -11960,12 +12026,15 @@ async function connectRegistryBackend(
       throw new Error(`SSH connection "${source.label}" has no host configured.`)
     }
 
+    const effectiveFingerprint = resolvedEffectiveFingerprint ? await resolvedEffectiveFingerprint : undefined
+    connectionGenerations.assertCurrent(generationClaim.generation)
+
     const connection = await bootstrapSshConnection(
       key,
       sshConfig,
       decryptDesktopSecret(source.token),
       tokenPersistenceSource || `registry:${source.id}`,
-      resolvedEffectiveFingerprint ? await resolvedEffectiveFingerprint : undefined,
+      effectiveFingerprint,
       {
         managedScope: 'pool',
         managedUpdateCorrelation,
@@ -12606,6 +12675,7 @@ async function spawnPoolBackend(
   const generationClaim = connectionGenerations.begin(`pool:${poolKey}`)
 
   await reapOrphanedBackendsOnce()
+  connectionGenerations.assertCurrent(generationClaim.generation)
   profileDeletionGate.assertCanStart(profile)
 
   // A profile may point at its OWN remote backend (connection.json
@@ -12614,7 +12684,14 @@ async function spawnPoolBackend(
   // remote is reachable and hand back its connection descriptor. The pool
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
-  const remote = opts.forceLocal ? null : await resolveRemoteBackend(profile, { poolKey })
+  const remote = opts.forceLocal
+    ? null
+    : await resolveRemoteBackend(profile, {
+        poolKey,
+        assertCurrent: () => connectionGenerations.assertCurrent(generationClaim.generation),
+        onSshScope: opts.reportPhase?.sshScope
+      })
+
   profileDeletionGate.assertCanStart(profile)
 
   if (remote) {
@@ -12643,16 +12720,24 @@ async function spawnPoolBackend(
   {
     let poolAnnounced = false
 
-    await waitForUpdateClearance(updateGateDeps(), {
-      onWaitTick: reason => {
-        if (!poolAnnounced) {
-          poolAnnounced = true
-          rememberLog(`[updates] update in progress (${reason}); deferring pool backend start for profile "${profile}"`)
-        }
-      },
-      pollMs: UPDATE_WAIT_POLL_MS,
-      timeoutMs: UPDATE_WAIT_TIMEOUT_MS
-    })
+    opts.reportPhase?.('preparing')
+
+    try {
+      await waitForUpdateClearance(updateGateDeps(), {
+        onWaitTick: reason => {
+          if (!poolAnnounced) {
+            poolAnnounced = true
+            rememberLog(
+              `[updates] update in progress (${reason}); deferring pool backend start for profile "${profile}"`
+            )
+          }
+        },
+        pollMs: UPDATE_WAIT_POLL_MS,
+        timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+      })
+    } finally {
+      opts.reportPhase?.('launch')
+    }
   }
 
   profileDeletionGate.assertCanStart(profile)
@@ -12661,7 +12746,14 @@ async function spawnPoolBackend(
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
-  const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  const resolvedBackend = resolveHermesBackend(backendArgs)
+
+  if (resolvedBackend.kind === 'bootstrap-needed') {
+    opts.reportPhase?.('preparing')
+  }
+
+  const backend = await ensureRuntime(resolvedBackend)
+  opts.reportPhase?.('launch')
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
@@ -12683,6 +12775,8 @@ async function spawnPoolBackend(
   const parentStartMarker = await desktopParentStartMarker()
   const backendNonce = crypto.randomBytes(16).toString('hex')
   const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
+
+  connectionGenerations.assertCurrent(generationClaim.generation)
 
   const child = spawn(
     backend.command,
@@ -12911,7 +13005,44 @@ async function prepareProfileRenameRequest(request) {
   })
 }
 
+let primaryStartupPhase: DesktopConnectionPhase = 'resolve'
+let primaryStartupSshScope: string | undefined
+const primaryStartupReporters = new Set<ConnectionAttemptReporter>()
+
 async function startHermes(reportPhase?: ConnectionAttemptReporter) {
+  reportPhase?.assertCurrent?.()
+
+  if (reportPhase) {
+    primaryStartupReporters.add(reportPhase)
+
+    if (primaryStartupSshScope !== undefined) {
+      reportPhase.sshScope?.(primaryStartupSshScope)
+    }
+
+    reportPhase(primaryStartupPhase)
+  }
+
+  try {
+    return await startPrimaryHermes(phase => {
+      primaryStartupPhase = phase
+
+      for (const reporter of primaryStartupReporters) {
+        // An invalidated consumer must not interrupt another consumer's shared boot.
+        try {
+          reporter(phase)
+        } catch {
+          primaryStartupReporters.delete(reporter)
+        }
+      }
+    }, reportPhase?.assertCurrent)
+  } finally {
+    if (reportPhase) {
+      primaryStartupReporters.delete(reportPhase)
+    }
+  }
+}
+
+async function startPrimaryHermes(reportPhase: ConnectionAttemptReporter, assertCurrent?: () => void) {
   connectionGenerations.assertAvailable()
 
   // Only the single-instance lock holder may reap/spawn/claim the desktop
@@ -12924,6 +13055,7 @@ async function startHermes(reportPhase?: ConnectionAttemptReporter) {
   }
 
   await reapOrphanedBackendsOnce()
+  assertCurrent?.()
 
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
@@ -12973,6 +13105,16 @@ async function startHermes(reportPhase?: ConnectionAttemptReporter) {
 
   const connectionAttempt = backendConnectionState.startAttempt()
   const generationClaim = connectionGenerations.begin('primary')
+  primaryStartupSshScope = undefined
+  const publishPhase = reportPhase
+
+  reportPhase = phase => {
+    if (backendConnectionState.isCurrentAttempt(connectionAttempt)) {
+      publishPhase(phase)
+    }
+  }
+
+  reportPhase('resolve')
   const primaryProfile = primaryProfileKey()
 
   // Legacy path callers without an explicit profile belong to the primary
@@ -13053,18 +13195,40 @@ async function startHermes(reportPhase?: ConnectionAttemptReporter) {
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,
-      ensureLocalRuntime: ensureRuntime,
+      ensureLocalRuntime: backend => {
+        connectionGenerations.assertCurrent(generationClaim.generation)
+
+        return ensureRuntime(backend)
+      },
+      requiresInstall: backend => backend.kind === 'bootstrap-needed',
+      reportPreparation: preparing => reportPhase(preparing ? 'preparing' : 'resolve'),
       prepareLocalBackend: async () => {
+        connectionGenerations.assertCurrent(generationClaim.generation)
         await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
 
         return resolveHermesBackend(backendArgs)
       },
       resolveRemote: () => {
+        connectionGenerations.assertCurrent(generationClaim.generation)
         // Classify immediately before each throwing resolve. This callback runs
         // both for an already-saved remote and after first-run remote Apply.
         attemptedRemote = managedPrimaryRestoreOwners.size > 0 || primaryBackendIsRemote()
 
-        return resolveRemoteBackend(primaryProfile, { primary: true })
+        return resolveRemoteBackend(primaryProfile, {
+          primary: true,
+          assertCurrent: () => connectionGenerations.assertCurrent(generationClaim.generation),
+          onSshScope: scope => {
+            primaryStartupSshScope = scope
+
+            for (const reporter of primaryStartupReporters) {
+              try {
+                reporter.sshScope?.(scope)
+              } catch {
+                primaryStartupReporters.delete(reporter)
+              }
+            }
+          }
+        })
       },
       waitForDecision: waitForFirstRunSetupChoice,
       // Mutual exclusion with an in-app update (#50238). Remote connections
@@ -13100,6 +13264,8 @@ async function startHermes(reportPhase?: ConnectionAttemptReporter) {
     const parentStartMarker = await desktopParentStartMarker()
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
+
+    connectionGenerations.assertCurrent(generationClaim.generation)
 
     const hermesProcess = spawn(
       backend.command,
@@ -16629,12 +16795,14 @@ async function handleHermesApiRequest(request, structured = false) {
         const id = apiRequestRegistryConnectionId(value)
 
         if (id) {
-          // Lifecycle mutations carry a captured route lease. They intentionally
-          // stay inside the raw resolver so the request can prove that exact
-          // generation before dispatch; entering the process-wide ready cache
-          // here would discard the lease and weaken stale-request fencing.
-          const descriptor = await backendDialClaims.run(backendScopeKey(id, value.profile), () =>
-            ensureRegistryBackend(id, value.profile, '', captured)
+          // Join the lifecycle owner while preserving the mutation's captured
+          // lease on both sides of ensure. A bare cached descriptor would lose
+          // this fence; a separate raw dial would lose timeout teardown ownership.
+          const descriptor = await ensureConnectionGenerationRoute(
+            connectionGenerations,
+            captured.routeKey,
+            () => ensureDesktopConnection({ connectionId: id, profile: value.profile }),
+            captured
           )
 
           connectionGenerations.associate(captured.routeKey, descriptor.connectionGeneration, captured.lease)
@@ -16647,8 +16815,14 @@ async function handleHermesApiRequest(request, structured = false) {
         }
 
         const route = resolveProfileApiRequest(value.profile, value.path, profileRouteOptions(value.profile, value))
-        // Same lease-preserving exception for legacy/profile lifecycle routes.
-        const descriptor = await ensureBackend(route.backendProfile, captured)
+
+        const descriptor = await ensureConnectionGenerationRoute(
+          connectionGenerations,
+          captured.routeKey,
+          () => ensureDesktopConnection({ connectionId: null, profile: route.backendProfile }),
+          captured
+        )
+
         connectionGenerations.associate(captured.routeKey, descriptor.connectionGeneration, captured.lease)
 
         return { descriptor, path: route.requestPath, routeKey: captured.routeKey }

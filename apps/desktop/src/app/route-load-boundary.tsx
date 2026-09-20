@@ -30,10 +30,15 @@ function RouteLoading({ onVisible, route, variant }: Omit<RouteLoadBoundaryProps
   return <PageLoader className={VARIANT_CLASS[variant]} label={t.common.loading} />
 }
 
-function RouteSettled({ onSettled, route }: Pick<RouteLoadBoundaryProps, 'onSettled' | 'route'>) {
+function RouteSettled({
+  onSettled,
+  onVisible,
+  route
+}: Pick<RouteLoadBoundaryProps, 'onSettled' | 'onVisible' | 'route'>) {
   useEffect(() => {
+    ;(onVisible ?? noteDesktopRouteVisible)(route)
     ;(onSettled ?? noteDesktopRouteSettled)(route)
-  }, [onSettled, route])
+  }, [onSettled, onVisible, route])
 
   return null
 }
@@ -41,7 +46,7 @@ function RouteSettled({ onSettled, route }: Pick<RouteLoadBoundaryProps, 'onSett
 export function RouteLoadBoundary({ children, onSettled, onVisible, route, variant }: RouteLoadBoundaryProps) {
   return (
     <Suspense fallback={<RouteLoading onVisible={onVisible} route={route} variant={variant} />}>
-      <RouteSettled onSettled={onSettled} route={route} />
+      <RouteSettled onSettled={onSettled} onVisible={onVisible} route={route} />
       {children}
     </Suspense>
   )

@@ -197,6 +197,7 @@ upstream_changes:
   owner: downstream-desktop-runtime
   overlap_policy: any_owned_file
   files:
+  - apps/desktop/electron/backend-dial-claim.ts
   - apps/desktop/electron/backend-dial-claim.test.ts
   - apps/desktop/electron/connection-lifecycle-bridge.ts
   - apps/desktop/electron/connection-lifecycle-policy.ts
@@ -205,6 +206,8 @@ upstream_changes:
   - apps/desktop/electron/main.ts
   - apps/desktop/electron/power-resume-remote-revalidation.test.ts
   - apps/desktop/electron/preload.ts
+  - apps/desktop/electron/primary-backend-startup.ts
+  - apps/desktop/electron/primary-backend-startup.test.ts
   - apps/desktop/electron/registry-primary-profile-scope.test.ts
   - apps/desktop/src/api/plugins.test.ts
   - apps/desktop/src/api/plugins.ts
@@ -227,6 +230,25 @@ upstream_changes:
   - apps/desktop/src/store/profile.ts
   - apps/desktop/src/store/workflow-marketplace-supervisor.test.ts
   owned_symbols:
+  - BackendDialClaims
+  - ConnectionAttemptReporter
+  - desktopAttemptBackends
+  - dialDesktopConnection
+  - startPrimaryHermes
+  - startHermes
+  - resolveBackend
+  - resolveRegistryBackend
+  - connectRegistryBackend
+  - spawnPoolBackend
+  - resolveRemoteBackend
+  - bootstrapSshConnection
+  - handleHermesApiRequest
+  - primaryStartupPhase
+  - primaryStartupSshScope
+  - primaryStartupReporters
+  - runPrimaryBackendStartup
+  - ConnectionWatchdogObservation
+  - connectionObservation
   - ConnectionLifecyclePolicy
   - resolveConnectionLifecyclePolicy
   - DesktopConnectionScopeInput
@@ -275,10 +297,14 @@ upstream_changes:
   owned_invariants:
   - Electron owns one bounded connection attempt for each normalized connection/profile scope; renderer callers join it and never impose an earlier backend-start deadline.
   - Inspection is side-effect free, lifecycle events never renew a deadline, and typed terminal results release ownership for retry.
+  - Explicit setup choice, update exclusion, and installation preparation pause remaining active dial budgets; ordinary phase progress cannot renew them. Preload replays scoped inspection and checks main responsiveness during preparation.
+  - Remote ready descriptors re-enter native route health policy; omitted primary renderer identity never aliases explicit default.
+  - Timed-out dial claims retire behind scoped process/SSH teardown before retry, and generation checks prevent late process creation or publication.
   - Profile and source activation preserve the previous usable context until the target backend and gateway are ready, then publish through existing generation and abort fences.
   - Performance entries stay local and contain only bounded operation, sequence, outcome, and duration data.
   tests:
   - apps/desktop/electron/connection-lifecycle.test.ts
+  - apps/desktop/electron/primary-backend-startup.test.ts
   - apps/desktop/electron/backend-dial-claim.test.ts
   - apps/desktop/electron/backend-ready.test.ts
   - apps/desktop/electron/backend-health.test.ts
@@ -311,6 +337,10 @@ upstream_changes:
     the strictly larger preload watchdog, typed credential-free errors, and the
     existing two-phase activation fences. Preserve the inner WebSocket and
     post-readiness operation bounds.
+    Preparation remains owned by existing setup/install/update authorities,
+    with remaining active time retained on resume. Remote ensures must retain
+    dispatch health checks. Timeout retry must fence and drain the actual
+    selected primary/pool and SSH scope before releasing its dial claim.
   removal_condition: >-
     Remove only when upstream provides one equivalent Electron-owned scoped
     lifecycle across every Desktop dial, including coalesced slow Windows cold

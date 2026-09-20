@@ -13,8 +13,7 @@ export const CONNECTION_LIFECYCLE_CHANNEL = 'hermes:connection:lifecycle'
 const MAX_CONNECTION_ERROR_MESSAGE_LENGTH = 2_048
 
 export type ConnectionEnsureEnvelope<TConnection> =
-  | { ok: true; connection: TConnection }
-  | { ok: false; error: DesktopConnectionErrorData }
+  { ok: true; connection: TConnection } | { ok: false; error: DesktopConnectionErrorData }
 
 export type PublicConnectionLifecycleSnapshot = Omit<DesktopConnectionSnapshot<never>, 'connection'>
 
@@ -114,7 +113,7 @@ function decodeError(value: unknown): DesktopConnectionErrorData | null {
   }
 
   const scope = decodeScope(value.scope)
-  const phases: DesktopConnectionPhase[] = ['resolve', 'launch', 'port', 'health', 'remote']
+  const phases: DesktopConnectionPhase[] = ['resolve', 'preparing', 'launch', 'port', 'health', 'remote']
 
   const codes = [
     'launch_failed',
@@ -157,16 +156,13 @@ function decodeError(value: unknown): DesktopConnectionErrorData | null {
 }
 
 export function decodeConnectionLifecycleSnapshot(value: unknown): PublicConnectionLifecycleSnapshot | null {
-  if (
-    !isPlainRecord(value) ||
-    !exactKeys(value, ['attemptId', 'elapsedMs', 'phase', 'scope', 'state'], ['error'])
-  ) {
+  if (!isPlainRecord(value) || !exactKeys(value, ['attemptId', 'elapsedMs', 'phase', 'scope', 'state'], ['error'])) {
     return null
   }
 
   const scope = decodeScope(value.scope)
   const states: DesktopConnectionState[] = ['absent', 'starting', 'ready', 'failed']
-  const phases: DesktopConnectionPhase[] = ['resolve', 'launch', 'port', 'health', 'remote']
+  const phases: DesktopConnectionPhase[] = ['resolve', 'preparing', 'launch', 'port', 'health', 'remote']
   const phase = value.phase
   const error = value.error === undefined ? undefined : decodeError(value.error)
 
@@ -215,12 +211,19 @@ export function subscribeConnectionLifecycle(
   }
 }
 
+export interface ConnectionWatchdogObservation {
+  checkTimeoutMs: number
+  inspect: () => Promise<PublicConnectionLifecycleSnapshot>
+  subscribe: (callback: (snapshot: PublicConnectionLifecycleSnapshot) => void) => () => void
+}
+
 export async function invokeWithConnectionWatchdog<TConnection>(
   invoke: () => Promise<ConnectionEnsureEnvelope<TConnection>>,
   scope: DesktopConnectionScopeInput,
-  watchdogMs: number
+  watchdogMs: number,
+  observation?: ConnectionWatchdogObservation
 ): Promise<TConnection> {
-  const envelope = await invokeConnectionIpcWithWatchdog(invoke, scope, watchdogMs)
+  const envelope = await invokeConnectionIpcWithWatchdog(invoke, scope, watchdogMs, observation)
 
   if (envelope.ok === false) {
     throw new ConnectionLifecycleError(envelope.error)
@@ -232,7 +235,8 @@ export async function invokeWithConnectionWatchdog<TConnection>(
 export async function invokeConnectionIpcWithWatchdog<TResult>(
   invoke: () => Promise<TResult>,
   scope: DesktopConnectionScopeInput,
-  watchdogMs: number
+  watchdogMs: number,
+  observation?: ConnectionWatchdogObservation
 ): Promise<TResult> {
   const normalizedScope: DesktopConnectionScope = {
     connectionId: String(scope.connectionId ?? '').trim() || null,
@@ -240,26 +244,170 @@ export async function invokeConnectionIpcWithWatchdog<TResult>(
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined
+  let checkTimer: ReturnType<typeof setTimeout> | undefined
+  let inspectTimer: ReturnType<typeof setTimeout> | undefined
+  let inspecting = false
+  let remainingMs = watchdogMs
+  let activeSince = Date.now()
+  let preparing = false
+  let settled = false
+  let revision = 0
+  let latestAttempt = -1
+  let unsubscribe: (() => void) | undefined
+  let resolvedProfile = String(scope.profile ?? '').trim() || (normalizedScope.connectionId ? 'default' : null)
+  let rejectWatchdog!: (error: unknown) => void
 
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new ConnectionLifecycleError({
-          attemptId: null,
-          code: 'ipc_timeout',
-          elapsedMs: watchdogMs,
-          message: 'Hermes connection IPC did not settle after the Electron lifecycle deadline.',
-          phase: 'resolve',
-          retryable: true,
-          scope: normalizedScope
-        })
-      )
-    }, watchdogMs)
+    rejectWatchdog = reject
   })
+
+  const armTimer = () => {
+    activeSince = Date.now()
+    timer = setTimeout(
+      () => {
+        rejectWatchdog(
+          new ConnectionLifecycleError({
+            attemptId: null,
+            code: 'ipc_timeout',
+            elapsedMs: watchdogMs,
+            message: 'Hermes connection IPC did not settle after the Electron lifecycle deadline.',
+            phase: 'resolve',
+            retryable: true,
+            scope: normalizedScope
+          })
+        )
+      },
+      Math.max(0, remainingMs)
+    )
+  }
+
+  armTimer()
+
+  const scheduleCheck = () => {
+    if (!observation || settled || !preparing || checkTimer !== undefined) {
+      return
+    }
+
+    // Preparation belongs to installer/setup/update. Probe main-process IPC,
+    // not progress: an alive preparation can wait, a dead main remains bounded.
+    checkTimer = setTimeout(() => {
+      checkTimer = undefined
+      void inspect()
+    }, observation.checkTimeoutMs)
+  }
+
+  const consume = (snapshot: PublicConnectionLifecycleSnapshot) => {
+    if (
+      settled ||
+      snapshot.scope.connectionId !== normalizedScope.connectionId ||
+      snapshot.scope.profile !== resolvedProfile
+    ) {
+      return
+    }
+
+    if (snapshot.attemptId !== null && snapshot.attemptId < latestAttempt) {
+      return
+    }
+
+    if (snapshot.attemptId !== null) {
+      latestAttempt = snapshot.attemptId
+    }
+
+    const nextPreparing = snapshot.state === 'starting' && snapshot.phase === 'preparing'
+
+    if (nextPreparing !== preparing) {
+      preparing = nextPreparing
+
+      if (preparing) {
+        remainingMs -= Date.now() - activeSince
+        clearTimeout(timer)
+        timer = undefined
+      } else {
+        clearTimeout(checkTimer)
+        checkTimer = undefined
+        armTimer()
+      }
+    }
+
+    scheduleCheck()
+  }
+
+  const inspect = async () => {
+    if (!observation || settled || inspecting) {
+      return
+    }
+
+    inspecting = true
+    const captured = ++revision
+    inspectTimer = setTimeout(
+      () => {
+        rejectWatchdog(
+          new ConnectionLifecycleError({
+            attemptId: null,
+            code: 'ipc_timeout',
+            elapsedMs: Date.now() - activeSince,
+            message: 'Hermes connection inspection stopped responding during startup.',
+            phase: 'resolve',
+            retryable: true,
+            scope: normalizedScope
+          })
+        )
+      },
+      preparing ? observation.checkTimeoutMs : Math.max(0, remainingMs - (Date.now() - activeSince))
+    )
+
+    try {
+      const snapshot = decodeConnectionLifecycleSnapshot(await observation.inspect())
+
+      if (settled || captured !== revision || !snapshot) {
+        return
+      }
+
+      if (resolvedProfile === null) {
+        resolvedProfile = snapshot.scope.profile
+      }
+
+      consume(snapshot)
+    } catch (error) {
+      if (!settled) {
+        rejectWatchdog(error)
+      }
+    } finally {
+      inspecting = false
+      clearTimeout(inspectTimer)
+      inspectTimer = undefined
+      scheduleCheck()
+    }
+  }
+
+  if (observation) {
+    unsubscribe = observation.subscribe(snapshot => {
+      if (resolvedProfile === null) {
+        if (snapshot.scope.connectionId === normalizedScope.connectionId) {
+          void inspect()
+        }
+
+        return
+      }
+
+      if (snapshot.scope.connectionId !== normalizedScope.connectionId || snapshot.scope.profile !== resolvedProfile) {
+        return
+      }
+
+      revision += 1
+      consume(snapshot)
+    })
+    void inspect()
+  }
 
   try {
     return await Promise.race([Promise.resolve().then(invoke), timeout])
   } finally {
+    settled = true
+    unsubscribe?.()
+    clearTimeout(checkTimer)
+    clearTimeout(inspectTimer)
+
     if (timer !== undefined) {
       clearTimeout(timer)
     }

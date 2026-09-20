@@ -20,15 +20,27 @@ const hudNativeDrag = hudWindowing?.nativeDrag === true
 const connectionPolicy = ipcRenderer.sendSync('hermes:connection:policy')
 const connectionWatchdogMs = Number(connectionPolicy?.preloadWatchdogMs)
 
+const connectionObservation = scope => ({
+  checkTimeoutMs: Number(connectionPolicy?.ipcDeliveryMarginMs),
+  inspect: () => ipcRenderer.invoke('hermes:connection:inspect', scope),
+  subscribe: callback => subscribeConnectionLifecycle(ipcRenderer, callback)
+})
+
 const ensureConnection = scope =>
   invokeWithConnectionWatchdog(
     () => ipcRenderer.invoke('hermes:connection:ensure', scope),
     scope,
-    connectionWatchdogMs
+    connectionWatchdogMs,
+    connectionObservation(scope)
   )
 
 const invokeConnectionIpc = (channel, scope, ...args) =>
-  invokeConnectionIpcWithWatchdog(() => ipcRenderer.invoke(channel, ...args), scope, connectionWatchdogMs)
+  invokeConnectionIpcWithWatchdog(
+    () => ipcRenderer.invoke(channel, ...args),
+    scope,
+    connectionWatchdogMs,
+    connectionObservation(scope)
+  )
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
@@ -44,14 +56,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       : invokeConnectionIpc('hermes:connection:for', payload || {}, payload),
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () =>
-    invokeConnectionIpc('hermes:connection:revalidate', { connectionId: null, profile: 'default' }),
+    invokeConnectionIpc('hermes:connection:revalidate', { connectionId: null, profile: null }),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile =>
-    invokeConnectionIpc('hermes:gateway:ws-url', { connectionId: null, profile }, profile),
+  getGatewayWsUrl: profile => invokeConnectionIpc('hermes:gateway:ws-url', { connectionId: null, profile }, profile),
   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
   // getGatewayWsUrl, minted against that connection's backend.
-  getGatewayWsUrlFor: payload =>
-    invokeConnectionIpc('hermes:gateway:ws-url-for', payload || {}, payload),
+  getGatewayWsUrlFor: payload => invokeConnectionIpc('hermes:gateway:ws-url-for', payload || {}, payload),
   // Union agent roster across every registered connection.
   getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),

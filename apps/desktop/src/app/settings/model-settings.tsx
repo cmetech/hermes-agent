@@ -248,6 +248,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
   // so a request in flight when the user switches profiles can't paint profile
   // A's models/providers into profile B (or fire onMainModelChanged for A).
   const profileEpoch = useRef(0)
+  const refreshGeneration = useRef(0)
   const moaRef = useRef<MoaConfigResponse | null>(null)
   const moaSaveGeneration = useRef(0)
   const moaSaveTimer = useRef<number | null>(null)
@@ -259,6 +260,8 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       replaceSelection = false
     }: { preserveDraft?: boolean; refreshCatalog?: boolean; replaceSelection?: boolean } = {}) => {
       const epoch = profileEpoch.current
+      const generation = ++refreshGeneration.current
+      const isCurrent = () => profileEpoch.current === epoch && refreshGeneration.current === generation
       setPrimaryLoading(true)
       setPrimaryError('')
       setAuxiliaryLoading(true)
@@ -271,7 +274,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
         getGlobalModelOptions(refreshCatalog ? { refresh: true } : undefined, requestProfile)
       ])
         .then(([modelInfo, modelOptions]) => {
-          if (profileEpoch.current !== epoch) {
+          if (!isCurrent()) {
             return
           }
 
@@ -293,36 +296,36 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           void invalidateHermesConfig(scopeProfile)
         })
         .catch(err => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setPrimaryError(err instanceof Error ? err.message : String(err))
           }
         })
         .finally(() => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setPrimaryLoading(false)
           }
         })
 
       const auxiliaryRequest = getAuxiliaryModels(requestProfile)
         .then(auxiliaryModels => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setAuxiliary(auxiliaryModels)
           }
         })
         .catch(err => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setAuxiliaryError(err instanceof Error ? err.message : String(err))
           }
         })
         .finally(() => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setAuxiliaryLoading(false)
           }
         })
 
       const moaRequest = getMoaModels(requestProfile)
         .then(moaModels => {
-          if (profileEpoch.current !== epoch) {
+          if (!isCurrent()) {
             return
           }
 
@@ -333,12 +336,12 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
           }
         })
         .catch(err => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setMoaError(err instanceof Error ? err.message : String(err))
           }
         })
         .finally(() => {
-          if (profileEpoch.current === epoch) {
+          if (isCurrent()) {
             setMoaLoading(false)
           }
         })
@@ -822,6 +825,9 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     }
 
     const epoch = profileEpoch.current
+    // A mutation revokes reads started before the user's new intent, including
+    // optional sections still loading from the initial page mount.
+    refreshGeneration.current += 1
     setApplying(true)
     setActionError('')
     setSelectionWarning(false)
@@ -854,9 +860,14 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
       await refresh()
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : String(err))
+      if (profileEpoch.current === epoch) {
+        setActionError(err instanceof Error ? err.message : String(err))
+        await refresh()
+      }
     } finally {
-      setApplying(false)
+      if (profileEpoch.current === epoch) {
+        setApplying(false)
+      }
     }
   }, [onMainModelChanged, refresh, requestProfile, scopeProfile, selectedModel, selectedProvider, selectedProviderRow])
 
@@ -1177,7 +1188,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             {auxiliaryError}
           </div>
         )}
-        {!auxiliaryLoading && !auxiliaryError && switchStaleAux.length === 0 && persistentStaleAux.length > 0 && (
+        {auxiliary && switchStaleAux.length === 0 && persistentStaleAux.length > 0 && (
           <div className="mb-2.5">
             <StaleAuxWarning
               applying={applying}
@@ -1187,7 +1198,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             />
           </div>
         )}
-        {!auxiliaryLoading && !auxiliaryError && (
+        {auxiliary && (
           <div className="grid gap-1">
             {AUX_TASKS.map(meta => {
               const copy = m.tasks[meta.key] ?? { label: meta.key, hint: meta.key }
