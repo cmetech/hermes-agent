@@ -203,7 +203,9 @@ upstream_changes:
   - apps/desktop/electron/connection-lifecycle.test.ts
   - apps/desktop/electron/connection-lifecycle.ts
   - apps/desktop/electron/main.ts
+  - apps/desktop/electron/power-resume-remote-revalidation.test.ts
   - apps/desktop/electron/preload.ts
+  - apps/desktop/electron/registry-primary-profile-scope.test.ts
   - apps/desktop/src/api/plugins.test.ts
   - apps/desktop/src/api/plugins.ts
   - apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
@@ -281,6 +283,8 @@ upstream_changes:
   - apps/desktop/electron/backend-ready.test.ts
   - apps/desktop/electron/backend-health.test.ts
   - apps/desktop/electron/backend-connection-state.test.ts
+  - apps/desktop/electron/power-resume-remote-revalidation.test.ts
+  - apps/desktop/electron/registry-primary-profile-scope.test.ts
   - apps/desktop/src/lib/desktop-connection.test.ts
   - apps/desktop/src/lib/desktop-connection-performance.test.ts
   - apps/desktop/src/app/gateway/hooks/use-gateway-boot.test.tsx
