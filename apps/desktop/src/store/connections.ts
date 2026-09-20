@@ -26,11 +26,9 @@ import { $connection } from '@/store/session'
 
 const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
 
-// Every await of a source switch is bounded. A wedged spawn, ticket mint,
-// handshake or IPC (the #93454 class) must surface as a failed click — not a
-// spinner that also swallows every later click on the same source, and never
-// a barrier left up or a wipe left unpainted.
-const SWITCH_DIAL_TIMEOUT_MS = 20_000
+// Electron owns backend-start/ticket deadlines and the gateway client owns its
+// socket-handshake deadline. The renderer bounds only the activation commit
+// and best-effort preference write that happen after the target is reachable.
 const SWITCH_COMMIT_TIMEOUT_MS = 20_000
 const SWITCH_REMEMBER_TIMEOUT_MS = 5_000
 export { $connectionsRegistry } from '@/store/connection-registry-state'
@@ -314,11 +312,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // Phase 1 — open the target's socket; the active route is untouched.
     // Always use the explicit registry route. `local` must mean This device,
     // and a registry primary can differ from a legacy per-profile override.
-    await withTimeout(
-      openGatewayAgent(connectionId, targetProfile),
-      SWITCH_DIAL_TIMEOUT_MS,
-      `Timed out connecting to "${targetConnection.label}".`
-    )
+    await openGatewayAgent(connectionId, targetProfile)
 
     // A newer click owns the switch from here on. The superseded dial never
     // activates, so the user doesn't flip through it on the way to the source

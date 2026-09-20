@@ -523,35 +523,43 @@ describe('selectConnection', () => {
     }
   })
 
-  it('a dial that never answers times out: nothing severed, the click fails visibly, and the source can be retried', async () => {
+  it('a slow source dial waits beyond 20 seconds for the authoritative lifecycle without severing context', async () => {
     vi.useFakeTimers()
 
     try {
       setConnectionsRegistry(registry)
       $connection.set({ connectionId: 'local', mode: 'local' })
       $activeSessionId.set('a93bb39d')
-      openGatewayAgent.mockImplementationOnce(() => new Promise<void>(() => undefined))
 
-      const outcome = selectConnection('homelab').then(
-        () => 'resolved',
-        (error: Error) => error.message
-      )
+      let releaseDial!: () => void
+      const dial = new Promise<void>(resolve => {
+        releaseDial = resolve
+      })
 
-      await vi.advanceTimersByTimeAsync(20_000)
+      openGatewayAgent.mockImplementationOnce(() => dial)
 
-      expect(await outcome).toMatch(/Timed out connecting to "Homelab"/)
+      let settled = false
+
+      const outcome = selectConnection('homelab').finally(() => {
+        settled = true
+      })
+
+      await vi.advanceTimersByTimeAsync(25_000)
+
+      expect(settled).toBe(false)
       expect(ensureGatewayAgent).not.toHaveBeenCalled()
       expect(beginGatewaySwitch).not.toHaveBeenCalled()
       expect($activeSessionId.get()).toBe('a93bb39d')
       expect($gatewaySwitching.get()).toBe(false)
-      expect($pendingConnectionId.get()).toBeNull()
+      expect($pendingConnectionId.get()).toBe('homelab')
 
-      // The stalled click does not poison the source: a retry is a real switch,
-      // not a duplicate of the pending one.
-      await selectConnection('homelab')
+      releaseDial()
+      await outcome
 
       expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
       expect($connection.get()?.connectionId).toBe('homelab')
+      expect($activeSessionId.get()).toBeNull()
+      expect($pendingConnectionId.get()).toBeNull()
     } finally {
       vi.useRealTimers()
     }
