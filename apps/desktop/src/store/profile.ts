@@ -4,6 +4,7 @@ import { atom, batch, computed } from 'nanostores'
 import type { HermesConnection } from '@/global'
 import { getProfiles, hermesApi, setApiRequestProfile, STARTUP_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { ensureDesktopConnection } from '@/lib/desktop-connection'
+import { beginDesktopConnectionMeasure } from '@/lib/desktop-connection-performance'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import {
   arraysEqual,
@@ -498,6 +499,9 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   }
 
   $gatewaySwapTarget.set(target)
+  const finishActivationMeasure = beginDesktopConnectionMeasure('profile.activation')
+  let activationOutcome: 'failed' | 'ready' = 'failed'
+
   gatewaySwitch = (async () => {
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
     // the active gateway at it — without closing the profile you came from.
@@ -528,7 +532,9 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   // own flows; fire-and-forget callers surface it via their own .catch below.
   try {
     await gatewaySwitch
+    activationOutcome = 'ready'
   } finally {
+    finishActivationMeasure(activationOutcome)
     gatewaySwitch = null
     $gatewaySwapTarget.set(null)
   }

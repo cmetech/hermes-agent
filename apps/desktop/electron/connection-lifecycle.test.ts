@@ -244,7 +244,7 @@ describe('ConnectionLifecycleCoordinator', () => {
   it('publishes only discrete phase changes in order and inspection has no side effects', async () => {
     let dials = 0
 
-    const { coordinator, snapshots } = lifecycleHarness(async (_scope, report) => {
+    const { coordinator, logs, snapshots } = lifecycleHarness(async (_scope, report) => {
       dials += 1
       report('launch')
       report('launch')
@@ -271,11 +271,22 @@ describe('ConnectionLifecycleCoordinator', () => {
       'starting:health',
       'ready:health'
     ])
+    expect(logs).toEqual([
+      {
+        attemptId: 1,
+        code: null,
+        elapsedMs: 0,
+        phase: 'health',
+        scope: { connectionId: null, profile: 'default' },
+        state: 'ready'
+      }
+    ])
   })
 
   it('classifies terminal errors and emits exactly one credential-free terminal log', async () => {
     const { coordinator, logs } = lifecycleHarness(async (_scope, report) => {
       report('launch')
+      vi.setSystemTime(1_250)
       throw new Error('spawn refused')
     })
 
@@ -289,6 +300,7 @@ describe('ConnectionLifecycleCoordinator', () => {
     expect(logs[0]).toMatchObject({
       attemptId: 1,
       code: 'launch_failed',
+      elapsedMs: 250,
       phase: 'launch',
       scope: { connectionId: null, profile: 'default' },
       state: 'failed'

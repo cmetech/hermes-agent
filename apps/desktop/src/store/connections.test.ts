@@ -532,6 +532,7 @@ describe('selectConnection', () => {
       $activeSessionId.set('a93bb39d')
 
       let releaseDial!: () => void
+
       const dial = new Promise<void>(resolve => {
         releaseDial = resolve
       })

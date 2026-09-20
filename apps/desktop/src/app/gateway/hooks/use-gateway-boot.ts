@@ -10,6 +10,7 @@ import {
   invalidateDesktopConnection,
   revalidateDesktopConnection
 } from '@/lib/desktop-connection'
+import { beginDesktopConnectionMeasure } from '@/lib/desktop-connection-performance'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
@@ -944,6 +945,8 @@ export function useGatewayBoot({
     })
 
     async function boot() {
+      const finishConnectionMeasure = beginDesktopConnectionMeasure('connection.initial')
+
       try {
         // A profile-pinned helper window (the HUD) dials its target profile's
         // backend directly — ensureBackend spawns/reuses it from the pool.
@@ -989,6 +992,7 @@ export function useGatewayBoot({
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
 
         await gateway.connect(wsUrl)
+        finishConnectionMeasure('ready')
 
         if (cancelled) {
           return
@@ -1060,6 +1064,8 @@ export function useGatewayBoot({
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
           setSessionsLoading(false)
         }
+      } finally {
+        finishConnectionMeasure(cancelled ? 'cancelled' : 'failed')
       }
     }
 

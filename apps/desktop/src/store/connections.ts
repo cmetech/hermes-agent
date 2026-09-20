@@ -2,6 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { ensureDesktopConnection } from '@/lib/desktop-connection'
+import { beginDesktopConnectionMeasure, type DesktopConnectionMeasureOutcome } from '@/lib/desktop-connection-performance'
 import { persistStringRecord, storedStringRecord } from '@/lib/storage'
 import { isTimeoutError, withTimeout } from '@/lib/with-timeout'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
@@ -303,6 +304,9 @@ export async function selectConnection(connectionId: string, options: SelectConn
   const revision = ++switchRevision
   pendingTarget = targetKey
   $pendingConnectionId.set(connectionId)
+  const finishActivationMeasure = beginDesktopConnectionMeasure('source.activation')
+  let activationOutcome: DesktopConnectionMeasureOutcome = 'failed'
+
   // Set by the commit hook once THIS switch has wiped — i.e. it owns the
   // barrier and, if the commit then fails, owes the still-active source a
   // repaint. Null while queued, or if it stepped aside before its turn.
@@ -318,6 +322,8 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // activates, so the user doesn't flip through it on the way to the source
     // they picked last; its socket stays warm for that click or idles out.
     if (revision !== switchRevision) {
+      activationOutcome = 'superseded'
+
       return
     }
 
@@ -379,6 +385,8 @@ export async function selectConnection(connectionId: string, options: SelectConn
       }
 
       if (revision !== switchRevision) {
+        activationOutcome = 'superseded'
+
         return
       }
 
@@ -407,6 +415,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
       captureNewChatSource()
       requestFreshSession()
       await refreshActiveProfile()
+      activationOutcome = revision === switchRevision ? 'ready' : 'superseded'
     }
   } catch (error) {
     if (revision === switchRevision) {
@@ -420,8 +429,12 @@ export async function selectConnection(connectionId: string, options: SelectConn
       }
 
       throw error
+    } else {
+      activationOutcome = 'superseded'
     }
   } finally {
+    finishActivationMeasure(activationOutcome)
+
     if (revision === switchRevision) {
       pendingTarget = null
       $pendingConnectionId.set(null)
