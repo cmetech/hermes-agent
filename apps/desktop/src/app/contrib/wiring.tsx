@@ -95,6 +95,7 @@ import { triggerAndRefreshCronJobs } from '../cron/cron-actions'
 import { useGatewayBoot } from '../gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
 import { useKeybinds } from '../hooks/use-keybinds'
+import { useIdleDesktopRoutePrefetch } from '../hooks/use-route-prefetch'
 import { useHudHandoff } from '../hud/handoff'
 import {
   AgentsView,
@@ -199,6 +200,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   useEffect(() => startWorkflowNotificationDelivery(), [])
 
   const gatewayState = useStore($gatewayState)
+  useIdleDesktopRoutePrefetch(gatewayState === 'open')
   const activeSessionId = useStore($activeSessionId)
   const billingSettingsRequest = useStore($billingSettingsRequest)
   const cronReviewRequest = useStore($cronReviewRequest)

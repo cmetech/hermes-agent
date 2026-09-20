@@ -133,6 +133,7 @@ import { markSessionUnread } from '@/store/session-unread-remote'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
+import { createRouteIntentPrefetch } from '../../hooks/use-route-prefetch'
 import {
   type AppView,
   ARTIFACTS_ROUTE,
@@ -739,6 +740,7 @@ export function ChatSidebar({
   // workspaceParentOrderIds; worktrees within a parent via workspaceOrderIds.
   const worktreeGroupingActive = agentsGrouped && !showArchived
   const gatewayReady = gatewayState === 'open'
+  const prefetchRoute = useMemo(() => createRouteIntentPrefetch(gatewayReady), [gatewayReady])
 
   // The backend project tree is a structural snapshot, NOT a per-message feed.
   // Refresh it on structural edges only — entering the grouped view, a profile
@@ -1539,6 +1541,8 @@ export function ChatSidebar({
 
                       onNavigate(item)
                     }}
+                    onFocus={() => prefetchRoute(item.route)}
+                    onPointerEnter={() => prefetchRoute(item.route)}
                     tooltip={
                       item.keybindActionId
                         ? {
