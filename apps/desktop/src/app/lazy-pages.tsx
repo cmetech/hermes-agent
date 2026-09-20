@@ -26,8 +26,10 @@ export interface DesktopLazyPageEntry {
   route: string
 }
 
-function memoizedLoader(load: DesktopLazyPageLoader): DesktopLazyPageLoader {
-  let pending: ReturnType<DesktopLazyPageLoader> | null = null
+function memoizedLoader<TModule extends Awaited<ReturnType<DesktopLazyPageLoader>>>(
+  load: () => Promise<TModule>
+): () => Promise<TModule> {
+  let pending: Promise<TModule> | null = null
 
   return () => (pending ??= load())
 }
@@ -53,22 +55,36 @@ export function createDesktopLazyPageRegistry(entries: readonly DesktopLazyPageE
   }
 }
 
+const loadArtifacts = memoizedLoader(async () => ({ default: (await import('./artifacts')).ArtifactsView }))
+const loadMessaging = memoizedLoader(async () => ({ default: (await import('./messaging')).MessagingView }))
+const loadSkills = memoizedLoader(async () => ({ default: (await import('./skills')).SkillsView }))
+const loadWorkflows = memoizedLoader(async () => ({ default: (await import('./workflows')).WorkflowsView }))
+const loadKanban = memoizedLoader(async () => ({ default: (await import('./kanban')).KanbanView }))
+const loadAgents = memoizedLoader(async () => ({ default: (await import('./agents')).AgentsView }))
+
+const loadCommandCenter = memoizedLoader(async () => ({
+  default: (await import('./command-center')).CommandCenterView
+}))
+
+const loadCron = memoizedLoader(async () => ({ default: (await import('./cron')).CronView }))
+const loadWebhooks = memoizedLoader(async () => ({ default: (await import('./webhooks')).WebhooksView }))
+const loadProfiles = memoizedLoader(async () => ({ default: (await import('./profiles')).ProfilesView }))
+const loadSettings = memoizedLoader(async () => ({ default: (await import('./settings')).SettingsView }))
+const loadStarmap = memoizedLoader(async () => ({ default: (await import('./starmap')).StarmapView }))
+
 const registry = createDesktopLazyPageRegistry([
-  { route: ARTIFACTS_ROUTE, load: async () => ({ default: (await import('./artifacts')).ArtifactsView }) },
-  { route: MESSAGING_ROUTE, load: async () => ({ default: (await import('./messaging')).MessagingView }) },
-  { route: SKILLS_ROUTE, load: async () => ({ default: (await import('./skills')).SkillsView }) },
-  { route: WORKFLOWS_ROUTE, load: async () => ({ default: (await import('./workflows')).WorkflowsView }) },
-  { route: KANBAN_ROUTE, load: async () => ({ default: (await import('./kanban')).KanbanView }) },
-  { route: AGENTS_ROUTE, load: async () => ({ default: (await import('./agents')).AgentsView }) },
-  {
-    route: COMMAND_CENTER_ROUTE,
-    load: async () => ({ default: (await import('./command-center')).CommandCenterView })
-  },
-  { route: CRON_ROUTE, load: async () => ({ default: (await import('./cron')).CronView }) },
-  { route: WEBHOOKS_ROUTE, load: async () => ({ default: (await import('./webhooks')).WebhooksView }) },
-  { route: PROFILES_ROUTE, load: async () => ({ default: (await import('./profiles')).ProfilesView }) },
-  { route: SETTINGS_ROUTE, load: async () => ({ default: (await import('./settings')).SettingsView }) },
-  { route: STARMAP_ROUTE, load: async () => ({ default: (await import('./starmap')).StarmapView }) }
+  { route: ARTIFACTS_ROUTE, load: loadArtifacts },
+  { route: MESSAGING_ROUTE, load: loadMessaging },
+  { route: SKILLS_ROUTE, load: loadSkills },
+  { route: WORKFLOWS_ROUTE, load: loadWorkflows },
+  { route: KANBAN_ROUTE, load: loadKanban },
+  { route: AGENTS_ROUTE, load: loadAgents },
+  { route: COMMAND_CENTER_ROUTE, load: loadCommandCenter },
+  { route: CRON_ROUTE, load: loadCron },
+  { route: WEBHOOKS_ROUTE, load: loadWebhooks },
+  { route: PROFILES_ROUTE, load: loadProfiles },
+  { route: SETTINGS_ROUTE, load: loadSettings },
+  { route: STARMAP_ROUTE, load: loadStarmap }
 ])
 
 export const DESKTOP_LAZY_ROUTES = [
@@ -86,18 +102,18 @@ export const DESKTOP_LAZY_ROUTES = [
   STARMAP_ROUTE
 ] as const
 
-export const ArtifactsView = registry.component(ARTIFACTS_ROUTE)!
-export const MessagingView = registry.component(MESSAGING_ROUTE)!
-export const SkillsView = registry.component(SKILLS_ROUTE)!
-export const WorkflowsView = registry.component(WORKFLOWS_ROUTE)!
-export const KanbanView = registry.component(KANBAN_ROUTE)!
-export const AgentsView = registry.component(AGENTS_ROUTE)!
-export const CommandCenterView = registry.component(COMMAND_CENTER_ROUTE)!
-export const CronView = registry.component(CRON_ROUTE)!
-export const WebhooksView = registry.component(WEBHOOKS_ROUTE)!
-export const ProfilesView = registry.component(PROFILES_ROUTE)!
-export const SettingsView = registry.component(SETTINGS_ROUTE)!
-export const StarmapView = registry.component(STARMAP_ROUTE)!
+export const ArtifactsView = lazy(loadArtifacts)
+export const MessagingView = lazy(loadMessaging)
+export const SkillsView = lazy(loadSkills)
+export const WorkflowsView = lazy(loadWorkflows)
+export const KanbanView = lazy(loadKanban)
+export const AgentsView = lazy(loadAgents)
+export const CommandCenterView = lazy(loadCommandCenter)
+export const CronView = lazy(loadCron)
+export const WebhooksView = lazy(loadWebhooks)
+export const ProfilesView = lazy(loadProfiles)
+export const SettingsView = lazy(loadSettings)
+export const StarmapView = lazy(loadStarmap)
 
 export function prefetchDesktopRoute(to: string): Promise<void> | null {
   return registry.prefetch(to)

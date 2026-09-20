@@ -7,19 +7,17 @@
  * main -> tree adoption lands it on the chosen edge; closing removes it.
  */
 
-import { lazy, type ReactNode, Suspense } from 'react'
+import type { ReactNode } from 'react'
 
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { $routeTiles, closeRouteTile, type RouteTile } from '@/store/route-tiles'
 
+import { ArtifactsView, MessagingView, SkillsView } from '../lazy-pages'
+import { RouteLoadBoundary } from '../route-load-boundary'
 import { ARTIFACTS_ROUTE, contributedRoutes, MESSAGING_ROUTE, ROUTES_AREA, SKILLS_ROUTE } from '../routes'
 
 import { paneMirror } from './pane-mirror'
-
-const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
-const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
-const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
 
 // Built-in page views + their pane titles, keyed by route.
 const BUILTIN_PAGES: Record<string, { render: () => ReactNode; title: string }> = {
@@ -57,9 +55,9 @@ function RouteTilePane({ path }: { path: string }) {
   if (builtin) {
     return (
       <ContribBoundary id={path}>
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={path} variant="tile">
           <ContribRender render={builtin.render} />
-        </Suspense>
+        </RouteLoadBoundary>
       </ContribBoundary>
     )
   }

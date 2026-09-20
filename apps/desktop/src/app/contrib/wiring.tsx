@@ -10,7 +10,7 @@
 
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
-import { type CSSProperties, lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
+import { type CSSProperties, type ReactNode, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
@@ -96,6 +96,15 @@ import { useGatewayBoot } from '../gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
 import { useKeybinds } from '../hooks/use-keybinds'
 import { useHudHandoff } from '../hud/handoff'
+import {
+  AgentsView,
+  CommandCenterView,
+  CronView,
+  ProfilesView,
+  SettingsView,
+  StarmapView,
+  WebhooksView
+} from '../lazy-pages'
 import { ModelPickerOverlay } from '../model-picker-overlay'
 import { ModelVisibilityOverlay } from '../model-visibility-overlay'
 import { mainChatOccupied, openSession } from '../open-session'
@@ -105,13 +114,19 @@ import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
 import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
+import { RouteLoadBoundary } from '../route-load-boundary'
 import {
+  AGENTS_ROUTE,
+  COMMAND_CENTER_ROUTE,
   CRON_ROUTE,
   navigateToWorkspacePage,
+  PROFILES_ROUTE,
   routeSessionId,
   sessionRoute,
   SETTINGS_ROUTE,
-  syncWorkspaceRoute
+  STARMAP_ROUTE,
+  syncWorkspaceRoute,
+  WEBHOOKS_ROUTE
 } from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
@@ -155,17 +170,6 @@ import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
-
-// Overlay views the controller mounts over the shell — lazy, load on demand.
-// The workspace-route full-page views (skills/messaging/artifacts) are the
-// ChatRoutesSurface's and live in ./surfaces.
-const AgentsView = lazy(async () => ({ default: (await import('../agents')).AgentsView }))
-const CommandCenterView = lazy(async () => ({ default: (await import('../command-center')).CommandCenterView }))
-const CronView = lazy(async () => ({ default: (await import('../cron')).CronView }))
-const WebhooksView = lazy(async () => ({ default: (await import('../webhooks')).WebhooksView }))
-const ProfilesView = lazy(async () => ({ default: (await import('../profiles')).ProfilesView }))
-const SettingsView = lazy(async () => ({ default: (await import('../settings')).SettingsView }))
-const StarmapView = lazy(async () => ({ default: (await import('../starmap')).StarmapView }))
 
 // Surfaces (the four wired panes), the render context + WiredPane, and the
 // WiringActions/WiringApi contracts all live in sibling modules — this file is
@@ -1180,7 +1184,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <FindBar />
 
       {settingsOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={SETTINGS_ROUTE} variant="overlay">
           <SettingsView
             gateway={gateway}
             onClose={closeOverlayToPreviousRoute}
@@ -1195,11 +1199,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
           />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {commandCenterOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={COMMAND_CENTER_ROUTE} variant="overlay">
           <CommandCenterView
             initialSection={commandCenterInitialSection}
             onClose={closeOverlayToPreviousRoute}
@@ -1207,40 +1211,40 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             onNavigateRoute={path => navigateToWorkspacePage(navigate, path)}
             onOpenSession={sessionId => openSession(sessionId, navigate)}
           />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {agentsOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={AGENTS_ROUTE} variant="overlay">
           <AgentsView onClose={closeOverlayToPreviousRoute} />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {cronOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={CRON_ROUTE} variant="overlay">
           <CronView
             onClose={closeOverlayToPreviousRoute}
             onOpenSession={sessionId => openSession(sessionId, navigate)}
           />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {webhooksOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={WEBHOOKS_ROUTE} variant="overlay">
           <WebhooksView onClose={closeOverlayToPreviousRoute} />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {profilesOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={PROFILES_ROUTE} variant="overlay">
           <ProfilesView onClose={closeOverlayToPreviousRoute} />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {starmapOpen && (
-        <Suspense fallback={null}>
+        <RouteLoadBoundary route={STARMAP_ROUTE} variant="overlay">
           <StarmapView onClose={closeOverlayToPreviousRoute} />
-        </Suspense>
+        </RouteLoadBoundary>
       )}
 
       {/* Toasts above everything. */}
