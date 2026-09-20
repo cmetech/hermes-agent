@@ -1296,6 +1296,27 @@ def _discard_staged(staged) -> None:
             logger.warning("could not remove staging path %s: %s", staging, exc)
 
 
+def _rename_staged_replacement(src: str, dst: str) -> None:
+    """Allow brief Windows handle contention during a ZIP swap or rollback.
+
+    An open child file can deny a directory rename with error 5; a handle
+    on the directory itself can report error 32. Retry those errors for at
+    most five attempts and 1.85 seconds of scheduled delay per rename.
+    """
+    for delay in (0.1, 0.25, 0.5, 1.0, None):
+        try:
+            os.rename(src, dst)
+            return
+        except OSError as exc:
+            if (
+                sys.platform != "win32"
+                or getattr(exc, "winerror", None) not in {5, 32}
+                or delay is None
+            ):
+                raise
+            _time.sleep(delay)
+
+
 def _commit_staged_replacements(staged) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
@@ -1324,11 +1345,11 @@ def _commit_staged_replacements(staged) -> None:
         for staging, dst in staged:
             backup = f"{dst}.hermes-update-old"
             if os.path.exists(dst):
-                os.rename(dst, backup)
+                _rename_staged_replacement(dst, backup)
                 swapped.append((dst, backup))
             else:
                 swapped.append((dst, ""))
-            os.rename(staging, dst)
+            _rename_staged_replacement(staging, dst)
     except OSError:
         # Undo every swap already made so the install stays self-consistent.
         for dst, backup in reversed(swapped):
@@ -1338,7 +1359,7 @@ def _commit_staged_replacements(staged) -> None:
                 elif os.path.exists(dst):
                     os.remove(dst)
                 if backup and os.path.exists(backup):
-                    os.rename(backup, dst)
+                    _rename_staged_replacement(backup, dst)
             except OSError as exc:
                 # Keep restoring the rest — a silent failure here is the one
                 # thing that turns a recoverable rollback into a mixed tree,
