@@ -2261,7 +2261,7 @@ describe('application marketplace operation supervision', () => {
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
       value: {
-        getConnectionFor: async () => ({ connectionId: 'remote-a', connectionGeneration: 7 }),
+        ensureConnection: async () => ({ connectionId: 'remote-a', connectionGeneration: 7 }),
         apiStructured: async () => ({ ok: false, status: 404, body: { detail: 'Not Found' } })
       }
     })
