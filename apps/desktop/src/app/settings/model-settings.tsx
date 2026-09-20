@@ -989,85 +989,87 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
     <div className="grid gap-6">
       <section>
         <p className="mb-3 text-xs text-muted-foreground">{m.appliesDesc}</p>
-        <div className="flex flex-wrap items-center gap-2">
-          <Select onValueChange={setSelectedProvider} value={selectedProvider}>
-            <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
-              <SelectValue placeholder={m.provider} />
-            </SelectTrigger>
-            <SelectContent>
-              {mainProviderOptions.map(provider => (
-                <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
-                  {provider.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {needsSetup ? (
-            setupIsApiKey ? (
+        {mainModel && (
+          <div className="flex flex-wrap items-center gap-2">
+            <Select onValueChange={setSelectedProvider} value={selectedProvider}>
+              <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
+                <SelectValue placeholder={m.provider} />
+              </SelectTrigger>
+              <SelectContent>
+                {mainProviderOptions.map(provider => (
+                  <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
+                    {provider.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {needsSetup ? (
+              setupIsApiKey ? (
+                <>
+                  <Input
+                    autoComplete="off"
+                    className={cn('min-w-60 flex-1', CONTROL_TEXT)}
+                    onChange={event => setApiKeyDraft(event.target.value)}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') {
+                        void activateApiKeyProvider()
+                      }
+                    }}
+                    placeholder={`Paste ${selectedProviderRow?.key_env ?? 'API key'}`}
+                    type="password"
+                    value={apiKeyDraft}
+                  />
+                  <Button
+                    disabled={!apiKeyDraft.trim() || activating}
+                    onClick={() => void activateApiKeyProvider()}
+                    size="sm"
+                  >
+                    {activating && <Loader2 className="size-3.5 animate-spin" />}
+                    {activating ? 'Activating...' : 'Activate'}
+                  </Button>
+                </>
+              ) : (
+                <Button onClick={startProviderSetup} size="sm" variant="textStrong">
+                  Set up {selectedProviderRow?.name ?? 'provider'}
+                </Button>
+              )
+            ) : (
               <>
-                <Input
-                  autoComplete="off"
-                  className={cn('min-w-60 flex-1', CONTROL_TEXT)}
-                  onChange={event => setApiKeyDraft(event.target.value)}
-                  onKeyDown={event => {
-                    if (event.key === 'Enter') {
-                      void activateApiKeyProvider()
-                    }
-                  }}
-                  placeholder={`Paste ${selectedProviderRow?.key_env ?? 'API key'}`}
-                  type="password"
-                  value={apiKeyDraft}
-                />
+                <Select onValueChange={setSelectedModel} value={selectedModel}>
+                  <SelectTrigger className={cn('min-w-60', CONTROL_TEXT)}>
+                    <SelectValue placeholder={m.model} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {selectedProviderRow &&
+                      selectedMainModels.map(model =>
+                        renderModelOption(
+                          selectedProviderRow,
+                          model,
+                          'main',
+                          mainModel?.provider === selectedProviderRow.slug && mainModel.model === model
+                        )
+                      )}
+                  </SelectContent>
+                </Select>
                 <Button
-                  disabled={!apiKeyDraft.trim() || activating}
-                  onClick={() => void activateApiKeyProvider()}
+                  disabled={
+                    !selectedProvider ||
+                    !selectedModel ||
+                    applying ||
+                    (!!selectedMainEligibility &&
+                      !selectedMainEligibility.eligible &&
+                      !selectedMainEligibility.grandfathered)
+                  }
+                  onClick={() => void applyMainModel()}
                   size="sm"
                 >
-                  {activating && <Loader2 className="size-3.5 animate-spin" />}
-                  {activating ? 'Activating...' : 'Activate'}
+                  {applying && <Loader2 className="size-3.5 animate-spin" />}
+                  {applying ? m.applying : t.common.apply}
                 </Button>
               </>
-            ) : (
-              <Button onClick={startProviderSetup} size="sm" variant="textStrong">
-                Set up {selectedProviderRow?.name ?? 'provider'}
-              </Button>
-            )
-          ) : (
-            <>
-              <Select onValueChange={setSelectedModel} value={selectedModel}>
-                <SelectTrigger className={cn('min-w-60', CONTROL_TEXT)}>
-                  <SelectValue placeholder={m.model} />
-                </SelectTrigger>
-                <SelectContent>
-                  {selectedProviderRow &&
-                    selectedMainModels.map(model =>
-                      renderModelOption(
-                        selectedProviderRow,
-                        model,
-                        'main',
-                        mainModel?.provider === selectedProviderRow.slug && mainModel.model === model
-                      )
-                    )}
-                </SelectContent>
-              </Select>
-              <Button
-                disabled={
-                  !selectedProvider ||
-                  !selectedModel ||
-                  applying ||
-                  (!!selectedMainEligibility &&
-                    !selectedMainEligibility.eligible &&
-                    !selectedMainEligibility.grandfathered)
-                }
-                onClick={() => void applyMainModel()}
-                size="sm"
-              >
-                {applying && <Loader2 className="size-3.5 animate-spin" />}
-                {applying ? m.applying : t.common.apply}
-              </Button>
-            </>
-          )}
-        </div>
+            )}
+          </div>
+        )}
         {providerReadiness && (
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span>{providerReadiness}</span>
@@ -1123,7 +1125,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
             )}
           </div>
         )}
-        {primaryError && <div className="mt-2 text-xs text-destructive">{primaryError}</div>}
+        {primaryError && (
+          <div className="mt-2 text-xs text-destructive" data-slot="primary-models-error" role="alert">
+            {primaryError}
+          </div>
+        )}
         {actionError && <div className="mt-2 text-xs text-destructive">{actionError}</div>}
         {selectionWarning && (
           <div className="mt-2 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
