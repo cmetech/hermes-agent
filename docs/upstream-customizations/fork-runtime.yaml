@@ -250,6 +250,7 @@ upstream_changes:
   - ConnectionWatchdogObservation
   - connectionObservation
   - ConnectionLifecyclePolicy
+  - connectionPreloadPolicy
   - resolveConnectionLifecyclePolicy
   - DesktopConnectionScopeInput
   - DesktopConnectionScope

@@ -18,7 +18,7 @@ import {
   sanitizeConnectionErrorMessage,
   subscribeConnectionLifecycle
 } from './connection-lifecycle-bridge'
-import { resolveConnectionLifecyclePolicy } from './connection-lifecycle-policy'
+import { connectionPreloadPolicy, resolveConnectionLifecyclePolicy } from './connection-lifecycle-policy'
 import { DEFAULT_CONNECT_TIMEOUT_MS as DEFAULT_GATEWAY_WS_CONNECT_TIMEOUT_MS } from './gateway-ws-probe'
 import { runPrimaryBackendStartup } from './primary-backend-startup'
 import {
@@ -496,6 +496,33 @@ describe('connection lifecycle IPC bridge', () => {
     await vi.advanceTimersByTimeAsync(policy.preloadWatchdogMs * 3)
     choice.resolve('continue-local')
     await expect(pending).resolves.toBe(ready)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('carries the preparation inspection budget through the serialized main-to-preload policy', async () => {
+    const wirePolicy = JSON.parse(JSON.stringify(connectionPreloadPolicy(resolveConnectionLifecyclePolicy({}))))
+    const scope = { connectionId: null, profile: 'work' }
+    const ready = { baseUrl: 'http://ready', token: 'safe' }
+    const result = deferred<{ ok: true; connection: TestConnection }>()
+    let inspections = 0
+
+    const pending = invokeWithConnectionWatchdog(() => result.promise, scope, Number(wirePolicy.preloadWatchdogMs), {
+      inspect: async () => {
+        if (++inspections > 1) {
+          await new Promise(resolve => setTimeout(resolve, 5))
+        }
+
+        return { attemptId: 1, elapsedMs: 0, phase: 'preparing', scope, state: 'starting' }
+      },
+      subscribe: () => () => {},
+      checkTimeoutMs: Number(wirePolicy.ipcDeliveryMarginMs)
+    })
+
+    void pending.catch(() => {})
+    await vi.advanceTimersByTimeAsync(15_010)
+    result.resolve({ ok: true, connection: ready })
+    await expect(pending).resolves.toBe(ready)
+    expect(inspections).toBeGreaterThan(1)
     expect(vi.getTimerCount()).toBe(0)
   })
 

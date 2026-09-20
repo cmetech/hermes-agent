@@ -24,6 +24,12 @@ export interface ConnectionLifecyclePolicy {
   remoteAttemptTimeoutMs: number
 }
 
+export function connectionPreloadPolicy(
+  policy: ConnectionLifecyclePolicy
+): Pick<ConnectionLifecyclePolicy, 'ipcDeliveryMarginMs' | 'preloadWatchdogMs'> {
+  return { ipcDeliveryMarginMs: policy.ipcDeliveryMarginMs, preloadWatchdogMs: policy.preloadWatchdogMs }
+}
+
 export function resolveConnectionLifecyclePolicy(
   env: NodeJS.ProcessEnv = process.env,
   _platform: NodeJS.Platform = process.platform

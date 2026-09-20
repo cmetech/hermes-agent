@@ -150,7 +150,7 @@ import {
   sanitizeConnectionErrorMessage,
   sanitizeConnectionLifecycleSnapshot
 } from './connection-lifecycle-bridge'
-import { resolveConnectionLifecyclePolicy } from './connection-lifecycle-policy'
+import { connectionPreloadPolicy, resolveConnectionLifecyclePolicy } from './connection-lifecycle-policy'
 import {
   backendScopeKey,
   backendScopePrefix,
@@ -15059,7 +15059,7 @@ ipcMain.handle('hermes:connection:inspect', async (_event, scope) =>
   sanitizeConnectionLifecycleSnapshot(desktopConnectionBridge.inspect(scope || {}))
 )
 ipcMain.on('hermes:connection:policy', event => {
-  event.returnValue = { preloadWatchdogMs: desktopConnectionPolicy.preloadWatchdogMs }
+  event.returnValue = connectionPreloadPolicy(desktopConnectionPolicy)
 })
 
 const windowConnectionRoutes = new WindowConnectionRouteRegistry()
