@@ -1,5 +1,37 @@
 # Windows Desktop validation evidence
 
+## Local integration approval (2026-09-20)
+
+The user explicitly approved merging into `base` and deferred macOS/Linux
+testing until after Windows UAT. This supersedes the earlier pre-merge platform
+gate in the plans; it does not claim those platforms have passed validation.
+The documented Windows baseline suite failures and parser limitation remain open.
+
+`base` was fast-forwarded from `56d05c885f2f11552ba369836b12f389b4fdbf11`
+to feature tip `111149a30c76fa7307b7b872676b8a876bca8e82`, retaining all 21
+feature commits and both customization ledger entries without conflicts.
+No remote push, upstream synchronization, branded-branch regeneration, installed
+application update, or release publication was performed.
+
+The prepared short-path worktree was retained for Windows UAT and diagnostics.
+Post-merge tests use its existing dependency installation after verifying that
+its Git tree is identical to the merged `base` tree. The primary checkout stays
+on `base`; only this integration receipt is amended after the test runs.
+
+Post-merge verification passed:
+
+- Nine focused Electron suites: 116 tests (lifecycle, primary startup, dial
+  claims, remote liveness, generation, generation integration, SSH bootstrap,
+  power-resume revalidation, and registry primary-profile scope).
+- Five focused UI suites: 75 tests (renderer connection client, route prefetch,
+  route loading boundary, Model Settings, and route performance).
+- Combined feature ledger diff coverage and expected commit subjects against
+  `56d05c885f..111149a30c`, plus `git diff --check`.
+
+The full suite was not repeated for this conflict-free fast-forward; its earlier
+Windows baseline failures remain documented below. These focused results are
+not a claim that the entire suite or macOS/Linux passed.
+
 ## Scope and environment
 
 Validation on the affected native Windows laptop, using Node 22.23.1 and
@@ -123,14 +155,15 @@ authoritative. Preparation pauses preserve the remaining active-work budget rath
 than renewing it. The tradeoffs are a health-check cost for remote reuse and an
 intentionally unbounded wait for the existing user/install/update authorities.
 
-Before integration: obtain macOS/Linux CI and resolve or formally accept the
+Original pre-integration gate (superseded by the approval above): obtain macOS/Linux CI and resolve or formally accept the
 documented pre-existing full-suite/platform-check limitations. The correction
 wave and local named-profile native acceptance are verified below.
 No native macOS/Linux run or real remote OAuth/SSH run has been
 performed here. Deferred optional-response and cross-scope behavior has unit-test
 coverage, but no live throttled-backend acceptance was performed at this revision.
 
-The branch is not yet merged into `base` or the branded branch.
+The feature is now merged locally into `base` as recorded above; branded branches
+and the installed application have not been updated.
 
 ## Correction-wave native acceptance
 
