@@ -105,6 +105,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
     # Gateway restart path (called after a successful update).
     monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a: None)
+    # This test exercises update ordering, not module invalidation. Keep the
+    # patched gateway-discovery boundary alive through the restart phase.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     # Keep the (now surfaced — #78574) gateway auto-restart phase away from
     # this machine's real gateways: discovery returns nothing, systemd is
     # unsupported, so the phase is a clean no-op for both snapshots.
@@ -125,12 +128,20 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
     _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    from hermes_cli import update_cmd
+    events = []
+    monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a: events.append("clear") or 0)
+    monkeypatch.setattr(hermes_main, "_refresh_active_memory_provider_dependencies", lambda: events.append("repair"))
+    monkeypatch.setattr(update_cmd, "_precompile_updated_runtime", lambda: events.append("prepare"))
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: events.append("node") or [])
 
     hermes_main.cmd_update(args)  # completes normally (no SystemExit)
 
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
     assert "Code did not move" not in out
+    assert events.count("prepare") == 1
+    assert max(i for i, event in enumerate(events) if event in {"clear", "repair"}) < events.index("prepare") < events.index("node")
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):

@@ -88,6 +88,26 @@ _UPDATE_RUNTIME_RELOAD_MODULES = (
     "tools.lazy_deps",
 )
 
+
+def _precompile_updated_runtime(*, only_if_needed: bool = False) -> None:
+    """Optional preparation with the new source and installation interpreter."""
+    script = _m().PROJECT_ROOT / "hermes_cli" / "bytecode_cache.py"
+    if not script.is_file():
+        return  # Older pinned releases do not have this optional helper.
+    print("  Preparing Python bytecode for faster startup...")
+    try:
+        installed_python = venv_python_path(_m().PROJECT_ROOT / "venv", windows=_m()._is_windows())
+        interpreter = str(installed_python) if installed_python.is_file() else sys.executable
+        result = subprocess.run(
+            [interpreter, str(script), *(["--if-needed"] if only_if_needed else [])], cwd=_m().PROJECT_ROOT,
+            env=_uv_subprocess_env(), timeout=180, check=False,
+        )
+        if result.returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Python bytecode preparation failed: %s", exc)
+    print("  Warning: bytecode preparation incomplete; Python will compile on demand.")
+
 #: Package prefixes whose cached modules become stale the moment the checkout
 #: changes under this process. Purged (not reloaded) by
 #: ``_purge_stale_hermes_modules`` so any LATER import chain resolves against
@@ -1731,7 +1751,13 @@ def _zip_overlay_block_reason(
 _ZIP_STAGING_ARTIFACT_SUFFIXES = (".hermes-update-staging", ".hermes-update-old")
 # Single source of truth for the top-level entries the ZIP swap preserves —
 # consumed by both the dirty-tree filter below and _update_via_zip's swap loop.
-_ZIP_PRESERVED_TOP_LEVEL = {"venv", "node_modules", ".git", ".env"}
+_ZIP_PRESERVED_TOP_LEVEL = {
+    "venv", "node_modules", ".git", ".env",
+    # Installer/updater-owned state is preserved, never mistaken for user dirt.
+    ".bytecode-prepared", ".bytecode-fingerprint", ".bytecode-fingerprint.tmp",
+    ".hermes-bootstrap-complete", ".update-incomplete", ".update-incomplete.lock",
+    ".lazy-refresh-incomplete",
+}
 
 
 def _is_zip_preserved_entry_status_line(line: str) -> bool:
@@ -2207,6 +2233,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         print("  Re-run `hermes update` to complete it.")
         _m().sys.exit(1)
 
+    # All Python replacement/repair and stale-cache cleanup is complete.
+    _precompile_updated_runtime()
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
     desktop_build_ok = _rebuild_desktop_after_update(
@@ -4028,6 +4056,7 @@ def _repair_node_deps_on_current_checkout(
     the web toolchain never landed), so this is a cheap no-op on healthy
     installs and a real repair after a failed one.
     """
+    _precompile_updated_runtime(only_if_needed=True)
     node_failures = _update_node_dependencies()
     if node_failures:
         print(f"  ⚠ Node.js refresh failed for: {', '.join(node_failures)}")
@@ -8650,6 +8679,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
                     print("✓ Dependencies repaired!")
+                    _precompile_updated_runtime()
                     _check_and_apply_config_migration(
                         assume_yes=assume_yes,
                         gateway_mode=gateway_mode,
@@ -9117,6 +9147,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("    Run `hermes update` again — if it persists, reinstall:")
             print("    https://hermes-agent.nousresearch.com")
 
+        # Run the freshly pulled helper, not modules held by this old updater.
+        _precompile_updated_runtime()
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 

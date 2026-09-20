@@ -1212,6 +1212,7 @@ class TestNodeRuntimeNpmResolution:
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
         desktop_builds = []
+        preparation_events = []
 
         def rebuild_desktop(*_args, **_kwargs):
             desktop_builds.append(not packaged_exe.exists())
@@ -1231,13 +1232,14 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "npm.cmd")
         monkeypatch.setattr(hm, "_desktop_build_needed", lambda *_args, **_kwargs: True)
         monkeypatch.setattr(hm, "_run_logged_subprocess", rebuild_desktop)
-        monkeypatch.setattr(hm, "_clear_bytecode_cache", lambda *_args: 0)
+        monkeypatch.setattr(hm, "_clear_bytecode_cache", lambda *_args: preparation_events.append("clear") or 0)
         monkeypatch.setattr(hm, "_record_bytecode_fingerprint", lambda: None)
         monkeypatch.setattr(hm, "_refresh_bootstrap_cache_scripts", lambda _branch: None)
         monkeypatch.setattr(
             hm, "_install_python_dependencies_with_optional_fallback", lambda *_args, **_kwargs: None
         )
-        monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: None)
+        monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: preparation_events.append("repair"))
+        monkeypatch.setattr(update_cmd, "_precompile_updated_runtime", lambda: preparation_events.append("prepare"))
         monkeypatch.setattr(hm, "_build_web_ui", lambda *_args: None)
         monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
         monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
@@ -1246,7 +1248,7 @@ class TestNodeRuntimeNpmResolution:
             "_validate_critical_modules_import",
             lambda *_args: (True, None, None),
         )
-        monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+        monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: preparation_events.append("node") or [])
         monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
         monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda _failures: None)
@@ -1281,6 +1283,8 @@ class TestNodeRuntimeNpmResolution:
         assert desktop_builds == [False]
         assert packaged_exe.exists()
         assert packaged_exe.read_bytes() == b"desktop"
+        assert preparation_events.count("prepare") == 1
+        assert max(i for i, event in enumerate(preparation_events) if event in {"clear", "repair"}) < preparation_events.index("prepare") < preparation_events.index("node")
 
 
 class TestUpdateNodeDependencies:

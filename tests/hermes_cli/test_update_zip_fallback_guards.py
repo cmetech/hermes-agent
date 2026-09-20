@@ -272,7 +272,12 @@ def test_zip_overlay_flag_is_valid_against_real_git(tmp_path):
     ignored user files.
     """
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*.local\nvenv/\n")
+    markers = (
+        ".bytecode-prepared", ".bytecode-fingerprint", ".bytecode-fingerprint.tmp",
+        ".hermes-bootstrap-complete", ".update-incomplete", ".update-incomplete.lock",
+        ".lazy-refresh-incomplete",
+    )
+    (tmp_path / ".gitignore").write_text("*.local\nvenv/\n" + "\n".join(markers) + "\n")
     subprocess.run(
         ["git", "-C", str(tmp_path), "add", ".gitignore"], check=True
     )
@@ -286,6 +291,9 @@ def test_zip_overlay_flag_is_valid_against_real_git(tmp_path):
     )
     # Clean tree: guard must pass (flag valid, no false refusal).
     assert update_cmd._zip_overlay_block_reason(tmp_path) is None
+    for marker in markers:
+        (tmp_path / marker).write_text("runtime-owned state")
+        assert update_cmd._zip_overlay_block_reason(tmp_path) is None, marker
     # Ignored user file: guard must block.
     (tmp_path / "data.local").write_text("x")
     reason = update_cmd._zip_overlay_block_reason(tmp_path)
