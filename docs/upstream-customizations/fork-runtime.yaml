@@ -192,33 +192,128 @@ upstream_changes:
     session during resume/focus routing.
   last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 
-- id: desktop-bootstrap-aware-connection-deadline
+- id: desktop-electron-owned-connection-lifecycle
   change_class: desktop-startup-correctness
   owner: downstream-desktop-runtime
   overlap_policy: any_owned_file
   files:
+  - apps/desktop/electron/backend-dial-claim.test.ts
+  - apps/desktop/electron/connection-lifecycle-bridge.ts
+  - apps/desktop/electron/connection-lifecycle-policy.ts
+  - apps/desktop/electron/connection-lifecycle.test.ts
+  - apps/desktop/electron/connection-lifecycle.ts
+  - apps/desktop/electron/main.ts
+  - apps/desktop/electron/preload.ts
+  - apps/desktop/src/api/plugins.test.ts
+  - apps/desktop/src/api/plugins.ts
   - apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
   - apps/desktop/src/app/gateway/hooks/use-gateway-boot.test.tsx
+  - apps/desktop/src/app/gateway/hooks/use-gateway-request.ts
+  - apps/desktop/src/app/workflows/marketplace/supervisor-provider.tsx
+  - apps/desktop/src/global.d.ts
+  - apps/desktop/src/lib/desktop-connection-performance.test.ts
+  - apps/desktop/src/lib/desktop-connection-performance.ts
+  - apps/desktop/src/lib/desktop-connection.test.ts
+  - apps/desktop/src/lib/desktop-connection.ts
+  - apps/desktop/src/lib/voice-playback.routing.test.ts
+  - apps/desktop/src/lib/voice-playback.ts
+  - apps/desktop/src/lib/with-timeout.ts
+  - apps/desktop/src/store/connections.test.ts
+  - apps/desktop/src/store/connections.ts
+  - apps/desktop/src/store/gateway.test.ts
+  - apps/desktop/src/store/gateway.ts
+  - apps/desktop/src/store/profile.ts
+  - apps/desktop/src/store/workflow-marketplace-supervisor.test.ts
   owned_symbols:
+  - ConnectionLifecyclePolicy
+  - resolveConnectionLifecyclePolicy
+  - DesktopConnectionScopeInput
+  - DesktopConnectionScope
+  - DesktopConnectionPhase
+  - DesktopConnectionState
+  - DesktopConnectionErrorCode
+  - DesktopConnectionErrorData
+  - DesktopConnectionSnapshot
+  - ConnectionLifecycleTerminalLog
+  - ConnectionLifecycleError
+  - normalizeDesktopConnectionScope
+  - desktopConnectionScopeKey
+  - ConnectionLifecycleCoordinator
+  - CONNECTION_LIFECYCLE_CHANNEL
+  - ConnectionEnsureEnvelope
+  - PublicConnectionLifecycleSnapshot
+  - sanitizeConnectionErrorMessage
+  - normalizeMainConnectionScope
+  - createConnectionLifecycleBridge
+  - sanitizeConnectionLifecycleSnapshot
+  - decodeConnectionLifecycleSnapshot
+  - subscribeConnectionLifecycle
+  - invokeWithConnectionWatchdog
+  - invokeConnectionIpcWithWatchdog
+  - desktopConnectionPolicy
+  - desktopConnectionCoordinator
+  - desktopConnectionBridge
+  - ensureDesktopConnection
+  - invalidateDesktopConnection
+  - revalidateDesktopConnection
+  - inspectDesktopConnection
+  - DesktopConnectionLifecycleError
+  - DesktopConnectionLifecycleSnapshot
+  - DesktopConnectionMeasure
+  - DesktopConnectionMeasureOutcome
+  - beginDesktopConnectionMeasure
   - useGatewayBoot
+  - activeConnection
+  - resolveSpeakStreamUrl
+  - startMainWindowMarketplaceSupervision
+  - openSecondary
+  - ensureGatewayProfile
+  - ensureGatewayAgent
+  - selectConnection
+  owned_invariants:
+  - Electron owns one bounded connection attempt for each normalized connection/profile scope; renderer callers join it and never impose an earlier backend-start deadline.
+  - Inspection is side-effect free, lifecycle events never renew a deadline, and typed terminal results release ownership for retry.
+  - Profile and source activation preserve the previous usable context until the target backend and gateway are ready, then publish through existing generation and abort fences.
+  - Performance entries stay local and contain only bounded operation, sequence, outcome, and duration data.
   tests:
+  - apps/desktop/electron/connection-lifecycle.test.ts
+  - apps/desktop/electron/backend-dial-claim.test.ts
+  - apps/desktop/electron/backend-ready.test.ts
+  - apps/desktop/electron/backend-health.test.ts
+  - apps/desktop/electron/backend-connection-state.test.ts
+  - apps/desktop/src/lib/desktop-connection.test.ts
+  - apps/desktop/src/lib/desktop-connection-performance.test.ts
   - apps/desktop/src/app/gateway/hooks/use-gateway-boot.test.tsx
-  expected_commit_subject: 'fix(desktop): exclude active bootstrap from connection deadline'
+  - apps/desktop/src/app/gateway/hooks/use-gateway-request.test.ts
+  - apps/desktop/src/store/gateway.test.ts
+  - apps/desktop/src/store/gateway-shared-remote.test.ts
+  - apps/desktop/src/store/gateway-connection-lifecycle.test.ts
+  - apps/desktop/src/store/profile.test.ts
+  - apps/desktop/src/store/profile-switch-failure.test.ts
+  - apps/desktop/src/store/profile-select-source.test.ts
+  - apps/desktop/src/store/connections.test.ts
+  - apps/desktop/src/api/plugins.test.ts
+  - apps/desktop/src/lib/voice-playback.routing.test.ts
+  - apps/desktop/src/plugin-socket-scope.test.ts
+  - apps/desktop/src/store/workflow-marketplace-supervisor.test.ts
+  expected_commit_subject: 'feat(desktop): define authoritative connection lifecycle'
   upstream_candidate: true
   merge_guidance: >-
-    UNION on merge. Keep upstream's bounded initial getConnection() wait, but
-    renew that same promise's 45-second renderer deadline while Electron reports
-    an active first-launch or release-update bootstrap. When bootstrap completes
-    successfully after the connection attempt began, grant one post-bootstrap
-    deadline even if active already flipped false; never grant twice for the
-    same completedAt timestamp. Never issue another getConnection() to extend
-    the wait: it could duplicate backend startup. A genuinely wedged connection
-    must still fail after the bounded completion grace.
+    UNION on merge. Preserve one Electron-owned, scope-keyed lifecycle for local,
+    remote, initial, reconnect, profile, and source dials. Renderer consumers
+    join the shared attempt and may cache only ready generation-fenced
+    descriptors; they must not restore shorter 20/45-second backend-start
+    timers. Keep compatibility bridge aliases delegated to the same authority,
+    the strictly larger preload watchdog, typed credential-free errors, and the
+    existing two-phase activation fences. Preserve the inner WebSocket and
+    post-readiness operation bounds.
   removal_condition: >-
-    Remove when upstream excludes active and just-completed bootstrap handoff
-    time from its initial renderer connection deadline without weakening the
-    non-bootstrap hang bound, and the focused useGatewayBoot regressions pass
-    unchanged.
+    Remove only when upstream provides one equivalent Electron-owned scoped
+    lifecycle across every Desktop dial, including coalesced slow Windows cold
+    starts, bounded genuine hangs, side-effect-free inspection, typed retries,
+    scope/generation fencing, and two-phase profile/source switching. The
+    focused slow-start, bounded-hang, switching, and platform-policy tests must
+    pass without downstream behavior shims.
   last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 
 - id: desktop-skills-hub-suppression

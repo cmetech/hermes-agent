@@ -151,7 +151,7 @@ dependency view disappears with the detached worktree on every exit path.
 - `desktop-loader.yaml` — non-blocking declarative Desktop loader animation.
 - `desktop-test-infra.yaml` — Desktop test and dependency-view infrastructure.
 - `environment-runtime.yaml` — authenticated shell snapshots and remote-shell compatibility.
-- `fork-runtime.yaml` — shared profile, branding, Desktop, gateway, and service-runtime behavior.
+- `fork-runtime.yaml` — shared profile, branding, Electron-owned Desktop connection lifecycle, gateway, and service-runtime behavior.
 - `gateway-autostart.yaml` — Desktop gateway automation startup and visibility.
 - `kanban-attachment-access.yaml` — bounded kanban attachment access.
 - `platform-test-skips.yaml` — explicit platform-specific test exclusions.
