@@ -15,6 +15,7 @@ the working winpty usage already shipping in ``tools/process_registry.py``.
 from __future__ import annotations
 
 import os
+import socket
 import sys
 import time
 from typing import Optional, Sequence
@@ -36,6 +37,8 @@ __all__ = ["WinPtyBridge", "PtyUnavailableError"]
 _MIN_DIMENSION = 1
 _MAX_COLS = 2000
 _MAX_ROWS = 1000
+_EXIT_DRAIN_GRACE_SECONDS = 2.0
+_PYWINPTY_IDLE_SENTINEL = b"0011Ignore"
 
 
 def _clamp(value: int, maximum: int) -> int:
@@ -65,6 +68,7 @@ class WinPtyBridge:
     def __init__(self, proc: "PtyProcess") -> None:  # type: ignore[name-defined]
         self._proc = proc
         self._closed = False
+        self._dead_quiet_since: Optional[float] = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -120,6 +124,20 @@ class WinPtyBridge:
 
     # -- I/O --------------------------------------------------------------
 
+    def _idle_read_result(self) -> Optional[bytes]:
+        """Return bounded idle/EOF state without dropping late ConPTY output."""
+        if self.is_alive():
+            self._dead_quiet_since = None
+            return b""
+
+        now = time.monotonic()
+        if self._dead_quiet_since is None:
+            self._dead_quiet_since = now
+            return b""
+        if now - self._dead_quiet_since >= _EXIT_DRAIN_GRACE_SECONDS:
+            return None
+        return b""
+
     def read(self, timeout: float = 0.2) -> Optional[bytes]:
         """Up to 64 KiB of child output.
 
@@ -128,24 +146,53 @@ class WinPtyBridge:
         """
         if self._closed:
             return None
+        fileobj = getattr(self._proc, "fileobj", None)
+        if fileobj is None:
+            # Supported pywinpty releases expose the socket as ``fileobj``.
+            # Keep a compatibility fallback for alternate implementations,
+            # though only their native read semantics can be offered here.
+            try:
+                data = self._proc.read(65536)
+            except EOFError:
+                return None
+            except Exception:
+                return None
+            encoded = data if isinstance(data, bytes) else data.encode("utf-8")
+            if not encoded:
+                return self._idle_read_result()
+            self._dead_quiet_since = None
+            return encoded
+
+        previous_timeout = None
         try:
-            data = self._proc.read(65536)  # pywinpty returns str
-        except EOFError:
-            return None
+            # Read the bridge socket directly. ``PtyProcess.read`` decodes UTF-8
+            # internally and may consume a partial sequence before a follow-up
+            # recv times out, losing those bytes. The dashboard/xterm contract
+            # is raw bytes, so direct recv is both bounded and lossless.
+            previous_timeout = fileobj.gettimeout()
+            fileobj.settimeout(max(float(timeout), 0.0))
+            data = fileobj.recv(65536)
+        except (socket.timeout, TimeoutError):
+            # Process exit can precede the ConPTY forwarding thread's final
+            # socket write. Wait for a quiet drain grace before synthesizing
+            # EOF for pywinpty versions whose forwarding socket never closes.
+            return self._idle_read_result()
         except Exception:
             return None
+        finally:
+            try:
+                fileobj.settimeout(previous_timeout)
+            except (OSError, ValueError):
+                pass
         if not data:
-            # No fd to select on; poll politely so the executor thread
-            # doesn't pin a core while the TUI is idle.
-            time.sleep(min(timeout, 0.02))
-            return b""
-        if isinstance(data, bytes):
-            return data
-        # NOTE: pywinpty decodes internally, so a multibyte UTF-8 sequence
-        # can in theory split across reads. xterm.js tolerates the rare
-        # replacement char; this is the one fidelity tradeoff vs the POSIX
-        # raw-fd path.
-        return data.encode("utf-8", errors="replace")
+            return None
+        # pywinpty writes this private marker whenever its PTY read returns no
+        # data. TCP may coalesce several markers, so remove every complete one.
+        data = data.replace(_PYWINPTY_IDLE_SENTINEL, b"")
+        if not data:
+            return self._idle_read_result()
+        self._dead_quiet_since = None
+        return data
 
     def write(self, data: bytes) -> None:
         if self._closed or not data:

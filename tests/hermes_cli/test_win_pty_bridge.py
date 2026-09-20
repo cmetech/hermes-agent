@@ -20,6 +20,8 @@ import time
 
 import pytest
 
+import hermes_cli.win_pty_bridge as win_pty_bridge
+
 # WinPtyBridge can be imported on every platform — ``is_available`` just
 # returns False when pywinpty isn't usable.  Importing the module itself
 # must never raise, otherwise the web_server import branch becomes a trap.
@@ -75,6 +77,47 @@ class TestWinPtyBridgeUnavailable:
         with pytest.raises(PtyUnavailableError):
             WinPtyBridge.spawn(["true"])
 
+    def test_dead_child_becomes_eof_after_quiet_drain_grace(self, monkeypatch):
+        class FakeClock:
+            now = 100.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        class FakeSocket:
+            def __init__(self):
+                self.timeout = None
+
+            def gettimeout(self):
+                return self.timeout
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def recv(self, _size):
+                return b"0011Ignore"
+
+        class DeadProcess:
+            fileobj = FakeSocket()
+            pid = 123
+
+            @staticmethod
+            def isalive():
+                return False
+
+        monkeypatch.setattr(win_pty_bridge, "time", FakeClock, raising=False)
+        monkeypatch.setattr(
+            win_pty_bridge, "_EXIT_DRAIN_GRACE_SECONDS", 2.0, raising=False
+        )
+        bridge = WinPtyBridge(DeadProcess())
+
+        assert bridge.read(timeout=0) == b""
+        FakeClock.now += 1.9
+        assert bridge.read(timeout=0) == b""
+        FakeClock.now += 0.2
+        assert bridge.read(timeout=0) is None
+
 
 # ---------------------------------------------------------------------------
 # Windows-only end-to-end behaviour
@@ -101,6 +144,22 @@ class TestWinPtyBridgeSpawn:
 @pytest.mark.windows_only
 class TestWinPtyBridgeIO:
 
+    def test_read_timeout_is_bounded_for_silent_child(self):
+        bridge = WinPtyBridge.spawn(
+            [sys.executable, "-c", "import time; time.sleep(2.0)"]
+        )
+        try:
+            # ConPTY emits terminal-mode setup bytes as soon as it starts.
+            # Drain those so this call measures an actually quiet PTY.
+            bridge.read(timeout=0.5)
+            started = time.monotonic()
+            chunk = bridge.read(timeout=0.1)
+            elapsed = time.monotonic() - started
+            assert chunk == b""
+            assert elapsed < 1.0, f"read(timeout=0.1) blocked for {elapsed:.2f}s"
+        finally:
+            bridge.close()
+
     def test_write_sends_to_child_stdin(self):
         # python -c reads stdin, echoes a marker, exits.  More reliable than
         # ``cat`` (not on Windows) and doesn't depend on a particular shell.
@@ -123,16 +182,30 @@ class TestWinPtyBridgeIO:
         bridge = WinPtyBridge.spawn(["cmd.exe", "/c", "echo done"])
         try:
             _read_until(bridge, b"done")
-            # Give the child a beat to exit, then drain until EOF.
-            deadline = time.monotonic() + 5.0
-            while bridge.is_alive() and time.monotonic() < deadline:
-                bridge.read(timeout=0.1)
+            # Give the child time to exit, then drain until EOF. ConPTY can
+            # report process exit just before its output socket reports EOF.
+            deadline = time.monotonic() + 30.0
             got_none = False
-            for _ in range(20):
+            while time.monotonic() < deadline:
                 if bridge.read(timeout=0.1) is None:
                     got_none = True
                     break
             assert got_none, "WinPtyBridge.read did not return None after child EOF"
+        finally:
+            bridge.close()
+
+    def test_final_output_is_drained_after_process_exit(self):
+        payload_size = 128 * 1024
+        script = (
+            "import sys; "
+            f"sys.stdout.buffer.write(b'x' * {payload_size} + b'FINAL-TAIL'); "
+            "sys.stdout.buffer.flush()"
+        )
+        bridge = WinPtyBridge.spawn([sys.executable, "-c", script])
+        try:
+            output = _read_until(bridge, b"FINAL-TAIL", timeout=30.0)
+            assert b"FINAL-TAIL" in output
+            assert output.count(b"x") >= payload_size
         finally:
             bridge.close()
 
@@ -219,7 +292,10 @@ class TestWinPtyBridgeEnv:
         try:
             # Path is case-insensitive on Windows; compare lowercased.
             needle_resolved = str(tmp_path.resolve()).lower().encode()
-            deadline = time.monotonic() + 5.0
+            # Starting a Python process behind ConPTY can take several seconds
+            # under the Windows lane's normal file-level concurrency.  The
+            # assertion is about cwd propagation, not interpreter startup.
+            deadline = time.monotonic() + 30.0
             buf = bytearray()
             while time.monotonic() < deadline:
                 chunk = bridge.read(timeout=0.2)
@@ -248,4 +324,3 @@ class TestWinPtyBridgeEnv:
             assert b"pty-env-works" in output
         finally:
             bridge.close()
-

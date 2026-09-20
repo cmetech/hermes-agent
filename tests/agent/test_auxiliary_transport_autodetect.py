@@ -129,6 +129,10 @@ def test_resolve_provider_client_kimi_coding_wraps_anthropic(monkeypatch, tmp_pa
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # sk-kimi- prefix triggers /coding endpoint auto-detection
     monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-faketesttoken123")
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client",
+        lambda *args, **kwargs: MagicMock(),
+    )
 
     client, model = resolve_provider_client("kimi-coding", "kimi-for-coding")
     assert client is not None, "Should resolve a client"

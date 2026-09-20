@@ -303,33 +303,43 @@ def _path_from_file_uri(uri: str) -> Path | None:
     """Convert local file URIs/paths from ACP clients into a readable Path.
 
     Zed may send POSIX file URIs from Linux/WSL workspaces or Windows-ish paths
-    when launched through wsl.exe. Translate the common Windows drive form to
-    /mnt/<drive>/... so Hermes running in WSL can read it.
+    when launched through wsl.exe. Keep drive paths native on Windows and only
+    translate them to /mnt/<drive>/... when Hermes is actually running in WSL.
     """
     raw = (uri or "").strip()
     if not raw:
         return None
 
-    parsed = urlparse(raw)
-    if parsed.scheme and parsed.scheme != "file":
-        return None
-
-    if parsed.scheme == "file":
-        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
-            return None
-        path_text = unquote(parsed.path or "")
+    # urlparse treats the drive letter in C:\path as a URI scheme, so identify
+    # native drive paths before parsing genuine URIs.
+    if len(raw) >= 3 and raw[1] == ":" and raw[0].isalpha() and raw[2] in "/\\":
+        path_text = raw
     else:
-        path_text = unquote(raw)
+        parsed = urlparse(raw)
+        if parsed.scheme and parsed.scheme != "file":
+            return None
+
+        if parsed.scheme == "file":
+            if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+                return None
+            path_text = unquote(parsed.path or "")
+        else:
+            # Scheme-less input is already a filesystem path. Percent escapes
+            # only have URI semantics inside ``file:`` URIs; decoding them here
+            # changes legitimate POSIX, UNC, and extended Windows filenames.
+            path_text = raw
 
     # file:///C:/Users/... or C:\Users\...
     if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
-        drive = path_text[1].lower()
-        rest = path_text[3:].lstrip("/\\").replace("\\", "/")
-        return Path("/mnt") / drive / rest
-    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
-        drive = path_text[0].lower()
-        rest = path_text[2:].lstrip("/\\").replace("\\", "/")
-        return Path("/mnt") / drive / rest
+        path_text = path_text[1:]
+    if len(path_text) >= 3 and path_text[1] == ":" and path_text[0].isalpha() and path_text[2] in "/\\":
+        if os.name == "nt":
+            return Path(path_text)
+
+        from hermes_constants import is_wsl, windows_path_to_wsl
+
+        translated = windows_path_to_wsl(path_text) if is_wsl() else None
+        return Path(translated or path_text)
 
     return Path(path_text)
 

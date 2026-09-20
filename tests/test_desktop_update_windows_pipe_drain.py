@@ -174,11 +174,13 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # TEMP; point that at tmp_path so the test leaves nothing behind.
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
-        # Keep the test quick. The grace is what the fix bounds; the hold is
-        # how long the leaking grandchild lives. hold >> grace is what makes a
-        # regression measurable rather than lucky.
+        # Keep the test quick without making process startup part of the
+        # assertion.  PowerShell startup can exceed three seconds on loaded or
+        # antivirus-scanned Windows hosts, so leave enough room for each helper
+        # to emit its first progress while keeping the intentional 45-second
+        # stall comfortably beyond the watchdog.
         "HERMES_UPDATE_PIPE_DRAIN_SECONDS": "3",
-        "HERMES_UPDATE_STEP_IDLE_SECONDS": "3",
+        "HERMES_UPDATE_STEP_IDLE_SECONDS": "15",
         "HERMES_SELFTEST_HOLD_SECONDS": "45",
     }
 
