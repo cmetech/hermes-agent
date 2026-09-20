@@ -310,11 +310,14 @@ describe('ModelSettings', () => {
 
   it('starts secondary reads immediately but does not publish incomplete primary controls', async () => {
     const modelInfo = deferred<{ model: string; provider: string }>()
+
     const auxiliaryModels = deferred<{
       main: { model: string; provider: string }
       tasks: { base_url: string; model: string; provider: string; task: string }[]
     }>()
+
     const moaModels = deferred<null>()
+
     getGlobalModelInfo.mockReturnValueOnce(modelInfo.promise)
     getAuxiliaryModels.mockReturnValueOnce(auxiliaryModels.promise)
     getMoaModels.mockReturnValueOnce(moaModels.promise)
@@ -816,7 +819,9 @@ describe('ModelSettings', () => {
       main: { model: string; provider: string }
       tasks: { base_url: string; model: string; provider: string; task: string }[]
     }>()
+
     const oldMoa = deferred<ReturnType<typeof namedMoaPreset>>()
+
     getAuxiliaryModels.mockReturnValueOnce(oldAuxiliary.promise).mockResolvedValueOnce({
       main: { provider: 'nous', model: 'hermes-4' },
       tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
