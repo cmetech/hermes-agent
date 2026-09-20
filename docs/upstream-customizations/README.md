@@ -149,6 +149,7 @@ dependency view disappears with the detached worktree on every exit path.
 - `browser-profiles.yaml` — enrolled browser profile trust and launch seams.
 - `credential-storage.yaml` — plugin-secret authority, migration, atomic publication, and ACL boundaries.
 - `desktop-loader.yaml` — non-blocking declarative Desktop loader animation.
+- `desktop-page-responsiveness.yaml` — visible lazy navigation, boot-gated prefetch, scoped caches, progressive settings, and local route timing.
 - `desktop-test-infra.yaml` — Desktop test and dependency-view infrastructure.
 - `environment-runtime.yaml` — authenticated shell snapshots and remote-shell compatibility.
 - `fork-runtime.yaml` — shared profile, branding, Electron-owned Desktop connection lifecycle, gateway, and service-runtime behavior.
