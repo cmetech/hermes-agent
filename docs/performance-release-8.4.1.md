@@ -74,6 +74,11 @@ manifests, with upstream baselines unchanged.
 - Existing Windows downloader scripts query `/releases`, including prereleases,
   and choose the first matching brand/architecture EXE. They do not use the
   strictly stable `/releases/latest` endpoint. No installer changes were made.
+- Desktop focused verification: 132 Electron connection/backend tests, 159
+  remote/generation tests, 384 renderer tests and 53 native Node tests passed
+  (728 total); three opt-in live-remote tests skipped. Desktop renderer,
+  Electron and E2E TypeScript checks passed. Dependency install used Node
+  22.23.1 and the committed lockfile without version changes.
 
 Desktop/build verification and publication are still in progress. Exact final
 commits, build run IDs and release assets will be recorded after completion.
