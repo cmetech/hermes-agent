@@ -2,19 +2,43 @@
 
 import hashlib
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
 import pytest
 
-from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli.main import cmd_update
 
 
-def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
-    """Build a side_effect function for subprocess.run that simulates git commands."""
+def _make_run_side_effect(
+    branch="main", verify_ok=True, commit_count="0", *,
+    checkout_fails=False, track_fails=False,
+):
+    """Simulate Git state, including the branch and HEAD after a successful update."""
+    head_sha = "a" * 40
 
     def side_effect(cmd, **kwargs):
+        nonlocal branch, head_sha
         joined = " ".join(str(c) for c in cmd)
+
+        if "checkout" in cmd:
+            checkout_args = cmd[cmd.index("checkout") + 1:]
+            tracking = checkout_args[0] == "-B"
+            target = checkout_args[1] if tracking else checkout_args[0]
+            failed = track_fails if tracking else checkout_fails
+            if not failed:
+                branch = target
+            return subprocess.CompletedProcess(
+                cmd, 128 if failed else 0, stdout="",
+                stderr=f"error: pathspec '{target}' did not match\n" if failed else "",
+            )
+
+        if "merge" in cmd and "--ff-only" in cmd and int(commit_count):
+            head_sha = "b" * 40
+
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{head_sha}\n", stderr="")
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -72,21 +96,62 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
-    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+def _isolate_update_runtime(tmp_path, monkeypatch):
+    """Exercise update decisions without touching the checkout or host fleet.
 
-    The restart phase used to swallow every exception at debug level, so these
-    end-to-end tests never noticed it touching real gateway discovery. Since
-    the phase is surfaced (#78574: an aborted restart now fails the update),
-    an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
-    conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    Runtime reloads/purges would discard the mocked gateway boundaries. These
+    tests cover branch/config/dependency decisions; lifecycle and module
+    refresh behavior have dedicated integration tests.
     """
-    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
-         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
-        yield
+    from hermes_cli import main as hm
+    from hermes_cli import update_cmd
+
+    project_root = tmp_path / "update-checkout"
+    (project_root / ".git").mkdir(parents=True)
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    hermes_home.mkdir(parents=True)
+    monkeypatch.setattr(hm, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    for name in (
+        "_run_pre_update_backup",
+        "_pause_windows_gateways_for_update",
+        "_resume_windows_gateways_after_update",
+        "_finish_dashboard_update_cleanup",
+        "_reload_updated_runtime_modules",
+        "_purge_stale_hermes_modules",
+        "_record_bytecode_fingerprint",
+        "_refresh_bootstrap_cache_scripts",
+    ):
+        monkeypatch.setattr(hm, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(hm, "_clear_bytecode_cache", lambda *args: 0)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_detect_concurrent_hermes_instances", lambda *args: [])
+    monkeypatch.setattr(hm, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hm, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_reload_config_modules", lambda: None)
+    monkeypatch.setattr(update_cmd, "_reload_process_scan_modules", lambda: None)
+    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *args, **kwargs: None)
+    monkeypatch.setattr(update_cmd, "_venv_core_imports_healthy", lambda: (True, ""))
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **kwargs: [])
+    monkeypatch.setattr("hermes_cli.gateway.supports_systemd_services", lambda: False)
+    monkeypatch.setattr("hermes_cli.gateway.find_profile_gateway_processes", lambda **kwargs: [])
+    monkeypatch.setattr("hermes_cli.gateway._get_service_pids", lambda *args, **kwargs: set())
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.collect_runtime_inventory",
+        lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+    )
+
+    class UnexpectedPopen(subprocess.Popen):
+        # Preserve Popen's generic/type behavior for imports using Popen[bytes].
+        # Individual npm tests replace this with their explicit process double.
+        def __init__(self, *args, **kwargs):
+            pytest.fail(f"Unexpected subprocess.Popen in updater test: {args!r}")
+
+    monkeypatch.setattr(subprocess, "Popen", UnexpectedPopen)
 
 
 class TestCmdUpdateNpmLockfileCache:
@@ -153,6 +218,7 @@ class TestCmdUpdateNpmLockfileCache:
         monkeypatch.setattr(
             hermes_constants, "find_node_executable", lambda _name: "/usr/bin/npm"
         )
+        monkeypatch.setattr("tools.browser_tool.warm_agent_browser_npx_cache", lambda: True)
 
         cache_roots = []
         with patch.object(
@@ -195,7 +261,7 @@ class TestCmdUpdateTermuxUvBootstrap:
             "--only-binary",
             ":all:",
         ]
-        assert mock_run.call_args.kwargs["cwd"] == PROJECT_ROOT
+        assert mock_run.call_args.kwargs["cwd"] == hm.PROJECT_ROOT
         assert mock_run.call_args.kwargs["check"] is False
 
     @patch("subprocess.run")
@@ -260,9 +326,9 @@ class TestUpdateManagedPythonEnvIsolation:
         from hermes_cli.managed_uv import managed_python_env
 
         uv_env = managed_python_env()
-        uv_env["VIRTUAL_ENV"] = str(PROJECT_ROOT / "venv")
+        uv_env["VIRTUAL_ENV"] = str(hm.PROJECT_ROOT / "venv")
 
-        assert uv_env["VIRTUAL_ENV"] == str(PROJECT_ROOT / "venv")
+        assert uv_env["VIRTUAL_ENV"] == str(hm.PROJECT_ROOT / "venv")
         # Managed store stays the install-scoped runtime dir, not a third-party one.
         assert ".hermes-runtime" in uv_env.get("UV_PYTHON_INSTALL_DIR", "")
         assert uv_env.get("UV_MANAGED_PYTHON") == "1"
@@ -373,7 +439,7 @@ class TestCmdUpdateBranchFallback:
         )
         sync_mock.assert_called_once_with(
             expected_git_cmd,
-            PROJECT_ROOT,
+            hm.PROJECT_ROOT,
             assume_yes=False,
             input_fn=None,
         )
@@ -409,7 +475,7 @@ class TestCmdUpdateBranchFallback:
         ) as add_remote, patch.object(
             update_cmd, "_mark_skip_upstream_prompt"
         ) as mark_skip, patch("builtins.input") as stdin_input:
-            cmd_update(SimpleNamespace(yes=True))
+            cmd_update(SimpleNamespace(yes=True, branch="main"))
 
         stdin_input.assert_not_called()
         add_remote.assert_not_called()
@@ -482,7 +548,7 @@ class TestCmdUpdateBranchFallback:
             side_effect=SystemExit(0),
         ) as post_update_step:
             with pytest.raises(SystemExit) as exit_info:
-                cmd_update(mock_args)
+                cmd_update(SimpleNamespace(branch="main"))
 
         assert exit_info.value.code == 0
         post_update_step.assert_called_once_with()
@@ -770,28 +836,12 @@ class TestCmdUpdateBranchFlag:
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
 
-        def side_effect(cmd, **kwargs):
-            joined = " ".join(str(c) for c in cmd)
-
-            if "rev-parse" in joined and "--abbrev-ref" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
-
-            if "checkout" in joined and "-B" in joined:
-                rc = 128 if track_fails else 0
-                err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
-                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
-
-            if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
-                rc = 128 if checkout_fails else 0
-                err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
-                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
-
-            if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
-
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        return side_effect
+        return _make_run_side_effect(
+            branch=current_branch,
+            commit_count=commit_count,
+            checkout_fails=checkout_fails,
+            track_fails=track_fails,
+        )
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -849,7 +899,8 @@ class TestCmdUpdateBranchFlag:
         assert "bb/gui" in checkout_cmds[0]
 
         out = capsys.readouterr().out
-        assert "switching to bb/gui" in out
+        assert "switching back to bb/gui" in out
+        assert "Code updated!" in out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -1108,13 +1159,13 @@ class TestNodeRuntimeNpmResolution:
         out = capsys.readouterr().out
         assert "mixed state" in out
 
+    @pytest.mark.linux_only
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
         """A Windows-only npm on WSL must not reach web or desktop builds."""
         from hermes_cli import main as hm
         import hermes_constants
 
         windows_npm = "/mnt/c/Program Files/nodejs/npm"
-        monkeypatch.setattr(hm, "_is_windows", lambda: False)
         monkeypatch.setattr(hermes_constants, "is_wsl", lambda: True)
         monkeypatch.setattr(
             hermes_constants,
@@ -1153,7 +1204,9 @@ class TestNodeRuntimeNpmResolution:
         from hermes_cli import main as hm
         from hermes_cli import update_cmd
 
-        desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        desktop_dir = hm.PROJECT_ROOT / "apps" / "desktop"
+        desktop_dir.mkdir(parents=True)
+        (desktop_dir / "package.json").write_text("{}")
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         build_ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
@@ -1176,10 +1229,11 @@ class TestNodeRuntimeNpmResolution:
         assert packaged.call_count == 2
         desktop_build.assert_called_once_with(
             [hm.sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"],
-            cwd=PROJECT_ROOT,
+            cwd=hm.PROJECT_ROOT,
             env=ANY,
         )
 
+    @pytest.mark.windows_only
     def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
         """The Windows ZIP fallback keeps Desktop intact when replacing ``apps/``.
 
@@ -1219,7 +1273,6 @@ class TestNodeRuntimeNpmResolution:
             return subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
         monkeypatch.setattr(hm, "PROJECT_ROOT", project_root)
-        monkeypatch.setattr(hm, "_is_windows", lambda: True)
         monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
         monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
         monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "")
@@ -1509,6 +1562,7 @@ class TestUpdateNodeDependencies:
 
         (tmp_path / "package.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: None)
 
         hm._update_node_dependencies()
 
@@ -1576,12 +1630,12 @@ class TestGitTrampolineSelfHeal:
             stderr="BUG (fork bomb): tried to spawn itself, check your PATH\n",
         )
 
+    @pytest.mark.windows_only
     def test_healthy_git_command_unchanged(self):
         from hermes_cli import update_cmd
 
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         with (
-            patch("sys.platform", "win32"),
             patch(
                 "hermes_cli.update_cmd.subprocess.run",
                 side_effect=self._fake_run_healthy,
@@ -1592,6 +1646,7 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         locate.assert_not_called()
 
+    @pytest.mark.windows_only
     def test_trampoline_swaps_to_real_git(self, capsys):
         from pathlib import Path
 
@@ -1600,7 +1655,6 @@ class TestGitTrampolineSelfHeal:
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         real = Path(r"C:\Program Files\Git\mingw64\libexec\git-core\git.exe")
         with (
-            patch("sys.platform", "win32"),
             patch(
                 "hermes_cli.update_cmd.subprocess.run",
                 side_effect=self._fake_run_trampoline,
@@ -1614,12 +1668,12 @@ class TestGitTrampolineSelfHeal:
         out = capsys.readouterr().out
         assert "switching to real git" in out
 
+    @pytest.mark.windows_only
     def test_trampoline_no_real_git_keeps_command(self, capsys):
         from hermes_cli import update_cmd
 
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         with (
-            patch("sys.platform", "win32"),
             patch(
                 "hermes_cli.update_cmd.subprocess.run",
                 side_effect=self._fake_run_trampoline,
@@ -1631,12 +1685,12 @@ class TestGitTrampolineSelfHeal:
         out = capsys.readouterr().out
         assert "ZIP path" in out
 
+    @pytest.mark.linux_only
     def test_off_windows_noop(self):
         from hermes_cli import update_cmd
 
         git_cmd = ["git"]
         with (
-            patch("sys.platform", "linux"),
             patch("hermes_cli.update_cmd.subprocess.run") as run,
         ):
             result = update_cmd._ensure_non_trampoline_git(git_cmd)
