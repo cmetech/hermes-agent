@@ -43,34 +43,38 @@ Preserve the entire unfinished `perf/install-bytecode` branch/worktree unchanged
 
 ### Task 1: Isolate and verify the performance candidate
 
-- [ ] Create `release/performance-only` at base in `C:/wt/hermes-performance-release`.
-- [ ] Cherry-pick `17c44a5501` (bytecode preparation and its manifest/tests).
-- [ ] Carry only updater production/test/manifest hunks from `c5ec546acd` and
+- [x] Create `release/performance-only` at base in `C:/wt/hermes-performance-release`.
+- [x] Cherry-pick `17c44a5501` (bytecode preparation and its manifest/tests).
+- [x] Carry only updater production/test/manifest hunks from `c5ec546acd` and
   updater test isolation from `bc52fc43f5`; retain provenance in commit messages.
-- [ ] Add a test-isolation manifest entry and scoped release receipt.
-- [ ] Run the canonical Python installer/cache/update suites, relevant Desktop
+- [x] Add a test-isolation manifest entry and scoped release receipt.
+- [x] Run the canonical Python installer/cache/update suites, relevant Desktop
   lifecycle/page suites, typecheck, neutral-brand and generator tests. Expected:
   all scoped tests pass; actual non-native skips remain explicit.
-- [ ] Validate new manifests against the committed tree and review the candidate
-  against base. Do not silently fix or import unrelated subsystem failures.
+- [x] Review the candidate against base. Python-only manifests passed strict
+  committed-tree checks. Full non-Python attestation remains blocked by the
+  documented native Windows parser defect; do not claim that gate passes.
 
 ### Task 2: Integrate base and regenerate every brand
 
-- [ ] Fast-forward clean `base` to the reviewed candidate.
-- [ ] Discover brands from `brands/*.json`, excluding schema and fixtures.
-- [ ] Merge exact tested base into each brand; regenerate owned overlays,
+- [x] Fast-forward clean `base` to the reviewed candidate.
+- [x] Discover brands from `brands/*.json`, excluding schema and fixtures.
+- [x] Merge exact tested base into each brand; regenerate owned overlays,
   preserve binary brand assets and shared-source changes, then commit.
-- [ ] Run generator checks, relevant branded runtime checks and Desktop build
+- [x] Run generator checks, relevant branded runtime checks and Desktop build
   gates. Verify base ancestry in each final brand SHA.
-- [ ] Push only the tested base and brand refs, forward-only.
+- [x] Push only the tested base and brand refs, forward-only.
 
 ### Task 3: Publish and verify v8.4.1
 
-- [ ] Inspect both existing release workflows: explicit `--publish never` in
+- [x] Inspect both existing release workflows: explicit `--publish never` in
   Electron Builder, explicit release upload, exact source SHA and stamp branch.
-- [ ] Confirm v8.4.1 does not already exist; dispatch both with prerelease=false.
-- [ ] Monitor exact runs to completion; verify release body commit and full
+- [x] Confirm v8.4.1 does not already exist; dispatch both with prerelease=false.
+- [x] Monitor exact runs to completion; verify release body commit and full
   Windows/macOS installer assets. No Linux artifact/runtime claim.
-- [ ] Record results/deferred failures and installer links, with stable `irm`
+- [x] Record results/deferred failures and installer links, with stable `irm`
   distribution behavior verified from the release-repository installer.
-- [ ] Verify primary checkout is clean and on base; retain repair worktree.
+- [x] Verify primary checkout is clean and on base; retain repair worktree.
+
+Completed production publication: see `docs/performance-release-8.4.1.md` for
+immutable source pins, exact successful runs, assets and deferred UAT/tooling.

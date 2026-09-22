@@ -89,7 +89,58 @@ manifests, with upstream baselines unchanged.
   gate passes. Brand runtime equality to tested base is checked directly.
 - OTTO's first generator run passed 129 tests and exposed the two fixture
   assumptions above. The isolated neutral fixture passes on base; the complete
-  branded rerun follows integration of these test-only corrections.
+  branded rerun passed all 131 tests after those test-only corrections.
+  Both descriptor checks passed, as did 34 Python brand tests per brand and
+  LOOP24's 53 native Node tests. Both local production builds passed.
+- The final test-manifest entry declares its fixture symbols. Full native
+  TypeScript/JavaScript symbol attestation remains subject to the documented
+  Windows parser limitation; earlier strict Python-only entries passed.
 
-Desktop/build verification and publication are still in progress. Exact final
-commits, build run IDs and release assets will be recorded after completion.
+## Integrated and published source
+
+Forward-only atomic push completed on 2026-09-22:
+
+| Branch | Source commit |
+| --- | --- |
+| base | `39bc34f59a0bee526de6522e6a5bb8e60c01ec43` |
+| otto | `7d68edf9b337ed68e381bc974b90072842e32244` |
+| loop24 | `79a9d242cb5acf5a7fb55f36bc317846c71bc918` |
+
+Both brands contain that base. Workflow/Kanban runtime and new bytecode/updater
+modules are byte-identical to base. OTTO's local build ran at `7c7b3de75c`, with
+only the three-line manifest-anchor correction added before the final source
+pin; CI builds the exact final pin. LOOP24's local build used its final pin.
+
+Production v8.4.1 runs dispatched with `prerelease=false`:
+
+- OTTO: https://github.com/cmetech/otto/actions/runs/35693226214
+- LOOP24: https://github.com/cmetech/loop24/actions/runs/35693228746
+
+Both exact runs completed successfully. Production releases are public,
+non-draft and non-prerelease:
+
+- [OTTO v8.4.1](https://github.com/cmetech/otto/releases/tag/v8.4.1), published
+  2026-09-22 06:10:24 UTC.
+- [LOOP24 v8.4.1](https://github.com/cmetech/loop24/releases/tag/v8.4.1), published
+  2026-09-22 06:10:37 UTC.
+
+Each release has seven uploaded assets: Windows x64 EXE/MSI, macOS arm64
+DMG/ZIP, plus three blockmaps. Verified nonzero sizes, API SHA-256 digests,
+exact source pins in release bodies and successful native build jobs.
+No Linux or Intel macOS installer is claimed. Builds remain unsigned.
+
+The existing downloader selection was reproduced read-only from each release
+API and selects its `*-8.4.1-win-x64.exe`. Install the chosen brand with:
+
+```powershell
+irm https://raw.githubusercontent.com/cmetech/otto/main/install.ps1 | iex
+# Or LOOP24:
+irm https://raw.githubusercontent.com/cmetech/loop24/main/install.ps1 | iex
+```
+
+Manual packaged Windows UAT and native macOS/Linux runtime UAT remain pending.
+Next Windows checks: install/update, first boot preparation, repeated cold
+connections, page navigation, retry after failure, profile switching and resume.
+Do not interpret successful packaging as measured startup-speed acceptance.
+The release receipt is a documentation-only follow-up on base; the table above
+records the immutable base/brand commits used for the release, not receipt HEAD.
