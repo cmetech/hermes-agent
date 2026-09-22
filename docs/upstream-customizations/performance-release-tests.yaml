@@ -8,6 +8,9 @@ upstream_changes:
   files:
   - scripts/brand/__tests__/generate.test.mjs
   - scripts/brand/__tests__/pyproject-scripts.test.mjs
+  owned_symbols:
+  - ROOT
+  - copyEmitterTree
   tests:
   - scripts/brand/__tests__/generate.test.mjs
   - scripts/brand/__tests__/pyproject-scripts.test.mjs
