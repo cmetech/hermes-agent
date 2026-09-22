@@ -18,6 +18,8 @@ Included:
   production repairs from intermediate commits.
 - Updater-only test isolation from `bc52fc43f5`; no environment/runtime patch
   from that mixed commit is included.
+- A test-only brand CLI smoke correction uses `hermes.exe` on Windows, retains
+  `hermes` on POSIX, pins imports to the tested checkout and checks CLI exit.
 
 The new Python helper benefits Desktop, CLI and TUI installation/startup; it
 does not change the core agent loop, prompt caching, tool schemas or sessions.
@@ -57,5 +59,21 @@ manifests, with upstream baselines unchanged.
 
 ## Current evidence
 
-Candidate verification and publication are in progress. Exact commits, scoped
-test results, build run IDs and release assets will be recorded after completion.
+- Installer/cache/update gate: 128 passed, zero failed, 12 platform skips across
+  12 files, canonical runner with one worker and no retries (277.1 seconds).
+- Brand Python contracts: 34 passed after correcting the Windows launcher
+  fixture. The final checkout-pinned real CLI suite separately passed all 14.
+- New bytecode/update/updater-fixture manifests passed strict committed-tree
+  checks; neutral branding passed. No workflow runtime or agent-loop delta
+  was carried from the repair branch.
+- Fresh scoped review found no Critical or Important implementation defects.
+- Generator unit tests initially ran against neutral base (94 passed, 37
+  failed); those tests assume live OTTO overlays. Their generated brand stamp
+  was neutralized and verified byte-identical to HEAD. OTTO-tree verification
+  remains required; this initial run is not a passing generator gate.
+- Existing Windows downloader scripts query `/releases`, including prereleases,
+  and choose the first matching brand/architecture EXE. They do not use the
+  strictly stable `/releases/latest` endpoint. No installer changes were made.
+
+Desktop/build verification and publication are still in progress. Exact final
+commits, build run IDs and release assets will be recorded after completion.
