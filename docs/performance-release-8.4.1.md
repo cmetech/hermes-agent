@@ -20,6 +20,9 @@ Included:
   from that mixed commit is included.
 - A test-only brand CLI smoke correction uses `hermes.exe` on Windows, retains
   `hermes` on POSIX, pins imports to the tested checkout and checks CLI exit.
+- Two generator fixtures now seed their neutral baseline in a temporary tree
+  and avoid a fixed upstream TOML section order while retaining byte-exact
+  round trips. No generator implementation changed.
 
 The new Python helper benefits Desktop, CLI and TUI installation/startup; it
 does not change the core agent loop, prompt caching, tool schemas or sessions.
@@ -84,6 +87,9 @@ manifests, with upstream baselines unchanged.
   plan). It is not a Desktop test failure. Its repair remains in the deferred
   worktree; this release does not claim that scanner or the full workflow merge
   gate passes. Brand runtime equality to tested base is checked directly.
+- OTTO's first generator run passed 129 tests and exposed the two fixture
+  assumptions above. The isolated neutral fixture passes on base; the complete
+  branded rerun follows integration of these test-only corrections.
 
 Desktop/build verification and publication are still in progress. Exact final
 commits, build run IDs and release assets will be recorded after completion.

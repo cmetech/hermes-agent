@@ -177,12 +177,13 @@ test('DRY-RUN-CLEAN: --neutralize (no --write) against the REAL neutral tree lea
 })
 
 test('write(otto) then neutralize --write applies all 8 emitters and round-trips neutral base byte-for-byte', () => {
-  const before = Object.fromEntries(EMITTER_FILES.map(rel => [rel, fs.readFileSync(path.join(ROOT, rel), 'utf8')]))
-
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'neutralize-write-all-'))
   copyEmitterTree(ROOT, tmpRoot)
 
   const descriptor = loadDescriptor('otto', { root: ROOT })
+  // This test needs a neutral fixture even when invoked on a branded checkout.
+  runEmitters(descriptor, { root: tmpRoot, mode: 'neutralize', emitters: DEFAULT_EMITTERS, write: true })
+  const before = Object.fromEntries(EMITTER_FILES.map(rel => [rel, fs.readFileSync(path.join(tmpRoot, rel), 'utf8')]))
 
   runEmitters(descriptor, { root: tmpRoot, mode: 'write', emitters: DEFAULT_EMITTERS })
   assert.equal(fs.existsSync(path.join(tmpRoot, 'plugins/model-providers/otto')), true)
