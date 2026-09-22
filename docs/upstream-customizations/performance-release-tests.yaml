@@ -1,6 +1,25 @@
 schema_version: 1
 feature: performance-release-tests
 upstream_changes:
+- id: portable-brand-generator-fixtures
+  change_class: test-portability
+  owner: downstream-tests
+  overlap_policy: any_owned_file
+  files:
+  - scripts/brand/__tests__/generate.test.mjs
+  - scripts/brand/__tests__/pyproject-scripts.test.mjs
+  tests:
+  - scripts/brand/__tests__/generate.test.mjs
+  - scripts/brand/__tests__/pyproject-scripts.test.mjs
+  expected_commit_subject: 'test: isolate brand generator round-trip fixtures'
+  upstream_candidate: false
+  merge_guidance: >-
+    Preserve temporary neutralization before the neutral round-trip baseline,
+    so branded checkouts exercise the same invariant. Do not require a fixed
+    upstream TOML section order. Retain byte-for-byte round-trip assertions.
+  removal_condition: >-
+    Remove when the equivalent hermetic round-trip fixtures exist upstream.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
 - id: isolated-performance-updater-fixtures
   change_class: test-portability
   owner: downstream-tests
