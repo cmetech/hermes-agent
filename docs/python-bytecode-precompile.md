@@ -1,5 +1,11 @@
 # Install/update Python bytecode preparation
 
+Current release disposition: [performance-only v8.4.1](performance-release-8.4.1.md)
+records the user's 2026-09-22 authorization to publish before manual UAT,
+the isolated updater-fixture repair, fresh scoped verification and remaining
+acceptance gaps. The original verification/release-gate statements below are
+historical evidence, not the current release authorization.
+
 ## Purpose and scope
 
 Prepare Python's normal import caches once during installation/update, moving

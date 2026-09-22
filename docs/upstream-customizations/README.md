@@ -159,6 +159,8 @@ dependency view disappears with the detached worktree on every exit path.
 - `plugin-configuration.yaml` — generic static plugin descriptors, profile setup actions, Desktop/CLI projection, and capability staging.
 - `python-isolation.yaml` — managed Python environment isolation.
 - `python-bytecode-precompile.yaml` — install/update bytecode preparation, interpreter ownership, stale-cache ordering, and resource-tree exclusions.
+- `performance-release-tests.yaml` — isolated updater verification for the performance-only release.
+- `windows-update-reliability.yaml` — bounded native ZIP rename retries with unchanged rollback.
 - `test-harness.yaml` — generic test harness customizations.
 - `tool-choice-contract.yaml` — one-shot controls, provider policy mapping, API lifecycle, and native structured output.
 - `windows-npm-toolchain.yaml` — Windows npm compatibility enforcement.
