@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection, setApiRequestProfile } from '@/hermes'
+import { _resetDesktopConnectionForTests } from '@/lib/desktop-connection'
 
 import { resolveSpeakStreamUrl } from './voice-playback'
 
@@ -40,6 +41,7 @@ describe('resolveSpeakStreamUrl', () => {
   afterEach(() => {
     setApiRequestConnection(null)
     setApiRequestProfile(null)
+    _resetDesktopConnectionForTests()
     Reflect.deleteProperty(window, 'hermesDesktop')
     vi.useRealTimers()
   })
@@ -105,10 +107,7 @@ describe('resolveSpeakStreamUrl', () => {
   })
 
   it('resolves to null instead of hanging forever when getConnection() wedges (#93454)', async () => {
-    // desktop.getConnection/getConnectionFor/resolveGatewayWsUrl are IPC
-    // round-trips into the main process with no timeout of their own. A
-    // wedged main-process round-trip otherwise hangs voice mode's "speaking"
-    // state forever instead of falling back to playSpeechText.
+    // Older preload bridges still need the renderer compatibility bound.
     vi.useFakeTimers()
     setApiRequestProfile('coder')
     getConnection.mockImplementation(() => new Promise(() => undefined))
@@ -118,5 +117,35 @@ describe('resolveSpeakStreamUrl', () => {
     await vi.advanceTimersByTimeAsync(20_000)
 
     await expect(pending).resolves.toBeNull()
+  })
+
+  it('allows the authoritative Electron connection attempt to take longer than 20 seconds', async () => {
+    vi.useFakeTimers()
+    setApiRequestProfile('coder')
+
+    let resolveConnection!: (value: { baseUrl: string; wsUrl: string }) => void
+
+    const connection = new Promise<{ baseUrl: string; wsUrl: string }>(resolve => {
+      resolveConnection = resolve
+    })
+
+    const ensureConnection = vi.fn(() => connection)
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { ensureConnection, getGatewayWsUrl }
+    })
+
+    let settled = false
+
+    const pending = resolveSpeakStreamUrl().finally(() => {
+      settled = true
+    })
+
+    await vi.advanceTimersByTimeAsync(25_000)
+    expect(settled).toBe(false)
+    resolveConnection({ baseUrl: 'http://127.0.0.1:5151', wsUrl: localWsUrl })
+    await expect(pending).resolves.toContain('/api/audio/speak-stream')
+    expect(ensureConnection).toHaveBeenCalledWith({ connectionId: null, profile: 'coder' })
   })
 })

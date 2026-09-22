@@ -283,13 +283,14 @@ describe('main.ts wiring for #93910', () => {
     expect(body).toContain('tracker: remoteLiveness')
   })
 
-  it('re-dials a retired pool key through the single-owner dial claim', () => {
+  it('re-dials a retired pool key through the scoped lifecycle authority', () => {
     const fnStart = mainSource.indexOf('function redialPoolBackendAfterResume(')
     expect(fnStart).toBeGreaterThan(-1)
     const body = mainSource.slice(fnStart, fnStart + 1_200)
 
     expect(body).toContain('parseBackendScopeKey(')
-    expect(body).toContain('backendDialClaims.run(')
-    expect(body).toContain('ensureRegistryBackend(')
+    expect(body).toContain('desktopConnectionCoordinator.invalidate({ connectionId, profile })')
+    expect(body).toContain('ensureDesktopConnection({ connectionId, profile })')
+    expect(body).not.toContain('ensureRegistryBackend(')
   })
 })

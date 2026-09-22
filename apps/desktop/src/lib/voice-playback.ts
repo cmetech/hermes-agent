@@ -1,6 +1,7 @@
 import { resolveGatewayWsUrl } from '@hermes/shared'
 
 import { getApiRequestConnection, getApiRequestProfile, speakText } from '@/hermes'
+import { ensureDesktopConnection } from '@/lib/desktop-connection'
 import {
   cutSentences,
   directTtsConfig,
@@ -108,7 +109,7 @@ export function stopVoicePlayback() {
 export async function resolveSpeakStreamUrl(): Promise<null | string> {
   const desktop = window.hermesDesktop
 
-  if (!desktop?.getConnection) {
+  if (!desktop || (!desktop.ensureConnection && !desktop.getConnection)) {
     return null
   }
 
@@ -126,23 +127,10 @@ export async function resolveSpeakStreamUrl(): Promise<null | string> {
     const profile = getApiRequestProfile()
     const connectionId = getApiRequestConnection()
 
-    // Both awaits below are IPC round-trips into the main process with no
-    // timeout of their own (#93454) — a wedged main-process round-trip
-    // otherwise hangs voice mode's "speaking" state forever instead of
-    // falling back to playSpeechText. Bound the same way
-    // store/gateway's openSecondary bounds the same *For/plain pair.
-    const conn =
-      connectionId && desktop.getConnectionFor
-        ? await withTimeout(
-            desktop.getConnectionFor({ connectionId, profile }),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
-            `Timed out connecting to profile "${profile}"`
-          )
-        : await withTimeout(
-            desktop.getConnection(profile),
-            RECONNECT_ATTEMPT_TIMEOUT_MS,
-            `Timed out connecting to profile "${profile}"`
-          )
+    // Electron owns the full dial lifecycle and its terminal timeout. The
+    // renderer joins that attempt so a legitimate slow Windows startup is not
+    // abandoned by an earlier, non-cancelling UI deadline.
+    const conn = await ensureDesktopConnection({ connectionId, profile })
 
     const wsDeps =
       connectionId && desktop.getGatewayWsUrlFor
@@ -151,11 +139,15 @@ export async function resolveSpeakStreamUrl(): Promise<null | string> {
           ? {}
           : desktop
 
-    const wsUrl = await withTimeout(
-      resolveGatewayWsUrl(wsDeps, conn),
-      RECONNECT_ATTEMPT_TIMEOUT_MS,
-      `Timed out re-minting the gateway WebSocket URL for profile "${profile}"`
-    )
+    const mint = resolveGatewayWsUrl(wsDeps, conn)
+
+    const wsUrl = desktop.ensureConnection
+      ? await mint
+      : await withTimeout(
+          mint,
+          RECONNECT_ATTEMPT_TIMEOUT_MS,
+          `Timed out re-minting a legacy gateway WebSocket URL for profile "${profile}"`
+        )
 
     const url = new URL(wsUrl)
 

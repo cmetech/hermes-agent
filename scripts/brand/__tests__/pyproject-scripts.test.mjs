@@ -67,7 +67,9 @@ test('neutralize(otto) reverts the real pyproject.toml to the upstream-neutral f
   const after = fs.readFileSync(tmpFile, 'utf8')
   assert.equal(hasBrandScripts(after, 'otto'), false)
   assert.doesNotMatch(after, /OTTO branding/)
-  assert.match(after, /hermes-acp = "acp_adapter\.entry:main"\n\n\[tool\.setuptools\]/)
+  // Upstream can reorder subsequent TOML sections without changing this contract.
+  assert.match(after, /hermes-acp = "acp_adapter\.entry:main"\n\n\[[^\]\n]+\]/)
+  assert.equal(addBrandScripts(after, d.slug, d.displayName), realSrc)
 
   fs.rmSync(tmpRoot, { recursive: true, force: true })
 })

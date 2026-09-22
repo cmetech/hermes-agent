@@ -12,8 +12,10 @@ Logic (kept in sync with contributor-check.yml):
   - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
-  - everything else must have ``contributors/emails/<email>`` or a legacy
-    AUTHOR_MAP entry in scripts/release.py
+  - everything else must have ``contributors/emails/<email>``, a row in
+    ``contributors/case-collisions.tsv`` (for emails that differ only in case
+    and so cannot both be filenames on NTFS/APFS), or a legacy AUTHOR_MAP
+    entry in scripts/release.py
 
 ``--fix`` resolution order for an unmapped email:
   1. bare ``<login>@users.noreply.github.com`` → ``<login>``, verified via
@@ -61,12 +63,47 @@ def new_emails() -> list[str]:
     return sorted({e for e in log.splitlines() if e.strip()})
 
 
+def _collision_emails() -> set:
+    """Exact emails mapped in contributors/case-collisions.tsv."""
+    emails = set()
+    try:
+        text = (REPO_ROOT / "contributors" / "case-collisions.tsv").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return emails
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            emails.add(line.partition("\t")[0].strip())
+    return emails
+
+
+def _mapping_file_exists(email: str) -> bool:
+    """True if contributors/emails/<email> exists with that exact spelling.
+
+    Path.is_file() matches case-insensitively on NTFS/APFS, so the directory
+    listing is compared directly -- otherwise this check disagrees with CI,
+    which runs on a case-sensitive Linux filesystem.
+    """
+    try:
+        return email in {
+            entry.name
+            for entry in (REPO_ROOT / "contributors" / "emails").iterdir()
+            if entry.is_file()
+        }
+    except OSError:
+        return False
+
+
 def is_mapped(email: str) -> bool:
     if any(s in email for s in SKIP_SUBSTRINGS):
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+    if _mapping_file_exists(email):
+        return True
+    if email in _collision_emails():
         return True
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:

@@ -7,6 +7,8 @@ export interface PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, C
   resolveRemote: () => Promise<Remote | null>
   waitForDecision: (backend: Backend) => Promise<FirstRunSetupDecision>
   waitForLocalStart: () => Promise<unknown>
+  requiresInstall?: (backend: Backend) => boolean
+  reportPreparation?: (preparing: boolean) => void
 }
 
 export type PrimaryBackendStartupResult<RuntimeBackend, Connection> =
@@ -82,7 +84,9 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
   prepareLocalBackend,
   resolveRemote,
   waitForDecision,
-  waitForLocalStart
+  waitForLocalStart,
+  requiresInstall = () => false,
+  reportPreparation
 }: PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, Connection>): Promise<
   PrimaryBackendStartupResult<RuntimeBackend, Connection>
 > {
@@ -92,10 +96,20 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
     return { kind: 'remote', connection: await connectRemote(savedRemote) }
   }
 
-  await waitForLocalStart()
+  const prepare = async <T>(work: () => Promise<T>): Promise<T> => {
+    reportPreparation?.(true)
+
+    try {
+      return await work()
+    } finally {
+      reportPreparation?.(false)
+    }
+  }
+
+  await prepare(waitForLocalStart)
 
   const backend = await prepareLocalBackend()
-  const decision = await waitForDecision(backend)
+  const decision = await prepare(() => waitForDecision(backend))
 
   if (decision === 'remote-applied') {
     const appliedRemote = await resolveRemote()
@@ -111,5 +125,8 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
     throw new FirstRunSetupResetError()
   }
 
-  return { kind: 'local', backend: await ensureLocalRuntime(backend) }
+  return {
+    kind: 'local',
+    backend: await (requiresInstall(backend) ? prepare(() => ensureLocalRuntime(backend)) : ensureLocalRuntime(backend))
+  }
 }

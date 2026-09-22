@@ -149,14 +149,18 @@ dependency view disappears with the detached worktree on every exit path.
 - `browser-profiles.yaml` — enrolled browser profile trust and launch seams.
 - `credential-storage.yaml` — plugin-secret authority, migration, atomic publication, and ACL boundaries.
 - `desktop-loader.yaml` — non-blocking declarative Desktop loader animation.
+- `desktop-page-responsiveness.yaml` — visible lazy navigation, boot-gated prefetch, scoped caches, progressive settings, and local route timing.
 - `desktop-test-infra.yaml` — Desktop test and dependency-view infrastructure.
 - `environment-runtime.yaml` — authenticated shell snapshots and remote-shell compatibility.
-- `fork-runtime.yaml` — shared profile, branding, Desktop, gateway, and service-runtime behavior.
+- `fork-runtime.yaml` — shared profile, branding, Electron-owned Desktop connection lifecycle, gateway, and service-runtime behavior.
 - `gateway-autostart.yaml` — Desktop gateway automation startup and visibility.
 - `kanban-attachment-access.yaml` — bounded kanban attachment access.
 - `platform-test-skips.yaml` — explicit platform-specific test exclusions.
 - `plugin-configuration.yaml` — generic static plugin descriptors, profile setup actions, Desktop/CLI projection, and capability staging.
 - `python-isolation.yaml` — managed Python environment isolation.
+- `python-bytecode-precompile.yaml` — install/update bytecode preparation, interpreter ownership, stale-cache ordering, and resource-tree exclusions.
+- `performance-release-tests.yaml` — isolated updater verification for the performance-only release.
+- `windows-update-reliability.yaml` — bounded native ZIP rename retries with unchanged rollback.
 - `test-harness.yaml` — generic test harness customizations.
 - `tool-choice-contract.yaml` — one-shot controls, provider policy mapping, API lifecycle, and native structured output.
 - `windows-npm-toolchain.yaml` — Windows npm compatibility enforcement.

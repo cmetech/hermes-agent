@@ -31,8 +31,7 @@ let profileSwitchHandler: (() => void) | null = null
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: (profile?: null | string) => getGlobalModelInfo(profile),
-  getGlobalModelOptions: (options?: unknown, profile?: null | string) =>
-    getGlobalModelOptions(options, profile),
+  getGlobalModelOptions: (options?: unknown, profile?: null | string) => getGlobalModelOptions(options, profile),
   getApiRequestProfile: () => apiRequestProfile,
   getAuxiliaryModels: (profile?: null | string) => getAuxiliaryModels(profile),
   getMoaModels: (profile?: null | string) => getMoaModels(profile),
@@ -105,11 +104,11 @@ afterEach(() => {
   profileSwitchHandler = null
 })
 
-async function renderModelSettings(scopeProfile?: string) {
+async function renderModelSettings(scopeProfile?: string, waitForSecondary = true) {
   const { ModelSettings } = await import('./model-settings')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
-  return render(
+  const result = render(
     // The aux-task deep-link highlight reads useSearchParams, so the page
     // needs a router context in tests (the app provides HashRouter at root).
     <MemoryRouter>
@@ -118,6 +117,20 @@ async function renderModelSettings(scopeProfile?: string) {
       </QueryClientProvider>
     </MemoryRouter>
   )
+
+  if (waitForSecondary) {
+    await waitFor(() => {
+      if (
+        result.container.querySelector('[data-slot="model-settings-skeleton"]') ||
+        result.container.querySelector('[data-slot="auxiliary-models-loading"]') ||
+        result.container.querySelector('[data-slot="moa-models-loading"]')
+      ) {
+        throw new Error('Secondary model settings are still loading')
+      }
+    })
+  }
+
+  return result
 }
 
 const ALL_SUPPORTED = {
@@ -261,6 +274,173 @@ describe('ModelSettings profile scope', () => {
 })
 
 describe('ModelSettings', () => {
+  it('fences an initial optional read as soon as a main mutation begins', async () => {
+    const oldAux = deferred<any>()
+    const mutation = deferred<any>()
+    getAuxiliaryModels.mockReturnValueOnce(oldAux.promise)
+    setModelAssignment.mockReturnValueOnce(mutation.promise)
+    const { container } = await renderModelSettings(undefined, false)
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+    await act(async () =>
+      oldAux.resolve({ main: {}, tasks: [{ task: 'vision', provider: 'nous', model: 'obsolete-read', base_url: '' }] })
+    )
+    expect(screen.queryByText(/obsolete-read/)).toBeNull()
+    expect(container.querySelector('[data-slot="auxiliary-models-loading"]')).toBeTruthy()
+    await act(async () => mutation.resolve({ ok: true, provider: 'nous', model: 'hermes-4' }))
+  })
+  it.each(['success', 'failure'] as const)('fences stale optional %s after a main mutation refresh', async outcome => {
+    const oldAux = deferred<any>()
+    const oldMoa = deferred<any>()
+    getAuxiliaryModels
+      .mockReturnValueOnce(oldAux.promise)
+      .mockResolvedValueOnce({
+        main: { provider: 'nous', model: 'hermes-4' },
+        tasks: [{ task: 'vision', provider: 'nous', model: 'fresh-vision', base_url: '' }]
+      })
+    getMoaModels.mockReturnValueOnce(oldMoa.promise).mockResolvedValueOnce(namedMoaPreset('fresh-preset'))
+    await renderModelSettings(undefined, false)
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+    expect(await screen.findByText(/fresh-vision/)).toBeTruthy()
+    await act(async () => {
+      if (outcome === 'success') {
+        oldAux.resolve({
+          main: { provider: 'nous', model: 'hermes-4' },
+          tasks: [{ task: 'vision', provider: 'nous', model: 'stale-vision', base_url: '' }]
+        })
+        oldMoa.resolve(namedMoaPreset('stale-preset'))
+      } else {
+        oldAux.reject(new Error('stale auxiliary failure'))
+        oldMoa.reject(new Error('stale moa failure'))
+      }
+    })
+    expect(screen.getByText(/fresh-vision/)).toBeTruthy()
+    expect(screen.getAllByText('fresh-preset')).toHaveLength(2)
+    expect(screen.queryByText(/stale/)).toBeNull()
+  })
+
+  it('keeps auxiliary editors visible during a refresh and after refresh failure', async () => {
+    const refreshAux = deferred<any>()
+    getAuxiliaryModels
+      .mockResolvedValueOnce({
+        main: { provider: 'nous', model: 'hermes-4' },
+        tasks: [{ task: 'vision', provider: 'nous', model: 'saved-vision', base_url: '' }]
+      })
+      .mockReturnValueOnce(refreshAux.promise)
+    const { container } = await renderModelSettings()
+    const vision = container.querySelector('#aux-task-vision') as HTMLElement
+    fireEvent.click(within(vision).getByRole('button', { name: 'Change' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Apply' })[0])
+    await waitFor(() => expect(container.querySelector('[data-slot="auxiliary-models-loading"]')).toBeTruthy())
+    expect(container.querySelector('#aux-task-vision')).toBe(vision)
+    expect(within(vision).getByRole('button', { name: 'Cancel' })).toBeTruthy()
+    await act(async () => refreshAux.reject(new Error('refresh unavailable')))
+    expect(screen.getByText('refresh unavailable')).toBeTruthy()
+    expect(container.querySelector('#aux-task-vision')).toBe(vision)
+  })
+
+  it('does not let an old optional finally clear loading for a newer refresh', async () => {
+    const oldAux = deferred<any>()
+    const oldMoa = deferred<any>()
+    const nextAux = deferred<any>()
+    const nextMoa = deferred<any>()
+    getAuxiliaryModels.mockReturnValueOnce(oldAux.promise).mockReturnValueOnce(nextAux.promise)
+    getMoaModels.mockReturnValueOnce(oldMoa.promise).mockReturnValueOnce(nextMoa.promise)
+    const { container } = await renderModelSettings(undefined, false)
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(getAuxiliaryModels).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      oldAux.resolve({ main: {}, tasks: [] })
+      oldMoa.resolve(null)
+    })
+    expect(container.querySelector('[data-slot="auxiliary-models-loading"]')).toBeTruthy()
+    expect(container.querySelector('[data-slot="moa-models-loading"]')).toBeTruthy()
+    await act(async () => {
+      nextAux.resolve({ main: {}, tasks: [] })
+      nextMoa.resolve(null)
+    })
+  })
+  it('reveals primary model controls while auxiliary sections are still loading', async () => {
+    const auxiliaryModels = deferred<Awaited<ReturnType<typeof getAuxiliaryModels>>>()
+    const moaModels = deferred<Awaited<ReturnType<typeof getMoaModels>>>()
+    getAuxiliaryModels.mockReturnValueOnce(auxiliaryModels.promise)
+    getMoaModels.mockReturnValueOnce(moaModels.promise)
+
+    const { container } = await renderModelSettings(undefined, false)
+
+    expect(await screen.findByText('hermes-4')).toBeTruthy()
+    expect(container.querySelector('[data-slot="model-settings-skeleton"]')).toBeNull()
+    expect(container.querySelector('[data-slot="auxiliary-models-loading"]')).toBeTruthy()
+    expect(container.querySelector('[data-slot="moa-models-loading"]')).toBeTruthy()
+
+    await act(async () => {
+      auxiliaryModels.resolve({
+        main: { provider: 'nous', model: 'hermes-4' },
+        tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
+      })
+      moaModels.resolve(null)
+    })
+  })
+
+  it('keeps primary model controls usable when an auxiliary section fails', async () => {
+    getAuxiliaryModels.mockRejectedValueOnce(new Error('auxiliary catalog unavailable'))
+
+    const { container } = await renderModelSettings()
+
+    expect(await screen.findByText('hermes-4')).toBeTruthy()
+    expect(container.querySelector('[data-slot="model-settings-skeleton"]')).toBeNull()
+    expect(container.querySelector('[data-slot="auxiliary-models-error"]')?.textContent).toContain(
+      'auxiliary catalog unavailable'
+    )
+  })
+
+  it('starts secondary reads immediately but does not publish incomplete primary controls', async () => {
+    const modelInfo = deferred<{ model: string; provider: string }>()
+
+    const auxiliaryModels = deferred<{
+      main: { model: string; provider: string }
+      tasks: { base_url: string; model: string; provider: string; task: string }[]
+    }>()
+
+    const moaModels = deferred<null>()
+
+    getGlobalModelInfo.mockReturnValueOnce(modelInfo.promise)
+    getAuxiliaryModels.mockReturnValueOnce(auxiliaryModels.promise)
+    getMoaModels.mockReturnValueOnce(moaModels.promise)
+
+    const { container } = await renderModelSettings(undefined, false)
+
+    await waitFor(() => {
+      expect(getAuxiliaryModels).toHaveBeenCalledOnce()
+      expect(getMoaModels).toHaveBeenCalledOnce()
+    })
+    expect(container.querySelector('[data-slot="model-settings-skeleton"]')).toBeTruthy()
+    expect(screen.queryByRole('combobox')).toBeNull()
+
+    await act(async () => {
+      modelInfo.resolve({ provider: 'nous', model: 'hermes-4' })
+      auxiliaryModels.resolve({
+        main: { provider: 'nous', model: 'hermes-4' },
+        tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
+      })
+      moaModels.resolve(null)
+    })
+    expect(await screen.findByText('hermes-4')).toBeTruthy()
+  })
+
+  it('keeps successful sections usable when primary or MoA data fails', async () => {
+    getGlobalModelInfo.mockRejectedValueOnce(new Error('main model unavailable'))
+    getMoaModels.mockRejectedValueOnce(new Error('MoA catalog unavailable'))
+
+    const { container } = await renderModelSettings()
+
+    expect(container.querySelector('[data-slot="primary-models-error"]')?.textContent).toContain(
+      'main model unavailable'
+    )
+    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(await screen.findByText('Vision')).toBeTruthy()
+    expect(container.querySelector('[data-slot="moa-models-error"]')?.textContent).toContain('MoA catalog unavailable')
+  })
+
   it('loads the current main model and lists configured providers only', async () => {
     await renderModelSettings()
 
@@ -706,7 +886,7 @@ describe('ModelSettings', () => {
       ]
     })
 
-    await renderModelSettings()
+    await renderModelSettings(undefined, false)
     await waitFor(() => expect(profileSwitch.callback).not.toBeNull())
     profileSwitch.callback?.()
 
@@ -717,6 +897,41 @@ describe('ModelSettings', () => {
     oldOptions.resolve({ providers: [gatewayProvider()] })
     await waitFor(() => expect(screen.queryByText('gateway-good')).toBeNull())
     expect(screen.getByText('legacy-model')).toBeTruthy()
+  })
+
+  it('ignores late auxiliary and MoA reads from the previous profile', async () => {
+    const oldAuxiliary = deferred<{
+      main: { model: string; provider: string }
+      tasks: { base_url: string; model: string; provider: string; task: string }[]
+    }>()
+
+    const oldMoa = deferred<ReturnType<typeof namedMoaPreset>>()
+
+    getAuxiliaryModels.mockReturnValueOnce(oldAuxiliary.promise).mockResolvedValueOnce({
+      main: { provider: 'nous', model: 'hermes-4' },
+      tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
+    })
+    getMoaModels.mockReturnValueOnce(oldMoa.promise).mockResolvedValueOnce(namedMoaPreset('profile-b'))
+
+    await renderModelSettings(undefined, false)
+    await waitFor(() => expect(profileSwitch.callback).not.toBeNull())
+
+    await act(async () => {
+      profileSwitch.callback?.()
+    })
+    expect(await screen.findAllByText('profile-b')).toHaveLength(2)
+
+    await act(async () => {
+      oldAuxiliary.resolve({
+        main: { provider: 'old-provider', model: 'old-model' },
+        tasks: [{ task: 'vision', provider: 'old-provider', model: 'old-model', base_url: '' }]
+      })
+      oldMoa.resolve(namedMoaPreset('old-profile'))
+    })
+
+    expect(screen.queryByText(/old-provider/)).toBeNull()
+    expect(screen.queryByText('old-profile')).toBeNull()
+    expect(screen.getAllByText('profile-b')).toHaveLength(2)
   })
 
   it('preserves a draft Gateway provider and model when manually refreshing its readiness', async () => {

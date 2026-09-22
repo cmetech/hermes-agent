@@ -1,0 +1,119 @@
+schema_version: 1
+feature: python-bytecode-precompile
+# Install/update preparation only. This does not change Python import behavior,
+# the agent loop, model tool schemas, or conversation/prompt caching.
+upstream_changes:
+- id: install-update-python-bytecode-preparation
+  change_class: capability-generic
+  owner: downstream-edge-capability
+  overlap_policy: any_owned_file
+  files:
+  - .gitignore
+  - hermes_cli/bytecode_cache.py
+  - hermes_cli/update_cmd.py
+  - hermes_cli/main.py
+  - scripts/install.ps1
+  - scripts/install.sh
+  - tests/hermes_cli/test_bytecode_precompile.py
+  - tests/test_install_bytecode_precompile.py
+  - tests/hermes_cli/test_cmd_update.py
+  - tests/hermes_cli/test_update_head_moved_gate.py
+  - tests/hermes_cli/test_update_zip_fallback_guards.py
+  owned_symbols:
+  - precompile_runtime
+  - prepare_installation
+  - dependency_cache_roots
+  - _python_files
+  - _SKIP_DIRECTORIES
+  - _PREPARATION_STAMP
+  - _read_packed_ref
+  - _read_git_revision_fingerprint
+  - _clear_bytecode_cache
+  - _precompile_updated_runtime
+  - _update_via_zip
+  - _cmd_update_impl
+  - _repair_node_deps_on_current_checkout
+  - _ZIP_PRESERVED_TOP_LEVEL
+  - _zip_overlay_block_reason
+  - _sweep_stale_bytecode_if_checkout_changed
+  - _record_bytecode_fingerprint
+  - Optimize-PythonBytecode
+  - Stage-BootstrapMarker
+  - precompile_python_bytecode
+  - run_stage_body
+  owned_invariants:
+  - Precompilation runs during installation/update, never on ordinary launch.
+  - The selected installation interpreter prepares its own caches.
+  - Source caches are force-refreshed after existing stale-cache cleanup.
+  - Checkout fingerprint invalidation still handles manual pulls and older updaters.
+  - Git and ZIP updates execute the newly installed helper in a fresh process.
+  - Optional compilation failures warn without invalidating successful installation.
+  - Bundled data, workflow showcases, user profiles, and global system dependencies are not precompiled.
+  tests:
+  - tests/hermes_cli/test_bytecode_precompile.py
+  - tests/test_install_bytecode_precompile.py
+  - tests/hermes_cli/test_bytecode_sweep.py
+  - tests/hermes_cli/test_uv_subprocess_env.py
+  - tests/test_install_ps1_ascii_only.py
+  - tests/hermes_cli/test_cmd_update.py
+  - tests/hermes_cli/test_update_head_moved_gate.py
+  - tests/hermes_cli/test_update_zip_fallback_guards.py
+  expected_commit_subject: 'perf(install): prepare Python bytecode before first launch'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION-ADAPT with upstream installer/updater refactors. Do not preserve whole
+    downstream files or drop upstream safety fixes. Any edit in these owned
+    files requires review, even if Git merges cleanly. See
+    docs/python-bytecode-precompile.md for purpose, measurements, and verification.
+
+    Keep the Windows completion-stage call before publishing the bootstrap
+    marker. Keep BOTH POSIX entry paths: the standalone main flow and the
+    separately executed complete stage used by Electron. Stage processes do
+    not share shell variables: re-resolve the installation interpreter locally.
+    Retain inherited-Python-environment isolation from python-isolation.yaml.
+
+    Keep Git and ZIP update preparation after Python dependency repair and the
+    final stale-bytecode sweep, before restarted services need fresh caches.
+    The updater is old code running across a source replacement: launch the new
+    helper by absolute path with the installation Python, not an in-process
+    cached import. An absent helper on older pinned targets is a safe no-op.
+
+    main.py delegates its existing fingerprint and cleanup primitives to the
+    stdlib-only helper, preserving compatibility wrappers. Do not import main
+    from the install helper: false-valid stale bytecode can execute before the
+    sweep. The install helper must sweep stale caches and record the fingerprint
+    BEFORE precompilation; otherwise the next launch erases the prepared cache.
+    Do not disable that guard or skip source refresh based only on timestamps.
+    No cache-preparation call belongs in normal CLI/TUI/Desktop startup.
+
+    Older updater code cannot execute a newly introduced hook on its first
+    upgrade. Preserve the current-checkout update backfill (--if-needed), keyed
+    by checkout revision, Python cache tag, interpreter path, and cache prefix.
+    Only successful preparation writes .bytecode-prepared (ignored by Git).
+    Dependency repairs force preparation; failed/interrupted attempts retry.
+    The release installer provides immediate preparation without a second update.
+    Preserve the named installer/updater-owned root markers in the ZIP swap's
+    shared allowlist as well as Git's ignore list: otherwise ignored runtime
+    state makes the next ZIP fallback refuse. Do not exempt arbitrary ignored
+    user data; the real-Git guard test must still reject that data.
+
+    Preserve source target selection from packaging metadata and exclusions
+    for development/resource trees, especially plugins/workflow/showcases.
+    Do not recursively compile the entire checkout or follow links out of the
+    selected roots. Only the installation venv's purelib/platlib are dependency
+    targets; never compile a shared system Python or user-site tree. Compilation
+    does not import target modules. Failure must remain warning-only.
+
+    Run the declared invariants on neutral base. Native installer tests use the
+    existing windows_only/linux_only/macos_only markers; skipped OS tests are
+    pending evidence, not cross-platform proof. Regenerate and gate every brand
+    after shared-base integration. Keep this manifest's upstream baseline in
+    lockstep with the catalog only through the upstream-merge skill's real-merge
+    closure, never after a downstream release or a trial merge.
+  removal_condition: >-
+    Remove when upstream install AND Git/ZIP update completion prepare the
+    correct interpreter's source/dependency caches with the same cleanup order,
+    nonfatal behavior, data-tree exclusions, and native installer tests. An
+    upstream uv --compile-bytecode flag alone is not equivalent: editable source
+    lives outside site-packages and later cache sweeps can erase its benefit.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

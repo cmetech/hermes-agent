@@ -3,6 +3,8 @@
 import contextlib
 import io
 import json
+import os
+import subprocess
 import time
 from types import SimpleNamespace
 import pytest
@@ -15,6 +17,21 @@ from hermes_state import SessionDB
 
 def _mock_agent():
     return MagicMock(name="MockAIAgent")
+
+
+def _make_directory_alias(alias, target):
+    """Create a directory alias without requiring Windows symlink privileges."""
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 @pytest.fixture()
@@ -168,7 +185,7 @@ class TestSymlinkAliasNormalization:
         real = tmp_path / "real"
         real.mkdir()
         alias = tmp_path / "alias"
-        alias.symlink_to(real)
+        _make_directory_alias(alias, real)
         assert acp_session._normalize_cwd_for_compare(
             str(alias)
         ) == acp_session._normalize_cwd_for_compare(str(real))
@@ -190,11 +207,39 @@ class TestSymlinkAliasNormalization:
             "/nonexistent-hermes-test/x/../y"
         ) == "/nonexistent-hermes-test/y"
 
+    def test_wsl_unc_matches_posix_workspace(self):
+        assert acp_session._normalize_cwd_for_compare(
+            r"\\wsl.localhost\Ubuntu\home\alice\repo"
+        ) == acp_session._normalize_cwd_for_compare("/home/alice/repo")
+
+    @pytest.mark.windows_only
+    def test_wsl_mount_alias_matches_native_target(self, tmp_path):
+        from hermes_constants import windows_path_to_wsl
+
+        real = tmp_path / "real"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        _make_directory_alias(alias, real)
+        wsl_alias = windows_path_to_wsl(str(alias))
+
+        assert wsl_alias is not None
+        assert acp_session._normalize_cwd_for_compare(
+            wsl_alias
+        ) == acp_session._normalize_cwd_for_compare(str(real))
+
+    @pytest.mark.windows_only
+    def test_forward_slash_unc_matches_backslash_unc(self):
+        assert acp_session._normalize_cwd_for_compare(
+            "//server/share/project"
+        ) == acp_session._normalize_cwd_for_compare(
+            r"\\server\share\project"
+        )
+
     def test_list_sessions_matches_symlink_alias_cwd(self, manager, tmp_path):
         real = tmp_path / "proj"
         real.mkdir()
         alias = tmp_path / "link"
-        alias.symlink_to(real)
+        _make_directory_alias(alias, real)
         state = manager.create_session(cwd=str(real))
         state.history.append({"role": "user", "content": "hello"})
         listed = manager.list_sessions(cwd=str(alias))

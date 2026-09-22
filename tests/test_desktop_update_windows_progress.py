@@ -87,7 +87,12 @@ def test_progress_advances_while_the_orchestrator_blocks(tmp_path: Path) -> None
         )
 
     try:
-        deadline = time.monotonic() + 20
+        # PowerShell loads the updater's embedded C# and runspace machinery
+        # before publishing the URL.  That startup can exceed 20 seconds when
+        # the Windows lane is running files concurrently; the held-stage timer
+        # starts afterwards, so waiting longer here does not weaken the actual
+        # progress assertion.
+        deadline = time.monotonic() + 60
         shim_url = None
         while time.monotonic() < deadline:
             text = output_path.read_text(encoding="utf-8", errors="replace")

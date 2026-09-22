@@ -20,7 +20,9 @@ These tests pin the contract:
 
 from __future__ import annotations
 
+import concurrent.futures
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -67,6 +69,7 @@ class _StalledSummaryWorker:
         self.routes = []
         self.fences = []
         self._lock = threading.Lock()
+        self._attempt_started = threading.Condition(self._lock)
         self.release = threading.Event()
 
     @property
@@ -74,10 +77,11 @@ class _StalledSummaryWorker:
         return len(self.routes)
 
     def __call__(self, fence: CompressionCommitFence):
-        with self._lock:
+        with self._attempt_started:
             self.routes.append(take_pinned_summary_route())
             self.fences.append(fence)
             attempt = len(self.routes)
+            self._attempt_started.notify_all()
         if attempt <= self.stall_attempts:
             # Connection open, zero tokens, zero fence progress.
             self.release.wait(timeout=10)
@@ -90,8 +94,54 @@ class _StalledSummaryWorker:
             fence.finish_commit()
 
 
-def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
-    with _patch_chain(chain):
+class _StartSynchronizedExecutor:
+    """Start each test worker before its sub-second timeout budget begins."""
+
+    def __init__(self, worker: _StalledSummaryWorker, ceiling: float):
+        self.worker = worker
+        self.ceiling = ceiling
+
+    def submit(self, fn, *args):
+        future = concurrent.futures.Future()
+        expected_attempt = self.worker.attempts + 1
+
+        def run():
+            if not future.set_running_or_notify_cancel():
+                return
+            fence = args[0]
+            now = time.monotonic()
+            fence._last_progress = now
+            fence._deadline = now + self.ceiling
+            try:
+                future.set_result(fn(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+        with self.worker._attempt_started:
+            started = self.worker._attempt_started.wait_for(
+                lambda: self.worker.attempts >= expected_attempt or future.done(),
+                timeout=30,
+            )
+        if not started:
+            raise AssertionError("compression test worker did not start")
+
+        # Production intentionally includes executor queueing in the ceiling.
+        # This test targets a worker that is already running and silent, so
+        # reset its clock after the synchronization gate above.
+        fence = args[0]
+        now = time.monotonic()
+        fence._last_progress = now
+        fence._deadline = now + self.ceiling
+        return future
+
+
+def _run(worker, *, chain, timeouts, messages, idle=0.2, ceiling=0.5):
+    executor = _StartSynchronizedExecutor(worker, ceiling)
+    with _patch_chain(chain), patch(
+        "agent.conversation_compression._get_compress_timeout_executor",
+        return_value=executor,
+    ):
         return run_compress_context_with_progress_timeout(
             worker=worker,
             messages=messages,

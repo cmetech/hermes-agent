@@ -260,6 +260,10 @@ class TestProvidersDictApiModeAnthropicMessages:
             AnthropicAuxiliaryClient,
             AsyncAnthropicAuxiliaryClient,
         )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_client",
+            lambda *args, **kwargs: MagicMock(),
+        )
         sync_client, sync_model = resolve_provider_client("myrelay", async_mode=False)
         assert isinstance(sync_client, AnthropicAuxiliaryClient), (
             f"expected AnthropicAuxiliaryClient, got {type(sync_client).__name__}"

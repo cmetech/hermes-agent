@@ -3257,6 +3257,41 @@ maybe_start_gateway() {
     fi
 }
 
+precompile_python_bytecode() {
+    # The final installation interpreter owns its caches; never use PATH python
+    # when a venv was requested, or populate a shared system site-packages tree.
+    local helper="$INSTALL_DIR/hermes_cli/bytecode_cache.py"
+    [ -f "$helper" ] || return 0
+    local cache_python="$INSTALL_DIR/venv/bin/python"
+    if [ "$USE_VENV" != true ]; then
+        cache_python="${PYTHON_PATH:-}"
+        if [ -z "$cache_python" ]; then
+            # Desktop's complete stage is a fresh shell. Resolve without
+            # provisioning another Python or assuming a prior stage's exports.
+            if [ "$DISTRO" = "termux" ]; then
+                cache_python="$(command -v python || true)"
+            else
+                if [ -z "${UV_CMD:-}" ]; then
+                    if [ -x "$HERMES_HOME/bin/uv" ]; then
+                        UV_CMD="$HERMES_HOME/bin/uv"
+                    else
+                        UV_CMD="$(command -v uv || true)"
+                    fi
+                fi
+                cache_python="$(find_managed_python "$PYTHON_VERSION" || "$UV_CMD" python find "$PYTHON_VERSION" 2>/dev/null || true)"
+            fi
+        fi
+    fi
+    if [ ! -x "$cache_python" ]; then
+        log_warn "Bytecode preparation skipped: installation Python unavailable"
+        return 0
+    fi
+    log_info "Preparing Python bytecode for faster startup..."
+    if ! "$cache_python" "$helper"; then
+        log_warn "Bytecode preparation incomplete; Python will compile on demand."
+    fi
+}
+
 write_bootstrap_marker() {
     # Writes $INSTALL_DIR/.hermes-bootstrap-complete, which tells the Hermes
     # desktop app (apps/desktop/electron/main.ts) and the macOS launcher fast
@@ -3975,6 +4010,7 @@ run_stage_body() {
         complete)
             detect_os
             resolve_install_layout
+            precompile_python_bytecode
             print_success
             write_bootstrap_marker
             # Code-scoped stamp: write next to the install tree, not into
@@ -4063,6 +4099,7 @@ main() {
         install_desktop
     fi
 
+    precompile_python_bytecode
     print_success
 
     write_bootstrap_marker

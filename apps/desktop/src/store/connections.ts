@@ -1,8 +1,10 @@
 import { atom, computed } from 'nanostores'
 
 import type { DesktopConnectionsRegistry } from '@/global'
+import { ensureDesktopConnection } from '@/lib/desktop-connection'
+import { beginDesktopConnectionMeasure, type DesktopConnectionMeasureOutcome } from '@/lib/desktop-connection-performance'
 import { persistStringRecord, storedStringRecord } from '@/lib/storage'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS, isTimeoutError, withTimeout } from '@/lib/with-timeout'
+import { isTimeoutError, withTimeout } from '@/lib/with-timeout'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 import {
   beginGatewaySwitch,
@@ -25,19 +27,11 @@ import { $connection } from '@/store/session'
 
 const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
 
-// Every await of a source switch is bounded. A wedged spawn, ticket mint,
-// handshake or IPC (the #93454 class) must surface as a failed click — not a
-// spinner that also swallows every later click on the same source, and never
-// a barrier left up or a wipe left unpainted.
-const SWITCH_DIAL_TIMEOUT_MS = 20_000
+// Electron owns backend-start/ticket deadlines and the gateway client owns its
+// socket-handshake deadline. The renderer bounds only the activation commit
+// and best-effort preference write that happen after the target is reachable.
 const SWITCH_COMMIT_TIMEOUT_MS = 20_000
 const SWITCH_REMEMBER_TIMEOUT_MS = 5_000
-// Matches the primary spawn budget: a healthy cold boot publishes well within
-// this; anything longer means the primary is not coming and the registry
-// restore should stop waiting for it. Shared constant so the boot-class
-// budgets can't drift apart (see with-timeout.ts).
-const BOOT_DESCRIPTOR_WAIT_TIMEOUT_MS = BACKEND_BOOT_WAIT_TIMEOUT_MS
-
 export { $connectionsRegistry } from '@/store/connection-registry-state'
 
 // Use only the resolved descriptor identity Electron publishes. `primary`
@@ -147,40 +141,22 @@ async function rememberConnection(connectionId: string): Promise<void> {
  * second time through the registry while the identical primary SSH backend is
  * still publishing its connection identity.
  *
- * Bounded: a primary that never publishes (spawn failure, dead SSH target)
- * must not strand the registry restore forever — after the deadline the
- * restore proceeds exactly as it did before this wait existed. The listener
- * is always torn down so a late descriptor can't leak a dangling resolver.
+ * This joins Electron's authoritative primary attempt. A terminal failure is
+ * swallowed here so registry initialization can still paint Settings; a slow,
+ * healthy launch is never abandoned by a shorter renderer timer.
  */
 function waitForInitialConnection(): Promise<void> {
   if ($connection.get()) {
     return Promise.resolve()
   }
 
-  let unlisten: (() => void) | undefined
-
-  const published = new Promise<void>(resolve => {
-    unlisten = $connection.listen(connection => {
-      if (!connection) {
-        return
+  return ensureDesktopConnection({ connectionId: null, profile: $activeGatewayProfile.get() })
+    .then(connection => {
+      if (!$connection.get()) {
+        $connection.set(connection)
       }
-
-      unlisten?.()
-      resolve()
     })
-  })
-
-  return withTimeout(
-    published,
-    BOOT_DESCRIPTOR_WAIT_TIMEOUT_MS,
-    'Timed out waiting for the primary connection descriptor'
-  ).catch(error => {
-    unlisten?.()
-
-    if (!isTimeoutError(error)) {
-      throw error
-    }
-  })
+    .catch(() => undefined)
 }
 
 /**
@@ -328,6 +304,9 @@ export async function selectConnection(connectionId: string, options: SelectConn
   const revision = ++switchRevision
   pendingTarget = targetKey
   $pendingConnectionId.set(connectionId)
+  const finishActivationMeasure = beginDesktopConnectionMeasure('source.activation')
+  let activationOutcome: DesktopConnectionMeasureOutcome = 'failed'
+
   // Set by the commit hook once THIS switch has wiped — i.e. it owns the
   // barrier and, if the commit then fails, owes the still-active source a
   // repaint. Null while queued, or if it stepped aside before its turn.
@@ -337,16 +316,14 @@ export async function selectConnection(connectionId: string, options: SelectConn
     // Phase 1 — open the target's socket; the active route is untouched.
     // Always use the explicit registry route. `local` must mean This device,
     // and a registry primary can differ from a legacy per-profile override.
-    await withTimeout(
-      openGatewayAgent(connectionId, targetProfile),
-      SWITCH_DIAL_TIMEOUT_MS,
-      `Timed out connecting to "${targetConnection.label}".`
-    )
+    await openGatewayAgent(connectionId, targetProfile)
 
     // A newer click owns the switch from here on. The superseded dial never
     // activates, so the user doesn't flip through it on the way to the source
     // they picked last; its socket stays warm for that click or idles out.
     if (revision !== switchRevision) {
+      activationOutcome = 'superseded'
+
       return
     }
 
@@ -408,6 +385,8 @@ export async function selectConnection(connectionId: string, options: SelectConn
       }
 
       if (revision !== switchRevision) {
+        activationOutcome = 'superseded'
+
         return
       }
 
@@ -436,6 +415,7 @@ export async function selectConnection(connectionId: string, options: SelectConn
       captureNewChatSource()
       requestFreshSession()
       await refreshActiveProfile()
+      activationOutcome = revision === switchRevision ? 'ready' : 'superseded'
     }
   } catch (error) {
     if (revision === switchRevision) {
@@ -449,8 +429,12 @@ export async function selectConnection(connectionId: string, options: SelectConn
       }
 
       throw error
+    } else {
+      activationOutcome = 'superseded'
     }
   } finally {
+    finishActivationMeasure(activationOutcome)
+
     if (revision === switchRevision) {
       pendingTarget = null
       $pendingConnectionId.set(null)

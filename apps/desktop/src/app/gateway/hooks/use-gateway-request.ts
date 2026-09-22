@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
-import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import { ensureDesktopConnection, invalidateDesktopConnection } from '@/lib/desktop-connection'
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
@@ -71,19 +71,14 @@ export function useGatewayRequest() {
       reauthErrorRef.current = null
 
       try {
-        // Reconnect to whichever profile the gateway is currently routed to (not
-        // always the primary), so a sleep/wake reconnect keeps the user on the
-        // profile they were chatting in. Both awaits below are IPC round-trips
-        // into the main process with no timeout of their own (#93454) — a
-        // wedged main-process round-trip otherwise hangs this await forever,
-        // latching reconnectingRef.current so every later requestGateway() call
-        // returns the same never-settling promise. Bound the same way
-        // use-gateway-boot.ts bounds the primary boot/soft-switch equivalents.
-        const conn = await withTimeout(
-          desktop.getConnection($activeGatewayProfile.get()),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out reconnecting to Hermes backend'
-        )
+        invalidateDesktopConnection({ connectionId: null, profile: $activeGatewayProfile.get() })
+
+        // Reconnect to whichever profile the gateway is currently routed to.
+        // Electron owns the bounded attempt; the renderer only joins it.
+        const conn = await ensureDesktopConnection({
+          connectionId: null,
+          profile: $activeGatewayProfile.get()
+        })
 
         connectionRef.current = conn
         setConnection(conn)
@@ -94,11 +89,7 @@ export function useGatewayRequest() {
         // auth rejection becomes a reauth error; transport failures remain
         // retryable. Stash only the former so requestGateway can show the
         // actionable "sign in again" message.
-        const wsUrl = await withTimeout(
-          resolveGatewayWsUrl(desktop, conn),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out re-minting the gateway WebSocket URL'
-        )
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
 
         await existing.connect(wsUrl)
 
