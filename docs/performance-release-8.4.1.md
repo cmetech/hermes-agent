@@ -79,6 +79,11 @@ manifests, with upstream baselines unchanged.
   (728 total); three opt-in live-remote tests skipped. Desktop renderer,
   Electron and E2E TypeScript checks passed. Dependency install used Node
   22.23.1 and the committed lockfile without version changes.
+- The additional strict Desktop manifest scan reproduces the previously
+  documented native Windows parser `invalid_json` defect (see native-validation
+  plan). It is not a Desktop test failure. Its repair remains in the deferred
+  worktree; this release does not claim that scanner or the full workflow merge
+  gate passes. Brand runtime equality to tested base is checked directly.
 
 Desktop/build verification and publication are still in progress. Exact final
 commits, build run IDs and release assets will be recorded after completion.
