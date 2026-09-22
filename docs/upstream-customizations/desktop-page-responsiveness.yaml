@@ -1,0 +1,106 @@
+schema_version: 1
+feature: desktop-page-responsiveness
+# Desktop navigation must acknowledge intent immediately without competing with
+# backend cold start. Built-in lazy modules share their import promise with
+# gateway-gated intent/idle prefetch, every lazy surface has a visible fallback,
+# and Model Settings publishes independent request groups instead of holding the
+# whole page behind its slowest read.
+#
+# This entry is deliberately separate from the Electron-owned connection
+# lifecycle in fork-runtime.yaml. Connection readiness and renderer page
+# readiness are different authorities and can be reviewed or upstreamed
+# independently.
+upstream_changes:
+- id: desktop-page-responsiveness
+  change_class: desktop-renderer-performance
+  owner: downstream-desktop-runtime
+  overlap_policy: any_owned_file
+  files:
+  - apps/desktop/src/app/chat/route-tile.tsx
+  - apps/desktop/src/app/chat/sidebar/index.tsx
+  - apps/desktop/src/app/contrib/surfaces.test.tsx
+  - apps/desktop/src/app/contrib/surfaces.tsx
+  - apps/desktop/src/app/contrib/wiring.tsx
+  - apps/desktop/src/app/hooks/use-route-prefetch.test.ts
+  - apps/desktop/src/app/hooks/use-route-prefetch.ts
+  - apps/desktop/src/app/lazy-pages.test.tsx
+  - apps/desktop/src/app/lazy-pages.tsx
+  - apps/desktop/src/app/route-load-boundary.test.tsx
+  - apps/desktop/src/app/route-load-boundary.tsx
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  - apps/desktop/src/app/settings/model-settings.tsx
+  - apps/desktop/src/app/skills/index.test.tsx
+  - apps/desktop/src/lib/desktop-performance.test.ts
+  - apps/desktop/src/lib/desktop-performance.ts
+  owned_symbols:
+  - DesktopLazyPageEntry
+  - createDesktopLazyPageRegistry
+  - DESKTOP_LAZY_ROUTES
+  - prefetchDesktopRoute
+  - RouteLoadBoundary
+  - RouteLoading
+  - RouteSettled
+  - RoutePrefetchScheduler
+  - createRouteIntentPrefetch
+  - useRoutePrefetchEnabled
+  - useIdleDesktopRoutePrefetch
+  - ChatSidebar
+  - ChatRoutesSurface
+  - ContribWiring
+  - ModelSettingsSkeleton
+  - ModelSettings
+  - DesktopRoutePerformanceLog
+  - DesktopRoutePerformance
+  - createDesktopRoutePerformance
+  - noteDesktopRouteIntent
+  - noteDesktopRouteVisible
+  - noteDesktopRouteSettled
+  owned_invariants:
+  - Built-in lazy-page prefetch and React.lazy consume the same memoized module promise; contributed routes remain outside this contract.
+  - Every built-in workspace, overlay, and route-tile lazy surface shows the existing declarative PageLoader while its module is pending.
+  - Intent and idle prefetch remain disabled until the gateway is open, and idle warming remains limited to Settings and Capabilities.
+  - Capabilities caches remain keyed by both connection and profile; same-scope revisits may paint stale data while refetching but cross-scope data never flashes.
+  - Primary, auxiliary, and MoA Model Settings reads publish independently and reject every late prior-profile state write through the profile epoch.
+  - Same-profile refresh generations and main-model mutations fence stale successes, failures, and finalizers; successful auxiliary editors survive nonblocking refresh and error states.
+  - Only actual navigation starts route measurements, including repeated warm clicks; hover/focus import deduplication cannot suppress measurements or add hover dwell to route latency. Warm page content marks visible before settled.
+  - Route performance evidence is local-only, strips query and hash data, and emits a bounded slow-route log only at or above 500 milliseconds.
+  tests:
+  - apps/desktop/src/app/lazy-pages.test.tsx
+  - apps/desktop/src/app/route-load-boundary.test.tsx
+  - apps/desktop/src/app/contrib/surfaces.test.tsx
+  - apps/desktop/src/app/hooks/use-route-prefetch.test.ts
+  - apps/desktop/src/app/settings/model-settings.test.tsx
+  - apps/desktop/src/app/skills/index.test.tsx
+  - apps/desktop/src/app/settings/profile-scope.test.tsx
+  - apps/desktop/src/store/settings-scope.test.ts
+  - apps/desktop/src/lib/desktop-performance.test.ts
+  expected_commit_subject: 'perf(desktop): share lazy page loaders'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION on merge. Preserve the behavior contract, not merely a cosmetic
+    spinner: lazy imports must be shared with prefetch, every built-in lazy
+    surface must visibly acknowledge navigation, prefetch must remain gated
+    behind an open gateway, and Model Settings must publish its three request
+    groups independently with profile-epoch fencing.
+
+    Keep TanStack Query as the page-data cache authority. Same-scope stale data
+    may paint during a refetch, but connection/profile changes must select a
+    different key and must never flash rows from the prior scope. Do not add a
+    second cache or a universal keep-alive.
+
+    This feature depends on desktop-loader.yaml. Its declarative, no-rAF Loader
+    remains authoritative for PageLoader animation. Do not reintroduce a
+    per-frame JavaScript animation in a fallback or treat an upstream spinner
+    alone as equivalent to this navigation contract.
+
+    Route timings are local diagnostics only. Preserve query/hash stripping,
+    bounded route identity, the 500ms slow threshold, and the ban on network
+    export or profile/connection/endpoint/credential fields.
+  removal_condition: >-
+    Remove only when upstream provides equivalent shared lazy import promises,
+    visible fallbacks on every built-in Desktop lazy surface, gateway-gated
+    bounded prefetch, connection/profile-safe stale-while-refresh behavior,
+    independently published and profile-fenced Model Settings groups, and
+    identifier-free local route timing. The focused tests must pass without
+    downstream behavior shims; a spinner-only change is not equivalent.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

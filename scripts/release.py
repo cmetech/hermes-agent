@@ -2081,6 +2081,7 @@ LEGACY_AUTHOR_MAP = {
 # Directory-based mappings: contributors/emails/<email> → login
 # ──────────────────────────────────────────────────────────────────────
 CONTRIBUTORS_EMAILS_DIR = REPO_ROOT / "contributors" / "emails"
+CONTRIBUTORS_COLLISIONS_FILE = REPO_ROOT / "contributors" / "case-collisions.tsv"
 
 
 def _load_contributor_dir(directory: "Path | None" = None) -> dict:
@@ -2108,8 +2109,66 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
     return mapping
 
 
-# Effective map: frozen legacy dict + directory entries (directory wins).
-AUTHOR_MAP = {**LEGACY_AUTHOR_MAP, **_load_contributor_dir()}
+def _load_contributor_collisions(path: "Path | None" = None) -> dict:
+    """Load mappings from contributors/case-collisions.tsv.
+
+    Emails differing only in case need filenames differing only in case, which
+    NTFS and APFS cannot both materialize -- a clone warns about colliding
+    paths and leaves one entry permanently "modified". Those few entries live
+    in one tab-delimited file instead, keyed by the exact email.
+    """
+    path = path or CONTRIBUTORS_COLLISIONS_FILE
+    mapping = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return mapping
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        email, _, login = line.partition("\t")
+        # A row may carry a trailing "# note"; the login itself never can.
+        login = login.partition("#")[0]
+        email, login = email.strip(), login.strip().lstrip("@")
+        if email and login:
+            mapping[email] = login
+    return mapping
+
+
+def _build_casefold_index(mapping: dict) -> dict:
+    """Lowercased-email index, excluding ambiguous groups.
+
+    Hostname case drifts between commits from the same machine (macOS reports
+    both "Foo-Mac-mini.local" and "foo-Mac-mini.local"), so an exact-case miss
+    should still resolve. But two distinct people can share a casefolded email
+    -- agent@Agents-Mac-mini.local and agent@agents-Mac-mini.local are two real
+    GitHub users -- and guessing between them would credit the wrong person.
+    Groups that disagree are dropped: no match beats a wrong match.
+    """
+    groups = {}
+    for email, login in mapping.items():
+        groups.setdefault(email.lower(), set()).add(login)
+    return {key: logins.pop() for key, logins in groups.items() if len(logins) == 1}
+
+
+# Effective map: frozen legacy dict + directory entries + collision entries
+# (later sources win). Keys stay exactly as written; lookups fall back to
+# AUTHOR_MAP_CASEFOLD when an exact match misses.
+AUTHOR_MAP = {
+    **LEGACY_AUTHOR_MAP,
+    **_load_contributor_dir(),
+    **_load_contributor_collisions(),
+}
+AUTHOR_MAP_CASEFOLD = _build_casefold_index(AUTHOR_MAP)
+
+
+def lookup_author_login(email: str) -> "str | None":
+    """Map a commit-author email to a GitHub login, exact match first."""
+    login = AUTHOR_MAP.get(email)
+    if login is None:
+        login = AUTHOR_MAP_CASEFOLD.get(email.lower())
+    return login
 
 
 def git(*args, cwd=None):
@@ -2229,7 +2288,7 @@ def update_version_files(semver: str, calver_date: str):
 def resolve_author(name: str, email: str) -> str:
     """Resolve a git author to a GitHub @mention."""
     # Try email lookup first
-    gh_user = AUTHOR_MAP.get(email)
+    gh_user = lookup_author_login(email)
     if gh_user:
         return f"@{gh_user}"
 

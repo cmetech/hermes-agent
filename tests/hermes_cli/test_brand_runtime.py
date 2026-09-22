@@ -221,18 +221,25 @@ def test_cli_startup_writes_brand_json(tmp_path):
     # `hermes` always exists (the branded alias routes to the same main()).
     env = dict(os.environ)
     env["HERMES_HOME"] = str(tmp_path)
+    # Shared worktree venv launchers may otherwise import a different checkout.
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(REPO_ROOT), env.get("PYTHONPATH")))
+    )
     env.pop("OTTO_BRAND", None)  # let the brand/active marker decide (otto on this branch)
     # The active brand now ships a real capabilitySets entry with a live https
     # source; force the resolver's env-override path so this subprocess never
     # attempts a network git clone.
     env["OTTO_CAPABILITY_SOURCE"] = str(tmp_path / "no-such-capability-source")
-    hermes = Path(sys.executable).parent / "hermes"
+    hermes = Path(sys.executable).parent / ("hermes.exe" if os.name == "nt" else "hermes")
     assert hermes.exists(), f"expected {hermes} in the venv"
     # v0.20.0 made `--version` an everywhere fast path (_startup_fast) that
     # exits before main()'s brand-startup seam — by design, brand.json is
     # skipped on fast paths. Drive `--help` instead: it reaches main() (and
     # therefore run_brand_startup) before argparse prints help and exits.
-    subprocess.run([str(hermes), "--help"], env=env, capture_output=True, timeout=120)
+    subprocess.run(
+        [str(hermes), "--help"], cwd=REPO_ROOT, env=env,
+        capture_output=True, timeout=120, check=True,
+    )
     assert (tmp_path / "brand.json").exists()
     data = json.loads((tmp_path / "brand.json").read_text())
     assert data["schemes"][-1] == "hermes"

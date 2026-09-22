@@ -219,3 +219,4 @@ native/fts5_cjk/*.so
 # .superpowers/sdd/*.md ARE tracked deliberately; brainstorm/ is session junk.
 .superpowers/brainstorm/
 .skills_prompt_snapshot.json
+.bytecode-prepared

@@ -64,6 +64,37 @@ function toolset(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(res => {
+    resolve = res
+  })
+
+  return { promise, resolve }
+}
+
+const skill = (name: string) => ({
+  name,
+  description: `${name} description`,
+  category: 'research',
+  enabled: true,
+  usage: 1,
+  provenance: 'bundled'
+})
+
+async function renderScopedSkills(connectionId: string, profile: string) {
+  const { SkillsView } = await import('./index')
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/skills?tab=skills']}>
+        <SkillsView fixedConnection={connectionId} fixedProfile={profile} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
 async function renderSkills(route = '/skills?tab=toolsets') {
   const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
@@ -365,6 +396,43 @@ describe('SkillsView toolset management', { timeout: 60_000 }, () => {
     expect(getToolsets.mock.calls[0][0]).toEqual({ connectionId: 'homelab', profile: 'inbox-bot' })
     // Pinned scope → no roster/profiles fetch, selector hidden.
     expect(getProfiles).not.toHaveBeenCalled()
+  })
+
+  it('paints same-scope cached skills immediately while a revisit refetches', async () => {
+    getSkills.mockResolvedValueOnce([skill('cached-skill')])
+    const first = await renderScopedSkills('homelab', 'inbox-bot')
+
+    expect((await screen.findAllByText('cached-skill')).length).toBeGreaterThan(0)
+    first.unmount()
+
+    const refreshedSkills = deferred<ReturnType<typeof skill>[]>()
+    getSkills.mockReturnValueOnce(refreshedSkills.promise)
+    await renderScopedSkills('homelab', 'inbox-bot')
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2))
+    expect(screen.getAllByText('cached-skill').length).toBeGreaterThan(0)
+
+    await act(async () => refreshedSkills.resolve([skill('refreshed-skill')]))
+    expect((await screen.findAllByText('refreshed-skill')).length).toBeGreaterThan(0)
+  })
+
+  it('never paints cached skills from another connection and profile scope', async () => {
+    getSkills.mockResolvedValueOnce([skill('scope-a-skill')])
+    const first = await renderScopedSkills('homelab', 'profile-a')
+
+    expect((await screen.findAllByText('scope-a-skill')).length).toBeGreaterThan(0)
+    first.unmount()
+
+    const scopeBSkills = deferred<ReturnType<typeof skill>[]>()
+    getSkills.mockReturnValueOnce(scopeBSkills.promise)
+    await renderScopedSkills('workstation', 'profile-b')
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText('scope-a-skill')).toBeNull()
+
+    await act(async () => scopeBSkills.resolve([skill('scope-b-skill')]))
+    expect((await screen.findAllByText('scope-b-skill')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('scope-a-skill')).toBeNull()
   })
 
   it('offers (connection, profile) scope rows on multi-connection desktops', async () => {

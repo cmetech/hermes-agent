@@ -279,6 +279,76 @@ describe('profile switch mid-WS-handshake (#92434 close-candidate pin)', () => {
 })
 
 describe('secondary connection timeout (#93454)', () => {
+  it('keeps a 20+ second Electron-owned cold profile ensure pending, then succeeds', async () => {
+    vi.useFakeTimers()
+    let resolveConnection: (value: Record<string, unknown>) => void = () => undefined
+
+    const ensureConnection = vi.fn(
+      () =>
+        new Promise<Record<string, unknown>>(resolve => {
+          resolveConnection = resolve
+        })
+    )
+
+    installDesktop({
+      ensureConnection,
+      getConnection: vi.fn(),
+      getGatewayWsUrl: vi.fn(async () => ({ ok: true, wsUrl: 'wss://work.invalid/ws' }))
+    })
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+
+    const pending = ensureGatewayForProfile('work')
+    await vi.advanceTimersByTimeAsync(25_000)
+    expect(activeGateway()).not.toBe(gatewayMocks.instances[0])
+
+    resolveConnection({
+      authMode: 'token',
+      baseUrl: 'https://work.invalid',
+      mode: 'local',
+      profile: 'work',
+      sharedPrimary: false,
+      token: 'fake-test-token',
+      wsUrl: 'wss://work.invalid/ws'
+    })
+    await pending
+
+    expect(activeGateway()).toBe(gatewayMocks.instances[0])
+    expect(ensureConnection).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases secondary ownership after a typed Electron timeout so retry succeeds', async () => {
+    const typedTimeout = Object.assign(new Error('Electron connection attempt timed out'), {
+      data: { attemptId: 4, code: 'attempt_timeout', retryable: true }
+    })
+
+    const ready = {
+      authMode: 'token',
+      baseUrl: 'https://work.invalid',
+      mode: 'local',
+      profile: 'work',
+      sharedPrimary: false,
+      token: 'fake-test-token',
+      wsUrl: 'wss://work.invalid/ws'
+    }
+
+    const ensureConnection = vi
+      .fn()
+      .mockRejectedValueOnce(typedTimeout)
+      .mockRejectedValueOnce(typedTimeout)
+      .mockResolvedValue(ready)
+
+    installDesktop({
+      ensureConnection,
+      getConnection: vi.fn(),
+      getGatewayWsUrl: vi.fn(async () => ({ ok: true, wsUrl: ready.wsUrl }))
+    })
+    gatewayMocks.connect.mockImplementation(async () => undefined)
+
+    await expect(ensureGatewayForProfile('work')).rejects.toBe(typedTimeout)
+    await expect(ensureGatewayForProfile('work')).resolves.toBeUndefined()
+    expect(activeGateway()).toBe(gatewayMocks.instances[0])
+  })
+
   it("rejects instead of hanging forever when openSecondary's getConnection() wedges", async () => {
     // Repro: desktop.getConnection is an IPC round-trip into the main process
     // with no timeout of its own. A wedged main-process round-trip (e.g. a
@@ -303,7 +373,9 @@ describe('secondary connection timeout (#93454)', () => {
 
     installDesktop({ getConnection })
 
-    const pending = expect(ensureGatewayForProfile('work')).rejects.toThrow('Timed out connecting to profile "work"')
+    const pending = expect(ensureGatewayForProfile('work')).rejects.toThrow(
+      'Timed out waiting for a legacy desktop connection bridge'
+    )
 
     // Advance past the internal reconnect-attempt timeout (20s) — the stalled
     // await must reject instead of hanging forever.

@@ -116,3 +116,110 @@ def test_cli_entrypoint_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = (tmp_path / "contributors" / "emails" / "cli@example.com").read_text(encoding="utf-8")
     assert out.splitlines()[0] == "cliperson"
+
+
+# ── case-collision handling ───────────────────────────────────────────
+
+
+def test_no_case_colliding_paths_are_tracked():
+    # A clone on NTFS/APFS cannot materialize two paths differing only in
+    # case: git warns and leaves one entry permanently "modified".
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True,
+    ).stdout.splitlines()
+    seen = {}
+    for path in tracked:
+        seen.setdefault(path.lower(), []).append(path)
+    collisions = {k: v for k, v in seen.items() if len(v) > 1}
+    assert not collisions, f"case-colliding tracked paths: {collisions}"
+
+
+def test_collisions_file_parses(tmp_path):
+    f = tmp_path / "case-collisions.tsv"
+    f.write_text(
+        "# header comment\n"
+        "\n"
+        "a@Host.local\tapple  # moved from contributors/emails/\n"
+        "a@host.local\t@banana\n",
+        encoding="utf-8",
+    )
+    assert release._load_contributor_collisions(f) == {
+        "a@Host.local": "apple",
+        "a@host.local": "banana",
+    }
+
+
+def test_collision_entries_reach_the_effective_map():
+    collisions = release._load_contributor_collisions()
+    assert collisions, "expected contributors/case-collisions.tsv to hold entries"
+    for email, login in collisions.items():
+        assert release.AUTHOR_MAP[email] == login
+        assert release.resolve_author("ignored", email) == f"@{login}"
+
+
+def test_casefold_fallback_resolves_hostname_case_drift():
+    # Same machine, hostname reported with different case between commits.
+    mapping = {"dev@Foo-Mac-mini.local": "devperson"}
+    index = release._build_casefold_index(mapping)
+    assert index["dev@foo-mac-mini.local"] == "devperson"
+
+
+def test_casefold_fallback_refuses_ambiguous_groups():
+    # Two distinct GitHub users whose emails differ only in case: guessing
+    # would credit the wrong person, so neither is offered as a fallback.
+    mapping = {"agent@A.local": "one", "agent@a.local": "two"}
+    assert release._build_casefold_index(mapping) == {}
+
+
+def test_lookup_prefers_exact_case_over_fallback():
+    assert release.lookup_author_login("agent@Agents-Mac-mini.local") == "skip-agent"
+    assert release.lookup_author_login("agent@agents-Mac-mini.local") == "momomojo"
+    # Neither spelling: ambiguous group, so no guess.
+    assert release.lookup_author_login("AGENT@AGENTS-MAC-MINI.LOCAL") is None
+
+
+def test_add_contributor_diverts_case_variant_to_collisions_file(
+    tmp_path, monkeypatch
+):
+    import add_contributor
+
+    emails = tmp_path / "contributors" / "emails"
+    emails.mkdir(parents=True)
+    tsv = tmp_path / "contributors" / "case-collisions.tsv"
+    monkeypatch.setattr(add_contributor, "EMAILS_DIR", emails)
+    monkeypatch.setattr(add_contributor, "COLLISIONS_FILE", tsv)
+
+    assert add_contributor.add_contributor("dev@Box.local", "first") == 0
+    assert (emails / "dev@Box.local").is_file()
+
+    # Same email bar case, different person -> both move to the TSV so the
+    # working tree never needs two filenames differing only in case.
+    assert add_contributor.add_contributor("dev@box.local", "second") == 0
+    assert not (emails / "dev@Box.local").exists()
+    assert add_contributor.read_collisions() == {
+        "dev@Box.local": "first",
+        "dev@box.local": "second",
+    }
+
+
+def test_add_contributor_is_idempotent_for_collision_entries(tmp_path, monkeypatch):
+    import add_contributor
+
+    emails = tmp_path / "contributors" / "emails"
+    emails.mkdir(parents=True)
+    tsv = tmp_path / "contributors" / "case-collisions.tsv"
+    tsv.write_text("dev@Box.local\tfirst\n", encoding="utf-8")
+    monkeypatch.setattr(add_contributor, "EMAILS_DIR", emails)
+    monkeypatch.setattr(add_contributor, "COLLISIONS_FILE", tsv)
+
+    assert add_contributor.add_contributor("dev@Box.local", "first") == 0
+    assert add_contributor.add_contributor("dev@Box.local", "other") == 1
+    assert tsv.read_text(encoding="utf-8") == "dev@Box.local\tfirst\n"
+
+
+def test_audit_is_mapped_accepts_collision_rows():
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import audit_pr_attribution
+
+    for email in release._load_contributor_collisions():
+        assert audit_pr_attribution.is_mapped(email)

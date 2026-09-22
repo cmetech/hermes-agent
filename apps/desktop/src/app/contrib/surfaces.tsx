@@ -8,7 +8,7 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { type ComponentProps, lazy, memo, type ReactNode, Suspense, useMemo } from 'react'
+import { type ComponentProps, memo, type ReactNode, Suspense, useMemo } from 'react'
 import { Navigate, Route, Routes, useParams } from 'react-router'
 
 import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
@@ -21,8 +21,20 @@ import { $freshDraftReady, $gatewayState } from '@/store/session'
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
 import { DispatcherBanner } from '../kanban/dispatcher-banner'
+import { ArtifactsView, KanbanView, MessagingView, SkillsView, WorkflowsView } from '../lazy-pages'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
-import { contributedRoutes, KANBAN_ROUTE, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
+import { RouteLoadBoundary } from '../route-load-boundary'
+import {
+  ARTIFACTS_ROUTE,
+  contributedRoutes,
+  KANBAN_ROUTE,
+  MESSAGING_ROUTE,
+  NEW_CHAT_ROUTE,
+  ROUTES_AREA,
+  sessionRoute,
+  SKILLS_ROUTE,
+  WORKFLOWS_ROUTE
+} from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
 import { useStatusbarItems } from '../shell/hooks/use-statusbar-items'
 import { ModelMenuPanel } from '../shell/model-menu-panel'
@@ -32,17 +44,6 @@ import { StatusbarBoundary } from '../shell/statusbar-fallback'
 import { latestChatActions, latestSidebarActions } from './latest-actions'
 import { setStatusbarItemGroup, useStatusbarContributions } from './panes'
 import type { SidebarActions, WiringActions } from './types'
-
-// Same lazy-view split as DesktopController — pages load on demand. The
-// full-page views the workspace route table mounts live here; overlay views
-// (agents/settings/…) are the controller's and stay in wiring.tsx.
-const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
-const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
-const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
-// OTTO additive full-page views (Workflows + Kanban) — reachable at their own
-// APP_ROUTES paths, rendered like every other page view in the workspace pane.
-const WorkflowsView = lazy(async () => ({ default: (await import('../workflows')).WorkflowsView }))
-const KanbanView = lazy(async () => ({ default: (await import('../kanban')).KanbanView }))
 
 export function LegacySessionRedirect() {
   const { sessionId } = useParams()
@@ -186,7 +187,15 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   // on the contribution, not a DOM marker — the `data-zone-no-header` attribute
   // that used to ride this wrapper gated a body double-click toggle that no
   // longer exists, and nothing has read it since.
-  const page = (view: ReactNode) => (
+  const page = (route: string, view: ReactNode) => (
+    <div className="contents">
+      <RouteLoadBoundary route={route} variant="workspace">
+        {view}
+      </RouteLoadBoundary>
+    </div>
+  )
+
+  const contributedPage = (view: ReactNode) => (
     <div className="contents">
       <Suspense fallback={null}>{view}</Suspense>
     </div>
@@ -196,13 +205,20 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
     <Routes>
       <Route element={chatView} index />
       <Route element={chatView} path=":sessionId" />
-      <Route element={page(<SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
-      <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
-      <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
-      <Route element={page(<WorkflowsView />)} path="workflows" />
+      <Route element={page(SKILLS_ROUTE, <SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
+      <Route
+        element={page(MESSAGING_ROUTE, <MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)}
+        path="messaging"
+      />
+      <Route
+        element={page(ARTIFACTS_ROUTE, <ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)}
+        path="artifacts"
+      />
+      <Route element={page(WORKFLOWS_ROUTE, <WorkflowsView />)} path="workflows" />
       {!kanbanContributed && (
         <Route
           element={page(
+            KANBAN_ROUTE,
             <KanbanRouteContent>
               <KanbanView />
             </KanbanRouteContent>
@@ -229,7 +245,9 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 
         return (
           <Route
-            element={page(route.path === KANBAN_ROUTE ? <KanbanRouteContent>{content}</KanbanRouteContent> : content)}
+            element={contributedPage(
+              route.path === KANBAN_ROUTE ? <KanbanRouteContent>{content}</KanbanRouteContent> : content
+            )}
             key={route.key}
             path={route.path.slice(1)}
           />

@@ -13,7 +13,9 @@ from hermes_constants import get_hermes_home
 import copy
 import json
 import logging
+import ntpath
 import os
+import posixpath
 import re
 import sys
 import time
@@ -46,15 +48,47 @@ def _normalize_cwd_for_compare(cwd: str | None) -> str:
         raw = "."
     expanded = os.path.expanduser(raw)
 
-    # Normalize Windows drive paths into the equivalent WSL mount form so
-    # ACP history filters match the same workspace across Windows and WSL.
-    from hermes_constants import windows_path_to_wsl
+    # Normalize Windows paths into a shared comparison spelling so ACP history
+    # filters match the same workspace across native Windows and WSL clients.
+    from hermes_constants import windows_path_to_wsl, wsl_unc_path_to_posix
+
+    wsl_unc = wsl_unc_path_to_posix(expanded)
+    if wsl_unc is not None:
+        expanded = wsl_unc
+
+    # Generic UNC spellings are Windows comparison data on every host. Treat
+    # //server/share and \\server\share as the same path without asking the
+    # current machine to contact or resolve that network share.
+    if expanded.startswith(("//", "\\\\")):
+        return ntpath.normcase(ntpath.normpath(expanded.replace("/", "\\")))
 
     translated = windows_path_to_wsl(expanded)
+    mount_match = re.match(r"^/mnt/([A-Za-z])(?:/(.*))?$", expanded)
+    if os.name == "nt" and (translated is not None or mount_match is not None):
+        # Resolve native aliases (including directory junctions) before
+        # converting to the shared Windows/WSL comparison spelling.
+        native_path = expanded
+        if mount_match is not None:
+            drive, tail = mount_match.groups()
+            native_path = f"{drive.upper()}:\\"
+            if tail:
+                native_path += tail.replace("/", "\\")
+        try:
+            resolved = os.path.realpath(native_path)
+        except OSError:
+            resolved = os.path.normpath(native_path)
+        canonical = windows_path_to_wsl(resolved) or translated or expanded
+        return posixpath.normpath(canonical)
     if translated is not None:
         expanded = translated
     elif re.match(r"^/mnt/[A-Za-z]/", expanded):
         expanded = f"/mnt/{expanded[5].lower()}/{expanded[7:]}"
+
+    # A POSIX/WSL path received by a native Windows process is comparison data,
+    # not a path on the current host. ntpath.realpath would incorrectly turn
+    # /mnt/c/... into C:\mnt\c\... and /tmp into C:\tmp.
+    if os.name == "nt" and expanded.startswith("/"):
+        return posixpath.normpath(expanded)
 
     # Resolve symlink aliases so equivalent spellings of the same directory
     # compare equal — macOS reports editor workspaces as ``/var/...`` while

@@ -111,13 +111,16 @@ fi
 # ── Windows location variables (computed before we drop env) ───────────────
 # `env -i` forwards HOME, which is enough on POSIX. Native Windows CPython
 # resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), stdlib
-# platform paths come from LOCALAPPDATA/APPDATA, ssl/sockets need SYSTEMROOT,
-# and tempfile needs TEMP/TMP. Dropping them breaks collection on native
-# Windows (issues #67385, #70813). These are location variables, not
-# credentials, so forwarding them keeps the isolation intent intact. Each is
-# only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
+# platform paths come from LOCALAPPDATA/APPDATA, machine-wide caches use
+# ProgramData/SYSTEMDRIVE, ssl/sockets need SYSTEMROOT, and tempfile needs
+# TEMP/TMP. Dropping them breaks collection on native Windows (issues #67385,
+# #70813), and some native programs interpret an unexpanded ``%SystemDrive%``
+# as a relative directory inside the checkout. These are location variables,
+# not credentials, so forwarding them keeps the isolation intent intact. Each
+# is only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
 WIN_ENV=()
-for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP; do
+for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA \
+  ProgramData SYSTEMDRIVE SYSTEMROOT TEMP TMP; do
   if [ -n "${!_win_var:-}" ]; then
     WIN_ENV+=("$_win_var=${!_win_var}")
   fi

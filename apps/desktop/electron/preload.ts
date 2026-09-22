@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
 import { subscribeConnectionGeneration } from './connection-generation-event'
+import {
+  invokeConnectionIpcWithWatchdog,
+  invokeWithConnectionWatchdog,
+  subscribeConnectionLifecycle
+} from './connection-lifecycle-bridge'
 
 // Which translucency the OS can back. Asked synchronously because the renderer
 // needs it before its first paint, and answered by main because deciding it
@@ -12,20 +17,51 @@ import { subscribeConnectionGeneration } from './connection-generation-event'
 const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
 const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
 const hudNativeDrag = hudWindowing?.nativeDrag === true
+const connectionPolicy = ipcRenderer.sendSync('hermes:connection:policy')
+const connectionWatchdogMs = Number(connectionPolicy?.preloadWatchdogMs)
+
+const connectionObservation = scope => ({
+  checkTimeoutMs: Number(connectionPolicy?.ipcDeliveryMarginMs),
+  inspect: () => ipcRenderer.invoke('hermes:connection:inspect', scope),
+  subscribe: callback => subscribeConnectionLifecycle(ipcRenderer, callback)
+})
+
+const ensureConnection = scope =>
+  invokeWithConnectionWatchdog(
+    () => ipcRenderer.invoke('hermes:connection:ensure', scope),
+    scope,
+    connectionWatchdogMs,
+    connectionObservation(scope)
+  )
+
+const invokeConnectionIpc = (channel, scope, ...args) =>
+  invokeConnectionIpcWithWatchdog(
+    () => ipcRenderer.invoke(channel, ...args),
+    scope,
+    connectionWatchdogMs,
+    connectionObservation(scope)
+  )
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
-  getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
+  ensureConnection,
+  inspectConnection: scope => ipcRenderer.invoke('hermes:connection:inspect', scope),
+  onConnectionLifecycle: callback => subscribeConnectionLifecycle(ipcRenderer, callback),
+  getConnection: profile => ensureConnection({ connectionId: null, profile }),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
-  getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
+  getConnectionFor: payload =>
+    String(payload?.connectionId ?? '').trim()
+      ? ensureConnection(payload)
+      : invokeConnectionIpc('hermes:connection:for', payload || {}, payload),
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
-  revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
+  revalidateConnection: () =>
+    invokeConnectionIpc('hermes:connection:revalidate', { connectionId: null, profile: null }),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  getGatewayWsUrl: profile => invokeConnectionIpc('hermes:gateway:ws-url', { connectionId: null, profile }, profile),
   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
   // getGatewayWsUrl, minted against that connection's backend.
-  getGatewayWsUrlFor: payload => ipcRenderer.invoke('hermes:gateway:ws-url-for', payload),
+  getGatewayWsUrlFor: payload => invokeConnectionIpc('hermes:gateway:ws-url-for', payload || {}, payload),
   // Union agent roster across every registered connection.
   getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),

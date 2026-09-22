@@ -13,12 +13,37 @@
  * (connectionId, profile) key runs; every concurrent caller for the same key
  * awaits and receives that first dial's result.
  *
- * Bounded by construction: a claim exists only while its dial promise is
- * unsettled — both outcomes release it, so a failed dial is never cached and
- * the next reconnect attempt runs fresh (fail closed, not latched).
+ * Settled dials release their claim. Lifecycle timeouts can also retire a
+ * hung claim, but replacement work waits for its owner's teardown barrier.
  */
 export class BackendDialClaims {
   readonly #inflightByKey = new Map<string, Promise<unknown>>()
+  readonly #retiringByKey = new Map<string, Promise<void>>()
+
+  /** Retire only after the lifecycle owner has fenced and drained its resources. */
+  retire(key: string, teardown: () => Promise<void>): Promise<void> {
+    const existing = this.#retiringByKey.get(key)
+
+    if (existing) {
+      return existing
+    }
+
+    this.#inflightByKey.delete(key)
+    const retirement = Promise.resolve().then(teardown)
+    this.#retiringByKey.set(key, retirement)
+    void retirement.then(
+      () => {
+        if (this.#retiringByKey.get(key) === retirement) {
+          this.#retiringByKey.delete(key)
+        }
+      },
+      () => {
+        /* A failed teardown must not permit an untracked replacement. */
+      }
+    )
+
+    return retirement
+  }
 
   /** Whether a dial for this key is currently in flight (test/diagnostic seam). */
   inFlight(key: string): boolean {
@@ -26,6 +51,12 @@ export class BackendDialClaims {
   }
 
   run<T>(key: string, dial: () => Promise<T> | T): Promise<T> {
+    const retirement = this.#retiringByKey.get(key)
+
+    if (retirement) {
+      return retirement.then(() => this.run(key, dial))
+    }
+
     const existing = this.#inflightByKey.get(key) as Promise<T> | undefined
 
     if (existing) {

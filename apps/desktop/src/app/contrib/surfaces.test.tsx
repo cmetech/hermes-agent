@@ -29,10 +29,23 @@ vi.mock('../shell/hooks/use-statusbar-items', () => ({
 }))
 vi.mock('../shell/statusbar-controls', () => ({ StatusbarControls: () => null }))
 vi.mock('../routes', () => ({
+  AGENTS_ROUTE: '/agents',
+  ARTIFACTS_ROUTE: '/artifacts',
+  COMMAND_CENTER_ROUTE: '/command-center',
   contributedRoutes: () => [],
+  CRON_ROUTE: '/cron',
+  KANBAN_ROUTE: '/kanban',
+  MESSAGING_ROUTE: '/messaging',
   NEW_CHAT_ROUTE: '/new',
+  PROFILES_ROUTE: '/profiles',
+  routePathname: (to: string) => to.split(/[?#]/, 1)[0],
   ROUTES_AREA: 'routes',
-  sessionRoute: (id: string) => `/${id}`
+  sessionRoute: (id: string) => `/${id}`,
+  SETTINGS_ROUTE: '/settings',
+  SKILLS_ROUTE: '/skills',
+  STARMAP_ROUTE: '/starmap',
+  WEBHOOKS_ROUTE: '/webhooks',
+  WORKFLOWS_ROUTE: '/workflows'
 }))
 vi.mock('./latest-actions', () => ({ latestChatActions: () => ({}), latestSidebarActions: () => ({}) }))
 vi.mock('./panes', () => ({ setStatusbarItemGroup: vi.fn(), useStatusbarContributions: () => [] }))

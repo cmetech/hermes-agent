@@ -1,0 +1,45 @@
+schema_version: 1
+feature: windows-update-reliability
+upstream_changes:
+- id: bounded-windows-zip-rename-retries
+  change_class: execution-reliability
+  owner: downstream-update-reliability
+  overlap_policy: any_owned_file
+  files:
+  - hermes_cli/update_cmd.py
+  - tests/hermes_cli/test_update_zip_windows_rename.py
+  owned_symbols:
+  - _rename_staged_replacement
+  - _commit_staged_replacements
+  owned_invariants:
+  - ZIP rename retries apply only to Windows access and sharing violations.
+  - Retry delays are bounded and permanent failures still propagate into rollback.
+  - Backup, promotion, and rollback renames retain same-filesystem atomic semantics.
+  - macOS and Linux retain single-attempt rename behavior.
+  tests:
+  - tests/hermes_cli/test_update_zip_windows_rename.py
+  - tests/hermes_cli/test_update_zip_two_phase.py
+  - tests/hermes_cli/test_update_zip_atomic_replace.py
+  - tests/hermes_cli/test_update_zip_release_preserve.py
+  - tests/hermes_cli/test_update_zip_fallback_guards.py
+  - tests/hermes_cli/test_cmd_update.py
+  expected_commit_subject: 'fix(update): tolerate transient Windows ZIP rename locks'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION-ADAPT. An open nested file can make Windows reject a staged directory
+    rename with WinError 5. Retry only native Windows WinError 5/32, with four
+    bounded delays totaling 1.85 seconds, never arbitrary errors or infinite
+    waits. Keep POSIX single-attempt behavior. Apply the same policy to backup,
+    promotion, and rollback renames without replacing atomic rename with copy
+    over live files. Exhausted retries must retain the existing error and
+    reverse-order transaction rollback; do not claim a locked rollback succeeded.
+    Preserve dirty-tree ZIP guards, staging-before-swapping, release artifacts,
+    and bytecode preparation ordering owned by other manifests. Regression
+    evidence must include real native Windows file handles causing real rename
+    failures, temporary lock recovery, and persistent-lock rollback. No tests
+    may launch or update the user's live installation or gateway services.
+  removal_condition: >-
+    Remove when upstream supplies equivalent bounded Windows rename-lock
+    tolerance with preserved ZIP atomicity, rollback, and native regression
+    coverage, without changing POSIX behavior.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

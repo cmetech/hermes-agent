@@ -122,81 +122,79 @@ describe('parseBackendScopeKey (#90812/#93910)', () => {
   })
 })
 
-describe('main.ts wiring for #90812', () => {
-  it('routes the profile-scoped dial IPC through the single-owner claim', () => {
+describe('main.ts connection authority wiring for #90812', () => {
+  it('keeps BackendDialClaims inside the one lifecycle dial adapter', () => {
+    const adapterStart = mainSource.indexOf('async function dialDesktopConnection(')
+    expect(adapterStart).toBeGreaterThan(-1)
+    const body = mainSource.slice(adapterStart, adapterStart + 2_000)
+
+    expect(body).toContain('backendDialClaims.run(backendScopeKey(scope.connectionId, scope.profile)')
+    expect(body).toContain("ensureRegistryBackend(scope.connectionId, scope.profile, '', undefined, reportPhase)")
+    expect(body).toContain('backendDialClaims.run(backendScopeKey(null, scope.profile)')
+    expect(body).toContain('ensureBackend(scope.profile, undefined, reportPhase)')
+  })
+
+  it('routes the profile-scoped dial IPC through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection', ")
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 900)
 
-    expect(body).toContain('backendDialClaims.run(')
-    expect(body).toContain('ensureBackend(profile)')
+    expect(body).toContain('ensureDesktopConnection({ connectionId: null, profile })')
   })
 
-  it('routes the registry-scoped dial IPC through the claim keyed by backendScopeKey(connectionId, profile)', () => {
+  it('routes the registry-scoped dial IPC through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connection:for', ")
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 1_200)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(id, profile)')
-    expect(body).toContain('ensureRegistryBackend(id, profile)')
+    expect(body).toContain('ensureDesktopConnection({ connectionId: id, profile })')
   })
 
-  // The four IPC/probe surfaces below call ensureRegistryBackend()/ensureBackend()
-  // directly, bypassing backendDialClaims entirely — so a renderer's guarded
-  // reconnect dial and one of these can independently race the SAME
-  // ensureRegistryBackend() await-before-pool-check window (main.ts) and each
-  // bootstrap its own SSH tunnel / remote dashboard for the same
-  // (connectionId, profile) scope.
+  // Native consumers join the same coordinator. BackendDialClaims remains the
+  // final raw-dial guard inside its adapter, so old and new callers cannot race.
 
-  it('routes a media-stream connection resolve through the single-owner claim', () => {
+  it('routes a media-stream connection resolve through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf('resolveRemoteConnection: ({ connectionId, profile }) =>')
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 300)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connectionId, profile)')
-    expect(body).toContain('ensureRegistryBackend(connectionId, profile)')
-    expect(body).toContain('ensureBackend(profile)')
+    expect(body).toContain('ensureDesktopConnection({ connectionId, profile })')
   })
 
-  it('routes a terminal-pane backend resolve through the single-owner claim on both the registry and local branches', () => {
+  it('routes terminal-pane registry and local resolves through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf('async function ensureTerminalBackend(webContentsId: number) {')
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 900)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(windowRoute.connectionId, windowRoute.profile)')
-    expect(body).toContain('ensureRegistryBackend(windowRoute.connectionId, windowRoute.profile)')
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(null, profile)')
-    expect(body).toContain('ensureBackend(profile)')
+    expect(body).toContain('connectionId: windowRoute.connectionId')
+    expect(body).toContain('return ensureDesktopConnection({ connectionId: null, profile })')
   })
 
-  it('routes the roster-enumeration probe through the single-owner claim', () => {
+  it('routes the roster-enumeration probe through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf('async function enumerateRegistryAgentSources')
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 3_700)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connection.id, null)')
-    expect(body).toContain('ensureRegistryBackend(connection.id, null)')
+    expect(body).toContain('ensureDesktopConnection({ connectionId: connection.id, profile: null })')
     expect(body).toContain("getJsonForBackend(descriptor, '/api/profiles'")
   })
 
-  it('routes the connections update-all dispatch through the single-owner claim', () => {
+  it('routes the connections update-all dispatch through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf("ipcMain.handle('hermes:connections:update-all',")
     expect(handlerStart).toBeGreaterThan(-1)
     // The handler grew on main (renderer-side exclusions + the managed-SSH
     // dispatch branch) — keep the scan window comfortably past the dial.
     const body = mainSource.slice(handlerStart, handlerStart + 3_000)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(connection.id, null)')
-    expect(body).toContain('ensureRegistryBackend(connection.id, null)')
+    expect(body).toContain('ensureDesktopConnection({ connectionId: connection.id, profile: null })')
     expect(body).toContain("postJsonForBackend(descriptor, '/api/hermes/update'")
   })
 
-  it('routes every registry-scoped REST dispatch (hermes:api) through the single-owner claim', () => {
+  it('routes every ordinary registry-scoped REST dispatch through the lifecycle authority', () => {
     const handlerStart = mainSource.indexOf('async function dispatchRegistryApiRequest(')
     expect(handlerStart).toBeGreaterThan(-1)
     const body = mainSource.slice(handlerStart, handlerStart + 900)
 
-    expect(body).toContain('backendDialClaims.run(backendScopeKey(registryConnectionId, routeProfile)')
-    expect(body).toContain('ensureRegistryBackend(registryConnectionId, routeProfile)')
+    expect(body).toContain('ensureDesktopConnection({ connectionId: registryConnectionId, profile: routeProfile })')
   })
 })

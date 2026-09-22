@@ -3597,6 +3597,34 @@ function Set-PathVariable {
     Write-Success "hermes command ready"
 }
 
+function Optimize-PythonBytecode {
+    # Install/update work only: never put this on a normal Desktop launch.
+    $helper = Join-Path $InstallDir "hermes_cli\bytecode_cache.py"
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) { return }
+    try {
+        $pythonExe = Join-Path $InstallDir "venv\Scripts\python.exe"
+        if ($NoVenv) {
+            Resolve-UvCmd
+            $resolvedVersion = Resolve-AvailablePythonVersion
+            $pythonExe = if ($resolvedVersion) { Get-ManagedPythonPath $resolvedVersion } else { $null }
+            if (-not $pythonExe -and $resolvedVersion) {
+                $pythonExe = (& $UvCmd python find $resolvedVersion)
+            }
+        }
+        if (-not $pythonExe -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) {
+            Write-Warn "Bytecode preparation skipped: installation Python unavailable"
+            return
+        }
+        Write-Info "Preparing Python bytecode for faster startup..."
+        Invoke-NativeWithRelaxedErrorAction { & $pythonExe $helper }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Bytecode preparation incomplete (exit $LASTEXITCODE); Python will compile on demand."
+        }
+    } catch {
+        Write-Warn "Bytecode preparation unavailable; Python will compile on demand."
+    }
+}
+
 function Write-BootstrapMarker {
     # Writes $InstallDir\.hermes-bootstrap-complete which tells the Hermes
     # desktop app (apps/desktop/electron/main.ts) "install.ps1 ran
@@ -5233,7 +5261,7 @@ function Stage-Desktop          { Install-DesktopVoiceDeps; Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
 function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }
-function Stage-BootstrapMarker  { Write-BootstrapMarker }
+function Stage-BootstrapMarker  { Optimize-PythonBytecode; Write-BootstrapMarker }
 function Stage-Configure        { Invoke-SetupWizard }
 function Stage-Gateway          { Start-GatewayIfConfigured }
 

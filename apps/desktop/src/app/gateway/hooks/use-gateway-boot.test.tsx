@@ -1241,28 +1241,18 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeTruthy()
   })
 
-  it('does not spend the initial connection deadline while first-launch bootstrap is active', async () => {
+  it('lets an Electron-owned healthy connection resolve after 45 seconds without a renderer timeout', async () => {
     let resolveConnection: (connection: typeof primaryConn) => void = () => undefined
-    let bootstrapActive = true
-    const desktop = fakeDesktop()
 
-    desktop.getConnection = vi.fn(
+    const ensureConnection = vi.fn(
       () =>
         new Promise(resolve => {
           resolveConnection = resolve
         })
     )
-    desktop.getBootstrapState = vi.fn(async () => ({
-      active: bootstrapActive,
-      completedAt: null,
-      error: null,
-      log: [],
-      manifest: null,
-      setupChoice: null,
-      stages: {},
-      startedAt: null,
-      unsupportedPlatform: null
-    }))
+
+    const desktop = { ...fakeDesktop(), ensureConnection }
+
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
 
     render(<Harness />)
@@ -1272,10 +1262,8 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
       await vi.advanceTimersByTimeAsync(45_000)
     })
 
-    expect(desktop.getBootstrapState).toHaveBeenCalledTimes(1)
     expect($desktopBoot.get().error).toBeNull()
 
-    bootstrapActive = false
     await act(async () => {
       resolveConnection(primaryConn)
       await vi.advanceTimersByTimeAsync(0)
@@ -1285,51 +1273,30 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
   })
 
-  it('keeps waiting through the install-complete backend handoff without flashing a timeout', async () => {
-    let resolveConnection: (connection: typeof primaryConn) => void = () => undefined
-    let completedAt: number | null = null
-    const startedAt = Date.now() + 1
-    const desktop = fakeDesktop()
+  it('surfaces a typed Electron terminal failure without waiting for a renderer timeout', async () => {
+    const failure = Object.assign(new Error('Remote host is unavailable'), {
+      data: {
+        attemptId: 7,
+        code: 'remote_unreachable',
+        elapsedMs: 12_000,
+        phase: 'remote',
+        retryable: false,
+        scope: { connectionId: null, profile: 'default' }
+      }
+    })
 
-    desktop.getConnection = vi.fn(
-      () =>
-        new Promise(resolve => {
-          resolveConnection = resolve
-        })
-    )
-    desktop.getBootstrapState = vi.fn(async () => ({
-      active: false,
-      completedAt,
-      error: null,
-      log: [],
-      manifest: null,
-      setupChoice: null,
-      stages: {},
-      startedAt,
-      unsupportedPlatform: null
-    }))
+    const ensureConnection = vi.fn().mockRejectedValue(failure)
+
+    const desktop = { ...fakeDesktop(), ensureConnection }
+
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
 
     render(<Harness />)
     await flushAsync()
 
-    // The installer finishes just before the renderer's 45-second deadline,
-    // while Electron is still handing off to the newly installed backend.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(44_000)
-      completedAt = Date.now()
-      await vi.advanceTimersByTimeAsync(1_000)
-    })
-
-    expect($desktopBoot.get().error).toBeNull()
-
-    await act(async () => {
-      resolveConnection(primaryConn)
-      await vi.advanceTimersByTimeAsync(0)
-    })
-
-    expect($gatewayState.get()).toBe('open')
-    expect($desktopBoot.get().error).toBeNull()
+    expect($desktopBoot.get().error).toBe(failure.message)
+    expect(notifyError).toHaveBeenCalledWith(failure, expect.any(String))
+    expect(ensureConnection).toHaveBeenCalledTimes(1)
   })
 
   it('softSwitch(): a getConnection() that hangs on a connection-apply switch does not latch $gatewaySwitching forever (#93454)', async () => {

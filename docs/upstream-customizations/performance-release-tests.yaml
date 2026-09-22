@@ -1,0 +1,50 @@
+schema_version: 1
+feature: performance-release-tests
+upstream_changes:
+- id: isolated-performance-updater-fixtures
+  change_class: test-portability
+  owner: downstream-tests
+  overlap_policy: any_owned_file
+  files:
+  - tests/hermes_cli/test_cmd_update.py
+  owned_symbols:
+  - _isolate_update_runtime
+  - _make_run_side_effect
+  tests:
+  - tests/hermes_cli/test_cmd_update.py
+  expected_commit_subject: 'test: isolate updater verification for the performance release'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION-ADAPT. Keep updater tests on temporary checkout/home paths, model Git
+    branch and HEAD transitions, isolate fleet discovery and module reloads,
+    and reject unexpected child-process launches. Native Windows ZIP tests
+    must not operate on the live installation. Use host markers for native
+    platform contracts, retaining Linux coverage without faking sys.platform.
+    These are the updater-only fixture changes extracted from bc52fc43f5;
+    unrelated environment-runtime fixes are not part of this release.
+  removal_condition: >-
+    Remove when upstream updater fixtures provide equivalent isolation and
+    native host coverage without weakening updater safety assertions.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77
+- id: portable-brand-cli-smoke-fixture
+  change_class: test-portability
+  owner: downstream-tests
+  overlap_policy: any_owned_file
+  files:
+  - tests/hermes_cli/test_brand_runtime.py
+  owned_symbols:
+  - test_cli_startup_writes_brand_json
+  tests:
+  - tests/hermes_cli/test_brand_runtime.py
+  expected_commit_subject: 'test: resolve native Windows CLI launcher in brand smoke'
+  upstream_candidate: true
+  merge_guidance: >-
+    UNION-ADAPT. Resolve the installed hermes.exe launcher on Windows and the
+    existing hermes launcher on POSIX. Preserve real CLI execution, isolated
+    HERMES_HOME, offline capability source and brand.json assertions. Pin the
+    subprocess import path to the tested checkout when sharing a worktree venv,
+    and require a successful CLI exit.
+  removal_condition: >-
+    Remove when upstream resolves installed CLI launchers portably without
+    skipping the real startup assertion on Windows.
+  last_verified_upstream: 29112bef099274229cadff79cdff7bf7b99c4b77

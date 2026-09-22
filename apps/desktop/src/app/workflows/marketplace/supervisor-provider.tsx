@@ -4,6 +4,7 @@ import { createContext, type ReactNode, useContext, useSyncExternalStore } from 
 
 import { getApiRequestConnection, getApiRequestProfile, type HermesGateway, type ProfileScope } from '@/api/client'
 import * as lifecycle from '@/api/workflow-marketplace-lifecycle'
+import { ensureDesktopConnection } from '@/lib/desktop-connection'
 import { $gateway } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $connection } from '@/store/session'
@@ -111,14 +112,15 @@ export function startMainWindowMarketplaceSupervision(queryClient: QueryClient):
     },
     connections: {
       resolveConnection: async scope => {
-        if (scope.connectionId !== null && !window.hermesDesktop.getConnectionFor) {
+        if (
+          scope.connectionId !== null &&
+          !window.hermesDesktop.ensureConnection &&
+          !window.hermesDesktop.getConnectionFor
+        ) {
           throw new lifecycle.LifecycleApiError('marketplace_lifecycle_unsupported', 0)
         }
 
-        const descriptor =
-          scope.connectionId === null
-            ? await window.hermesDesktop.getConnection(scope.profile)
-            : await window.hermesDesktop.getConnectionFor!({ connectionId: scope.connectionId, profile: scope.profile })
+        const descriptor = await ensureDesktopConnection(scope)
 
         return { connectionId: descriptor.connectionId ?? null, connectionGeneration: descriptor.connectionGeneration }
       },

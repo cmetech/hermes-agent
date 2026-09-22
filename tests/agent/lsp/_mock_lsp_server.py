@@ -113,7 +113,13 @@ def main():
                 if script == "malformed_frame":
                     sys.stdout.buffer.write(b"Content-Length: invalid\r\n\r\n")
                     sys.stdout.buffer.flush()
-                os.close(sys.stdout.fileno())
+                sys.stdout.close()
+                # Windows' Proactor subprocess transport does not report this
+                # synthetic partial pipe close while the child stays alive.
+                # Process exit still provides a clean EOF and exercises the
+                # same client retirement path on that host.
+                if os.name == "nt":
+                    return 0
                 while read_message() is not None:
                     pass
                 return 0
